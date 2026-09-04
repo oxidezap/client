@@ -27,6 +27,42 @@ pub struct TrayState {
     pub unread: u32,
 }
 
+impl TrayState {
+    /// The count the icon speaks from.
+    ///
+    /// Zero while the connection is down: what was last heard is then a
+    /// number nothing is refreshing, and an icon asking to be looked at over
+    /// a stale count is worse than one saying the connection is what is
+    /// wrong. One method rather than one per tray, so no platform can
+    /// disagree with another about what is unread.
+    #[must_use]
+    pub fn shown_unread(&self) -> u32 {
+        if self.connected { self.unread } else { 0 }
+    }
+
+    /// The name beside the count: a host that renders only the first line of
+    /// a tooltip is otherwise told nothing, and the number is the one thing
+    /// an icon itself cannot say.
+    #[must_use]
+    pub fn title(&self) -> String {
+        match self.shown_unread() {
+            0 => "oxidezap".to_string(),
+            n => format!("oxidezap ({n})"),
+        }
+    }
+
+    /// What the icon has to say, in one sentence.
+    #[must_use]
+    pub fn description(&self) -> String {
+        match (self.connected, self.shown_unread()) {
+            (false, _) => "Disconnected".to_string(),
+            (true, 0) => "Connected".to_string(),
+            (true, 1) => "1 unread message".to_string(),
+            (true, n) => format!("{n} unread messages"),
+        }
+    }
+}
+
 /// A state change on its way into the hub.
 ///
 /// [`DaemonEvent`] is the wire type: it carries what a client needs and
@@ -506,5 +542,28 @@ mod tests {
         assert!(published.is_none());
         assert!(!claimed.get(), "nothing was published, so nothing claimed");
         assert_eq!(store.snapshot().version, before);
+    }
+
+    /// What every tray says, whatever it draws with: the words live here so
+    /// no platform can disagree with another about them.
+    fn tray(connected: bool, unread: u32) -> TrayState {
+        TrayState { connected, unread }
+    }
+
+    #[test]
+    fn a_disconnected_tray_shows_no_count() {
+        assert_eq!(tray(false, 3).shown_unread(), 0);
+        assert_eq!(tray(false, 3).title(), "oxidezap");
+        assert_eq!(tray(false, 3).description(), "Disconnected");
+    }
+
+    #[test]
+    fn the_tray_names_its_count() {
+        assert_eq!(tray(true, 0).title(), "oxidezap");
+        assert_eq!(tray(true, 0).description(), "Connected");
+        assert_eq!(tray(true, 1).title(), "oxidezap (1)");
+        assert_eq!(tray(true, 1).description(), "1 unread message");
+        assert_eq!(tray(true, 4).title(), "oxidezap (4)");
+        assert_eq!(tray(true, 4).description(), "4 unread messages");
     }
 }

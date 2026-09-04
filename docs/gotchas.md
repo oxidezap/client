@@ -203,6 +203,9 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   what it says — and is re-read when the host opens the menu, which ksni
   does only for a tray that implements `menu_about_to_show`; the tray
   otherwise hears only `TrayState`, which a window attaching does not move.
+  On Windows the menu carries Open and Hide as two fixed items instead:
+  muda has no about-to-show, and either request published to nobody is
+  harmless, so there is no label that can go stale there.
 - **Unread has to reach the icon, not only its tooltip.** StatusNotifierItem
   carries no badge and no number, so a count can only be spoken as a *state*:
   the icon takes a themed `mail-unread` while anything is waiting, and the

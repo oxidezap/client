@@ -95,6 +95,12 @@ smol = "2"
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 openh264 = "0.9" # H.264 software decoder
 
+# The one Win32 constant the daemon spawn names (`CREATE_NO_WINDOW`), and
+# nothing else: process creation flags are std, and the value itself belongs
+# to the OS rather than to a literal in the call.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
 # The same window as a page. `gpui_platform` picks the web backend by target,
 # so the dependency differs only in the features a browser has no use for —
 # there is no font-kit, no X11 and no Wayland behind a canvas.

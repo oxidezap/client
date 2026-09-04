@@ -82,7 +82,17 @@ fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
 
     session.ends_with(Teardown::new(move || {
         hangup.hang_up();
-        let _ = until_gone.recv_timeout(READER_PATIENCE);
+        // Off the dropping thread: waiting here used to block whoever
+        // dropped the session — on window close, the UI thread — for up to
+        // `READER_PATIENCE` while the window was going away, which on
+        // Windows surfaced as the window going invalid under a close it was
+        // still tearing down. The wait only reaps the reader, so it keeps a
+        // thread of its own the way `reap` keeps one for the child.
+        let _ = std::thread::Builder::new()
+            .name("oxidezap-ipc-wait".to_string())
+            .spawn(move || {
+                let _ = until_gone.recv_timeout(READER_PATIENCE);
+            });
     }));
 
     Ok((session, events))
@@ -233,20 +243,9 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
             Some(Ok(None)) => {}
             _ => {
                 info!("no daemon on {}; starting one", path.display());
-                started = Some(
-                    std::process::Command::new(&program)
-                        // The daemon's own log belongs in the daemon's, not
-                        // interleaved into this window's.
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .map_err(|e| {
-                            std::io::Error::other(format!(
-                                "could not start {}: {e}",
-                                program.display()
-                            ))
-                        })?,
-                );
+                started = Some(detached_command(&program).spawn().map_err(|e| {
+                    std::io::Error::other(format!("could not start {}: {e}", program.display()))
+                })?);
             }
         }
 
@@ -302,6 +301,41 @@ fn daemon_program() -> Option<std::path::PathBuf> {
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
         .filter(|path| path.exists())
+}
+
+/// How the daemon is launched: detached, on every platform.
+///
+/// The mirror of the daemon's own `detached_command` for the other
+/// direction — same name and same split, one per binary rather than one
+/// shared, because the two launches differ in what they inherit: the
+/// daemon's log belongs in the daemon's, not interleaved into this window's,
+/// while a front end started from a terminal keeps the terminal's.
+#[cfg(windows)]
+fn detached_command(program: &std::path::Path) -> std::process::Command {
+    use std::os::windows::process::CommandExt as _;
+
+    // A console-subsystem child pops a console window of its own unless told
+    // not to: opening the GUI popped a terminal with the daemon in it. A
+    // GUI-subsystem parent still spawns a console child visibly, so the flag
+    // is needed regardless of our own subsystem.
+    let mut command = std::process::Command::new(program);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    command
+}
+
+/// Everywhere else a spawn is an ordinary spawn with quiet stdio.
+#[cfg(not(windows))]
+fn detached_command(program: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
 }
 
 /// What dropping a connection does to the daemon at the other end.

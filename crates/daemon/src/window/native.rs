@@ -76,7 +76,7 @@ fn show_program(hub: &StateHub, program: &std::path::Path) {
         }
     }
 
-    match Command::new(program).spawn() {
+    match detached_command(program).spawn() {
         Ok(child) => {
             log::info!("no front end attached; started {}", program.display());
             *launched = Some(child);
@@ -86,6 +86,34 @@ fn show_program(hub: &StateHub, program: &std::path::Path) {
             *launched = None;
         }
     }
+}
+
+/// A launch that never opens a console window of its own.
+///
+/// The mirror of the front end's `detached_command` for the other direction:
+/// same name and same split, one per binary rather than one shared, because
+/// the two launches differ in what they inherit — a front end started from a
+/// terminal keeps the terminal's, while the daemon's log belongs in the
+/// daemon's. `CREATE_NO_WINDOW` only affects the console a child would
+/// otherwise inherit — a GUI window still shows — so it is safe however the
+/// program at the other end is built.
+#[cfg(windows)]
+fn detached_command(program: &std::path::Path) -> Command {
+    use std::os::windows::process::CommandExt as _;
+
+    let mut command = Command::new(program);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    command
+}
+
+/// Everywhere else a spawn is an ordinary spawn.
+#[cfg(not(windows))]
+fn detached_command(program: &std::path::Path) -> Command {
+    Command::new(program)
 }
 
 /// The environment variable that names a front end other than the one that

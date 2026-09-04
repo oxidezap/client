@@ -14,7 +14,7 @@ video calls work, on the desktop and in a browser. Read
 ## Layout
 
 The WhatsApp connection lives in one background process, `oxidezapd`: it holds
-the session, owns the store, shows a tray icon on Linux and serves front ends
+the session, owns the store, shows a tray icon on Linux and Windows and serves front ends
 over a per-user local transport — a Unix socket, or a named pipe on Windows.
 `oxidezap` is the GPUI desktop window; it owns no session and starts the daemon
 when none is running. One session per user, one process that opens the

@@ -31,19 +31,11 @@ struct Item {
 }
 
 impl Item {
-    /// The count the icon and the tooltip both speak from.
-    ///
-    /// Zero while the connection is down: what we last heard is then a number
-    /// nothing is refreshing, and an icon asking to be looked at over a stale
-    /// count is worse than one saying the connection is what is wrong. One
-    /// method rather than the test written twice, so the icon and the tooltip
-    /// cannot disagree about what is unread.
+    /// The count the icon and the tooltip both speak from: [`TrayState`]'s
+    /// own answer, so this tray cannot disagree with any other about what is
+    /// unread.
     fn unread(&self) -> u32 {
-        if self.state.connected {
-            self.state.unread
-        } else {
-            0
-        }
+        self.state.shown_unread()
     }
 }
 
@@ -119,25 +111,15 @@ impl KsniTray for Item {
     fn menu_about_to_show(&mut self) {}
 
     fn tool_tip(&self) -> ToolTip {
-        let description = match (self.state.connected, self.unread()) {
-            (false, _) => "Disconnected".to_string(),
-            (true, 0) => "Connected".to_string(),
-            (true, 1) => "1 unread message".to_string(),
-            (true, n) => format!("{n} unread messages"),
-        };
-        // The count rides in the title too: a host that renders only the
-        // first line of a tooltip is otherwise told nothing, and the number
-        // is the one thing the icon itself cannot say.
-        let title = match self.unread() {
-            0 => "oxidezap".to_string(),
-            n => format!("oxidezap ({n})"),
-        };
         ToolTip {
             // Named so a tooltip that draws an icon draws the one the tray
             // is showing rather than a default.
             icon_name: self.icon_name(),
-            title,
-            description,
+            // The words are the hub's, shared with every other tray: the
+            // count rides in the title too, since a host that renders only
+            // the first line of a tooltip is otherwise told nothing.
+            title: self.state.title(),
+            description: self.state.description(),
             ..Default::default()
         }
     }
