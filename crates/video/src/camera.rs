@@ -21,8 +21,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{
-    ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
-    Resolution,
+    ApiBackend, CameraFormat, CameraIndex, CameraInfo, FrameFormat, RequestedFormat,
+    RequestedFormatType, Resolution,
 };
 use portable_atomic::{AtomicBool, Ordering};
 use wacore::time::Instant;
@@ -150,7 +150,17 @@ impl Drop for CameraStream {
 /// to answer a video call learns *here* that there is no camera — rather than
 /// accepting one and then having nothing to send.
 pub fn open(quality: VideoQuality) -> Result<CameraStream> {
+    // After the authorization, not before: on macOS nothing else in the
+    // library may run until `nokhwa_initialize` has answered, so an
+    // inventory read first can report an empty backend over cameras that
+    // are right there.
     authorize()?;
+    // Read against the device list from here on: the open names only the
+    // camera it took, and never what else was there — a virtual camera
+    // sitting at index 0 while the real one waits at 1, a privacy-blocked
+    // device, an empty backend. Enumerating is much cheaper than opening,
+    // and opens happen at call rate.
+    log::info!("cameras in reach: {}", inventory());
 
     let (frames_tx, frames_rx) = async_channel::bounded(QUEUE_DEPTH);
     let control = CameraControl::default();
@@ -513,6 +523,31 @@ pub(crate) fn configured_device() -> CameraIndex {
     }
 }
 
+/// The devices an open will choose among, as one line.
+///
+/// Read off enumeration rather than the open because the open names only the
+/// device it took. `OXIDEZAP_CAMERA` names the same index and name space
+/// [`configured_device`] reads, so the line says exactly what there is to
+/// choose from when index 0 is the wrong camera.
+fn inventory() -> String {
+    match nokhwa::query(ApiBackend::Auto) {
+        Ok(cameras) => describe(&cameras),
+        Err(e) => format!("unlistable: {e}"),
+    }
+}
+
+/// The enumeration, in the override's own terms: index, then name.
+fn describe(cameras: &[CameraInfo]) -> String {
+    if cameras.is_empty() {
+        return "none".to_string();
+    }
+    cameras
+        .iter()
+        .map(|camera| format!("{:?}: {}", camera.index(), camera.human_name()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Whether this platform has a capture backend at all, without opening a
 /// device.
 ///
@@ -556,5 +591,21 @@ mod tests {
             assert!(!failures.gave_up());
         }
         assert!(failures.gave_up());
+    }
+
+    /// The inventory reads in the override's own terms, so the line next to
+    /// a failed open says what there was to choose from.
+    #[test]
+    fn the_inventory_names_every_camera_by_index() {
+        use nokhwa::utils::{CameraIndex, CameraInfo};
+
+        assert_eq!(super::describe(&[]), "none");
+        assert_eq!(
+            super::describe(&[
+                CameraInfo::new("FaceTime HD Camera", "camera", "", CameraIndex::Index(0)),
+                CameraInfo::new("OBS Virtual Camera", "camera", "", CameraIndex::Index(1)),
+            ]),
+            "Index(0): FaceTime HD Camera, Index(1): OBS Virtual Camera"
+        );
     }
 }
