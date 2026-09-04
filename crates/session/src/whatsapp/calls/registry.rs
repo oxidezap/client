@@ -903,6 +903,14 @@ impl WhatsAppClient {
                     Ok(video) => Some(video),
                     Err(err) => {
                         warn!("Answering call {call_id} without video: {err}");
+                        // Said out loud rather than left in the log: the call
+                        // carries on as voice, so without this the person
+                        // hears a voice call with no account of where the
+                        // picture went.
+                        let _ = ui_sender.send(UiEvent::CallVideoUnavailable {
+                            call_id: call_id.clone(),
+                            reason: err,
+                        });
                         None
                     }
                 }
@@ -1157,6 +1165,10 @@ impl WhatsAppClient {
                         error!("Camera setup failed for call {call_id}: {err}");
                         // Said out loud rather than left silent: the front end
                         // drew the camera as coming on the moment it was asked.
+                        let _ = ui_sender.send(UiEvent::CallVideoUnavailable {
+                            call_id: call_id.clone(),
+                            reason: err,
+                        });
                         Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                         return;
                     }
@@ -1486,6 +1498,14 @@ impl WhatsAppClient {
                             "Placing the call to {} without video: {err}",
                             observe_str(&recipient_jid)
                         );
+                        // Said out loud rather than left in the log: the offer
+                        // goes out as voice, so without this the person dials
+                        // a video call and gets a voice one with no account
+                        // of where the picture went.
+                        let _ = ui_sender.send(UiEvent::CallVideoUnavailable {
+                            call_id: placeholder_id.clone(),
+                            reason: err,
+                        });
                         None
                     }
                 }

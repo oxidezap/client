@@ -663,7 +663,11 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   draw what it is sending. What crosses the socket is therefore *both*
   directions of the call, as H.264 access units: 16 KiB a frame against 3.5
   MiB of pixels, and the front end already carries a decoder for the video it
-  plays in a conversation. Sending the self-view as the very stream the peer
+  plays in a conversation. The open takes the first device unless
+  `OXIDEZAP_CAMERA` names an index or a backend-specific name — which is the
+  answer when index 0 is a virtual camera with nothing behind it, and the log
+  line next to every open (`cameras in reach`) says what there was to choose
+  from. Sending the self-view as the very stream the peer
   receives costs one more decode and no second encode, and is the only form
   of it that cannot lie about what they are seeing. Frames are a third kind
   of daemon frame beside state and news (`StateHub::publish_video`), because
@@ -954,7 +958,12 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   `OutgoingCallStarted::is_video` carries what the offer actually went out
   as, and `UiEvent::CallAnswered` what the accept actually attached; without
   them a window holds a video layout open on a call with no picture in it and
-  the conversation records a video call that never was one.
+  the conversation records a video call that never was one. And the *reason*
+  is said too, as `CallVideoUnavailable`: a downgrade with no account of
+  itself reads as a webcam that does not work, and the daemon's log is
+  nowhere a user of a console-less platform can look — so the window toasts
+  the session's own words, on the answer path, the placement path and the
+  mid-call upgrade alike.
 - **A video call is offered as one, and answered as one.** The endpoints have
   to be attached before the offer or the accept goes out, which is why the
   camera opens first and why a camera that fails downgrades the call to voice

@@ -316,6 +316,19 @@ impl WhatsAppApp {
                     cx,
                 );
             }
+            // Said out loud rather than only logged: the call carries on
+            // without video — answered or placed as voice, or left without
+            // the upgrade — so without a notice the person gets a voice
+            // call with no account of where the picture went. Unlike the
+            // failure above, nothing ends behind this.
+            UiEvent::CallVideoUnavailable { call_id, reason } => {
+                warn!("Call {call_id} is continuing without video: {reason}");
+                self.notify_user(
+                    format!("The camera could not be opened: {reason}"),
+                    crate::app::notices::Tone::Problem,
+                    cx,
+                );
+            }
             UiEvent::CallEnded(call_id) => {
                 info!("Call {call_id} ended");
             }

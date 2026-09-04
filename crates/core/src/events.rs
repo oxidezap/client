@@ -159,6 +159,22 @@ pub enum UiEvent {
         call_id: CallId,
         reason: String,
     },
+    /// The camera would not open, and why.
+    ///
+    /// The call carries on without it — answered as voice, placed as voice,
+    /// or left without the upgrade that was asked for — so without this the
+    /// person sees a voice call (or a camera button that did nothing) and
+    /// the reason dies in the daemon's log, which on some platforms is
+    /// nowhere a user can look at all. Said wherever the open fails after
+    /// video was asked for: the answer path, the placement path, and the
+    /// mid-call upgrade.
+    ///
+    /// Not [`CallMediaFailed`](Self::CallMediaFailed), which is followed by
+    /// the call ending: this one is followed by the call carrying on.
+    CallVideoUnavailable {
+        call_id: CallId,
+        reason: String,
+    },
     CallEnded(CallId),
     /// What the microphone really is, once the newest request has reached it.
     ///
