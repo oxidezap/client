@@ -227,6 +227,7 @@ struct Shared {
     calls: CallRegistry,
     shutdown: Arc<tokio::sync::Notify>,
     reload: Arc<tokio::sync::Notify>,
+    history_budget: Arc<ui_queue::HistoryBudget>,
 }
 
 /// WhatsApp client wrapper that manages the connection and provides
@@ -253,8 +254,7 @@ pub struct WhatsAppClient {
     /// Its own channel rather than a `UiEvent`: an event is news that a
     /// reader which missed one has missed for good, and this is a stream
     /// whose newest frame is the only one worth having. It is also bounded,
-    /// which the event channel is not — a camera that outran a stalled
-    /// reader would otherwise grow the queue for as long as the call lasted.
+    /// while the UI event channel has its own admission and recovery policy.
     video_tx: VideoSenderSlot,
     /// Whether anybody is drawing what the cameras produce. See
     /// [`Self::set_video_publishing`].
@@ -273,6 +273,7 @@ pub struct WhatsAppClient {
     /// no chats and nothing has changed, so nothing would arrive until the
     /// next message did.
     reload: Arc<tokio::sync::Notify>,
+    history_budget: Arc<ui_queue::HistoryBudget>,
 }
 
 impl WhatsAppClient {
@@ -282,7 +283,8 @@ impl WhatsAppClient {
     /// the thread that asked.
     pub fn new() -> std::io::Result<Self> {
         let reload = Arc::new(tokio::sync::Notify::new());
-        let (ui_sender, ui_events) = ui_queue::channel(reload.clone());
+        let history_budget = Arc::new(ui_queue::HistoryBudget::new());
+        let (ui_sender, ui_events) = ui_queue::channel(reload.clone(), history_budget.clone());
         Ok(Self {
             exec: Executor::new()?,
             ui_sender,
@@ -295,6 +297,7 @@ impl WhatsAppClient {
             session: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             reload,
+            history_budget,
         })
     }
 
@@ -481,6 +484,7 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let shutdown = self.shutdown.clone();
         let reload = self.reload.clone();
+        let history_budget = self.history_budget.clone();
 
         let started = self.exec.start("oxidezap-session", async move {
             Self::run_client(
@@ -490,6 +494,7 @@ impl WhatsAppClient {
                     calls,
                     shutdown,
                     reload,
+                    history_budget,
                 },
             )
             .await;
@@ -687,6 +692,7 @@ impl WhatsAppClient {
             calls,
             shutdown,
             reload,
+            history_budget,
         } = shared;
         let cold_start = wacore::time::Instant::now();
         // Device store + durable chat history share one SQLite file (one pool,
@@ -712,7 +718,17 @@ impl WhatsAppClient {
         // JIDs normalize through the same PN->LID mapping live events use.
         let hydrating = wacore::time::Instant::now();
         let mut hydrated = 0;
-        match Self::load_history(chat_store, &bot.client(), names).await {
+        let (chat_limit, message_limit) = history_budget.limits();
+        match Self::load_history_scoped_with_limits(
+            chat_store,
+            &bot.client(),
+            None,
+            names,
+            chat_limit,
+            message_limit,
+        )
+        .await
+        {
             Ok(loaded) if !loaded.chats.is_empty() => {
                 hydrated = loaded.chats.len();
                 let _ = ui_tx.send(loaded.into_event());
@@ -744,8 +760,8 @@ impl WhatsAppClient {
             .detach();
 
         // The UI observes only the event kinds handled below. Two bounded
-        // mailboxes reserve space for session and call control while allowing
-        // message traffic to request a durable history recovery when it lags.
+        // mailboxes reserve space for session and call control; committed
+        // ChatStore invalidations remain the recovery source for raw-event lag.
         let (control_events, control_incoming, control_stats) = interested_channel(
             &[
                 EventKind::PairingQrCode,
@@ -796,7 +812,7 @@ impl WhatsAppClient {
             let ui_tx = ui_tx.clone();
             let calls = calls.clone();
             let names = names.clone();
-            let recovery = reload.clone();
+            let control_fault_ui = ui_tx.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
                 // The dispatch loop's own handle. The one below is moved into
@@ -815,7 +831,6 @@ impl WhatsAppClient {
                         }
                     },
                     stopping.clone(),
-                    recovery.clone(),
                 );
                 let mut control_open = true;
                 let mut data_open = true;
@@ -852,6 +867,7 @@ impl WhatsAppClient {
                             control_snapshot.dropped_full - control_drops
                         );
                         control_drops = control_snapshot.dropped_full;
+                        control_fault_ui.signal_control_overflow();
                     }
                     let data_snapshot = data_stats.stats();
                     if data_snapshot.dropped_full > data_drops {
@@ -860,7 +876,6 @@ impl WhatsAppClient {
                             data_snapshot.dropped_full - data_drops
                         );
                         data_drops = data_snapshot.dropped_full;
-                        recovery.notify_one();
                     }
                     // The kind, and only the kind. It is `Copy`, carries no
                     // payload and names the variant, which makes this the one
@@ -889,6 +904,7 @@ impl WhatsAppClient {
             &bot,
             &ui_tx,
             reload,
+            history_budget,
             names.clone(),
             stopping,
         );
@@ -2115,10 +2131,14 @@ impl Drop for WhatsAppClient {
         if stats.dropped_recoverable != 0
             || stats.dropped_ephemeral != 0
             || stats.dropped_control != 0
+            || stats.control_faults != 0
         {
             warn!(
-                "UI event queue overflow: {} recoverable, {} ephemeral, {} control drops",
-                stats.dropped_recoverable, stats.dropped_ephemeral, stats.dropped_control
+                "UI event queue overflow: {} recoverable, {} ephemeral, {} control drops ({} failover faults)",
+                stats.dropped_recoverable,
+                stats.dropped_ephemeral,
+                stats.dropped_control,
+                stats.control_faults
             );
         }
         // A dropped wrapper can never be shut down explicitly anymore; free

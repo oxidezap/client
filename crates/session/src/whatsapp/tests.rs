@@ -1025,7 +1025,10 @@ async fn a_session_is_never_observed_half_open() {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
-    let (ui_tx, _ui_rx) = super::ui_queue::channel(Arc::new(tokio::sync::Notify::new()));
+    let (ui_tx, _ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
     let session: super::SessionSlot = Arc::new(super::Mutex::new(None));
 
     let opening = WhatsAppClient::open_session(
@@ -1068,7 +1071,10 @@ async fn a_session_is_never_observed_half_open() {
 /// followed on the "clear data and pair again" path.
 #[tokio::test]
 async fn closing_takes_the_client_away_with_the_store() {
-    let (ui_tx, _ui_rx) = super::ui_queue::channel(Arc::new(tokio::sync::Notify::new()));
+    let (ui_tx, _ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
     let session: super::SessionSlot = Arc::new(super::Mutex::new(None));
     WhatsAppClient::open_session(
         "file:oxidezap-session-close?mode=memory&cache=shared",

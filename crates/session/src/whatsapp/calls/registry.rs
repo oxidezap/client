@@ -2085,7 +2085,10 @@ mod tests {
     #[tokio::test]
     async fn a_peers_own_camera_does_not_answer_our_upgrade() {
         let calls = CallRegistry::default();
-        let (ui, _rx) = ui_queue::channel(Arc::new(tokio::sync::Notify::new()));
+        let (ui, _rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
 
         calls.begin_upgrade("call-1");
         WhatsAppClient::observe_peer_video(&calls, &ui, "call-1", VideoState::Enabled, None).await;
@@ -2136,7 +2139,10 @@ mod tests {
     /// with the only thing true of a call with no handle.
     #[tokio::test]
     async fn a_mute_request_with_no_handle_still_says_what_the_microphone_is() {
-        let (ui_sender, mut rx) = ui_queue::channel(Arc::new(tokio::sync::Notify::new()));
+        let (ui_sender, mut rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
         let lane = MuteLane::default();
         let seq = request(&lane, true);
 

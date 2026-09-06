@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore::types::events::Event;
 use whatsapp_rust::wacore_binary::jid::Jid;
@@ -36,16 +36,11 @@ const LANE_CAPACITY: usize = 64;
 /// code never waits behind a conversation.
 pub(super) struct EventLanes {
     lanes: Vec<mpsc::Sender<Arc<Event>>>,
-    recovery: Arc<Notify>,
     stopping: tokio::sync::watch::Receiver<()>,
 }
 
 impl EventLanes {
-    pub(super) fn new<F, Fut>(
-        handle: F,
-        stopping: tokio::sync::watch::Receiver<()>,
-        recovery: Arc<Notify>,
-    ) -> Self
+    pub(super) fn new<F, Fut>(handle: F, stopping: tokio::sync::watch::Receiver<()>) -> Self
     where
         F: Fn(Arc<Event>) -> Fut + Clone + crate::exec::MaybeSend + 'static,
         Fut: Future<Output = ()> + crate::exec::MaybeSend + 'static,
@@ -78,11 +73,7 @@ impl EventLanes {
                 tx
             })
             .collect();
-        Self {
-            lanes,
-            recovery,
-            stopping,
-        }
+        Self { lanes, stopping }
     }
 
     pub(super) async fn dispatch(&mut self, client: &Client, names: &NameBook, event: Arc<Event>) {
@@ -96,10 +87,9 @@ impl EventLanes {
             let lane = lane_for(client, names, &event).await;
             if recoverable(&event) {
                 if self.lanes[lane].try_send(event).is_err() {
-                    self.recovery.notify_one();
                     log::warn!(
-                        "dropping recoverable WhatsApp event from full lane {}",
-                        lane
+                        "dropping recoverable WhatsApp event from full lane {}; ChatStore invalidation will drive recovery after commit",
+                        lane,
                     );
                 }
             } else {
