@@ -15,7 +15,7 @@ use log::warn;
 use tokio::sync::{broadcast, mpsc};
 use wacore_binary::{Jid, JidExt as _};
 use waproto::whatsapp as wa;
-use whatsapp_rust_sqlite_storage::SharedSqlite;
+use whatsapp_rust_sqlite_storage::{CommitBarrierError, SharedSqlite};
 
 use crate::error::db_err;
 use crate::schema;
@@ -34,7 +34,7 @@ use crate::types::StoreChange;
 const BATCH_MAX: usize = 128;
 
 /// Chats/contacts touched by a batch, accumulated for post-commit invalidation.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ChangeSet {
     pub(crate) chats: bool,
     pub(crate) contacts: bool,
@@ -61,6 +61,7 @@ pub(super) async fn writer_loop(
         let mut batch = Vec::with_capacity(8);
         let mut flushes = Vec::new();
         let mut stopping = None;
+        let mut inbound_done = None;
         // A Flush is a batch BARRIER: stop draining there, so writes enqueued
         // after a caller's flush() can neither commit ahead of that call's
         // answer nor drag the awaited writes down with a later failure. A Stop
@@ -73,6 +74,11 @@ pub(super) async fn writer_loop(
             }
             WriterMsg::Stop(done) => {
                 stopping = Some(done);
+                true
+            }
+            WriterMsg::InboundDurability { event, done } => {
+                batch.push(WriterMsg::Event(event));
+                inbound_done = Some(done);
                 true
             }
             other => {
@@ -97,26 +103,58 @@ pub(super) async fn writer_loop(
                 acks.clone()
             };
             let shared = Arc::clone(&deferred_acks);
+            let committed_changes = Arc::new(std::sync::Mutex::new(None));
+            let committed_changes_for_db = Arc::clone(&committed_changes);
             let result = db
                 .run(move |conn| {
                     let mut deferred = lock_deferred_acks(&shared);
-                    conn.transaction(|conn| {
+                    let result = conn.transaction(|conn| {
                         let mut cs = ChangeSet::default();
                         for msg in &batch {
                             apply_writer_msg(conn, device_id, msg, &mut cs, &mut deferred)?;
                         }
                         Ok(cs)
-                    })
-                    .map_err(db_err)
+                    });
+                    result
+                        .map(|cs| {
+                            *committed_changes_for_db
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cs);
+                        })
+                        .map_err(db_err)
                 })
                 .await;
+            let inbound_outcome = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+            if let Some(done) = inbound_done {
+                let _ = done.send(inbound_outcome);
+            }
             match result {
-                Ok(cs) => emit_changes(&changes, cs),
-                // Nothing committed, by any route: the transaction rolled back,
-                // or the pool/task failed before or during it. The queue is
-                // reachable either way, so fold it back the same way — undoing
-                // what the batch consumed, keeping what it deferred.
+                Ok(()) => {
+                    if let Some(cs) = committed_changes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    {
+                        emit_changes(&changes, cs);
+                    }
+                }
+                Err(e) if is_commit_barrier_error(&e) => {
+                    if let Some(cs) = committed_changes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    {
+                        emit_changes(&changes, cs);
+                    }
+                    let mut acks = lock_deferred_acks(&deferred_acks);
+                    acks.committed();
+                    warn!("chat-store: post-commit durability barrier failed: {e}");
+                    pending_error = Some(e.to_string());
+                }
                 Err(e) => {
+                    // Nothing committed: the transaction rolled back, or the
+                    // pool/task failed before or during it. Restore the queue
+                    // state so deferred acks remain retryable.
                     let mut acks = lock_deferred_acks(&deferred_acks);
                     *acks = std::mem::take(&mut *acks).rolled_back(pre_batch);
                     warn!("chat-store: dropping write batch: {e}");
@@ -148,6 +186,17 @@ pub(super) async fn writer_loop(
     }
 }
 
+fn is_commit_barrier_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(current) = source {
+        if current.downcast_ref::<CommitBarrierError>().is_some() {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
 fn emit_changes(changes: &broadcast::Sender<StoreChange>, cs: ChangeSet) {
     if cs.chats {
         let _ = changes.send(StoreChange::Chats);
@@ -171,6 +220,9 @@ fn apply_writer_msg(
 ) -> QueryResult<()> {
     match msg {
         WriterMsg::Event(event) => apply_event(conn, device_id, event, cs, deferred),
+        WriterMsg::InboundDurability { event, .. } => {
+            apply_event(conn, device_id, event, cs, deferred)
+        }
         WriterMsg::Reconcile(chat) => {
             let wire = chat.to_string();
             if let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &wire)? {

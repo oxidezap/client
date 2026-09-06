@@ -331,15 +331,60 @@ pub(super) fn apply_event(
         Event::DeleteMessageForMeUpdate(update) => {
             let chat =
                 crate::lid::route_chat_key(conn, device_id, &update.chat_jid.to_string(), cs)?;
+            let sender = update
+                .participant_jid
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| chat.clone());
             // Capture the victim's read state before it goes: deleting an
             // unread inbound row must also drop its badge (sentinel -1 and
             // already-read rows are untouched).
-            let victim: Option<(bool, i64)> = message_row(device_id, &chat, &update.message_id)
-                .select((schema::messages::from_me, schema::messages::timestamp_ms))
-                .first(conn)
-                .optional()?;
-            diesel::delete(message_row(device_id, &chat, &update.message_id)).execute(conn)?;
-            if let Some((false, ts_ms)) = victim
+            #[derive(QueryableByName)]
+            struct Victim {
+                #[diesel(sql_type = diesel::sql_types::Bool)]
+                from_me: bool,
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                timestamp_ms: i64,
+            }
+            let victim: Option<Victim> = diesel::sql_query(
+                "SELECT from_me, timestamp_ms FROM messages \
+                 WHERE device_id = ? AND chat_jid = ? AND msg_id = ? \
+                   AND from_me = ? AND sender_jid = ? LIMIT 1",
+            )
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>(&chat)
+            .bind::<diesel::sql_types::Text, _>(&update.message_id)
+            .bind::<diesel::sql_types::Bool, _>(update.from_me)
+            .bind::<diesel::sql_types::Text, _>(if update.from_me { "" } else { sender.as_str() })
+            .load::<Victim>(conn)?
+            .into_iter()
+            .next();
+            if victim.is_none() {
+                return Ok(());
+            }
+            let message_count: i64 = schema::messages::table
+                .filter(
+                    schema::messages::device_id
+                        .eq(device_id)
+                        .and(schema::messages::chat_jid.eq(&chat))
+                        .and(schema::messages::msg_id.eq(&update.message_id)),
+                )
+                .count()
+                .get_result(conn)?;
+            diesel::sql_query(
+                "DELETE FROM messages WHERE device_id = ? AND chat_jid = ? \
+                 AND msg_id = ? AND from_me = ? AND sender_jid = ?",
+            )
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>(&chat)
+            .bind::<diesel::sql_types::Text, _>(&update.message_id)
+            .bind::<diesel::sql_types::Bool, _>(update.from_me)
+            .bind::<diesel::sql_types::Text, _>(if update.from_me { "" } else { sender.as_str() })
+            .execute(conn)?;
+            if let Some(Victim {
+                from_me: false,
+                timestamp_ms: ts_ms,
+            }) = victim
                 && !read_state(conn, device_id, &chat)?.covers(ts_ms, &update.message_id)
             {
                 diesel::update(
@@ -348,24 +393,26 @@ pub(super) fn apply_event(
                 .set(schema::chats::unread_count.eq(schema::chats::unread_count - 1))
                 .execute(conn)?;
             }
-            diesel::delete(
-                schema::reactions::table.filter(
-                    schema::reactions::device_id
-                        .eq(device_id)
-                        .and(schema::reactions::chat_jid.eq(&chat))
-                        .and(schema::reactions::msg_id.eq(&update.message_id)),
-                ),
-            )
-            .execute(conn)?;
-            diesel::delete(
-                schema::message_receipts::table.filter(
-                    schema::message_receipts::device_id
-                        .eq(device_id)
-                        .and(schema::message_receipts::chat_jid.eq(&chat))
-                        .and(schema::message_receipts::msg_id.eq(&update.message_id)),
-                ),
-            )
-            .execute(conn)?;
+            if message_count == 1 {
+                diesel::delete(
+                    schema::reactions::table.filter(
+                        schema::reactions::device_id
+                            .eq(device_id)
+                            .and(schema::reactions::chat_jid.eq(&chat))
+                            .and(schema::reactions::msg_id.eq(&update.message_id)),
+                    ),
+                )
+                .execute(conn)?;
+                diesel::delete(
+                    schema::message_receipts::table.filter(
+                        schema::message_receipts::device_id
+                            .eq(device_id)
+                            .and(schema::message_receipts::chat_jid.eq(&chat))
+                            .and(schema::message_receipts::msg_id.eq(&update.message_id)),
+                    ),
+                )
+                .execute(conn)?;
+            }
             // The deleted row may have been the chat's preview.
             recompute_chat_preview(conn, device_id, &chat)?;
             cs.chats = true;

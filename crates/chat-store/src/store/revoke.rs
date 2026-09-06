@@ -28,13 +28,25 @@ pub(super) fn apply_revoke(
     ts_ms: i64,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
-    let updated = diesel::update(message_row(device_id, chat, target_id))
-        .set((
-            dsl::revoked.eq(true),
-            dsl::text_content.eq(None::<String>),
-            dsl::proto.eq(None::<Vec<u8>>),
-        ))
-        .execute(conn)?;
+    let updated = if target_from_me {
+        diesel::update(
+            message_row(device_id, chat, target_id)
+                .filter(dsl::from_me.eq(true))
+                .filter(dsl::sender_jid.eq("")),
+        )
+    } else {
+        diesel::update(
+            message_row(device_id, chat, target_id)
+                .filter(dsl::from_me.eq(false))
+                .filter(dsl::sender_jid.eq(sender)),
+        )
+    }
+    .set((
+        dsl::revoked.eq(true),
+        dsl::text_content.eq(None::<String>),
+        dsl::proto.eq(None::<Vec<u8>>),
+    ))
+    .execute(conn)?;
     if updated == 0 {
         let inserted = diesel::insert_into(dsl::messages)
             .values((

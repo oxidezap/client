@@ -29,8 +29,11 @@ pub(super) fn apply_edit(
     ts_ms: i64,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
+    let target = message_row(device_id, chat, target_id)
+        .filter(dsl::from_me.eq(from_me))
+        .filter(dsl::sender_jid.eq(if from_me { "" } else { sender }));
     let updated = diesel::update(
-        message_row(device_id, chat, target_id)
+        target
             // A tombstone absorbs edits too: revoked content must not resurface.
             .filter(dsl::revoked.eq(false))
             .filter(dsl::edited_at_ms.is_null().or(dsl::edited_at_ms.le(ts_ms))),

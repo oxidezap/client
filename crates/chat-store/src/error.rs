@@ -10,6 +10,9 @@ pub enum ChatStoreError {
     #[error("invalid full-text search query")]
     InvalidSearchQuery,
 
+    #[error("message id is ambiguous; query the chat page for sender identity")]
+    AmbiguousMessageId,
+
     /// A writer batch rolled back; the writes acknowledged by this `flush`
     /// were dropped. Carries the underlying error rendered to text (one batch
     /// outcome fans out to many flush waiters).

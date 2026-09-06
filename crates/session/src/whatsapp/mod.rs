@@ -6,6 +6,9 @@ mod calls;
 /// A stored row and a composed quote, read as the other side's shape.
 mod convert;
 
+/// The inbound commit hook that makes the chat store the ack durability point.
+mod durability;
+
 /// Who is in a group, for the surfaces that name them.
 mod groups;
 
@@ -30,6 +33,7 @@ mod tests;
 
 use calls::CallRegistry;
 use convert::{account_event, quote_context};
+use durability::ChatStoreDurabilityHook;
 use lanes::EventLanes;
 use paging::{participant_keyed_chat, read_message_range};
 
@@ -576,7 +580,9 @@ impl WhatsAppClient {
         // override makes the library skip its own resolution *and* the
         // day-long cache stamp behind it.
         let building = wacore::time::Instant::now();
-        let builder = crate::net::with_platform_plugins(Bot::builder()).with_backend(backend);
+        let builder = crate::net::with_platform_plugins(Bot::builder())
+            .with_backend(backend)
+            .with_inbound_durability_hook(ChatStoreDurabilityHook::new(chat_store.clone()));
         let bot = match builder.build().await {
             Ok(bot) => bot,
             Err(e) => {
@@ -595,6 +601,12 @@ impl WhatsAppClient {
             }
         };
         let built = building.elapsed();
+
+        // The hook above writes this exact batch before the core dispatches its
+        // hook_committed event, so the event handler must not materialize it a
+        // second time. Event-only routes leave the marker unset and remain on
+        // the ordinary handler path.
+        chat_store.skip_hook_committed_batches(true);
 
         // Give the client this platform's way onto a call's media wire, before
         // anything can ring. Nothing on a desktop, where the library's own UDP

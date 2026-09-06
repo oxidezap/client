@@ -208,6 +208,14 @@ impl DeferredAcks {
         pre_batch
     }
 
+    /// Settle a batch whose SQLite transaction committed but whose post-commit
+    /// durability barrier failed. The queue already reflects the committed
+    /// inserts and consumed acknowledgements; only the batch bookkeeping must
+    /// be cleared before a replay retries the materialization.
+    pub(super) fn committed(&mut self) {
+        self.added_this_batch.clear();
+    }
+
     pub(super) fn defer(
         &mut self,
         ack: &wacore::types::events::ServerAck,

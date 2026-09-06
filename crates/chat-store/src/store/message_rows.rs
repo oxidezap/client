@@ -46,6 +46,18 @@ pub(super) fn insert_message(
     new: NewMessage<'_>,
 ) -> QueryResult<StoredRow> {
     use schema::messages::dsl;
+    // Local optimistic rows do not carry a sender. Their ids still must not
+    // claim an inbound row that uses the same chat/id under its real sender.
+    if new.sender_jid.is_empty()
+        && diesel::select(diesel::dsl::exists(message_row(
+            device_id,
+            new.chat_jid,
+            new.msg_id,
+        )))
+        .get_result(conn)?
+    {
+        return Ok(StoredRow::Skipped);
+    }
     let values = (
         dsl::device_id.eq(device_id),
         dsl::chat_jid.eq(new.chat_jid),
@@ -68,6 +80,23 @@ pub(super) fn insert_message(
         return Ok(StoredRow::Inserted);
     }
     if new.overwrite {
+        type ExistingMessage = (String, bool, Option<String>, Option<Vec<u8>>);
+        let existing: Option<ExistingMessage> = message_row(device_id, new.chat_jid, new.msg_id)
+            .filter(dsl::sender_jid.eq(new.sender_jid))
+            .select((dsl::sender_jid, dsl::revoked, dsl::text_content, dsl::proto))
+            .first(conn)
+            .optional()?;
+        if existing
+            .as_ref()
+            .is_some_and(|(sender, revoked, text, proto)| {
+                sender == new.sender_jid
+                    && !revoked
+                    && text.as_deref() == new.text
+                    && proto.as_deref() == new.proto
+            })
+        {
+            return Ok(StoredRow::Skipped);
+        }
         let refreshed = diesel::update(
             message_row(device_id, new.chat_jid, new.msg_id)
                 .filter(dsl::revoked.eq(false))

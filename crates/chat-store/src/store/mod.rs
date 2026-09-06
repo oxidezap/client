@@ -27,7 +27,9 @@ use chrono::{DateTime, Utc};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use wacore::store::error::StoreError;
-use wacore::types::events::{Event, EventHandler, EventInterest, EventKind};
+use wacore::types::events::{
+    BatchOrigin, Event, EventHandler, EventInterest, EventKind, InboundMessage, MessageBatch,
+};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
@@ -56,6 +58,10 @@ const CHANGE_CHANNEL_CAPACITY: usize = 256;
 
 pub(crate) enum WriterMsg {
     Event(Arc<Event>),
+    InboundDurability {
+        event: Arc<Event>,
+        done: oneshot::Sender<std::result::Result<(), String>>,
+    },
     Outgoing {
         chat: Jid,
         msg_id: String,
@@ -231,6 +237,28 @@ impl ChatStore {
             tx: self.tx.clone(),
             skip_hook_committed: Arc::clone(&self.skip_hook_committed),
         })
+    }
+
+    /// Materialize one inbound durability-hook batch and wait for its SQLite
+    /// transaction and backend commit barrier to finish.
+    pub async fn commit_inbound_batch(&self, batch: &[InboundMessage]) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let event = Arc::new(Event::Messages(
+            MessageBatch::builder()
+                .messages(Arc::from(batch.to_vec()))
+                .origin(BatchOrigin::Live)
+                .build(),
+        ));
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(WriterMsg::InboundDurability { event, done })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?;
+        result
+            .await
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?
+            .map_err(ChatStoreError::WriteBatchFailed)
     }
 
     /// Subscribe to invalidation signals. Emitted once per committed write
@@ -453,5 +481,54 @@ impl ChatStore {
 
     pub(crate) fn db(&self) -> &SharedSqlite {
         &self.db
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use diesel::prelude::*;
+    use diesel_migrations::MigrationHarness;
+
+    #[tokio::test]
+    async fn sender_identity_migration_refuses_downgrade() {
+        let store = SqliteStore::new(&format!(
+            "file:memdb_chat_store_downgrade_{}?mode=memory&cache=shared",
+            std::process::id()
+        ))
+        .await
+        .expect("create store");
+        ChatStore::new(&store).await.expect("run migrations");
+
+        let error = store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect_err("irreversible migration must reject downgrade");
+        assert!(error.to_string().contains("migration"));
+
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+        let exists: i64 = store
+            .shared()
+            .read(|conn| {
+                diesel::sql_query(
+                    "SELECT count(*) AS count FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'messages'",
+                )
+                .get_result::<Count>(conn)
+                .map(|row| row.count)
+                .map_err(crate::error::db_err)
+            })
+            .await
+            .expect("inspect schema");
+        assert_eq!(exists, 1);
     }
 }

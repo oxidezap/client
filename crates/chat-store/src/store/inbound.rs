@@ -88,7 +88,9 @@ pub(super) fn apply_inbound(
                 )?;
                 cs.chats = true;
             }
-            cs.message_chats.insert(chat);
+            if inserted != StoredRow::Skipped {
+                cs.message_chats.insert(chat);
+            }
         }
         MessageOp::Reaction { target_id, emoji } => {
             if apply_reaction(conn, device_id, &chat, &target_id, &sender, &emoji, ts_ms)? {
