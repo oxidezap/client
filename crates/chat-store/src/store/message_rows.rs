@@ -80,6 +80,22 @@ pub(super) fn insert_message(
         return Ok(StoredRow::Inserted);
     }
     if new.overwrite {
+        let existing: Option<(String, bool, Option<String>, Option<Vec<u8>>)> =
+            message_row(device_id, new.chat_jid, new.msg_id)
+                .select((dsl::sender_jid, dsl::revoked, dsl::text_content, dsl::proto))
+                .first(conn)
+                .optional()?;
+        if existing
+            .as_ref()
+            .is_some_and(|(sender, revoked, text, proto)| {
+                sender == new.sender_jid
+                    && !revoked
+                    && text.as_deref() == new.text
+                    && proto.as_deref() == new.proto
+            })
+        {
+            return Ok(StoredRow::Skipped);
+        }
         let refreshed = diesel::update(
             message_row(device_id, new.chat_jid, new.msg_id)
                 .filter(dsl::revoked.eq(false))

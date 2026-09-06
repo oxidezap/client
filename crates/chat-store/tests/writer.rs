@@ -11,6 +11,39 @@ mod common;
 
 use common::*;
 
+async fn barrier_store(
+    failed: Arc<std::sync::atomic::AtomicBool>,
+) -> (SqliteStore, Arc<ChatStore>) {
+    use std::sync::atomic::Ordering;
+    use whatsapp_rust_sqlite_storage::{CommitBarrierHook, SqliteStoreConfig};
+    static COUNTER: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let barrier: CommitBarrierHook = Arc::new(move || {
+        let failed = Arc::clone(&failed);
+        Box::pin(async move {
+            if failed.load(Ordering::Acquire) {
+                Err(wacore::store::error::StoreError::Validation(
+                    "synthetic barrier failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    });
+    let store = SqliteStore::with_config(
+        &format!(
+            "file:memdb_chat_store_barrier_{}?mode=memory&cache=shared",
+            format!("{}_{}", std::process::id(), id)
+        ),
+        SqliteStoreConfig::default().with_commit_barrier(barrier),
+    )
+    .await
+    .expect("create barrier store");
+    let chat_store = ChatStore::new(&store).await.expect("create chat store");
+    (store, chat_store)
+}
+
 #[tokio::test]
 async fn invalidation_broadcast_fires_per_batch() {
     let (_store, chat_store) = test_store().await;
@@ -94,6 +127,82 @@ async fn inbound_commit_reports_sql_failure() {
         error,
         oxidezap_chat_store::ChatStoreError::WriteBatchFailed(_)
     ));
+}
+
+#[tokio::test]
+async fn post_commit_barrier_failure_replays_without_duplicate_invalidation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let failed = Arc::new(AtomicBool::new(false));
+    let (_store, chat_store) = barrier_store(Arc::clone(&failed)).await;
+    failed.store(true, Ordering::Release);
+    let mut changes = chat_store.subscribe();
+
+    let message = inbound_message("HOOK-BARRIER");
+    assert!(
+        chat_store
+            .commit_inbound_batch(std::slice::from_ref(&message))
+            .await
+            .is_err()
+    );
+    assert!(
+        chat_store
+            .message(&jid(PEER), "HOOK-BARRIER")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    for _ in 0..2 {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), changes.recv())
+                .await
+                .is_ok()
+        );
+    }
+
+    failed.store(false, Ordering::Release);
+    chat_store
+        .commit_inbound_batch(std::slice::from_ref(&message))
+        .await
+        .expect("retry after barrier recovery");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), changes.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn post_commit_failure_preserves_deferred_ack() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let failed = Arc::new(AtomicBool::new(false));
+    let (_store, chat_store) = barrier_store(Arc::clone(&failed)).await;
+    failed.store(true, Ordering::Release);
+    chat_store
+        .handler()
+        .handle_event(Arc::new(ack("OUT-BARRIER", jid(PEER))));
+    assert!(chat_store.flush().await.is_err());
+
+    failed.store(false, Ordering::Release);
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-BARRIER",
+            &wa::Message::text("held ack"),
+            ts(1_700_000_100),
+        )
+        .unwrap();
+    let _ = chat_store.flush().await;
+    assert_eq!(
+        chat_store
+            .message(&jid(PEER), "OUT-BARRIER")
+            .await
+            .unwrap()
+            .expect("outgoing row")
+            .status,
+        MessageStatus::ServerAck
+    );
 }
 
 #[tokio::test]

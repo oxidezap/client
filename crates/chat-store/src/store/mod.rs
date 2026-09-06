@@ -483,3 +483,52 @@ impl ChatStore {
         &self.db
     }
 }
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use diesel::prelude::*;
+    use diesel_migrations::MigrationHarness;
+
+    #[tokio::test]
+    async fn sender_identity_migration_refuses_downgrade() {
+        let store = SqliteStore::new(&format!(
+            "file:memdb_chat_store_downgrade_{}?mode=memory&cache=shared",
+            std::process::id()
+        ))
+        .await
+        .expect("create store");
+        ChatStore::new(&store).await.expect("run migrations");
+
+        let error = store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect_err("irreversible migration must reject downgrade");
+        assert!(error.to_string().contains("migration"));
+
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+        let exists: i64 = store
+            .shared()
+            .read(|conn| {
+                diesel::sql_query(
+                    "SELECT count(*) AS count FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'messages'",
+                )
+                .get_result::<Count>(conn)
+                .map(|row| row.count)
+                .map_err(crate::error::db_err)
+            })
+            .await
+            .expect("inspect schema");
+        assert_eq!(exists, 1);
+    }
+}
