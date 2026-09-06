@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use log::warn;
 use oxidezap_chat_store::{ChatEntry, ChatStore, StoreChange};
-use tokio::sync::mpsc;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore_binary::jid::{Jid, observe_str};
@@ -23,6 +22,7 @@ use oxidezap_core::{Chat, ChatMessage, UiEvent};
 use super::WhatsAppClient;
 use super::convert::{mark_unread_tail, stored_to_chat_message};
 use super::paging::chat_cursor;
+use super::ui_queue::Sender as UiEventSender;
 use crate::names::NameBook;
 
 /// What a history load has to say: the chats, whether they are the whole
@@ -124,12 +124,14 @@ impl WhatsAppClient {
     /// receiver is waiting on — so "the store went away" is a thing this task
     /// makes impossible by existing. On a desktop that never showed, because
     /// dropping the runtime took the task with it; on a page nothing does.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_history_reloader(
         mut changes: tokio::sync::broadcast::Receiver<oxidezap_chat_store::StoreChange>,
         chat_store: Arc<ChatStore>,
         bot: &Bot,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+        ui_tx: &UiEventSender,
         reload: Arc<tokio::sync::Notify>,
+        history_budget: Arc<super::ui_queue::HistoryBudget>,
         names: Arc<NameBook>,
         mut stopping: tokio::sync::watch::Receiver<()>,
     ) {
@@ -202,7 +204,17 @@ impl WhatsAppClient {
                 // elsewhere must clear the list here too. An empty narrowed
                 // one names nothing the list shows (an archived chat, or one
                 // past the window) and has nothing to say.
-                match Self::load_history_scoped(&chat_store, &client, scope.chats(), &names).await {
+                let (chat_limit, message_limit) = history_budget.limits();
+                match Self::load_history_scoped_with_limits(
+                    &chat_store,
+                    &client,
+                    scope.chats(),
+                    &names,
+                    chat_limit,
+                    message_limit,
+                )
+                .await
+                {
                     Ok(loaded) if loaded.chats.is_empty() && !loaded.complete => {}
                     Ok(loaded) => {
                         if ui_tx.send(loaded.into_event()).is_err() {
@@ -221,6 +233,7 @@ impl WhatsAppClient {
     /// The returned flag says whether this is the store's WHOLE display list;
     /// it comes from the raw entry count, since PN/LID collapsing can shrink
     /// a truncated fetch back under the limit.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) async fn load_history(
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
@@ -238,11 +251,31 @@ impl WhatsAppClient {
     /// receipt or an ack moves rows inside one conversation and leaves the
     /// list's order, membership and names exactly as they were, so the load
     /// it triggers can be that conversation's.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) async fn load_history_scoped(
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
         only: Option<&HashSet<String>>,
         names: &NameBook,
+    ) -> Result<LoadedHistory, oxidezap_chat_store::ChatStoreError> {
+        Self::load_history_scoped_with_limits(
+            chat_store,
+            client,
+            only,
+            names,
+            Self::HISTORY_CHAT_LIMIT as usize,
+            Self::ATTACH_CEILING as usize,
+        )
+        .await
+    }
+
+    pub(super) async fn load_history_scoped_with_limits(
+        chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        only: Option<&HashSet<String>>,
+        names: &NameBook,
+        chat_limit: usize,
+        message_limit: usize,
     ) -> Result<LoadedHistory, oxidezap_chat_store::ChatStoreError> {
         // A whole-list load is the pass that re-reads the address book, so it
         // is the one that drops what the book remembers: a contact renamed on
@@ -251,10 +284,11 @@ impl WhatsAppClient {
         if only.is_none() {
             names.forget();
         }
-        let mut entries = chat_store.chats(false, Self::HISTORY_CHAT_LIMIT).await?;
+        let chat_limit = chat_limit.max(1).min(Self::HISTORY_CHAT_LIMIT as usize) as i64;
+        let mut entries = chat_store.chats(false, chat_limit).await?;
         // A narrowed load says nothing about the chats it left out, so it is
         // never the whole display list and must never drive the UI's prune.
-        let complete = only.is_none() && (entries.len() as i64) < Self::HISTORY_CHAT_LIMIT;
+        let complete = only.is_none() && (entries.len() as i64) < chat_limit;
         // Where this load stopped, so the front end's first "load more" is a
         // page it does not have rather than the page it was just handed. Taken
         // from the raw entries, before the alias filter below and before the
@@ -311,8 +345,10 @@ impl WhatsAppClient {
             // chats somebody named rather than from a page.
             entries
         };
-        let chats =
-            Self::hydrate_entries(chat_store, client, names, entries, Self::attach_page).await?;
+        let chats = Self::hydrate_entries(chat_store, client, names, entries, |entry| {
+            Self::attach_page_with_ceiling(entry, message_limit as i64)
+        })
+        .await?;
         Ok(LoadedHistory {
             chats,
             complete,
@@ -509,10 +545,14 @@ impl WhatsAppClient {
     /// exception: its feed *is* those rows — there is no conversation to open
     /// that would ask for more — so it keeps a whole page.
     pub(super) fn attach_page(entry: &ChatEntry) -> i64 {
+        Self::attach_page_with_ceiling(entry, Self::ATTACH_CEILING)
+    }
+
+    fn attach_page_with_ceiling(entry: &ChatEntry, ceiling: i64) -> i64 {
         if is_status_broadcast(entry) {
-            return Self::MESSAGE_PAGE;
+            return Self::MESSAGE_PAGE.min(ceiling.max(1));
         }
-        i64::from(entry.unread_count.max(0)).clamp(Self::ATTACH_FLOOR, Self::ATTACH_CEILING)
+        i64::from(entry.unread_count.max(0)).clamp(Self::ATTACH_FLOOR.min(ceiling), ceiling.max(1))
     }
 
     /// Every storage key the invalidated chats are held under.

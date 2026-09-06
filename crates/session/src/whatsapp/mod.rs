@@ -27,6 +27,7 @@ mod outgoing;
 
 /// Pages, their cursors, and where a read stops.
 mod paging;
+mod ui_queue;
 
 #[cfg(test)]
 mod tests;
@@ -36,6 +37,8 @@ use convert::{account_event, quote_context};
 use durability::ChatStoreDurabilityHook;
 use lanes::EventLanes;
 use paging::{participant_keyed_chat, read_message_range};
+use ui_queue::Sender as UiEventSender;
+pub use ui_queue::{Receiver as UiEventReceiver, TryRecvError as UiEventTryRecvError};
 
 /// How far back a read receipt reaches: the last row a front end was shown,
 /// and the ids it is bounded by. Written in `paging`, beside the cursors.
@@ -57,7 +60,9 @@ use whatsapp_rust::client::Client;
 use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
-use whatsapp_rust::wacore::types::events::{ChannelEventHandler, Event};
+use whatsapp_rust::wacore::types::events::{
+    ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
+};
 use whatsapp_rust::wacore::types::presence::{
     ChatPresence as WaChatPresence, ChatPresenceMedia, ReceiptType,
 };
@@ -79,6 +84,41 @@ use whatsapp_rust::voip::KeyframeUrgency;
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
 use crate::store::settings as store_settings;
+
+struct InterestedEventHandler {
+    inner: Arc<ChannelEventHandler>,
+    interest: EventInterest,
+}
+
+impl EventHandler for InterestedEventHandler {
+    fn handle_event(&self, event: Arc<Event>) {
+        self.inner.handle_event(event);
+    }
+
+    fn interest(&self) -> EventInterest {
+        self.interest
+    }
+}
+
+fn interested_channel(
+    kinds: &[EventKind],
+    capacity: usize,
+) -> (
+    Arc<InterestedEventHandler>,
+    async_channel::Receiver<Arc<Event>>,
+    Arc<ChannelEventHandler>,
+) {
+    let (inner, receiver) = ChannelEventHandler::with_capacity(capacity);
+    let interest = EventInterest::of(kinds);
+    (
+        Arc::new(InterestedEventHandler {
+            inner: inner.clone(),
+            interest,
+        }),
+        receiver,
+        inner,
+    )
+}
 
 /// Where the store lives on this platform. See [`crate::store`].
 pub use crate::store::{database_path as resolve_database_path, prepare as prepare_store};
@@ -126,8 +166,6 @@ fn logout_message(event: &whatsapp_rust::types::events::LoggedOut) -> String {
 /// exactly the one it has to hear about. This used to be a slot filled by the
 /// session task, so those failures were sent to nobody and the optimistic
 /// bubble sat pending forever.
-pub type UiEventSender = mpsc::UnboundedSender<UiEvent>;
-
 /// Everything the session *is*, once it is up.
 ///
 /// One value rather than four slots. The client, the history it is recorded
@@ -189,6 +227,7 @@ struct Shared {
     calls: CallRegistry,
     shutdown: Arc<tokio::sync::Notify>,
     reload: Arc<tokio::sync::Notify>,
+    history_budget: Arc<ui_queue::HistoryBudget>,
 }
 
 /// WhatsApp client wrapper that manages the connection and provides
@@ -204,7 +243,7 @@ pub struct WhatsAppClient {
     /// This is also what "already started" *is*: the receiver is the token, so
     /// the question cannot be answered one way by a flag and another way by
     /// whether anybody is listening.
-    ui_events: Option<mpsc::UnboundedReceiver<UiEvent>>,
+    ui_events: Option<UiEventReceiver>,
     /// Live/ringing calls
     calls: CallRegistry,
     /// Where a call's video frames are published, once somebody has asked
@@ -215,8 +254,7 @@ pub struct WhatsAppClient {
     /// Its own channel rather than a `UiEvent`: an event is news that a
     /// reader which missed one has missed for good, and this is a stream
     /// whose newest frame is the only one worth having. It is also bounded,
-    /// which the event channel is not — a camera that outran a stalled
-    /// reader would otherwise grow the queue for as long as the call lasted.
+    /// while the UI event channel has its own admission and recovery policy.
     video_tx: VideoSenderSlot,
     /// Whether anybody is drawing what the cameras produce. See
     /// [`Self::set_video_publishing`].
@@ -235,6 +273,7 @@ pub struct WhatsAppClient {
     /// no chats and nothing has changed, so nothing would arrive until the
     /// next message did.
     reload: Arc<tokio::sync::Notify>,
+    history_budget: Arc<ui_queue::HistoryBudget>,
 }
 
 impl WhatsAppClient {
@@ -243,7 +282,9 @@ impl WhatsAppClient {
     /// refuse — so a retry can route to the error screen instead of panicking
     /// the thread that asked.
     pub fn new() -> std::io::Result<Self> {
-        let (ui_sender, ui_events) = mpsc::unbounded_channel::<UiEvent>();
+        let reload = Arc::new(tokio::sync::Notify::new());
+        let history_budget = Arc::new(ui_queue::HistoryBudget::new());
+        let (ui_sender, ui_events) = ui_queue::channel(reload.clone(), history_budget.clone());
         Ok(Self {
             exec: Executor::new()?,
             ui_sender,
@@ -255,7 +296,8 @@ impl WhatsAppClient {
             video_publishing: Arc::new(portable_atomic::AtomicBool::new(false)),
             session: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
-            reload: Arc::new(tokio::sync::Notify::new()),
+            reload,
+            history_budget,
         })
     }
 
@@ -432,7 +474,7 @@ impl WhatsAppClient {
     /// Start the WhatsApp client in a background thread
     ///
     /// Returns a receiver for UI events, or an error if already started
-    pub fn start(&mut self) -> Result<mpsc::UnboundedReceiver<UiEvent>, &'static str> {
+    pub fn start(&mut self) -> Result<UiEventReceiver, &'static str> {
         let ui_rx = self
             .take_events()
             .ok_or("WhatsApp client already started")?;
@@ -442,6 +484,7 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let shutdown = self.shutdown.clone();
         let reload = self.reload.clone();
+        let history_budget = self.history_budget.clone();
 
         let started = self.exec.start("oxidezap-session", async move {
             Self::run_client(
@@ -451,6 +494,7 @@ impl WhatsAppClient {
                     calls,
                     shutdown,
                     reload,
+                    history_budget,
                 },
             )
             .await;
@@ -471,7 +515,7 @@ impl WhatsAppClient {
     /// The receiving half exists from construction, so events sent before the
     /// session is up are not lost; taking it is what [`Self::start`] does with
     /// it, and doing so is what makes a second start an error.
-    pub(crate) fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<UiEvent>> {
+    pub(crate) fn take_events(&mut self) -> Option<UiEventReceiver> {
         self.ui_events.take()
     }
 
@@ -648,6 +692,7 @@ impl WhatsAppClient {
             calls,
             shutdown,
             reload,
+            history_budget,
         } = shared;
         let cold_start = wacore::time::Instant::now();
         // Device store + durable chat history share one SQLite file (one pool,
@@ -673,7 +718,17 @@ impl WhatsAppClient {
         // JIDs normalize through the same PN->LID mapping live events use.
         let hydrating = wacore::time::Instant::now();
         let mut hydrated = 0;
-        match Self::load_history(chat_store, &bot.client(), names).await {
+        let (chat_limit, message_limit) = history_budget.limits();
+        match Self::load_history_scoped_with_limits(
+            chat_store,
+            &bot.client(),
+            None,
+            names,
+            chat_limit,
+            message_limit,
+        )
+        .await
+        {
             Ok(loaded) if !loaded.chats.is_empty() => {
                 hydrated = loaded.chats.len();
                 let _ = ui_tx.send(loaded.into_event());
@@ -704,21 +759,33 @@ impl WhatsAppClient {
             .subscribe_handler(chat_store.handler())
             .detach();
 
-        // And so does the UI, through the same door rather than the builder's
-        // `on_event`. The closure registrars want a `Send` future, which is a
-        // bound a page cannot meet: the `Arc<Client>` a handler is handed is
-        // not `Send` there, because the transport it holds is a
-        // `web_sys::WebSocket`. `EventHandler` is the surface the library
-        // already relaxed for this, and the chat store above was using it
-        // before we were.
-        //
-        // Nothing is missed by subscribing after the build: `bot.run()` is
-        // what connects, and this is the same window the store's own
-        // subscription sits in. The channel is unbounded and delivery is a
-        // `try_send`, so a slow reader cannot back up the dispatch path — and
-        // one task per event keeps the concurrent delivery the builder was
-        // giving us, rather than quietly turning the event stream serial.
-        let (events, incoming) = ChannelEventHandler::new();
+        // The UI observes only the event kinds handled below. Two bounded
+        // mailboxes reserve space for session and call control; committed
+        // ChatStore invalidations remain the recovery source for raw-event lag.
+        let (control_events, control_incoming, control_stats) = interested_channel(
+            &[
+                EventKind::PairingQrCode,
+                EventKind::PairingCode,
+                EventKind::PairSuccess,
+                EventKind::Connected,
+                EventKind::LoggedOut,
+                EventKind::SelfPushNameUpdated,
+                EventKind::IncomingCall,
+                EventKind::MissedCall,
+                EventKind::CallEndedElsewhere,
+                EventKind::GroupUpdate,
+            ],
+            64,
+        );
+        let (data_events, data_incoming, data_stats) = interested_channel(
+            &[
+                EventKind::Messages,
+                EventKind::Receipt,
+                EventKind::ChatPresence,
+                EventKind::Presence,
+            ],
+            256,
+        );
         // What tells this session's own tasks that it is over.
         //
         // A desktop session ends by dropping the runtime it was built on,
@@ -738,12 +805,14 @@ impl WhatsAppClient {
         // holding it until `run_client` returns is the whole of its job.
         let (_session_over, stopping) = tokio::sync::watch::channel(());
 
-        bot.client().subscribe_handler(events).detach();
+        bot.client().subscribe_handler(control_events).detach();
+        bot.client().subscribe_handler(data_events).detach();
         {
             let client = bot.client();
             let ui_tx = ui_tx.clone();
             let calls = calls.clone();
             let names = names.clone();
+            let control_fault_ui = ui_tx.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
                 // The dispatch loop's own handle. The one below is moved into
@@ -763,16 +832,51 @@ impl WhatsAppClient {
                     },
                     stopping.clone(),
                 );
+                let mut control_open = true;
+                let mut data_open = true;
+                let mut control_drops = 0;
+                let mut data_drops = 0;
                 loop {
+                    if !control_open && !data_open {
+                        break;
+                    }
                     let event = tokio::select! {
-                        event = incoming.recv() => match event {
-                            Ok(event) => event,
-                            Err(_) => break,
+                        event = control_incoming.recv(), if control_open => match event {
+                            Ok(event) => Some(event),
+                            Err(_) => {
+                                control_open = false;
+                                None
+                            }
+                        },
+                        event = data_incoming.recv(), if data_open => match event {
+                            Ok(event) => Some(event),
+                            Err(_) => {
+                                data_open = false;
+                                None
+                            }
                         },
                         // The session has gone. Anything still queued belongs
                         // to an account this task no longer speaks for.
                         _ = stopping.changed() => break,
                     };
+                    let Some(event) = event else { continue };
+                    let control_snapshot = control_stats.stats();
+                    if control_snapshot.dropped_full > control_drops {
+                        warn!(
+                            "dropping {} control WhatsApp event(s) from full mailbox",
+                            control_snapshot.dropped_full - control_drops
+                        );
+                        control_drops = control_snapshot.dropped_full;
+                        control_fault_ui.signal_control_overflow();
+                    }
+                    let data_snapshot = data_stats.stats();
+                    if data_snapshot.dropped_full > data_drops {
+                        warn!(
+                            "dropping {} recoverable WhatsApp event(s) from full mailbox",
+                            data_snapshot.dropped_full - data_drops
+                        );
+                        data_drops = data_snapshot.dropped_full;
+                    }
                     // The kind, and only the kind. It is `Copy`, carries no
                     // payload and names the variant, which makes this the one
                     // account of the event stream that can be pasted into an
@@ -800,6 +904,7 @@ impl WhatsAppClient {
             &bot,
             &ui_tx,
             reload,
+            history_budget,
             names.clone(),
             stopping,
         );
@@ -1188,7 +1293,7 @@ impl WhatsAppClient {
         msg: &wa::Message,
         info: &whatsapp_rust::wacore::types::message::MessageInfo,
         client: &Arc<Client>,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+        ui_tx: &UiEventSender,
         names: &NameBook,
         eager: bool,
     ) {
@@ -2022,6 +2127,20 @@ fn mark_send_failed(store: &ChatStore, jid: &Jid, message_id: &str) {
 
 impl Drop for WhatsAppClient {
     fn drop(&mut self) {
+        let stats = self.ui_sender.stats();
+        if stats.dropped_recoverable != 0
+            || stats.dropped_ephemeral != 0
+            || stats.dropped_control != 0
+            || stats.control_faults != 0
+        {
+            warn!(
+                "UI event queue overflow: {} recoverable, {} ephemeral, {} control drops ({} failover faults)",
+                stats.dropped_recoverable,
+                stats.dropped_ephemeral,
+                stats.dropped_control,
+                stats.control_faults
+            );
+        }
         // A dropped wrapper can never be shut down explicitly anymore; free
         // its loop instead of leaking the executor + DB pool.
         self.shutdown.notify_one();
