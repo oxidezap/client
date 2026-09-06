@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use log::warn;
 use oxidezap_chat_store::{ChatEntry, ChatStore, StoreChange};
-use tokio::sync::mpsc;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore_binary::jid::{Jid, observe_str};
@@ -23,6 +22,7 @@ use oxidezap_core::{Chat, ChatMessage, UiEvent};
 use super::WhatsAppClient;
 use super::convert::{mark_unread_tail, stored_to_chat_message};
 use super::paging::chat_cursor;
+use super::ui_queue::Sender as UiEventSender;
 use crate::names::NameBook;
 
 /// What a history load has to say: the chats, whether they are the whole
@@ -128,7 +128,7 @@ impl WhatsAppClient {
         mut changes: tokio::sync::broadcast::Receiver<oxidezap_chat_store::StoreChange>,
         chat_store: Arc<ChatStore>,
         bot: &Bot,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+        ui_tx: &UiEventSender,
         reload: Arc<tokio::sync::Notify>,
         names: Arc<NameBook>,
         mut stopping: tokio::sync::watch::Receiver<()>,

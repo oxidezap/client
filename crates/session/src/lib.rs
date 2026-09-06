@@ -15,6 +15,6 @@ mod whatsapp;
 
 pub use exec::{Cancelled, Task, sleep, spawn, unblock, with_timeout};
 pub use whatsapp::{
-    OutgoingFile, ReadBoundary, WhatsAppClient, prepare_store, resolve_database_path,
-    wipe_local_state,
+    OutgoingFile, ReadBoundary, UiEventReceiver, UiEventTryRecvError, WhatsAppClient,
+    prepare_store, resolve_database_path, wipe_local_state,
 };

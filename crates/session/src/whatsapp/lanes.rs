@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore::types::events::Event;
 use whatsapp_rust::wacore_binary::jid::Jid;
@@ -22,6 +22,7 @@ use crate::names::NameBook;
 /// had. Subjects share a lane by hash, so two busy chats can queue behind
 /// each other — which costs latency, where the alternative costs order.
 const EVENT_LANES: usize = 8;
+const LANE_CAPACITY: usize = 64;
 
 /// Events about one subject, handled in the order they arrived.
 ///
@@ -34,18 +35,24 @@ const EVENT_LANES: usize = 8;
 /// naming neither is session-wide and gets a lane of its own, so a pairing
 /// code never waits behind a conversation.
 pub(super) struct EventLanes {
-    lanes: Vec<mpsc::UnboundedSender<Arc<Event>>>,
+    lanes: Vec<mpsc::Sender<Arc<Event>>>,
+    recovery: Arc<Notify>,
+    stopping: tokio::sync::watch::Receiver<()>,
 }
 
 impl EventLanes {
-    pub(super) fn new<F, Fut>(handle: F, stopping: tokio::sync::watch::Receiver<()>) -> Self
+    pub(super) fn new<F, Fut>(
+        handle: F,
+        stopping: tokio::sync::watch::Receiver<()>,
+        recovery: Arc<Notify>,
+    ) -> Self
     where
         F: Fn(Arc<Event>) -> Fut + Clone + crate::exec::MaybeSend + 'static,
         Fut: Future<Output = ()> + crate::exec::MaybeSend + 'static,
     {
         let lanes = (0..=EVENT_LANES)
             .map(|_| {
-                let (tx, mut rx) = mpsc::unbounded_channel::<Arc<Event>>();
+                let (tx, mut rx) = mpsc::channel::<Arc<Event>>(LANE_CAPACITY);
                 let handle = handle.clone();
                 let mut stopping = stopping.clone();
                 crate::exec::spawn_owned(async move {
@@ -71,7 +78,11 @@ impl EventLanes {
                 tx
             })
             .collect();
-        Self { lanes }
+        Self {
+            lanes,
+            recovery,
+            stopping,
+        }
     }
 
     pub(super) async fn dispatch(&mut self, client: &Client, names: &NameBook, event: Arc<Event>) {
@@ -83,9 +94,31 @@ impl EventLanes {
         // against each other.
         for event in split_by_subject(&event) {
             let lane = lane_for(client, names, &event).await;
-            let _ = self.lanes[lane].send(event);
+            if recoverable(&event) {
+                if self.lanes[lane].try_send(event).is_err() {
+                    self.recovery.notify_one();
+                    log::warn!(
+                        "dropping recoverable WhatsApp event from full lane {}",
+                        lane
+                    );
+                }
+            } else {
+                let mut stopping = self.stopping.clone();
+                tokio::select! {
+                    result = self.lanes[lane].send(event) => {
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                    _ = stopping.changed() => return,
+                }
+            }
         }
     }
+}
+
+fn recoverable(event: &Event) -> bool {
+    matches!(event, Event::Messages(_) | Event::Receipt(_))
 }
 
 /// One event per subject it is about, which for everything but a batch of
