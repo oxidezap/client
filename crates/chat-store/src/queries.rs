@@ -10,7 +10,7 @@ use diesel::prelude::*;
 use log::warn;
 use wacore_binary::Jid;
 
-use crate::error::{Result, db_err};
+use crate::error::{ChatStoreError, Result, db_err};
 use crate::schema;
 use crate::store::ChatStore;
 use crate::types::{
@@ -115,7 +115,7 @@ impl From<ChatRow> for ChatEntry {
     }
 }
 
-#[derive(Queryable)]
+#[derive(Clone, Queryable)]
 pub(crate) struct MessageRow {
     #[allow(dead_code)]
     device_id: i32,
@@ -753,7 +753,7 @@ impl ChatStore {
         let device_id = self.device_id();
         let chat = chat.to_string();
         let msg_id = msg_id.to_owned();
-        let row: Option<MessageRow> = self
+        let rows: Vec<MessageRow> = self
             .db()
             .read(move |conn| {
                 let keys =
@@ -765,12 +765,15 @@ impl ChatStore {
                             .and(dsl::chat_jid.eq_any(keys))
                             .and(dsl::msg_id.eq(&msg_id)),
                     )
-                    .first(conn)
-                    .optional()
+                    .load(conn)
                     .map_err(db_err)
             })
             .await?;
-        Ok(row.map(Into::into))
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => Ok(Some(row.clone().into())),
+            _ => Err(ChatStoreError::AmbiguousMessageId),
+        }
     }
 
     /// Every reaction on one message.

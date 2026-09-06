@@ -108,6 +108,30 @@ async fn delete_for_me_targets_only_the_named_group_sender() {
 }
 
 #[tokio::test]
+async fn replay_of_same_id_sender_pair_does_not_reinvalidate() {
+    let (_store, chat_store) = test_store().await;
+    let second_sender = "559900000002@s.whatsapp.net";
+    let events = [
+        message_event(
+            wa::Message::text("from first"),
+            incoming_info(GROUP, PEER, "REPLAY-ID", 1_700_000_000),
+        ),
+        message_event(
+            wa::Message::text("from second"),
+            incoming_info(GROUP, second_sender, "REPLAY-ID", 1_700_000_001),
+        ),
+    ];
+    feed(&chat_store, events.clone()).await;
+    let mut changes = chat_store.subscribe();
+    feed(&chat_store, events).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), changes.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn business_verified_name_is_learned_from_live_messages() {
     let (_store, chat_store) = test_store().await;
 

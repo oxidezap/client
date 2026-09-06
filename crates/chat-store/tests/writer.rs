@@ -33,8 +33,9 @@ async fn barrier_store(
     });
     let store = SqliteStore::with_config(
         &format!(
-            "file:memdb_chat_store_barrier_{}?mode=memory&cache=shared",
-            format!("{}_{}", std::process::id(), id)
+            "file:memdb_chat_store_barrier_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            id
         ),
         SqliteStoreConfig::default().with_commit_barrier(barrier),
     )

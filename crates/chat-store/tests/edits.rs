@@ -444,7 +444,7 @@ async fn cross_sender_id_reuse_cannot_rewrite_a_message() {
     .await;
 
     // Message ids are sender-chosen: a different participant reusing the id
-    // must be deduped, never rewrite the victim's row.
+    // gets its own row and never rewrites the victim's row.
     feed(
         &chat_store,
         [message_event(
@@ -454,7 +454,17 @@ async fn cross_sender_id_reuse_cannot_rewrite_a_message() {
     )
     .await;
 
-    let msg = chat_store.message(&chat, "MSG-VIC").await.unwrap().unwrap();
+    assert!(matches!(
+        chat_store.message(&chat, "MSG-VIC").await,
+        Err(oxidezap_chat_store::ChatStoreError::AmbiguousMessageId)
+    ));
+    let msg = chat_store
+        .messages(&chat, None, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|message| message.sender_jid == jid(PEER))
+        .expect("victim row");
     assert_eq!(msg.text.as_deref(), Some("victim's original words"));
     assert_eq!(msg.sender_jid, jid(PEER));
 }

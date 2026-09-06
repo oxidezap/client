@@ -82,6 +82,7 @@ pub(super) fn insert_message(
     if new.overwrite {
         type ExistingMessage = (String, bool, Option<String>, Option<Vec<u8>>);
         let existing: Option<ExistingMessage> = message_row(device_id, new.chat_jid, new.msg_id)
+            .filter(dsl::sender_jid.eq(new.sender_jid))
             .select((dsl::sender_jid, dsl::revoked, dsl::text_content, dsl::proto))
             .first(conn)
             .optional()?;
