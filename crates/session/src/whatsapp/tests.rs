@@ -486,6 +486,7 @@ async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
     let chat_store = ChatStore::new(&store).await.expect("chat store");
     let bot = whatsapp_rust::bot::Bot::builder()
         .with_backend(store)
+        .with_inbound_durability_hook(super::ChatStoreDurabilityHook::new(chat_store.clone()))
         .build()
         .await
         .expect("offline bot");
