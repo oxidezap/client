@@ -80,11 +80,11 @@ pub(super) fn insert_message(
         return Ok(StoredRow::Inserted);
     }
     if new.overwrite {
-        let existing: Option<(String, bool, Option<String>, Option<Vec<u8>>)> =
-            message_row(device_id, new.chat_jid, new.msg_id)
-                .select((dsl::sender_jid, dsl::revoked, dsl::text_content, dsl::proto))
-                .first(conn)
-                .optional()?;
+        type ExistingMessage = (String, bool, Option<String>, Option<Vec<u8>>);
+        let existing: Option<ExistingMessage> = message_row(device_id, new.chat_jid, new.msg_id)
+            .select((dsl::sender_jid, dsl::revoked, dsl::text_content, dsl::proto))
+            .first(conn)
+            .optional()?;
         if existing
             .as_ref()
             .is_some_and(|(sender, revoked, text, proto)| {
