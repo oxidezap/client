@@ -62,7 +62,7 @@ print_stderr = "deny"
 # deliberately avoids.
 anyhow = "1.0"
 async-trait = "0.1"
-buffa = { version = "0.9.1", default-features = false, features = ["json"] }
+buffa = { version = "0.9.2", default-features = false, features = ["json"] }
 # `wasmbind` reads the clock from the browser's `Date` instead of
 # `SystemTime`, which on `wasm32-unknown-unknown` is the std function that
 # panics with "time not implemented on this platform" — and `Utc::now()` is
@@ -110,9 +110,9 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "3cf0d648997c8d5a4df96dc50d3c429aad32160f" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "3cf0d648997c8d5a4df96dc50d3c429aad32160f" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "3cf0d648997c8d5a4df96dc50d3c429aad32160f" }
 
 # The library and its satellites. One git source, one branch: cargo resolves
 # every entry below to the SAME commit, so `cargo update` moves them together
@@ -135,8 +135,8 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 # crates that need none of it. `SharedSqlite` is also not re-exported, so the
 # chat store needs sqlite-storage directly regardless.
 #
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", features = ["voip"] }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "3cf0d648997c8d5a4df96dc50d3c429aad32160f", features = ["voip"] }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "3cf0d648997c8d5a4df96dc50d3c429aad32160f" }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and

@@ -25,6 +25,11 @@ pub(super) fn apply_receipt(
     // acking a DM arrives as `user:48@lid`. Rows are keyed bare.
     let chat = receipt.source.chat.to_non_ad_string();
     let ts_ms = receipt.timestamp.timestamp_millis();
+    let message_ids: Vec<String> = receipt
+        .message_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect();
 
     let status = match receipt.r#type {
         ReceiptType::Delivered => wa::web_message_info::Status::DELIVERY_ACK as i32,
@@ -44,7 +49,7 @@ pub(super) fn apply_receipt(
                     dsl::device_id
                         .eq(device_id)
                         .and(dsl::chat_jid.eq(&chat))
-                        .and(dsl::msg_id.eq_any(&receipt.message_ids)),
+                        .and(dsl::msg_id.eq_any(&message_ids)),
                 )
                 .select(diesel::dsl::max(dsl::timestamp_ms))
                 .first(conn)
@@ -57,13 +62,8 @@ pub(super) fn apply_receipt(
             // the named ids ride along so a covered row materialized later
             // stays read while an unlisted same-instant sibling still badges.
             // A stale replay changes nothing and is skipped outright.
-            let Some(state) = advance_read_state(
-                conn,
-                device_id,
-                &chat,
-                boundary_ms - 1,
-                &receipt.message_ids,
-            )?
+            let Some(state) =
+                advance_read_state(conn, device_id, &chat, boundary_ms - 1, &message_ids)?
             else {
                 // Cursor didn't move (chat re-read on another device), but a
                 // self-read still clears a manual-unread marker.
@@ -89,7 +89,7 @@ pub(super) fn apply_receipt(
     // the first of those acks moves anything.
     let mut wrote = false;
     let mut missed: Vec<&String> = Vec::new();
-    for msg_id in &receipt.message_ids {
+    for msg_id in &message_ids {
         // Zero rows covers both the real PN/LID miss and a replay against a
         // row already at/past the target; the alt retry stays harmless for
         // the latter (advance-only) and still heals a lagging split copy.
@@ -174,7 +174,7 @@ pub(super) fn apply_receipt(
     // user had deleted, which is a worse answer than a blank time on a race
     // that resolves itself: the message's own status is only ever advanced by a
     // receipt that finds it, and a later one for the same message will.
-    for msg_id in &receipt.message_ids {
+    for msg_id in &message_ids {
         let key = match relocated.get(msg_id) {
             Some(alt) => alt,
             None if unowned.contains(&msg_id) => continue,

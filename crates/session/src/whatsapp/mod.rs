@@ -872,7 +872,7 @@ impl WhatsAppClient {
                         return;
                     }
                     info!("Incoming call from {}", call.from.observe());
-                    let offer = Arc::new(call.clone());
+                    let offer = Arc::new((**call).clone());
                     calls.offer(call_id.clone(), offer.clone());
                     // A call has to ring even when nobody can say which of
                     // the caller's two addresses their chat is filed under:
@@ -1029,7 +1029,11 @@ impl WhatsAppClient {
 
                 let _ = ui_tx.send(UiEvent::ReceiptReceived {
                     chat_jid,
-                    message_ids: receipt.message_ids.clone(),
+                    message_ids: receipt
+                        .message_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
                     receipt_type: dominated_type,
                 });
             }
@@ -1264,7 +1268,7 @@ impl WhatsAppClient {
             });
 
         let mut chat_message = ChatMessage {
-            id: info.id.clone(),
+            id: info.id.to_string(),
             sender: info.source.sender.to_string(),
             sender_name: None, // Will be set in handle_message_received for groups
             content,

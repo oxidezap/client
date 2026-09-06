@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 async-channel = "2"
+async-trait = { workspace = true }
 # What an outgoing picture says about itself: its dimensions, and the small
 # JPEG that rides on the message so the other side draws something before it
 # has downloaded anything. The formats a file picker actually hands over — the
@@ -72,19 +73,18 @@ whatsapp-rust = { workspace = true }
 # used to get wrong, and the reason a browser was told it had none. What it
 # supplies instead of the socket is a `RelayTransportProvider`; see
 # `src/relay/`.
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false, features = [
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "3cf0d648997c8d5a4df96dc50d3c429aad32160f", default-features = false, features = [
     "voip-mlow",
 ] }
 # Directly, because the library no longer re-exports it: `sqlite-storage` is
 # one of the defaults dropped above. Same crate the chat store opens, and
 # without the `bundled-sqlite` that wants a C toolchain — diesel supplies
 # SQLite itself on this target.
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "3cf0d648997c8d5a4df96dc50d3c429aad32160f", default-features = false }
 # The browser, bound from Rust: the WebSocket, `fetch` and `setTimeout` that
 # stand in for the transport, the HTTP client and the runtime the defaults
 # would have supplied.
 anyhow = { workspace = true }
-async-trait = { workspace = true }
 bytes = "1"
 futures-channel = "0.3"
 # `or`, for racing a future against its own cancellation.

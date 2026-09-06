@@ -71,7 +71,7 @@ async fn a_view_moves_only_incoming_rows_in_the_chat_it_names() {
             is_from_me: true,
             ..Default::default()
         },
-        id: "MINE".to_string(),
+        id: "MINE".into(),
         timestamp: ts(1_700_000_000),
         ..Default::default()
     };

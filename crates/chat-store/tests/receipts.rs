@@ -703,7 +703,7 @@ async fn companion_sender_push_name_lands_on_the_bare_contact() {
             is_from_me: false,
             ..Default::default()
         },
-        id: "IN-AD-2".to_string(),
+        id: "IN-AD-2".into(),
         timestamp: ts(1_700_000_000),
         ..Default::default()
     };

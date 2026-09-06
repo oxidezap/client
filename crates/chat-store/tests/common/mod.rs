@@ -83,7 +83,7 @@ pub fn incoming_info(chat: &str, sender: &str, id: &str, ts_secs: i64) -> Messag
             is_group: chat.ends_with("@g.us"),
             ..Default::default()
         },
-        id: id.to_string(),
+        id: id.to_string().into(),
         timestamp: ts(ts_secs),
         ..Default::default()
     }
@@ -167,7 +167,7 @@ fn built_receipt(
                 sender,
                 ..Default::default()
             })
-            .message_ids(ids.iter().map(|id| (*id).to_string()).collect())
+            .message_ids(ids.iter().map(|id| (*id).into()).collect())
             .timestamp(at)
             .r#type(ty)
             .offline(offline)

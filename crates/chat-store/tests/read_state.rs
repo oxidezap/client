@@ -116,7 +116,7 @@ async fn delete_for_me_cleans_satellites_and_recomputes_preview() {
                     is_group: true,
                     ..Default::default()
                 })
-                .message_ids(vec!["MSG-D".to_string()])
+                .message_ids(vec!["MSG-D".into()])
                 .timestamp(ts(1_700_000_110))
                 .r#type(ReceiptType::Read)
                 .offline(false)
