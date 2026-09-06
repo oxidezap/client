@@ -46,6 +46,106 @@ async fn invalidation_broadcast_fires_per_batch() {
     assert!(got_chats && got_messages);
 }
 
+fn inbound_message(id: &str) -> InboundMessage {
+    InboundMessage::builder()
+        .message(Arc::new(wa::Message::text("durable")))
+        .info(Arc::new(incoming_info(PEER, PEER, id, 1_700_000_000)))
+        .build()
+}
+
+#[tokio::test]
+async fn inbound_commit_returns_after_materialization() {
+    let (_store, chat_store) = test_store().await;
+    let message = inbound_message("HOOK-COMMIT");
+
+    chat_store
+        .commit_inbound_batch(std::slice::from_ref(&message))
+        .await
+        .expect("inbound commit");
+
+    assert!(
+        chat_store
+            .message(&jid(PEER), "HOOK-COMMIT")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn inbound_commit_reports_sql_failure() {
+    let (store, chat_store) = test_store().await;
+    store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query("ALTER TABLE messages RENAME TO messages_gone")
+                .execute(conn)
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let error = chat_store
+        .commit_inbound_batch(std::slice::from_ref(&inbound_message("HOOK-FAIL")))
+        .await
+        .expect_err("missing table must fail closed");
+    assert!(matches!(
+        error,
+        oxidezap_chat_store::ChatStoreError::WriteBatchFailed(_)
+    ));
+}
+
+#[tokio::test]
+async fn cancelling_waiter_does_not_cancel_queued_commit() {
+    let (store, chat_store) = test_store().await;
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let entered_in_db = Arc::clone(&entered);
+    let release_in_db = Arc::clone(&release);
+    let shared = store.shared();
+    let blocker = tokio::spawn(async move {
+        shared
+            .run(move |_conn| {
+                entered_in_db.wait();
+                release_in_db.wait();
+                Ok(())
+            })
+            .await
+    });
+    tokio::task::spawn_blocking(move || entered.wait())
+        .await
+        .unwrap();
+
+    let message = inbound_message("HOOK-CANCEL");
+    let pending = tokio::spawn({
+        let chat_store = Arc::clone(&chat_store);
+        async move {
+            chat_store
+                .commit_inbound_batch(std::slice::from_ref(&message))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    pending.abort();
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .unwrap();
+    blocker.await.unwrap().unwrap();
+
+    chat_store
+        .flush()
+        .await
+        .expect("writer survives cancellation");
+    assert!(
+        chat_store
+            .message(&jid(PEER), "HOOK-CANCEL")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
 /// A subscriber's only answer to an invalidation is to re-query, so one for a
 /// batch that touched no row costs a full reload for nothing. Peers ack per
 /// device: the second device's receipt finds the message already at that

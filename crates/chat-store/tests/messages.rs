@@ -41,6 +41,36 @@ async fn live_text_message_materializes_chat_and_message() {
 }
 
 #[tokio::test]
+async fn same_id_from_two_group_senders_keeps_both_rows() {
+    let (_store, chat_store) = test_store().await;
+    let second_sender = "559900000002@s.whatsapp.net";
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("from first"),
+                incoming_info(GROUP, PEER, "REUSED-ID", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("from second"),
+                incoming_info(GROUP, second_sender, "REUSED-ID", 1_700_000_001),
+            ),
+        ],
+    )
+    .await;
+
+    let messages = chat_store.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages.iter().any(|message| {
+        message.sender_jid == jid(PEER) && message.text.as_deref() == Some("from first")
+    }));
+    assert!(messages.iter().any(|message| {
+        message.sender_jid == jid(second_sender) && message.text.as_deref() == Some("from second")
+    }));
+}
+
+#[tokio::test]
 async fn business_verified_name_is_learned_from_live_messages() {
     let (_store, chat_store) = test_store().await;
 

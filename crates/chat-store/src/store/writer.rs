@@ -61,6 +61,7 @@ pub(super) async fn writer_loop(
         let mut batch = Vec::with_capacity(8);
         let mut flushes = Vec::new();
         let mut stopping = None;
+        let mut inbound_done = None;
         // A Flush is a batch BARRIER: stop draining there, so writes enqueued
         // after a caller's flush() can neither commit ahead of that call's
         // answer nor drag the awaited writes down with a later failure. A Stop
@@ -73,6 +74,11 @@ pub(super) async fn writer_loop(
             }
             WriterMsg::Stop(done) => {
                 stopping = Some(done);
+                true
+            }
+            WriterMsg::InboundDurability { event, done } => {
+                batch.push(WriterMsg::Event(event));
+                inbound_done = Some(done);
                 true
             }
             other => {
@@ -110,6 +116,10 @@ pub(super) async fn writer_loop(
                     .map_err(db_err)
                 })
                 .await;
+            let inbound_outcome = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+            if let Some(done) = inbound_done {
+                let _ = done.send(inbound_outcome);
+            }
             match result {
                 Ok(cs) => emit_changes(&changes, cs),
                 // Nothing committed, by any route: the transaction rolled back,
@@ -171,6 +181,9 @@ fn apply_writer_msg(
 ) -> QueryResult<()> {
     match msg {
         WriterMsg::Event(event) => apply_event(conn, device_id, event, cs, deferred),
+        WriterMsg::InboundDurability { event, .. } => {
+            apply_event(conn, device_id, event, cs, deferred)
+        }
         WriterMsg::Reconcile(chat) => {
             let wire = chat.to_string();
             if let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &wire)? {

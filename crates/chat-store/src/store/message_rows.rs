@@ -46,6 +46,18 @@ pub(super) fn insert_message(
     new: NewMessage<'_>,
 ) -> QueryResult<StoredRow> {
     use schema::messages::dsl;
+    // Local optimistic rows do not carry a sender. Their ids still must not
+    // claim an inbound row that uses the same chat/id under its real sender.
+    if new.sender_jid.is_empty()
+        && diesel::select(diesel::dsl::exists(message_row(
+            device_id,
+            new.chat_jid,
+            new.msg_id,
+        )))
+        .get_result(conn)?
+    {
+        return Ok(StoredRow::Skipped);
+    }
     let values = (
         dsl::device_id.eq(device_id),
         dsl::chat_jid.eq(new.chat_jid),

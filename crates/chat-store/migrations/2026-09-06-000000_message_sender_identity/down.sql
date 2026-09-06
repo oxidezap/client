@@ -1,0 +1,2 @@
+-- This migration changes the identity key and cannot safely collapse rows
+-- that became distinct, so rollback is intentionally unavailable.

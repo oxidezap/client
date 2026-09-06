@@ -146,7 +146,7 @@ fn a_calls_later_stanza_is_handled_behind_its_offer() {
     let call_id = "CALL-ORDER-1";
     let peer: Jid = TEST_PEER.parse().expect("test JID");
     let at = whatsapp_rust::wacore::time::from_secs(1_700_000_000).expect("test timestamp");
-    let offer = Event::IncomingCall(IncomingCall::new_for_test(
+    let offer = Event::IncomingCall(Box::new(IncomingCall::new_for_test(
         peer.clone(),
         "STANZA-1".to_string(),
         at,
@@ -161,7 +161,7 @@ fn a_calls_later_stanza_is_handled_behind_its_offer() {
             audio: Vec::new(),
             group_jid: None,
         },
-    ));
+    )));
     let missed = Event::MissedCall(MissedCall::new(
         peer,
         call_id.to_string(),
@@ -203,7 +203,7 @@ fn a_batch_spanning_chats_reaches_every_lane_it_is_about() {
                     sender: chat.parse().expect("test JID"),
                     ..Default::default()
                 },
-                id: format!("MSG-BATCH-{n}"),
+                id: format!("MSG-BATCH-{n}").into(),
                 timestamp: whatsapp_rust::wacore::time::from_secs(1_700_000_000)
                     .expect("test timestamp"),
                 ..Default::default()
@@ -520,9 +520,9 @@ fn from(
             sender: sender.parse().expect("test JID"),
             ..Default::default()
         },
-        id: id.to_string(),
+        id: id.to_string().into(),
         timestamp: whatsapp_rust::wacore::time::from_secs(ts_secs).expect("test timestamp"),
-        push_name: push_name.unwrap_or_default().to_string(),
+        push_name: push_name.unwrap_or_default().to_string().into(),
         ..Default::default()
     };
     Event::Messages(
@@ -551,7 +551,7 @@ fn incoming_in(
             sender: chat.parse().expect("test JID"),
             ..Default::default()
         },
-        id: id.to_string(),
+        id: id.to_string().into(),
         timestamp: whatsapp_rust::wacore::time::from_secs(ts_secs).expect("test timestamp"),
         ..Default::default()
     };
@@ -792,7 +792,7 @@ async fn a_scoped_load_finds_a_chat_the_page_left_out() {
                         sender,
                         ..Default::default()
                     },
-                    id: format!("MSG-{index}"),
+                    id: format!("MSG-{index}").into(),
                     // Ascending, so the target's is the oldest.
                     timestamp: whatsapp_rust::wacore::time::from_secs(1_700_000_000 + index as i64)
                         .expect("test timestamp"),

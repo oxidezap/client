@@ -17,7 +17,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    messages (device_id, chat_jid, msg_id) {
+    messages (device_id, chat_jid, msg_id, sender_jid) {
         device_id -> Integer,
         chat_jid -> Text,
         msg_id -> Text,

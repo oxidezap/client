@@ -380,6 +380,13 @@ pub(crate) fn merge_split_chat(
             ))
             .execute(conn)?;
         }
+        diesel::sql_query(
+            "DELETE FROM messages WHERE device_id = ? AND chat_jid = ? AND msg_id = ?",
+        )
+        .bind::<Integer, _>(device_id)
+        .bind::<Text, _>(src)
+        .bind::<Text, _>(&dup.id)
+        .execute(conn)?;
     }
     // UPDATE OR IGNORE: PK collisions (the dups above) stay behind and are
     // dropped after. rowids survive the UPDATE, so the FTS external-content

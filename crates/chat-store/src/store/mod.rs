@@ -27,7 +27,9 @@ use chrono::{DateTime, Utc};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use wacore::store::error::StoreError;
-use wacore::types::events::{Event, EventHandler, EventInterest, EventKind};
+use wacore::types::events::{
+    BatchOrigin, Event, EventHandler, EventInterest, EventKind, InboundMessage, MessageBatch,
+};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
@@ -56,6 +58,10 @@ const CHANGE_CHANNEL_CAPACITY: usize = 256;
 
 pub(crate) enum WriterMsg {
     Event(Arc<Event>),
+    InboundDurability {
+        event: Arc<Event>,
+        done: oneshot::Sender<std::result::Result<(), String>>,
+    },
     Outgoing {
         chat: Jid,
         msg_id: String,
@@ -231,6 +237,28 @@ impl ChatStore {
             tx: self.tx.clone(),
             skip_hook_committed: Arc::clone(&self.skip_hook_committed),
         })
+    }
+
+    /// Materialize one inbound durability-hook batch and wait for its SQLite
+    /// transaction and backend commit barrier to finish.
+    pub async fn commit_inbound_batch(&self, batch: &[InboundMessage]) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let event = Arc::new(Event::Messages(
+            MessageBatch::builder()
+                .messages(Arc::from(batch.to_vec()))
+                .origin(BatchOrigin::Live)
+                .build(),
+        ));
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(WriterMsg::InboundDurability { event, done })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?;
+        result
+            .await
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?
+            .map_err(ChatStoreError::WriteBatchFailed)
     }
 
     /// Subscribe to invalidation signals. Emitted once per committed write
