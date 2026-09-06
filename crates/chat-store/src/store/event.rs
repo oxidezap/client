@@ -362,6 +362,15 @@ pub(super) fn apply_event(
             if victim.is_none() {
                 return Ok(());
             }
+            let message_count: i64 = schema::messages::table
+                .filter(
+                    schema::messages::device_id
+                        .eq(device_id)
+                        .and(schema::messages::chat_jid.eq(&chat))
+                        .and(schema::messages::msg_id.eq(&update.message_id)),
+                )
+                .count()
+                .get_result(conn)?;
             diesel::sql_query(
                 "DELETE FROM messages WHERE device_id = ? AND chat_jid = ? \
                  AND msg_id = ? AND from_me = ? AND sender_jid = ?",
@@ -384,9 +393,26 @@ pub(super) fn apply_event(
                 .set(schema::chats::unread_count.eq(schema::chats::unread_count - 1))
                 .execute(conn)?;
             }
-            // Reactions and receipts do not yet carry the target sender in
-            // their schema, so retaining those rows avoids deleting metadata
-            // belonging to another message that reused this id.
+            if message_count == 1 {
+                diesel::delete(
+                    schema::reactions::table.filter(
+                        schema::reactions::device_id
+                            .eq(device_id)
+                            .and(schema::reactions::chat_jid.eq(&chat))
+                            .and(schema::reactions::msg_id.eq(&update.message_id)),
+                    ),
+                )
+                .execute(conn)?;
+                diesel::delete(
+                    schema::message_receipts::table.filter(
+                        schema::message_receipts::device_id
+                            .eq(device_id)
+                            .and(schema::message_receipts::chat_jid.eq(&chat))
+                            .and(schema::message_receipts::msg_id.eq(&update.message_id)),
+                    ),
+                )
+                .execute(conn)?;
+            }
             // The deleted row may have been the chat's preview.
             recompute_chat_preview(conn, device_id, &chat)?;
             cs.chats = true;
