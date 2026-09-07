@@ -85,6 +85,44 @@ add another PLI trigger.
 
 Audio still uses ScriptProcessorNode, not AudioWorklet. Video still crosses CPU
 memory before texture upload. Those architectural changes need separate runtime
-and performance evidence. No live post-fix call or native daemon CPU profile was
-recorded for this iteration, and the local-camera-off/remote-reception limitation
-documented in [video lifecycle](video-lifecycle.md) remains.
+and performance evidence. The local-camera-off/remote-reception limitation
+documented in [video lifecycle](video-lifecycle.md) remains. No native daemon CPU
+profile was recorded for this iteration.
+
+## Preview retest
+
+The September 7 15:57 trace and accompanying log both name bundle
+`565296d0f6a1efd4` from PR 140. The previous 13:33 capture names
+`c10b5cdcb2f09341` from PR 139. Matching trace/log assets do not establish the
+deployed Git commit or equal video workloads.
+
+| Recorded metric | PR 139 capture | PR 140 capture |
+| --- | ---: | ---: |
+| Active interval | 27.879 s | 24.616 s |
+| Main task wall occupancy | 66.14% | 99.68% |
+| Main task CPU, fraction of one core | 36.21% | 48.76% |
+| Sampled elapsed attribution to `copyTo` | 39.42% | 64.76% |
+| RAF callback duration p95 | 7.272 ms | 12.596 ms |
+
+The retest has worse recorded responsiveness. Its five remote decoder failures
+are each followed by a queued request, an admitted IDR, and first decoder output.
+That proves recovery output, not uninterrupted playback or presentation. Audio
+reports 999 starved blocks among 2,094 callbacks across nine intervals, with
+584,258 missing samples and no logged speaker-write error. The capture ends
+before camera teardown.
+
+Neither trace records copy invocation counts, formats, bytes, or per-copy source
+dimensions. The increased `copyTo` share therefore cannot distinguish more work
+from slower individual copies. Profiling itself consumes substantial CPU.
+Follow-up benchmarks using real software-decoded frames still favor BGRA total
+publication time, but no hardware decoder was available locally. Neither a
+BGRA revert nor an added event-loop yield is justified by those measurements.
+
+Debug-enabled call decoders now report cumulative readback totals at most once
+per five seconds of output activity, plus a frozen final snapshot on teardown.
+The call, direction and first input stamp identify each decoder lifetime.
+Counters include decoded outputs, copy attempts and completions, materialized
+images and bytes, visible dimensions, discarded output, formats, and fallbacks.
+Attempts include rejected copies and retries, but not the capability probe.
+They are workload counters, not per-copy duration measurements. Compare deltas
+within one decoder lifetime rather than summing cumulative reports.

@@ -79,6 +79,7 @@ pub struct Picture {
 /// A `VideoDecoder`, its callbacks, and the slot they write into.
 pub struct Decoder {
     inner: web_sys::VideoDecoder,
+    readback: Rc<Readback>,
     slot: Rc<RefCell<Slot>>,
     /// The `avc1` string the decoder was configured with.
     ///
@@ -193,6 +194,25 @@ impl Decoder {
             let pending = Rc::clone(&pending);
             let readback = Rc::clone(&readback);
             Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame: web_sys::VideoFrame| {
+                if readback.stats.get().is_some() {
+                    let (width, height) = frame.visible_rect().map_or_else(
+                        || (frame.coded_width() as usize, frame.coded_height() as usize),
+                        |rect| (rect.width() as usize, rect.height() as usize),
+                    );
+                    readback.count(|s| {
+                        s.decoded_outputs = s.decoded_outputs.saturating_add(1);
+                        s.latest_dimensions = Some((width, height));
+                        s.min_dimensions = Some(
+                            s.min_dimensions
+                                .map_or((width, height), |(w, h)| (w.min(width), h.min(height))),
+                        );
+                        s.max_dimensions = Some(
+                            s.max_dimensions
+                                .map_or((width, height), |(w, h)| (w.max(width), h.max(height))),
+                        );
+                    });
+                    readback.report(false);
+                }
                 let turn = turns
                     .borrow_mut()
                     .take(frame.timestamp() as i32)
@@ -204,6 +224,7 @@ impl Decoder {
                 // either, since an unclosed `VideoFrame` pins a decoder
                 // buffer and a decoder that runs out stops producing.
                 if sink.is_none() && in_flight.get() >= MAX_COPIES_IN_FLIGHT {
+                    readback.count(|s| s.dropped_pending = s.dropped_pending.saturating_add(1));
                     frame.close();
                     refused.set(true);
                     return;
@@ -222,7 +243,9 @@ impl Decoder {
                 // Only decoded output is replaced. Compressed units must all
                 // reach the decoder to preserve its reference chain.
                 if sink.is_some() && in_flight.get() != 0 {
-                    *pending.borrow_mut() = Some(work);
+                    if pending.borrow_mut().replace(work).is_some() {
+                        readback.count(|s| s.dropped_pending = s.dropped_pending.saturating_add(1));
+                    }
                     return;
                 }
                 let outstanding = Outstanding::new(Rc::clone(&in_flight));
@@ -260,6 +283,7 @@ impl Decoder {
         // Install the close guard before configure can fail.
         let decoder = Self {
             inner,
+            readback,
             slot,
             codec,
             generation,
@@ -345,6 +369,20 @@ impl Decoder {
         self.slot.borrow().failed.clone()
     }
 
+    /// Enable once, before feeding any units. The callback receives cumulative
+    /// snapshots on output activity and a final, frozen snapshot on drop.
+    /// The caller owns log throttling; this module reads no clock.
+    pub fn enable_diagnostics(&self, report: impl Fn(Diagnostics, bool) + 'static) {
+        if self.diagnostics().is_none() && self.submitted.get() == 0 {
+            self.readback.stats.set(Some(Diagnostics::default()));
+            *self.readback.reporter.borrow_mut() = Some(Rc::new(report));
+        }
+    }
+
+    pub fn diagnostics(&self) -> Option<Diagnostics> {
+        self.readback.stats.get()
+    }
+
     /// Whether a picture was dropped for want of a copy slot since this was
     /// last asked, and clear the fact.
     ///
@@ -364,7 +402,10 @@ impl Decoder {
         // Before anything else, so a copy already in flight is recognised as
         // belonging to the stream that has just been left behind.
         self.generation.set(self.generation.get().wrapping_add(1));
-        self.pending.borrow_mut().take();
+        if self.pending.borrow_mut().take().is_some() {
+            self.readback
+                .count(|s| s.dropped_obsolete = s.dropped_obsolete.saturating_add(1));
+        }
         self.submitted.set(0);
         self.refused.set(false);
 
@@ -426,6 +467,16 @@ impl Drop for Decoder {
         self.generation.set(self.generation.get().wrapping_add(1));
         self.pending.borrow_mut().take();
         let _ = self.inner.close();
+        // Include pending and active work now, then freeze before late promises
+        // settle. Every output not already terminal becomes obsolete on drop.
+        self.readback.count(|s| {
+            s.dropped_obsolete = s
+                .decoded_outputs
+                .saturating_sub(s.dropped_pending)
+                .saturating_sub(s.materialized)
+                .saturating_sub(s.failed_frames);
+        });
+        self.readback.report(true);
     }
 }
 
@@ -486,14 +537,80 @@ impl Drop for PendingFrame {
     }
 }
 
+type DiagnosticsReporter = Rc<dyn Fn(Diagnostics, bool)>;
+
 #[derive(Default)]
 struct Readback {
     spare: RefCell<Option<js_sys::Uint8Array>>,
     bgra: Cell<Option<bool>>,
     probe: RefCell<Option<js_sys::Promise>>,
+    stats: Cell<Option<Diagnostics>>,
+    reporter: RefCell<Option<DiagnosticsReporter>>,
+}
+
+/// Fixed-size cumulative totals. Readbacks count actual copyTo attempts and
+/// settled promises, including rejected attempts and RGBA retries, not the probe.
+/// Dimensions are visible output dimensions before rotation, with per-axis extrema.
+/// Pending drops include attachment overflow. Obsolete drops include reset,
+/// teardown, superseded copies, and queued work discarded after decoder failure.
+/// Requested bytes include failed attempts; materialized bytes count published images.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Diagnostics {
+    pub decoded_outputs: u64,
+    pub readbacks_started: u64,
+    pub readbacks_completed: u64,
+    pub materialized: u64,
+    pub dropped_pending: u64,
+    pub dropped_obsolete: u64,
+    pub failed_frames: u64,
+    pub bytes_requested: u64,
+    pub bytes_materialized: u64,
+    pub latest_dimensions: Option<(usize, usize)>,
+    pub min_dimensions: Option<(usize, usize)>,
+    pub max_dimensions: Option<(usize, usize)>,
+    pub rgba: u64,
+    pub bgra: u64,
+    pub probe_fallbacks: u64,
+    pub allocation_fallbacks: u64,
+    pub copy_fallbacks: u64,
 }
 
 impl Readback {
+    fn count(&self, update: impl FnOnce(&mut Diagnostics)) {
+        if let Some(mut stats) = self.stats.get() {
+            update(&mut stats);
+            self.stats.set(Some(stats));
+        }
+    }
+
+    fn report(&self, final_report: bool) {
+        let stats = if final_report {
+            self.stats.take()
+        } else {
+            self.stats.get()
+        };
+        let reporter = if final_report {
+            self.reporter.borrow_mut().take()
+        } else {
+            self.reporter.borrow().clone()
+        };
+        if let (Some(stats), Some(reporter)) = (stats, reporter) {
+            reporter(stats, final_report);
+        }
+    }
+
+    fn started(&self, bgra: bool, bytes: usize) {
+        self.count(|s| {
+            s.readbacks_started = s.readbacks_started.saturating_add(1);
+            s.bytes_requested = s.bytes_requested.saturating_add(bytes as u64);
+            if bgra {
+                s.bgra = s.bgra.saturating_add(1);
+            } else {
+                s.rgba = s.rgba.saturating_add(1);
+            }
+        });
+    }
+
     async fn supports_bgra(&self) -> bool {
         if let Some(supported) = self.bgra.get() {
             return supported;
@@ -513,6 +630,9 @@ impl Readback {
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         // A concurrent real-frame rejection must not be overwritten by the probe.
+        if self.bgra.get().is_none() && !supported {
+            self.count(|s| s.probe_fallbacks = s.probe_fallbacks.saturating_add(1));
+        }
         self.bgra.set(Some(self.bgra.get().unwrap_or(supported)));
         self.probe.borrow_mut().take();
         self.bgra.get() == Some(true)
@@ -569,6 +689,7 @@ async fn read_frame(
         stamp,
     } = &work;
     if !stamp.wanted(&slot.borrow()) {
+        readback.count(|s| s.dropped_obsolete = s.dropped_obsolete.saturating_add(1));
         return;
     }
     // The *visible* rectangle, not the coded one. `copyTo` copies the visible
@@ -590,6 +711,7 @@ async fn read_frame(
     let Some(byte_len) =
         frame_byte_len(width, height).filter(|_| width.saturating_mul(height) <= max_pixels)
     else {
+        readback.count(|s| s.failed_frames = s.failed_frames.saturating_add(1));
         if stamp.current() {
             let mut slot = slot.borrow_mut();
             if slot.failed.is_none() {
@@ -601,6 +723,7 @@ async fn read_frame(
 
     let mut bgra = *rotation == Rotation::None && readback.supports_bgra().await;
     if !stamp.wanted(&slot.borrow()) {
+        readback.count(|s| s.dropped_obsolete = s.dropped_obsolete.saturating_add(1));
         return;
     }
     let options = web_sys::VideoFrameCopyToOptions::new();
@@ -619,6 +742,7 @@ async fn read_frame(
     // where they do not it is the browser that is right.
     let mut allocation = frame.allocation_size_with_options(&options);
     if bgra && allocation.is_err() {
+        readback.count(|s| s.allocation_fallbacks = s.allocation_fallbacks.saturating_add(1));
         bgra = false;
         readback.bgra.set(Some(false));
         options.set_format(web_sys::VideoPixelFormat::Rgba);
@@ -626,6 +750,7 @@ async fn read_frame(
     }
     let needed = allocation.map_or(byte_len, |size| size as usize);
     if needed > byte_len {
+        readback.count(|s| s.failed_frames = s.failed_frames.saturating_add(1));
         if stamp.current() {
             let mut slot = slot.borrow_mut();
             if slot.failed.is_none() {
@@ -644,24 +769,36 @@ async fn read_frame(
     // Returns the promise directly rather than a `Result`: a `copyTo` that
     // cannot be started rejects rather than throwing, so there is one failure
     // path and it is the awaited one below.
+    readback.started(bgra, needed);
     let promise = frame.copy_to_with_buffer_source_and_options(&destination, &options);
 
     let mut read = wasm_bindgen_futures::JsFuture::from(promise).await;
+    readback.count(|s| s.readbacks_completed = s.readbacks_completed.saturating_add(1));
     if bgra && read.is_err() && stamp.wanted(&slot.borrow()) {
+        readback.count(|s| s.copy_fallbacks = s.copy_fallbacks.saturating_add(1));
         // A format may work for the probe but not this decoder's backing store.
         // Retry the same open frame before declaring the decoder failed.
         bgra = false;
         readback.bgra.set(Some(false));
         options.set_format(web_sys::VideoPixelFormat::Rgba);
+        readback.started(false, needed);
         read = wasm_bindgen_futures::JsFuture::from(
             frame.copy_to_with_buffer_source_and_options(&destination, &options),
         )
         .await;
+        readback.count(|s| s.readbacks_completed = s.readbacks_completed.saturating_add(1));
     }
     // Closed on both paths, and before the slot is touched: the buffer it
     // holds is the decoder's, not ours.
     frame.close();
     if let Err(e) = read {
+        readback.count(|s| {
+            if stamp.wanted(&slot.borrow()) {
+                s.failed_frames = s.failed_frames.saturating_add(1);
+            } else {
+                s.dropped_obsolete = s.dropped_obsolete.saturating_add(1);
+            }
+        });
         if stamp.wanted(&slot.borrow()) {
             let mut slot = slot.borrow_mut();
             if slot.failed.is_none() {
@@ -675,6 +812,7 @@ async fn read_frame(
     // laid out, since the work below is only worth doing for a picture
     // somebody is still going to look at.
     if !stamp.wanted(&slot.borrow()) {
+        readback.count(|s| s.dropped_obsolete = s.dropped_obsolete.saturating_add(1));
         *spare.borrow_mut() = Some(destination);
         return;
     }
@@ -682,6 +820,7 @@ async fn read_frame(
     let source = destination.to_vec();
     *spare.borrow_mut() = Some(destination);
     if source.len() < width * height * 4 {
+        readback.count(|s| s.failed_frames = s.failed_frames.saturating_add(1));
         return;
     }
     let bgra = if bgra {
@@ -695,6 +834,7 @@ async fn read_frame(
         (width, height)
     };
     let Some(buffer) = RgbaImage::from_raw(draw_width as u32, draw_height as u32, bgra) else {
+        readback.count(|s| s.failed_frames = s.failed_frames.saturating_add(1));
         return;
     };
     let image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
@@ -709,11 +849,16 @@ async fn read_frame(
         // an older picture arriving late is not the newest one: dropped
         // rather than allowed to overwrite what has already been shown.
         if !stamp.wanted(&slot) {
+            readback.count(|s| s.dropped_obsolete = s.dropped_obsolete.saturating_add(1));
             return;
         }
         slot.accepted = stamp.seq;
         slot.newest = Some(picture.clone());
     }
+    readback.count(|s| {
+        s.materialized = s.materialized.saturating_add(1);
+        s.bytes_materialized = s.bytes_materialized.saturating_add(needed as u64);
+    });
     // After the borrow is released: a sink is the caller's code, and one
     // that asked this decoder anything would find it already borrowed.
     if let Some(sink) = sink {

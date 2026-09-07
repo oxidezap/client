@@ -410,7 +410,30 @@ impl Stream {
             MAX_PIXELS,
             Some(self.sink()),
         ) {
-            Ok(decoder) => Some(decoder),
+            Ok(decoder) => {
+                if log::log_enabled!(log::Level::Debug) {
+                    let call_id = self.call_id.clone();
+                    let stream = self.stream;
+                    let first_stamp = self.fed.get();
+                    let last_report = std::cell::Cell::new(wacore::time::Instant::now());
+                    decoder.enable_diagnostics(move |stats, final_report| {
+                        if !log::log_enabled!(log::Level::Debug) {
+                            return;
+                        }
+                        let now = wacore::time::Instant::now();
+                        let elapsed = now.saturating_duration_since(last_report.get());
+                        if !final_report && elapsed < std::time::Duration::from_secs(5) {
+                            return;
+                        }
+                        last_report.set(now);
+                        log::debug!(
+                            "video readback call={call_id} stream={stream:?} first_stamp={first_stamp} final={final_report} interval_ms={} totals={stats:?}",
+                            elapsed.as_millis(),
+                        );
+                    });
+                }
+                Some(decoder)
+            }
             Err(e) => {
                 log::warn!("no decoder for the {:?} video of a call: {e}", self.stream);
                 None

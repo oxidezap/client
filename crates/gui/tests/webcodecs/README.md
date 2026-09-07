@@ -103,7 +103,11 @@ Select only `--test readback`, add `--release --features benchmarks`, and append
 `production_readback_benchmark -- --nocapture`. Set
 `WASM_BINDGEN_TEST_TIMEOUT=120` for the longer run.
 
-Two production decoders alternate readbacks from clones of the same synthetic
+The current benchmark also measures generated H.264 output and reports separate
+synchronous-call and promise-completion times. See the decoded-frame follow-up
+below for its parameters. The following measurements used the earlier fixture.
+
+Two production decoders alternated readbacks from clones of the same synthetic
 frame. The baseline's capability probe is rejected once to select the shipped
 RGBA-plus-swizzle path. The candidate uses native BGRA. Both use the production
 output callback, JS destination reuse, JS-to-wasm copy and image construction.
@@ -156,3 +160,164 @@ an unknown dictionary member, production verifies a 1x1 color sample rather
 than treating promise success as support. The probe and any downgrade are
 cached per decoder and survive reset. A backing-store-specific rejection still
 retries the same open frame as RGBA before setting failure.
+
+## Decoded-frame follow-up
+
+The benchmark now generates moving canvas rectangles at 1280x720 with a 20 fps
+deadline and 50,000 microsecond timestamps. A real `VideoEncoder` produces
+Annex-B baseline H.264, `avc1.42001f`, at a requested 2.5 Mbps with a keyframe
+every 20 pictures. Each encoded picture goes through a real `VideoDecoder`.
+Two clones of that decoded frame then enter the existing production readback
+callback, alternating RGBA-first and BGRA-first. There is no camera, captured
+media, decoder-output replacement, or promise gate in this source path.
+The two production callback owners still use the fixture's inert decoder during
+construction, so the readback comparison does not decode the picture twice.
+
+There are 20 warmup pictures and 120 measured pictures per path, followed by
+raw RGBA and I420 controls at the same resolution. Those controls are unpaced
+and contain constant pixels, so compare formats within each row rather than
+absolute times between source types. First and last pairs verify every copied
+pixel after accounting for channel order, outside the timed interval. Every
+copy checks its byte count. Each measured path copies 442,368,000 bytes across
+120 frames, 3,686,400 bytes per frame. Warmup copies are additional.
+
+The report distinguishes these intervals, in milliseconds.
+
+- `callMs` measures entry to return of the native `copyTo` call.
+- `copyMs` measures entry to the first promise continuation.
+- `postCopyMs` measures that continuation to publication completion. It includes
+  JS-to-wasm materialization, optional Rust swizzle, image construction and
+  continuation overhead, not an isolated timer around `to_vec`.
+- `outputMs` measures production output-callback entry to publication completion.
+
+Source generation and encoding are outside the per-frame readback timer. The
+encoder flushes each submitted picture. The steady source decoder uses
+`optimizeForLatency: true` to deliver one picture without waiting for later
+input. Without it this serialized fixture waited indefinitely for its first
+output; that was a fixture deadlock, not measured readback starvation. This
+setting differs from production decoder configuration and does not change the
+imported production readback helper. Output still goes through the real
+JS-owned destination reuse and Rust conversion, with only `RenderImage` replaced
+as described above. Shared-memory execution and GPUI upload remain outside scope.
+
+### Browser setup
+
+Measured on 2026-09-07 with Chrome for Testing and ChromeDriver
+151.0.7922.34, optimized Rust wasm, and bindgen runner 0.2.127. The system runner
+had become 0.2.128, so a separate 0.2.127 installation was used. Do not update the
+test lockfile to work around a runner mismatch.
+
+Use the command above with this WebDriver configuration, substituting the local
+Chrome 151 binary path. `--enable-gpu` is necessary here because the existing
+headless defaults selected SwiftShader. No VAAPI, ANGLE, driver-check override,
+or software-decoding switch was added to the measured GPU-enabled runs.
+
+```json
+{"goog:chromeOptions":{"binary":"/absolute/path/to/chrome151","args":["enable-gpu","remote-debugging-port=9335"]}}
+```
+
+```bash
+WASM_BINDGEN_TEST_WEBDRIVER_JSON=/absolute/path/to/webdriver.json \
+WASM_BINDGEN_TEST_TIMEOUT=120 \
+CHROMEDRIVER=/absolute/path/to/chromedriver151 \
+RUSTFLAGS='--cfg web_sys_unstable_apis' \
+CARGO_TARGET_DIR=target/webcodecs-tests \
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=/absolute/path/to/wasm-bindgen-test-runner-0.2.127 \
+  cargo test --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
+    --locked --target wasm32-unknown-unknown --test readback \
+    --release --features benchmarks production_readback_benchmark -- --nocapture
+```
+
+The runner additionally supplies headless, no-sandbox and disable-dev-shm-usage;
+ChromeDriver supplies its normal automation flags. Port 9335 is only for optional
+CDP observation and can be omitted for timing-only runs. While the test runs,
+use browser-session `SystemInfo.getInfo` and page-session `Media.enable`, then
+record `Media.playerPropertiesChanged`. Support queries alone do not identify
+the codec implementation actually chosen.
+
+In the observed benchmark browser, CDP reported Intel device 32103 and NVIDIA
+device 11608, Mesa 26.2.2, with GPU compositing, rasterization, 2D canvas and
+WebGL enabled. The generic `video_decode` status was `enabled`, but the
+`videoDecoding` profile list was empty. Both encoder and decoder support queries
+returned true for `no-preference` and `prefer-software`, false for
+`prefer-hardware`. The hardware row explicitly reports zero frames and bytes.
+CDP identified `OpenH264VideoEncoder` and `FFmpegVideoDecoder`, with
+`kIsPlatformVideoEncoder` and `kIsPlatformVideoDecoder` both false. Decoded
+frames reported I420, BT709 limited range and a 1280x720 visible rectangle.
+
+These are real decoded frames with GPU rendering enabled, but they are **not
+hardware-decoder-backed frames**. An earlier run without `enable-gpu` also
+reported hardware support false and used SwiftShader. A separate capability
+inspection with Linux accelerated-decode feature flags still exposed no decode
+profiles; it is not included in the timing results.
+
+### Results
+
+Four GPU-enabled runs gave these mean publication times. Entries are RGBA to
+BGRA in milliseconds. Run C also had the read-only CDP observer attached.
+Run D verified the added full-pixel comparisons and per-copy byte assertions.
+
+| Source | Run A | Run B | Run C | Run D |
+| --- | --- | --- | --- | --- |
+| Decoded, no preference | 3.612 to 3.328 | 3.565 to 3.351 | 3.890 to 3.595 | 3.439 to 3.175 |
+| Decoded, prefer software | 3.340 to 3.030 | 3.644 to 3.511 | 3.452 to 3.279 | 3.118 to 2.880 |
+| Raw RGBA | 3.561 to 3.287 | 3.950 to 3.644 | 2.567 to 2.390 | 6.209 to 6.065 |
+| Raw I420 | 9.899 to 9.250 | 9.358 to 8.797 | 7.453 to 6.914 | 4.641 to 4.456 |
+
+Run C separates the decoded-frame work as follows. All values are means.
+
+| Source | Format | Synchronous call | Promise completion | Post-copy | Publication |
+| --- | --- | --- | --- | --- | --- |
+| No preference | RGBA | 2.587 | 2.606 | 1.241 | 3.890 |
+| No preference | BGRA | 2.691 | 2.711 | 0.842 | 3.595 |
+| Prefer software | RGBA | 2.265 | 2.281 | 1.129 | 3.452 |
+| Prefer software | BGRA | 2.451 | 2.466 | 0.776 | 3.279 |
+
+Most of the copy time was synchronous. BGRA increased decoded `copyTo` mean
+time by 2.5-9.0% across these runs, while publication mean time decreased by
+3.6-9.3%. The post-copy savings exceeded the copy penalty. Machine load varied;
+the sequential raw-control rows are not evidence that I420 is intrinsically
+slower than decoder-produced I420. Run C encoded and decoded 140 pictures per
+source, totaling 727,530 and 723,998 compressed bytes respectively. Each row
+measured 120 complete copies per format after warmup, with no resolution change.
+
+### Pending-loop inspection
+
+The benchmark also submits the first 66 compressed pictures as a burst through
+a fresh real decoder into each production callback. It uses the production
+default `optimizeForLatency: false` for this check. The actual active/pending
+worker closes and publishes the frames. Timer and animation callbacks count
+progress during the burst. These sequential bursts diagnose scheduling; their
+elapsed times are not an interleaved format comparison.
+
+In run C each burst decoded, copied, closed and published all 66 pictures,
+243,302,400 copied bytes per burst.
+
+| Decoder preference | Format | Elapsed ms | Timer ticks | Animation callbacks | Maximum timer gap ms |
+| --- | --- | --- | --- | --- | --- |
+| No preference | RGBA | 454.010 | 72 | 28 | 21.660 |
+| No preference | BGRA | 263.760 | 70 | 16 | 7.715 |
+| Prefer software | RGBA | 300.715 | 68 | 19 | 10.185 |
+| Prefer software | BGRA | 199.415 | 52 | 12 | 10.910 |
+
+`webcodecs.rs` takes the pending frame immediately after `read_frame(...).await`
+without a task yield. A resolved copy promise therefore does not guarantee a
+rendering opportunity before the pending copy. However, the pending slot holds
+only one frame, and real decode callbacks need task delivery to replenish it.
+These bursts did not reproduce an indefinitely replenished microtask chain.
+They also did not exercise pending replacement under slow GPU readback, since
+all 66 frames were copied. They establish timer/render-callback progress in the
+tested software path, not a bound for every decoder or the application's other
+microtask producers. No bounded-yield alternative was tested or added.
+
+### Recommendation
+
+Do not infer a BGRA-specific GPU/vendor regression from these runs, and do not
+treat them as evidence that the hardware path is safe. That comparison remains
+blocked by unavailable hardware decoding in this Chrome 151 setup. The supplied
+trace percentages were not independently reprocessed, and percentages of
+different captures do not establish per-frame cost without counts and duration.
+The measured software path does not justify a BGRA revert. The burst results do
+not justify adding a yield to fix demonstrated starvation. A hardware-backed
+paired readback result or a production-equivalent starvation reproduction is
+still needed before choosing either production change.
