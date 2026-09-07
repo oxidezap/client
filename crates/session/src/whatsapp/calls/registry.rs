@@ -54,15 +54,14 @@ impl Drop for AcceptGuard {
 
 /// What became of a camera handed to [`CallRegistry::hold_camera`].
 ///
-/// Three answers rather than a `bool`, because only one of them leaves the
-/// peer holding a pane open: a call that ended is one nobody is announcing
-/// anything to, and a device that died on a live call is a direction the far
-/// side still believes in.
+/// Device failure needs signaling; endpoint teardown has already happened in
+/// the library and must not send another stop stanza.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Camera {
     Held,
     CallEnded,
     Died,
+    EndpointClosed,
 }
 
 /// Live call state shared between the event pump and the UI action methods.
@@ -209,16 +208,10 @@ struct Calls {
     upgrades: HashMap<String, VideoUpgradeToken>,
     /// Calls with an upgrade of *ours* still waiting on an answer.
     ///
-    /// Presence, not identity, and that is the whole of it: the library does
-    /// not match a refusal to the request it refuses. Its handler tears the
-    /// local plane down whenever *some* request of ours is outstanding —
-    /// whichever camera is attached by then — and ignores the stanza entirely
-    /// when none is. So the question this has to answer is "did the library
-    /// just release our endpoints", and this flag is exactly that. Keying on
-    /// the camera the request went out with would leave a camera registered
-    /// and drawn after its media plane was already gone, which is the same
-    /// lie in the other direction.
-    upgrading: HashSet<String>,
+    /// Peer signaling reads presence, matching the library's pending request.
+    /// The camera ID is only for local ownership cleanup, so an old owner
+    /// cannot withdraw a replacement's request.
+    upgrading: HashMap<String, video::CameraId>,
 }
 
 impl CallRegistry {
@@ -517,44 +510,30 @@ impl CallRegistry {
     /// Put a camera in the registry, or take it straight back down when there
     /// is nothing left to hold it for.
     ///
-    /// Both questions — is the device still there, is the call still there —
-    /// are asked *after* the insertion and under the lock the teardowns take,
-    /// and that is the whole of it. Asked before, each leaves a window in
-    /// which the cleanup runs against a registry this camera is not in yet:
-    /// it finds nothing to remove and finishes, and the entry made a moment
-    /// later is the one nothing ever comes back for — the device staying
-    /// open, with its light on, until the daemon exits.
-    ///
-    /// One lock is what makes the answers true for long enough to act on. The
-    /// pump clears `alive` before it reports a loss, so a dead camera is
-    /// either already gone from the map or visible right here; and a call
-    /// that ended has left `active` under this same lock, so "still live" and
-    /// "camera filed" cannot disagree between two acquisitions.
+    /// Check and insertion share the teardown lock. A loss already reported
+    /// is visible in `alive`; a concurrent report finds the inserted owner.
+    /// Rejected and displaced owners are stopped outside the lock.
     async fn hold_camera(&self, call_id: &str, local: LocalVideo) -> Camera {
-        let taken = {
+        let (outcome, taken) = {
             let mut calls = self.calls.lock().expect("call registry poisoned");
-            calls.cameras.insert(call_id.to_string(), local);
-            let ended = !calls.active.contains_key(call_id);
-            let dead = !calls.cameras.get(call_id).is_some_and(LocalVideo::alive);
-            if ended || dead {
-                calls.cameras.remove(call_id).map(|held| (held, ended))
+            if !calls.active.contains_key(call_id) {
+                (Camera::CallEnded, Some(local))
+            } else if local.endpoint_closed() {
+                (Camera::EndpointClosed, Some(local))
+            } else if !local.alive() {
+                (Camera::Died, Some(local))
             } else {
-                None
+                (
+                    Camera::Held,
+                    calls.cameras.insert(call_id.to_string(), local),
+                )
             }
         };
-        let Some((taken, ended)) = taken else {
-            return Camera::Held;
-        };
-        // Outside the lock: closing a device waits for its capture thread,
-        // and every other call's bookkeeping would queue behind it.
-        taken.stop().await;
-        if ended {
-            info!("Call {call_id} ended while its camera was being wired up");
-            Camera::CallEnded
-        } else {
-            warn!("The camera on call {call_id} died while it was being wired up");
-            Camera::Died
+        if let Some(taken) = taken {
+            self.end_camera_upgrade(call_id, taken.camera_id());
+            taken.stop().await;
         }
+        outcome
     }
 
     /// The call this camera belongs to has just become live: hand the device
@@ -570,6 +549,9 @@ impl CallRegistry {
         let Some(local) = calls.cameras.get(call_id) else {
             return false;
         };
+        if !local.alive() {
+            return false;
+        }
         local.live();
         local.request_keyframe();
         true
@@ -605,6 +587,15 @@ impl CallRegistry {
             .lock()
             .expect("call registry poisoned")
             .cameras
+            .get(call_id)
+            .is_some_and(LocalVideo::alive)
+    }
+
+    fn upgrade_pending(&self, call_id: &str) -> bool {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .upgrading
             .contains_key(call_id)
     }
 
@@ -702,12 +693,12 @@ impl CallRegistry {
     }
 
     /// Record that an upgrade of *ours* is waiting on the peer's answer.
-    fn begin_upgrade(&self, call_id: &str) {
+    fn begin_upgrade(&self, call_id: &str, camera_id: video::CameraId) {
         self.calls
             .lock()
             .expect("call registry poisoned")
             .upgrading
-            .insert(call_id.to_string());
+            .insert(call_id.to_string(), camera_id);
     }
 
     /// Withdraw it, and say whether there was one — which is the whole
@@ -718,6 +709,14 @@ impl CallRegistry {
             .expect("call registry poisoned")
             .upgrading
             .remove(call_id)
+            .is_some()
+    }
+
+    fn end_camera_upgrade(&self, call_id: &str, camera_id: video::CameraId) {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        if calls.upgrading.get(call_id) == Some(&camera_id) {
+            calls.upgrading.remove(call_id);
+        }
     }
 
     /// A call has ended: clear everything keyed to it and hand back the
@@ -1035,6 +1034,14 @@ impl WhatsAppClient {
                             // gone. Nothing was announced here, so the state
                             // already says what is true on this side.
                             Camera::Died => Self::stop_peer_video(&handle, &call_id).await,
+                            Camera::EndpointClosed => {
+                                Self::announce_video(
+                                    &ui_sender,
+                                    &call_id,
+                                    VideoStream::Remote,
+                                    false,
+                                );
+                            }
                             Camera::CallEnded => {}
                         }
                     }
@@ -1045,7 +1052,7 @@ impl WhatsAppClient {
                     // no plane for their frames to arrive on, and a window
                     // told otherwise waits out the call in front of a pane
                     // nothing can ever fill.
-                    if answered_with_video && offered_video(&offer) {
+                    if answered_with_video && offered_video(&offer) && calls.camera_on(&call_id) {
                         Self::announce_video(&ui_sender, &call_id, VideoStream::Remote, true);
                     }
                     Self::watch_call(handle, calls.clone(), ui_sender.clone());
@@ -1166,6 +1173,17 @@ impl WhatsAppClient {
                 Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                 return;
             }
+            Self::retire_dead_camera(&calls, &ui_sender, &call_id).await;
+            if lane.intent.lock().expect("video intent poisoned").seq != seq {
+                return;
+            }
+            if !calls
+                .live(&call_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, &handle))
+            {
+                Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
+                return;
+            }
             let (local, endpoints) =
                 match video::open(video::slot(&call_id), publish, lost, picture_lost).await {
                     Ok(video) => video,
@@ -1199,6 +1217,15 @@ impl WhatsAppClient {
                 local.stop().await;
                 return;
             }
+            if !local.alive()
+                || !calls
+                    .live(&call_id)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &handle))
+            {
+                local.stop().await;
+                Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
+                return;
+            }
             // Consuming the token *is* the answer, so the question goes with
             // it — every window drawing it has to stop.
             let answering = calls.take_upgrade(&call_id);
@@ -1222,8 +1249,10 @@ impl WhatsAppClient {
             // early can, because every path out of here that is not a camera
             // held withdraws it again.
             if ours_to_be_answered {
-                calls.begin_upgrade(&call_id);
+                calls.begin_upgrade(&call_id, local.camera_id());
             }
+            let camera_id = local.camera_id();
+            let accepting_peer = answering.is_some();
             let started = match answering {
                 Some(token) => {
                     handle
@@ -1243,9 +1272,14 @@ impl WhatsAppClient {
                     // that was never registered, no picture of its own to
                     // stop, and a peer still holding a pane open.
                     if lane.intent.lock().expect("video intent poisoned").seq != seq {
+                        let endpoint_closed = local.endpoint_closed();
                         local.stop().await;
-                        Self::stop_peer_video(&handle, &call_id).await;
-                        calls.end_upgrade(&call_id);
+                        if endpoint_closed {
+                            Self::announce_video(&ui_sender, &call_id, VideoStream::Remote, false);
+                        } else {
+                            Self::stop_peer_video(&handle, &call_id).await;
+                        }
+                        calls.end_camera_upgrade(&call_id, camera_id);
                         return;
                     }
                     // The call is already live, so the self-view has had
@@ -1270,18 +1304,30 @@ impl WhatsAppClient {
                     match calls.hold_camera(&call_id, local).await {
                         Camera::Died => {
                             Self::stop_peer_video(&handle, &call_id).await;
-                            calls.end_upgrade(&call_id);
+                            calls.end_camera_upgrade(&call_id, camera_id);
                         }
                         Camera::CallEnded => {
-                            calls.end_upgrade(&call_id);
+                            calls.end_camera_upgrade(&call_id, camera_id);
+                        }
+                        Camera::EndpointClosed => {
+                            Self::announce_video(&ui_sender, &call_id, VideoStream::Remote, false);
                         }
                         Camera::Held => {}
+                    }
+                    if accepting_peer && calls.camera_on(&call_id) {
+                        Self::announce_video(&ui_sender, &call_id, VideoStream::Remote, true);
+                        calls.ask_peer_for_keyframe(&call_id, KeyframeUrgency::Coalesced);
                     }
                 }
                 Err(e) => {
                     error!("Failed to start video on call {}: {}", call_id, e);
+                    let endpoint_closed = local.endpoint_closed();
                     local.stop().await;
-                    calls.end_upgrade(&call_id);
+                    calls.end_camera_upgrade(&call_id, camera_id);
+                    if endpoint_closed {
+                        Self::withdraw_video_request(&calls, &ui_sender, &call_id).await;
+                        Self::announce_video(&ui_sender, &call_id, VideoStream::Remote, false);
+                    }
                 }
             }
             Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
@@ -1309,6 +1355,9 @@ impl WhatsAppClient {
             return;
         }
         let settled = calls.camera_on(call_id);
+        if settled && calls.upgrade_pending(call_id) {
+            return;
+        }
         Self::announce_video(ui_sender, call_id, VideoStream::Local, settled);
     }
 
@@ -1339,11 +1388,42 @@ impl WhatsAppClient {
         let Some(local) = calls.take_camera_if(call_id, only) else {
             return;
         };
+        Self::stop_owned_video(calls, ui_sender, call_id, local).await;
+    }
+
+    // The caller holds the video lane, including across the next device open.
+    async fn retire_dead_camera(calls: &CallRegistry, ui_sender: &UiEventSender, call_id: &str) {
+        let dead = {
+            let calls = calls.calls.lock().expect("call registry poisoned");
+            calls
+                .cameras
+                .get(call_id)
+                .filter(|local| !local.alive())
+                .map(LocalVideo::camera_id)
+        };
+        if let Some(id) = dead
+            && let Some(local) = calls.take_camera_if(call_id, Some(id))
+        {
+            Self::stop_owned_video(calls, ui_sender, call_id, local).await;
+        }
+    }
+
+    async fn stop_owned_video(
+        calls: &CallRegistry,
+        ui_sender: &UiEventSender,
+        call_id: &str,
+        local: LocalVideo,
+    ) {
+        let endpoint_closed = local.endpoint_closed();
+        calls.end_camera_upgrade(call_id, local.camera_id());
         local.stop().await;
         // Asked for out of the registry rather than held across the wait:
         // telling the peer is a stanza on the wire, and holding the lock
         // across it stalls every other call's bookkeeping behind one peer.
-        if let Some(handle) = calls.live(call_id) {
+        if endpoint_closed {
+            Self::withdraw_video_request(calls, ui_sender, call_id).await;
+            Self::announce_video(ui_sender, call_id, VideoStream::Remote, false);
+        } else if let Some(handle) = calls.live(call_id) {
             Self::stop_peer_video(&handle, call_id).await;
         }
         Self::announce_video(ui_sender, call_id, VideoStream::Local, false);
@@ -1810,6 +1890,12 @@ impl WhatsAppClient {
                         upgrade_token,
                         ..
                     } => {
+                        if !calls
+                            .live(&call_id)
+                            .is_some_and(|current| Arc::ptr_eq(&current, &handle))
+                        {
+                            continue;
+                        }
                         Self::observe_peer_video(
                             &calls,
                             &ui_sender,
@@ -1909,19 +1995,24 @@ impl WhatsAppClient {
             // this request. Without a token there is nothing to answer with —
             // the signaling state machine has already resolved it — so it is
             // not offered as a question.
-            VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
-                let Some(token) = upgrade_token else { return };
+            VideoState::UpgradeRequest | VideoState::UpgradeRequestV2
+                if upgrade_token.is_some() =>
+            {
+                let token = upgrade_token.expect("guarded upgrade token");
                 calls.park_upgrade(call_id, token);
                 Self::announce_video_request(ui_sender, call_id, true);
             }
-            // Their camera, not our answer. `Enabled` is what a peer sends
-            // for their own camera and their own rotations, so retiring our
-            // outstanding question on it leaves a later refusal answering
-            // nothing here while the library has already released the plane
-            // under it: the device stays open, encoding for nobody, drawn as
-            // live. Only the two stanzas that are addressed to our request
-            // retire it.
-            VideoState::Enabled => {
+            // The library emits a tokenless request only after resolving glare.
+            VideoState::Enabled
+            | VideoState::UpgradeAccept
+            | VideoState::UpgradeRequest
+            | VideoState::UpgradeRequestV2 => {
+                let accepted = calls.end_upgrade(call_id);
+                Self::withdraw_video_request(calls, ui_sender, call_id).await;
+                if accepted && calls.camera_on(call_id) {
+                    Self::announce_video(ui_sender, call_id, VideoStream::Local, true);
+                    calls.ask_for_keyframe(call_id);
+                }
                 // Their camera has just come on, and the first thing it sends
                 // need not be a keyframe -- a peer that turns video on mid-call
                 // resumes an encoder that is already running. Asking now costs
@@ -1933,49 +2024,62 @@ impl WhatsAppClient {
             // Paused is drawn the same as off, and deliberately: a peer whose
             // app went to the background sends nothing, and a pane held open
             // for it would be a frozen frame nobody can tell from a live one.
-            VideoState::Stopped
-            | VideoState::Disabled
-            | VideoState::Paused
-            | VideoState::Error
-            | VideoState::UnknownPeer => {
+            VideoState::Stopped | VideoState::Paused | VideoState::UnknownPeer => {
                 Self::withdraw_video_request(calls, ui_sender, call_id).await;
                 Self::announce_video(ui_sender, call_id, VideoStream::Remote, false);
             }
-            // Our own upgrade was refused, or ran out of time waiting to be
-            // answered. The camera was opened and announced when the request
-            // went out — the library holds it off the wire until the peer
-            // accepts — so a refusal that only closed the question would
-            // leave the device open and encoding for the rest of the call,
-            // with every window saying our video was on.
-            VideoState::UpgradeReject | VideoState::UpgradeRejectByTimeout => {
-                Self::withdraw_video_request(calls, ui_sender, call_id).await;
-                // Only while a request of ours is outstanding, and then for
-                // whatever camera is held — which is what the library does
-                // with the same stanza: it tears the attached plane down when
-                // some request of ours is pending, and ignores the refusal
-                // when none is. One arriving after our upgrade was already
-                // answered belongs to nothing here, and stopping the camera
-                // on it would take down one nobody refused.
-                if calls.end_upgrade(call_id) {
-                    Self::stop_local_video(calls, ui_sender, call_id, None).await;
-                } else {
-                    debug!("Refused video upgrade on {call_id} answers nothing of ours");
+            VideoState::Disabled
+            | VideoState::Error
+            | VideoState::UpgradeCancel
+            | VideoState::UpgradeCancelByTimeout
+            | VideoState::UpgradeReject
+            | VideoState::UpgradeRejectByTimeout => {
+                let lane = calls.video_lane(call_id);
+                let seq = lane.intent.lock().expect("video intent poisoned").seq;
+                // The event can predate the current intent. Only a closed
+                // endpoint is evidence of library teardown, and the camera
+                // found here may be replaced while we wait for setup.
+                let (camera_id, pending) = {
+                    let calls = calls.calls.lock().expect("call registry poisoned");
+                    let camera_id = match calls.cameras.get(call_id) {
+                        Some(local) if local.endpoint_closed() => Some(local.camera_id()),
+                        Some(_) => return,
+                        None => None,
+                    };
+                    (camera_id, calls.upgrading.get(call_id).copied())
+                };
+                let _serialized = lane.lane.lock().await;
+                if lane.intent.lock().expect("video intent poisoned").seq != seq
+                    || !calls
+                        .video
+                        .lock()
+                        .expect("video lanes poisoned")
+                        .get(call_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &lane))
+                {
+                    return;
                 }
-            }
-            // Their request, withdrawn or timed out. Nothing about either
-            // camera changed; what has changed is that there is no longer a
-            // question on the table, and a front end still drawing one would
-            // be pointing at a peer who has stopped waiting.
-            VideoState::UpgradeCancel | VideoState::UpgradeCancelByTimeout => {
+                let local = {
+                    let mut calls = calls.calls.lock().expect("call registry poisoned");
+                    match (camera_id, calls.cameras.get(call_id)) {
+                        (Some(id), Some(local))
+                            if local.camera_id() == id && local.endpoint_closed() =>
+                        {
+                            calls.cameras.remove(call_id)
+                        }
+                        (None, None) if calls.upgrading.get(call_id).copied() == pending => None,
+                        _ => return,
+                    }
+                };
+                if let Some(local) = local {
+                    Self::stop_owned_video(calls, ui_sender, call_id, local).await;
+                    return;
+                }
                 Self::withdraw_video_request(calls, ui_sender, call_id).await;
-            }
-            // The peer took the upgrade, so nothing of ours is outstanding
-            // and a refusal landing after it answers something else.
-            VideoState::UpgradeAccept => {
                 calls.end_upgrade(call_id);
+                Self::announce_video(ui_sender, call_id, VideoStream::Local, false);
+                Self::announce_video(ui_sender, call_id, VideoStream::Remote, false);
             }
-            // `UpgradeAccept` is answered by the `Enabled` that follows it,
-            // which is the state that actually says a camera is on.
             _ => {}
         }
     }
@@ -2078,25 +2182,536 @@ fn log_termination(call_id: &str, outcome: CallTermination) {
 mod tests {
     use super::*;
 
-    /// A peer turning their own camera on is not an answer to ours. Taken as
-    /// one, the refusal that follows finds nothing outstanding, leaves
-    /// `stop_local_video` unrun, and the camera stands open with its light on
-    /// over a media plane the library has already released.
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn endpoint_timeout_retires_the_owner_pending_and_both_directions() {
+        let calls = CallRegistry::default();
+        let (ui, mut rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let (lost_tx, lost_rx) = async_channel::bounded(1);
+        let cleanup = calls.clone();
+        let cleanup_ui = ui.clone();
+        let (local, endpoints, capture) = video::camera_fixture(
+            "current",
+            Arc::new(move |id, camera| {
+                assert!(
+                    cleanup.calls.try_lock().is_ok(),
+                    "loss callback held the registry lock"
+                );
+                let calls = cleanup.clone();
+                let ui = cleanup_ui.clone();
+                let done = lost_tx.clone();
+                crate::exec::spawn(async move {
+                    WhatsAppClient::stop_local_video(&calls, &ui, &id, Some(camera)).await;
+                    done.try_send(()).unwrap();
+                });
+            }),
+        );
+        assert!(local.alive());
+        assert!(!local.endpoint_closed());
+        calls.begin_upgrade("current", local.camera_id());
+        calls
+            .calls
+            .lock()
+            .unwrap()
+            .cameras
+            .insert("current".into(), local);
+        drop(endpoints);
+        lost_rx.recv().await.unwrap();
+        assert!(capture.is_closed());
+        assert!(calls.calls.lock().unwrap().cameras.is_empty());
+        assert!(
+            !calls.upgrade_pending("current"),
+            "timeout left the pending upgrade behind"
+        );
+        let mut off = Vec::new();
+        while let Ok(UiEvent::CallVideoChanged { stream, on, .. }) = rx.try_recv() {
+            assert!(!on);
+            off.push(stream);
+        }
+        assert!(off.contains(&VideoStream::Local));
+        assert!(off.contains(&VideoStream::Remote));
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn endpoint_closed_before_the_pump_runs_is_not_a_live_camera() {
+        let (local, endpoints, capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+        drop(endpoints);
+        assert!(local.endpoint_closed());
+        assert!(
+            !local.alive(),
+            "closed endpoint advertised a live owner before the pump ran"
+        );
+        let calls = CallRegistry::default();
+        calls.begin_upgrade("current", local.camera_id());
+        assert!(calls.hold_camera("current", local).await != Camera::Held);
+        assert!(capture.is_closed());
+        assert!(!calls.upgrade_pending("current"));
+        assert!(!calls.camera_became_drawable("current"));
+    }
+
     #[tokio::test]
-    async fn a_peers_own_camera_does_not_answer_our_upgrade() {
+    async fn enabled_answers_our_upgrade() {
         let calls = CallRegistry::default();
         let (ui, _rx) = ui_queue::channel(
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(ui_queue::HistoryBudget::new()),
         );
 
-        calls.begin_upgrade("call-1");
+        calls.begin_upgrade("call-1", 0);
         WhatsAppClient::observe_peer_video(&calls, &ui, "call-1", VideoState::Enabled, None).await;
 
         assert!(
-            calls.end_upgrade("call-1"),
-            "our upgrade is still waiting on an answer of its own"
+            !calls.end_upgrade("call-1"),
+            "Enabled completes the locked library's pending local request"
         );
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn accepted_upgrade_projects_remote_enabled_without_another_stanza() {
+        use whatsapp_rust::wacore::voip::{CallSession, PeerVideoTransition};
+        for state in [
+            VideoState::Enabled,
+            VideoState::UpgradeAccept,
+            VideoState::UpgradeRequest,
+            VideoState::UpgradeRequestV2,
+        ] {
+            let library = whatsapp_rust::wacore::voip::CallRegistry::default();
+            let generation = library.insert(CallSession::new_outgoing(
+                "current",
+                "peer@s.whatsapp.net".parse().unwrap(),
+                "self@s.whatsapp.net".parse().unwrap(),
+            ));
+            assert!(
+                library
+                    .begin_local_video_request("current", generation)
+                    .is_some()
+            );
+            assert!(matches!(
+                library.apply_peer_video_state("current", generation, state),
+                PeerVideoTransition::Applied {
+                    enable_plane: true,
+                    teardown_local: false,
+                    ..
+                }
+            ));
+            assert_eq!(
+                library.video_states("current", generation),
+                Some((VideoState::Enabled, VideoState::Enabled))
+            );
+            let calls = CallRegistry::default();
+            let (ui, mut rx) = ui_queue::channel(
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(ui_queue::HistoryBudget::new()),
+            );
+            let (local, endpoints, capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+            calls.begin_upgrade("current", local.camera_id());
+            calls
+                .calls
+                .lock()
+                .unwrap()
+                .cameras
+                .insert("current".into(), local);
+            let lane = calls.video_lane("current");
+            WhatsAppClient::settle_video(&calls, &ui, "current", 0, &lane).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "pending upgrade was announced as on"
+            );
+            WhatsAppClient::observe_peer_video(&calls, &ui, "current", state, None).await;
+            assert!(!calls.end_upgrade("current"));
+            let mut projected = oxidezap_core::CallState::default();
+            projected.set_outgoing(oxidezap_core::OutgoingCall::new(
+                "current",
+                "peer@example.invalid".into(),
+                "Peer".into(),
+                false,
+            ));
+            let mut active_projection = projected.clone();
+            active_projection.connect(&"current".into());
+            while let Ok(event) = rx.try_recv() {
+                if let UiEvent::CallVideoChanged {
+                    call_id,
+                    stream,
+                    on,
+                } = event
+                {
+                    projected.set_video(&call_id, stream, on);
+                    active_projection.set_video(&call_id, stream, on);
+                }
+            }
+            // The per-call event task can beat the global acceptance lane.
+            assert!(!projected.video().remote);
+            projected.connect(&"current".into());
+            assert!(projected.video().remote, "{state:?}");
+            assert!(
+                !projected.video().local,
+                "local state is announced after call connection"
+            );
+            assert!(
+                active_projection.video().local,
+                "the accepted camera must be announced as on"
+            );
+            assert!(active_projection.video().remote);
+            calls.take_camera("current").unwrap().stop().await;
+            assert!(capture.is_closed());
+            drop(endpoints);
+        }
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn retry_releases_dead_owner_and_late_loss_cannot_touch_replacement() {
+        let calls = CallRegistry::default();
+        let (ui, mut rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let (lost_tx, lost_rx) = async_channel::bounded(1);
+        let (a, endpoint_a, capture_a) = video::camera_fixture(
+            "current",
+            Arc::new(move |id, camera| {
+                lost_tx.try_send((id, camera)).unwrap();
+            }),
+        );
+        let id_a = a.camera_id();
+        calls.begin_upgrade("current", id_a);
+        calls
+            .calls
+            .lock()
+            .unwrap()
+            .cameras
+            .insert("current".into(), a);
+        drop(endpoint_a);
+        let (old_call, old_id) = lost_rx.recv().await.unwrap();
+        assert_eq!(old_id, id_a);
+        let lane = calls.video_lane("current");
+        {
+            let _serialized = lane.lane.lock().await;
+            WhatsAppClient::retire_dead_camera(&calls, &ui, "current").await;
+            assert!(
+                capture_a.is_closed(),
+                "retry opened before the old owner stopped"
+            );
+            assert!(!calls.upgrade_pending("current"));
+        }
+        while rx.try_recv().is_ok() {}
+        let (b, endpoint_b, capture_b) = video::camera_fixture("current", Arc::new(|_, _| {}));
+        let id_b = b.camera_id();
+        calls.begin_upgrade("current", id_b);
+        calls
+            .calls
+            .lock()
+            .unwrap()
+            .cameras
+            .insert("current".into(), b);
+        WhatsAppClient::stop_local_video(&calls, &ui, &old_call, Some(old_id)).await;
+        calls.end_camera_upgrade("current", id_a);
+        assert!(calls.camera_on("current"));
+        assert_eq!(
+            calls.calls.lock().unwrap().upgrading.get("current"),
+            Some(&id_b)
+        );
+        assert!(!capture_b.is_closed());
+        assert!(
+            rx.try_recv().is_err(),
+            "old callback changed the replacement's state"
+        );
+        calls.take_camera("current").unwrap().stop().await;
+        drop(endpoint_b);
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn capture_failure_is_not_mistaken_for_endpoint_teardown() {
+        let calls = CallRegistry::default();
+        let (ui, mut rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let (lost_tx, lost_rx) = async_channel::bounded(1);
+        let (local, endpoints, capture) = video::camera_fixture(
+            "current",
+            Arc::new(move |id, camera| {
+                lost_tx.try_send((id, camera)).unwrap();
+            }),
+        );
+        calls.begin_upgrade("current", local.camera_id());
+        calls
+            .calls
+            .lock()
+            .unwrap()
+            .cameras
+            .insert("current".into(), local);
+        capture.close();
+        let (id, camera) = lost_rx.recv().await.unwrap();
+        assert!(!calls.calls.lock().unwrap().cameras[&id].endpoint_closed());
+        WhatsAppClient::stop_local_video(&calls, &ui, &id, Some(camera)).await;
+        assert!(!calls.upgrade_pending("current"));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            UiEvent::CallVideoChanged {
+                stream: VideoStream::Local,
+                on: false,
+                ..
+            }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "device failure must not fabricate remote teardown"
+        );
+        drop(endpoints);
+    }
+
+    #[tokio::test]
+    async fn a_real_peer_request_stays_pending_until_answered() {
+        use whatsapp_rust::wacore::voip::{CallSession, PeerVideoTransition};
+        let library = whatsapp_rust::wacore::voip::CallRegistry::default();
+        let generation = library.insert(CallSession::new_outgoing(
+            "current",
+            "peer@s.whatsapp.net".parse().unwrap(),
+            "self@s.whatsapp.net".parse().unwrap(),
+        ));
+        let PeerVideoTransition::UpgradeRequested(token) =
+            library.apply_peer_video_state("current", generation, VideoState::UpgradeRequestV2)
+        else {
+            panic!("expected actionable token")
+        };
+        let calls = CallRegistry::default();
+        let (ui, mut rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        WhatsAppClient::observe_peer_video(
+            &calls,
+            &ui,
+            "current",
+            VideoState::UpgradeRequestV2,
+            Some(token),
+        )
+        .await;
+        assert!(calls.take_upgrade("current").is_some());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            UiEvent::CallVideoRequested { pending: true, .. }
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn full_video_teardown_clears_pending_and_both_directions() {
+        for state in [
+            VideoState::Disabled,
+            VideoState::Error,
+            VideoState::UpgradeCancel,
+            VideoState::UpgradeCancelByTimeout,
+        ] {
+            let calls = CallRegistry::default();
+            let (ui, mut rx) = ui_queue::channel(
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(ui_queue::HistoryBudget::new()),
+            );
+            calls.begin_upgrade("current", 0);
+            WhatsAppClient::observe_peer_video(&calls, &ui, "current", state, None).await;
+            assert!(!calls.end_upgrade("current"), "{state:?}");
+            let mut off = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let UiEvent::CallVideoChanged { stream, on, .. } = event {
+                    assert!(!on);
+                    off.push(stream);
+                }
+            }
+            assert!(off.contains(&VideoStream::Local), "{state:?}");
+            assert!(off.contains(&VideoStream::Remote), "{state:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_peer_teardown_does_not_retire_a_newer_video_intent() {
+        let calls = CallRegistry::default();
+        let (ui, mut rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let lane = calls.video_lane("current");
+        let held = lane.lane.lock().await;
+        let observe =
+            WhatsAppClient::observe_peer_video(&calls, &ui, "current", VideoState::Disabled, None);
+        tokio::pin!(observe);
+        tokio::select! {
+            biased;
+            () = &mut observe => panic!("teardown must serialize with camera setup"),
+            () = std::future::ready(()) => {}
+        }
+        lane.intent.lock().unwrap().seq += 1;
+        calls.begin_upgrade("current", 0);
+        drop(held);
+        observe.await;
+        assert!(calls.end_upgrade("current"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    async fn delayed_teardown_after_retry_was_stamped(state: VideoState) {
+        use whatsapp_rust::wacore::voip::{CallSession, PeerVideoTransition};
+        for retire_before_consumption in [false, true] {
+            let library = whatsapp_rust::wacore::voip::CallRegistry::default();
+            let generation = library.insert(CallSession::new_outgoing(
+                "current",
+                "peer@s.whatsapp.net".parse().unwrap(),
+                "self@s.whatsapp.net".parse().unwrap(),
+            ));
+            assert!(
+                library
+                    .begin_local_video_request("current", generation)
+                    .is_some()
+            );
+            let calls = CallRegistry::default();
+            let (ui, mut rx) = ui_queue::channel(
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(ui_queue::HistoryBudget::new()),
+            );
+            let (a, endpoint_a, capture_a) = video::camera_fixture("current", Arc::new(|_, _| {}));
+            calls.begin_upgrade("current", a.camera_id());
+            calls
+                .calls
+                .lock()
+                .unwrap()
+                .cameras
+                .insert("current".into(), a);
+            assert!(matches!(
+                library.apply_peer_video_state("current", generation, state),
+                PeerVideoTransition::Applied {
+                    teardown_local: true,
+                    ..
+                }
+            ));
+            drop(endpoint_a);
+
+            let lane = calls.video_lane("current");
+            lane.intent.lock().unwrap().seq += 1;
+            let setup = lane.lane.lock().await;
+            if retire_before_consumption {
+                WhatsAppClient::retire_dead_camera(&calls, &ui, "current").await;
+            }
+            let mut observe = Box::pin(WhatsAppClient::observe_peer_video(
+                &calls, &ui, "current", state, None,
+            ));
+            assert!(
+                futures_lite::future::poll_once(&mut observe)
+                    .await
+                    .is_none()
+            );
+            if !retire_before_consumption {
+                WhatsAppClient::retire_dead_camera(&calls, &ui, "current").await;
+            }
+            assert!(capture_a.is_closed());
+            while rx.try_recv().is_ok() {}
+            let (b, endpoint_b, capture_b) = video::camera_fixture("current", Arc::new(|_, _| {}));
+            let id_b = b.camera_id();
+            calls.begin_upgrade("current", id_b);
+            calls
+                .calls
+                .lock()
+                .unwrap()
+                .cameras
+                .insert("current".into(), b);
+            drop(setup);
+            observe.await;
+            assert!(
+                !capture_b.is_closed(),
+                "{state:?} from A stopped replacement B"
+            );
+            assert!(calls.camera_on("current"));
+            assert_eq!(
+                calls.calls.lock().unwrap().upgrading.get("current"),
+                Some(&id_b)
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "old teardown changed B's video state"
+            );
+            // The same stale event arriving after registration is harmless too.
+            WhatsAppClient::observe_peer_video(&calls, &ui, "current", state, None).await;
+            assert!(calls.camera_on("current"));
+            assert!(calls.upgrade_pending("current"));
+            assert!(rx.try_recv().is_err());
+            calls.take_camera("current").unwrap().stop().await;
+            drop(endpoint_b);
+        }
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn delayed_disabled_does_not_claim_a_retry_already_stamped() {
+        delayed_teardown_after_retry_was_stamped(VideoState::Disabled).await;
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn delayed_reject_does_not_claim_a_retry_already_stamped() {
+        delayed_teardown_after_retry_was_stamped(VideoState::UpgradeReject).await;
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn peer_teardown_still_retires_its_closed_current_endpoint() {
+        for state in [VideoState::Disabled, VideoState::UpgradeReject] {
+            let calls = CallRegistry::default();
+            let (ui, mut rx) = ui_queue::channel(
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(ui_queue::HistoryBudget::new()),
+            );
+            let (local, endpoints, capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+            calls.begin_upgrade("current", local.camera_id());
+            calls
+                .calls
+                .lock()
+                .unwrap()
+                .cameras
+                .insert("current".into(), local);
+            drop(endpoints);
+            WhatsAppClient::observe_peer_video(&calls, &ui, "current", state, None).await;
+            assert!(capture.is_closed());
+            assert!(calls.calls.lock().unwrap().cameras.is_empty());
+            assert!(!calls.upgrade_pending("current"));
+            let mut off = Vec::new();
+            while let Ok(UiEvent::CallVideoChanged { stream, on, .. }) = rx.try_recv() {
+                assert!(!on);
+                off.push(stream);
+            }
+            assert!(off.contains(&VideoStream::Local));
+            assert!(off.contains(&VideoStream::Remote));
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_peer_teardown_does_not_cross_a_call_generation() {
+        let calls = CallRegistry::default();
+        let (ui, mut rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let lane = calls.video_lane("current");
+        let held = lane.lane.lock().await;
+        let observe =
+            WhatsAppClient::observe_peer_video(&calls, &ui, "current", VideoState::Disabled, None);
+        tokio::pin!(observe);
+        tokio::select! {
+            biased;
+            () = &mut observe => panic!("teardown must serialize with camera setup"),
+            () = std::future::ready(()) => {}
+        }
+        calls.ended("current");
+        calls.video_lane("current");
+        calls.begin_upgrade("current", 0);
+        drop(held);
+        observe.await;
+        assert!(calls.end_upgrade("current"));
+        assert!(rx.try_recv().is_err());
     }
 
     /// Stamp a request the way `set_call_muted` does, on the caller's thread.

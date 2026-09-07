@@ -216,6 +216,9 @@ pub enum Admission {
 pub struct CallState {
     stage: Option<Stage>,
     waiting: Option<WaitingCall>,
+    // Video signaling is consumed independently of the call acceptance event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_before_connect: Option<(CallId, bool)>,
     /// What to write down for the call that has just left this state.
     ///
     /// A front end learns a call is over by watching the stage disappear, and
@@ -323,6 +326,7 @@ impl CallState {
     /// one the user has already been shown.
     pub fn set_incoming(&mut self, call: IncomingCall) -> Admission {
         let Some(stage) = &self.stage else {
+            self.remote_before_connect = None;
             self.stage = Some(Stage::Incoming(call));
             return Admission::Ringing;
         };
@@ -346,6 +350,7 @@ impl CallState {
 
     /// We placed a call.
     pub fn set_outgoing(&mut self, call: OutgoingCall) {
+        self.remote_before_connect = None;
         if let Some(prev) = &self.stage {
             log::warn!(
                 "replacing call {} with outgoing {}",
@@ -382,7 +387,10 @@ impl CallState {
 
     pub fn take_outgoing(&mut self) -> Option<OutgoingCall> {
         match self.stage.take() {
-            Some(Stage::Outgoing(call)) => Some(call),
+            Some(Stage::Outgoing(call)) => {
+                self.remote_before_connect = None;
+                Some(call)
+            }
             other => {
                 self.stage = other;
                 None
@@ -435,6 +443,7 @@ impl CallState {
     /// a phone is still ringing that nothing draws.
     fn promote_waiting(&mut self) {
         if self.stage.is_none() {
+            self.remote_before_connect = None;
             self.stage = self
                 .waiting
                 .take()
@@ -520,10 +529,13 @@ impl CallState {
             peer_jid: stage.peer_jid().to_string(),
             peer_name: stage.peer_name().to_string(),
             is_video: stage.is_video(),
-            // Nothing is on the wire yet whichever way the call was offered:
-            // the media plane is brought up by the accept, and each side
-            // announces its own camera. `set_video` is what turns these on.
-            video: CallVideo::default(),
+            video: CallVideo {
+                remote: self
+                    .remote_before_connect
+                    .take()
+                    .is_some_and(|(id, on)| id == *call_id && on),
+                ..CallVideo::default()
+            },
             is_outgoing: matches!(stage, Stage::Outgoing(_)),
             started_at: wacore::time::now_utc(),
             muted: false,
@@ -564,7 +576,13 @@ impl CallState {
             peer_jid: call.caller_jid.clone(),
             peer_name: call.caller_name.clone(),
             is_video: call.is_video,
-            video: CallVideo::default(),
+            video: CallVideo {
+                remote: self
+                    .remote_before_connect
+                    .take()
+                    .is_some_and(|(id, on)| id == call.call_id && on),
+                ..CallVideo::default()
+            },
             // Answering an offer: they called us.
             is_outgoing: false,
             started_at: wacore::time::now_utc(),
@@ -609,6 +627,12 @@ impl CallState {
                     call.video.requested = false;
                     changed = true;
                 }
+                changed
+            }
+            Some(stage) if stage.call_id() == call_id && stream == VideoStream::Remote => {
+                let next = Some((call_id.clone(), on));
+                let changed = self.remote_before_connect != next;
+                self.remote_before_connect = next;
                 changed
             }
             _ => false,
@@ -774,6 +798,7 @@ impl CallState {
         let held = self.stage.is_some() || self.waiting.is_some();
         self.stage = None;
         self.waiting = None;
+        self.remote_before_connect = None;
         held
     }
 
@@ -828,6 +853,11 @@ impl CallState {
     ) -> bool {
         match &mut self.stage {
             Some(Stage::Outgoing(call)) if call.call_id == placeholder_id => {
+                if let Some((id, _)) = &mut self.remote_before_connect
+                    && id == placeholder_id
+                {
+                    id.clone_from(&new_call_id);
+                }
                 call.call_id = new_call_id;
                 call.is_video = is_video;
                 true
@@ -858,6 +888,81 @@ mod tests {
     use super::*;
     use wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
     use wacore_binary::jid::Jid;
+
+    #[test]
+    fn remote_video_before_acceptance_survives_only_its_call() {
+        for on in [false, true] {
+            let mut state = CallState::default();
+            state.set_outgoing(outgoing("current"));
+            state.set_video(&"current".into(), VideoStream::Remote, true);
+            state.set_video(&"current".into(), VideoStream::Remote, on);
+            assert!(!state.set_video(&"unknown".into(), VideoStream::Remote, true));
+            assert!(!state.video().remote);
+            assert!(state.connect(&"current".into()));
+            assert_eq!(state.video().remote, on);
+        }
+        let mut state = CallState::default();
+        state.set_outgoing(outgoing("reused"));
+        state.set_video(&"reused".into(), VideoStream::Remote, true);
+        state.end(&"reused".into());
+        state.set_outgoing(outgoing("reused"));
+        state.connect(&"reused".into());
+        assert!(!state.video().remote);
+    }
+
+    #[test]
+    fn early_remote_video_is_retired_on_every_ringing_exit() {
+        let exits: [fn(&mut CallState); 6] = [
+            |s| {
+                s.end(&"current".into());
+            },
+            |s| {
+                s.end_all();
+            },
+            |s| {
+                s.take();
+            },
+            |s| {
+                s.dismiss_outgoing(&"current".into());
+            },
+            |s| {
+                s.take_outgoing();
+            },
+            |s| {
+                s.set_outgoing(outgoing("current"));
+            },
+        ];
+        for exit in exits {
+            let mut state = CallState::default();
+            state.set_outgoing(outgoing("current"));
+            state.set_video(&"current".into(), VideoStream::Remote, true);
+            exit(&mut state);
+            assert!(state.remote_before_connect.is_none());
+            state.set_outgoing(outgoing("current"));
+            state.connect(&"current".into());
+            assert!(!state.video().remote);
+        }
+    }
+
+    #[test]
+    fn early_remote_video_survives_snapshot_and_matching_accept_only() {
+        let mut state = CallState::default();
+        state.set_incoming(incoming("current"));
+        state.set_video(&"current".into(), VideoStream::Remote, true);
+        state.set_incoming(incoming("waiting"));
+        assert!(!state.set_video(&"waiting".into(), VideoStream::Remote, true));
+        assert!(!state.connect(&"unknown".into()));
+        let encoded = serde_json::to_string(&state).unwrap();
+        let mut restored: CallState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored.accept(&"current".into()), Some(false));
+        assert!(restored.video().remote);
+        let accepted = state.take_incoming().unwrap();
+        state.connect_accepted(&accepted);
+        assert!(state.video().remote);
+        state.end(&"current".into());
+        state.accept(&"waiting".into());
+        assert!(!state.video().remote);
+    }
 
     /// A minimal library offer.
     ///
