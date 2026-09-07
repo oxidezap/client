@@ -156,7 +156,7 @@ async fn reset_closes_pending_and_keeps_one_active_copy_across_generations() {
     assert_eq!(s.browser.stamp(1), 3);
     s.browser.settle(1, false).await.unwrap();
     assert_eq!(s.stamps(), [3]);
-    assert_eq!(s.decoder().produced(), 1);
+    assert_eq!(s.images(), 1);
 }
 
 #[wasm_bindgen_test]

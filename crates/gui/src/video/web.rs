@@ -103,23 +103,10 @@ pub struct StreamingVideoDecoder {
 }
 
 impl StreamingVideoDecoder {
-    /// Demux the container and configure the browser's decoder for it.
-    ///
-    /// # Errors
-    ///
-    /// No video track, a container this build cannot read, or a browser that
-    /// will not decode the stream.
-    pub fn new(mp4_data: &[u8]) -> Result<Self> {
-        Self::attach(Track::read(mp4_data)?)
-    }
-
     /// Build the decoder from work already done.
     ///
-    /// Split from [`Self::new`] because only this half touches JS: the demux
-    /// and the AAC decode are plain Rust over the whole file, twice, and
-    /// running them on the window thread is a conversation that stops
-    /// scrolling for as long as a long attachment takes to open. See
-    /// [`super::build_decoder`].
+    /// Only this half touches JS. [`super::build_decoder`] runs demuxing and
+    /// AAC decoding on the background executor before attaching on this thread.
     ///
     /// # Errors
     ///

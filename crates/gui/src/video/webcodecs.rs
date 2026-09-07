@@ -58,9 +58,6 @@ struct Slot {
     /// errored produces nothing further, so the first reason is the useful
     /// one and later ones are consequences.
     failed: Option<String>,
-    /// How many pictures have come out, which is how a caller waiting for the
-    /// first one knows it has arrived.
-    produced: u64,
     /// The sequence number of the newest picture that was accepted.
     ///
     /// Reading the pixels out of a frame is asynchronous, so several copies
@@ -358,11 +355,6 @@ impl Decoder {
         self.refused.replace(false)
     }
 
-    /// How many pictures have come out so far.
-    pub fn produced(&self) -> u64 {
-        self.slot.borrow().produced
-    }
-
     /// Forget everything decoded so far and start again at a keyframe.
     ///
     /// What a seek costs on this path: the browser's decoder has its own
@@ -381,7 +373,6 @@ impl Decoder {
         {
             let mut slot = self.slot.borrow_mut();
             slot.newest = None;
-            slot.produced = 0;
             slot.accepted = 0;
         }
 
@@ -628,7 +619,6 @@ async fn read_frame(
         }
         slot.accepted = stamp.seq;
         slot.newest = Some(picture.clone());
-        slot.produced += 1;
     }
     // After the borrow is released: a sink is the caller's code, and one
     // that asked this decoder anything would find it already borrowed.
