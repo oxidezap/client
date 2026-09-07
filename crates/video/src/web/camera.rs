@@ -407,10 +407,12 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
     // Armed before anything else can fail: from here to `Held` the camera is
     // open, and every `?` below would otherwise leave it that way.
     let guard = open_device(&window, quality).await?;
-    let stream = guard.0.as_ref().expect("just armed").clone();
+    // MediaStream::clone duplicates tracks, not just the JS handle. Borrow so
+    // the preview and ended handlers use the tracks the guard will stop.
+    let stream = guard.0.as_ref().expect("just armed");
     // Guarded from the moment it is in the document, for the same reason the
     // camera is guarded from the moment it is open: see `ElementGuard`.
-    let preview = attach(&window, &stream).await?;
+    let preview = attach(&window, stream).await?;
     let element = preview.0.as_ref().expect("just armed").clone();
 
     let (tx, rx) = async_channel::bounded::<EncodedFrame>(FRAME_DEPTH);
