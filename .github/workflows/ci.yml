@@ -91,7 +91,11 @@ jobs:
           # and evicts least-recently-used, so letting every PR save a ~4 GB
           # entry would push out the one branch every PR restores from.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo fmt --all -- --check
+      - name: Check formatting
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path crates/gui/tests/webcodecs/Cargo.toml --all -- --check
+          cargo fmt --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml --all -- --check
       - name: Check unused dependencies
         run: cargo machete
       # --all-features so the chat store's `search` feature (FTS5) is covered;
@@ -99,6 +103,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo nextest run --workspace --all-features
+      - name: Test call playout statistics
+        run: |
+          CARGO_TARGET_DIR=target/call-playout-tests cargo test \
+            --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
+            --locked --test stats
       # nextest cannot run doctests (nextest-rs/nextest#16) and silently reports
       # none, so they need their own libtest step.
       - name: Run doctests
@@ -304,7 +313,13 @@ jobs:
           cargo test -p oxidezap-daemon -p oxidezap-session --lib --target wasm32-unknown-unknown
           CARGO_TARGET_DIR=target/webcodecs-tests cargo test \
             --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
-            --locked --target wasm32-unknown-unknown --test readback
+            --locked --target wasm32-unknown-unknown --test readback --test recovery
+          # The rejection test needs SharedArrayBuffer without isolation headers.
+          export WASM_BINDGEN_TEST_WEBDRIVER_JSON="$RUNNER_TEMP/call-playout-webdriver.json"
+          printf '%s\n' '{"goog:chromeOptions":{"args":["--enable-features=SharedArrayBuffer"]}}' > "$WASM_BINDGEN_TEST_WEBDRIVER_JSON"
+          CARGO_TARGET_DIR=target/call-playout-browser cargo test \
+            --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
+            --locked --target wasm32-unknown-unknown --test browser
 
   # The library crates an embedder can depend on: the chat store, which lost
   # the MSRV job it had in whatsapp-rust when it moved here, and the IPC

@@ -110,7 +110,8 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 # and no two crates can drift onto incompatible revisions. The exact commit is
 # pinned in the committed Cargo.lock.
 #
-# main includes the upright RTP video orientation fix from whatsapp-rust#1463.
+# main includes the upright RTP video orientation fix from whatsapp-rust#1463
+# and the MLow success-log trace level from whatsapp-rust#1466.
 #
 # `whatsapp-rust` re-exports wacore, wacore-binary and waproto wholesale, so
 # anything already depending on it reaches them through that and does not
