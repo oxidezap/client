@@ -121,7 +121,11 @@ const PLAYOUT_PRIME: usize = 180;
 struct Graph {
     diagnostics: Rc<RefCell<Diagnostics>>,
     context: web_sys::AudioContext,
-    stream: web_sys::MediaStream,
+    /// The microphone's tracks, moved in rather than cloned. `MediaStream`'s
+    /// inherent `clone` is the browser method and duplicates tracks, so a
+    /// cloned stream would stop copies here while the original kept the
+    /// microphone. `wire` borrows the guard's stream and moves its tracks.
+    tracks: Vec<web_sys::MediaStreamTrack>,
     /// The node the microphone feeds, held so it can be *disconnected*.
     ///
     /// It was a local in `wire` before, which left the only thing still
@@ -154,24 +158,22 @@ impl Drop for Graph {
         let _ = self.playout.disconnect();
         let mut stopped = 0usize;
         let mut still_live = 0usize;
-        for track in self.stream.get_tracks().iter() {
-            if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
-                // Before `stop`, and before the closures below are dropped
-                // with `self`: `stop()` is specified not to fire `ended`, but
-                // a handler the browser calls after its closure has gone is a
-                // trap rather than a missed event, so nothing is left armed.
-                track.set_onended(None);
-                track.stop();
-                // Asked rather than assumed. `stop()` sets `readyState` to
-                // `ended` synchronously, so a track still live here is a
-                // device this teardown did not release — which is what a
-                // person reports as a tab that keeps its microphone, and it
-                // is precisely what a count of `stop()` *calls* cannot show.
-                if track.ready_state() == web_sys::MediaStreamTrackState::Ended {
-                    stopped += 1;
-                } else {
-                    still_live += 1;
-                }
+        for track in &self.tracks {
+            // Before `stop`, and before the closures below are dropped
+            // with `self`: `stop()` is specified not to fire `ended`, but
+            // a handler the browser calls after its closure has gone is a
+            // trap rather than a missed event, so nothing is left armed.
+            track.set_onended(None);
+            track.stop();
+            // Asked rather than assumed. `stop()` sets `readyState` to
+            // `ended` synchronously, so a track still live here is a
+            // device this teardown did not release — which is what a
+            // person reports as a tab that keeps its microphone, and it
+            // is precisely what a count of `stop()` *calls* cannot show.
+            if track.ready_state() == web_sys::MediaStreamTrackState::Ended {
+                stopped += 1;
+            } else {
+                still_live += 1;
             }
         }
         // The count, because "the graph is closed" was a sentence this line
@@ -291,6 +293,24 @@ pub async fn open_call_audio() -> Result<(
 )> {
     let context = web_sys::AudioContext::new()
         .map_err(|e| anyhow!("this browser has no AudioContext: {}", describe(&e)))?;
+    // Closed on the way out unless setup reaches the graph: dropping an
+    // `AudioContext` handle leaves the context itself running, and a setup
+    // dropped while the permission prompt is still up never built the
+    // `Opening` guard that would otherwise close it.
+    struct UnclosedContext(Option<web_sys::AudioContext>);
+    impl UnclosedContext {
+        fn keep(mut self) {
+            self.0.take();
+        }
+    }
+    impl Drop for UnclosedContext {
+        fn drop(&mut self) {
+            if let Some(context) = self.0.take() {
+                let _ = context.close();
+            }
+        }
+    }
+    let unclosed = UnclosedContext(Some(context.clone()));
     let rate = context.sample_rate() as u32;
 
     let opening = Opening {
@@ -299,7 +319,11 @@ pub async fn open_call_audio() -> Result<(
             let _ = context.close();
         })?),
     };
-    let stream = opening.stream.as_ref().expect("just armed").clone();
+    // Borrowed, not cloned: `MediaStream::clone` is the browser method and
+    // duplicates tracks, which teardown could then never reach. `wire` moves
+    // the tracks into the graph; the guard's stream handle is released —
+    // never stopped — once setup owns them.
+    let stream = opening.stream.as_ref().expect("just armed");
 
     let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(MIC_DEPTH);
     let (speaker_tx, speaker_rx) = async_channel::bounded::<Vec<i16>>(MIC_DEPTH * 4);
@@ -316,7 +340,7 @@ pub async fn open_call_audio() -> Result<(
 
     let graph = wire(
         &context,
-        &stream,
+        stream,
         rate,
         mic_tx.clone(),
         Rc::clone(&playout),
@@ -346,6 +370,7 @@ pub async fn open_call_audio() -> Result<(
     // Past every fallible step: `Graph` owns the context and the microphone
     // from here, and closes both when the call ends.
     let _stream = opening.release();
+    unclosed.keep();
 
     // One task owns the graph, and it ends when the call does. Both channels
     // are dropped together by the call's teardown, so whichever is noticed
@@ -401,18 +426,38 @@ async fn open_microphone() -> Result<web_sys::MediaStream> {
     // goes on ringing until their own timeout. The camera's prompt is bounded
     // the same way and for the same half of this reason.
     let abandoned = std::rc::Rc::new(std::cell::Cell::new(false));
+    let claimed = std::rc::Rc::new(std::cell::Cell::new(false));
     // A prompt answered after we gave up still opens the device, and the
     // stream it resolves with is one nothing here is holding — so its tracks
     // would run, with the tab's indicator on, until the page went away. The
     // same promise is awaited twice, which is what promises are for.
+    //
+    // Giving up is not only the timeout below: dropping this future while the
+    // prompt is up — the call was cancelled — must arm the same cleanup, so
+    // the drop itself sets `abandoned`. `claimed` keeps that from ever
+    // stopping a live stream: it is set synchronously when this function
+    // takes the stream, before any further await, so a handler observing
+    // `abandoned` with `claimed` set knows its opener is still holding it.
+    struct AbandonOnDrop {
+        abandoned: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+    impl Drop for AbandonOnDrop {
+        fn drop(&mut self) {
+            self.abandoned.set(true);
+        }
+    }
+    let _abandon = AbandonOnDrop {
+        abandoned: std::rc::Rc::clone(&abandoned),
+    };
     {
         let abandoned = std::rc::Rc::clone(&abandoned);
+        let claimed = std::rc::Rc::clone(&claimed);
         let late = asked.clone();
         crate::web::spawn(async move {
             let Ok(value) = wasm_bindgen_futures::JsFuture::from(late).await else {
                 return;
             };
-            if !abandoned.get() {
+            if !abandoned.get() || claimed.get() {
                 return;
             }
             if let Ok(stream) = value.dyn_into::<web_sys::MediaStream>() {
@@ -437,10 +482,14 @@ async fn open_microphone() -> Result<web_sys::MediaStream> {
         bail!("the microphone permission prompt went unanswered");
     };
 
-    opened
+    let stream = opened
         .map_err(|e| anyhow!("the microphone was refused: {}", describe(&e)))?
         .dyn_into::<web_sys::MediaStream>()
-        .map_err(|_| anyhow!("the browser opened something that is not a stream"))
+        .map_err(|_| anyhow!("the browser opened something that is not a stream"))?;
+    // Synchronously with taking it, before any further await: from here the
+    // late-grant handler above knows this stream has an owner.
+    claimed.set(true);
+    Ok(stream)
 }
 
 /// How long a microphone permission prompt is waited on.
@@ -530,7 +579,15 @@ fn wire(
 
     let playout_node = context
         .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(CHUNK, 0, 1)
-        .map_err(|e| anyhow!("no playout node: {}", describe(&e)))?;
+        .map_err(|e| {
+            // The capture handler is already armed and its closure is still
+            // alive here, so it is detached now rather than left for a guard
+            // that does not exist yet. A node that never connects never fires,
+            // but the probe counts an armed handler as a leak either way.
+            capture.set_onaudioprocess(None);
+            let _ = capture.disconnect();
+            anyhow!("no playout node: {}", describe(&e))
+        })?;
 
     let diagnostics_enabled = log::log_enabled!(log::Level::Warn);
     let diagnostics = Rc::new(RefCell::new(Diagnostics::new(diagnostics_enabled)));
@@ -595,7 +652,12 @@ fn wire(
     // up, the engine goes on waiting for input, and the person on the other
     // end hears silence with nothing anywhere saying why. Closing the channel
     // is the same ending the teardown uses, so it needs no second path out.
-    let on_ended: Vec<Closure<dyn FnMut(web_sys::Event)>> = stream
+    // The tracks move into the graph, never cloned: `MediaStream::clone`
+    // duplicates tracks, and stopping a clone leaves the original running.
+    let (tracks, on_ended): (
+        Vec<web_sys::MediaStreamTrack>,
+        Vec<Closure<dyn FnMut(web_sys::Event)>>,
+    ) = stream
         .get_tracks()
         .iter()
         .filter_map(|track| track.dyn_into::<web_sys::MediaStreamTrack>().ok())
@@ -624,9 +686,9 @@ fn wire(
                 ended_locally_now.capture_ended();
                 ended_mic.close();
             }
-            ended
+            (track, ended)
         })
-        .collect();
+        .unzip();
 
     // Past every `?`: `Graph` detaches these from here.
     wiring.release();
@@ -634,7 +696,7 @@ fn wire(
     Ok(Graph {
         diagnostics,
         context: context.clone(),
-        stream: stream.clone(),
+        tracks,
         source,
         capture,
         playout: playout_node,
