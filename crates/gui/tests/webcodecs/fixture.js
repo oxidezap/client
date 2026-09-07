@@ -186,6 +186,12 @@ export class ControlledDecoder {
             template?.close();
             if (encoder && encoder.state !== "closed") encoder.close();
             if (decoder && decoder.state !== "closed") decoder.close();
+            // A throw before the per-iteration restore must not leak the
+            // format override into later tests sharing this browser realm.
+            if (this.originalCopy) {
+                VideoFrame.prototype.copyTo = this.originalCopy;
+                this.originalCopy = undefined;
+            }
         }
         if (copyFormats[0] !== "RGBA" || copyFormats[1] !== "BGRA") {
             throw new Error(`benchmark did not compare RGBA/BGRA: ${copyFormats}`);
