@@ -7,6 +7,7 @@
 //! - `calls`: Call state management (incoming/outgoing)
 
 mod attaching;
+mod body;
 mod calls;
 mod calls_ctl;
 pub mod chat_row;
@@ -30,6 +31,8 @@ mod timeline_ctl;
 mod viewer;
 
 pub use calls::CallCard;
+#[cfg(all(test, unix))]
+pub(crate) use calls_ctl::exercise_call_frame_adoption;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
 pub use chats::{ChatFilter, ChatListCache, Survival, survives_complete_load};
 pub use media::RecordingState;
@@ -569,6 +572,9 @@ pub enum ChatOpen {
 
 /// Main application struct
 pub struct WhatsAppApp {
+    body: Option<Entity<body::Body>>,
+    #[cfg(test)]
+    body_renders: usize,
     /// Current application state
     app_state: AppState,
     /// List of chats
@@ -978,6 +984,9 @@ impl WhatsAppApp {
     /// Create a new WhatsApp application
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            body: None,
+            #[cfg(test)]
+            body_renders: 0,
             app_state: AppState::Loading,
             chats: Vec::new(),
             selected_chat: None,
@@ -3114,14 +3123,11 @@ impl Render for WhatsAppApp {
             // including the rem gpui-component's own controls resolve from.
             window.refresh();
         }
-        let entity = cx.entity().clone();
-        // Cleared here and set by whichever branch below actually draws a
-        // conversation, so it describes this frame rather than an older one:
-        // the pairing, error and Settings screens draw none. The keyboard
-        // surfaces go the same way and for the same reason — focus may only
-        // be handed to something this frame drew.
-        self.visible_chat = None;
-        self.keyboard_surfaces = KeyboardSurfaces::default();
+        let entity = cx.entity();
+        if self.body.is_none() {
+            self.body = Some(cx.new(|cx| body::Body::new(self, entity.clone(), cx)));
+        }
+        let body = self.body.as_ref().unwrap().clone();
 
         // Window-level commands hang off the root so they work wherever focus
         // happens to be, which is the point of a window-level command.
@@ -3167,38 +3173,6 @@ impl Render for WhatsAppApp {
         // it, computed before the borrow below.
         let connected = matches!(self.app_state, AppState::Connected | AppState::Offline);
 
-        let body = match &self.app_state {
-            AppState::Loading => render_loading_view(cx).into_any_element(),
-            AppState::Connecting => render_connecting_view(cx).into_any_element(),
-            AppState::WaitingForPairing { qr_code, pair_code } => {
-                render_pairing_view(qr_code.as_ref(), pair_code.clone(), cx).into_any_element()
-            }
-            AppState::Syncing => render_syncing_view(cx).into_any_element(),
-            // Settings is a screen over the conversation view, so it takes
-            // the whole frame while it is open rather than floating.
-            AppState::Connected | AppState::Offline if self.showing_settings(cx) => {
-                render_settings_view(self, window, cx).into_any_element()
-            }
-            AppState::Connected | AppState::Offline => {
-                render_connected_view(self, window, cx).into_any_element()
-            }
-            AppState::Error(fault) => render_error_view(
-                fault,
-                self.retry_countdown(cx),
-                self.error_detail_open(cx),
-                entity,
-                cx,
-            )
-            .into_any_element(),
-            AppState::Refused { reason } => {
-                render_refused_view(reason, self.error_detail_open(cx), entity, cx)
-                    .into_any_element()
-            }
-            AppState::LoggedOut { message } => {
-                render_logged_out_view(message, entity, cx).into_any_element()
-            }
-        };
-
         // Outside the Settings-versus-conversation branch on purpose. The
         // card and the focus it takes were built by the conversation view
         // alone, so a call arriving while Settings was open rang at the far
@@ -3210,12 +3184,7 @@ impl Render for WhatsAppApp {
 
         // The card is the one surface the root draws itself, so it is the
         // one the root answers for.
-        self.keyboard_surfaces.call_card = call_overlay.is_some();
-        // After the body, which is what named the surfaces it drew, and
-        // before the frame is painted, which is when the focus it hands over
-        // takes effect. Unconditional: the screens on the way to a
-        // conversation need a keyboard too, and the window is what they get.
-        self.sync_overlay_focus(window, cx);
+        let call_card = call_overlay.is_some();
 
         // Above the call card as well as the body: a notice raised by
         // something the call did is about the call, and a card that covered
@@ -3223,9 +3192,28 @@ impl Render for WhatsAppApp {
         // out of here, so the clock taking a line down repaints the stack and
         // asks nothing of the conversation underneath it; the stack draws
         // nothing at all while it is empty.
-        root.child(body)
+        root.child(body.cached(gpui::StyleRefinement::default().size_full()))
             .children(call_overlay)
             .child(self.notices().clone())
+            // Cached views report their surfaces in prepaint. Move focus after
+            // drawing, when focus can schedule the frame that delivers blur/focus.
+            .child(
+                gpui::canvas(
+                    move |_, window, cx| {
+                        entity.update(cx, |app, _| {
+                            app.keyboard_surfaces.call_card = call_card;
+                        });
+                        let entity = entity.downgrade();
+                        window.defer(cx, move |window, cx| {
+                            let _ = entity.update(cx, |app, cx| {
+                                app.sync_overlay_focus(window, cx);
+                            });
+                        });
+                    },
+                    |_, (), _, _| {},
+                )
+                .absolute(),
+            )
     }
 }
 

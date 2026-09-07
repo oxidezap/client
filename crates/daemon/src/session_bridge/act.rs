@@ -583,6 +583,9 @@ impl Bridge {
                     CallAction::SetVideo { call_id, enabled } => {
                         client.set_call_video(&call_id, enabled);
                     }
+                    CallAction::RequestVideoKeyframe { call_id, stream } => {
+                        client.request_call_video_keyframe(&call_id, stream);
+                    }
                 }
                 CommandOutcome::Accepted
             }

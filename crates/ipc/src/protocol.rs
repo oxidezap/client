@@ -1041,6 +1041,10 @@ pub enum CallAction {
         call_id: String,
         enabled: bool,
     },
+    RequestVideoKeyframe {
+        call_id: String,
+        stream: oxidezap_core::VideoStream,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -1091,6 +1095,30 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_recovery_roundtrips_call_and_direction() {
+        for stream in [
+            oxidezap_core::VideoStream::Local,
+            oxidezap_core::VideoStream::Remote,
+        ] {
+            let action = CallAction::RequestVideoKeyframe {
+                call_id: "test-call".into(),
+                stream,
+            };
+            let encoded = serde_json::to_string(&action).unwrap();
+            assert_eq!(
+                serde_json::from_str::<CallAction>(&encoded).unwrap(),
+                action
+            );
+        }
+        assert!(
+            serde_json::from_str::<CallAction>(
+                r#"{"call":"request_video_keyframe","call_id":"test-call"}"#
+            )
+            .is_err()
+        );
+    }
 
     /// One chat holds everybody's status updates, and watching one is
     /// recorded on the message rather than on that counter — so it never goes

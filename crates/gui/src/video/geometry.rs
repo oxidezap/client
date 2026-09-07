@@ -142,13 +142,27 @@ pub(super) fn write_bgra_rotated(
 /// For a frame that is not being turned: the destination is the buffer the
 /// image will own, so it can be written into directly and corrected in place
 /// rather than copied out of a scratch.
-// The caller is the call pane's own decoder, which is openh264 and so
-// native: a page decodes through WebCodecs and never holds an RGBA buffer of
-// its own to correct.
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub(super) fn swap_rb_in_place(pixels: &mut [u8]) {
     for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
+    }
+}
+
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+pub(super) fn into_bgra_rotated(
+    mut pixels: Vec<u8>,
+    width: usize,
+    height: usize,
+    rotation: Rotation,
+) -> Vec<u8> {
+    debug_assert_eq!(pixels.len(), width * height * 4);
+    if rotation == Rotation::None {
+        swap_rb_in_place(&mut pixels);
+        pixels
+    } else {
+        let mut output = vec![0; pixels.len()];
+        write_bgra_rotated(&pixels, width, height, rotation, &mut output);
+        output
     }
 }
 
@@ -303,6 +317,32 @@ mod tests {
         let mut dst = [0u8; 4];
         write_bgra_rotated(&src, 1, 1, Rotation::None, &mut dst);
         assert_eq!(dst, [30, 20, 10, 40]);
+    }
+
+    #[test]
+    fn owned_conversion_matches_every_rotation() {
+        for (width, height) in [(1, 1), (3, 2), (1, 5), (5, 1)] {
+            for rotation in [
+                Rotation::None,
+                Rotation::Cw90,
+                Rotation::Cw180,
+                Rotation::Cw270,
+            ] {
+                let source: Vec<u8> = (0..width * height * 4).map(|i| i as u8).collect();
+                let mut expected = vec![0; source.len()];
+                write_bgra_rotated(&source, width, height, rotation, &mut expected);
+                assert_eq!(into_bgra_rotated(source, width, height, rotation), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn unrotated_conversion_keeps_the_allocation() {
+        let source = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let pointer = source.as_ptr();
+        let converted = into_bgra_rotated(source, 2, 1, Rotation::None);
+        assert_eq!(converted.as_ptr(), pointer);
+        assert_eq!(converted, [30, 20, 10, 40, 70, 60, 50, 80]);
     }
 
     #[test]

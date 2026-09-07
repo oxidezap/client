@@ -671,16 +671,14 @@ impl CallRegistry {
         }
     }
 
-    /// Ask every live camera, for a subscriber who has never seen one.
+    /// Ask both directions of every live call for a new subscriber or a delivery gap.
     fn ask_all_for_keyframes(&self) {
-        for local in self
-            .calls
-            .lock()
-            .expect("call registry poisoned")
-            .cameras
-            .values()
-        {
-            local.request_keyframe();
+        let calls = self.calls.lock().expect("call registry poisoned");
+        for (id, handle) in &calls.active {
+            if let Some(local) = calls.cameras.get(id) {
+                local.request_keyframe();
+            }
+            handle.request_peer_keyframe(KeyframeUrgency::Coalesced);
         }
     }
 
@@ -1063,23 +1061,25 @@ impl WhatsAppClient {
         });
     }
 
-    /// Ask every live camera for a keyframe, because somebody is about to
-    /// draw who has never seen one.
-    ///
-    /// A window attaching mid-call subscribes to the stream where it happens
-    /// to be, which is a P-frame referencing units published before it was
-    /// listening. Its decoder can do nothing with those, so the self-view
-    /// stays empty until the encoder's own periodic IDR — seconds, on a
-    /// picture the person just opened a window to see. The same rule every
-    /// other moment a decoder is born follows.
-    ///
-    /// Every camera rather than one call's: this is asked when a subscriber
-    /// arrives, and a subscriber draws whatever the daemon is holding.
+    /// Recover both directions after subscriber attachment or daemon delivery lag.
     pub fn request_video_keyframe(&self) {
-        let calls = self.calls.clone();
-        self.exec.spawn(async move {
-            calls.ask_all_for_keyframes();
-        });
+        self.calls.ask_all_for_keyframes();
+    }
+
+    /// Recover only the named live call and direction, never a replacement call.
+    pub fn request_call_video_keyframe(&self, call_id: &str, stream: VideoStream) {
+        let calls = self.calls.calls.lock().expect("call registry poisoned");
+        let Some(handle) = calls.active.get(call_id) else {
+            return;
+        };
+        match stream {
+            VideoStream::Local => {
+                if let Some(local) = calls.cameras.get(call_id) {
+                    local.request_keyframe();
+                }
+            }
+            VideoStream::Remote => handle.request_peer_keyframe(KeyframeUrgency::Coalesced),
+        }
     }
 
     /// Turn this side's camera on or off during a live call.

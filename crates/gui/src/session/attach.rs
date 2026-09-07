@@ -45,6 +45,7 @@ pub(super) struct Attached {
     pub pending: Pending,
     /// Where a decoded call picture goes.
     pub pictures: crate::video::LatestFrames,
+    pub recover: crate::video::RecoverySink,
 }
 
 /// Say hello, and hand back the parts a reader is assembled from.
@@ -78,12 +79,14 @@ pub(super) fn begin(
     })?;
     let pending = Arc::clone(&session.conn.pending);
     let pictures = session.call_frames().clone();
+    let recover = super::recovery::sink(session.conn.wire.clone())?;
     Ok(Attached {
         session,
         events,
         sink,
         pending,
         pictures,
+        recover,
     })
 }
 

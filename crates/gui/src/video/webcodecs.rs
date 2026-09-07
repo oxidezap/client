@@ -38,7 +38,7 @@ use wasm_bindgen::prelude::Closure;
 
 use super::geometry::{
     MAX_VIDEO_PIXELS, Rotation, TurnLog, declares_more_than, declares_unreadably, frame_byte_len,
-    write_bgra_rotated,
+    into_bgra_rotated,
 };
 
 /// The newest decoded picture, and what has gone wrong.
@@ -58,9 +58,6 @@ struct Slot {
     /// errored produces nothing further, so the first reason is the useful
     /// one and later ones are consequences.
     failed: Option<String>,
-    /// How many pictures have come out, which is how a caller waiting for the
-    /// first one knows it has arrived.
-    produced: u64,
     /// The sequence number of the newest picture that was accepted.
     ///
     /// Reading the pixels out of a frame is asynchronous, so several copies
@@ -109,14 +106,8 @@ pub struct Decoder {
     /// So the fact is reported rather than only acted on, and the caller that
     /// cares asks.
     refused: Rc<Cell<bool>>,
-    /// How many copies have been started and not yet resolved.
-    ///
-    /// The callers bound the decoder's *input* queue, which says nothing
-    /// about frames that have already left it. Reading the pixels out of one
-    /// is asynchronous and allocates the whole picture, so a browser that
-    /// decodes faster than it copies accumulates multi-megabyte buffers for
-    /// as long as a call lasts, however few of them anybody draws.
-    in_flight: Rc<Cell<usize>>,
+    /// Live calls keep one active readback and replace only the pending output.
+    pending: Rc<RefCell<Option<PendingFrame>>>,
     /// The turn to apply to the next unit fed.
     ///
     /// A cell because a call's is per frame: a peer's orientation describes
@@ -187,6 +178,8 @@ impl Decoder {
         let submitted = Rc::new(Cell::new(0u64));
         let in_flight = Rc::new(Cell::new(0usize));
         let refused = Rc::new(Cell::new(false));
+        let pending = Rc::new(RefCell::new(None::<PendingFrame>));
+        let spare = Rc::new(RefCell::new(None::<js_sys::Uint8Array>));
         let turns: Rc<RefCell<TurnLog>> = Rc::new(RefCell::new(TurnLog::default()));
 
         let on_frame = {
@@ -197,41 +190,54 @@ impl Decoder {
             let submitted = Rc::clone(&submitted);
             let in_flight = Rc::clone(&in_flight);
             let refused = Rc::clone(&refused);
+            let pending = Rc::clone(&pending);
+            let spare = Rc::clone(&spare);
             Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame: web_sys::VideoFrame| {
+                let turn = turns
+                    .borrow_mut()
+                    .take(frame.timestamp() as i32)
+                    .unwrap_or_else(|| rotation.get());
                 // Dropped rather than queued, which is what every queue on
                 // this path does: the slot holds one picture, so a frame
                 // arriving while that many copies are still outstanding is
                 // one nobody was going to see. Closing it is not optional
                 // either, since an unclosed `VideoFrame` pins a decoder
                 // buffer and a decoder that runs out stops producing.
-                if in_flight.get() >= MAX_COPIES_IN_FLIGHT {
+                if sink.is_none() && in_flight.get() >= MAX_COPIES_IN_FLIGHT {
                     frame.close();
                     refused.set(true);
                     return;
                 }
                 let seq = submitted.get().wrapping_add(1);
                 submitted.set(seq);
-                // The turn this picture was encoded under, not whatever the
-                // peer has done since. Falls back to the current one for a
-                // picture whose stamp was never recorded, which is the
-                // attachment path, where the turn never changes anyway.
-                let turn = turns
-                    .borrow_mut()
-                    .take(frame.timestamp() as i32)
-                    .unwrap_or_else(|| rotation.get());
-                read_frame(
+                let work = PendingFrame {
                     frame,
-                    turn,
-                    max_pixels,
-                    Rc::clone(&slot),
-                    sink.clone(),
-                    Stamp {
+                    rotation: turn,
+                    stamp: Stamp {
                         generation: Rc::clone(&generation),
                         born: generation.get(),
                         seq,
                     },
-                    Rc::clone(&in_flight),
-                );
+                };
+                // Only decoded output is replaced. Compressed units must all
+                // reach the decoder to preserve its reference chain.
+                if sink.is_some() && in_flight.get() != 0 {
+                    *pending.borrow_mut() = Some(work);
+                    return;
+                }
+                let outstanding = Outstanding::new(Rc::clone(&in_flight));
+                let pending = Rc::clone(&pending);
+                let spare = Rc::clone(&spare);
+                let slot = Rc::clone(&slot);
+                let sink = sink.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _outstanding = outstanding;
+                    let mut work = Some(work);
+                    while let Some(frame) = work {
+                        read_frame(frame, max_pixels, &slot, sink.as_ref(), &spare).await;
+                        work = pending.borrow_mut().take();
+                    }
+                });
             })
         };
         let on_error = {
@@ -251,27 +257,30 @@ impl Decoder {
         let inner = web_sys::VideoDecoder::new(&init)
             .map_err(|e| format!("this browser has no video decoder: {e:?}"))?;
 
-        let config = web_sys::VideoDecoderConfig::new(&codec);
-        // Left to the browser: it knows its own hardware, and the picture is
-        // read back through `copy_to` either way.
-        inner
-            .configure(&config)
-            .map_err(|e| format!("the browser would not decode {codec}: {e:?}"))?;
-
-        Ok(Self {
+        // Install the close guard before configure can fail.
+        let decoder = Self {
             inner,
             slot,
             codec,
             generation,
             submitted,
-            in_flight,
+            pending,
             refused,
             rotation,
             turns,
             max_pixels,
             _on_frame: on_frame,
             _on_error: on_error,
-        })
+        };
+        let config = web_sys::VideoDecoderConfig::new(&decoder.codec);
+        // Left to the browser: it knows its own hardware, and the picture is
+        // read back through `copy_to` either way.
+        decoder
+            .inner
+            .configure(&config)
+            .map_err(|e| format!("the browser would not decode {}: {e:?}", decoder.codec))?;
+
+        Ok(decoder)
     }
 
     /// Hand one access unit to the decoder.
@@ -346,11 +355,6 @@ impl Decoder {
         self.refused.replace(false)
     }
 
-    /// How many pictures have come out so far.
-    pub fn produced(&self) -> u64 {
-        self.slot.borrow().produced
-    }
-
     /// Forget everything decoded so far and start again at a keyframe.
     ///
     /// What a seek costs on this path: the browser's decoder has its own
@@ -360,6 +364,7 @@ impl Decoder {
         // Before anything else, so a copy already in flight is recognised as
         // belonging to the stream that has just been left behind.
         self.generation.set(self.generation.get().wrapping_add(1));
+        self.pending.borrow_mut().take();
         self.submitted.set(0);
         self.refused.set(false);
 
@@ -368,7 +373,6 @@ impl Decoder {
         {
             let mut slot = self.slot.borrow_mut();
             slot.newest = None;
-            slot.produced = 0;
             slot.accepted = 0;
         }
 
@@ -420,16 +424,12 @@ impl Drop for Decoder {
         // its sink outlive it: a call replaces the decoder without replacing
         // either, so a picture from the old one would land on the new stream.
         self.generation.set(self.generation.get().wrapping_add(1));
+        self.pending.borrow_mut().take();
         let _ = self.inner.close();
     }
 }
 
-/// How many pixel copies may be outstanding at once.
-///
-/// A little more than the deepest input queue either caller allows, so an
-/// ordinary burst is never refused and a browser that has stopped resolving
-/// copies stops costing memory. The slot holds one picture, so what is
-/// dropped here is a picture nobody would have drawn.
+/// Attachments retain concurrent copies and report overflow for seek replay.
 const MAX_COPIES_IN_FLIGHT: usize = 8;
 
 /// One outstanding pixel copy, counted while it lives.
@@ -468,6 +468,22 @@ impl Stamp {
     fn current(&self) -> bool {
         self.generation.get() == self.born
     }
+
+    fn wanted(&self, slot: &Slot) -> bool {
+        self.current() && self.seq > slot.accepted && slot.failed.is_none()
+    }
+}
+
+struct PendingFrame {
+    frame: web_sys::VideoFrame,
+    rotation: Rotation,
+    stamp: Stamp,
+}
+
+impl Drop for PendingFrame {
+    fn drop(&mut self) {
+        self.frame.close();
+    }
 }
 
 /// Read the pixels out of a decoded frame and put them in the slot.
@@ -475,15 +491,21 @@ impl Stamp {
 /// Asynchronous, because `copy_to` is: the frame is closed as soon as the
 /// copy resolves, since an unclosed `VideoFrame` pins a decoder buffer and a
 /// decoder that runs out of them stops producing.
-fn read_frame(
-    frame: web_sys::VideoFrame,
-    rotation: Rotation,
+async fn read_frame(
+    work: PendingFrame,
     max_pixels: usize,
-    slot: Rc<RefCell<Slot>>,
-    sink: Option<Rc<dyn Fn(Picture)>>,
-    stamp: Stamp,
-    in_flight: Rc<Cell<usize>>,
+    slot: &RefCell<Slot>,
+    sink: Option<&Rc<dyn Fn(Picture)>>,
+    spare: &RefCell<Option<js_sys::Uint8Array>>,
 ) {
+    let PendingFrame {
+        frame,
+        rotation,
+        stamp,
+    } = &work;
+    if !stamp.wanted(&slot.borrow()) {
+        return;
+    }
     // The *visible* rectangle, not the coded one. `copyTo` copies the visible
     // region by default, and a coded frame is padded out to whole macroblocks
     // — 1080 is not a multiple of 16 — so sizing the buffer from
@@ -506,7 +528,6 @@ fn read_frame(
     let Some(byte_len) =
         frame_byte_len(width, height).filter(|_| width.saturating_mul(height) <= max_pixels)
     else {
-        frame.close();
         if stamp.current() {
             let mut slot = slot.borrow_mut();
             if slot.failed.is_none() {
@@ -516,11 +537,8 @@ fn read_frame(
         return;
     };
 
-    // Into a JS-side buffer rather than a `&mut [u8]` over wasm memory. The
-    // copy resolves later, and the only Rust buffer that could back it is one
-    // this function is about to move into an async block: the promise would
-    // be writing through a pointer into memory that has since moved. A
-    // `Uint8Array` is the browser's own and survives whatever this side does.
+    // A JS-owned buffer stays valid until the promise settles, without a
+    // borrowed wasm slice crossing an asynchronous binding.
     // Asked of the frame rather than computed, because the browser knows its
     // own layout: `byte_len` above is the budget's arithmetic and this is the
     // buffer the copy will actually fill. They agree for packed RGBA, and
@@ -529,7 +547,6 @@ fn read_frame(
         .allocation_size_with_options(&options)
         .map_or(byte_len, |size| size as usize);
     if needed > byte_len {
-        frame.close();
         if stamp.current() {
             let mut slot = slot.borrow_mut();
             if slot.failed.is_none() {
@@ -540,78 +557,74 @@ fn read_frame(
         }
         return;
     }
-    let destination = js_sys::Uint8Array::new_with_length(needed as u32);
-    // Counted from here, where the buffer is actually allocated, to wherever
-    // the copy settles below. The two early returns above allocate nothing.
-    let outstanding = Outstanding::new(in_flight);
+    let destination = spare
+        .borrow_mut()
+        .take()
+        .filter(|buffer| buffer.length() as usize == needed)
+        .unwrap_or_else(|| js_sys::Uint8Array::new_with_length(needed as u32));
     // Returns the promise directly rather than a `Result`: a `copyTo` that
     // cannot be started rejects rather than throwing, so there is one failure
     // path and it is the awaited one below.
     let promise = frame.copy_to_with_buffer_source_and_options(&destination, &options);
 
-    wasm_bindgen_futures::spawn_local(async move {
-        // Held for the length of the copy and released however it ends, so a
-        // rejected or refused read frees the slot it took.
-        let _outstanding = outstanding;
-        let read = wasm_bindgen_futures::JsFuture::from(promise).await;
-        // Closed on both paths, and before the slot is touched: the buffer it
-        // holds is the decoder's, not ours.
-        frame.close();
-        if let Err(e) = read {
-            if stamp.current() {
-                let mut slot = slot.borrow_mut();
-                if slot.failed.is_none() {
-                    slot.failed = Some(format!("could not read a decoded frame: {e:?}"));
-                }
-            }
-            return;
-        }
-        // The copy resolved, and the decoder it belongs to may have been
-        // reset or replaced while it was in flight. Checked before a pixel is
-        // laid out, since the work below is only worth doing for a picture
-        // somebody is still going to look at.
-        if !stamp.current() {
-            return;
-        }
-
-        let source = destination.to_vec();
-        if source.len() < width * height * 4 {
-            return;
-        }
-        let mut bgra = vec![0u8; byte_len];
-        write_bgra_rotated(&source, width, height, rotation, &mut bgra);
-        let (draw_width, draw_height) = if rotation.transposes() {
-            (height, width)
-        } else {
-            (width, height)
-        };
-        let Some(buffer) = RgbaImage::from_raw(draw_width as u32, draw_height as u32, bgra) else {
-            return;
-        };
-        let image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
-
-        let picture = Picture {
-            image,
-            timestamp_micros,
-        };
-        {
+    let read = wasm_bindgen_futures::JsFuture::from(promise).await;
+    // Closed on both paths, and before the slot is touched: the buffer it
+    // holds is the decoder's, not ours.
+    frame.close();
+    if let Err(e) = read {
+        if stamp.wanted(&slot.borrow()) {
             let mut slot = slot.borrow_mut();
-            // Copies resolve in whatever order the browser finishes them, so
-            // an older picture arriving late is not the newest one: dropped
-            // rather than allowed to overwrite what has already been shown.
-            if !stamp.current() || stamp.seq <= slot.accepted {
-                return;
+            if slot.failed.is_none() {
+                slot.failed = Some(format!("could not read a decoded frame: {e:?}"));
             }
-            slot.accepted = stamp.seq;
-            slot.newest = Some(picture.clone());
-            slot.produced += 1;
         }
-        // After the borrow is released: a sink is the caller's code, and one
-        // that asked this decoder anything would find it already borrowed.
-        if let Some(sink) = sink {
-            sink(picture);
+        return;
+    }
+    // The copy resolved, and the decoder it belongs to may have been
+    // reset or replaced while it was in flight. Checked before a pixel is
+    // laid out, since the work below is only worth doing for a picture
+    // somebody is still going to look at.
+    if !stamp.wanted(&slot.borrow()) {
+        *spare.borrow_mut() = Some(destination);
+        return;
+    }
+
+    let source = destination.to_vec();
+    *spare.borrow_mut() = Some(destination);
+    if source.len() < width * height * 4 {
+        return;
+    }
+    let bgra = into_bgra_rotated(source, width, height, *rotation);
+    let (draw_width, draw_height) = if rotation.transposes() {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let Some(buffer) = RgbaImage::from_raw(draw_width as u32, draw_height as u32, bgra) else {
+        return;
+    };
+    let image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
+
+    let picture = Picture {
+        image,
+        timestamp_micros,
+    };
+    {
+        let mut slot = slot.borrow_mut();
+        // Copies resolve in whatever order the browser finishes them, so
+        // an older picture arriving late is not the newest one: dropped
+        // rather than allowed to overwrite what has already been shown.
+        if !stamp.wanted(&slot) {
+            return;
         }
-    });
+        slot.accepted = stamp.seq;
+        slot.newest = Some(picture.clone());
+    }
+    // After the borrow is released: a sink is the caller's code, and one
+    // that asked this decoder anything would find it already borrowed.
+    if let Some(sink) = sink {
+        sink(picture);
+    }
 }
 
 /// The `avc1.PPCCLL` string WebCodecs wants, read out of the parameter set.
@@ -663,6 +676,51 @@ fn first_nal_of_type(stream: &[u8], nal_type: u8) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_copies_are_rejected_before_materialization() {
+        let generation = Rc::new(Cell::new(4));
+        let stamp = Stamp {
+            generation: Rc::clone(&generation),
+            born: 4,
+            seq: 2,
+        };
+        let mut slot = Slot::default();
+        assert!(stamp.wanted(&slot));
+        slot.accepted = 2;
+        assert!(!stamp.wanted(&slot));
+        slot.accepted = 3;
+        assert!(!stamp.wanted(&slot));
+        slot.accepted = 0;
+        generation.set(5);
+        assert!(!stamp.wanted(&slot));
+    }
+
+    #[test]
+    fn failed_decoder_does_not_materialize_a_copy() {
+        let stamp = Stamp {
+            generation: Rc::new(Cell::new(0)),
+            born: 0,
+            seq: 1,
+        };
+        let slot = Slot {
+            failed: Some("decoder failed".into()),
+            ..Slot::default()
+        };
+        assert!(!stamp.wanted(&slot));
+    }
+
+    #[test]
+    fn outstanding_count_is_released_on_drop() {
+        let count = Rc::new(Cell::new(0));
+        let first = Outstanding::new(Rc::clone(&count));
+        let second = Outstanding::new(Rc::clone(&count));
+        assert_eq!(count.get(), 2);
+        drop(first);
+        assert_eq!(count.get(), 1);
+        drop(second);
+        assert_eq!(count.get(), 0);
+    }
 
     fn annexb(units: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();

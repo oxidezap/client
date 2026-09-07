@@ -28,8 +28,10 @@ mod demux;
 /// What every decoded picture obeys, whichever decoder produced it.
 mod geometry;
 mod player;
+mod recovery;
 #[cfg_attr(target_family = "wasm", allow(dead_code, reason = "no decoder here"))]
 mod sps;
+mod texture;
 /// The browser's own H.264 decoder, standing in for openh264.
 #[cfg(target_family = "wasm")]
 mod webcodecs;
@@ -46,9 +48,11 @@ pub use platform::StreamingVideoDecoder;
 
 // A live call's two directions, decoded off the IPC thread.
 pub use call::{CallFrame, CallVideo, FrameSink, LatestFrames};
+pub use recovery::RecoverySink;
 
 // Video player state machine
 pub use player::{VideoPlayer, VideoPlayerState};
+pub use texture::video_image;
 
 /// Build a decoder wherever this platform can build one.
 ///

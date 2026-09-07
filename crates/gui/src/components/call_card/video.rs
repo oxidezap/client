@@ -83,7 +83,7 @@ pub(super) fn panes(
             // cropping one to fill a pane is how you cut somebody's head off.
             // The letterbox is the theme's deepest surface, so the picture
             // reads as the lit thing.
-            Some(picture) => img(picture)
+            Some(picture) => img(crate::video::video_image(picture))
                 .size_full()
                 .object_fit(gpui::ObjectFit::Contain)
                 .into_any_element(),
@@ -106,7 +106,7 @@ pub(super) fn panes(
                 .items_center()
                 .justify_center()
                 .child(match local {
-                    Some(picture) => img(picture)
+                    Some(picture) => img(crate::video::video_image(picture))
                         .size_full()
                         .object_fit(gpui::ObjectFit::Contain)
                         .into_any_element(),

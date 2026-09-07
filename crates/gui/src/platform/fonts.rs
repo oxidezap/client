@@ -88,7 +88,7 @@ pub fn with_downloaded_fonts(start: impl FnOnce() + 'static) {
 ///
 /// Written down here rather than read from gpui, which does not export it:
 /// `gpui_web` passes it to `CosmicTextSystem::new_without_system_fonts`.
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(test)]
 const WEB_SYSTEM_FONT: &str = "IBM Plex Sans";
 
 /// What a page carries, and what it costs: eight faces, about 1.6 MB before

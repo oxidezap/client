@@ -302,6 +302,9 @@ jobs:
           export CHROMEDRIVER="${CHROMEWEBDRIVER:-}/chromedriver"
           test -x "$CHROMEDRIVER" || CHROMEDRIVER=$(command -v chromedriver)
           cargo test -p oxidezap-daemon -p oxidezap-session --lib --target wasm32-unknown-unknown
+          CARGO_TARGET_DIR=target/webcodecs-tests cargo test \
+            --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
+            --locked --target wasm32-unknown-unknown --test readback
 
   # The library crates an embedder can depend on: the chat store, which lost
   # the MSRV job it had in whatsapp-rust when it moved here, and the IPC

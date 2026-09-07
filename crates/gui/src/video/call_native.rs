@@ -34,6 +34,8 @@ use smallvec::SmallVec;
 
 use super::geometry::{Rotation, swap_rb_in_place, write_bgra_rotated};
 
+use super::recovery::{Recovery, RecoverySink};
+
 /// Where a decoded picture goes.
 ///
 /// A closure rather than a channel of this module's own: what the window
@@ -74,8 +76,32 @@ impl LatestFrames {
     }
 
     /// Everything waiting, in one pass, leaving the slots empty.
+    #[cfg(test)]
     pub fn take(&self) -> SmallVec<[CallFrame; 2]> {
         self.lock().iter_mut().filter_map(Option::take).collect()
+    }
+
+    /// Leave pictures whose enabling state has not reached the UI in their slots.
+    pub fn take_for(&self, calls: &oxidezap_core::CallState) -> SmallVec<[CallFrame; 2]> {
+        let Some(call) = calls.active() else {
+            return SmallVec::new();
+        };
+        self.lock()
+            .iter_mut()
+            .filter_map(|slot| {
+                if slot.as_ref().is_some_and(|frame| {
+                    frame.call_id == call.call_id && call.video.is_on(frame.stream)
+                }) {
+                    slot.take()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn clear(&self, stream: VideoStream) {
+        self.lock()[slot_of(stream)] = None;
     }
 
     /// Poisoned or not. `put` runs on a decode thread and `take` on the
@@ -96,23 +122,27 @@ pub struct CallFrame {
     pub image: Arc<RenderImage>,
 }
 
-/// Both directions of the call being drawn.
+/// One direction of the call being drawn.
 ///
-/// Created when the first frame of a call arrives and dropped when the call
-/// does, which is what closes the threads: a decoder held past its call would
-/// keep a megabyte of reference frames for a picture nobody is looking at.
+/// Created on this direction's first frame and dropped when its camera or
+/// call ends. The opposite direction keeps its own reference chain.
 pub struct CallVideo {
     call_id: String,
-    local: Stream,
-    remote: Stream,
+    stream: VideoStream,
+    decoder: Stream,
 }
 
 impl CallVideo {
-    pub fn new(call_id: String, frames: FrameSink) -> Self {
+    pub fn new(
+        call_id: String,
+        stream: VideoStream,
+        frames: FrameSink,
+        recover: RecoverySink,
+    ) -> Self {
         Self {
-            local: Stream::spawn(call_id.clone(), VideoStream::Local, Arc::clone(&frames)),
-            remote: Stream::spawn(call_id.clone(), VideoStream::Remote, frames),
+            decoder: Stream::spawn(call_id.clone(), stream, frames, recover),
             call_id,
+            stream,
         }
     }
 
@@ -125,13 +155,9 @@ impl CallVideo {
 
     /// Something between here and the camera dropped units.
     ///
-    /// Both directions, because the channel that lost them carries both and
-    /// a gap in it says nothing about which was in flight. Each decoder then
-    /// waits for a point it can start from rather than rendering frames built
-    /// on references it never received.
+    /// Wait for a keyframe rather than rendering with missing references.
     pub fn interrupted(&self) {
-        self.local.interrupted();
-        self.remote.interrupted();
+        self.decoder.interrupted();
     }
 
     /// Hand one access unit to the decoder that owns its direction.
@@ -140,10 +166,10 @@ impl CallVideo {
     /// a better picture than this one, and the sender will produce a keyframe
     /// once it learns something was lost.
     pub fn accept(&self, frame: CallVideoFrame) {
-        match frame.stream {
-            VideoStream::Local => self.local.accept(frame),
-            VideoStream::Remote => self.remote.accept(frame),
+        if frame.call_id != self.call_id || frame.stream != self.stream {
+            return;
         }
+        self.decoder.accept(frame);
     }
 }
 
@@ -161,11 +187,19 @@ struct Stream {
     /// through — which is the one the loss is *about*. Touched only from the
     /// sending side, so the queue's order is the gap's order.
     gap: AtomicBool,
+    recovery: Arc<Recovery>,
 }
 
 impl Stream {
-    fn spawn(call_id: String, stream: VideoStream, frames: FrameSink) -> Self {
+    fn spawn(
+        call_id: String,
+        stream: VideoStream,
+        frames: FrameSink,
+        recover: RecoverySink,
+    ) -> Self {
         let (units, queue) = std::sync::mpsc::sync_channel::<CallVideoFrame>(QUEUE_DEPTH);
+        let recovery = Arc::new(Recovery::new(call_id.clone(), stream, recover));
+        let decoding_recovery = recovery.clone();
         let name = match stream {
             VideoStream::Local => "oxidezap-selfview",
             VideoStream::Remote => "oxidezap-callvideo",
@@ -175,19 +209,21 @@ impl Stream {
         // rather than not running.
         if let Err(e) = std::thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || decode_loop(&call_id, stream, &queue, &frames))
+            .spawn(move || decode_loop(&call_id, stream, &queue, &frames, &decoding_recovery))
         {
             log::error!("no thread for the {stream:?} video of a call: {e}");
         }
         Self {
             units,
             gap: AtomicBool::new(false),
+            recovery,
         }
     }
 
     /// Something upstream lost units. The next one through says so.
     fn interrupted(&self) {
         self.gap.store(true, Ordering::Relaxed);
+        self.recovery.request();
     }
 
     fn accept(&self, frame: CallVideoFrame) {
@@ -195,13 +231,16 @@ impl Stream {
         // on the first unit that actually reaches the decoder — the one whose
         // references are the ones missing.
         let gap = self.gap.swap(false, Ordering::Relaxed) || frame.gap;
-        if self.units.try_send(frame.after_a_gap(gap)).is_err() {
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+            self.units.try_send(frame.after_a_gap(gap))
+        {
             // What follows this unit references it, and a decoder fed the
             // remainder produces a second of torn picture over the last good
             // one. Waiting for a keyframe instead is a freeze, which is at
-            // least honest — and a short one, because the sender emits one
-            // every few seconds.
+            // least honest. Request a recovery point rather than relying on
+            // the sender to emit periodic keyframes.
             self.gap.store(true, Ordering::Relaxed);
+            self.recovery.request();
         }
     }
 }
@@ -211,6 +250,7 @@ fn decode_loop(
     stream: VideoStream,
     queue: &std::sync::mpsc::Receiver<CallVideoFrame>,
     frames: &FrameSink,
+    recovery: &Recovery,
 ) {
     let mut decoder = match Decoder::new() {
         Ok(decoder) => decoder,
@@ -233,6 +273,7 @@ fn decode_loop(
         }
         if !started {
             if !unit.keyframe {
+                recovery.request();
                 continue;
             }
             started = true;
@@ -273,6 +314,7 @@ fn decode_loop(
                 // A reference was lost. Wait for a point that stands on its
                 // own rather than compounding the error over the next second.
                 started = false;
+                recovery.request();
                 continue;
             }
         };
@@ -351,6 +393,78 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_failure_requests_the_failed_direction() {
+        let data = vec![0, 0, 0, 1, 0x65, 0xff];
+        assert!(Decoder::new().unwrap().decode(&data).is_err());
+        let (sender, queue) = std::sync::mpsc::channel();
+        sender
+            .send(CallVideoFrame::new(
+                "failed-call".into(),
+                VideoStream::Remote,
+                data,
+                true,
+                0,
+            ))
+            .unwrap();
+        drop(sender);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = requests.clone();
+        let recovery = Recovery::new(
+            "failed-call".into(),
+            VideoStream::Remote,
+            Arc::new(move |id, stream| {
+                received.lock().unwrap().push((id.to_owned(), stream));
+                true
+            }),
+        );
+        let frames: FrameSink = Arc::new(|_| panic!("invalid unit produced a picture"));
+        decode_loop(
+            "failed-call",
+            VideoStream::Remote,
+            &queue,
+            &frames,
+            &recovery,
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![("failed-call".into(), VideoStream::Remote)]
+        );
+    }
+
+    #[test]
+    fn decoder_overflow_requests_recovery_and_preserves_the_gap_position() {
+        let (units, queue) = std::sync::mpsc::sync_channel(1);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = requests.clone();
+        let recovery = Arc::new(Recovery::new(
+            "test-call".into(),
+            VideoStream::Remote,
+            Arc::new(move |id, stream| {
+                received.lock().unwrap().push((id.to_owned(), stream));
+                true
+            }),
+        ));
+        let stream = Stream {
+            units,
+            gap: AtomicBool::new(false),
+            recovery,
+        };
+        let unit =
+            || CallVideoFrame::new("test-call".into(), VideoStream::Remote, vec![], false, 0);
+        stream.accept(unit());
+        for _ in 0..20 {
+            stream.accept(unit());
+        }
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![("test-call".into(), VideoStream::Remote)]
+        );
+        assert!(!queue.recv().unwrap().gap);
+        stream.accept(unit());
+        assert!(queue.recv().unwrap().gap);
+    }
 
     /// `put` runs on a decode thread and `take` on the window's. Panicking on
     /// a poisoned lock turned a panic in one decoder into a panic in the UI

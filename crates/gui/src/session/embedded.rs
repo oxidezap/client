@@ -85,6 +85,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         sink,
         pending,
         pictures,
+        recover,
     } = attach::begin(
         Link::over_pipe(outgoing),
         Arc::new(InProcess) as Arc<dyn MediaCache>,
@@ -101,7 +102,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
 
     spawn_local(async move {
         let cache = InProcess;
-        let frames = Frames::new(&sink, &pending, &cache, &pictures);
+        let frames = Frames::new(&sink, &pending, &cache, &pictures, recover);
         let mut lines = BufReader::new(reader).lines();
         attach::read_frames(
             frames,
