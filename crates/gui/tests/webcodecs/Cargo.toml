@@ -4,6 +4,11 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+# Used by ../../src/video/webcodecs.rs, imported through #[path] in lib.rs.
+# cargo-machete does not scan that module outside this crate's directory.
+[package.metadata.cargo-machete]
+ignored = ["js-sys", "wasm-bindgen-futures", "web-sys"]
+
 # The browser runner needs neither GPUI's shared memory nor its native tests.
 [workspace]
 
