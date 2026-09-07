@@ -32,15 +32,10 @@ symphonia = { version = "0.6", default-features = false, features = ["aac", "iso
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["std", "clock"] }
 
-# UI framework: GPUI upstream + gpui-component. gpui-component leaves its gpui
-# dep unpinned (tracks zed HEAD), and cargo forbids [patch]-pinning a source to
-# itself, so the rev pin lives in this workspace's committed Cargo.lock
-# (`cargo update -p gpui --precise <rev>` to move it). Same-source everywhere =
-# one gpui in the tree, no fork.
-gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
-# Input paint invalidation fix pending longbridge/gpui-kit#2988.
-gpui-component = { git = "https://github.com/jlucaso1/gpui-component.git", branch = "fix/input-scroll-notify-0.5" }
-gpui-component-assets = { git = "https://github.com/jlucaso1/gpui-component.git", branch = "fix/input-scroll-notify-0.5" }
+# Match GPUI Kit's published GPUI family so entities share one implementation.
+gpui = { package = "gpui-pre", version = "0.3.4" }
+gpui-component = { git = "https://github.com/longbridge/gpui-kit.git" }
+gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit.git" }
 
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Ordered maps for deterministic cache eviction
@@ -93,7 +88,7 @@ wacore-binary = { workspace = true }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 # Timers, on a platform that has a reactor to run them on.
 smol = "2"
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.4", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 openh264 = "0.9" # H.264 software decoder
 
 # The one Win32 constant the daemon spawn names (`CREATE_NO_WINDOW`), and
@@ -123,7 +118,7 @@ oxidezap-platform = { workspace = true }
 # The oneshot behind "wait for the file dialog to end"; see `platform/plugins.rs`.
 futures-channel = "0.3"
 js-sys = "0.3"
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.4" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
@@ -174,8 +169,8 @@ web-sys = { version = "0.3", features = [
 # hold a browser-only failure under `cargo test` by building the same thing —
 # the crate is already in the graph on every platform, and this only names it.
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", features = ["test-support"] }
-gpui_wgpu = { git = "https://github.com/zed-industries/zed", package = "gpui_wgpu" }
+gpui = { package = "gpui-pre", version = "0.3.4", features = ["test-support"] }
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "0.3.4" }
 # The same synthetic chats and messages every crate above core tests against.
 oxidezap-core = { workspace = true, features = ["fixtures"] }
 

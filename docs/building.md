@@ -1,5 +1,10 @@
 # Building & verifying
 
+The GUI consumes GPUI Kit from its canonical git repository and the matching
+published `gpui-pre` family. `Cargo.lock` records the revisions and versions.
+Do not mix in Zed git GPUI, which would give the component library and client
+different entity types. The root's GPUI optimization overrides name `gpui-pre`.
+
 ```bash
 # These mirror `.github/workflows/ci.yml`, which is the authority: check the
 # flags there rather than copying them from here.

@@ -1,4 +1,4 @@
-//! Custom asset source that combines gpui-component-assets with our custom icons
+//! Combines gpui-kit-assets with our custom icons.
 
 use anyhow::anyhow;
 use gpui::{AssetSource, Result, SharedString};
@@ -31,7 +31,7 @@ pub struct Assets;
 /// The set to fall back to, however this build carries it.
 #[cfg(not(target_family = "wasm"))]
 fn fallback_load(path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-    gpui_component_assets::Assets.load(path)
+    gpui_kit_assets::Assets.load(path)
 }
 
 #[cfg(target_family = "wasm")]
@@ -41,7 +41,7 @@ fn fallback_load(path: &str) -> Result<Option<Cow<'static, [u8]>>> {
 
 #[cfg(not(target_family = "wasm"))]
 fn fallback_list(path: &str) -> Result<Vec<SharedString>> {
-    gpui_component_assets::Assets.list(path)
+    gpui_kit_assets::Assets.list(path)
 }
 
 #[cfg(target_family = "wasm")]
@@ -87,6 +87,21 @@ impl AssetSource for Assets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_icons_load_through_the_fallback() {
+        let listed = fallback_list("icons/").expect("upstream icon list");
+        assert!(!listed.is_empty());
+        for name in listed {
+            let bytes = fallback_load(&name)
+                .unwrap_or_else(|e| panic!("{name} failed to load: {e}"))
+                .unwrap_or_else(|| panic!("{name} resolved to nothing"));
+            assert!(
+                bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml"),
+                "{name} does not look like an SVG"
+            );
+        }
+    }
 
     /// The `#[folder]`/`#[include]` pair is resolved at build time, so a
     /// renamed or moved icon fails here rather than as a blank button.

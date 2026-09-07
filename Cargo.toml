@@ -28,16 +28,8 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# 1.95 because the GUI cannot be built with less: gpui calls
-# `std::hint::cold_path`, stable since 1.95, and this crate tracks that
-# repository's git HEAD rather than a release. The number is therefore a
-# floor the *window* imposes on everything beside it — the library crates
-# below it compile on 1.94 and say 1.95 anyway, which is the price of one
-# figure for one workspace. What it buys is a manifest that does not lie:
-# `rust-version` is inherited by every member, so a GUI declaring 1.94 was
-# telling cargo something no toolchain could honour. It moves again when
-# gpui does, which is the cost of tracking a git HEAD rather than of this
-# figure.
+# GPUI calls `std::hint::cold_path`, stable since 1.95. The GUI's compiler
+# floor applies to every member through the shared workspace version.
 rust-version = "1.95"
 license = "MIT"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
@@ -172,7 +164,7 @@ debug = false
 # package override and `"*"` both apply to gpui, and which of the two answers
 # for a setting the named one does not mention is a question this file should
 # not be asking about the largest dependency in the tree.
-[profile.dev.package.gpui]
+[profile.dev.package.gpui-pre]
 opt-level = 3
 debug = false
 
@@ -267,10 +259,6 @@ opt-level = "z"
 [profile.release.package.regex-automata]
 opt-level = "z"
 [profile.release.package.regex]
-opt-level = "z"
-[profile.release.package.fancy-regex]
-opt-level = "z"
-[profile.release.package.syntect]
 opt-level = "z"
 [profile.release.package.markdown]
 opt-level = "z"
@@ -608,7 +596,7 @@ debug = "full"
 # module at 10.6% of its code, and it is the one place where "fast" is worth
 # more than "small". Needed here precisely because the desktop leaves it to
 # the base setting, and this profile's base is "s".
-[profile.web.package.gpui]
+[profile.web.package.gpui-pre]
 opt-level = 3
 
 # The protocol, for the reason `[profile.web]` exists at all. A page's
