@@ -40,8 +40,10 @@ timestamps and cannot be aligned to individual trace stalls. The camera reports
 - Cache the screen independently of call pictures. State, theme, bounds, and
   input changes still invalidate it. Focus transitions run after drawing so GPUI
   can update focus paths and emit blur events.
-- Use canonical GPUI Kit 0.6 containing the input notification
-  fix merged in [upstream PR #2988](https://github.com/longbridge/gpui-kit/pull/2988).
+- Use the post-release GPUI Kit 0.6.0 revision recorded in `Cargo.lock`,
+  containing the input notification fix merged in
+  [upstream PR #2988](https://github.com/longbridge/gpui-kit/pull/2988),
+  rather than the `v0.6.0` tag.
   Unchanged input scroll offsets and paint geometry no longer notify every draw.
 - Give decoded-frame readiness a capacity-one lane, separate from ordinary
   events. After at most 16 ordinary deliveries, pending video gets a turn.

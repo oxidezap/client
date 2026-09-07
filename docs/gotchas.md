@@ -760,27 +760,32 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   request is the only one that may speak, and what it publishes is read back
   from the registry rather than from what was asked for. A camera that will
   not open, a call hung up while it was opening, an announcement the peer
-  never got, and a device unplugged mid-call all end the same way — the
-  registry entry is what "our video is on" *means*, and `settle_video` says
-  what is in it.
+  never got, and a device unplugged mid-call all end with owner cleanup.
+  `settle_video` checks that the registered camera is alive and withholds
+  local-on while its upgrade is unanswered. Registry membership alone does
+  not prove that frames are going out.
 - **A refusal is answered by whether one is outstanding, not by which camera
   asked.** The library does not match a refused upgrade to the request it
   refuses: its handler tears the local plane down whenever *some* request of
   ours is pending — whichever camera is attached by then — and ignores the
-  stanza when none is. So `CallRegistry::upgrading` holds presence rather
-  than identity, and the camera goes off exactly when the library has
-  released its endpoints. Keying it on the camera the request went out with
-  reads as more careful and is worse: a refusal landing after an off-and-on
-  again tears down the replacement's plane in the library while leaving it
-  registered here, drawn as live, encoding into nothing. The presence is
-  stamped *before* the request goes out, for the reason every intent here is
-  stamped before its task exists: the reply is not ours to schedule, and a
-  peer refusing while `start_video` is still awaiting would otherwise find
-  nothing outstanding and leave the camera standing over a plane the library
-  has already released. Registering early is the half that can be made safe —
-  every path out that is not a camera held withdraws it again, and the
-  refusal's own teardown queues on the call's video lane behind the enable it
-  is answering.
+  stanza when none is. Peer signaling therefore tests presence in
+  `CallRegistry::upgrading`, not the camera that originally sent the request.
+  The map also stores `CameraId` for a different purpose. Local owner cleanup
+  removes a pending upgrade only when its camera ID matches, so a delayed
+  callback from camera A cannot withdraw replacement camera B's request.
+
+  Endpoint closure determines which camera must stop. The peer-event handler
+  records the closed camera's ID before waiting on the video lane, then
+  rechecks its identity and endpoint closure before removing it. A healthy
+  replacement survives a queued old event; a replacement whose endpoints the
+  library actually closed is still retired. The no-camera path also checks
+  that neither an owner nor a different pending upgrade appeared during the
+  wait.
+
+  The pending upgrade is recorded *before* `start_video` is awaited because
+  the peer can answer before that call returns. Setup failure and owner loss
+  withdraw only that camera's pending request. This separates the library's
+  presence-based negotiation from generation-specific local cleanup.
 - **The peer's picture is asked for from exactly two places, and both are
   above the library.** A dropped access unit used to end the peer's stream for
   good: the decoder abandons its chain at the gap and waits for a keyframe the
