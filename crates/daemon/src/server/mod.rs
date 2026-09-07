@@ -313,9 +313,8 @@ where
                     // And asked for a point it can start from. Telling the
                     // decoders to stop is half an answer: what they hold is
                     // useless either way, and without this the picture stays
-                    // blank until the encoder's own periodic IDR. Only our
-                    // own camera can be asked — the peer's direction has
-                    // nobody on this side to ask.
+                    // blank until another IDR. Refresh asks both the local
+                    // cameras and the remote peers, with upstream throttling.
                     let _ = dispatch(&hub, &commands, Action::RefreshVideo).await;
                 }
                 Err(RecvError::Closed) => return Ok(()),

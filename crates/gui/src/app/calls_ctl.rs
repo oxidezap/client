@@ -17,6 +17,9 @@ use crate::video::CallFrame;
 /// Keyed by call, because a picture belongs to the call it was taken in: a
 /// frame that arrives after the call it came from has ended — the socket is
 /// one hop behind the state — would otherwise be drawn into the next one.
+///
+/// Atlas tiles outlive these slots while cached paint still references them.
+/// `video::video_image` retires them when GPUI releases that scene's state.
 #[derive(Default)]
 pub struct CallPictures {
     call_id: Option<String>,
@@ -717,9 +720,10 @@ impl WhatsAppApp {
     /// direction, the newest, and the ones it replaced were never worth
     /// drawing.
     pub(super) fn draw_waiting_call_frames(&mut self, cx: &mut Context<Self>) {
-        let Some(waiting) = self.client.as_ref().map(|c| c.call_frames().take()) else {
+        let Some(client) = self.client.as_ref() else {
             return;
         };
+        let waiting = client.call_frames().take_for(self.calls.read(cx).state());
         self.calls.update(cx, |calls, cx| {
             for frame in waiting {
                 calls.draw_frame(frame, cx);
@@ -968,6 +972,8 @@ impl WhatsAppApp {
         for call in ended {
             self.record_call(call, cx);
         }
+        // Fair readiness can precede this state. Its picture is still in the slot.
+        self.draw_waiting_call_frames(cx);
     }
 
     /// Hand the keyboard to whichever overlay should have it, and hand it
@@ -1145,6 +1151,60 @@ fn keyboard_owner_for(
         None if surfaces.composer => KeyboardOwner::Composer,
         None => KeyboardOwner::Root,
     }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn exercise_call_frame_adoption(
+    client: Session,
+    events: &mut crate::session::Events,
+    initial: CallState,
+    after_readiness: impl FnOnce() -> bool,
+) -> Option<Arc<RenderImage>> {
+    let mut cx = gpui::HeadlessAppContext::with_asset_source(
+        Arc::new(gpui_wgpu::CosmicTextSystem::new("DejaVu Sans")),
+        Arc::new(crate::assets::Assets),
+    );
+    let app = cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::init(cx);
+        cx.new(|cx| {
+            let mut app = WhatsAppApp::new(cx);
+            app.client = Some(client);
+            app.adopt_calls(initial, cx);
+            app
+        })
+    });
+    let mut after_readiness = Some(after_readiness);
+    let mut retired = false;
+    while let Ok(event) = events.try_recv() {
+        match event {
+            FromDaemon::ShowWindow => {}
+            FromDaemon::CallFrames => {
+                app.update(&mut cx, |app, cx| {
+                    app.draw_waiting_call_frames(cx);
+                    assert!(app.calls.read(cx).picture(VideoStream::Remote).is_none());
+                });
+                retired = after_readiness.take().expect("only one readiness wake")();
+            }
+            FromDaemon::Calls(calls) => {
+                app.update(&mut cx, |app, cx| {
+                    app.adopt_calls(*calls, cx);
+                    if retired {
+                        assert!(app.calls.read(cx).picture(VideoStream::Remote).is_none());
+                    }
+                });
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+    assert!(after_readiness.is_none());
+    cx.update(|cx| {
+        app.read(cx)
+            .calls
+            .read(cx)
+            .picture(VideoStream::Remote)
+            .cloned()
+    })
 }
 
 #[cfg(test)]

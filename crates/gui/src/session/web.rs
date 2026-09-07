@@ -93,6 +93,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         sink,
         pending,
         pictures,
+        recover,
     } = attach::begin(
         link,
         Arc::clone(&fetched) as Arc<dyn super::media::MediaCache>,
@@ -114,7 +115,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     )?;
 
     spawn_local(async move {
-        let frames = Frames::new(&sink, &pending, fetched.as_ref(), &pictures);
+        let frames = Frames::new(&sink, &pending, fetched.as_ref(), &pictures, recover);
         attach::read_frames(
             frames,
             async || {

@@ -1,0 +1,33 @@
+[package]
+name = "oxidezap-webcodecs-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The browser runner needs neither GPUI's shared memory nor its native tests.
+[workspace]
+
+[lib]
+path = "lib.rs"
+test = false
+doctest = false
+
+[[test]]
+name = "readback"
+path = "readback.rs"
+
+[dependencies]
+image = { version = "0.25", default-features = false }
+smallvec = "1"
+# Match the root lockfile and CI's wasm-bindgen-test-runner.
+js-sys = "=0.3.104"
+wasm-bindgen = "=0.2.127"
+wasm-bindgen-futures = "=0.4.77"
+web-sys = { version = "=0.3.104", features = [
+    "VideoDecoder", "VideoDecoderConfig", "VideoDecoderInit", "VideoFrame",
+    "DomRectReadOnly", "VideoPixelFormat", "VideoFrameCopyToOptions", "PlaneLayout",
+    "EncodedVideoChunk", "EncodedVideoChunkInit", "EncodedVideoChunkType", "DomException",
+] }
+
+[dev-dependencies]
+wasm-bindgen-test = "=0.3.77"

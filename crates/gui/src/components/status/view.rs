@@ -224,7 +224,7 @@ fn render_update(props: &StatusViewProps, metrics: Metrics, cx: &App) -> impl In
         // showing a still of itself while the decoder ran behind it.
         .child(match (props.frame.clone(), props.image.clone()) {
             // A video update, decoding. The same frames the timeline draws.
-            (Some(frame), _) => img(ImageSource::Render(frame))
+            (Some(frame), _) => img(crate::video::video_image(frame))
                 .max_w_full()
                 .max_h_full()
                 .object_fit(gpui::ObjectFit::Contain)

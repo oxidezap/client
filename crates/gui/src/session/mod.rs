@@ -30,6 +30,7 @@ mod frames;
 mod media;
 #[cfg(not(target_family = "wasm"))]
 mod native;
+mod recovery;
 mod sink;
 #[cfg(target_family = "wasm")]
 mod tab;

@@ -690,9 +690,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   a drop costs is the reference chain — each unit after it points at one the
   far side never received — so the sender's queue asks its own encoder for an
   IDR, the peer's RTCP PLI asks for one through `CallEvent::RtcpReceived`,
-  and the window's decoder, which can ask nobody, waits for the next one
-  rather than rendering a second of torn macroblocks over the last good
-  picture. Every moment a decoder is *born* mid-stream is asked for too — an
+  and the window's decoder requests recovery through
+  `CallAction::RequestVideoKeyframe`, naming the original call and direction.
+  It waits for that keyframe instead of decoding with missing references.
+  Every moment a decoder is *born* mid-stream is asked for too — an
   outgoing call renamed off its placeholder, one the peer has just answered,
   and every camera that becomes drawable, since the encoder opened before the
   offer or the announcement did and its opening IDR was published nowhere.
@@ -719,9 +720,15 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   lost need it to be, and a decoded 720p frame is 3.5 MiB — so frames put
   there would let a stalled window bank gigabytes of obsolete video *and* park
   every state frame behind ten seconds of it. `LatestFrames` holds one picture
-  per direction, the newest overwriting the last, and the channel carries only
-  a nudge; a dropped nudge costs nothing, because the slot still holds the
-  newest picture and the next frame nudges again.
+  per direction, the newest overwriting the last. Readiness has an independent
+  capacity-one channel, so a full ordinary queue cannot lose the final wake.
+  The receiver yields to video after at most sixteen ordinary events without
+  reordering those events. Readiness can therefore precede the call state that
+  enables its picture. `LatestFrames::take_for` leaves that picture in its slot,
+  and UI call-state adoption retries the drain without waiting for another frame.
+  Reader-side camera retirement invalidates that direction's generation and
+  clears its slot under the publication lock. Call end or replacement retires
+  both directions, so a deferred picture cannot survive into a later call.
 - **A picture's position is where it is shown, not where it was decoded.**
   An attachment has two orders — `stts` says when a sample is decoded and
   `ctts` the offset to when it is displayed — and they differ exactly when a
@@ -797,11 +804,14 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   beside it, which asks *our* camera for the same reason in the other
   direction.
 
-  Both pass `KeyframeUrgency::Coalesced`. `Immediate` is for a decoder that
-  has already failed and reset -- the front end is what would know that, and
-  nothing here reports a decode failure back, so there is nowhere to call it
-  honestly yet. The official client draws the same line: `pli_throttle_time_ms`
-  for the routine case, `enable_pli_for_dec_err` for the one that skips it.
+  Both pass `KeyframeUrgency::Coalesced`. The front end now also reports decode
+  failures, queue overflow, and missing recovery points through its bounded
+  session recovery path. Requests retain their call ID and direction and are
+  throttled per stream, including failed admission attempts. The daemon asks
+  the named local encoder for an IDR or uses `Coalesced` for the named remote
+  call. This path does not select `Immediate`. The official client distinguishes
+  routine PLI throttling through `pli_throttle_time_ms` from decoder-error
+  recovery through `enable_pli_for_dec_err`.
 - **Video encoded before the peer accepts is thrown away twice, and poisons
   the channel it is thrown away in.** The camera has to open before the offer
   -- an offer with no camera is not a video offer -- but nothing wants those

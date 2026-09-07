@@ -303,7 +303,7 @@ fn render_frame(
     // made. The viewer only opens pictures today, which is what keeps this
     // from being visible rather than what makes it right.
     if let Some(frame) = frame {
-        return img(ImageSource::Render(frame))
+        return img(crate::video::video_image(frame))
             .max_w_full()
             .max_h_full()
             .object_fit(gpui::ObjectFit::Contain)

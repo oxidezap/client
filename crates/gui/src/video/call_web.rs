@@ -39,6 +39,8 @@ use wacore::voip::h264::{au_has_idr, nal_unit_type, split_annexb};
 use super::geometry::{Rotation, declares_unreadably};
 use super::webcodecs;
 
+use super::recovery::{Recovery, RecoverySink};
+
 /// The SPS and PPS an access unit carries, if it carries both.
 ///
 /// Owned for the PPS because the caller wants the two together and the
@@ -96,8 +98,34 @@ impl LatestFrames {
     }
 
     /// Take what has arrived since the last look.
+    #[cfg(test)]
     pub fn take(&self) -> SmallVec<[CallFrame; 2]> {
         std::mem::take(&mut *self.newest.borrow_mut())
+    }
+
+    /// Leave pictures whose enabling state has not reached the UI in their slots.
+    pub fn take_for(&self, calls: &oxidezap_core::CallState) -> SmallVec<[CallFrame; 2]> {
+        let mut ready = SmallVec::new();
+        let Some(call) = calls.active() else {
+            return ready;
+        };
+        let mut held = self.newest.borrow_mut();
+        let mut index = 0;
+        while index < held.len() {
+            let frame = &held[index];
+            if frame.call_id == call.call_id && call.video.is_on(frame.stream) {
+                ready.push(held.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        ready
+    }
+
+    pub fn clear(&self, stream: VideoStream) {
+        self.newest
+            .borrow_mut()
+            .retain(|frame| frame.stream != stream);
     }
 }
 
@@ -116,19 +144,24 @@ const MAX_PIXELS: usize = 3840 * 2160;
 /// bound moved to the far side of the binding, where the queue actually is.
 const MAX_QUEUED_UNITS: u32 = 4;
 
-/// Both directions of a call, each decoded as its units arrive.
+/// One direction of a call, decoded as its units arrive.
 pub struct CallVideo {
     call_id: String,
-    local: Stream,
-    remote: Stream,
+    stream: VideoStream,
+    decoder: Stream,
 }
 
 impl CallVideo {
-    pub fn new(call_id: String, frames: FrameSink) -> Self {
+    pub fn new(
+        call_id: String,
+        stream: VideoStream,
+        frames: FrameSink,
+        recover: RecoverySink,
+    ) -> Self {
         Self {
-            local: Stream::new(call_id.clone(), VideoStream::Local, Arc::clone(&frames)),
-            remote: Stream::new(call_id.clone(), VideoStream::Remote, frames),
+            decoder: Stream::new(call_id.clone(), stream, frames, recover),
             call_id,
+            stream,
         }
     }
 
@@ -141,24 +174,23 @@ impl CallVideo {
 
     /// Something between here and the camera dropped units.
     ///
-    /// Both directions, because the channel that lost them carries both and a
-    /// gap in it says nothing about which was in flight.
+    /// Wait for a keyframe rather than rendering with missing references.
     pub fn interrupted(&self) {
-        self.local.interrupted();
-        self.remote.interrupted();
+        self.decoder.interrupted();
     }
 
     /// Hand one access unit to the decoder that owns its direction.
     pub fn accept(&self, frame: CallVideoFrame) {
-        match frame.stream {
-            VideoStream::Local => self.local.accept(frame),
-            VideoStream::Remote => self.remote.accept(frame),
+        if frame.call_id != self.call_id || frame.stream != self.stream {
+            return;
         }
+        self.decoder.accept(frame);
     }
 }
 
 /// One direction: its decoder, and whether it may be fed yet.
 struct Stream {
+    recovery: Recovery,
     call_id: String,
     stream: VideoStream,
     frames: FrameSink,
@@ -180,8 +212,9 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(call_id: String, stream: VideoStream, frames: FrameSink) -> Self {
+    fn new(call_id: String, stream: VideoStream, frames: FrameSink, recover: RecoverySink) -> Self {
         Self {
+            recovery: Recovery::new(call_id.clone(), stream, recover),
             call_id,
             stream,
             frames,
@@ -227,6 +260,7 @@ impl Stream {
     /// matches what the sender encoded against.
     fn interrupted(&self) {
         self.abandon();
+        self.recovery.request();
     }
 
     /// Give up the reference chain, and everything the decoder is still
@@ -266,6 +300,7 @@ impl Stream {
         let recovers = frame.keyframe || au_has_idr(&frame.data);
         if !self.started.get() {
             if !recovers {
+                self.recovery.request();
                 // The one silent refusal on this path, and the one that
                 // costs a whole call: a stream that never receives a
                 // keyframe waits here for every unit and draws nothing,
@@ -322,6 +357,7 @@ impl Stream {
                 Some(decoder) => *held = Some(decoder),
                 None => {
                     self.started.set(false);
+                    self.recovery.request();
                     return;
                 }
             }
@@ -340,6 +376,7 @@ impl Stream {
             *held = None;
             self.started.set(false);
             if !recovers {
+                self.recovery.request();
                 return;
             }
             self.started.set(true);
@@ -347,6 +384,7 @@ impl Stream {
                 Some(decoder) => *held = Some(decoder),
                 None => {
                     self.started.set(false);
+                    self.recovery.request();
                     return;
                 }
             }
@@ -373,6 +411,7 @@ impl Stream {
             // decoder is borrowed here.
             decoder.reset();
             self.started.set(false);
+            self.recovery.request();
             return;
         }
 
@@ -382,6 +421,10 @@ impl Stream {
         let stamp = self.fed.get();
         self.fed.set(stamp.wrapping_add(1));
         decoder.decode(&frame.data, stamp, recovers);
+        if decoder.failure().is_some() {
+            self.started.set(false);
+            self.recovery.request();
+        }
     }
 
     /// Build a decoder from the parameter sets this keyframe carries.

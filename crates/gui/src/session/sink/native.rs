@@ -7,7 +7,7 @@
 
 use tokio::sync::mpsc::error::TrySendError;
 
-use super::Dropped;
+use super::{Dropped, Events, FrameReady};
 use crate::session::FromDaemon;
 
 /// How many session events may wait for a UI that is busy drawing.
@@ -21,14 +21,14 @@ use crate::session::FromDaemon;
 const EVENT_QUEUE: usize = 512;
 
 /// The half the front end drains.
-pub type Events = tokio::sync::mpsc::Receiver<FromDaemon>;
+pub(super) type Queue = tokio::sync::mpsc::Receiver<FromDaemon>;
 
 /// The half the reader publishes on, and the only one that can wait.
 ///
 /// Not `Clone`: there is one reader, it is the thread this was made for, and
 /// being able to block belongs to that thread alone. Everything else gets
 /// [`Self::ui`].
-pub struct ReaderSink(tokio::sync::mpsc::Sender<FromDaemon>);
+pub struct ReaderSink(tokio::sync::mpsc::Sender<FromDaemon>, FrameReady);
 
 /// The half everything on the UI executor publishes on.
 ///
@@ -37,13 +37,21 @@ pub struct ReaderSink(tokio::sync::mpsc::Sender<FromDaemon>);
 /// queue, so a publish that waited for room would park the only thread that
 /// could make any. There is no method here that could wait.
 #[derive(Clone)]
-pub struct UiSink(tokio::sync::mpsc::Sender<FromDaemon>);
+pub struct UiSink(tokio::sync::mpsc::Sender<FromDaemon>, FrameReady);
 
 /// The pair, sized for this platform.
 #[must_use]
 pub fn channel() -> (ReaderSink, Events) {
     let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE);
-    (ReaderSink(tx), rx)
+    let (frames, ready) = tokio::sync::mpsc::channel(1);
+    (
+        ReaderSink(tx, FrameReady(frames)),
+        Events {
+            ordinary: rx,
+            frames: ready,
+            ordinary_batch: 0,
+        },
+    )
 }
 
 impl ReaderSink {
@@ -58,12 +66,15 @@ impl ReaderSink {
     /// async runtime's worker. The one caller is a reader on a thread of its
     /// own, which is what holding one of these means.
     pub fn send(&self, event: FromDaemon) -> Result<(), ()> {
+        if matches!(event, FromDaemon::CallFrames) {
+            return self.1.send().map_err(|_| ());
+        }
         self.0.blocking_send(event).map_err(|_| ())
     }
 
     /// The end for everything that runs on the UI executor.
     pub fn ui(&self) -> UiSink {
-        UiSink(self.0.clone())
+        UiSink(self.0.clone(), self.1.clone())
     }
 }
 
@@ -72,29 +83,16 @@ impl UiSink {
     ///
     /// For the paths that run *on* the UI executor — a send that failed
     /// before it left this process, a status view that never went out, a
-    /// nudge saying a call picture is waiting. A full queue drops the event
-    /// and says so; see [`Dropped`] for why dropping is the only answer
-    /// available here.
+    /// nudge saying a call picture is waiting. Video readiness coalesces on
+    /// its own channel. A full ordinary queue drops the event and says so.
     pub fn try_send(&self, event: FromDaemon) -> Result<(), Dropped> {
+        if matches!(event, FromDaemon::CallFrames) {
+            return self.1.send();
+        }
         match self.0.try_send(event) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(event)) => {
-                // Dropped either way; only how loudly differs. A nudge says
-                // a picture is waiting in a slot that holds the newest one,
-                // and a call refills that slot every frame, so a lost nudge
-                // mid-call is corrected by the next one about thirty
-                // milliseconds later — at the rate a call publishes them, an
-                // `error!` each would be the log rather than a line in it.
-                // Not free: the *last* nudge of a call has no next one, so a
-                // final picture can sit undrawn. That is the older bargain
-                // this channel already makes and not something this type
-                // changed; everything else here is news that arrives once and
-                // is worth a line saying it did not.
-                if matches!(event, FromDaemon::CallFrames) {
-                    log::debug!("the window is behind: dropped a call-frame nudge");
-                } else {
-                    log::error!("the window is behind: a session event was dropped");
-                }
+            Err(TrySendError::Full(_)) => {
+                log::error!("the window is behind: a session event was dropped");
                 Err(Dropped::Full)
             }
             Err(TrySendError::Closed(_)) => {
@@ -109,6 +107,28 @@ impl UiSink {
 mod tests {
     use super::{Dropped, EVENT_QUEUE, channel};
     use crate::session::{Fault, FromDaemon};
+
+    #[test]
+    fn delayed_last_frame_survives_an_ordinary_queue_full() {
+        let (reader, mut events) = channel();
+        let ui = reader.ui();
+        for _ in 0..EVENT_QUEUE {
+            assert_eq!(ui.try_send(FromDaemon::ShowWindow), Ok(()));
+        }
+        let decoder = std::thread::spawn(move || ui.try_send(FromDaemon::CallFrames));
+        assert_eq!(decoder.join().unwrap(), Ok(()));
+        let mut frames = 0;
+        let mut ordinary = 0;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                FromDaemon::CallFrames => frames += 1,
+                FromDaemon::ShowWindow => ordinary += 1,
+                _ => panic!("unexpected event"),
+            }
+        }
+        assert_eq!(ordinary, EVENT_QUEUE);
+        assert_eq!(frames, 1);
+    }
 
     /// A publish from the executor's end never waits, and says what it lost.
     ///

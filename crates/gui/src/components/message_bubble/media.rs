@@ -379,7 +379,7 @@ fn render_video_frame(frame: Arc<RenderImage>, width: f32, height: f32) -> gpui:
         .w_full()
         .h_full()
         .child(
-            img(frame)
+            img(crate::video::video_image(frame))
                 .w(px(width))
                 .h(px(height))
                 .object_fit(ObjectFit::Contain),

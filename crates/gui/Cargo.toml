@@ -38,8 +38,9 @@ chrono = { workspace = true, features = ["std", "clock"] }
 # (`cargo update -p gpui --precise <rev>` to move it). Same-source everywhere =
 # one gpui in the tree, no fork.
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component.git" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git" }
+# Input paint invalidation fix pending longbridge/gpui-kit#2988.
+gpui-component = { git = "https://github.com/jlucaso1/gpui-component.git", branch = "fix/input-scroll-notify-0.5" }
+gpui-component-assets = { git = "https://github.com/jlucaso1/gpui-component.git", branch = "fix/input-scroll-notify-0.5" }
 
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Ordered maps for deterministic cache eviction
@@ -173,6 +174,7 @@ web-sys = { version = "0.3", features = [
 # hold a browser-only failure under `cargo test` by building the same thing —
 # the crate is already in the graph on every platform, and this only names it.
 [dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", features = ["test-support"] }
 gpui_wgpu = { git = "https://github.com/zed-industries/zed", package = "gpui_wgpu" }
 # The same synthetic chats and messages every crate above core tests against.
 oxidezap-core = { workspace = true, features = ["fixtures"] }

@@ -60,6 +60,7 @@ fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
         sink,
         pending,
         pictures,
+        recover,
     } = attach::begin(
         Link::over_stream(writer),
         Arc::new(Directory),
@@ -77,7 +78,7 @@ fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
         .name("oxidezap-ipc".to_string())
         .spawn(move || {
             let _alive = alive;
-            read_frames(reader, &sink, &pending, &pictures);
+            read_frames(reader, &sink, &pending, &pictures, recover);
         })?;
 
     session.ends_with(Teardown::new(move || {
@@ -117,9 +118,10 @@ fn read_frames(
     events: &ReaderSink,
     pending: &Pending,
     pictures: &crate::video::LatestFrames,
+    recover: crate::video::RecoverySink,
 ) {
     let cache = Directory;
-    let mut frames = Frames::new(events, pending, &cache, pictures);
+    let mut frames = Frames::new(events, pending, &cache, pictures, recover);
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         read_loop(stream, &mut frames);
     }))
@@ -498,6 +500,49 @@ mod tests {
             matches!(peer.heard.recv_timeout(SOON), Ok(Some(_))),
             "the request arrived"
         );
+    }
+
+    #[test]
+    fn recovery_stays_on_its_connection_after_reconnect() {
+        let old_peer = Peer::listening("recovery-old").unwrap();
+        let (old, _events) = old_peer.client().unwrap();
+        old_peer.hello();
+        let recover = super::super::recovery::sink(old.conn.wire.clone()).unwrap();
+        assert!(recover("original-call", oxidezap_core::VideoStream::Remote));
+        let line = old_peer.heard.recv_timeout(SOON).unwrap().unwrap();
+        let request: oxidezap_ipc::Request = serde_json::from_str(&line).unwrap();
+        assert!(matches!(
+            request.request,
+            ClientRequest::Call(oxidezap_ipc::CallAction::RequestVideoKeyframe { call_id, stream })
+                if call_id == "original-call" && stream == oxidezap_core::VideoStream::Remote
+        ));
+        drop(old);
+        assert!(old_peer.ended());
+
+        let new_peer = Peer::listening("recovery-new").unwrap();
+        let (_new, _events) = new_peer.client().unwrap();
+        new_peer.hello();
+        let _ = recover("original-call", oxidezap_core::VideoStream::Local);
+        assert!(new_peer.quiet());
+    }
+
+    #[test]
+    fn recovery_admission_is_bounded_and_does_not_wait_for_the_wire() {
+        let peer = Peer::listening("recovery-busy").unwrap();
+        let (session, _events) = peer.client().unwrap();
+        peer.hello();
+        let recover = super::super::recovery::sink(session.conn.wire.clone()).unwrap();
+        let held = session.conn.wire.0.lock().unwrap();
+        let (sent, received) = channel();
+        std::thread::spawn(move || {
+            let admitted = (0..16)
+                .filter(|_| recover("busy-call", oxidezap_core::VideoStream::Remote))
+                .count();
+            let _ = sent.send(admitted);
+        });
+        let admitted = received.recv_timeout(SOON);
+        drop(held);
+        assert!(matches!(admitted, Ok(2..=3)), "{admitted:?}");
     }
 
     /// The write half is given up before the hangup runs.

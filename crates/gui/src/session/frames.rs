@@ -11,10 +11,11 @@
 //! be got wrong about the protocol is written once.
 
 use std::ops::ControlFlow;
+use std::sync::{Arc, Mutex};
 
 use chrono::DateTime;
 use log::{debug, error, info, warn};
-use oxidezap_core::{Chat, MediaContent, UiEvent};
+use oxidezap_core::{CallState, Chat, MediaContent, UiEvent, VideoStream};
 use oxidezap_ipc::{
     ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, PROTOCOL_VERSION, RequestId,
     StateSnapshot, StateVersion,
@@ -47,10 +48,11 @@ pub(super) struct Frames<'a> {
     /// arrives and dropped when the call state says there is no call: a
     /// decoder held past its call keeps its reference frames for a picture
     /// nobody is looking at, and whatever it decodes on with them.
-    video: Option<crate::video::CallVideo>,
-    /// Where a decoded picture goes: into the slot for its direction, and a
-    /// nudge behind it.
-    decoded: crate::video::FrameSink,
+    video: [Option<crate::video::CallVideo>; 2],
+    calls: CallState,
+    pictures: crate::video::LatestFrames,
+    generation: Arc<Mutex<[u64; 2]>>,
+    recover: crate::video::RecoverySink,
 }
 
 impl<'a> Frames<'a> {
@@ -59,30 +61,72 @@ impl<'a> Frames<'a> {
         pending: &'a Pending,
         media: &'a dyn MediaCache,
         pictures: &crate::video::LatestFrames,
+        recover: crate::video::RecoverySink,
     ) -> Self {
-        let decoded: crate::video::FrameSink = {
-            let events = events.ui();
-            let pictures = pictures.clone();
-            std::sync::Arc::new(move |frame| {
-                // Into the slot, replacing whatever that direction was
-                // holding: this is the same bargain the daemon makes one hop
-                // earlier, and the window is where the backlog would actually
-                // be seen. The nudge may be dropped as well — a full channel
-                // already has one in it, and the slot holds the newest
-                // picture either way.
-                pictures.put(frame);
-                let _ = events.try_send(FromDaemon::CallFrames);
-            })
-        };
         Self {
             events,
             pending,
             media,
             applied: StateVersion::INITIAL,
             reason: None,
-            video: None,
-            decoded,
+            video: [None, None],
+            calls: CallState::default(),
+            pictures: pictures.clone(),
+            generation: Arc::new(Mutex::new([0; 2])),
+            recover,
         }
+    }
+
+    fn decoder_sink(&self) -> crate::video::FrameSink {
+        let generation = Arc::clone(&self.generation);
+        let born = *generation.lock().expect("video generation poisoned");
+        let pictures = self.pictures.clone();
+        let events = self.events.ui();
+        Arc::new(move |frame| {
+            // Serialize publication with retirement, including clearing the slots.
+            let current = generation.lock().expect("video generation poisoned");
+            let slot = stream_slot(frame.stream);
+            if current[slot] != born[slot] {
+                return;
+            }
+            pictures.put(frame);
+            let _ = events.try_send(FromDaemon::CallFrames);
+        })
+    }
+
+    fn retire_video(&mut self) {
+        for stream in [VideoStream::Local, VideoStream::Remote] {
+            self.retire_stream(stream);
+        }
+    }
+
+    fn retire_stream(&mut self, stream: VideoStream) {
+        let slot = stream_slot(stream);
+        {
+            let mut generation = self.generation.lock().expect("video generation poisoned");
+            generation[slot] = generation[slot]
+                .checked_add(1)
+                .expect("video generation exhausted");
+            self.pictures.clear(stream);
+        }
+        self.video[slot] = None;
+    }
+
+    fn follow_calls(&mut self, calls: &CallState) {
+        for stream in [VideoStream::Local, VideoStream::Remote] {
+            let retired = match (self.calls.active(), calls.active()) {
+                (Some(before), Some(after)) => {
+                    before.call_id != after.call_id
+                        || (before.video.is_on(stream) && !after.video.is_on(stream))
+                }
+                (None, None) => false,
+                _ => true,
+            };
+            if retired {
+                self.retire_stream(stream);
+            }
+        }
+        self.calls = calls.clone();
     }
 
     /// End this connection with a reason of the transport's own.
@@ -126,6 +170,7 @@ impl<'a> Frames<'a> {
             // nothing to compare against.
             DaemonMessage::Hello { protocol, snapshot } if protocol == PROTOCOL_VERSION => {
                 self.applied = snapshot.version;
+                self.follow_calls(&snapshot.calls);
                 for event in catch_up(&snapshot) {
                     self.publish(event)?;
                 }
@@ -344,35 +389,38 @@ impl<'a> Frames<'a> {
                 event: DaemonEvent::CallsChanged(calls),
             } => {
                 self.applied = version;
-                // The call the decoders belong to is over, or a different one
-                // is up. Either way theirs has ended.
-                if !calls.holds(self.video.as_ref().map_or("", |v| v.call_id())) {
-                    self.video = None;
-                }
+                self.follow_calls(&calls);
                 self.publish(FromDaemon::Calls(Box::new(calls)))?;
             }
             // A stream rather than an event: fed to the decoder that owns its
             // direction, which drops it if it is still busy with the one
             // before. Nothing here waits, and nothing recovers a frame.
             DaemonMessage::CallVideo(frame) => {
-                let decoders = match &self.video {
-                    Some(decoders) if decoders.call_id() == frame.call_id => decoders,
-                    // A different call: the old decoders are mid-bitstream on
-                    // a stream that has ended, and feeding them this one would
-                    // produce nothing either could use.
-                    _ => self.video.insert(crate::video::CallVideo::new(
+                if !self.calls.active().is_some_and(|call| {
+                    call.call_id == frame.call_id && call.video.is_on(frame.stream)
+                }) {
+                    return ControlFlow::Continue(());
+                }
+                let slot = stream_slot(frame.stream);
+                if self.video[slot].is_none() {
+                    self.video[slot] = Some(crate::video::CallVideo::new(
                         frame.call_id.clone(),
-                        std::sync::Arc::clone(&self.decoded),
-                    )),
-                };
-                decoders.accept(*frame);
+                        frame.stream,
+                        self.decoder_sink(),
+                        Arc::clone(&self.recover),
+                    ));
+                }
+                if let Some(decoders) = &self.video[slot] {
+                    debug_assert_eq!(decoders.call_id(), frame.call_id);
+                    decoders.accept(*frame);
+                }
             }
             // The daemon skipped frames on the way here. Whatever the decoders
             // hold no longer matches what the senders encoded against, so they
             // wait for a keyframe rather than drawing on references that never
             // arrived.
             DaemonMessage::CallVideoGap => {
-                if let Some(decoders) = &self.video {
+                for decoders in self.video.iter().flatten() {
                     decoders.interrupted();
                 }
             }
@@ -413,7 +461,8 @@ impl<'a> Frames<'a> {
     /// Whatever ended this, the front end is now talking to nobody, and every
     /// caller waiting on a download is waiting on an answer that will never
     /// come.
-    pub(super) fn finish(self) {
+    pub(super) fn finish(mut self) {
+        self.retire_video();
         info!("daemon connection closed");
         let abandoned: Vec<Awaiting> = self
             .pending
@@ -430,11 +479,24 @@ impl<'a> Frames<'a> {
                 &Failure::worth_retrying("the daemon connection closed"),
             );
         }
-        let _ = self
-            .events
-            .send(FromDaemon::Ended(self.reason.unwrap_or_else(|| {
-                Fault::unreachable("lost the connection to the daemon")
-            })));
+        let _ =
+            self.events
+                .send(FromDaemon::Ended(self.reason.take().unwrap_or_else(|| {
+                    Fault::unreachable("lost the connection to the daemon")
+                })));
+    }
+}
+
+impl Drop for Frames<'_> {
+    fn drop(&mut self) {
+        self.retire_video();
+    }
+}
+
+fn stream_slot(stream: VideoStream) -> usize {
+    match stream {
+        VideoStream::Local => 0,
+        VideoStream::Remote => 1,
     }
 }
 
@@ -750,6 +812,500 @@ mod tests {
     use super::*;
     use oxidezap_core::CallState;
     use oxidezap_ipc::StateVersion;
+
+    struct NoMedia;
+
+    impl MediaCache for NoMedia {
+        fn read(&self, _: &str) -> Result<std::sync::Arc<Vec<u8>>, String> {
+            panic!("frame tests must not read media")
+        }
+        fn stage(&self, _: &str, _: &[u8]) -> Result<(), String> {
+            panic!("frame tests must not stage media")
+        }
+        fn discard(&self, _: &str) {
+            panic!("frame tests must not discard media")
+        }
+    }
+
+    fn video_call(id: &str) -> CallState {
+        let mut calls = CallState::default();
+        calls.set_outgoing(oxidezap_core::OutgoingCall::new(
+            id,
+            "peer@example.invalid".into(),
+            "Test peer".into(),
+            true,
+        ));
+        assert!(calls.connect(&id.to_string()));
+        assert!(calls.set_video(&id.to_string(), oxidezap_core::VideoStream::Remote, true));
+        calls
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn opposite_camera_off_preserves_delta_decoding_without_recovery() {
+        use openh264::encoder::{Encoder, EncoderConfig};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+        use oxidezap_core::VideoStream::{Local, Remote};
+        use std::time::Duration;
+
+        let mut encoder =
+            Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new())
+                .unwrap();
+        let pixels = vec![96; 32 * 32 * 3];
+        let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (32, 32)));
+        let key = encoder.encode(&yuv).unwrap();
+        assert!(matches!(
+            key.frame_type(),
+            openh264::encoder::FrameType::IDR
+        ));
+        let key = key.to_vec();
+        let delta = encoder.encode(&yuv).unwrap();
+        assert!(matches!(
+            delta.frame_type(),
+            openh264::encoder::FrameType::P
+        ));
+        let delta = delta.to_vec();
+
+        for healthy in [Local, Remote] {
+            let disabled = if healthy == Local { Remote } else { Local };
+            let (sink, _events) = super::super::sink::channel();
+            let pending = Pending::default();
+            let pictures = crate::video::LatestFrames::default();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let received = requests.clone();
+            let mut frames = Frames::new(
+                &sink,
+                &pending,
+                &NoMedia,
+                &pictures,
+                Arc::new(move |_, stream| {
+                    received.lock().unwrap().push(stream);
+                    true
+                }),
+            );
+            let mut calls = video_call("current");
+            calls.set_video(&"current".into(), Local, true);
+            frames.follow_calls(&calls);
+            let unit = |stream, data, keyframe| {
+                DaemonMessage::CallVideo(Box::new(oxidezap_core::CallVideoFrame::new(
+                    "current".into(),
+                    stream,
+                    data,
+                    keyframe,
+                    0,
+                )))
+            };
+            let wait_picture = |expected| {
+                let deadline = wacore::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    if let Some(frame) = pictures.take().into_iter().next() {
+                        assert_eq!(frame.stream, expected);
+                        break;
+                    }
+                    assert!(
+                        wacore::time::Instant::now() < deadline,
+                        "decoder produced no picture; recovery requests: {:?}",
+                        requests.lock().unwrap()
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            for stream in [disabled, healthy] {
+                assert!(frames.apply(unit(stream, key.clone(), true)).is_continue());
+                wait_picture(stream);
+            }
+            calls.set_video(&"current".into(), disabled, false);
+            assert!(
+                frames
+                    .apply(DaemonMessage::Update {
+                        version: StateVersion::INITIAL.next(),
+                        event: DaemonEvent::CallsChanged(calls),
+                    })
+                    .is_continue()
+            );
+            assert!(
+                frames
+                    .apply(unit(healthy, delta.clone(), false))
+                    .is_continue()
+            );
+            wait_picture(healthy);
+            assert!(requests.lock().unwrap().is_empty());
+        }
+    }
+
+    fn keyframe(id: &str) -> DaemonMessage {
+        DaemonMessage::CallVideo(Box::new(oxidezap_core::CallVideoFrame {
+            call_id: id.into(),
+            stream: oxidezap_core::VideoStream::Remote,
+            data: Vec::new(),
+            keyframe: true,
+            gap: false,
+            orientation: 0,
+        }))
+    }
+
+    fn picture(id: &str, stream: oxidezap_core::VideoStream) -> crate::video::CallFrame {
+        crate::video::CallFrame {
+            call_id: id.into(),
+            stream,
+            image: std::sync::Arc::new(gpui::RenderImage::new(smallvec::smallvec![
+                image::Frame::new(image::RgbaImage::new(1, 1)),
+            ])),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fair_readiness_before_call_adoption_keeps_the_only_picture() {
+        for replacement in [None, Some(CallState::default()), Some(video_call("next"))] {
+            let (sink, mut events) = super::super::sink::channel();
+            let path = std::env::temp_dir().join(format!(
+                "oxidezap-frame-adoption-{}.sock",
+                std::process::id()
+            ));
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let endpoint = oxidezap_ipc::Endpoint::connect_at(&path).unwrap();
+            let (_peer, _) = listener.accept().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let (_, writer) = endpoint.split().unwrap();
+            let client = super::super::Session::new(
+                oxidezap_ipc::Link::over_stream(writer),
+                sink.ui(),
+                Arc::new(NoMedia),
+            );
+            let pending = Pending::default();
+            let pictures = client.call_frames().clone();
+            let mut frames =
+                Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+            let enabled = video_call("current");
+            let mut ui = enabled.clone();
+            ui.set_video(&"current".into(), VideoStream::Remote, false);
+            frames.follow_calls(&ui);
+            for _ in 0..16 {
+                assert!(sink.send(FromDaemon::ShowWindow).is_ok());
+            }
+            assert!(
+                frames
+                    .apply(DaemonMessage::Update {
+                        version: StateVersion::INITIAL.next(),
+                        event: DaemonEvent::CallsChanged(enabled),
+                    })
+                    .is_continue()
+            );
+            let decoded = frames.decoder_sink();
+            let first = picture("current", VideoStream::Remote);
+            let image = Arc::clone(&first.image);
+            decoded(first);
+            let drawn = crate::app::exercise_call_frame_adoption(client, &mut events, ui, || {
+                if let Some(next) = replacement.as_ref() {
+                    assert!(
+                        frames
+                            .apply(DaemonMessage::Update {
+                                version: StateVersion::INITIAL.next().next(),
+                                event: DaemonEvent::CallsChanged(next.clone()),
+                            })
+                            .is_continue()
+                    );
+                    decoded(picture("current", VideoStream::Remote));
+                }
+                replacement.is_some()
+            });
+            if replacement.is_none() {
+                assert!(
+                    drawn.is_some_and(|drawn| Arc::ptr_eq(&drawn, &image)),
+                    "the only picture was lost before UI camera enable"
+                );
+            } else {
+                assert!(drawn.is_none(), "retired picture reached the UI");
+            }
+        }
+    }
+
+    #[test]
+    fn camera_retirement_clears_only_its_slot_and_generation() {
+        use oxidezap_core::VideoStream::{Local, Remote};
+        for disabled in [Local, Remote] {
+            let healthy = if disabled == Local { Remote } else { Local };
+            let (sink, _events) = super::super::sink::channel();
+            let pending = Pending::default();
+            let pictures = crate::video::LatestFrames::default();
+            let mut frames =
+                Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+            let mut calls = video_call("current");
+            calls.set_video(&"current".into(), Local, true);
+            frames.follow_calls(&calls);
+            let delayed = frames.decoder_sink();
+            for stream in [Local, Remote] {
+                delayed(picture("current", stream));
+            }
+            calls.set_video(&"current".into(), disabled, false);
+            frames.follow_calls(&calls);
+            let waiting = pictures.take();
+            assert_eq!(waiting.len(), 1);
+            assert_eq!(waiting[0].stream, healthy);
+            calls.set_video(&"current".into(), disabled, true);
+            frames.follow_calls(&calls);
+            delayed(picture("current", disabled));
+            assert!(pictures.take().is_empty());
+            delayed(picture("current", healthy));
+            assert_eq!(pictures.take().len(), 1);
+            for next in [video_call("replacement"), CallState::default()] {
+                let delayed = frames.decoder_sink();
+                for stream in [Local, Remote] {
+                    delayed(picture("current", stream));
+                }
+                frames.follow_calls(&next);
+                assert!(pictures.take().is_empty());
+                for stream in [Local, Remote] {
+                    delayed(picture("current", stream));
+                }
+                assert!(pictures.take().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn two_latest_slots_share_one_readiness_notification() {
+        use oxidezap_core::VideoStream::{Local, Remote};
+        let (sink, mut events) = super::super::sink::channel();
+        let pending = Pending::default();
+        let pictures = crate::video::LatestFrames::default();
+        let frames = Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+        for stream in [Local, Remote, Local, Remote] {
+            (frames.decoder_sink())(picture("current", stream));
+        }
+        let newest = picture("current", Local);
+        let image = std::sync::Arc::clone(&newest.image);
+        (frames.decoder_sink())(newest);
+        let newest = picture("current", Remote);
+        let remote_image = std::sync::Arc::clone(&newest.image);
+        (frames.decoder_sink())(newest);
+        assert!(matches!(events.try_recv(), Ok(FromDaemon::CallFrames)));
+        assert!(
+            events.try_recv().is_err(),
+            "readiness notifications accumulated"
+        );
+        let held = pictures.take();
+        assert_eq!(held.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(
+            &held
+                .iter()
+                .find(|frame| frame.stream == Local)
+                .unwrap()
+                .image,
+            &image,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &held
+                .iter()
+                .find(|frame| frame.stream == Remote)
+                .unwrap()
+                .image,
+            &remote_image,
+        ));
+        assert!(pictures.take().is_empty());
+    }
+
+    #[test]
+    fn decoded_output_in_flight_cannot_repopulate_a_retired_call() {
+        let (sink, _events) = super::super::sink::channel();
+        let pending = Pending::default();
+        let pictures = crate::video::LatestFrames::default();
+        let mut frames = Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+        let mut snapshot = snapshot_of(Vec::new());
+        snapshot.calls = video_call("ended");
+        assert!(
+            frames
+                .apply(DaemonMessage::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    snapshot,
+                })
+                .is_continue()
+        );
+        let delayed = frames.decoder_sink();
+        assert!(
+            frames
+                .apply(DaemonMessage::Update {
+                    version: StateVersion::INITIAL.next(),
+                    event: DaemonEvent::CallsChanged(CallState::default()),
+                })
+                .is_continue()
+        );
+        delayed(picture("ended", oxidezap_core::VideoStream::Remote));
+        assert!(
+            pictures.take().is_empty(),
+            "retired output repopulated its slot"
+        );
+    }
+
+    #[test]
+    fn teardown_then_late_keyframe_must_not_recreate_decoders() {
+        let (sink, _events) = super::super::sink::channel();
+        let pending = Pending::default();
+        let pictures = crate::video::LatestFrames::default();
+        let mut frames = Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+        let mut snapshot = snapshot_of(Vec::new());
+        snapshot.calls = video_call("ended");
+        assert!(
+            frames
+                .apply(DaemonMessage::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    snapshot,
+                })
+                .is_continue()
+        );
+        assert!(frames.apply(keyframe("ended")).is_continue());
+        assert!(frames.video[1].is_some());
+        let version = StateVersion::INITIAL.next();
+        assert!(
+            frames
+                .apply(DaemonMessage::Update {
+                    version,
+                    event: DaemonEvent::CallsChanged(CallState::default()),
+                })
+                .is_continue()
+        );
+        assert!(frames.video.iter().all(Option::is_none));
+        assert!(frames.apply(keyframe("ended")).is_continue());
+        assert!(
+            frames.video.iter().all(Option::is_none),
+            "a late keyframe recreated decoders"
+        );
+    }
+
+    #[test]
+    fn frames_without_an_authorized_camera_never_create_decoders() {
+        let (sink, _events) = super::super::sink::channel();
+        let pending = Pending::default();
+        let pictures = crate::video::LatestFrames::default();
+        let mut frames = Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+        assert!(frames.apply(keyframe("unknown")).is_continue());
+        assert!(
+            frames.video.iter().all(Option::is_none),
+            "a frame before Hello created decoders"
+        );
+        let mut snapshot = snapshot_of(Vec::new());
+        snapshot.calls = video_call("current");
+        assert!(
+            frames
+                .apply(DaemonMessage::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    snapshot,
+                })
+                .is_continue()
+        );
+        assert!(frames.apply(keyframe("different")).is_continue());
+        assert!(
+            frames.video.iter().all(Option::is_none),
+            "a mismatched frame created decoders"
+        );
+        let DaemonMessage::CallVideo(mut local) = keyframe("current") else {
+            unreachable!();
+        };
+        local.stream = oxidezap_core::VideoStream::Local;
+        assert!(frames.apply(DaemonMessage::CallVideo(local)).is_continue());
+        assert!(
+            frames.video.iter().all(Option::is_none),
+            "Hello did not enable the local camera"
+        );
+    }
+
+    #[test]
+    fn disabling_a_camera_rejects_late_keyframes_and_old_decoded_output() {
+        use oxidezap_core::VideoStream::Remote;
+        let (sink, _events) = super::super::sink::channel();
+        let pending = Pending::default();
+        let pictures = crate::video::LatestFrames::default();
+        let mut frames = Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+        let mut calls = video_call("current");
+        let mut snapshot = snapshot_of(Vec::new());
+        snapshot.calls = calls.clone();
+        assert!(
+            frames
+                .apply(DaemonMessage::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    snapshot,
+                })
+                .is_continue()
+        );
+        assert!(frames.apply(keyframe("current")).is_continue());
+        let delayed = frames.decoder_sink();
+        delayed(picture("current", Remote));
+        assert!(calls.set_video(&"current".into(), Remote, false));
+        let version = StateVersion::INITIAL.next();
+        assert!(
+            frames
+                .apply(DaemonMessage::Update {
+                    version,
+                    event: DaemonEvent::CallsChanged(calls.clone()),
+                })
+                .is_continue()
+        );
+        assert!(
+            pictures.take().is_empty(),
+            "disabled camera retained a picture"
+        );
+        assert!(frames.apply(keyframe("current")).is_continue());
+        assert!(
+            frames.video.iter().all(Option::is_none),
+            "disabled camera recreated decoders"
+        );
+        assert!(calls.set_video(&"current".into(), Remote, true));
+        assert!(
+            frames
+                .apply(DaemonMessage::Update {
+                    version: version.next(),
+                    event: DaemonEvent::CallsChanged(calls),
+                })
+                .is_continue()
+        );
+        delayed(picture("current", Remote));
+        assert!(
+            pictures.take().is_empty(),
+            "old generation survived camera restart"
+        );
+        assert!(frames.apply(keyframe("current")).is_continue());
+        assert!(frames.video[1].is_some());
+        let delayed = frames.decoder_sink();
+        drop(frames);
+        delayed(picture("current", Remote));
+        assert!(
+            pictures.take().is_empty(),
+            "output survived connection teardown"
+        );
+    }
+
+    #[test]
+    fn covered_call_updates_do_not_retire_the_hello_camera() {
+        let (sink, _events) = super::super::sink::channel();
+        let pending = Pending::default();
+        let pictures = crate::video::LatestFrames::default();
+        let mut frames = Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+        let mut snapshot = snapshot_of(Vec::new());
+        snapshot.version = StateVersion::INITIAL.next();
+        snapshot.calls = video_call("current");
+        let version = snapshot.version;
+        assert!(
+            frames
+                .apply(DaemonMessage::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    snapshot,
+                })
+                .is_continue()
+        );
+        assert!(
+            frames
+                .apply(DaemonMessage::Update {
+                    version,
+                    event: DaemonEvent::CallsChanged(CallState::default()),
+                })
+                .is_continue()
+        );
+        assert!(frames.apply(keyframe("current")).is_continue());
+        assert_eq!(frames.video[1].as_ref().unwrap().call_id(), "current");
+        assert!(frames.apply(keyframe("different")).is_continue());
+        assert_eq!(frames.video[1].as_ref().unwrap().call_id(), "current");
+    }
 
     /// Three endings reached one screen: "Can't reach WhatsApp… We'll keep
     /// trying to reconnect", with the real reason folded away. Two of them

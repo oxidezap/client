@@ -5,6 +5,10 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 28: `CallAction::RequestVideoKeyframe` names the call and direction whose
+/// compressed reference chain was lost. Older daemons reject the request,
+/// leaving a remote decoder waiting for an IDR the peer may never send.
+///
 /// 27: `ClientRequest::GroupMembers`, answered by
 /// `DaemonMessage::GroupMembers`. A group's header had no line under its name
 /// because nothing on a front end's side could answer who is in it: what a
@@ -211,7 +215,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///
