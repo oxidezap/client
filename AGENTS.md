@@ -144,8 +144,12 @@ which is why they are here and the inventories are not.
   everything precisely so `plugin-host`, which must not depend on `session`, can
   reach it too; that rule used to name the session's `exec/` and the tree had
   quietly forked three copies of one browser timer because `plugin-host` could
-  not obey it. Go through it rather than naming a clock or a pool. What decides
-  where work goes is what the work *is*, not where the code lives.
+  not obey it. Route asynchronous waits and task execution through it rather
+  than calling browser timers or runtime pools directly. Reading elapsed time
+  is separate. Use `wacore::time::Instant`, as required by `clippy.toml`.
+  The web startup registers its monotonic provider before the application runs;
+  `oxidezap-platform` does not expose a clock-reading API. What decides where
+  work goes is what the work *is*, not where the code lives.
 - **A browser API never gets a view into wasm memory.** The module is built with
   `--shared-memory`, so the specs refuse a shared `ArrayBufferView`: copy before
   crossing out. This cost three outages, so the spelling is now banned rather
