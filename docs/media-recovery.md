@@ -152,11 +152,11 @@ timers and callbacks. Neither exercises a physical camera LED.
 ## Received orientation
 
 Switching the Android camera from front to rear turned the web picture upside
-down. The locked library stamped every received frame with the last signaling
+down. The library stamped every received frame with the last signaling
 `device_orientation`, ignoring the per-frame RTP rotation. The executed
 receive oracle maps all 256 frame-info bytes to clockwise display turns of 0,
-270, 180 and 90 degrees for low bits 0, 1, 2 and 3. The upstream correction is
-proposed in
-[whatsapp-rust#1469](https://github.com/oxidezap/whatsapp-rust/pull/1469) and
-is not yet merged, so this branch keeps the locked revision and only documents
-the convention. No 180-degree GUI compensation was added.
+270, 180 and 90 degrees for low bits 0, 1, 2 and 3. The upstream correction
+merged in
+[whatsapp-rust#1469](https://github.com/oxidezap/whatsapp-rust/pull/1469),
+which this branch consumes at `9f25ff96`. No 180-degree GUI compensation was
+added. A live Android front/rear retest is still required.
