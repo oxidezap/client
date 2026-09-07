@@ -694,6 +694,7 @@ mod tests {
     /// on its way out. The plane's receiver is deliberately kept alive here:
     /// that is what makes `plane.is_closed()` false and leaves the flag as the
     /// only thing that can tell the difference.
+    #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
     async fn a_camera_we_stopped_is_not_a_camera_that_was_lost() {
         let (frames_tx, frames) = async_channel::bounded::<EncodedFrame>(1);
@@ -782,6 +783,7 @@ mod tests {
     /// belongs to used to go on reading as live: a caller wiring it into the
     /// registry kept it, so the device stayed open with its light on and
     /// every window drew a direction nothing would ever arrive on.
+    #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
     async fn a_camera_whose_plane_closed_stops_reading_as_live() {
         let (frames_tx, frames) = async_channel::bounded(1);

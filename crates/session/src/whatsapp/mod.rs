@@ -29,8 +29,11 @@ mod outgoing;
 mod paging;
 mod ui_queue;
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests;
+
+#[cfg(all(test, target_family = "wasm"))]
+mod browser_tests;
 
 use calls::CallRegistry;
 use convert::{account_event, quote_context};
