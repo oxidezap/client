@@ -745,13 +745,15 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   presentation order on every baseline stream, which is every video WhatsApp
   itself sends, and only an attachment from somewhere else has the shape that
   breaks it.
-- **A peer's orientation describes their device, not their picture.** The
-  camera encodes in the sensor's orientation whatever the phone is doing, so a
-  frame arrives already turned by however it is held and `device_orientation`
-  is the *description* of that turn. Drawing it upright means undoing it —
-  `Rotation::to_upright`, not the turn itself. Applying it again is the one
-  mistake that looks deliberate: at one quarter turn it is 180° out, which
-  reads as a peer standing on their head rather than as a sign error.
+- **Frame rotation is not camera-facing state.** Captured `JgwtTQVeWPm.wasm`
+  function 828 maps frame-info bits `0,1,2,3` to JS orientation enum `1,4,3,2`.
+  `WAWebVoipVideoRenderer` applies clockwise `0,270,180,90` degrees, matching
+  `Rotation::to_upright`. The receive oracle executes all 256 metadata bytes;
+  the remaining bits do not change rotation at that rendering boundary.
+  At library revision `2b9a8d7`, received frames instead use signaling
+  `device_orientation`, ignoring RTP frame-info rotation. Camera changes can
+  therefore leave the GUI with stale orientation. Correcting the metadata
+  source upstream is required; adding 180 degrees in the GUI is not a fix.
 - **A camera is a request, not a state, and requests arrive out of order.**
   Opening one is device work — tens of milliseconds, and a permission prompt
   the first time — so two toggles spawned in order routinely start in the

@@ -56,17 +56,10 @@ impl Rotation {
         }
     }
 
-    /// The turn that draws a peer's frame the right way up, given the
-    /// `device_orientation` they announced.
-    ///
-    /// Their rotation *undone*, not repeated. A camera encodes in its sensor's
-    /// orientation whatever the device is doing, so the picture arrives
-    /// already turned by however the phone is held, and
-    /// `device_orientation` is the description of that turn rather than a
-    /// correction for it. Applying it again is what put a peer holding their
-    /// phone sideways on their head: one quarter turn the wrong way is 180°
-    /// out, which is the one error a wrong sign can make look like a
-    /// deliberate choice.
+    /// Display correction for the peer's two rotation bits. Captured WhatsApp
+    /// WASM JgwtTQVeWPm function 828 maps bits 0,1,2,3 to JS orientation enum
+    /// 1,4,3,2. WAWebVoipVideoRenderer draws those as clockwise 0,270,180,90.
+    /// The source must select per-frame RTP metadata before signaling fallback.
     pub(super) fn to_upright(device_orientation: u8) -> Self {
         match device_orientation {
             1 => Self::Cw270,
@@ -286,6 +279,25 @@ mod tests {
                 &mut back,
             );
             assert_eq!(back, src, "a peer at {turns} quarter turns");
+        }
+    }
+
+    #[test]
+    fn camera_switch_rotation_sequence_matches_the_received_wasm_convention() {
+        let expected = [
+            [0, 1, 2, 3, 4, 5],
+            [2, 5, 1, 4, 0, 3],
+            [5, 4, 3, 2, 1, 0],
+            [3, 0, 4, 1, 5, 2],
+        ];
+        // Synthetic front/rear pairs exercise every rotation and opposite turns.
+        for bits in [0, 2, 1, 3, 2, 0, 3, 1] {
+            let source = tagged(3, 2);
+            let rotation = Rotation::to_upright(bits);
+            let mut native = vec![0; source.len()];
+            write_bgra_rotated(&source, 3, 2, rotation, &mut native);
+            assert_eq!(reds(&native), expected[bits as usize]);
+            assert_eq!(into_bgra_rotated(source, 3, 2, rotation), native);
         }
     }
 

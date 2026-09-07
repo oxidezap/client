@@ -126,3 +126,37 @@ images and bytes, visible dimensions, discarded output, formats, and fallbacks.
 Attempts include rejected copies and retries, but not the capability probe.
 They are workload counters, not per-copy duration measurements. Compare deltas
 within one decoder lifetime rather than summing cumulative reports.
+
+## Capture ownership
+
+`MediaStream.clone` is the browser method and duplicates tracks; it is not a
+Rust handle copy. The camera preview and the microphone graph both cloned the
+acquired stream and stopped only one track set on teardown, leaving the
+original capturing with the tab indicator on. Both paths now borrow the guarded
+stream and move its tracks into the owner that stops them.
+
+Two adjacent microphone paths needed guards of their own. A permission grant
+landing after the opener was dropped or timed out still opens the device, so a
+late grant is stopped unless the opener synchronously claimed the stream. A
+setup dropped while the prompt is up also closes the audio context, which the
+call graph never came to own. A playout-node creation failure detaches the
+already-armed capture handler before its closure goes away.
+
+`crates/audio/tests/call_audio_lifecycle.rs` drives the production opener
+through granted, failing and cancelled setups in a real browser and requires
+every track ended, every handler detached and every context closed. The camera
+harness in `crates/session/src/video/camera_lifecycle_tests.rs` counts
+`MediaStream` and track clones and likewise requires zero surviving tracks,
+timers and callbacks. Neither exercises a physical camera LED.
+
+## Received orientation
+
+Switching the Android camera from front to rear turned the web picture upside
+down. The locked library stamped every received frame with the last signaling
+`device_orientation`, ignoring the per-frame RTP rotation. The executed
+receive oracle maps all 256 frame-info bytes to clockwise display turns of 0,
+270, 180 and 90 degrees for low bits 0, 1, 2 and 3. The upstream correction is
+proposed in
+[whatsapp-rust#1469](https://github.com/oxidezap/whatsapp-rust/pull/1469) and
+is not yet merged, so this branch keeps the locked revision and only documents
+the convention. No 180-degree GUI compensation was added.

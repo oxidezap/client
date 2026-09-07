@@ -118,13 +118,9 @@ pub struct CallVideoFrame {
     /// against, and the units that follow reference what it never received.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub gap: bool,
-    /// The sender's device rotation in quarter turns, clockwise.
-    ///
-    /// Their *device*, not their picture: a camera encodes in its sensor's
-    /// orientation whatever the phone is doing, so the frame arrives already
-    /// turned by this much and whoever draws it turns it back. Repeating the
-    /// turn instead of undoing it is 180° out at one quarter turn, which
-    /// looks like a peer standing on their head rather than like a sign.
+    /// The peer frame's two rotation bits. Values 0,1,2,3 require clockwise
+    /// display corrections of 0,270,180,90 degrees. This is not camera-facing
+    /// state; RTP frame metadata should take precedence over device signaling.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub orientation: u8,
 }

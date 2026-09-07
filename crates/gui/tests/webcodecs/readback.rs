@@ -389,21 +389,21 @@ async fn real_copy_colors_odd_dimensions_all_turns_and_older_formats() {
             2 => s.browser.ignore_format(),
             _ => {}
         }
-        for orientation in 0..4 {
-            let stamp = orientation as i32 + 1;
+        for (index, orientation) in [0, 2, 1, 3, 2, 0, 3, 1].into_iter().enumerate() {
+            let stamp = index as i32 + 1;
             feed(s.decoder(), stamp, orientation);
             s.browser.emit(stamp, 3, 5);
             drain().await.unwrap();
             assert_eq!(
-                s.browser.format(orientation as u32),
+                s.browser.format(index as u32),
                 if mode == 0 && orientation == 0 {
                     "BGRA"
                 } else {
                     "RGBA"
                 }
             );
-            assert_eq!(s.stamps().len(), orientation as usize);
-            s.browser.settle(orientation as u32, false).await.unwrap();
+            assert_eq!(s.stamps().len(), index);
+            s.browser.settle(index as u32, false).await.unwrap();
             let pictures = s.published.borrow();
             let pixels = pictures.last().unwrap().image.0[0].buffer();
             let (dw, dh) = if orientation % 2 == 0 { (3, 5) } else { (5, 3) };
@@ -423,8 +423,8 @@ async fn real_copy_colors_odd_dimensions_all_turns_and_older_formats() {
         }
         let stats = s.decoder().diagnostics().unwrap();
         assert_eq!(stats.probe_fallbacks, u64::from(mode != 0));
-        assert_eq!(stats.bgra, u64::from(mode == 0));
-        assert_eq!(stats.rgba, if mode == 0 { 3 } else { 4 });
+        assert_eq!(stats.bgra, 2 * u64::from(mode == 0));
+        assert_eq!(stats.rgba, if mode == 0 { 6 } else { 8 });
     }
 }
 
