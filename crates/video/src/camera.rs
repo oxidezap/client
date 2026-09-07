@@ -1,7 +1,7 @@
 //! The camera, on its own thread.
 //!
 //! A capture backend is blocking on every platform — `frame()` waits for the
-//! sensor — and an encode is a hundred microseconds of CPU, so both live on
+//! sensor, while encoding runs on the CPU, so both live on
 //! one dedicated thread and hand finished access units to the async side
 //! through a channel. That is the same shape the microphone takes in
 //! `oxidezap-audio`, and for the same reason: a device driven from a runtime
@@ -14,8 +14,15 @@
 //! so it also asks the encoder for a keyframe — otherwise every frame after
 //! the gap points at one the peer never received, and the picture stays
 //! broken until the periodic one comes round.
+//!
+//! `RUST_LOG=info,oxidezap_video::camera=debug` enables stage totals and frame
+//! counters at frame boundaries after five seconds, plus a final partial window.
+//! These measure elapsed wall time, not CPU time. Capture includes blocking
+//! sensor wait; even conversion and encoding include time spent descheduled.
+//! Use a native CPU profile alongside these logs to identify CPU-heavy functions.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use nokhwa::Camera;
@@ -245,6 +252,13 @@ fn run(
     frames: &async_channel::Sender<EncodedFrame>,
     ready: &Ready,
 ) {
+    log::debug!(
+        "requesting native camera {}x{} @ {} fps MJPEG, {} kbps",
+        quality.width,
+        quality.height,
+        quality.fps,
+        quality.bitrate_kbps,
+    );
     let opened = match start(quality) {
         Ok(opened) => opened,
         Err(e) => {
@@ -266,10 +280,23 @@ fn run(
 
     let started = Instant::now();
     let mut failures = Failures::default();
+    let mut timing: Option<CameraTiming> = None;
     while !control.stop.load(Ordering::Relaxed) && !frames.is_closed() {
-        let buffer = match camera.frame() {
+        if log::log_enabled!(log::Level::Debug) {
+            let now = Instant::now();
+            let timing = timing.get_or_insert_with(|| CameraTiming::new(now));
+            if let Some(window) = timing.take_if_due(now) {
+                window.report(now);
+            }
+        } else {
+            timing = None;
+        }
+        let buffer = match timed(timing.as_mut().map(|t| &mut t.capture), || camera.frame()) {
             Ok(buffer) => buffer,
             Err(e) => {
+                if let Some(timing) = &mut timing {
+                    timing.record(FrameOutcome::CaptureFailed);
+                }
                 // A camera that has been unplugged reports this forever, and
                 // there is no recovery a call can do: the direction stops and
                 // the audio carries on.
@@ -281,32 +308,44 @@ fn run(
             encoder.request_keyframe();
         }
         let at = openh264::Timestamp::from_millis(started.elapsed().as_millis() as u64);
-        let encoded = match convert_and_encode(&buffer, &mut converter, &mut encoder, at) {
-            Ok(Some(frame)) => {
-                failures.worked();
-                frame
-            }
-            // The rate control skipped it, which is the encoder doing its job.
-            Ok(None) => {
-                failures.worked();
-                continue;
-            }
-            Err(e) => {
-                log::warn!("dropping a camera frame: {e}");
-                // Some of these are one frame — a truncated buffer, a decode
-                // that fell over — and some are permanent: a camera that
-                // changes format mid-stream fails every frame from then on.
-                // Retrying the permanent ones forever holds the channel open,
-                // so nothing reports the loss and every window goes on saying
-                // video is live in front of a pane no picture will reach.
-                if failures.gave_up() {
-                    log::error!("the camera stopped producing frames this side can encode");
-                    break;
+        let encoded =
+            match convert_and_encode(&buffer, &mut converter, &mut encoder, at, timing.as_mut()) {
+                Ok(Some(frame)) => {
+                    failures.worked();
+                    frame
                 }
-                continue;
-            }
-        };
-        if frames.try_send(encoded).is_err() {
+                // The rate control skipped it, which is the encoder doing its job.
+                Ok(None) => {
+                    if let Some(timing) = &mut timing {
+                        timing.record(FrameOutcome::Skipped);
+                    }
+                    failures.worked();
+                    continue;
+                }
+                Err(e) => {
+                    if let Some(timing) = &mut timing {
+                        timing.record(FrameOutcome::ProcessingFailed);
+                    }
+                    log::warn!("dropping a camera frame: {e}");
+                    // Some of these are one frame — a truncated buffer, a decode
+                    // that fell over — and some are permanent: a camera that
+                    // changes format mid-stream fails every frame from then on.
+                    // Retrying the permanent ones forever holds the channel open,
+                    // so nothing reports the loss and every window goes on saying
+                    // video is live in front of a pane no picture will reach.
+                    if failures.gave_up() {
+                        log::error!("the camera stopped producing frames this side can encode");
+                        break;
+                    }
+                    continue;
+                }
+            };
+        let keyframe = encoded.keyframe;
+        let dropped = frames.try_send(encoded).is_err();
+        if let Some(timing) = &mut timing {
+            timing.record(FrameOutcome::Encoded { keyframe, dropped });
+        }
+        if dropped {
             // Either the media plane is behind or the call is over. The next
             // frame the peer *does* get has to be one it can decode on its
             // own, since everything after a gap references what it missed.
@@ -314,10 +353,110 @@ fn run(
         }
     }
 
+    if let Some(timing) = timing {
+        timing.report(Instant::now());
+    }
     if let Err(e) = camera.stop_stream() {
         log::warn!("the camera did not close cleanly: {e}");
     }
     log::debug!("camera stopped");
+}
+
+const TIMING_INTERVAL: Duration = Duration::from_secs(5);
+
+enum FrameOutcome {
+    CaptureFailed,
+    ProcessingFailed,
+    Skipped,
+    Encoded { keyframe: bool, dropped: bool },
+}
+
+struct CameraTiming {
+    since: Instant,
+    capture: Duration,
+    conversion: Duration,
+    encode: Duration,
+    captured: u64,
+    capture_errors: u64,
+    processing_errors: u64,
+    encoded: u64,
+    keyframes: u64,
+    skipped: u64,
+    dropped: u64,
+}
+
+impl CameraTiming {
+    fn new(since: Instant) -> Self {
+        Self {
+            since,
+            capture: Duration::ZERO,
+            conversion: Duration::ZERO,
+            encode: Duration::ZERO,
+            captured: 0,
+            capture_errors: 0,
+            processing_errors: 0,
+            encoded: 0,
+            keyframes: 0,
+            skipped: 0,
+            dropped: 0,
+        }
+    }
+
+    fn record(&mut self, outcome: FrameOutcome) {
+        match outcome {
+            FrameOutcome::CaptureFailed => {
+                self.capture_errors += 1;
+                return;
+            }
+            FrameOutcome::ProcessingFailed => self.processing_errors += 1,
+            FrameOutcome::Skipped => self.skipped += 1,
+            FrameOutcome::Encoded { keyframe, dropped } => {
+                self.encoded += 1;
+                self.keyframes += u64::from(keyframe);
+                self.dropped += u64::from(dropped);
+            }
+        }
+        self.captured += 1;
+    }
+
+    fn take_if_due(&mut self, now: Instant) -> Option<Self> {
+        (now - self.since >= TIMING_INTERVAL).then(|| std::mem::replace(self, Self::new(now)))
+    }
+
+    fn report(&self, now: Instant) {
+        let seconds = (now - self.since).as_secs_f64();
+        if seconds == 0.0 || self.captured + self.capture_errors == 0 {
+            return;
+        }
+        log::debug!(
+            "native camera timing over {seconds:.3}s, elapsed wall time not CPU; \
+             capture includes blocking wait: captured={} observed_fps={:.2} encoded={} \
+             keyframes={} skipped={} processing_errors={} capture_errors={} queue_drops={} \
+             capture_total_ms={:.3} decode_conversion_total_ms={:.3} encode_total_ms={:.3}",
+            self.captured,
+            self.captured as f64 / seconds,
+            self.encoded,
+            self.keyframes,
+            self.skipped,
+            self.processing_errors,
+            self.capture_errors,
+            self.dropped,
+            self.capture.as_secs_f64() * 1000.0,
+            self.conversion.as_secs_f64() * 1000.0,
+            self.encode.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+// Disabled diagnostics read no clocks. Enabled diagnostics use two reads per
+// stage and one window check per frame, with no per-frame formatting or storage.
+fn timed<T>(elapsed: Option<&mut Duration>, work: impl FnOnce() -> T) -> T {
+    let started = elapsed.as_ref().map(|_| Instant::now());
+    let result = work();
+    if let (Some(elapsed), Some(started)) = (elapsed, started) {
+        *elapsed += started.elapsed();
+    }
+    result
 }
 
 /// How many frames in a row may fail to convert before the camera is treated
@@ -431,9 +570,7 @@ fn start_at(wanted: VideoQuality) -> Result<Opened> {
     let requested =
         RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(CameraFormat::new(
             Resolution::new(wanted.width, wanted.height),
-            // The format the closest-match search starts from. A camera that
-            // has no MJPEG mode is matched on the rest and answers in
-            // whatever it does have, which is what the converter branches on.
+            // nokhwa's closest match requires this format; only size and FPS vary.
             FrameFormat::MJPEG,
             wanted.fps,
         )));
@@ -456,13 +593,24 @@ fn start_at(wanted: VideoQuality) -> Result<Opened> {
     let format = camera.camera_format();
     let encoder = H264Encoder::new(quality)?;
     log::info!(
-        "camera {index} open: {}x{} @ {} fps, {} in, H.264 out at {} kbps",
+        "camera {index} open: {}x{} @ {} fps, {} in, H.264 out at {} kbps; \
+         requested {}x{} @ {} fps MJPEG",
         quality.width,
         quality.height,
         quality.fps,
         format_name(format.format()),
         quality.bitrate_kbps,
+        wanted.width,
+        wanted.height,
+        wanted.fps,
     );
+    if quality.fps > wanted.fps {
+        log::warn!(
+            "camera selected {} fps above requested {}; preserving negotiated cadence and RTP stride",
+            quality.fps,
+            wanted.fps,
+        );
+    }
     Ok(Opened {
         camera,
         converter,
@@ -476,26 +624,31 @@ fn convert_and_encode(
     converter: &mut Frames,
     encoder: &mut H264Encoder,
     at: openh264::Timestamp,
+    mut timing: Option<&mut CameraTiming>,
 ) -> Result<Option<EncodedFrame>> {
-    match converter {
-        Frames::Planar(planes) => {
-            read_planar(buffer, planes)?;
-            encoder.encode(&planes.as_source(), at)
-        }
-        Frames::Rgb { rgb, yuv } => {
-            buffer
-                .decode_image_to_buffer::<RgbFormat>(rgb)
-                .map_err(|e| {
-                    anyhow!(
-                        "decoding a {} frame: {e}",
-                        format_name(buffer.source_frame_format())
-                    )
-                })?;
-            let (width, height) = openh264::formats::YUVSource::dimensions(yuv);
-            yuv.read_rgb8(openh264::formats::RgbSliceU8::new(rgb, (width, height)));
-            encoder.encode(yuv, at)
-        }
-    }
+    timed(
+        timing.as_mut().map(|t| &mut t.conversion),
+        || match converter {
+            Frames::Planar(planes) => read_planar(buffer, planes),
+            Frames::Rgb { rgb, yuv } => {
+                buffer
+                    .decode_image_to_buffer::<RgbFormat>(rgb)
+                    .map_err(|e| {
+                        anyhow!(
+                            "decoding a {} frame: {e}",
+                            format_name(buffer.source_frame_format())
+                        )
+                    })?;
+                let (width, height) = openh264::formats::YUVSource::dimensions(yuv);
+                yuv.read_rgb8(openh264::formats::RgbSliceU8::new(rgb, (width, height)));
+                Ok(())
+            }
+        },
+    )?;
+    timed(timing.map(|t| &mut t.encode), || match converter {
+        Frames::Planar(planes) => encoder.encode(&planes.as_source(), at),
+        Frames::Rgb { yuv, .. } => encoder.encode(yuv, at),
+    })
 }
 
 fn read_planar(buffer: &nokhwa::Buffer, planes: &mut I420Buffer) -> Result<()> {
@@ -607,5 +760,141 @@ mod tests {
             ]),
             "Index(0): FaceTime HD Camera, Index(1): OBS Virtual Camera"
         );
+    }
+
+    #[test]
+    fn timing_windows_aggregate_outcomes_and_reset_at_the_deadline() {
+        use super::{CameraTiming, Duration, FrameOutcome, Instant, TIMING_INTERVAL};
+
+        let start = Instant::ZERO;
+        let mut timing = CameraTiming::new(start);
+        for outcome in [
+            FrameOutcome::CaptureFailed,
+            FrameOutcome::ProcessingFailed,
+            FrameOutcome::Skipped,
+            FrameOutcome::Encoded {
+                keyframe: true,
+                dropped: false,
+            },
+            FrameOutcome::Encoded {
+                keyframe: false,
+                dropped: true,
+            },
+        ] {
+            timing.record(outcome);
+        }
+        timing.capture = Duration::from_millis(4000);
+        timing.conversion = Duration::from_millis(200);
+        timing.encode = Duration::from_millis(300);
+        assert!(
+            timing
+                .take_if_due(start + TIMING_INTERVAL - Duration::from_nanos(1))
+                .is_none()
+        );
+
+        let now = start + TIMING_INTERVAL;
+        let window = timing.take_if_due(now).expect("five seconds elapsed");
+        assert_eq!(window.captured, 4);
+        assert_eq!(window.capture_errors, 1);
+        assert_eq!(window.processing_errors, 1);
+        assert_eq!(window.skipped, 1);
+        assert_eq!(window.encoded, 2);
+        assert_eq!(window.keyframes, 1);
+        assert_eq!(window.dropped, 1);
+        assert_eq!(window.capture, Duration::from_millis(4000));
+        assert_eq!(window.conversion, Duration::from_millis(200));
+        assert_eq!(window.encode, Duration::from_millis(300));
+
+        assert!(timing.take_if_due(now).is_none());
+        let next = timing.take_if_due(now + TIMING_INTERVAL).unwrap();
+        assert_eq!(next.since, now);
+        assert_eq!(
+            next.captured + next.capture_errors + next.processing_errors,
+            0
+        );
+        assert_eq!(
+            next.encoded + next.keyframes + next.skipped + next.dropped,
+            0
+        );
+        assert_eq!(next.capture + next.conversion + next.encode, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_delayed_timing_window_does_not_emit_catch_up_reports() {
+        use super::{CameraTiming, Duration, FrameOutcome, Instant, TIMING_INTERVAL};
+
+        let mut timing = CameraTiming::new(Instant::ZERO);
+        timing.record(FrameOutcome::Skipped);
+        let now = Instant::ZERO + Duration::from_secs(60);
+        assert_eq!(timing.take_if_due(now).unwrap().skipped, 1);
+        assert!(timing.take_if_due(now).is_none());
+        assert!(
+            timing
+                .take_if_due(now + TIMING_INTERVAL - Duration::from_nanos(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn disabled_timing_preserves_the_operation_result() {
+        let mut calls = 0;
+        let result = super::timed(None, || {
+            calls += 1;
+            Err::<(), _>("synthetic failure")
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result, Err("synthetic failure"));
+    }
+
+    #[test]
+    fn timing_does_not_change_encoded_frames_or_encode_failed_conversions() {
+        use super::*;
+
+        for format in [FrameFormat::GRAY, FrameFormat::RAWRGB] {
+            let mut converter = match format {
+                FrameFormat::GRAY => Frames::planar(64, 48),
+                _ => Frames::rgb(64, 48),
+            }
+            .unwrap();
+            let mut plain = H264Encoder::new(VideoQuality::default()).unwrap();
+            let mut measured = H264Encoder::new(VideoQuality::default()).unwrap();
+            let mut timing = CameraTiming::new(Instant::ZERO);
+            let short = nokhwa::Buffer::new(Resolution::new(64, 48), &[], FrameFormat::GRAY);
+            assert!(
+                convert_and_encode(
+                    &short,
+                    &mut converter,
+                    &mut measured,
+                    openh264::Timestamp::ZERO,
+                    Some(&mut timing),
+                )
+                .is_err()
+            );
+            assert_eq!(timing.encode, Duration::ZERO);
+
+            let channels = if format == FrameFormat::GRAY { 1 } else { 3 };
+            let buffer = nokhwa::Buffer::new(
+                Resolution::new(64, 48),
+                &vec![128; 64 * 48 * channels],
+                format,
+            );
+            for millis in [0, 50] {
+                let at = openh264::Timestamp::from_millis(millis);
+                let expected = convert_and_encode(&buffer, &mut converter, &mut plain, at, None)
+                    .unwrap()
+                    .unwrap();
+                let actual = convert_and_encode(
+                    &buffer,
+                    &mut converter,
+                    &mut measured,
+                    at,
+                    Some(&mut timing),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(actual.data, expected.data);
+                assert_eq!(actual.keyframe, expected.keyframe);
+            }
+        }
     }
 }
