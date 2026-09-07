@@ -33,7 +33,7 @@
 //!
 //! # Where a frame is dropped
 //!
-//! Both callbacks run on the page's audio thread and neither may wait. The
+//! Both callbacks run on the page's main thread and neither may wait. The
 //! microphone's send is a `try_send` onto a short queue, because a frame the
 //! engine has not taken by the time the next one is captured is a frame worth
 //! less than the delay of holding it; the speaker's ring is bounded for the
@@ -45,12 +45,18 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow, bail};
-use log::{debug, error, warn};
+use log::{debug, warn};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 
 use crate::{CALL_FRAME_SAMPLES, CALL_RATE};
 use std::time::Duration;
+
+mod diagnostics;
+mod output;
+mod stats;
+
+use diagnostics::{Diagnostics, describe};
 
 /// How many samples a WebAudio callback carries at a time.
 ///
@@ -113,6 +119,7 @@ const PLAYOUT_PRIME: usize = 180;
 /// explicitly, because a `MediaStream` merely dropped leaves the tab's
 /// recording indicator on — and then the context.
 struct Graph {
+    diagnostics: Rc<RefCell<Diagnostics>>,
     context: web_sys::AudioContext,
     stream: web_sys::MediaStream,
     /// The node the microphone feeds, held so it can be *disconnected*.
@@ -139,6 +146,7 @@ impl Drop for Graph {
         // called while the context closes, and `close` is asynchronous.
         self.capture.set_onaudioprocess(None);
         self.playout.set_onaudioprocess(None);
+        self.diagnostics.borrow_mut().report(true);
         // The source first: it is what joins the device to the context, and
         // the two nodes below are downstream of it.
         let _ = self.source.disconnect();
@@ -355,8 +363,8 @@ pub async fn open_call_audio() -> Result<(
             feed_playout(speaker_rx, rate, playout),
             mic_tx.closed(),
             &owned_facts,
-        )
-        .await;
+        );
+        let ending = diagnostics::report_until(ending, &graph.diagnostics).await;
         debug!("the call's audio is ending: {}", ending.as_str());
         drop(graph);
     });
@@ -524,94 +532,36 @@ fn wire(
         .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(CHUNK, 0, 1)
         .map_err(|e| anyhow!("no playout node: {}", describe(&e)))?;
 
+    let diagnostics_enabled = log::log_enabled!(log::Level::Warn);
+    let diagnostics = Rc::new(RefCell::new(Diagnostics::new(diagnostics_enabled)));
     let on_playout = {
         let playout = Rc::clone(&playout);
-        // Held across callbacks: this runs ~90 times a second and the block
-        // is the same size every time.
-        let mut scratch: Vec<f32> = Vec::new();
-        // Said once, not per block, for the same reason.
-        let reported = std::cell::Cell::new(false);
-        // How many blocks the ring could not fill, for the whole call, and
-        // whether the run of them is still going. See their use below.
-        let underran = std::cell::Cell::new(0u32);
-        let in_underrun = std::cell::Cell::new(false);
-        // Whether the peer has ever been heard. The ring is deliberately empty
-        // until their first frame primes it -- see `PLAYOUT_PRIME` -- and this
-        // callback runs from the moment the context resumes, through signalling
-        // and relay setup. Every one of those blocks is a ring that could not
-        // be filled and none of them is a late packet, so without this the
-        // diagnostic below fires on every healthy call and says nothing.
-        let ever_fed = std::cell::Cell::new(false);
+        let diagnostics = Rc::clone(&diagnostics);
+        let mut output = output::Output::new(CHUNK);
+        let origin = diagnostics_enabled.then(wacore::time::Instant::now);
+        let period = Duration::from_secs_f64(f64::from(CHUNK) / f64::from(rate));
         Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(
             move |event: web_sys::AudioProcessingEvent| {
+                let now = origin.as_ref().map(|origin| origin.elapsed());
                 let Ok(buffer) = event.output_buffer() else {
                     return;
                 };
-                let len = buffer.length() as usize;
-                scratch.clear();
-                scratch.reserve(len);
-                let short = {
+                let available = {
                     let mut ring = playout.borrow_mut();
-                    // An empty ring is a gap in the network, not an error:
-                    // the peer stopped sending, or their packet is late.
-                    // Silence is what a call sounds like there.
                     let had = ring.len();
-                    if had > 0 {
-                        ever_fed.set(true);
-                    }
-                    scratch.extend(
-                        std::iter::repeat_with(|| ring.pop_front().unwrap_or(0.0)).take(len),
-                    );
-                    len.saturating_sub(had)
+                    output.fill(&mut ring);
+                    had
                 };
-                // Counted, because it was the one thing on this path with no
-                // account of itself. A ring that runs dry writes zeros into
-                // the middle of speech, and the result is described as robotic
-                // rather than as silent -- so the symptom points at the codec,
-                // which is the half that is working. The prime and the ceiling
-                // are both sized against this number and neither could be
-                // checked against anything.
-                if short > 0 && ever_fed.get() {
-                    let blocks = underran.get() + 1;
-                    underran.set(blocks);
-                    // Once when a run begins, and then at each doubling of the
-                    // call's total. A ring that is behind is behind on every
-                    // block, so a line per block is what made the last log
-                    // unreadable -- but a count alone answers the wrong
-                    // question: two runs of one block are a call with a jitter
-                    // problem, and one run of two is a call that hiccuped.
-                    // Only the start of a run tells them apart, and the
-                    // running total is what says how bad it got.
-                    let began = !in_underrun.replace(true);
-                    if began || blocks.is_power_of_two() {
-                        warn!(
-                            "the call's playout ring ran dry on {blocks} block(s) so far; the \
-                             peer's audio is arriving later than it is played"
-                        );
-                    }
-                } else if short == 0 {
-                    in_underrun.set(false);
+                if let Some(now) = now {
+                    diagnostics
+                        .borrow_mut()
+                        .stats
+                        .as_mut()
+                        .expect("diagnostics enabled")
+                        .record(available, CHUNK as usize, now, period);
                 }
-                // JS-owned, and that is the whole of this line. `copyToChannel`
-                // takes a `Float32Array` that "must not be shared", and every
-                // slice this module can hand it is a view over a wasm heap
-                // built with `--shared-memory` — so `copy_to_channel`, which
-                // takes `&[f32]`, threw on every block ever played. The peer's
-                // audio arrived, decoded, and was written nowhere.
-                //
-                // The same rule the socket and the relay learned, and the
-                // third crossing to learn it. See AGENTS.md.
-                let block = js_sys::Float32Array::from(&scratch[..]);
-                if let Err(e) = buffer.copy_to_channel_with_f32_array(&block, 0)
-                    && !reported.replace(true)
-                {
-                    // Never swallowed again: a discarded error here is a call
-                    // that connects, decodes the peer perfectly, and plays
-                    // silence with nothing anywhere saying why.
-                    error!(
-                        "the peer's audio could not be written to the speaker: {}",
-                        describe(&e)
-                    );
+                if let Err(error) = output.write(&buffer) {
+                    diagnostics.borrow_mut().write_failed(error);
                 }
             },
         )
@@ -682,6 +632,7 @@ fn wire(
     wiring.release();
 
     Ok(Graph {
+        diagnostics,
         context: context.clone(),
         stream: stream.clone(),
         source,
@@ -732,13 +683,4 @@ async fn feed_playout(
             }
         }
     }
-}
-
-/// A `JsValue` as something worth putting in a log line.
-fn describe(value: &wasm_bindgen::JsValue) -> String {
-    value
-        .dyn_ref::<js_sys::Error>()
-        .map(|e| String::from(e.message()))
-        .or_else(|| value.as_string())
-        .unwrap_or_else(|| format!("{value:?}"))
 }
