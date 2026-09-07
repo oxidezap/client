@@ -121,7 +121,7 @@ test -x "$CHROMEDRIVER" || CHROMEDRIVER=$(command -v chromedriver)
 CHROMEDRIVER="$CHROMEDRIVER" \
 RUSTFLAGS='--cfg web_sys_unstable_apis' \
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-  cargo test -p oxidezap-daemon --lib --target wasm32-unknown-unknown
+  cargo test -p oxidezap-daemon -p oxidezap-session --lib --target wasm32-unknown-unknown
 ```
 
 Type-checking the web build without the whole bundle:
@@ -140,4 +140,3 @@ cargo +nightly check -p oxidezap-session --target wasm32-unknown-unknown -Z buil
 
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
 unusable.
-

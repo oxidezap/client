@@ -110,17 +110,14 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fix/browser-durability-probe" }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fix/browser-durability-probe" }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fix/browser-durability-probe" }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 
 # The library and its satellites. One git source, one branch: cargo resolves
 # every entry below to the SAME commit, so `cargo update` moves them together
 # and no two crates can drift onto incompatible revisions. The exact commit is
 # pinned in the committed Cargo.lock.
-#
-# Temporary branch for upstream PR #1462. Cargo.lock selects the fix and its
-# WASM regression test before the branch merged unrelated main API changes.
 #
 # `main` carries the VoIP split this front end needs as of
 # oxidezap/whatsapp-rust#1364: the library's portable VoIP runtime is separate
@@ -138,8 +135,8 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fix/bro
 # crates that need none of it. `SharedSqlite` is also not re-exported, so the
 # chat store needs sqlite-storage directly regardless.
 #
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fix/browser-durability-probe", features = ["voip"] }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fix/browser-durability-probe" }
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", features = ["voip"] }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and
