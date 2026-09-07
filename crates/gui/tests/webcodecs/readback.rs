@@ -38,8 +38,59 @@ extern "C" {
     fn decode_count(this: &ControlledDecoder) -> u32;
     #[wasm_bindgen(method)]
     fn cleanup(this: &ControlledDecoder);
+    #[wasm_bindgen(method)]
+    fn finish(this: &ControlledDecoder);
+    #[wasm_bindgen(method, js_name = rgbaOnly)]
+    fn rgba_only(this: &ControlledDecoder);
+    #[wasm_bindgen(method, js_name = ignoreFormat)]
+    fn ignore_format(this: &ControlledDecoder);
+    #[wasm_bindgen(method, js_name = rejectAllocation)]
+    fn reject_allocation(this: &ControlledDecoder);
+    #[wasm_bindgen(method)]
+    fn format(this: &ControlledDecoder, index: u32) -> String;
+    #[wasm_bindgen(method, catch)]
+    async fn benchmark(
+        this: &ControlledDecoder,
+        width: u32,
+        height: u32,
+        format: &str,
+        rounds: u32,
+        peer: &ControlledDecoder,
+    ) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch)]
     async fn drain() -> Result<(), JsValue>;
+}
+
+#[wasm_bindgen_test]
+#[cfg(feature = "benchmarks")]
+async fn production_readback_benchmark() {
+    for format in ["RGBA", "I420"] {
+        for (width, height) in [(640, 360), (1280, 720)] {
+            let browser = Rc::new(ControlledDecoder::new());
+            browser.rgba_only();
+            let notify = Rc::clone(&browser);
+            browser.install(false);
+            let baseline = decoder(Some(Rc::new(move |_| notify.finish()))).unwrap();
+            browser.restore();
+            let peer = Rc::new(ControlledDecoder::new());
+            let notify = Rc::clone(&peer);
+            peer.install(false);
+            let candidate = decoder(Some(Rc::new(move |_| notify.finish()))).unwrap();
+            peer.restore();
+            console_log!(
+                "{}",
+                browser
+                    .benchmark(width, height, format, 1000, &peer)
+                    .await
+                    .unwrap()
+                    .as_string()
+                    .unwrap()
+            );
+            drop((baseline, candidate));
+            browser.cleanup();
+            peer.cleanup();
+        }
+    }
 }
 
 struct Scenario {
@@ -183,9 +234,12 @@ async fn rejected_copy_closes_pending_and_reset_can_resume() {
     drain().await.unwrap();
     s.emit(2);
     s.browser.settle(0, true).await.unwrap();
+    assert!(s.decoder().failure().is_none());
+    assert_eq!(s.browser.format(1), "RGBA");
+    s.browser.settle(1, true).await.unwrap();
     assert!(s.browser.closed(0));
     assert!(s.browser.closed(1));
-    assert_eq!(s.browser.count(), 1);
+    assert_eq!(s.browser.count(), 2);
     assert!(
         s.decoder()
             .failure()
@@ -196,10 +250,110 @@ async fn rejected_copy_closes_pending_and_reset_can_resume() {
     s.decoder().reset();
     s.emit(3);
     drain().await.unwrap();
-    assert_eq!(s.browser.count(), 2, "rejection released the active slot");
-    s.browser.settle(1, false).await.unwrap();
+    assert_eq!(s.browser.count(), 3, "rejection released the active slot");
+    s.browser.settle(2, false).await.unwrap();
     assert_eq!(s.stamps(), [3]);
     assert!(s.decoder().failure().is_none());
+}
+
+#[wasm_bindgen_test]
+async fn bgra_rejection_recovers_same_frame_and_caches_rgba() {
+    let s = Scenario::new(true);
+    s.emit(1);
+    drain().await.unwrap();
+    assert_eq!(s.browser.format(0), "BGRA");
+    s.browser.settle(0, true).await.unwrap();
+    assert!(s.decoder().failure().is_none());
+    assert!(s.stamps().is_empty(), "no output before fallback settles");
+    assert!(!s.browser.closed(0));
+    assert_eq!(s.browser.format(1), "RGBA");
+    assert!(s.browser.reused(0, 1));
+    s.browser.settle(1, false).await.unwrap();
+    assert_eq!(s.stamps(), [1]);
+    assert_eq!(
+        &s.published.borrow()[0].image.0[0].buffer().as_raw()[..4],
+        &[80, 40, 0, 255]
+    );
+    s.emit(2);
+    drain().await.unwrap();
+    assert_eq!(s.browser.format(2), "RGBA");
+    s.browser.settle(2, false).await.unwrap();
+    assert_eq!(s.stamps(), [1, 2]);
+}
+
+#[wasm_bindgen_test]
+async fn reset_during_rgba_retry_cancels_publication() {
+    let s = Scenario::new(true);
+    s.emit(1);
+    drain().await.unwrap();
+    s.browser.settle(0, true).await.unwrap();
+    s.decoder().reset();
+    s.emit(2);
+    assert_eq!(s.browser.count(), 2);
+    s.browser.settle(1, false).await.unwrap();
+    assert_eq!(s.images(), 0);
+    assert!(s.stamps().is_empty());
+    assert_eq!(s.browser.format(2), "RGBA");
+    s.browser.settle(2, false).await.unwrap();
+    assert_eq!(s.stamps(), [2]);
+    assert!(s.decoder().failure().is_none());
+}
+
+#[wasm_bindgen_test]
+async fn bgra_allocation_rejection_uses_rgba_before_copy() {
+    let s = Scenario::new(true);
+    s.browser.reject_allocation();
+    s.emit(1);
+    drain().await.unwrap();
+    assert_eq!(s.browser.count(), 1);
+    assert_eq!(s.browser.format(0), "RGBA");
+    s.browser.settle(0, false).await.unwrap();
+    assert_eq!(s.stamps(), [1]);
+    assert!(s.decoder().failure().is_none());
+}
+
+#[wasm_bindgen_test]
+async fn real_copy_colors_odd_dimensions_all_turns_and_older_formats() {
+    for mode in 0..3 {
+        let s = Scenario::new(true);
+        match mode {
+            1 => s.browser.rgba_only(),
+            2 => s.browser.ignore_format(),
+            _ => {}
+        }
+        for orientation in 0..4 {
+            let stamp = orientation as i32 + 1;
+            feed(s.decoder(), stamp, orientation);
+            s.browser.emit(stamp, 3, 5);
+            drain().await.unwrap();
+            assert_eq!(
+                s.browser.format(orientation as u32),
+                if mode == 0 && orientation == 0 {
+                    "BGRA"
+                } else {
+                    "RGBA"
+                }
+            );
+            assert_eq!(s.stamps().len(), orientation as usize);
+            s.browser.settle(orientation as u32, false).await.unwrap();
+            let pictures = s.published.borrow();
+            let pixels = pictures.last().unwrap().image.0[0].buffer();
+            let (dw, dh) = if orientation % 2 == 0 { (3, 5) } else { (5, 3) };
+            assert_eq!(pixels.dimensions(), (dw, dh));
+            for y in 0..5 {
+                for x in 0..3 {
+                    let (dx, dy) = match orientation {
+                        0 => (x, y),
+                        1 => (y, 2 - x),
+                        2 => (2 - x, 4 - y),
+                        _ => (4 - y, x),
+                    };
+                    assert_eq!(pixels.get_pixel(dx, dy).0, [80, 40, (y * 3 + x) as u8, 255]);
+                }
+            }
+            assert!(s.decoder().failure().is_none());
+        }
+    }
 }
 
 #[wasm_bindgen_test]

@@ -34,9 +34,9 @@ use gpui::RenderImage;
 use oxidezap_core::{CallVideoFrame, VideoStream};
 use smallvec::SmallVec;
 
-use wacore::voip::h264::{au_has_idr, nal_unit_type, split_annexb};
+use super::recovery::h264::{MAX_PIXELS, nal_unit_type, split_annexb};
 
-use super::geometry::{Rotation, declares_unreadably};
+use super::geometry::Rotation;
 use super::webcodecs;
 
 use super::recovery::{Recovery, RecoverySink};
@@ -129,14 +129,6 @@ impl LatestFrames {
     }
 }
 
-/// The largest picture a call frame may be.
-///
-/// The dimensions come off a peer's bitstream, so their product is somebody
-/// else's number: 4K is far past anything a call offers and still bounds the
-/// allocation. The same number the desktop path uses, and for the same
-/// reason.
-const MAX_PIXELS: usize = 3840 * 2160;
-
 /// How many units may sit in the browser's decode queue before frames are
 /// dropped instead of fed.
 ///
@@ -190,7 +182,8 @@ impl CallVideo {
 
 /// One direction: its decoder, and whether it may be fed yet.
 struct Stream {
-    recovery: Recovery,
+    recovery: Rc<Recovery>,
+    access_units: RefCell<super::recovery::h264::AccessUnits>,
     call_id: String,
     stream: VideoStream,
     frames: FrameSink,
@@ -214,7 +207,8 @@ struct Stream {
 impl Stream {
     fn new(call_id: String, stream: VideoStream, frames: FrameSink, recover: RecoverySink) -> Self {
         Self {
-            recovery: Recovery::new(call_id.clone(), stream, recover),
+            recovery: Rc::new(Recovery::new(call_id.clone(), stream, recover)),
+            access_units: RefCell::new(super::recovery::h264::AccessUnits::default()),
             call_id,
             stream,
             frames,
@@ -245,13 +239,13 @@ impl Stream {
         if let Some((sps, pps)) = sets {
             self.described.set(true);
             log::debug!(
-                "the {:?} stream carries avc1.{} ({} byte(s), NALs {:?}, SPS {}, PPS {})",
+                "the {:?} stream carries avc1.{} ({} byte(s), NALs {:?}, SPS bytes {}, PPS bytes {})",
                 self.stream,
                 hex(sps.get(1..4).unwrap_or_default()),
                 frame.data.len(),
                 nals,
-                hex(sps),
-                hex(&pps),
+                sps.len(),
+                pps.len(),
             );
         }
     }
@@ -279,25 +273,29 @@ impl Stream {
         self.started.set(false);
     }
 
-    fn accept(&self, frame: CallVideoFrame) {
+    fn accept(&self, mut frame: CallVideoFrame) {
         self.describe(&frame);
         if frame.gap {
             self.abandon();
         }
-        // The bitstream, not only the flag beside it. `voip-cli` restarts on
-        // `au_has_idr` and recovers where this waited: a unit that carries an
-        // IDR *is* a recovery point whatever the flag says, and a flag that is
-        // wrong once costs the pane every picture until the sender's next
-        // keyframe -- which the peer sent four times in a whole call. Widened
-        // rather than replaced: a keyframe the sender vouches for is still one.
-        //
-        // Read ONCE and used everywhere below, which is the whole of the
-        // reason it is a local. Answering this question in one place and
-        // `frame.keyframe` in the next is worse than either alone: a unit that
-        // starts the stream here and is then submitted as a delta chunk is one
-        // the browser rejects outright, because a key chunk is required first
-        // after `configure`. That is the case this exists to serve, failing.
-        let recovers = frame.keyframe || au_has_idr(&frame.data);
+        let (data, recovers) = match self.access_units.borrow_mut().prepare(&frame.data) {
+            Ok(Some(picture)) => picture,
+            Ok(None) => {
+                if !self.started.get() {
+                    self.recovery.request();
+                }
+                return;
+            }
+            Err(_) => {
+                self.abandon();
+                self.recovery.request();
+                return;
+            }
+        };
+        if let std::borrow::Cow::Owned(data) = data {
+            frame.data = data;
+        }
+        let mut recovering = !self.started.get();
         if !self.started.get() {
             if !recovers {
                 self.recovery.request();
@@ -316,35 +314,6 @@ impl Stream {
             }
             self.waiting.set(false);
             self.started.set(true);
-        }
-
-        // Read before the decoder is handed it, because a decoder allocates
-        // its reference and output buffers from the parameter set — from
-        // numbers the *peer* chose. A unit carrying no parameter set declares
-        // no new geometry and is left alone.
-        if let super::sps::Geometry::Size(width, height) = super::sps::coded_size(&frame.data)
-            && (width as usize).saturating_mul(height as usize) > MAX_PIXELS
-        {
-            log::warn!(
-                "refusing a {width}x{height} video stream on call {}",
-                self.call_id
-            );
-            // Not a gap to recover from: every unit that follows references
-            // this picture, so the stream stays refused until the peer sends
-            // a parameter set describing one that fits.
-            self.started.set(false);
-            return;
-        }
-        // The same rule as the budget above and a different sentence: a set
-        // the parser gave up on is a picture the decoder allocates from with
-        // nothing having checked it.
-        if declares_unreadably(&frame.data) {
-            log::warn!(
-                "refusing a video stream on call {} whose geometry cannot be read",
-                self.call_id
-            );
-            self.started.set(false);
-            return;
         }
 
         let mut held = self.decoder.borrow_mut();
@@ -372,6 +341,7 @@ impl Stream {
         // the recovery point and leave the pane blank for a whole group of
         // pictures, waiting for the keyframe after it.
         if let Some(e) = decoder.failure() {
+            recovering = true;
             log::debug!("the {:?} video of a call stopped: {e}", self.stream);
             *held = None;
             self.started.set(false);
@@ -424,6 +394,8 @@ impl Stream {
         if decoder.failure().is_some() {
             self.started.set(false);
             self.recovery.request();
+        } else if recovering {
+            self.recovery.admitted();
         }
     }
 
@@ -451,7 +423,9 @@ impl Stream {
         let call_id = self.call_id.clone();
         let stream = self.stream;
         let frames = Arc::clone(&self.frames);
+        let recovery = self.recovery.clone();
         Rc::new(move |picture: webcodecs::Picture| {
+            recovery.output();
             frames(CallFrame {
                 call_id: call_id.clone(),
                 stream,

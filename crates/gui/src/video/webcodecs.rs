@@ -179,7 +179,7 @@ impl Decoder {
         let in_flight = Rc::new(Cell::new(0usize));
         let refused = Rc::new(Cell::new(false));
         let pending = Rc::new(RefCell::new(None::<PendingFrame>));
-        let spare = Rc::new(RefCell::new(None::<js_sys::Uint8Array>));
+        let readback = Rc::new(Readback::default());
         let turns: Rc<RefCell<TurnLog>> = Rc::new(RefCell::new(TurnLog::default()));
 
         let on_frame = {
@@ -191,7 +191,7 @@ impl Decoder {
             let in_flight = Rc::clone(&in_flight);
             let refused = Rc::clone(&refused);
             let pending = Rc::clone(&pending);
-            let spare = Rc::clone(&spare);
+            let readback = Rc::clone(&readback);
             Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame: web_sys::VideoFrame| {
                 let turn = turns
                     .borrow_mut()
@@ -227,14 +227,14 @@ impl Decoder {
                 }
                 let outstanding = Outstanding::new(Rc::clone(&in_flight));
                 let pending = Rc::clone(&pending);
-                let spare = Rc::clone(&spare);
+                let readback = Rc::clone(&readback);
                 let slot = Rc::clone(&slot);
                 let sink = sink.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let _outstanding = outstanding;
                     let mut work = Some(work);
                     while let Some(frame) = work {
-                        read_frame(frame, max_pixels, &slot, sink.as_ref(), &spare).await;
+                        read_frame(frame, max_pixels, &slot, sink.as_ref(), &readback).await;
                         work = pending.borrow_mut().take();
                     }
                 });
@@ -486,6 +486,71 @@ impl Drop for PendingFrame {
     }
 }
 
+#[derive(Default)]
+struct Readback {
+    spare: RefCell<Option<js_sys::Uint8Array>>,
+    bgra: Cell<Option<bool>>,
+    probe: RefCell<Option<js_sys::Promise>>,
+}
+
+impl Readback {
+    async fn supports_bgra(&self) -> bool {
+        if let Some(supported) = self.bgra.get() {
+            return supported;
+        }
+        let promise = self
+            .probe
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                wasm_bindgen_futures::future_to_promise(async {
+                    Ok(probe_bgra().await.unwrap_or(false).into())
+                })
+            })
+            .clone();
+        let supported = wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        // A concurrent real-frame rejection must not be overwritten by the probe.
+        self.bgra.set(Some(self.bgra.get().unwrap_or(supported)));
+        self.probe.borrow_mut().take();
+        self.bgra.get() == Some(true)
+    }
+}
+
+async fn probe_bgra() -> Result<bool, wasm_bindgen::JsValue> {
+    // Unknown dictionary members can be silently ignored. Verify channel order,
+    // not merely promise success, once per decoder using four JS-owned bytes.
+    let constructor = js_sys::Reflect::get(&js_sys::global(), &"VideoFrame".into())?
+        .dyn_into::<js_sys::Function>()?;
+    let init = js_sys::Object::new();
+    for (key, value) in [
+        ("format", "RGBA".into()),
+        ("codedWidth", 1.into()),
+        ("codedHeight", 1.into()),
+        ("timestamp", 0.into()),
+    ] {
+        js_sys::Reflect::set(&init, &key.into(), &value)?;
+    }
+    let pixels = js_sys::Uint8Array::from(&[19u8, 73, 151, 255][..]);
+    let args = js_sys::Array::new();
+    args.push(&pixels);
+    args.push(&init);
+    let frame: web_sys::VideoFrame =
+        js_sys::Reflect::construct(&constructor, &args)?.unchecked_into();
+    let options = web_sys::VideoFrameCopyToOptions::new();
+    options.set_format(web_sys::VideoPixelFormat::Bgra);
+    let destination = js_sys::Uint8Array::new_with_length(4);
+    let result = wasm_bindgen_futures::JsFuture::from(
+        frame.copy_to_with_buffer_source_and_options(&destination, &options),
+    )
+    .await;
+    frame.close();
+    result?;
+    Ok(destination.to_vec() == [151, 73, 19, 255])
+}
+
 /// Read the pixels out of a decoded frame and put them in the slot.
 ///
 /// Asynchronous, because `copy_to` is: the frame is closed as soon as the
@@ -496,7 +561,7 @@ async fn read_frame(
     max_pixels: usize,
     slot: &RefCell<Slot>,
     sink: Option<&Rc<dyn Fn(Picture)>>,
-    spare: &RefCell<Option<js_sys::Uint8Array>>,
+    readback: &Readback,
 ) {
     let PendingFrame {
         frame,
@@ -519,9 +584,6 @@ async fn read_frame(
     );
     let timestamp_micros = frame.timestamp() as i64;
 
-    let options = web_sys::VideoFrameCopyToOptions::new();
-    options.set_format(web_sys::VideoPixelFormat::Rgba);
-
     // The decoder's own geometry, never the container's. See
     // [`super::geometry::frame_byte_len`] for why that distinction is the one
     // that matters.
@@ -537,15 +599,32 @@ async fn read_frame(
         return;
     };
 
+    let mut bgra = *rotation == Rotation::None && readback.supports_bgra().await;
+    if !stamp.wanted(&slot.borrow()) {
+        return;
+    }
+    let options = web_sys::VideoFrameCopyToOptions::new();
+    options.set_format(if bgra {
+        web_sys::VideoPixelFormat::Bgra
+    } else {
+        web_sys::VideoPixelFormat::Rgba
+    });
+    let spare = &readback.spare;
+
     // A JS-owned buffer stays valid until the promise settles, without a
     // borrowed wasm slice crossing an asynchronous binding.
     // Asked of the frame rather than computed, because the browser knows its
     // own layout: `byte_len` above is the budget's arithmetic and this is the
     // buffer the copy will actually fill. They agree for packed RGBA, and
     // where they do not it is the browser that is right.
-    let needed = frame
-        .allocation_size_with_options(&options)
-        .map_or(byte_len, |size| size as usize);
+    let mut allocation = frame.allocation_size_with_options(&options);
+    if bgra && allocation.is_err() {
+        bgra = false;
+        readback.bgra.set(Some(false));
+        options.set_format(web_sys::VideoPixelFormat::Rgba);
+        allocation = frame.allocation_size_with_options(&options);
+    }
+    let needed = allocation.map_or(byte_len, |size| size as usize);
     if needed > byte_len {
         if stamp.current() {
             let mut slot = slot.borrow_mut();
@@ -567,7 +646,18 @@ async fn read_frame(
     // path and it is the awaited one below.
     let promise = frame.copy_to_with_buffer_source_and_options(&destination, &options);
 
-    let read = wasm_bindgen_futures::JsFuture::from(promise).await;
+    let mut read = wasm_bindgen_futures::JsFuture::from(promise).await;
+    if bgra && read.is_err() && stamp.wanted(&slot.borrow()) {
+        // A format may work for the probe but not this decoder's backing store.
+        // Retry the same open frame before declaring the decoder failed.
+        bgra = false;
+        readback.bgra.set(Some(false));
+        options.set_format(web_sys::VideoPixelFormat::Rgba);
+        read = wasm_bindgen_futures::JsFuture::from(
+            frame.copy_to_with_buffer_source_and_options(&destination, &options),
+        )
+        .await;
+    }
     // Closed on both paths, and before the slot is touched: the buffer it
     // holds is the decoder's, not ours.
     frame.close();
@@ -594,7 +684,11 @@ async fn read_frame(
     if source.len() < width * height * 4 {
         return;
     }
-    let bgra = into_bgra_rotated(source, width, height, *rotation);
+    let bgra = if bgra {
+        source
+    } else {
+        into_bgra_rotated(source, width, height, *rotation)
+    };
     let (draw_width, draw_height) = if rotation.transposes() {
         (height, width)
     } else {
