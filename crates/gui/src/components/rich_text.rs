@@ -15,14 +15,14 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, FontStyle, FontWeight, HighlightStyle, IntoElement, SharedString, StrikethroughStyle,
-    StyledText,
+    App, FontStyle, FontWeight, HighlightStyle, InteractiveText, IntoElement, SharedString,
+    StrikethroughStyle, StyledText, UnderlineStyle,
 };
 use gpui_component::ActiveTheme as _;
 
 use crate::theme::ActiveProductTheme as _;
 
-use oxidezap_core::{Emphasis, parse_rich_text};
+use oxidezap_core::{Emphasis, LinkSpan, find_message_links, parse_rich_text};
 
 /// One message's text, parsed once.
 ///
@@ -48,22 +48,29 @@ pub struct BubbleText {
     /// Shared rather than owned because a `BubbleProps` is built per visible
     /// row per frame and this travels in it.
     runs: Arc<[(Range<usize>, Emphasis)]>,
+    /// The URLs in the parsed text, in order. Empty for text without any —
+    /// which is the common case, and the case that then costs one refcount
+    /// per frame and nothing else.
+    links: Arc<[LinkSpan]>,
 }
 
 impl BubbleText {
     /// Parse `source` once, for the timeline that will draw it many times.
     pub fn of(source: &str) -> Self {
         let rich = parse_rich_text(source);
+        let links: Arc<[LinkSpan]> = find_message_links(&rich.text).into();
         if rich.is_plain() {
             return Self {
                 text: rich.text.into(),
                 runs: Arc::from([]),
+                links,
             };
         }
         let runs = rich.runs();
         Self {
             text: rich.text.into(),
             runs: runs.into(),
+            links,
         }
     }
 
@@ -79,6 +86,9 @@ impl BubbleText {
 /// Returns an element either way: the caller styles size and colour on the
 /// parent, and both paths inherit it.
 pub fn render_rich_text(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
+    if !parsed.links.is_empty() {
+        return render_with_links(parsed, cx).into_any_element();
+    }
     if parsed.runs.is_empty() {
         // Nothing to say about any range, so say nothing: `StyledText` with an
         // empty highlight list still walks and allocates runs.
@@ -127,8 +137,221 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
     }
 }
 
+/// Message text that holds links, in one inline flow.
+///
+/// A `StyledText` paints but answers no clicks, so the addresses ride along
+/// as clickable ranges on an `InteractiveText` instead of becoming elements
+/// of their own. Nothing is split into flex children, so a newline before an
+/// address starts a line the way it does without one, and a long address
+/// wraps the way plain text does rather than overflowing its item into the
+/// bubble's `overflow_hidden`. Clicks open the target through `cx.open_url`,
+/// which is why this needs no platform split of its own: GPUI answers that
+/// on the desktop and in the page alike. Size and colour are inherited from
+/// the parent; only the link ink comes from the theme.
+fn render_with_links(parsed: &BubbleText, cx: &App) -> impl IntoElement + use<> {
+    let metrics = cx.product().metrics;
+    let ink = cx.theme().link;
+    let mono = cx.theme().mono_font_family.clone();
+    let text: SharedString = parsed.text.clone();
+    // Every emphasis edge and every link edge is a point where the
+    // appearance can change; between two adjacent edges it cannot, so each
+    // gap is one run. Both partitions arrive sorted and disjoint, which is
+    // what keeps the highlights handed to `StyledText` disjoint too: two
+    // highlights for one byte is a panic, not a blend.
+    let mut edges = Vec::with_capacity(parsed.runs.len() * 2 + parsed.links.len() * 2 + 2);
+    edges.push(0);
+    edges.push(text.len());
+    for (range, _) in parsed.runs.iter() {
+        edges.push(range.start);
+        edges.push(range.end);
+    }
+    for link in parsed.links.iter() {
+        edges.push(link.range.start);
+        edges.push(link.range.end);
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut code: Vec<(Range<usize>, SharedString)> = Vec::new();
+    let mut run_ix = 0;
+    let mut link_ix = 0;
+    for cell in edges.windows(2) {
+        let (start, end) = (cell[0], cell[1]);
+        if start == end {
+            continue;
+        }
+        while run_ix < parsed.runs.len() && parsed.runs[run_ix].0.end <= start {
+            run_ix += 1;
+        }
+        while link_ix < parsed.links.len() && parsed.links[link_ix].range.end <= start {
+            link_ix += 1;
+        }
+        let emphasis = match parsed.runs.get(run_ix) {
+            Some((range, emphasis)) if range.start < end && range.end > start => *emphasis,
+            _ => Emphasis::default(),
+        };
+        let linked = parsed
+            .links
+            .get(link_ix)
+            .is_some_and(|link| link.range.start <= start && start < link.range.end);
+        if emphasis.is_plain() && !linked {
+            continue;
+        }
+        if linked {
+            highlights.push((start..end, link_style(emphasis, metrics, ink)));
+        } else {
+            highlights.push((start..end, style_for(emphasis, metrics)));
+        }
+        if emphasis.code {
+            code.push((start..end, mono.clone()));
+        }
+    }
+    let styled = StyledText::new(text)
+        .with_highlights(highlights)
+        .with_font_family_overrides(code);
+    let ranges: Vec<Range<usize>> = parsed.links.iter().map(|link| link.range.clone()).collect();
+    let targets: Vec<SharedString> = parsed
+        .links
+        .iter()
+        .map(|link| SharedString::from(link.target.clone()))
+        .collect();
+    // One instance per bubble, scoped under the row's own id.
+    InteractiveText::new("message-links", styled).on_click(ranges, move |ix, _window, cx| {
+        cx.open_url(&targets[ix]);
+    })
+}
+
+/// One run's appearance inside a link: its own emphasis, inked and underlined
+/// as a link. The ink is the theme's rather than the bubble's, so an address
+/// reads as one on every ground a bubble paints.
+fn link_style(
+    emphasis: Emphasis,
+    metrics: crate::theme::Metrics,
+    ink: gpui::Hsla,
+) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(ink),
+        underline: Some(UnderlineStyle {
+            thickness: metrics.hairline(),
+            color: None,
+            wavy: false,
+        }),
+        ..style_for(emphasis, metrics)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::BubbleText;
+
+    /// Links are resolved where the rows are built, beside the markup — so a
+    /// frame hands out ranges rather than scanning the peer's text again.
+    #[test]
+    fn links_are_detected_once_per_bubble() {
+        let plain = BubbleText::of("nothing to open here");
+        assert!(plain.links.is_empty());
+
+        let linked = BubbleText::of("see https://example.com/x now");
+        assert_eq!(linked.links.len(), 1);
+        assert_eq!(
+            &linked.text[linked.links[0].range.clone()],
+            "https://example.com/x"
+        );
+        assert_eq!(linked.links[0].target, "https://example.com/x");
+
+        let bare = BubbleText::of("try www.example.com/a");
+        assert_eq!(bare.links.len(), 1);
+        assert_eq!(bare.links[0].target, "https://www.example.com/a");
+    }
+
+    /// Markup is stripped before detection runs, so the ranges describe what
+    /// the reader sees rather than what the sender typed.
+    #[test]
+    fn links_line_up_with_the_parsed_text() {
+        let parsed = BubbleText::of("*look* at https://example.com/x!");
+        assert_eq!(parsed.text, "look at https://example.com/x!");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(
+            &parsed.text[parsed.links[0].range.clone()],
+            "https://example.com/x"
+        );
+    }
+
+    /// Markup characters inside an address are address characters, not
+    /// formatting: the parser leaves them alone, so the target is exactly
+    /// what the sender wrote rather than the address with pieces missing.
+    #[test]
+    fn link_targets_keep_markup_characters_inside_the_address() {
+        let parsed = BubbleText::of("see https://example.com/foo_bar_baz now");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(
+            &parsed.text[parsed.links[0].range.clone()],
+            "https://example.com/foo_bar_baz"
+        );
+        assert_eq!(parsed.links[0].target, "https://example.com/foo_bar_baz");
+    }
+
+    /// A marker around an address styles the address without joining it:
+    /// the target is exactly what the sender wrote.
+    #[test]
+    fn markup_around_a_link_styles_it_and_keeps_the_target() {
+        for (source, flag) in [
+            ("*https://example.com*", "bold"),
+            ("_https://example.com_", "italic"),
+            ("~https://example.com~", "strike"),
+            ("`https://example.com`", "code"),
+        ] {
+            let parsed = BubbleText::of(source);
+            assert_eq!(parsed.text, "https://example.com", "for {source:?}");
+            assert_eq!(parsed.links.len(), 1, "for {source:?}");
+            assert_eq!(
+                &parsed.text[parsed.links[0].range.clone()],
+                "https://example.com",
+                "for {source:?}"
+            );
+            assert_eq!(
+                parsed.links[0].target, "https://example.com",
+                "for {source:?}"
+            );
+            assert_eq!(parsed.runs.len(), 1, "for {source:?}: {:?}", parsed.runs);
+            let emphasis = parsed.runs[0].1;
+            assert!(
+                match flag {
+                    "bold" => emphasis.bold,
+                    "italic" => emphasis.italic,
+                    "strike" => emphasis.strikethrough,
+                    _ => emphasis.code,
+                },
+                "for {source:?}: {emphasis:?}"
+            );
+        }
+    }
+
+    /// The wrapped address keeps the markers inside it: they are address
+    /// characters, not formatting.
+    #[test]
+    fn a_wrapped_link_keeps_markers_inside_the_address() {
+        let parsed = BubbleText::of("*https://example.com/foo_bar_baz*");
+        assert_eq!(parsed.text, "https://example.com/foo_bar_baz");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(parsed.links[0].target, "https://example.com/foo_bar_baz");
+        assert_eq!(parsed.runs.len(), 1);
+        assert!(parsed.runs[0].1.bold);
+    }
+
+    /// A newline ends the line even when an address follows it: detection
+    /// runs over the whole text, and the single inline flow draws it.
+    #[test]
+    fn a_link_after_a_newline_is_still_one_link() {
+        let parsed = BubbleText::of("before\nhttps://example.com");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(
+            &parsed.text[parsed.links[0].range.clone()],
+            "https://example.com"
+        );
+        assert_eq!(parsed.links[0].target, "https://example.com");
+    }
+
     /// A stopwatch rather than an assertion: what a conversation pays to
     /// re-derive text nothing changed, and what it pays now that it does not.
     ///
