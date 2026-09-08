@@ -1,8 +1,10 @@
 # Browser call playout tests
 
 This separate workspace imports the production output, statistics, and reporting
-helpers. CI runs `stats` in `Check` and `browser` in `Test (web)`, and checks
-this workspace's formatting separately. Run from the repository root.
+helpers. CI runs `stats` in `Check` and ordinary and shared `browser` builds in
+`Test (web)`, and checks this workspace's formatting separately. It also runs
+the audio crate's `call_audio_lifecycle` integration test in both browser builds.
+Run from the repository root.
 
 The manifest's cargo-machete exception covers only `oxidezap-platform`.
 `browser.rs` imports `../diagnostics.rs` through `#[path]`, outside the directory
@@ -18,11 +20,22 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
   --locked --target wasm32-unknown-unknown --test browser
 
+RUSTFLAGS='--cfg web_sys_unstable_apis' \
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo test -p oxidezap-audio --target wasm32-unknown-unknown --test call_audio_lifecycle
+
 # Inherits the root atomics/shared-memory flags and rebuilds std with them.
+rustup toolchain install nightly-2026-09-03 --profile minimal --component rust-src --target wasm32-unknown-unknown
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 CARGO_TARGET_DIR=target/call-playout-shared \
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-  cargo +nightly test --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
+  cargo +nightly-2026-09-03 test --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
   --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort --test browser
+
+CARGO_TARGET_DIR=target/call-audio-shared \
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo +nightly-2026-09-03 test -p oxidezap-audio --target wasm32-unknown-unknown \
+  -Z build-std=std,panic_abort --test call_audio_lifecycle
 ```
 
 Use wasm-bindgen-test-runner 0.2.127 and matching Chrome/ChromeDriver versions.
@@ -33,11 +46,13 @@ not serve isolation headers. Enable shared memory for these tests with Chrome's
 with `binary` pointing to your Chrome executable.
 
 The shared-memory rejection test needs that flag even in the ordinary stable
-build. CI supplies it through a temporary capabilities file; the nightly shared
-build remains a separate local check.
+build. CI supplies it through a temporary capabilities file for both builds.
+The production lifecycle test also needs `--autoplay-policy=no-user-gesture-required`.
+It substitutes an oscillator stream for permission requests, uses real WebAudio
+callbacks, and waits in 50 ms intervals without requesting hardware devices.
 
 ```json
-{"goog:chromeOptions":{"binary":"/path/to/chrome","args":["--enable-features=SharedArrayBuffer"]}}
+{"goog:chromeOptions":{"binary":"/path/to/chrome","args":["--enable-features=SharedArrayBuffer","--autoplay-policy=no-user-gesture-required"]}}
 ```
 
 ## Evidence
@@ -78,6 +93,7 @@ total, and cancels the reporting wait. Speaker write failures are retained once
 and formatted outside the callback, at the next report or teardown.
 
 The tests do not measure live-call audio quality, hardware scheduling, browser
-throttling, or end-to-end latency. They do not run the full microphone graph.
+throttling, or end-to-end latency. The standalone helpers do not run the full
+microphone graph; the separate lifecycle integration test does.
 Startup prime duration, ring ceiling, capture behavior, codecs, and native audio
 remain unchanged.

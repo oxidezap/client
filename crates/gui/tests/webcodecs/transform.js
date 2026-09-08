@@ -20,6 +20,9 @@ export class TransformDecoder {
             timestamp: 1, rotation: 90, flip: true,
         });
         try {
+            if (frame.rotation !== 90 || frame.flip !== true) {
+                throw new Error("VideoFrame metadata unsupported: requested 90/true");
+            }
             this.output(frame);
             await new Promise(resolve => setTimeout(resolve, 0));
         } finally {
