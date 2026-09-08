@@ -52,8 +52,9 @@ retains startup stamps, so a redial cannot extend an old event's wait. There is
 no timer that silently discards a valid early accept.
 
 The library resolves the original PN target while placing the call. The client
-then reads that LID mapping without changing the builder's input or issuing an
-extra device lookup. Accepted media must name that target user, the
+reads the handle's immutable `initial_peer_jid()` afterward, without a second
+cache lookup that could fail after the offer is sent. Cache eviction cannot
+terminate the placement or substitute a different target. Accepted media must name that target user, the
 handle's selected device and its creator. All direct-call video states and
 upgrade tokens come from `CallEvent::PeerVideoStateChanged` on the handle's
 ordered queue. Global `IncomingCall::VideoState` events do not update video.
@@ -79,9 +80,12 @@ not imply remote-on, and frame arrival does not grant video permission.
 Native tests use the upstream `CallFixture` to complete Noise XX and login,
 block the real offer send, and obtain real dormant handles from the public call
 builder. Injected stanzas pass through the library parser and handlers. The
-tests then exercise the client handler, daemon reducer and GUI `Frames` with
-generated H.264, including an IDR rejected before acceptance and a subsequent
-recovery request. They do not set the winning device or fabricate readiness.
+tests then exercise the client handler and daemon reducer through serialized
+`CallsChanged` messages. They do not set the winning device or fabricate readiness.
+Separate session-free GUI tests exercise `Frames` with generated H.264, including
+an IDR rejected before acceptance and a subsequent recovery request. Native GUI
+tests do not depend on the daemon or session. These are producer and consumer
+contract tests, not one cross-crate fixture inside the front end.
 Ordering tests hold the watcher while the global lane drains, reverse that
 scheduling before activation, and fill the real bounded queue before injecting
 the final transitions. They require remote-off and no pending peer request
@@ -91,10 +95,11 @@ when the queue closes. Legacy-only custom producers cannot drive video state
 and must migrate to the source-bearing event. This does not promise recovery
 of an operation evicted from the bounded queue.
 
-The optional `tests/call-fixture` dependency keeps the upstream fixture feature
-out of web and default production builds. Web tests separately exercise raw
-advertisement parsing, source-event/token extraction, lane identity and registration waits; shared-memory
-WebCodecs tests exercise the real browser codecs.
+Session's opt-in `test-support` feature forwards to the upstream fixture feature.
+The fixture is native-only, remains outside default production builds, and needs
+no standalone wrapper workspace. Web tests separately exercise raw advertisement
+parsing, source-event/token extraction, lane identity and registration waits;
+shared-memory WebCodecs tests exercise the real browser codecs.
 
 Stanza injection bypasses inbound Noise framing. No media relay or Android
 decoder runs in this fixture. Upstream still permits an unrung first winner
@@ -102,6 +107,20 @@ and lets a later non-busy sibling reject end the call. Matching application
 metadata does not repair those policies. The existing standalone video
 announcement remains unchanged, and Android reception of this client's
 outbound video still needs a live retest.
+
+Browser relay summaries now count successful `RTCDataChannel.send` calls
+separately from congestion drops, non-open channels and send exceptions.
+Outbound payload types are recorded only after successful browser admission.
+Video byte counts, admitted marker packets and IDR-marked marker packets help
+locate the remaining outgoing failure; they do not prove complete access units,
+relay delivery or Android receipt. Each transport uses a local ordinal rather
+than logging keys, account identifiers or media contents.
+
+Counters are fixed-size and cumulative. Debug summaries occur at most once per
+five seconds of sampled activity and once at teardown. Existing congestion and
+send-error warnings remain visible without debug logging. Production send-path
+tests verify accounting with a patched browser channel in ordinary and shared
+WASM memory, not a real network connection.
 
 ## Incoming call log
 

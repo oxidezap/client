@@ -1,7 +1,7 @@
 //! Real outgoing builders and injected production library events, with no media relay.
 
 use super::*;
-use oxidezap_call_fixture::CallFixture;
+use whatsapp_rust::test_support::CallFixture;
 use whatsapp_rust::wacore_binary::{Node, builder::NodeBuilder};
 
 #[derive(Clone, Copy, Debug)]
@@ -20,12 +20,14 @@ pub enum OutgoingAcceptCase {
     CameraReplaced,
     Ended,
     PhoneTarget,
+    PhoneTargetCacheLost,
+    PhoneTargetCacheLostWrongUser,
     WrongUser,
     Flood,
 }
 
 impl OutgoingAcceptCase {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::Video,
         Self::EarlyVideo,
         Self::Audio,
@@ -40,11 +42,16 @@ impl OutgoingAcceptCase {
         Self::CameraReplaced,
         Self::Ended,
         Self::PhoneTarget,
+        Self::PhoneTargetCacheLost,
+        Self::PhoneTargetCacheLostWrongUser,
         Self::WrongUser,
         Self::Flood,
     ];
     pub fn connects(self) -> bool {
-        !matches!(self, Self::Ended | Self::WrongUser)
+        !matches!(
+            self,
+            Self::Ended | Self::WrongUser | Self::PhoneTargetCacheLostWrongUser
+        )
     }
     pub fn remote_expected(self) -> bool {
         matches!(
@@ -57,6 +64,7 @@ impl OutgoingAcceptCase {
                 | Self::SiblingOff
                 | Self::SiblingOffAfter
                 | Self::PhoneTarget
+                | Self::PhoneTargetCacheLost
                 | Self::Flood
         )
     }
@@ -160,7 +168,18 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
     let camera = local.camera_id();
     let (_mic, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
     let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
-    let requested = if matches!(case, OutgoingAcceptCase::PhoneTarget) {
+    let cache_lost = matches!(
+        case,
+        OutgoingAcceptCase::PhoneTargetCacheLost
+            | OutgoingAcceptCase::PhoneTargetCacheLostWrongUser
+    );
+    let wrong_user = matches!(
+        case,
+        OutgoingAcceptCase::WrongUser | OutgoingAcceptCase::PhoneTargetCacheLostWrongUser
+    );
+    let requested = if cache_lost {
+        fixture.cache_peer_phone("15550003333").await
+    } else if matches!(case, OutgoingAcceptCase::PhoneTarget) {
         fixture
             .client()
             .add_lid_pn_mapping(
@@ -189,6 +208,18 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
         }
     });
     let offer = fixture.next_offer().await.unwrap();
+    if cache_lost {
+        fixture.clear_lid_pn_cache().await;
+        assert!(
+            fixture
+                .client()
+                .get_lid_pn_entry(&requested)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!starting.is_finished());
+    }
     assert_eq!(
         offer.stanza().as_node_ref().attrs().optional_jid("to"),
         Some(fixture.peer().clone())
@@ -221,7 +252,7 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
                 .build(),
         ),
     };
-    let accept = if matches!(case, OutgoingAcceptCase::WrongUser) {
+    let accept = if wrong_user {
         NodeBuilder::new("call")
             .attr("from", Jid::lid("999999999999999").with_device(2))
             .attr("id", "wrong-user-accept")
@@ -235,10 +266,11 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
     } else {
         stanza(&fixture, &id, 2, "accept", advertisement)
     };
-    let early = matches!(
-        case,
-        OutgoingAcceptCase::EarlyVideo | OutgoingAcceptCase::Ended | OutgoingAcceptCase::Flood
-    );
+    let early = cache_lost
+        || matches!(
+            case,
+            OutgoingAcceptCase::EarlyVideo | OutgoingAcceptCase::Ended | OutgoingAcceptCase::Flood
+        );
     let injection = early.then(|| {
         tokio::spawn({
             let fixture = fixture.clone();
@@ -266,8 +298,19 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
     offer.complete().unwrap();
     let handle = Arc::new(starting.await.unwrap().unwrap());
     assert_eq!(handle.call_id(), id);
-    let target = outgoing_target(fixture.client(), &requested).await.unwrap();
+    let target = handle.initial_peer_jid().clone();
     assert_eq!(target, *fixture.peer());
+    if cache_lost {
+        assert!(
+            fixture
+                .client()
+                .get_lid_pn_entry(&requested)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(whatsapp_rust::futures::poll!(std::pin::pin!(handle.wait_ended())).is_pending());
+    }
     if let Some(injection) = injection {
         injection.await.unwrap();
     }
@@ -408,7 +451,7 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
         .await
         .unwrap()
         .unwrap();
-    if matches!(case, OutgoingAcceptCase::WrongUser) {
+    if wrong_user {
         assert_eq!(
             fixture
                 .call_snapshot(&id)
@@ -458,6 +501,30 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn phone_target_cache_loss_preserves_call_and_rejects_spoofed_winner() {
+        for case in [
+            OutgoingAcceptCase::PhoneTargetCacheLost,
+            OutgoingAcceptCase::PhoneTargetCacheLostWrongUser,
+        ] {
+            let events = outgoing_accept_events(case).await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, UiEvent::CallAccepted(_)))
+                    .count(),
+                usize::from(case.connects()),
+                "{case:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, UiEvent::CallEnded { .. })),
+                "{case:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn delayed_watcher_keeps_upgrade_and_stop_in_source_queue_order() {

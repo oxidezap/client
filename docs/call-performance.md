@@ -80,14 +80,14 @@ crossed RTP to Android but was absent from the local encoded preview.
   camera off preserves the opposite decoder's reference chain.
 - Queue tests cover continuously replenished ordinary traffic and a full
   ordinary queue with a final pending video notification.
-- Nine [browser readback tests](../crates/gui/tests/webcodecs/README.md) import
+- The [browser readback tests](../crates/gui/tests/webcodecs/README.md) import
   production code and exercise real `VideoFrame.copyTo` with controlled promise
-  completion. CI runs them separately from GPUI's shared-memory build.
+  completion. CI runs them with ordinary and shared WASM memory, without GPUI.
 
 ## Remaining measurements
 
 No post-fix live call or native GPU-memory profile was recorded. Browser tests
-do not exercise hardware decoding, GPUI painting, or shared-memory integration.
+do not establish hardware decoding or exercise GPUI painting and worker integration.
 Linux tests and native/web compilation do not replace Windows/macOS runtime
 testing. Decoder-error recovery without subsequent input is not autonomous.
 

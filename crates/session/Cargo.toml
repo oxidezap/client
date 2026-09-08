@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-test-support = ["dep:oxidezap-call-fixture"]
+test-support = ["whatsapp-rust/test-support"]
 
 [dependencies]
 async-channel = "2"
@@ -65,7 +65,6 @@ tokio = { workspace = true, features = ["macros", "sync", "time"] }
 # takes none of them and supplies its own through the library's own plugin
 # traits.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-oxidezap-call-fixture = { path = "../../tests/call-fixture", optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 whatsapp-rust = { workspace = true }
 
@@ -77,14 +76,14 @@ whatsapp-rust = { workspace = true }
 # used to get wrong, and the reason a browser was told it had none. What it
 # supplies instead of the socket is a `RelayTransportProvider`; see
 # `src/relay/`.
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "test/voip-call-fixture", default-features = false, features = [
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false, features = [
     "voip-mlow",
 ] }
 # Directly, because the library no longer re-exports it: `sqlite-storage` is
 # one of the defaults dropped above. Same crate the chat store opens, and
 # without the `bundled-sqlite` that wants a C toolchain — diesel supplies
 # SQLite itself on this target.
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "test/voip-call-fixture", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
 # The browser, bound from Rust: the WebSocket, `fetch` and `setTimeout` that
 # stand in for the transport, the HTTP client and the runtime the defaults
 # would have supplied.

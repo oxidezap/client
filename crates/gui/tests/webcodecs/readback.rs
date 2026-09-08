@@ -9,6 +9,16 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+#[wasm_bindgen_test]
+fn wasm_memory_matches_build_configuration() {
+    let memory = wasm_bindgen::memory().unchecked_into::<js_sys::WebAssembly::Memory>();
+    let shared = memory
+        .buffer()
+        .is_instance_of::<js_sys::SharedArrayBuffer>();
+    assert_eq!(shared, cfg!(target_feature = "atomics"));
+    console_log!("WASM memory.buffer instanceof SharedArrayBuffer = {shared}");
+}
+
 #[wasm_bindgen(module = "/fixture.js")]
 extern "C" {
     type ControlledDecoder;

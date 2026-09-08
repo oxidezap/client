@@ -57,14 +57,60 @@ pub(super) fn bridge() -> Bridge {
 }
 
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
-#[cfg_attr(not(target_family = "wasm"), tokio::test)]
-#[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
-async fn outgoing_accept_handler_reaches_authoritative_state() {
+#[tokio::test]
+async fn outgoing_accept_handler_reaches_daemon_wire() {
+    use oxidezap_ipc::{DaemonEvent, StateVersion};
+    use oxidezap_session::{OutgoingAcceptCase, outgoing_accept_events};
+
     for case in OutgoingAcceptCase::ALL {
-        let states = outgoing_accept_states(case).await;
-        let state = states.last().unwrap();
+        let events = outgoing_accept_events(case).await;
+        let (id, recipient) = events
+            .iter()
+            .find_map(|event| match event {
+                UiEvent::OutgoingCallStarted {
+                    call_id,
+                    recipient_jid,
+                    ..
+                } => Some((call_id.clone(), recipient_jid.clone())),
+                _ => None,
+            })
+            .unwrap();
+        let mut bridge = bridge();
+        let mut updates = bridge.hub.subscribe();
+        bridge.hub.calls(|calls| {
+            calls.set_outgoing(oxidezap_core::OutgoingCall::new(
+                "placeholder",
+                recipient.clone(),
+                "Peer".into(),
+                true,
+            ))
+        });
+        let mut version = StateVersion::INITIAL;
+        let mut state = oxidezap_core::CallState::default();
+        for event in std::iter::once(None).chain(events.into_iter().map(Some)) {
+            if let Some(event) = event {
+                bridge.observe(event);
+            }
+            while let Ok(line) = updates.try_recv() {
+                let DaemonMessage::Update {
+                    version: next,
+                    event: DaemonEvent::CallsChanged(calls),
+                } = serde_json::from_str(&line).unwrap()
+                else {
+                    panic!("{case:?}: unexpected wire update");
+                };
+                assert_eq!(next, version.next(), "{case:?}");
+                version = next;
+                state = calls;
+            }
+            assert_eq!(state, bridge.hub.call_state(), "{case:?}");
+        }
+        assert_eq!(state.stage().unwrap().call_id(), id, "{case:?}");
         assert_eq!(state.active().is_some(), case.connects(), "{case:?}");
         assert_eq!(state.video().remote, case.remote_expected(), "{case:?}");
+        if let Some(active) = state.active() {
+            assert_eq!(active.peer_jid, recipient, "{case:?}");
+        }
     }
 }
 

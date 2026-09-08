@@ -326,9 +326,9 @@ jobs:
           CARGO_TARGET_DIR=target/call-playout-browser cargo test \
             --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
             --locked --target wasm32-unknown-unknown --test browser
-      - name: Install nightly for shared audio tests
+      - name: Install nightly for shared WASM tests
         run: rustup toolchain install nightly-2026-09-03 --profile minimal --component rust-src --target wasm32-unknown-unknown
-      - name: Test production audio with shared WASM memory
+      - name: Test production audio and WebCodecs with shared WASM memory
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
         run: |
@@ -337,6 +337,10 @@ jobs:
           test -x "$CHROMEDRIVER" || CHROMEDRIVER=$(command -v chromedriver)
           export WASM_BINDGEN_TEST_WEBDRIVER_JSON="$RUNNER_TEMP/call-playout-webdriver.json"
           # Inherit the web bundle's root flags and rebuild std, as Pages does.
+          CARGO_TARGET_DIR=target/webcodecs-shared cargo +nightly-2026-09-03 test \
+            --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
+            --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort \
+            --test readback --test recovery --test transform
           CARGO_TARGET_DIR=target/call-playout-shared cargo +nightly-2026-09-03 test \
             --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
             --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort --test browser

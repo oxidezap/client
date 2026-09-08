@@ -169,7 +169,6 @@ web-sys = { version = "0.3", features = [
 # hold a browser-only failure under `cargo test` by building the same thing —
 # the crate is already in the graph on every platform, and this only names it.
 [dev-dependencies]
-oxidezap-daemon = { workspace = true, features = ["test-support"] }
 gpui = { package = "gpui-pre", version = "0.3.4", features = ["test-support"] }
 gpui_wgpu = { package = "gpui-pre-wgpu", version = "0.3.4" }
 # The same synthetic chats and messages every crate above core tests against.

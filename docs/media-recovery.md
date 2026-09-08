@@ -158,15 +158,18 @@ receive oracle maps all 256 frame-info bytes to clockwise display turns of 0,
 270, 180 and 90 degrees for low bits 0, 1, 2 and 3. The upstream correction
 merged in
 [whatsapp-rust#1469](https://github.com/oxidezap/whatsapp-rust/pull/1469),
-which is included in the merged revision consumed below. No 180-degree GUI
-compensation was added. A live Android front/rear retest is still required.
+which is included in the revision consumed below. No 180-degree GUI
+compensation was added. The later Android-initiated retest confirmed correct
+front/rear rotation on that setup.
 
 The parser correction merged in
 [whatsapp-rust#1470](https://github.com/oxidezap/whatsapp-rust/pull/1470)
 at `2681a687c35f8fc290c1ff62bb30a857a12df9e0`. The client currently consumes
-`test/voip-call-fixture` at `a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0`, based on
-that commit, for source-bearing call events and the native fixtures in
+the merged source-bearing events and native fixtures from
 [whatsapp-rust#1472](https://github.com/oxidezap/whatsapp-rust/pull/1472).
+It uses `main` at `b71c813dbb888aae58ac41994afcd39352148498`, including the immutable
+resolved-target accessor merged in
+[whatsapp-rust#1473](https://github.com/oxidezap/whatsapp-rust/pull/1473).
 The client-side ordering tests are described in [video lifecycle](video-lifecycle.md).
 All WhatsApp dependency declarations use the same branch and the root lockfile
 records the revision. The fixture adds no production call-policy correction.

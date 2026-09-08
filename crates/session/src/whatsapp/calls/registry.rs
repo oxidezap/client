@@ -79,21 +79,6 @@ fn accepted_advertisement(
     Some((call, video))
 }
 
-async fn outgoing_target(client: &Client, requested: &Jid) -> Result<Jid, String> {
-    if requested.is_lid() {
-        return Ok(requested.clone());
-    }
-    if !requested.is_pn() {
-        return Err("outgoing calls require a PN or LID peer".into());
-    }
-    client
-        .get_lid_pn_entry(requested)
-        .await
-        .map_err(|error| error.to_string())?
-        .map(|mapping| Jid::lid(mapping.lid.as_ref()))
-        .ok_or_else(|| "no known LID for outgoing call target".into())
-}
-
 /// Clears an accept from the in-flight set however its task ends.
 ///
 /// A guard rather than a line at each exit: the accept path returns from a
@@ -2083,19 +2068,9 @@ impl WhatsAppClient {
                 Ok(handle) => {
                     let call_id = handle.call_id().to_string();
                     let handle = Arc::new(handle);
-                    // The builder has resolved PN to LID. Read that mapping without
-                    // substituting its possibly already selected answering device.
-                    let target = match outgoing_target(&client, &jid).await {
-                        Ok(target) => target,
-                        Err(error) => {
-                            if let Some(local) = local {
-                                local.stop().await;
-                            }
-                            log_termination(&call_id, handle.terminate().await);
-                            notify_failure(error).await;
-                            return;
-                        }
-                    };
+                    // A secondary cache lookup can fail after the offer was sent. The handle
+                    // retains the resolved target independently of an early answering device.
+                    let target = handle.initial_peer_jid().clone();
                     // Cancelled while still connecting: the UI only knew the
                     // placeholder id, so the rename and the note are answered
                     // together, under one lock. As two steps there is a

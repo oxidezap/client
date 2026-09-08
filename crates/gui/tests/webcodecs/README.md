@@ -66,10 +66,9 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 Use explicit test targets in the `Test (web)` CI job with the same runner
 as the daemon and session tests. Do not substitute `--all-targets`, which also
 builds the library's imported native unit tests requiring OpenH264.
-The separate workspace avoids the daemon and session dependencies
-and the GUI's shared-memory build. The explicit `RUSTFLAGS` replaces the root
-wasm flags, as in the existing browser
-CI job. Keep the bindgen versions here in step with that job when updating them.
+The separate workspace avoids the daemon and session dependencies and GPUI.
+The ordinary run's explicit `RUSTFLAGS` replaces the root wasm flags.
+Keep the bindgen versions here in step with CI when updating them.
 
 If Chrome is not installed in its default location, set
 `WASM_BINDGEN_TEST_WEBDRIVER_JSON` to an absolute path to a local file containing
@@ -77,21 +76,37 @@ If Chrome is not installed in its default location, set
 `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER` can likewise name an absolute path
 to the matching runner. Do not commit machine-specific paths.
 
-To exercise the atomics scheduler too, use nightly with `rust-src` installed and
-the root's shared-memory flags, without the ordinary run's `RUSTFLAGS` override:
+CI also runs all three targets in its shared-WASM step, using pinned nightly
+with `rust-src` and the root's shared-memory flags. Run the same command locally
+after configuring ChromeDriver as above. The shared step reuses the audio
+WebDriver properties, including `--enable-features=SharedArrayBuffer` and
+`--autoplay-policy=no-user-gesture-required`:
+
+```json
+{"goog:chromeOptions":{"args":["--enable-features=SharedArrayBuffer","--autoplay-policy=no-user-gesture-required"]}}
+```
+
+Set `WASM_BINDGEN_TEST_WEBDRIVER_JSON` to the absolute path of that file. Add
+`binary` under `goog:chromeOptions` if Chrome is not in its default location.
 
 ```bash
-env -u RUSTFLAGS \
+rustup toolchain install nightly-2026-09-03 --profile minimal --component rust-src --target wasm32-unknown-unknown
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
   CARGO_TARGET_DIR=target/webcodecs-shared \
   CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-  cargo +nightly test --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
+  cargo +nightly-2026-09-03 test --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
     --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort \
     --test readback --test recovery --test transform
 ```
 
-Runner 0.2.127 serves isolation headers for the shared module. With Chrome and
-ChromeDriver 153.0.8010.12, the page exposed `SharedArrayBuffer` without a browser
-feature override. This still does not run GPUI's worker pool or upload images.
+Both flag overrides must be unset so Cargo inherits `.cargo/config.toml`,
+including atomics, shared imported memory, the memory limit and TLS exports.
+Runner 0.2.127 serves isolation headers for the shared module.
+The standalone `wasm_memory_matches_build_configuration` readback test checks
+the actual `wasm_bindgen::memory().buffer()` against `SharedArrayBuffer` and
+asserts that it is shared in the atomics build and unshared in the ordinary build.
+Browser support or a compile-time atomics flag alone is not proof of shared memory.
+This still does not run GPUI's worker pool or upload images.
 
 The old readback wait used one zero-delay timer. It returned before the first
 copy in the shared build, whose pending Rust futures resume through
@@ -99,6 +114,12 @@ copy in the shared build, whose pending Rust futures resume through
 The shared suite reproduced 14 failures and two passes, while ordinary wasm
 passed all 16. Copy-entry and consumption milestones passed all 16 in both builds;
 adding another timer would not establish the required ordering.
+
+Verified on 2026-09-08 with Chrome and ChromeDriver 152.0.7977.82 and runner
+0.2.127. Both commands passed 17 readback tests, four recovery tests and three
+transform tests, with no failures or skips. Those totals include the new memory
+guard in addition to the existing 23 tests. Its runtime check reported
+`SharedArrayBuffer = true` with nightly-2026-09-03 and `false` with ordinary wasm.
 
 ## Coverage
 

@@ -817,30 +817,54 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn outgoing_accept_handler_reaches_remote_decoder() {
+    fn synthetic_call_states_gate_remote_decoder_and_keyframe_recovery() {
         use openh264::encoder::{Encoder, EncoderConfig};
         use openh264::formats::{RgbSliceU8, YUVBuffer};
-        use oxidezap_daemon::session_bridge::{OutgoingAcceptCase, outgoing_accept_states};
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         let mut encoder =
             Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new())
                 .unwrap();
         let pixels = vec![96; 32 * 32 * 3];
         let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (32, 32)));
-        let key = encoder.encode(&yuv).unwrap().to_vec();
-        let delta = encoder.encode(&yuv).unwrap().to_vec();
-        for case in OutgoingAcceptCase::ALL {
-            let states = runtime.block_on(outgoing_accept_states(case));
-            let call_id = states
-                .last()
-                .unwrap()
-                .stage()
-                .unwrap()
-                .call_id()
-                .to_string();
+        let key = encoder.encode(&yuv).unwrap();
+        assert!(matches!(
+            key.frame_type(),
+            openh264::encoder::FrameType::IDR
+        ));
+        let key = key.to_vec();
+        let delta = encoder.encode(&yuv).unwrap();
+        assert!(matches!(
+            delta.frame_type(),
+            openh264::encoder::FrameType::P
+        ));
+        let delta = delta.to_vec();
+        // Producer sender/order cases live in the daemon's wire contract test.
+        for (case, connected, remote, stopped) in [
+            ("video", true, true, false),
+            ("audio", true, false, false),
+            ("unaccepted", false, false, false),
+            ("camera stopped", true, true, true),
+        ] {
+            let call_id = "synthetic-call".to_string();
+            let mut calls = CallState::default();
+            calls.set_outgoing(oxidezap_core::OutgoingCall::new(
+                &call_id,
+                "peer@example.invalid".into(),
+                "Peer".into(),
+                true,
+            ));
+            let mut states = vec![calls.clone()];
+            if connected {
+                assert!(calls.connect(&call_id));
+                states.push(calls.clone());
+            }
+            if remote {
+                assert!(calls.set_video(&call_id, VideoStream::Remote, true));
+                states.push(calls.clone());
+            }
+            if stopped {
+                assert!(calls.set_video(&call_id, VideoStream::Remote, false));
+                states.push(calls);
+            }
             let (sink, _events) = super::super::sink::channel();
             let pending = Pending::default();
             let pictures = crate::video::LatestFrames::default();
@@ -885,7 +909,7 @@ mod tests {
                 assert!(frames.apply(message).is_continue());
             }
             assert!(frames.apply(unit(delta.clone(), false)).is_continue());
-            let enabled = case.remote_expected();
+            let enabled = remote && !stopped;
             if enabled {
                 assert!(
                     frames.video[stream_slot(VideoStream::Remote)].is_some(),
@@ -899,6 +923,7 @@ mod tests {
                 );
             } else {
                 assert!(frames.video.iter().all(Option::is_none), "{case:?}");
+                assert!(requested.try_recv().is_err(), "{case:?}");
             }
             assert!(frames.apply(unit(key.clone(), true)).is_continue());
             if enabled {
