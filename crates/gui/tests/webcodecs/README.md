@@ -9,9 +9,12 @@ production admission helper and a real `VideoDecoder`.
 The readback fixture replaces `VideoDecoder` only while constructing a decoder. It sends
 synthetic, real `VideoFrame` objects through the registered output callback.
 Each `copyTo` executes in the browser immediately, but a promise gate withholds
-its completion until the test releases it. Tests await the real copy and drain
-the promise continuations before asserting results. No camera or H.264 encoder
-is needed.
+its completion until the test releases it. Tests await actual copy entry before
+resetting, dropping, or checking the active/pending order. Releasing a copy waits
+for Rust to close its frame or enter a fallback copy on that same frame. Neither
+wait polls nor releases a gate; a five-second deadline fails missing milestones.
+Exact copy-count, pixel, and publication assertions remain separate from the waits.
+No camera or H.264 encoder is needed.
 
 The recovery fixture uses real `VideoEncoder` and `VideoDecoder` instances,
 without replacing either global. It encodes two synthetic 32x32 canvas pictures
@@ -57,22 +60,66 @@ RUSTFLAGS='--cfg web_sys_unstable_apis' \
 CARGO_TARGET_DIR=target/webcodecs-tests \
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
-    --locked --target wasm32-unknown-unknown --test readback --test recovery
+    --locked --target wasm32-unknown-unknown --test readback --test recovery --test transform
 ```
 
-Use both explicit test targets in the `Test (web)` CI job with the same runner
+Use explicit test targets in the `Test (web)` CI job with the same runner
 as the daemon and session tests. Do not substitute `--all-targets`, which also
 builds the library's imported native unit tests requiring OpenH264.
-The separate workspace avoids the daemon and session dependencies
-and the GUI's shared-memory build. The explicit `RUSTFLAGS` replaces the root
-wasm flags, as in the existing browser
-CI job. Keep the bindgen versions here in step with that job when updating them.
+The separate workspace avoids the daemon and session dependencies and GPUI.
+The ordinary run's explicit `RUSTFLAGS` replaces the root wasm flags.
+Keep the bindgen versions here in step with CI when updating them.
 
 If Chrome is not installed in its default location, set
 `WASM_BINDGEN_TEST_WEBDRIVER_JSON` to an absolute path to a local file containing
 `{"goog:chromeOptions":{"binary":"/absolute/path/to/chrome"}}`.
 `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER` can likewise name an absolute path
 to the matching runner. Do not commit machine-specific paths.
+
+CI also runs all three targets in its shared-WASM step, using pinned nightly
+with `rust-src` and the root's shared-memory flags. Run the same command locally
+after configuring ChromeDriver as above. The shared step reuses the audio
+WebDriver properties, including `--enable-features=SharedArrayBuffer` and
+`--autoplay-policy=no-user-gesture-required`:
+
+```json
+{"goog:chromeOptions":{"args":["--enable-features=SharedArrayBuffer","--autoplay-policy=no-user-gesture-required"]}}
+```
+
+Set `WASM_BINDGEN_TEST_WEBDRIVER_JSON` to the absolute path of that file. Add
+`binary` under `goog:chromeOptions` if Chrome is not in its default location.
+
+```bash
+rustup toolchain install nightly-2026-09-03 --profile minimal --component rust-src --target wasm32-unknown-unknown
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+  CARGO_TARGET_DIR=target/webcodecs-shared \
+  CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo +nightly-2026-09-03 test --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
+    --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort \
+    --test readback --test recovery --test transform
+```
+
+Both flag overrides must be unset so Cargo inherits `.cargo/config.toml`,
+including atomics, shared imported memory, the memory limit and TLS exports.
+Runner 0.2.127 serves isolation headers for the shared module.
+The standalone `wasm_memory_matches_build_configuration` readback test checks
+the actual `wasm_bindgen::memory().buffer()` against `SharedArrayBuffer` and
+asserts that it is shared in the atomics build and unshared in the ordinary build.
+Browser support or a compile-time atomics flag alone is not proof of shared memory.
+This still does not run GPUI's worker pool or upload images.
+
+The old readback wait used one zero-delay timer. It returned before the first
+copy in the shared build, whose pending Rust futures resume through
+`Atomics.waitAsync`. The BGRA probe adds promise continuations before that copy.
+The shared suite reproduced 14 failures and two passes, while ordinary wasm
+passed all 16. Copy-entry and consumption milestones passed all 16 in both builds;
+adding another timer would not establish the required ordering.
+
+Verified on 2026-09-08 with Chrome and ChromeDriver 152.0.7977.82 and runner
+0.2.127. Both commands passed 17 readback tests, four recovery tests and three
+transform tests, with no failures or skips. Those totals include the new memory
+guard in addition to the existing 23 tests. Its runtime check reported
+`SharedArrayBuffer = true` with nightly-2026-09-03 and `false` with ordinary wasm.
 
 ## Coverage
 
@@ -92,10 +139,11 @@ to the matching runner. Do not commit machine-specific paths.
   publishing early or marking the decoder failed. Reset cancels that retry.
 
 The recovery target decodes compressed reference chains but does not assert
-whether Chrome selects hardware or software codecs. Neither target measures
-camera performance or draws through GPUI. Both run without the application's
-shared-memory configuration. RGBA and BGRA copies are real;
-older-browser behavior is injected around the native copying method.
+whether Chrome selects hardware or software codecs. These targets do not measure
+camera performance or draw through GPUI. The ordinary command omits the
+application's shared-memory configuration; the nightly command includes it.
+RGBA and BGRA copies are real; older-browser behavior is injected around the
+native copying method.
 
 ## Readback benchmark
 

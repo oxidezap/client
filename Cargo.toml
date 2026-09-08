@@ -110,7 +110,7 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 # and no two crates can drift onto incompatible revisions. The exact commit is
 # pinned in the committed Cargo.lock.
 #
-# main includes the incoming frame-info parser fix from whatsapp-rust#1470.
+# whatsapp-rust#1473 exposes the builder's immutable resolved call target.
 #
 # `whatsapp-rust` re-exports wacore, wacore-binary and waproto wholesale, so
 # anything already depending on it reaches them through that and does not

@@ -158,14 +158,21 @@ receive oracle maps all 256 frame-info bytes to clockwise display turns of 0,
 270, 180 and 90 degrees for low bits 0, 1, 2 and 3. The upstream correction
 merged in
 [whatsapp-rust#1469](https://github.com/oxidezap/whatsapp-rust/pull/1469),
-which is included in the merged revision consumed below. No 180-degree GUI
-compensation was added. A live Android front/rear retest is still required.
+which is included in the revision consumed below. No 180-degree GUI
+compensation was added. The later Android-initiated retest confirmed correct
+front/rear rotation on that setup.
 
-The client now consumes merged
+The parser correction merged in
 [whatsapp-rust#1470](https://github.com/oxidezap/whatsapp-rust/pull/1470)
-from `main` at `2681a687c35f8fc290c1ff62bb30a857a12df9e0`.
-All WhatsApp dependency declarations use that source, with the revision
-recorded in the client lockfile.
+at `2681a687c35f8fc290c1ff62bb30a857a12df9e0`. The client currently consumes
+the merged source-bearing events and native fixtures from
+[whatsapp-rust#1472](https://github.com/oxidezap/whatsapp-rust/pull/1472).
+It uses `main` at `b71c813dbb888aae58ac41994afcd39352148498`, including the immutable
+resolved-target accessor merged in
+[whatsapp-rust#1473](https://github.com/oxidezap/whatsapp-rust/pull/1473).
+The client-side ordering tests are described in [video lifecycle](video-lifecycle.md).
+All WhatsApp dependency declarations use the same branch and the root lockfile
+records the revision. The fixture adds no production call-policy correction.
 
 Authenticated receive packets now expose frame-info independently of optional
 timing and bandwidth extensions. Upstream compared 3,840 synthetic packets and

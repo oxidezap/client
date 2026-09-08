@@ -2,6 +2,8 @@
 
 /// Voice calls, which are the one part of the session a page cannot run.
 mod calls;
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+pub use calls::{OutgoingAcceptCase, outgoing_accept_events};
 
 /// A stored row and a composed quote, read as the other side's shape.
 mod convert;
@@ -95,6 +97,11 @@ struct InterestedEventHandler {
 
 impl EventHandler for InterestedEventHandler {
     fn handle_event(&self, event: Arc<Event>) {
+        if let Event::RawNode(node) = &*event
+            && (node.get().tag != "call" || node.get().get_optional_child("accept").is_none())
+        {
+            return;
+        }
         self.inner.handle_event(event);
     }
 
@@ -774,6 +781,7 @@ impl WhatsAppClient {
                 EventKind::LoggedOut,
                 EventKind::SelfPushNameUpdated,
                 EventKind::IncomingCall,
+                EventKind::RawNode,
                 EventKind::MissedCall,
                 EventKind::CallEndedElsewhere,
                 EventKind::GroupUpdate,
@@ -808,6 +816,7 @@ impl WhatsAppClient {
         // holding it until `run_client` returns is the whole of its job.
         let (_session_over, stopping) = tokio::sync::watch::channel(());
 
+        let _call_advertisements = bot.client().acquire_raw_node_forwarding();
         bot.client().subscribe_handler(control_events).detach();
         bot.client().subscribe_handler(data_events).detach();
         {
@@ -945,6 +954,7 @@ impl WhatsAppClient {
         names: Arc<NameBook>,
     ) {
         match &*event {
+            Event::RawNode(node) => calls.accept_advertisement(node).await,
             Event::PairingQrCode(qr) => {
                 info!("QR code received");
                 let _ = ui_tx.send(UiEvent::QrCode {
@@ -1020,31 +1030,7 @@ impl WhatsAppClient {
                 }
                 CallAction::Accept { call_id, .. } => {
                     info!("Call {} accepted by peer", call_id);
-                    let _ = ui_tx.send(UiEvent::CallAccepted(call_id.clone()));
-                    // And what our camera is doing, which nothing has been
-                    // able to say until now: a call this side placed as video
-                    // opened its camera while the call was still *ringing*,
-                    // and a ringing call has no live state for a camera to be
-                    // recorded against. This is the first moment it does —
-                    // after the acceptance above, which is what creates it.
-                    // The call has somewhere to be drawn, and needs a point
-                    // to start decoding from. Until this moment it was
-                    // ringing: no window had a live call to put either
-                    // direction in, so nothing was published and the next
-                    // unit alone references frames no decoder starting now
-                    // has ever seen.
-                    if calls.camera_became_drawable(call_id) {
-                        // And tell the peer, which nothing did for a call that
-                        // offered video from the start: the offer advertises a
-                        // capability, and the receiving side opens its pane off
-                        // the announcement. See `announce_our_video`.
-                        calls.announce_our_video(call_id).await;
-                        let _ = ui_tx.send(UiEvent::CallVideoChanged {
-                            call_id: call_id.clone(),
-                            stream: VideoStream::Local,
-                            on: true,
-                        });
-                    }
+                    calls.accepted(call, &ui_tx).await;
                 }
                 CallAction::Reject { call_id, .. } => {
                     info!("Call {} rejected by peer", call_id);

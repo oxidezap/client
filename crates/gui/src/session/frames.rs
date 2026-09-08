@@ -818,6 +818,138 @@ mod tests {
 
     struct NoMedia;
 
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn synthetic_call_states_gate_remote_decoder_and_keyframe_recovery() {
+        use openh264::encoder::{Encoder, EncoderConfig};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+        let mut encoder =
+            Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new())
+                .unwrap();
+        let pixels = vec![96; 32 * 32 * 3];
+        let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (32, 32)));
+        let key = encoder.encode(&yuv).unwrap();
+        assert!(matches!(
+            key.frame_type(),
+            openh264::encoder::FrameType::IDR
+        ));
+        let key = key.to_vec();
+        let delta = encoder.encode(&yuv).unwrap();
+        assert!(matches!(
+            delta.frame_type(),
+            openh264::encoder::FrameType::P
+        ));
+        let delta = delta.to_vec();
+        // Producer sender/order cases live in the daemon's wire contract test.
+        for (case, connected, remote, stopped) in [
+            ("video", true, true, false),
+            ("audio", true, false, false),
+            ("unaccepted", false, false, false),
+            ("camera stopped", true, true, true),
+        ] {
+            let call_id = "synthetic-call".to_string();
+            let mut calls = CallState::default();
+            calls.set_outgoing(oxidezap_core::OutgoingCall::new(
+                &call_id,
+                "peer@example.invalid".into(),
+                "Peer".into(),
+                true,
+            ));
+            let mut states = vec![calls.clone()];
+            if connected {
+                assert!(calls.connect(&call_id));
+                states.push(calls.clone());
+            }
+            if remote {
+                assert!(calls.set_video(&call_id, VideoStream::Remote, true));
+                states.push(calls.clone());
+            }
+            if stopped {
+                assert!(calls.set_video(&call_id, VideoStream::Remote, false));
+                states.push(calls);
+            }
+            let (sink, _events) = super::super::sink::channel();
+            let pending = Pending::default();
+            let pictures = crate::video::LatestFrames::default();
+            let (requests, requested) = std::sync::mpsc::channel();
+            let mut frames = Frames::new(
+                &sink,
+                &pending,
+                &NoMedia,
+                &pictures,
+                Arc::new(move |id, stream| {
+                    requests.send((id.to_string(), stream)).unwrap();
+                    true
+                }),
+            );
+            let unit = |data: Vec<u8>, keyframe| {
+                DaemonMessage::CallVideo(Box::new(oxidezap_core::CallVideoFrame::new(
+                    call_id.clone(),
+                    VideoStream::Remote,
+                    data,
+                    keyframe,
+                    0,
+                )))
+            };
+            assert!(
+                frames
+                    .apply(DaemonMessage::Update {
+                        version: StateVersion::INITIAL.next(),
+                        event: DaemonEvent::CallsChanged(states[0].clone()),
+                    })
+                    .is_continue()
+            );
+            // The opening IDR arrives before accepted-video permission.
+            assert!(frames.apply(unit(key.clone(), true)).is_continue());
+            assert!(frames.video.iter().all(Option::is_none));
+            let mut version = StateVersion::INITIAL.next();
+            for calls in states.into_iter().skip(1) {
+                version = version.next();
+                let message = DaemonMessage::Update {
+                    version,
+                    event: DaemonEvent::CallsChanged(calls),
+                };
+                assert!(frames.apply(message).is_continue());
+            }
+            assert!(frames.apply(unit(delta.clone(), false)).is_continue());
+            let enabled = remote && !stopped;
+            if enabled {
+                assert!(
+                    frames.video[stream_slot(VideoStream::Remote)].is_some(),
+                    "{case:?}: video accept did not authorize a remote decoder"
+                );
+                assert_eq!(
+                    requested
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap(),
+                    (call_id.clone(), VideoStream::Remote)
+                );
+            } else {
+                assert!(frames.video.iter().all(Option::is_none), "{case:?}");
+                assert!(requested.try_recv().is_err(), "{case:?}");
+            }
+            assert!(frames.apply(unit(key.clone(), true)).is_continue());
+            if enabled {
+                let deadline = wacore::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    if let Some(picture) = pictures.take().into_iter().next() {
+                        assert_eq!(picture.stream, VideoStream::Remote);
+                        assert_eq!(picture.call_id, call_id);
+                        break;
+                    }
+                    assert!(
+                        wacore::time::Instant::now() < deadline,
+                        "{case:?} produced no picture"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            } else {
+                assert!(frames.video.iter().all(Option::is_none));
+                assert!(pictures.take().is_empty());
+            }
+        }
+    }
+
     impl MediaCache for NoMedia {
         fn read(&self, _: &str) -> Result<std::sync::Arc<Vec<u8>>, String> {
             panic!("frame tests must not read media")

@@ -19,6 +19,9 @@ use whatsapp_rust::voip::{
     CallEvent, CallHandle, CallTermination, KeyframeUrgency, VideoState, VideoUpgradeToken,
 };
 
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+pub mod acceptance_fixture;
+
 /// Whether an offer asked for video.
 ///
 /// Read off the offer rather than trusted from the front end: what the card
@@ -27,6 +30,53 @@ use whatsapp_rust::voip::{
 /// (the library refuses `.video()` on an audio offer).
 fn offered_video(offer: &WaIncomingCall) -> bool {
     matches!(&offer.action, CallAction::Offer { is_video, .. } if *is_video)
+}
+
+fn direct_peer_video(state: VideoState) -> Option<bool> {
+    match state {
+        VideoState::Enabled => Some(true),
+        VideoState::Stopped | VideoState::Paused | VideoState::UnknownPeer => Some(false),
+        _ => None,
+    }
+}
+
+struct PeerVideoUpdate {
+    source: Jid,
+    call_creator: Jid,
+    state: VideoState,
+    upgrade_token: Option<VideoUpgradeToken>,
+}
+
+fn peer_video_update(event: CallEvent) -> Option<PeerVideoUpdate> {
+    match event {
+        CallEvent::PeerVideoStateChanged {
+            source,
+            call_creator,
+            state,
+            upgrade_token,
+            ..
+        } => Some(PeerVideoUpdate {
+            source,
+            call_creator,
+            state,
+            upgrade_token,
+        }),
+        _ => None,
+    }
+}
+
+fn accepted_advertisement(
+    node: &whatsapp_rust::wacore_binary::NodeRef<'_>,
+) -> Option<(WaIncomingCall, bool)> {
+    let call = wacore::stanza::call::parse_call_stanza(node).ok()??;
+    if !matches!(call.action, CallAction::Accept { .. }) {
+        return None;
+    }
+    let video = node
+        .get_optional_child("accept")?
+        .get_optional_child("video")
+        .is_some();
+    Some((call, video))
 }
 
 /// Clears an accept from the in-flight set however its task ends.
@@ -83,6 +133,7 @@ enum Camera {
 /// only approximate.
 #[derive(Clone, Default)]
 pub struct CallRegistry {
+    registration: Arc<tokio::sync::Notify>,
     /// A `std` lock, and every method that takes it is synchronous.
     ///
     /// Not a preference: an outgoing call has to be marked in flight on the
@@ -173,6 +224,10 @@ const ANNOUNCED_ENDINGS: usize = 256;
 
 #[derive(Default)]
 struct Calls {
+    peer_lanes: HashMap<String, Arc<Mutex<()>>>,
+    starting: HashMap<String, u64>,
+    next_start: u64,
+    outgoing: HashMap<String, OutgoingActivation>,
     /// Endings already published, so the same one is never published twice.
     /// See [`CallRegistry::announce_ending`].
     announced: HashSet<String>,
@@ -214,6 +269,38 @@ struct Calls {
     upgrading: HashMap<String, video::CameraId>,
 }
 
+#[derive(Default)]
+struct OutgoingActivation {
+    placeholder: Option<String>,
+    ready: Option<OutgoingReady>,
+    activated: bool,
+    advertisements: HashMap<(String, Jid), bool>,
+    peer_video: Option<PeerVideoUpdate>,
+}
+
+struct OutgoingReady {
+    target: Jid,
+    camera: Option<video::CameraId>,
+}
+
+struct StartGuard {
+    calls: CallRegistry,
+    placeholder: String,
+    stamp: u64,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        let mut calls = self.calls.calls.lock().expect("call registry poisoned");
+        if calls.starting.get(&self.placeholder) == Some(&self.stamp) {
+            calls.starting.remove(&self.placeholder);
+            calls.in_flight.remove(&self.placeholder);
+            calls.cancelled.remove(&self.placeholder);
+        }
+        self.calls.registration.notify_waiters();
+    }
+}
+
 impl CallRegistry {
     /// Record a ringing offer, so accept and decline have something to act on.
     pub(in crate::whatsapp) fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
@@ -253,6 +340,7 @@ impl CallRegistry {
             return Some(ending);
         }
         calls.active.insert(call_id.to_string(), Arc::clone(handle));
+        calls.peer_lanes.insert(call_id.to_string(), Arc::default());
         None
     }
 
@@ -282,12 +370,16 @@ impl CallRegistry {
     }
 
     /// Mark an outgoing call as being placed, under the id the window drew.
-    pub(in crate::whatsapp) fn begin_start(&self, placeholder: &str) {
-        self.calls
-            .lock()
-            .expect("call registry poisoned")
-            .in_flight
-            .insert(placeholder.to_string());
+    pub(in crate::whatsapp) fn begin_start(&self, placeholder: &str) -> u64 {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        calls.next_start = calls
+            .next_start
+            .checked_add(1)
+            .expect("call start stamp exhausted");
+        let stamp = calls.next_start;
+        calls.starting.insert(placeholder.to_string(), stamp);
+        calls.in_flight.insert(placeholder.to_string());
+        stamp
     }
 
     /// File a placed call as live under its real id — unless it was cancelled
@@ -308,18 +400,41 @@ impl CallRegistry {
         // that learned the real id first cancels under that.
         let cancelled = calls.cancelled.remove(placeholder).is_some()
             | calls.cancelled.remove(call_id).is_some();
-        if cancelled {
+        if cancelled || calls.announced.contains(call_id) {
+            calls.outgoing.remove(call_id);
             return false;
         }
         calls.active.insert(call_id.to_string(), Arc::clone(handle));
+        calls.peer_lanes.insert(call_id.to_string(), Arc::default());
+        calls.outgoing.insert(
+            call_id.to_string(),
+            OutgoingActivation {
+                placeholder: Some(placeholder.to_string()),
+                ..Default::default()
+            },
+        );
+        if calls.in_flight.is_empty() {
+            let Calls {
+                active, outgoing, ..
+            } = &mut *calls;
+            outgoing.retain(|id, _| active.contains_key(id));
+        }
         true
     }
 
     /// An outgoing call that never produced a handle.
     pub(in crate::whatsapp) fn abandon_start(&self, placeholder: &str) {
         let mut calls = self.calls.lock().expect("call registry poisoned");
+        calls.starting.remove(placeholder);
+        self.registration.notify_waiters();
         calls.in_flight.remove(placeholder);
         calls.cancelled.remove(placeholder);
+        if calls.in_flight.is_empty() {
+            let Calls {
+                active, outgoing, ..
+            } = &mut *calls;
+            outgoing.retain(|id, _| active.contains_key(id));
+        }
     }
 
     /// The peer ended this call: drop the local side without answering.
@@ -348,6 +463,9 @@ impl CallRegistry {
     /// nothing to end it.
     pub(in crate::whatsapp) fn ended_remotely(&self, call_id: &str) {
         let mut calls = self.calls.lock().expect("call registry poisoned");
+        self.registration.notify_waiters();
+        calls.outgoing.remove(call_id);
+        calls.peer_lanes.remove(call_id);
         calls.pending.remove(call_id);
         if let Some(handle) = calls.active.remove(call_id) {
             // The session's executor rather than tokio's: a page has no runtime
@@ -382,10 +500,12 @@ impl CallRegistry {
     /// the case it does not cover.
     pub(in crate::whatsapp) fn announce_ending(&self, call_id: &str) -> bool {
         let mut calls = self.calls.lock().expect("call registry poisoned");
+        self.registration.notify_waiters();
         if calls.announced.contains(call_id) {
             return false;
         }
         calls.announced.insert(call_id.to_string());
+        calls.outgoing.remove(call_id);
         calls.announced_order.push_back(call_id.to_string());
         while calls.announced_order.len() > ANNOUNCED_ENDINGS {
             if let Some(oldest) = calls.announced_order.pop_front() {
@@ -440,6 +560,13 @@ impl CallRegistry {
     /// stopped.
     pub(in crate::whatsapp) fn cancel(&self, call_id: &str) -> Cancelled {
         let mut calls = self.calls.lock().expect("call registry poisoned");
+        self.registration.notify_waiters();
+        let renamed = calls.outgoing.iter().find_map(|(id, start)| {
+            (start.placeholder.as_deref() == Some(call_id)).then(|| id.clone())
+        });
+        let call_id = renamed.as_deref().unwrap_or(call_id);
+        calls.outgoing.remove(call_id);
+        calls.peer_lanes.remove(call_id);
         calls.pending.remove(call_id);
         if let Some(handle) = calls.active.remove(call_id) {
             return Cancelled::Live(handle);
@@ -475,6 +602,9 @@ impl CallRegistry {
     /// live handle behind a cleared card.
     pub(in crate::whatsapp) fn decline(&self, call_id: &str) -> Declined {
         let mut calls = self.calls.lock().expect("call registry poisoned");
+        self.registration.notify_waiters();
+        calls.outgoing.remove(call_id);
+        calls.peer_lanes.remove(call_id);
         if let Some(offer) = calls.pending.remove(call_id) {
             return Declined::Ringing(offer);
         }
@@ -507,6 +637,301 @@ impl CallRegistry {
 
 /// The camera half, under the same lock as everything else.
 impl CallRegistry {
+    fn peer_lane(&self, handle: &Arc<CallHandle>) -> Option<Arc<Mutex<()>>> {
+        let calls = self.calls.lock().expect("call registry poisoned");
+        if calls.announced.contains(handle.call_id())
+            || !calls
+                .active
+                .get(handle.call_id())
+                .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            return None;
+        }
+        calls.peer_lanes.get(handle.call_id()).cloned()
+    }
+
+    async fn registered_outgoing(&self, call_id: &str) -> Option<Arc<CallHandle>> {
+        let pending = self
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .starting
+            .clone();
+        let mut expected = None;
+        loop {
+            let changed = self.registration.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let calls = self.calls.lock().expect("call registry poisoned");
+                if calls.announced.contains(call_id) || calls.cancelled.contains_key(call_id) {
+                    return None;
+                }
+                if let Some(handle) = calls.active.get(call_id) {
+                    if expected
+                        .as_ref()
+                        .is_some_and(|old| !Arc::ptr_eq(old, handle))
+                    {
+                        return None;
+                    }
+                    expected = Some(handle.clone());
+                    if calls
+                        .outgoing
+                        .get(call_id)
+                        .is_some_and(|start| start.ready.is_some())
+                    {
+                        return Some(handle.clone());
+                    }
+                } else if expected.is_some() {
+                    return None;
+                }
+                // Only startups present on entry may keep this event waiting. A redial
+                // cannot extend an unrelated event's lifetime, and cancellation wakes it.
+                if !pending.iter().any(|(id, stamp)| {
+                    calls.starting.get(id) == Some(stamp) && !calls.cancelled.contains_key(id)
+                }) {
+                    return None;
+                }
+            }
+            changed.await;
+        }
+    }
+
+    pub(in crate::whatsapp) async fn accept_advertisement(
+        &self,
+        node: &whatsapp_rust::wacore_binary::OwnedNodeRef,
+    ) {
+        let Some((call, video)) = accepted_advertisement(node.get()) else {
+            return;
+        };
+        let call_id = call.action.call_id();
+        let Some(handle) = self.registered_outgoing(call_id).await else {
+            return;
+        };
+        let peer = call.participant.as_ref().unwrap_or(&call.from);
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        if !calls
+            .active
+            .get(call_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            || handle.call_creator() != call.action.call_creator()
+        {
+            return;
+        }
+        let Some(start) = calls.outgoing.get_mut(call_id) else {
+            return;
+        };
+        if start.activated
+            || !start
+                .ready
+                .as_ref()
+                .is_some_and(|ready| ready.target == peer.to_non_ad())
+        {
+            return;
+        }
+        start
+            .advertisements
+            .entry((call.stanza_id, peer.clone()))
+            .or_insert(video);
+    }
+
+    pub(in crate::whatsapp) async fn accepted(&self, call: &WaIncomingCall, ui: &UiEventSender) {
+        let call_id = call.action.call_id();
+        let Some(handle) = self.registered_outgoing(call_id).await else {
+            return;
+        };
+        let Some(lane) = self.peer_lane(&handle) else {
+            return;
+        };
+        let _ordered = lane.lock().await;
+        let (announce, pending) = {
+            let mut calls = self.calls.lock().expect("call registry poisoned");
+            let peer = call.participant.as_ref().unwrap_or(&call.from);
+            if !calls
+                .active
+                .get(call_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                return;
+            }
+            let Some(start) = calls.outgoing.get_mut(call_id) else {
+                return;
+            };
+            let advertisement = start
+                .advertisements
+                .remove(&(call.stanza_id.clone(), peer.clone()));
+            if handle.peer_jid() != *peer || handle.call_creator() != call.action.call_creator() {
+                return;
+            }
+            let Some(ready) = &start.ready else { return };
+            if start.activated || ready.target != peer.to_non_ad() {
+                return;
+            }
+            let camera = ready.camera;
+            let video = advertisement.unwrap_or_else(|| {
+                call.video_orientation
+                    .is_some_and(|orientation| orientation < 4)
+            });
+            let pending = start
+                .peer_video
+                .take()
+                .filter(|update| update.source == *peer);
+            start.activated = true;
+            start.advertisements.clear();
+            let _ = ui.send(UiEvent::CallAccepted(call_id.to_string()));
+            let announce = if let Some(local) = calls.cameras.get(call_id).filter(|local| {
+                Some(local.camera_id()) == camera
+                    && local.alive()
+                    && !calls.upgrading.contains_key(call_id)
+            }) {
+                local.live();
+                local.request_keyframe();
+                WhatsAppClient::announce_video(ui, call_id, VideoStream::Local, true);
+                if pending.is_none() {
+                    WhatsAppClient::announce_video(ui, call_id, VideoStream::Remote, video);
+                    if video {
+                        handle.request_peer_keyframe(KeyframeUrgency::Coalesced);
+                    }
+                }
+                true
+            } else {
+                false
+            };
+            (announce, pending)
+        };
+        self.registration.notify_waiters();
+        if let Some(update) = pending {
+            WhatsAppClient::observe_peer_video(
+                self,
+                ui,
+                call_id,
+                update.state,
+                update.upgrade_token,
+            )
+            .await;
+        }
+        if announce {
+            self.announce_our_video(call_id, &handle).await;
+        }
+    }
+
+    async fn peer_video_event(
+        &self,
+        handle: &Arc<CallHandle>,
+        event: CallEvent,
+        ui: &UiEventSender,
+    ) {
+        let Some(update) = peer_video_update(event) else {
+            return;
+        };
+        let id = handle.call_id();
+        let outgoing = self
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .outgoing
+            .contains_key(id);
+        if outgoing
+            && !self
+                .registered_outgoing(id)
+                .await
+                .is_some_and(|current| Arc::ptr_eq(&current, handle))
+        {
+            return;
+        }
+        let Some(lane) = self.peer_lane(handle) else {
+            return;
+        };
+        let _ordered = lane.lock().await;
+        let update = {
+            let mut calls = self.calls.lock().expect("call registry poisoned");
+            if !calls
+                .active
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current, handle))
+                || calls.announced.contains(id)
+                || handle.call_creator() != &update.call_creator
+            {
+                return;
+            }
+            // Group participant state belongs to its roster, not the 1:1 upgrade reducer.
+            if handle.group_state().is_some() {
+                return;
+            }
+            if let Some(start) = calls.outgoing.get_mut(id) {
+                if !start
+                    .ready
+                    .as_ref()
+                    .is_some_and(|ready| ready.target == update.source.to_non_ad())
+                {
+                    return;
+                }
+                if !start.activated {
+                    start.peer_video = Some(update);
+                    None
+                } else if handle.peer_jid() != update.source {
+                    return;
+                } else {
+                    Some(update)
+                }
+            } else if handle.peer_jid() != update.source {
+                return;
+            } else {
+                Some(update)
+            }
+        };
+        let Some(update) = update else {
+            drop(_ordered);
+            // One complete operation is retained. The bounded handle queue holds the
+            // rest, so acceptance cannot coalesce away an upgrade before a stop.
+            loop {
+                let changed = self.registration.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                {
+                    let calls = self.calls.lock().expect("call registry poisoned");
+                    if !calls
+                        .active
+                        .get(id)
+                        .is_some_and(|current| Arc::ptr_eq(current, handle))
+                        || calls.outgoing.get(id).is_none_or(|start| start.activated)
+                    {
+                        return;
+                    }
+                }
+                changed.await;
+            }
+        };
+        WhatsAppClient::observe_peer_video(self, ui, id, update.state, update.upgrade_token).await;
+    }
+
+    fn outgoing_ready(
+        &self,
+        call_id: &str,
+        handle: &Arc<CallHandle>,
+        target: Jid,
+        camera: Option<video::CameraId>,
+    ) {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        if calls.announced.contains(call_id)
+            || !calls
+                .active
+                .get(call_id)
+                .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            return;
+        }
+        if let Some(start) = calls.outgoing.get_mut(call_id)
+            && start.ready.is_none()
+        {
+            start.ready = Some(OutgoingReady {
+                target: target.to_non_ad(),
+                camera,
+            });
+        }
+        self.registration.notify_waiters();
+    }
+
     /// Put a camera in the registry, or take it straight back down when there
     /// is nothing left to hold it for.
     ///
@@ -536,27 +961,6 @@ impl CallRegistry {
         outcome
     }
 
-    /// The call this camera belongs to has just become live: hand the device
-    /// the two things a newly drawable call needs, and say whether there was
-    /// one.
-    ///
-    /// A camera opened while the call was still ringing has been encoding
-    /// into a stream nobody could draw — the state had no live call to put a
-    /// direction in — so the first unit any decoder now starting sees would
-    /// reference frames it never got.
-    pub(in crate::whatsapp) fn camera_became_drawable(&self, call_id: &str) -> bool {
-        let calls = self.calls.lock().expect("call registry poisoned");
-        let Some(local) = calls.cameras.get(call_id) else {
-            return false;
-        };
-        if !local.alive() {
-            return false;
-        }
-        local.live();
-        local.request_keyframe();
-        true
-    }
-
     /// Tell the peer this side is sending video, on a call that always was.
     ///
     /// A video-from-start call describes its video in the `<offer>` and then
@@ -572,10 +976,13 @@ impl CallRegistry {
     /// Only ever "1": this says which direction *we* are sending, and a call
     /// that offered video is sending from the moment the peer accepts. A
     /// mid-call camera goes through `start_video`, which announces already.
-    pub(in crate::whatsapp) async fn announce_our_video(&self, call_id: &str) {
-        let Some(handle) = self.live(call_id) else {
+    async fn announce_our_video(&self, call_id: &str, handle: &Arc<CallHandle>) {
+        if !self
+            .live(call_id)
+            .is_some_and(|current| Arc::ptr_eq(&current, handle))
+        {
             return;
-        };
+        }
         if let Err(e) = handle.announce_video_enabled().await {
             warn!("Call {call_id}: could not announce our video direction: {e}");
         }
@@ -728,6 +1135,9 @@ impl CallRegistry {
     /// that has none.
     fn ended(&self, call_id: &str) -> Option<LocalVideo> {
         let mut calls = self.calls.lock().expect("call registry poisoned");
+        self.registration.notify_waiters();
+        calls.outgoing.remove(call_id);
+        calls.peer_lanes.remove(call_id);
         calls.active.remove(call_id);
         calls.upgrades.remove(call_id);
         calls.upgrading.remove(call_id);
@@ -1535,9 +1945,14 @@ impl WhatsAppClient {
         // task this mark is too late by construction; here there is no gap
         // for a cancel to fall into, because the daemon takes the two
         // requests in order on one thread.
-        calls.begin_start(&placeholder_id);
+        let starting = StartGuard {
+            stamp: calls.begin_start(&placeholder_id),
+            calls: calls.clone(),
+            placeholder: placeholder_id.clone(),
+        };
 
         self.exec.spawn(async move {
+            let _starting = starting;
             let notify_failure = |error: String| {
                 let ui_sender = ui_sender.clone();
                 let recipient_jid = recipient_jid.clone();
@@ -1615,6 +2030,7 @@ impl WhatsAppClient {
             // rather than by what was asked for. Read here because the
             // endpoints are about to be handed away.
             let endpoints_attached = endpoints.is_some();
+            let camera_id = local.as_ref().map(LocalVideo::camera_id);
 
             let voip = client.voip();
             let outgoing = voip.call(&jid).audio(mic, speaker);
@@ -1652,6 +2068,9 @@ impl WhatsAppClient {
                 Ok(handle) => {
                     let call_id = handle.call_id().to_string();
                     let handle = Arc::new(handle);
+                    // A secondary cache lookup can fail after the offer was sent. The handle
+                    // retains the resolved target independently of an early answering device.
+                    let target = handle.initial_peer_jid().clone();
                     // Cancelled while still connecting: the UI only knew the
                     // placeholder id, so the rename and the note are answered
                     // together, under one lock. As two steps there is a
@@ -1704,7 +2123,7 @@ impl WhatsAppClient {
                         // already out.
                         calls.hold_camera(&call_id, local).await;
                     }
-                    Self::watch_call(handle, calls.clone(), ui_sender.clone());
+                    Self::watch_call(handle.clone(), calls.clone(), ui_sender.clone());
                     // The rename first: everything after it is addressed by
                     // the id the server gave the call, and a front end told
                     // its camera was on under an id it has not adopted yet
@@ -1721,10 +2140,7 @@ impl WhatsAppClient {
                         // conversation's record as a video call.
                         is_video: endpoints_attached,
                     });
-                    // Not announced here: the call is ringing, and a ringing
-                    // call has no live state to record a camera against. The
-                    // peer's `<accept>` is the first moment there is one, and
-                    // that is where it is said.
+                    calls.outgoing_ready(&call_id, &handle, target, camera_id);
                 }
                 Err(e) => {
                     if let Some(local) = local {
@@ -1880,102 +2296,112 @@ impl WhatsAppClient {
     /// The call's own event stream: what the peer says about its video, and
     /// what the network says about ours.
     fn watch_call_events(handle: Arc<CallHandle>, calls: CallRegistry, ui_sender: UiEventSender) {
-        crate::exec::spawn(async move {
-            let events = handle.events();
-            let call_id = handle.call_id().to_string();
-            while let Ok(event) = events.recv().await {
-                match event {
-                    CallEvent::VideoStateChanged {
-                        state,
-                        upgrade_token,
-                        ..
-                    } => {
-                        if !calls
-                            .live(&call_id)
-                            .is_some_and(|current| Arc::ptr_eq(&current, &handle))
-                        {
-                            continue;
-                        }
-                        Self::observe_peer_video(
-                            &calls,
-                            &ui_sender,
-                            &call_id,
-                            state,
-                            upgrade_token,
-                        )
-                        .await;
-                    }
-                    // The peer has lost our stream and is asking for a point
-                    // it can start from. Sending it more P-frames it cannot
-                    // decode is the one thing that certainly does not help.
-                    CallEvent::RtcpReceived {
-                        reports_video,
-                        feedback,
-                        ..
-                    } if reports_video && feedback.iter().any(reports_loss) => {
-                        calls.ask_for_keyframe(&call_id);
-                    }
-                    // The library asking for the one thing only the encoder
-                    // can produce, and for a long time nobody answered.
-                    //
-                    // Two gates inside the engine and the driver drop *every*
-                    // access unit that is not an IDR while they are closed —
-                    // and both close on ordinary events: backpressure shedding
-                    // a queued unit, a relay reconnect, a group epoch, an
-                    // inbound PLI. This event is the only notice either gate
-                    // gives. Unanswered, outbound video stops for the rest of
-                    // the call, which is exactly what production showed: 276
-                    // access units encoded, 269 accepted by the media plane,
-                    // and not one picture at the peer.
-                    //
-                    // The desktop hid it, which is why it lasted: openh264 is
-                    // configured with a periodic IDR, so every gate reopened
-                    // within three seconds whether or not anyone listened. The
-                    // browser's encoder had no such cadence — it does now, and
-                    // this arm is still the correct fix, because a cadence
-                    // makes recovery take seconds where an answer makes it
-                    // take one frame.
-                    CallEvent::VideoKeyframeNeeded => {
-                        debug!("call {call_id}: the media plane asked for a keyframe");
-                        calls.ask_for_keyframe(&call_id);
-                    }
-                    // The driver saying it threw our media away. A discarded
-                    // access unit is a gap every later frame references, so
-                    // this is a keyframe request in all but name — and it is
-                    // the line that says whether a call losing video is losing
-                    // it here or somewhere with no account of itself.
-                    CallEvent::OutboundMediaDropped {
-                        video_access_units,
-                        packets,
-                    } => {
-                        if video_access_units > 0 {
-                            warn!(
-                                "call {call_id}: the media plane dropped {video_access_units} \
+        crate::exec::spawn(Self::run_call_events(handle, calls, ui_sender));
+    }
+
+    async fn run_call_events(
+        handle: Arc<CallHandle>,
+        calls: CallRegistry,
+        ui_sender: UiEventSender,
+    ) {
+        let events = handle.events();
+        let call_id = handle.call_id().to_string();
+        while let Ok(event) = events.recv().await {
+            match event {
+                event @ CallEvent::PeerVideoStateChanged { .. } => {
+                    calls.peer_video_event(&handle, event, &ui_sender).await;
+                }
+                // A compatibility copy of the preceding source-bearing event.
+                CallEvent::VideoStateChanged { .. } => {}
+                // The peer has lost our stream and is asking for a point
+                // it can start from. Sending it more P-frames it cannot
+                // decode is the one thing that certainly does not help.
+                CallEvent::RtcpReceived {
+                    reports_video,
+                    feedback,
+                    ..
+                } if reports_video && feedback.iter().any(reports_loss) => {
+                    calls.ask_for_keyframe(&call_id);
+                }
+                // The library asking for the one thing only the encoder
+                // can produce, and for a long time nobody answered.
+                //
+                // Two gates inside the engine and the driver drop *every*
+                // access unit that is not an IDR while they are closed —
+                // and both close on ordinary events: backpressure shedding
+                // a queued unit, a relay reconnect, a group epoch, an
+                // inbound PLI. This event is the only notice either gate
+                // gives. Unanswered, outbound video stops for the rest of
+                // the call, which is exactly what production showed: 276
+                // access units encoded, 269 accepted by the media plane,
+                // and not one picture at the peer.
+                //
+                // The desktop hid it, which is why it lasted: openh264 is
+                // configured with a periodic IDR, so every gate reopened
+                // within three seconds whether or not anyone listened. The
+                // browser's encoder had no such cadence — it does now, and
+                // this arm is still the correct fix, because a cadence
+                // makes recovery take seconds where an answer makes it
+                // take one frame.
+                CallEvent::VideoKeyframeNeeded => {
+                    debug!("call {call_id}: the media plane asked for a keyframe");
+                    calls.ask_for_keyframe(&call_id);
+                }
+                // The driver saying it threw our media away. A discarded
+                // access unit is a gap every later frame references, so
+                // this is a keyframe request in all but name — and it is
+                // the line that says whether a call losing video is losing
+                // it here or somewhere with no account of itself.
+                CallEvent::OutboundMediaDropped {
+                    video_access_units,
+                    packets,
+                } => {
+                    if video_access_units > 0 {
+                        warn!(
+                            "call {call_id}: the media plane dropped {video_access_units} \
                                  outbound video access unit(s) ({packets} packet(s)); asking for \
                                  a keyframe"
-                            );
-                            calls.ask_for_keyframe(&call_id);
-                        }
+                        );
+                        calls.ask_for_keyframe(&call_id);
                     }
-                    // The reason the call is about to end, and the only
-                    // place it is ever said. `wait_ended` fires right behind
-                    // this, so a call whose media never came up otherwise
-                    // vanishes a moment after it was placed with nothing
-                    // anywhere saying why — which is exactly how a browser
-                    // call that dials no relay reads in a console: an offer,
-                    // then an ending, and not one line between them.
-                    CallEvent::MediaSetupFailed(reason) => {
-                        warn!("call {call_id} media setup failed: {reason}");
-                        let _ = ui_sender.send(UiEvent::CallMediaFailed {
-                            call_id: call_id.clone(),
-                            reason,
-                        });
-                    }
-                    _ => {}
+                }
+                // The reason the call is about to end, and the only
+                // place it is ever said. `wait_ended` fires right behind
+                // this, so a call whose media never came up otherwise
+                // vanishes a moment after it was placed with nothing
+                // anywhere saying why — which is exactly how a browser
+                // call that dials no relay reads in a console: an offer,
+                // then an ending, and not one line between them.
+                CallEvent::MediaSetupFailed(reason) => {
+                    warn!("call {call_id} media setup failed: {reason}");
+                    let _ = ui_sender.send(UiEvent::CallMediaFailed {
+                        call_id: call_id.clone(),
+                        reason,
+                    });
+                }
+                _ => {}
+            }
+        }
+        debug!("event stream for call {call_id} closed");
+    }
+
+    fn project_peer_direction(calls: &mut Calls, ui: &UiEventSender, id: &str, on: bool) {
+        if calls.upgrades.remove(id).is_some() {
+            Self::announce_video_request(ui, id, false);
+        }
+        if on {
+            let accepted = calls.upgrading.remove(id).is_some();
+            if let Some(local) = calls.cameras.get(id) {
+                local.request_keyframe();
+                if accepted && local.alive() {
+                    Self::announce_video(ui, id, VideoStream::Local, true);
                 }
             }
-            debug!("event stream for call {call_id} closed");
-        });
+            if let Some(handle) = calls.active.get(id) {
+                handle.request_peer_keyframe(KeyframeUrgency::Coalesced);
+            }
+        }
+        Self::announce_video(ui, id, VideoStream::Remote, on);
     }
 
     /// Fold one `<video state=N>` from the peer into what this side holds.
@@ -1986,6 +2412,11 @@ impl WhatsAppClient {
         state: VideoState,
         upgrade_token: Option<VideoUpgradeToken>,
     ) {
+        if let Some(on) = direct_peer_video(state) {
+            let mut held = calls.calls.lock().expect("call registry poisoned");
+            Self::project_peer_direction(&mut held, ui_sender, call_id, on);
+            return;
+        }
         if peer_can_receive_video(state) {
             calls.ask_for_keyframe(call_id);
         }
@@ -2003,8 +2434,7 @@ impl WhatsAppClient {
                 Self::announce_video_request(ui_sender, call_id, true);
             }
             // The library emits a tokenless request only after resolving glare.
-            VideoState::Enabled
-            | VideoState::UpgradeAccept
+            VideoState::UpgradeAccept
             | VideoState::UpgradeRequest
             | VideoState::UpgradeRequestV2 => {
                 let accepted = calls.end_upgrade(call_id);
@@ -2020,13 +2450,6 @@ impl WhatsAppClient {
                 // periodic IDR into one that fills on the next frame.
                 calls.ask_peer_for_keyframe(call_id, KeyframeUrgency::Coalesced);
                 Self::announce_video(ui_sender, call_id, VideoStream::Remote, true);
-            }
-            // Paused is drawn the same as off, and deliberately: a peer whose
-            // app went to the background sends nothing, and a pane held open
-            // for it would be a frozen frame nobody can tell from a live one.
-            VideoState::Stopped | VideoState::Paused | VideoState::UnknownPeer => {
-                Self::withdraw_video_request(calls, ui_sender, call_id).await;
-                Self::announce_video(ui_sender, call_id, VideoStream::Remote, false);
             }
             VideoState::Disabled
             | VideoState::Error
@@ -2182,6 +2605,165 @@ fn log_termination(call_id: &str, outcome: CallTermination) {
 mod tests {
     use super::*;
 
+    #[cfg_attr(not(target_family = "wasm"), test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    fn source_video_event_keeps_the_operation_and_rejects_legacy() {
+        use whatsapp_rust::wacore::voip::{CallSession, PeerVideoTransition};
+        let registry = whatsapp_rust::wacore::voip::CallRegistry::default();
+        let source = Jid::lid("200").with_device(2);
+        let creator = Jid::lid("100");
+        let generation = registry.insert(CallSession::new_outgoing(
+            "test",
+            source.clone(),
+            creator.clone(),
+        ));
+        let PeerVideoTransition::UpgradeRequested(token) =
+            registry.apply_peer_video_state("test", generation, VideoState::UpgradeRequestV2)
+        else {
+            panic!("expected a peer request")
+        };
+        let update = peer_video_update(CallEvent::PeerVideoStateChanged {
+            source: source.clone(),
+            call_creator: creator.clone(),
+            state: VideoState::UpgradeRequestV2,
+            orientation: Some(3),
+            upgrade_token: Some(token),
+        })
+        .unwrap();
+        assert_eq!(update.source, source);
+        assert_eq!(update.call_creator, creator);
+        assert_eq!(update.state, VideoState::UpgradeRequestV2);
+        assert_eq!(update.upgrade_token, Some(token));
+        assert!(
+            peer_video_update(CallEvent::VideoStateChanged {
+                state: VideoState::UpgradeRequestV2,
+                orientation: Some(3),
+                upgrade_token: Some(token),
+            })
+            .is_none()
+        );
+        assert!(
+            peer_video_update(CallEvent::VideoStateChanged {
+                state: VideoState::Stopped,
+                orientation: None,
+                upgrade_token: None,
+            })
+            .is_none()
+        );
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    fn raw_accept_presence_and_call_lane_do_not_depend_on_orientation() {
+        use whatsapp_rust::wacore_binary::{OwnedNodeRef, builder::NodeBuilder};
+        for (video, orientation) in [
+            (false, None),
+            (true, None),
+            (true, Some("0")),
+            (true, Some("4")),
+        ] {
+            let mut accept = NodeBuilder::new("accept")
+                .attr("call-id", "raw-call")
+                .attr("call-creator", Jid::lid("100"));
+            if video {
+                let mut child = NodeBuilder::new("video").attr("dec", "H264");
+                if let Some(orientation) = orientation {
+                    child = child.attr("device_orientation", orientation);
+                }
+                accept = accept.children([child.build()]);
+            }
+            let node = NodeBuilder::new("call")
+                .attr("from", Jid::lid("200").with_device(2))
+                .attr("id", "raw-accept")
+                .attr("t", "1788840000")
+                .children([accept.build()])
+                .build();
+            let packed = whatsapp_rust::wacore_binary::marshal::marshal(&node).unwrap();
+            let bytes = whatsapp_rust::wacore_binary::util::unpack(&packed)
+                .unwrap()
+                .into_owned();
+            let raw = Arc::new(OwnedNodeRef::new(bytes).unwrap());
+            let (call, advertised) = accepted_advertisement(raw.get()).unwrap();
+            assert_eq!(advertised, video);
+            assert_eq!(
+                call.video_orientation,
+                (orientation == Some("0")).then_some(0)
+            );
+            let raw_subject = crate::whatsapp::lanes::event_subject(&Event::RawNode(raw))
+                .unwrap()
+                .as_written();
+            let parsed_subject =
+                crate::whatsapp::lanes::event_subject(&Event::IncomingCall(Box::new(call)))
+                    .unwrap()
+                    .as_written();
+            assert_eq!(raw_subject, parsed_subject);
+        }
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn registration_wait_does_not_admit_unknown_ids_or_follow_a_redial() {
+        let calls = CallRegistry::default();
+        calls.begin_start("first");
+        let mut waiting = std::pin::pin!(calls.registered_outgoing("unknown"));
+        assert!(whatsapp_rust::futures::poll!(waiting.as_mut()).is_pending());
+        assert!(calls.calls.lock().unwrap().outgoing.is_empty());
+        calls.cancel("first");
+        calls.begin_start("next");
+        assert!(waiting.await.is_none());
+        let guard = StartGuard {
+            stamp: calls.begin_start("first"),
+            calls: calls.clone(),
+            placeholder: "first".into(),
+        };
+        let newer = calls.begin_start("first");
+        drop(guard);
+        assert_eq!(calls.calls.lock().unwrap().starting["first"], newer);
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+    async fn video_accept_without_enabled_projects_remote_video() {
+        let events = acceptance_fixture::outgoing_accept_events(
+            acceptance_fixture::OutgoingAcceptCase::Video,
+        )
+        .await;
+        let mut projected = oxidezap_core::CallState::default();
+        projected.set_outgoing(oxidezap_core::OutgoingCall::new(
+            "placeholder",
+            "200@lid".into(),
+            "Peer".into(),
+            true,
+        ));
+        for event in events {
+            match event {
+                UiEvent::OutgoingCallStarted {
+                    placeholder_id,
+                    call_id,
+                    is_video,
+                    ..
+                } => {
+                    projected.update_outgoing_call_id(&placeholder_id, call_id, is_video);
+                }
+                UiEvent::CallAccepted(id) => {
+                    projected.connect(&id);
+                }
+                UiEvent::CallVideoChanged {
+                    call_id,
+                    stream,
+                    on,
+                } => {
+                    projected.set_video(&call_id, stream, on);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            projected.video().remote,
+            "video accept never enabled remote admission"
+        );
+    }
+
     #[cfg_attr(not(target_family = "wasm"), tokio::test)]
     #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
     async fn endpoint_timeout_retires_the_owner_pending_and_both_directions() {
@@ -2250,7 +2832,7 @@ mod tests {
         assert!(calls.hold_camera("current", local).await != Camera::Held);
         assert!(capture.is_closed());
         assert!(!calls.upgrade_pending("current"));
-        assert!(!calls.camera_became_drawable("current"));
+        assert!(!calls.camera_on("current"));
     }
 
     #[tokio::test]

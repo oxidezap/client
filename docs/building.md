@@ -129,6 +129,12 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test -p oxidezap-daemon -p oxidezap-session --lib --target wasm32-unknown-unknown
 ```
 
+CI also runs the standalone WebCodecs readback, recovery and transform targets
+in ordinary and shared-memory builds. The shared step uses pinned nightly with
+`rust-src`, inherits the root wasm flags and rebuilds `std` and `panic_abort`.
+The [WebCodecs test README](../crates/gui/tests/webcodecs/README.md) gives the
+commands, Chrome properties and runtime memory assertion.
+
 Type-checking the web build without the whole bundle:
 
 ```bash
