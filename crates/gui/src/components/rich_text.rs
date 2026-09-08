@@ -15,14 +15,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, FontStyle, FontWeight, HighlightStyle, IntoElement, SharedString, StrikethroughStyle,
-    StyledText,
+    App, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString,
+    StrikethroughStyle, Styled, StyledText, UnderlineStyle, div,
 };
 use gpui_component::ActiveTheme as _;
+use gpui_component::link::Link;
 
 use crate::theme::ActiveProductTheme as _;
 
-use oxidezap_core::{Emphasis, parse_rich_text};
+use oxidezap_core::{Emphasis, LinkSpan, find_message_links, parse_rich_text};
 
 /// One message's text, parsed once.
 ///
@@ -48,22 +49,29 @@ pub struct BubbleText {
     /// Shared rather than owned because a `BubbleProps` is built per visible
     /// row per frame and this travels in it.
     runs: Arc<[(Range<usize>, Emphasis)]>,
+    /// The URLs in the parsed text, in order. Empty for text without any —
+    /// which is the common case, and the case that then costs one refcount
+    /// per frame and nothing else.
+    links: Arc<[LinkSpan]>,
 }
 
 impl BubbleText {
     /// Parse `source` once, for the timeline that will draw it many times.
     pub fn of(source: &str) -> Self {
         let rich = parse_rich_text(source);
+        let links: Arc<[LinkSpan]> = find_message_links(&rich.text).into();
         if rich.is_plain() {
             return Self {
                 text: rich.text.into(),
                 runs: Arc::from([]),
+                links,
             };
         }
         let runs = rich.runs();
         Self {
             text: rich.text.into(),
             runs: runs.into(),
+            links,
         }
     }
 
@@ -79,6 +87,9 @@ impl BubbleText {
 /// Returns an element either way: the caller styles size and colour on the
 /// parent, and both paths inherit it.
 pub fn render_rich_text(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
+    if !parsed.links.is_empty() {
+        return render_with_links(parsed, cx);
+    }
     if parsed.runs.is_empty() {
         // Nothing to say about any range, so say nothing: `StyledText` with an
         // empty highlight list still walks and allocates runs.
@@ -127,8 +138,185 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
     }
 }
 
+/// Message text that holds links: plain stretches with one `Link` per
+/// address, wrapped into the line box the plain path fills.
+///
+/// A `StyledText` paints but answers no clicks, so an address has to be its
+/// own element. `Link` opens its `href` through `cx.open_url`, which is why
+/// this needs no platform split of its own: GPUI answers that on the desktop
+/// and in the page alike. Size and colour are inherited from the parent; only
+/// the link ink comes from the theme.
+fn render_with_links(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
+    let mut children = Vec::new();
+    let mut at = 0;
+    for (ix, link) in parsed.links.iter().enumerate() {
+        if at < link.range.start {
+            children.push(render_plain_segment(parsed, at..link.range.start, cx));
+        }
+        children.push(render_link_segment(parsed, link, ix, cx));
+        at = link.range.end;
+    }
+    if at < parsed.text.len() {
+        children.push(render_plain_segment(parsed, at..parsed.text.len(), cx));
+    }
+    div()
+        .flex()
+        .flex_wrap()
+        .children(children)
+        .into_any_element()
+}
+
+/// One stretch without links, with the emphasis clipped to it. A stretch
+/// with nothing to say about any range goes out as a plain string, for the
+/// reason the plain path in [`render_rich_text`] does.
+fn render_plain_segment(parsed: &BubbleText, range: Range<usize>, cx: &App) -> gpui::AnyElement {
+    let metrics = cx.product().metrics;
+    let highlights: Vec<(Range<usize>, HighlightStyle)> = clip_runs(&parsed.runs, &range)
+        .map(|(range, emphasis)| (range, style_for(emphasis, metrics)))
+        .collect();
+    let code = code_overrides(&parsed.runs, &range, cx);
+    let slice: SharedString = parsed.text[range].to_string().into();
+    if highlights.is_empty() && code.is_empty() {
+        return slice.into_any_element();
+    }
+    StyledText::new(slice)
+        .with_highlights(highlights)
+        .with_font_family_overrides(code)
+        .into_any_element()
+}
+
+/// One address: a `Link` opening the target, drawn inked and underlined, with
+/// the emphasis it overlaps kept — a bold address stays bold.
+fn render_link_segment(
+    parsed: &BubbleText,
+    link: &LinkSpan,
+    ix: usize,
+    cx: &App,
+) -> gpui::AnyElement {
+    let metrics = cx.product().metrics;
+    let ink = cx.theme().link;
+    // The emphasis pieces inside the address, each carrying the link ink and
+    // its underline on top of its own weight and slant, and the ink alone
+    // over the gaps between them. Together they cover the address end to end
+    // with disjoint runs, which is what `StyledText` requires: two highlights
+    // for one byte is a panic, not a blend.
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut at = 0;
+    for (range, emphasis) in clip_runs(&parsed.runs, &link.range) {
+        if at < range.start {
+            highlights.push((
+                at..range.start,
+                link_style(Emphasis::default(), metrics, ink),
+            ));
+        }
+        highlights.push((range.clone(), link_style(emphasis, metrics, ink)));
+        at = range.end;
+    }
+    if at < link.range.len() {
+        highlights.push((
+            at..link.range.len(),
+            link_style(Emphasis::default(), metrics, ink),
+        ));
+    }
+    let code = code_overrides(&parsed.runs, &link.range, cx);
+    let slice: SharedString = parsed.text[link.range.clone()].to_string().into();
+    Link::new(ix)
+        .href(link.target.clone())
+        .child(
+            StyledText::new(slice)
+                .with_highlights(highlights)
+                .with_font_family_overrides(code),
+        )
+        .into_any_element()
+}
+
+/// The emphasis runs overlapping `range`, rebased to its start. Clipping a
+/// partition keeps it one — disjoint and ordered — which is the shape both
+/// `StyledText` callers above have to hand over.
+fn clip_runs<'a>(
+    runs: &'a [(Range<usize>, Emphasis)],
+    range: &Range<usize>,
+) -> impl Iterator<Item = (Range<usize>, Emphasis)> + use<'a> {
+    let (start, end) = (range.start, range.end);
+    runs.iter()
+        .filter(move |(run, _)| run.start < end && run.end > start)
+        .map(move |(run, emphasis)| {
+            (
+                run.start.max(start) - start..run.end.min(end) - start,
+                *emphasis,
+            )
+        })
+}
+
+/// The monospace swaps over `range`, resolved against this frame's theme.
+fn code_overrides(
+    runs: &[(Range<usize>, Emphasis)],
+    range: &Range<usize>,
+    cx: &App,
+) -> Vec<(Range<usize>, SharedString)> {
+    let mono = cx.theme().mono_font_family.clone();
+    clip_runs(runs, range)
+        .filter(|(_, emphasis)| emphasis.code)
+        .map(|(range, _)| (range, mono.clone()))
+        .collect()
+}
+
+/// One run's appearance inside a link: its own emphasis, inked and underlined
+/// as a link. The ink is the theme's rather than the bubble's, so an address
+/// reads as one on every ground a bubble paints.
+fn link_style(
+    emphasis: Emphasis,
+    metrics: crate::theme::Metrics,
+    ink: gpui::Hsla,
+) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(ink),
+        underline: Some(UnderlineStyle {
+            thickness: metrics.hairline(),
+            color: None,
+            wavy: false,
+        }),
+        ..style_for(emphasis, metrics)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::BubbleText;
+
+    /// Links are resolved where the rows are built, beside the markup — so a
+    /// frame hands out ranges rather than scanning the peer's text again.
+    #[test]
+    fn links_are_detected_once_per_bubble() {
+        let plain = BubbleText::of("nothing to open here");
+        assert!(plain.links.is_empty());
+
+        let linked = BubbleText::of("see https://example.com/x now");
+        assert_eq!(linked.links.len(), 1);
+        assert_eq!(
+            &linked.text[linked.links[0].range.clone()],
+            "https://example.com/x"
+        );
+        assert_eq!(linked.links[0].target, "https://example.com/x");
+
+        let bare = BubbleText::of("try www.example.com/a");
+        assert_eq!(bare.links.len(), 1);
+        assert_eq!(bare.links[0].target, "https://www.example.com/a");
+    }
+
+    /// Markup is stripped before detection runs, so the ranges describe what
+    /// the reader sees rather than what the sender typed.
+    #[test]
+    fn links_line_up_with_the_parsed_text() {
+        let parsed = BubbleText::of("*look* at https://example.com/x!");
+        assert_eq!(parsed.text, "look at https://example.com/x!");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(
+            &parsed.text[parsed.links[0].range.clone()],
+            "https://example.com/x"
+        );
+    }
+
     /// A stopwatch rather than an assertion: what a conversation pays to
     /// re-derive text nothing changed, and what it pays now that it does not.
     ///
