@@ -5,6 +5,7 @@
 
 mod exec;
 mod group_notice;
+mod mentions;
 mod names;
 mod net;
 mod quoting;

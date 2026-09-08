@@ -405,8 +405,19 @@ impl WhatsAppClient {
                 if existing.is_status {
                     status_views.extend(watched_ids(&page));
                 }
+                let mention_lists = crate::mentions::mention_lists_of(&page);
+                let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
+                crate::mentions::hydrate_mention_lists(client, names, &mention_lists, &mut msgs)
+                    .await;
+                crate::mentions::hydrate_quoted_mention_lists(
+                    client,
+                    names,
+                    &quoted_lists,
+                    &mut msgs,
+                )
+                .await;
                 Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut msgs).await;
                 Self::hydrate_quoted_authors(client, names, &mut msgs).await;
                 // Groups *and* the status broadcast: both carry rows written
@@ -446,7 +457,23 @@ impl WhatsAppClient {
             if chat.is_status {
                 status_views.extend(watched_ids(&page));
             }
+            let mention_lists = crate::mentions::mention_lists_of(&page);
+            let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
+            crate::mentions::hydrate_mention_lists(
+                client,
+                names,
+                &mention_lists,
+                &mut chat.messages,
+            )
+            .await;
+            crate::mentions::hydrate_quoted_mention_lists(
+                client,
+                names,
+                &quoted_lists,
+                &mut chat.messages,
+            )
+            .await;
             Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut chat.messages)
                 .await;
             Self::hydrate_quoted_authors(client, names, &mut chat.messages).await;
@@ -832,6 +859,10 @@ pub(super) fn apply_status_views(chats: &mut [oxidezap_core::Chat], watched: &Ha
 /// same one the live path puts in the list — so it answers where the column
 /// cannot, and a chat that plainly has messages stops rendering as "No
 /// messages".
+///
+/// The newest row answers first for a second reason: its text went through
+/// the same naming the live path applies — `@`-mentions rewritten to names —
+/// while the column holds the wire's verbatim digits.
 fn history_preview(stored: Option<String>, newest: Option<&ChatMessage>) -> Option<String> {
-    stored.or_else(|| newest.map(ChatMessage::preview_text))
+    newest.map(ChatMessage::preview_text).or(stored)
 }

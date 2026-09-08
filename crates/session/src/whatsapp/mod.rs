@@ -1387,6 +1387,30 @@ impl WhatsAppClient {
                 }
             });
 
+        // A mention arrives as `@` plus the user part — the digits of a LID
+        // where the peer is LID-addressed — and a phone draws the contact's
+        // name there. Rewritten here, so the live bubble, the chat preview
+        // and the reloaded bubble agree rather than each deciding alone. The
+        // caption goes through the same pairs: the list preview reads it
+        // rather than the body. The sender's own push name goes along for
+        // their self-mention: the bubble label below already uses it, and
+        // without it an unknown sender reads named over their bubble and
+        // raw inside their `@`.
+        let mention_names = crate::mentions::resolve_for(
+            client,
+            names,
+            Some(base_msg),
+            Some((&info.source.sender, info.push_name.as_str())),
+        )
+        .await;
+        let content = crate::mentions::apply_to(&mention_names, content);
+        let media_result = media_result.map(|mut media| {
+            if let Some(caption) = media.caption.take() {
+                media.caption = Some(crate::mentions::apply_to(&mention_names, caption));
+            }
+            media
+        });
+
         let mut chat_message = ChatMessage {
             id: info.id.to_string(),
             sender: info.source.sender.to_string(),
@@ -1411,6 +1435,17 @@ impl WhatsAppClient {
 
         if let Some(media) = media_result {
             chat_message.media = Some(media);
+        }
+
+        // The quote bar draws the nested original verbatim, mentions and all:
+        // its own mention list gets the same rewrite the body just got, or
+        // the reply arrives naming contacts while its quote still dials them.
+        let quoted_names = crate::mentions::resolve_quoted_for(client, names, base_msg).await;
+        if !quoted_names.is_empty()
+            && let Some(quoted) = chat_message.quoted.as_mut()
+        {
+            quoted.preview =
+                crate::mentions::apply_to(&quoted_names, std::mem::take(&mut quoted.preview));
         }
 
         Self::hydrate_quoted_authors(client, names, std::slice::from_mut(&mut chat_message)).await;

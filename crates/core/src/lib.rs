@@ -27,6 +27,7 @@ mod events;
 mod group;
 mod log_level;
 mod media_budget;
+mod mentions;
 mod message_status;
 mod plugin;
 mod presence;
@@ -51,6 +52,7 @@ pub use log_level::{LogLevel, UnknownLogLevel};
 pub use media_budget::{
     DECODED_IMAGE_BUDGET_BYTES, RETAINED_MEDIA_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES,
 };
+pub use mentions::format_mentions;
 pub use message_status::MessageStatus;
 pub use plugin::{PluginAction, PluginNode, PluginRoot, PluginSlot, PluginSurface, PluginWidget};
 pub use presence::{
