@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use log::{debug, warn};
 use oxidezap_core::{CallVideoFrame, VideoStream};
-use oxidezap_video::{CameraControl, CameraStream, EncodedFrame, VideoQuality};
+use oxidezap_video::{CameraStream, EncodedFrame, VideoQuality};
 
 use crate::exec::Task;
 use whatsapp_rust::voip::{VideoFrame, VideoSource};
@@ -127,14 +127,12 @@ fn publish(publisher: &VideoPublisher, frame: impl FnOnce() -> CallVideoFrame) -
     }
 }
 
-/// What is called when the device itself goes away.
+/// Requests cleanup when capture or its outbound endpoint ends unexpectedly.
 ///
-/// A camera can be unplugged, or its backend can fail for good, and the
-/// capture thread then ends on its own. Nothing else notices: the call runs
-/// on, the registry still holds a camera, and every window goes on drawing a
-/// direction that will never produce another frame. A deliberate stop does
-/// not come through here — that path aborts the pump before the channel
-/// closes — so this means exactly "the device is gone".
+/// Endpoint loss does not imply device failure. An upgrade timeout can release
+/// the endpoint while the registry still owns a working camera. Explicit stop
+/// and owner drop suppress this callback. The callback must schedule cleanup,
+/// not wait for it, since cleanup joins the pump calling it.
 ///
 /// Carries which camera died, not only which call it was on. The cleanup is
 /// spawned, so a user who turns video off and on again in that window would
@@ -194,7 +192,8 @@ pub(crate) struct LocalVideo {
     /// Owned outright, not shared: closing the device is a matter of waiting
     /// for its thread, and a second owner would leave nothing able to wait.
     /// What the pump needs is the *control*, which is shareable.
-    camera: CameraStream,
+    /// Taken during explicit stop so owner drop can still retire the channels.
+    camera: Option<CameraStream>,
     /// Whether this side's picture has anywhere to go yet.
     ///
     /// The camera opens before the offer goes out — it has to, or the offer
@@ -228,12 +227,15 @@ pub(crate) struct LocalVideo {
     /// tears down what the *registry* holds and finds nothing while the
     /// camera is on its way into it — seconds, on a path that waits for
     /// signaling. So the flag is about the pump and not about the report:
-    /// the plane closing is an ending nobody reports, and leaving the flag
+    /// the plane closing is an ending too, and leaving the flag
     /// set for it hands a caller a camera it will draw as live and never
     /// receive another frame from.
     alive: Arc<AtomicBool>,
     id: CallIdSlot,
     camera_id: CameraId,
+    /// Retained so pump exit alone cannot close the source channel. Closure
+    /// here means the library released or closed its receiver.
+    plane: async_channel::Sender<Vec<u8>>,
 }
 
 /// Which call the frames belong to, as a slot rather than a value.
@@ -268,7 +270,11 @@ impl LocalVideo {
     /// Whether the device is still producing. False means this camera has
     /// stopped, whether or not its loss was worth reporting.
     pub(crate) fn alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
+        self.alive.load(Ordering::Relaxed) && !self.frames.is_closed() && !self.endpoint_closed()
+    }
+
+    pub(crate) fn endpoint_closed(&self) -> bool {
+        self.plane.is_closed()
     }
 
     /// Address this call's frames by the name the server gave it.
@@ -278,14 +284,16 @@ impl LocalVideo {
 
     /// Tell the encoder the peer has lost the stream.
     pub(crate) fn request_keyframe(&self) {
-        self.camera.control().request_keyframe();
+        if let Some(camera) = &self.camera {
+            camera.control().request_keyframe();
+        }
     }
 
     /// Close the device and wait for the thread to let go of it.
     ///
     /// Waited for because the next call opens the same camera, and a backend
     /// that still holds it fails that open rather than queueing behind it.
-    pub(crate) async fn stop(self) {
+    pub(crate) async fn stop(mut self) {
         // Said before the channel closes, and that order is the whole point:
         // the pump reads this on its way out to tell a device that died from
         // one that was asked to stop, and the two reach it as the same closed
@@ -308,12 +316,23 @@ impl LocalVideo {
         // backend that still holds it fails that open rather than queueing
         // behind it. Where that wait is a blocking one, the camera itself is
         // what moves it off a runtime thread.
-        self.camera.stop().await;
+        if let Some(camera) = self.camera.take() {
+            camera.stop().await;
+        }
         // And the pumps, so a camera reported as stopped is one that has
         // stopped: a pump still draining its queue can publish a frame after
         // the call that owned it is gone.
-        let _ = self.pump.await;
-        let _ = self.remote_pump.await;
+        let _ = (&mut self.pump).await;
+        let _ = (&mut self.remote_pump).await;
+    }
+}
+
+impl Drop for LocalVideo {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        self.alive.store(false, Ordering::Relaxed);
+        self.frames.close();
+        self.sink.close();
     }
 }
 
@@ -372,11 +391,12 @@ pub(crate) async fn open(
 
     let frames = camera.frames();
     let stopping = Arc::new(AtomicBool::new(false));
+    let control = camera.control();
     let pump = crate::exec::spawn(pump_local(LocalPump {
         call_id: Arc::clone(&call_id),
         frames: frames.clone(),
-        camera: camera.control(),
-        plane: source_tx,
+        request_keyframe: move || control.request_keyframe(),
+        plane: source_tx.clone(),
         publisher: publisher.clone(),
         lost,
         camera_id,
@@ -389,11 +409,12 @@ pub(crate) async fn open(
         sink_rx.clone(),
         publisher,
         picture_lost,
+        Arc::clone(&stopping),
     ));
 
     Ok((
         LocalVideo {
-            camera,
+            camera: Some(camera),
             pump,
             frames,
             remote_pump,
@@ -403,6 +424,7 @@ pub(crate) async fn open(
             live,
             alive,
             stopping,
+            plane: source_tx,
         },
         Endpoints {
             source: CameraSource {
@@ -414,6 +436,69 @@ pub(crate) async fn open(
     ))
 }
 
+#[cfg(test)]
+/// Real pumps without a capture device. The sender can simulate capture loss,
+/// and dropping the endpoints simulates library teardown.
+pub(crate) fn camera_fixture(
+    call_id: &str,
+    lost: CameraLost,
+) -> (LocalVideo, Endpoints, async_channel::Sender<EncodedFrame>) {
+    let (capture, frames) = async_channel::bounded(PLANE_DEPTH);
+    let (plane, source) = async_channel::bounded(PLANE_DEPTH);
+    let (sink_tx, sink) = async_channel::bounded(PLANE_DEPTH);
+    let id = slot(call_id);
+    let camera_id = next_camera_id();
+    let alive = Arc::new(AtomicBool::new(true));
+    let live = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let publisher = VideoPublisher {
+        sender: Arc::new(std::sync::Mutex::new(None)),
+        watched: Arc::new(AtomicBool::new(false)),
+    };
+    let pump = crate::exec::spawn(pump_local(LocalPump {
+        call_id: id.clone(),
+        frames: frames.clone(),
+        request_keyframe: || {},
+        plane: plane.clone(),
+        publisher: publisher.clone(),
+        lost,
+        camera_id,
+        live: live.clone(),
+        alive: alive.clone(),
+        stopping: stopping.clone(),
+    }));
+    let remote_pump = crate::exec::spawn(pump_remote(
+        id.clone(),
+        sink.clone(),
+        publisher,
+        Arc::new(|_| {}),
+        stopping.clone(),
+    ));
+    (
+        LocalVideo {
+            camera: None,
+            live,
+            pump,
+            frames,
+            stopping,
+            remote_pump,
+            sink,
+            alive,
+            id,
+            camera_id,
+            plane,
+        },
+        Endpoints {
+            source: CameraSource {
+                frames: source,
+                stride: 6000,
+            },
+            sink: sink_tx,
+        },
+        capture,
+    )
+}
+
 /// Camera to the media plane, and to the self-view.
 ///
 /// One reader, two destinations: the plane must not be starved by a front end
@@ -423,10 +508,10 @@ pub(crate) async fn open(
 /// The ends the local pump is tied to, named rather than listed: eight
 /// positional arguments is a call nobody can read and one nobody can get
 /// wrong twice.
-pub(crate) struct LocalPump {
+struct LocalPump<F> {
     call_id: CallIdSlot,
     frames: async_channel::Receiver<EncodedFrame>,
-    camera: CameraControl,
+    request_keyframe: F,
     plane: async_channel::Sender<Vec<u8>>,
     publisher: VideoPublisher,
     lost: CameraLost,
@@ -435,17 +520,16 @@ pub(crate) struct LocalPump {
     alive: Arc<AtomicBool>,
     /// Set by [`LocalVideo::stop`] before it closes the camera's channel.
     ///
-    /// The pump's two endings are indistinguishable without it: a device that
-    /// died and a device we asked to stop both arrive as `frames` closing.
-    /// Only the first is a `CameraLost`.
+    /// Capture failure and explicit stop both close `frames`. Only an ending
+    /// that was not requested should schedule cleanup.
     stopping: Arc<AtomicBool>,
 }
 
-async fn pump_local(pump: LocalPump) {
+async fn pump_local(pump: LocalPump<impl Fn()>) {
     let LocalPump {
         call_id,
         frames,
-        camera,
+        request_keyframe,
         plane,
         publisher,
         lost,
@@ -468,7 +552,18 @@ async fn pump_local(pump: LocalPump) {
     let mut drawn = 0u64;
     let mut dropped_by_the_window = 0u64;
     let mut unwatched = false;
-    while let Ok(EncodedFrame { data, keyframe }) = frames.recv().await {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = plane.closed() => break,
+            frame = frames.recv() => frame,
+        };
+        let Ok(EncodedFrame { data, keyframe }) = frame else {
+            break;
+        };
+        if stopping.load(Ordering::Relaxed) {
+            break;
+        }
         taken += 1;
         if taken == 1 {
             debug!("the first encoded frame of local video reached the session");
@@ -503,7 +598,7 @@ async fn pump_local(pump: LocalPump) {
             // frozen until the next, and the mark travels with the frame that
             // does arrive.
             if delivery == Delivery::Dropped {
-                camera.request_keyframe();
+                request_keyframe();
             }
             match delivery {
                 Delivery::Sent => {
@@ -561,16 +656,9 @@ async fn pump_local(pump: LocalPump) {
             // The plane is behind. Whatever it sends next has to be
             // decodable on its own, since everything after a gap references
             // a unit the peer never received.
-            camera.request_keyframe();
+            request_keyframe();
         }
     }
-    // Two ways out and they look identical from here: the camera's channel
-    // closing is *both* the device ending the stream and `LocalVideo::stop`
-    // asking it to, because closing that channel is how a stop ends a pump
-    // that cannot be aborted on a page. `stopping` is what tells them apart,
-    // and without it every deliberate teardown reported a camera loss and the
-    // registry tore down a call that was already ending. The plane going away
-    // is the third way out, and that one is the call ending too.
     let call_id = read(&call_id);
     debug!(
         "local video for {call_id} ended ({taken} frame(s) taken, {to_the_plane} handed to the \
@@ -582,8 +670,9 @@ async fn pump_local(pump: LocalPump) {
     // report — which is what the registry is torn down by, and which finds
     // nothing while the camera is not in it yet.
     alive.store(false, Ordering::Relaxed);
-    if !plane.is_closed() && !stopping.load(Ordering::Relaxed) {
-        warn!("the camera on call {call_id} stopped producing frames");
+    frames.close();
+    if !stopping.load(Ordering::Relaxed) {
+        warn!("local video on call {call_id} ended unexpectedly; releasing its camera");
         lost(call_id, camera_id);
     }
 }
@@ -594,6 +683,7 @@ async fn pump_remote(
     frames: async_channel::Receiver<VideoFrame>,
     publisher: VideoPublisher,
     picture_lost: PictureLost,
+    stopping: Arc<AtomicBool>,
 ) {
     // Runs for as long as the call does, whoever is or is not watching. A
     // pump that stopped at the first frame nobody took would leave the peer's
@@ -611,6 +701,9 @@ async fn pump_remote(
     let mut dropped_by_the_window = 0u64;
     let mut unwatched = false;
     while let Ok(frame) = frames.recv().await {
+        if stopping.load(Ordering::Relaxed) {
+            break;
+        }
         taken += 1;
         let keyframe = frame.keyframe;
         if keyframe {
@@ -694,8 +787,8 @@ mod tests {
     /// on its way out. The plane's receiver is deliberately kept alive here:
     /// that is what makes `plane.is_closed()` false and leaves the flag as the
     /// only thing that can tell the difference.
-    #[cfg(not(target_family = "wasm"))]
-    #[tokio::test]
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
     async fn a_camera_we_stopped_is_not_a_camera_that_was_lost() {
         let (frames_tx, frames) = async_channel::bounded::<EncodedFrame>(1);
         let (plane, _plane_rx) = async_channel::bounded(1);
@@ -709,7 +802,7 @@ mod tests {
         let pump = LocalPump {
             call_id: slot("call-1"),
             frames,
-            camera: CameraControl::default(),
+            request_keyframe: || {},
             plane,
             publisher: VideoPublisher {
                 sender: Arc::new(std::sync::Mutex::new(None)),
@@ -769,7 +862,14 @@ mod tests {
         }
         frames_tx.close();
 
-        pump_remote(slot("call-1"), frames, publisher, picture_lost).await;
+        pump_remote(
+            slot("call-1"),
+            frames,
+            publisher,
+            picture_lost,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         let asked = asked.lock().expect("asked poisoned");
         assert_eq!(
@@ -783,8 +883,8 @@ mod tests {
     /// belongs to used to go on reading as live: a caller wiring it into the
     /// registry kept it, so the device stayed open with its light on and
     /// every window drew a direction nothing would ever arrive on.
-    #[cfg(not(target_family = "wasm"))]
-    #[tokio::test]
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
     async fn a_camera_whose_plane_closed_stops_reading_as_live() {
         let (frames_tx, frames) = async_channel::bounded(1);
         let (plane, plane_rx) = async_channel::bounded(1);
@@ -798,7 +898,7 @@ mod tests {
         let pump = LocalPump {
             call_id: slot("call-1"),
             frames,
-            camera: CameraControl::default(),
+            request_keyframe: || {},
             plane,
             publisher: VideoPublisher {
                 sender: Arc::new(std::sync::Mutex::new(None)),
@@ -828,8 +928,215 @@ mod tests {
             "the pump has stopped, so the camera may not read as producing"
         );
         assert!(
-            !reported.load(Ordering::Relaxed),
-            "the call ending is not the device being lost"
+            reported.load(Ordering::Relaxed),
+            "an endpoint ending without a user stop must release its registered camera"
+        );
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn an_idle_camera_loses_its_endpoint_without_waiting_for_a_frame() {
+        let (frames_tx, frames) = async_channel::bounded(1);
+        let (plane, plane_rx) = async_channel::bounded(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        let call_id = slot("pending-call");
+        let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lost: CameraLost = {
+            let alive = alive.clone();
+            let call_id = call_id.clone();
+            let reported = reported.clone();
+            let frames_tx = frames_tx.clone();
+            Arc::new(move |id, camera_id| {
+                assert!(!alive.load(Ordering::Relaxed));
+                assert!(frames_tx.is_closed());
+                *call_id
+                    .try_lock()
+                    .expect("callback must not hold the id lock") = "replacement-call".to_string();
+                reported.lock().unwrap().push((id, camera_id));
+            })
+        };
+        let pump = LocalPump {
+            call_id: call_id.clone(),
+            frames,
+            request_keyframe: || panic!("an idle camera needs no keyframe"),
+            plane,
+            publisher: VideoPublisher {
+                sender: Arc::new(std::sync::Mutex::new(None)),
+                watched: Arc::new(AtomicBool::new(false)),
+            },
+            lost,
+            camera_id: 42,
+            live: Arc::new(AtomicBool::new(false)),
+            alive,
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        let mut pumping = Box::pin(pump_local(pump));
+        assert!(
+            futures_lite::future::poll_once(&mut pumping)
+                .await
+                .is_none()
+        );
+        *call_id.lock().unwrap() = "assigned-call".to_string();
+        drop(plane_rx);
+        assert!(
+            futures_lite::future::poll_once(&mut pumping)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            *reported.lock().unwrap(),
+            vec![("assigned-call".to_string(), 42)]
+        );
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn deliberate_stop_discards_queued_frames_even_with_a_closed_endpoint() {
+        for endpoint_closed in [false, true] {
+            let (frames_tx, frames) = async_channel::bounded(1);
+            frames_tx
+                .try_send(EncodedFrame {
+                    data: vec![0],
+                    keyframe: true,
+                })
+                .unwrap();
+            let (plane, plane_rx) = async_channel::bounded(1);
+            if endpoint_closed {
+                plane_rx.close();
+            }
+            let (sender, mut published) = tokio::sync::mpsc::channel(1);
+            let stopping = Arc::new(AtomicBool::new(true));
+            frames.close();
+            pump_local(LocalPump {
+                call_id: slot("stopped-call"),
+                frames,
+                request_keyframe: || panic!("a stopped camera needs no keyframe"),
+                plane,
+                publisher: VideoPublisher {
+                    sender: Arc::new(std::sync::Mutex::new(Some(sender))),
+                    watched: Arc::new(AtomicBool::new(true)),
+                },
+                lost: Arc::new(|_, _| panic!("user stop is not camera loss")),
+                camera_id: 7,
+                live: Arc::new(AtomicBool::new(true)),
+                alive: Arc::new(AtomicBool::new(true)),
+                stopping,
+            })
+            .await;
+            assert!(published.try_recv().is_err());
+            assert!(plane_rx.try_recv().is_err());
+        }
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn dropping_or_stopping_the_owner_retires_both_pumps() {
+        for explicit_stop in [false, true] {
+            let (frames_tx, frames) = async_channel::bounded(1);
+            let (plane, _plane_rx) = async_channel::bounded(1);
+            let (sink_tx, sink) = async_channel::bounded(1);
+            let (sender, mut published) = tokio::sync::mpsc::channel(2);
+            let publisher = VideoPublisher {
+                sender: Arc::new(std::sync::Mutex::new(Some(sender))),
+                watched: Arc::new(AtomicBool::new(true)),
+            };
+            let live = Arc::new(AtomicBool::new(true));
+            let alive = Arc::new(AtomicBool::new(true));
+            let stopping = Arc::new(AtomicBool::new(false));
+            let id = slot("retired-call");
+            let (done_tx, done) = async_channel::bounded(2);
+            let local = LocalPump {
+                call_id: id.clone(),
+                frames: frames.clone(),
+                request_keyframe: || panic!("a retired camera needs no keyframe"),
+                plane: plane.clone(),
+                publisher: publisher.clone(),
+                lost: Arc::new(|_, _| panic!("owner retirement is not camera loss")),
+                camera_id: 9,
+                live: live.clone(),
+                alive: alive.clone(),
+                stopping: stopping.clone(),
+            };
+            let pump = {
+                let done_tx = done_tx.clone();
+                crate::exec::spawn(async move {
+                    pump_local(local).await;
+                    done_tx.try_send(()).unwrap();
+                })
+            };
+            let remote_pump = {
+                let id = id.clone();
+                let sink = sink.clone();
+                let stopping = stopping.clone();
+                crate::exec::spawn(async move {
+                    pump_remote(id, sink, publisher, Arc::new(|_| {}), stopping).await;
+                    done_tx.try_send(()).unwrap();
+                })
+            };
+            let owner = LocalVideo {
+                camera: None,
+                live,
+                pump,
+                frames,
+                stopping,
+                remote_pump,
+                sink,
+                alive: alive.clone(),
+                id,
+                camera_id: 9,
+                plane,
+            };
+            frames_tx
+                .try_send(EncodedFrame {
+                    data: vec![0],
+                    keyframe: true,
+                })
+                .unwrap();
+            sink_tx.try_send(VideoFrame::new(vec![0])).unwrap();
+            if explicit_stop {
+                owner.stop().await;
+            } else {
+                drop(owner);
+            }
+            done.recv().await.unwrap();
+            done.recv().await.unwrap();
+            assert!(frames_tx.is_closed());
+            assert!(sink_tx.is_closed());
+            assert!(!alive.load(Ordering::Relaxed));
+            assert!(published.try_recv().is_err());
+        }
+    }
+
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn capture_failure_still_reports_its_camera_generation() {
+        let (frames_tx, frames) = async_channel::bounded(1);
+        let (plane, _plane_rx) = async_channel::bounded(1);
+        let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lost: CameraLost = {
+            let reported = reported.clone();
+            Arc::new(move |id, camera_id| reported.lock().unwrap().push((id, camera_id)))
+        };
+        drop(frames_tx);
+        pump_local(LocalPump {
+            call_id: slot("failed-capture"),
+            frames,
+            request_keyframe: || {},
+            plane,
+            publisher: VideoPublisher {
+                sender: Arc::new(std::sync::Mutex::new(None)),
+                watched: Arc::new(AtomicBool::new(false)),
+            },
+            lost,
+            camera_id: 31,
+            live: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(AtomicBool::new(true)),
+            stopping: Arc::new(AtomicBool::new(false)),
+        })
+        .await;
+        assert_eq!(
+            *reported.lock().unwrap(),
+            vec![("failed-capture".to_string(), 31)]
         );
     }
 
@@ -855,3 +1162,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, target_family = "wasm"))]
+#[path = "camera_lifecycle_tests.rs"]
+mod camera_lifecycle_tests;

@@ -406,11 +406,11 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
 
     // Armed before anything else can fail: from here to `Held` the camera is
     // open, and every `?` below would otherwise leave it that way.
-    let guard = CameraGuard(Some(open_device(&window, quality).await?));
+    let guard = open_device(&window, quality).await?;
     let stream = guard.0.as_ref().expect("just armed").clone();
     // Guarded from the moment it is in the document, for the same reason the
     // camera is guarded from the moment it is open: see `ElementGuard`.
-    let preview = ElementGuard(Some(attach(&window, &stream).await?));
+    let preview = attach(&window, &stream).await?;
     let element = preview.0.as_ref().expect("just armed").clone();
 
     let (tx, rx) = async_channel::bounded::<EncodedFrame>(FRAME_DEPTH);
@@ -614,10 +614,7 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
 /// `ideal` rather than `exact`: a device that cannot do 720p20 should give
 /// what it has rather than refuse, and the encoder scales what it is handed.
 /// An `exact` constraint here is a call that fails on a webcam.
-async fn open_device(
-    window: &web_sys::Window,
-    quality: VideoQuality,
-) -> Result<web_sys::MediaStream> {
+async fn open_device(window: &web_sys::Window, quality: VideoQuality) -> Result<CameraGuard> {
     let devices = window
         .navigator()
         .media_devices()
@@ -650,44 +647,33 @@ async fn open_device(
     // and a hangup that can only be recorded as deferred, for as long as the
     // tab is left alone. Giving up downgrades the call to voice, which is
     // what every other camera failure does.
-    let abandoned = Rc::new(Cell::new(false));
-    // A prompt answered after we gave up still opens the device, and the
-    // stream it resolves with is one nothing here is holding — so its tracks
-    // would run, with the tab's indicator on, until the page went away. The
-    // same promise is awaited twice, which is what promises are for.
-    {
-        let abandoned = Rc::clone(&abandoned);
-        let late = asked.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let Ok(value) = wasm_bindgen_futures::JsFuture::from(late).await else {
-                return;
-            };
-            if !abandoned.get() {
-                return;
-            }
-            if let Ok(stream) = value.dyn_into::<web_sys::MediaStream>() {
-                warn!("the camera opened after the call gave up waiting for it; closing it again");
-                stop_tracks(&stream, "the late camera is closed");
-            }
-        });
-    }
-
-    let opened = wasm_bindgen_futures::JsFuture::from(asked);
+    // The promise cannot be cancelled. Its task owns the result until the
+    // caller receives a guard. Cancellation and timeout both drop the receiver,
+    // so even a stream delivered between polls is stopped rather than leaked.
+    let (tx, opened) = async_channel::bounded(1);
+    oxidezap_platform::spawn(async move {
+        let stream = wasm_bindgen_futures::JsFuture::from(asked)
+            .await
+            .map_err(|e| anyhow!("the camera was refused: {}", describe(&e)))
+            .and_then(|value| {
+                value
+                    .dyn_into::<web_sys::MediaStream>()
+                    .map_err(|_| anyhow!("the browser opened something that is not a stream"))
+            })
+            .map(|stream| CameraGuard(Some(stream)));
+        let _ = tx.try_send(stream);
+    });
     let deadline = oxidezap_platform::sleep(Duration::from_millis(PERMISSION_CEILING_MS as u64));
-    let Some(opened) = futures_lite::future::or(async move { Some(opened.await) }, async move {
+    let Some(opened) = futures_lite::future::or(async { Some(opened.recv().await) }, async move {
         deadline.await;
         None
     })
     .await
     else {
-        abandoned.set(true);
         bail!("the camera permission prompt went unanswered");
     };
 
-    opened
-        .map_err(|e| anyhow!("the camera was refused: {}", describe(&e)))?
-        .dyn_into::<web_sys::MediaStream>()
-        .map_err(|_| anyhow!("the browser opened something that is not a stream"))
+    opened.map_err(|_| anyhow!("the camera open task ended without a result"))?
 }
 
 /// How long a camera permission prompt is waited on.
@@ -719,10 +705,7 @@ const PERMISSION_CEILING_MS: i32 = 30_000;
 /// if setup fails after this returns, and by this function on the way out of
 /// its own failure: six failed attempts in one call is six elements, and a
 /// leak of them is a leak of the streams they hold.
-async fn attach(
-    window: &web_sys::Window,
-    stream: &web_sys::MediaStream,
-) -> Result<web_sys::HtmlVideoElement> {
+async fn attach(window: &web_sys::Window, stream: &web_sys::MediaStream) -> Result<ElementGuard> {
     let document = window
         .document()
         .ok_or_else(|| anyhow!("no document to attach a camera to"))?;
@@ -753,6 +736,7 @@ async fn attach(
             )
         })?;
     element.set_src_object(Some(stream));
+    let preview = ElementGuard(Some(element.clone()));
 
     // Awaited, because a refusal here is a camera that will produce nothing:
     // the tick reads `ready_state` and would sit under it forever, or encode
@@ -770,10 +754,6 @@ async fn attach(
     let started = match element.play() {
         Ok(started) => started,
         Err(e) => {
-            // The element is in the document by now, so this exit has to take
-            // it down itself: `ElementGuard` only covers the failures *after*
-            // this function returns one.
-            release_element(&element);
             bail!("the camera preview would not start: {}", describe(&e));
         }
     };
@@ -808,7 +788,6 @@ async fn attach(
     // the capture tick asks plus the one it cannot: playing, and showing
     // something.
     if element.paused() || element.ready_state() < 2 || element.video_width() == 0 {
-        release_element(&element);
         match refused {
             Some(reason) => bail!("the browser would not play the camera's own stream: {reason}"),
             None => bail!(
@@ -822,7 +801,7 @@ async fn attach(
     if let Some(reason) = refused {
         warn!("the camera's preview reported {reason}, but it is playing; carrying on");
     }
-    Ok(element)
+    Ok(preview)
 }
 
 /// How long `play()` is given to say anything before the element is asked.

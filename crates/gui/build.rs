@@ -7,7 +7,7 @@
 //! 0.1.0" names a hundred different builds; the short hash beside it names
 //! one, and the window makes it a link to that commit.
 //!
-//! On the desktop `gpui-component-assets` embeds its own icons and this does
+//! On the desktop `gpui-kit-assets` embeds its own icons and this does
 //! nothing. Its web implementation does not embed them — it downloads each
 //! one from an endpoint on first use, which keeps a wasm bundle small at the
 //! cost of the page needing somewhere to download from. A build published as
@@ -15,9 +15,9 @@
 //! round trip at a time is a window that draws empty buttons first.
 //!
 //! So for wasm the icons are copied into `OUT_DIR` and embedded beside our
-//! own. `gpui-component-assets` advertises where they are through the `links`
-//! mechanism — `DEP_GPUI_COMPONENT_DEFAULT_ICONS_ICONS_DIR` — so nothing here
-//! has to guess at a path inside a cargo checkout.
+//! own. `gpui-kit-assets` advertises their location through
+//! `DEP_GPUI_KIT_DEFAULT_ICONS_ICONS_DIR`, using Cargo's `links` mechanism.
+//! Nothing here guesses at a path inside a cargo checkout.
 
 use std::path::{Path, PathBuf};
 
@@ -38,9 +38,9 @@ fn main() {
         return;
     }
 
-    let Some(source) = std::env::var_os("DEP_GPUI_COMPONENT_DEFAULT_ICONS_ICONS_DIR") else {
+    let Some(source) = std::env::var_os("DEP_GPUI_KIT_DEFAULT_ICONS_ICONS_DIR") else {
         panic!(
-            "gpui-component-assets did not advertise its icon directory; \
+            "gpui-kit-assets did not advertise its icon directory; \
              the web build has no icons to embed"
         );
     };
