@@ -164,7 +164,7 @@ compensation was added. A live Android front/rear retest is still required.
 The client now consumes open
 [whatsapp-rust#1470](https://github.com/oxidezap/whatsapp-rust/pull/1470)
 from `fix/voip-frame-info-extension-parser` at
-`ca05aaaaef6b8c47dd005e86d385bafa72d50d02`, based on main at
+`faee7f547e04dabc9ee62f5f7b6fc25381b485a0`, based on main at
 `47e1b5b41b63c23b59372828901ea945c8149565`. All WhatsApp dependency declarations
 use that source, with the revision recorded in the client lockfile.
 
