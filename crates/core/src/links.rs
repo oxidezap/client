@@ -143,6 +143,21 @@ fn preceded_by_word_char(bytes: &[u8], at: usize) -> bool {
 /// `https://example.com/O'Reilly`, is kept. A raw `"` never reaches this
 /// far, since it already ends the token.
 fn trim_trailing_punctuation(text: &str, rest: usize, mut end: usize) -> usize {
+    // Both balances up front, so trimming a run of unmatched closers is one
+    // scan plus one step per closer. Calling `closers_outnumber_openers` per
+    // removed character rescanned the whole shrinking candidate each time,
+    // which is quadratic in a peer-controlled message of `))))…`.
+    let mut parens = 0i32;
+    let mut brackets = 0i32;
+    for ch in text[rest..end].chars() {
+        match ch {
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            _ => {}
+        }
+    }
     while end > rest {
         let Some(ch) = text[..end].chars().next_back() else {
             break;
@@ -172,10 +187,19 @@ fn trim_trailing_punctuation(text: &str, rest: usize, mut end: usize) -> usize {
                 | '』'
         ) {
             end -= ch.len_utf8();
-        } else if matches!(ch, ')' | ']') {
-            let (open, close) = if ch == ')' { ('(', ')') } else { ('[', ']') };
-            if closers_outnumber_openers(&text[rest..end], open, close) {
+        } else if ch == ')' {
+            // Only a closer leaves; an opener never sits at the trailing
+            // edge trimmed here, so the balance only ever rises back.
+            if parens < 0 {
                 end -= 1;
+                parens += 1;
+            } else {
+                break;
+            }
+        } else if ch == ']' {
+            if brackets < 0 {
+                end -= 1;
+                brackets += 1;
             } else {
                 break;
             }
@@ -184,22 +208,6 @@ fn trim_trailing_punctuation(text: &str, rest: usize, mut end: usize) -> usize {
         }
     }
     end
-}
-
-/// Whether `close` appears more often than `open` in `text`, which is when a
-/// trailing closer belongs to the sentence around the link rather than to
-/// the link — `https://en.wikipedia.org/wiki/Rust_(language)` keeps its
-/// parens, `(see https://example.com)` loses the sentence's.
-fn closers_outnumber_openers(text: &str, open: char, close: char) -> bool {
-    let mut depth = 0i32;
-    for ch in text.chars() {
-        if ch == open {
-            depth += 1;
-        } else if ch == close {
-            depth -= 1;
-        }
-    }
-    depth < 0
 }
 
 /// Whether the part after the prefix could be a host: non-empty, and dotted
@@ -398,6 +406,35 @@ mod tests {
             elapsed.as_secs() < 10,
             "took {elapsed:?} for {} bytes",
             source.len()
+        );
+    }
+
+    /// An address followed by a long run of unmatched closers: the balance
+    /// is counted once, so trimming is linear rather than quadratic in the
+    /// peer's message.
+    #[test]
+    fn many_unmatched_closers_trim_fast() {
+        let closers = ")".repeat(20_000);
+        let source = format!("https://example.com/x{closers}");
+        let started = wacore::time::Instant::now();
+        let links = find_links(&source);
+        let elapsed = started.elapsed();
+        assert_eq!(links.len(), 1);
+        assert_eq!(&source[links[0].range.clone()], "https://example.com/x");
+        assert_eq!(links[0].target, "https://example.com/x");
+        assert!(
+            elapsed.as_secs() < 10,
+            "took {elapsed:?} for {} bytes",
+            source.len()
+        );
+
+        // The balanced half stays: only the sentence's closers go.
+        let source = format!("https://en.wikipedia.org/wiki/Rust_(language){closers}");
+        let links = find_links(&source);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            &source[links[0].range.clone()],
+            "https://en.wikipedia.org/wiki/Rust_(language)"
         );
     }
 }

@@ -188,6 +188,27 @@ pub fn parse(source: &str) -> RichText {
         // sender never wrote. Markers around the address still apply, so a
         // quoted address stays quoted.
         if let Some((end, _)) = crate::links::link_end_at(source, at, &mut url_token_end) {
+            // The verbatim copy would swallow the delimiter closing a run
+            // the address sits in: `*https://example.com*` came out with no
+            // bold span and a `*` on the target. A trailing marker that
+            // matches a run still open closes that run instead, so only the
+            // address is copied and the markup path sees its closer.
+            let mut end = end;
+            while end > at {
+                let Some(ch) = source[..end].chars().next_back() else {
+                    break;
+                };
+                if !matches!(ch, '*' | '_' | '~' | '`') {
+                    break;
+                }
+                if !open.iter().any(|run| run.marker == ch) {
+                    break;
+                }
+                if !closes(bytes, end - ch.len_utf8()) {
+                    break;
+                }
+                end -= ch.len_utf8();
+            }
             out.text.push_str(&source[at..end]);
             at = end;
             continue;
@@ -741,6 +762,59 @@ mod tests {
         let (text, spans) = only("*look* at https://example.com/x");
         assert_eq!(text, "look at https://example.com/x");
         assert_eq!(spans, vec![(0..4, bold())]);
+    }
+
+    /// A marker around an address marks the address: the verbatim copy stops
+    /// at the closer rather than swallowing it into the link.
+    #[test]
+    fn markup_around_a_link_wraps_the_link() {
+        for (source, expected) in [
+            (
+                "*https://example.com*",
+                Emphasis {
+                    bold: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "_https://example.com_",
+                Emphasis {
+                    italic: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "~https://example.com~",
+                Emphasis {
+                    strikethrough: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "`https://example.com`",
+                Emphasis {
+                    code: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let (text, spans) = only(source);
+            assert_eq!(text, "https://example.com", "for {source:?}");
+            assert_eq!(
+                spans,
+                vec![(0.."https://example.com".len(), expected)],
+                "for {source:?}"
+            );
+        }
+    }
+
+    /// Markers inside the address are still address characters when the
+    /// address itself is wrapped.
+    #[test]
+    fn a_wrapped_link_keeps_its_inner_markers() {
+        let (text, spans) = only("*https://example.com/foo_bar_baz*");
+        assert_eq!(text, "https://example.com/foo_bar_baz");
+        assert_eq!(spans, vec![(0..text.len(), bold())]);
     }
 
     #[test]

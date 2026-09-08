@@ -87,7 +87,7 @@ impl BubbleText {
 /// parent, and both paths inherit it.
 pub fn render_rich_text(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
     if !parsed.links.is_empty() {
-        return render_with_links(parsed, cx);
+        return render_with_links(parsed, cx).into_any_element();
     }
     if parsed.runs.is_empty() {
         // Nothing to say about any range, so say nothing: `StyledText` with an
@@ -148,7 +148,7 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
 /// which is why this needs no platform split of its own: GPUI answers that
 /// on the desktop and in the page alike. Size and colour are inherited from
 /// the parent; only the link ink comes from the theme.
-fn render_with_links(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
+fn render_with_links(parsed: &BubbleText, cx: &App) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
     let ink = cx.theme().link;
     let mono = cx.theme().mono_font_family.clone();
@@ -216,11 +216,9 @@ fn render_with_links(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
         .map(|link| SharedString::from(link.target.clone()))
         .collect();
     // One instance per bubble, scoped under the row's own id.
-    InteractiveText::new("message-links", styled)
-        .on_click(ranges, move |ix, _window, cx| {
-            cx.open_url(&targets[ix]);
-        })
-        .into_any_element()
+    InteractiveText::new("message-links", styled).on_click(ranges, move |ix, _window, cx| {
+        cx.open_url(&targets[ix]);
+    })
 }
 
 /// One run's appearance inside a link: its own emphasis, inked and underlined
@@ -291,6 +289,54 @@ mod tests {
             "https://example.com/foo_bar_baz"
         );
         assert_eq!(parsed.links[0].target, "https://example.com/foo_bar_baz");
+    }
+
+    /// A marker around an address styles the address without joining it:
+    /// the target is exactly what the sender wrote.
+    #[test]
+    fn markup_around_a_link_styles_it_and_keeps_the_target() {
+        for (source, flag) in [
+            ("*https://example.com*", "bold"),
+            ("_https://example.com_", "italic"),
+            ("~https://example.com~", "strike"),
+            ("`https://example.com`", "code"),
+        ] {
+            let parsed = BubbleText::of(source);
+            assert_eq!(parsed.text, "https://example.com", "for {source:?}");
+            assert_eq!(parsed.links.len(), 1, "for {source:?}");
+            assert_eq!(
+                &parsed.text[parsed.links[0].range.clone()],
+                "https://example.com",
+                "for {source:?}"
+            );
+            assert_eq!(
+                parsed.links[0].target, "https://example.com",
+                "for {source:?}"
+            );
+            assert_eq!(parsed.runs.len(), 1, "for {source:?}: {:?}", parsed.runs);
+            let emphasis = parsed.runs[0].1;
+            assert!(
+                match flag {
+                    "bold" => emphasis.bold,
+                    "italic" => emphasis.italic,
+                    "strike" => emphasis.strikethrough,
+                    _ => emphasis.code,
+                },
+                "for {source:?}: {emphasis:?}"
+            );
+        }
+    }
+
+    /// The wrapped address keeps the markers inside it: they are address
+    /// characters, not formatting.
+    #[test]
+    fn a_wrapped_link_keeps_markers_inside_the_address() {
+        let parsed = BubbleText::of("*https://example.com/foo_bar_baz*");
+        assert_eq!(parsed.text, "https://example.com/foo_bar_baz");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(parsed.links[0].target, "https://example.com/foo_bar_baz");
+        assert_eq!(parsed.runs.len(), 1);
+        assert!(parsed.runs[0].1.bold);
     }
 
     /// A newline ends the line even when an address follows it: detection
