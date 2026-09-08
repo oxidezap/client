@@ -38,7 +38,7 @@ use wasm_bindgen::prelude::Closure;
 
 use super::geometry::{
     MAX_VIDEO_PIXELS, Rotation, TurnLog, declares_more_than, declares_unreadably, frame_byte_len,
-    into_bgra_rotated,
+    into_bgra_transformed,
 };
 
 /// The newest decoded picture, and what has gone wrong.
@@ -202,6 +202,19 @@ impl Decoder {
                     readback.count(|s| {
                         s.decoded_outputs = s.decoded_outputs.saturating_add(1);
                         s.latest_dimensions = Some((width, height));
+                        let degrees = frame.rotation();
+                        let transform =
+                            (degrees.is_finite().then_some(degrees as u16), frame.flip());
+                        s.latest_display_dimensions =
+                            Some((frame.display_width(), frame.display_height()));
+                        if degrees.is_finite() && (degrees != 0.0 || frame.flip()) {
+                            s.transformed_outputs = s.transformed_outputs.saturating_add(1);
+                        }
+                        if s.latest_display_transform != Some(transform) {
+                            s.display_transform_changes =
+                                s.display_transform_changes.saturating_add(1);
+                            s.latest_display_transform = Some(transform);
+                        }
                         s.min_dimensions = Some(
                             s.min_dimensions
                                 .map_or((width, height), |(w, h)| (w.min(width), h.min(height))),
@@ -566,6 +579,12 @@ pub struct Diagnostics {
     pub bytes_requested: u64,
     pub bytes_materialized: u64,
     pub latest_dimensions: Option<(usize, usize)>,
+    /// Actual decoder output rotation in degrees and flip, not RTP input.
+    /// An absent rotation means the browser does not expose the property.
+    pub latest_display_transform: Option<(Option<u16>, bool)>,
+    pub display_transform_changes: u64,
+    pub transformed_outputs: u64,
+    pub latest_display_dimensions: Option<(u32, u32)>,
     pub min_dimensions: Option<(usize, usize)>,
     pub max_dimensions: Option<(usize, usize)>,
     pub rgba: u64,
@@ -704,6 +723,11 @@ async fn read_frame(
         |rect| (rect.width() as usize, rect.height() as usize),
     );
     let timestamp_micros = frame.timestamp() as i64;
+    let flip = frame.flip();
+    // copyTo returns untransformed visible pixels; drawImage applies the frame's
+    // clockwise rotation, then horizontal flip, before the caller's transform.
+    let internal = Rotation::from_quarter_turns((frame.rotation() / 90.0) as u8);
+    let rotation = rotation.after_frame(internal, flip);
 
     // The decoder's own geometry, never the container's. See
     // [`super::geometry::frame_byte_len`] for why that distinction is the one
@@ -721,7 +745,7 @@ async fn read_frame(
         return;
     };
 
-    let mut bgra = *rotation == Rotation::None && readback.supports_bgra().await;
+    let mut bgra = rotation == Rotation::None && !flip && readback.supports_bgra().await;
     if !stamp.wanted(&slot.borrow()) {
         readback.count(|s| s.dropped_obsolete = s.dropped_obsolete.saturating_add(1));
         return;
@@ -826,7 +850,7 @@ async fn read_frame(
     let bgra = if bgra {
         source
     } else {
-        into_bgra_rotated(source, width, height, *rotation)
+        into_bgra_transformed(source, width, height, rotation, flip)
     };
     let (draw_width, draw_height) = if rotation.transposes() {
         (height, width)

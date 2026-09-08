@@ -98,6 +98,10 @@ jobs:
           cargo fmt --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml --all -- --check
       - name: Check unused dependencies
         run: cargo machete
+      - name: Test benchmark cleanup
+        run: |
+          node --version
+          node --test crates/gui/tests/webcodecs/benchmark-cleanup.test.mjs
       # --all-features so the chat store's `search` feature (FTS5) is covered;
       # a default-features run silently skips its index and query tests.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -313,7 +317,7 @@ jobs:
           cargo test -p oxidezap-daemon -p oxidezap-session --lib --target wasm32-unknown-unknown
           CARGO_TARGET_DIR=target/webcodecs-tests cargo test \
             --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
-            --locked --target wasm32-unknown-unknown --test readback --test recovery
+            --locked --target wasm32-unknown-unknown --test readback --test recovery --test transform
           # The rejection test needs SharedArrayBuffer without isolation headers.
           export WASM_BINDGEN_TEST_WEBDRIVER_JSON="$RUNNER_TEMP/call-playout-webdriver.json"
           printf '%s\n' '{"goog:chromeOptions":{"args":["--enable-features=SharedArrayBuffer"]}}' > "$WASM_BINDGEN_TEST_WEBDRIVER_JSON"

@@ -28,6 +28,10 @@ path = "readback.rs"
 name = "recovery"
 path = "recovery.rs"
 
+[[test]]
+name = "transform"
+path = "transform.rs"
+
 [dependencies]
 image = { version = "0.25", default-features = false }
 smallvec = "1"
