@@ -183,8 +183,14 @@ impl WhatsAppApp {
                 }
             }
         }
-        self.chats
-            .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
+        self.chats.sort_by(|a, b| {
+            // Pinned chats lead, most recently pinned first; the rest follow
+            // by activity. Ties by JID, so every load renders the same order.
+            b.pinned_at
+                .cmp(&a.pinned_at)
+                .then_with(|| b.last_message_time.cmp(&a.last_message_time))
+                .then_with(|| a.jid.cmp(&b.jid))
+        });
     }
 
     /// Put chats into the list, with everything that installing them owes.

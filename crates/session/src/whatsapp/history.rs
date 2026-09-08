@@ -429,12 +429,19 @@ impl WhatsAppClient {
                 // the naming `add_message` does per row has to be run over it.
                 existing.name_quoted_authors();
                 existing.manually_unread |= entry.unread_count < 0;
+                // One conversation, two stored rows: pinned on either half
+                // pins the chat, and the later pin time is the one the list
+                // sorts by.
+                if entry.pinned_at > existing.pinned_at {
+                    existing.pinned_at = entry.pinned_at;
+                }
                 existing.set_name_if_better(name, name_priority);
                 continue;
             }
             // Store-originated: the HistoryLoaded prune may drop it when a
             // later complete load no longer returns it.
             let mut chat = oxidezap_core::Chat::from_store(jid_str.clone(), name, name_priority);
+            chat.pinned_at = entry.pinned_at;
             chat.unread_count = entry.unread_count.max(0) as u32;
             // -1 = manually marked unread (WA Web convention); .max(0) above
             // must not silently eat the flag.

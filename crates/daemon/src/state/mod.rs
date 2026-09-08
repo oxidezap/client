@@ -313,6 +313,7 @@ mod tests {
             name: jid.into(),
             unread,
             manually_unread: false,
+            pinned_at_ms: None,
             last_message: Some(MessagePreview {
                 id: Some(format!("{jid}-newest")),
                 text: "t".into(),

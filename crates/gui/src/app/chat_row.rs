@@ -84,6 +84,7 @@ pub struct ChatRow {
     pub timestamp: Option<DateTime<Utc>>,
     pub unread: Unread,
     pub preview: Preview,
+    pub pinned: bool,
 }
 
 impl ChatRow {
@@ -110,6 +111,7 @@ impl ChatRow {
                 Unread::None
             },
             preview: preview_for(chat, typing, draft, is_own_number),
+            pinned: chat.pinned_at.is_some(),
         }
     }
 
@@ -398,6 +400,15 @@ mod tests {
             panic!("expected a message preview");
         };
         assert_eq!(text, "line one line two tab");
+    }
+
+    #[test]
+    fn a_pinned_chat_marks_its_row() {
+        use chrono::TimeZone as _;
+        let mut chat = chat(false);
+        assert!(!ChatRow::new(&chat, None, None, false).pinned);
+        chat.pinned_at = Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        assert!(ChatRow::new(&chat, None, None, false).pinned);
     }
 
     #[test]

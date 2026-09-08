@@ -298,6 +298,7 @@ impl Bridge {
                     unread: 0,
                     manually_unread: false,
                     last_message: None,
+                    pinned_at_ms: None,
                 });
                 // Asked of the tracker rather than recomputed, so the badge
                 // and the receipts this side owes cannot disagree: the same
@@ -451,6 +452,7 @@ pub(super) fn chat_updated(chat: &Chat, reads: &mut ReadTracker) -> Change {
         name: chat.name.clone(),
         unread: chat.unread_count,
         manually_unread: chat.manually_unread,
+        pinned_at_ms: chat.pinned_at.map(|t| t.timestamp_millis()),
         last_message: chat.last_message.as_ref().map(|text| MessagePreview {
             id: newest.map(|m| m.id.clone()),
             text: text.clone(),
