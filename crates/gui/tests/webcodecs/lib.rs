@@ -9,11 +9,13 @@ use std::rc::Rc;
 
 #[path = "../../src/video/geometry.rs"]
 mod geometry;
+mod recovery_helper;
 #[path = "../../src/video/sps.rs"]
 mod sps;
 #[path = "../../src/video/webcodecs.rs"]
 mod webcodecs;
 
+pub use recovery_helper::h264;
 pub use webcodecs::{Decoder, Picture};
 
 thread_local! {

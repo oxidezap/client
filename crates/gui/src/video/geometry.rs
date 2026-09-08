@@ -46,7 +46,6 @@ impl Rotation {
     /// rotation of their *device* — which is not the turn that draws their
     /// picture; see [`Rotation::to_upright`]. Anything outside `0..=3` is not
     /// a rotation, and is left alone rather than guessed at.
-    #[cfg(test)]
     pub(super) fn from_quarter_turns(turns: u8) -> Self {
         match turns {
             1 => Self::Cw90,
@@ -56,17 +55,10 @@ impl Rotation {
         }
     }
 
-    /// The turn that draws a peer's frame the right way up, given the
-    /// `device_orientation` they announced.
-    ///
-    /// Their rotation *undone*, not repeated. A camera encodes in its sensor's
-    /// orientation whatever the device is doing, so the picture arrives
-    /// already turned by however the phone is held, and
-    /// `device_orientation` is the description of that turn rather than a
-    /// correction for it. Applying it again is what put a peer holding their
-    /// phone sideways on their head: one quarter turn the wrong way is 180°
-    /// out, which is the one error a wrong sign can make look like a
-    /// deliberate choice.
+    /// Display correction for the peer's two rotation bits. Captured WhatsApp
+    /// WASM JgwtTQVeWPm function 828 maps bits 0,1,2,3 to JS orientation enum
+    /// 1,4,3,2. WAWebVoipVideoRenderer draws those as clockwise 0,270,180,90.
+    /// The source must select per-frame RTP metadata before signaling fallback.
     pub(super) fn to_upright(device_orientation: u8) -> Self {
         match device_orientation {
             1 => Self::Cw270,
@@ -80,6 +72,13 @@ impl Rotation {
     pub(super) fn transposes(self) -> bool {
         matches!(self, Self::Cw90 | Self::Cw270)
     }
+
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    pub(super) fn after_frame(self, internal: Self, flip: bool) -> Self {
+        // R_outer F R_inner = F R_(inner-outer). The flip follows rotation.
+        let outer = if flip { 4 - self as u8 } else { self as u8 };
+        Self::from_quarter_turns((internal as u8 + outer) % 4)
+    }
 }
 
 /// Copy `src` (RGBA, `width` x `height`) into `dst` as BGRA, applying `rotation`.
@@ -88,11 +87,23 @@ impl Rotation {
 /// RGBA, and the frame has to be turned by the track matrix. `dst` holds the
 /// same bytes laid out in the destination geometry, which is the source's
 /// transposed for a quarter turn.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub(super) fn write_bgra_rotated(
     src: &[u8],
     width: usize,
     height: usize,
     rotation: Rotation,
+    dst: &mut [u8],
+) {
+    write_bgra_transformed(src, width, height, rotation, false, dst);
+}
+
+fn write_bgra_transformed(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    rotation: Rotation,
+    flip: bool,
     dst: &mut [u8],
 ) {
     debug_assert_eq!(src.len(), width * height * 4);
@@ -102,7 +113,7 @@ pub(super) fn write_bgra_rotated(
     // directions is ~55 million pixels a second, and the general loop pays
     // two bounds checks and a multiply per pixel for a rotation that is not
     // happening.
-    if rotation == Rotation::None {
+    if rotation == Rotation::None && !flip {
         for (to, from) in dst
             .as_chunks_mut::<4>()
             .0
@@ -128,6 +139,7 @@ pub(super) fn write_bgra_rotated(
                 Rotation::Cw270 => (y, width - 1 - x),
             };
             let s = (y * width + x) * 4;
+            let dx = if flip { dst_width - 1 - dx } else { dx };
             let t = (dy * dst_width + dx) * 4;
             dst[t] = src[s + 2];
             dst[t + 1] = src[s + 1];
@@ -148,20 +160,31 @@ pub(super) fn swap_rb_in_place(pixels: &mut [u8]) {
     }
 }
 
-#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn into_bgra_rotated(
-    mut pixels: Vec<u8>,
+    pixels: Vec<u8>,
     width: usize,
     height: usize,
     rotation: Rotation,
 ) -> Vec<u8> {
+    into_bgra_transformed(pixels, width, height, rotation, false)
+}
+
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+pub(super) fn into_bgra_transformed(
+    mut pixels: Vec<u8>,
+    width: usize,
+    height: usize,
+    rotation: Rotation,
+    flip: bool,
+) -> Vec<u8> {
     debug_assert_eq!(pixels.len(), width * height * 4);
-    if rotation == Rotation::None {
+    if rotation == Rotation::None && !flip {
         swap_rb_in_place(&mut pixels);
         pixels
     } else {
         let mut output = vec![0; pixels.len()];
-        write_bgra_rotated(&pixels, width, height, rotation, &mut output);
+        write_bgra_transformed(&pixels, width, height, rotation, flip, &mut output);
         output
     }
 }
@@ -290,6 +313,25 @@ mod tests {
     }
 
     #[test]
+    fn camera_switch_rotation_sequence_matches_the_received_wasm_convention() {
+        let expected = [
+            [0, 1, 2, 3, 4, 5],
+            [2, 5, 1, 4, 0, 3],
+            [5, 4, 3, 2, 1, 0],
+            [3, 0, 4, 1, 5, 2],
+        ];
+        // Synthetic front/rear pairs exercise every rotation and opposite turns.
+        for bits in [0, 2, 1, 3, 2, 0, 3, 1] {
+            let source = tagged(3, 2);
+            let rotation = Rotation::to_upright(bits);
+            let mut native = vec![0; source.len()];
+            write_bgra_rotated(&source, 3, 2, rotation, &mut native);
+            assert_eq!(reds(&native), expected[bits as usize]);
+            assert_eq!(into_bgra_rotated(source, 3, 2, rotation), native);
+        }
+    }
+
+    #[test]
     fn quarter_turns_are_classified() {
         assert_eq!(Rotation::from_matrix(0, ONE, NEG_ONE, 0), Rotation::Cw90);
         assert_eq!(
@@ -343,6 +385,35 @@ mod tests {
         let converted = into_bgra_rotated(source, 2, 1, Rotation::None);
         assert_eq!(converted.as_ptr(), pointer);
         assert_eq!(converted, [30, 20, 10, 40, 70, 60, 50, 80]);
+    }
+
+    #[test]
+    fn composed_frame_transform_matches_sequential_passes() {
+        for (width, height) in [(3, 5), (1, 7), (7, 1)] {
+            for inner in 0..4 {
+                for outer in 0..4 {
+                    for flip in [false, true] {
+                        let internal = Rotation::from_quarter_turns(inner);
+                        let external = Rotation::from_quarter_turns(outer);
+                        let source = tagged(width, height);
+                        let mut first =
+                            into_bgra_transformed(source.clone(), width, height, internal, flip);
+                        swap_rb_in_place(&mut first);
+                        let (w, h) = if internal.transposes() {
+                            (height, width)
+                        } else {
+                            (width, height)
+                        };
+                        let expected = into_bgra_rotated(first, w, h, external);
+                        let composed = external.after_frame(internal, flip);
+                        assert_eq!(
+                            into_bgra_transformed(source, width, height, composed, flip),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

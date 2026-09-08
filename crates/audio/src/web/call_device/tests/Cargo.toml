@@ -1,0 +1,31 @@
+[package]
+name = "oxidezap-call-playout-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# browser.rs imports ../diagnostics.rs through #[path]; cargo-machete does
+# not scan that external module, which calls oxidezap_platform::sleep.
+[package.metadata.cargo-machete]
+ignored = ["oxidezap-platform"]
+
+[workspace]
+
+[[test]]
+name = "browser"
+path = "browser.rs"
+
+[[test]]
+name = "stats"
+path = "stats.rs"
+
+[dependencies]
+futures-lite = "2"
+log = "0.4"
+oxidezap-platform = { path = "../../../../../platform" }
+js-sys = "=0.3.104"
+wasm-bindgen = "=0.2.127"
+web-sys = { version = "=0.3.104", features = ["AudioBuffer", "AudioContext"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "=0.3.77"

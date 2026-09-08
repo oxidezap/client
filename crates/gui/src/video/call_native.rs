@@ -34,6 +34,7 @@ use smallvec::SmallVec;
 
 use super::geometry::{Rotation, swap_rb_in_place, write_bgra_rotated};
 
+use super::recovery::h264::MAX_PIXELS;
 use super::recovery::{Recovery, RecoverySink};
 
 /// Where a decoded picture goes.
@@ -264,6 +265,7 @@ fn decode_loop(
     // only thing that would come of it.
     let mut started = false;
     let mut scratch = Scratch::default();
+    let mut access_units = super::recovery::h264::AccessUnits::default();
 
     while let Ok(unit) = queue.recv() {
         // Units before this one were lost, so what this decoder holds no
@@ -271,41 +273,29 @@ fn decode_loop(
         if unit.gap {
             started = false;
         }
+        let (data, recovers) = match access_units.prepare(&unit.data) {
+            Ok(Some(picture)) => picture,
+            Ok(None) => {
+                if !started {
+                    recovery.request();
+                }
+                continue;
+            }
+            Err(_) => {
+                started = false;
+                recovery.request();
+                continue;
+            }
+        };
         if !started {
-            if !unit.keyframe {
+            if !recovers {
                 recovery.request();
                 continue;
             }
             started = true;
+            recovery.admitted();
         }
-        // Read before the decoder is handed it, because a decoder allocates
-        // its reference and output buffers from the parameter set — from
-        // numbers the *peer* chose. `Scratch` refuses an oversized picture,
-        // but it refuses one that has already been decoded, which is after
-        // the allocation the refusal is for.
-        let refuse = match super::sps::coded_size(&unit.data) {
-            // No new geometry: coded against a set already read and bounded.
-            super::sps::Geometry::NoParameterSet => None,
-            super::sps::Geometry::Size(width, height) => {
-                ((width as usize).saturating_mul(height as usize) > MAX_PIXELS)
-                    .then(|| format!("a {width}x{height} video stream"))
-            }
-            // A budget nothing could apply is not a budget. What reaches here
-            // is a parameter set shaped like a truncated or hostile one, and
-            // the sender is the one who chose its shape.
-            super::sps::Geometry::Unreadable => {
-                Some("a video stream whose parameter set cannot be read".to_string())
-            }
-        };
-        if let Some(reason) = refuse {
-            log::warn!("refusing {reason} on call {call_id}");
-            // Not a gap to recover from: every unit that follows references
-            // this picture, so the stream stays refused until the peer sends
-            // a parameter set describing one that fits.
-            started = false;
-            continue;
-        }
-        let picture = match decoder.decode(&unit.data) {
+        let picture = match decoder.decode(&data) {
             Ok(Some(yuv)) => yuv,
             // The decoder is buffering, which is normal.
             Ok(None) => continue,
@@ -321,6 +311,7 @@ fn decode_loop(
         let Some(image) = scratch.render(&picture, Rotation::to_upright(unit.orientation)) else {
             continue;
         };
+        recovery.output();
         // Whether it is drawn is the window's decision: a stale frame drawn
         // late is worse than the next one drawn on time, so the sink drops
         // rather than waits.
@@ -344,11 +335,6 @@ struct Scratch {
     rgba: Vec<u8>,
     size: (usize, usize),
 }
-
-/// The largest picture a frame is allowed to be. The dimensions come off a
-/// peer's bitstream, so their product is somebody else's number: 4K is far
-/// past anything a call offers and still bounds the allocation.
-const MAX_PIXELS: usize = 3840 * 2160;
 
 impl Scratch {
     fn render(&mut self, yuv: &DecodedYUV<'_>, rotation: Rotation) -> Option<Arc<RenderImage>> {
@@ -393,6 +379,188 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod fixture {
+        include!("../../tests/webcodecs/h264_fixture.rs");
+    }
+
+    fn encoded_pair() -> (Vec<u8>, Vec<u8>) {
+        use openh264::encoder::{Encoder, EncoderConfig};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+        let mut encoder =
+            Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new())
+                .unwrap();
+        let pixels = vec![80; 32 * 32 * 3];
+        let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (32, 32)));
+        (
+            encoder.encode(&yuv).unwrap().to_vec(),
+            encoder.encode(&yuv).unwrap().to_vec(),
+        )
+    }
+
+    fn call_outputs(units: Vec<Vec<u8>>) -> (usize, usize) {
+        let (sender, queue) = std::sync::mpsc::channel();
+        for data in units {
+            sender
+                .send(CallVideoFrame::new(
+                    "generated".into(),
+                    VideoStream::Remote,
+                    data,
+                    true,
+                    0,
+                ))
+                .unwrap();
+        }
+        drop(sender);
+        let outputs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = outputs.clone();
+        let frames: FrameSink = Arc::new(move |_| {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let recovery = Recovery::new(
+            "generated".into(),
+            VideoStream::Remote,
+            Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::Relaxed);
+                true
+            }),
+        );
+        decode_loop("generated", VideoStream::Remote, &queue, &frames, &recovery);
+        (
+            outputs.load(Ordering::Relaxed),
+            requests.load(Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn repeated_parameter_sets_preserve_the_active_reference_chain() {
+        use super::super::recovery::h264::split_annexb;
+        let (idr, delta) = encoded_pair();
+        let mut sets = Vec::new();
+        for nal in split_annexb(&idr).filter(|nal| matches!(nal[0] & 31, 7 | 8)) {
+            sets.extend_from_slice(&[0, 0, 0, 1]);
+            sets.extend_from_slice(nal);
+        }
+        let mut direct = Decoder::new().unwrap();
+        assert!(direct.decode(&idr).unwrap().is_some());
+        assert!(direct.decode(&sets).unwrap().is_none());
+        assert!(direct.decode(&delta).unwrap().is_some());
+        assert_eq!(call_outputs(vec![idr, sets.clone(), sets, delta]), (2, 0));
+    }
+
+    #[test]
+    fn an_idr_preserves_pps_announced_for_a_later_delta() {
+        use super::super::recovery::h264::split_annexb;
+        let (idr, delta) = encoded_pair();
+        let mut announced = Vec::new();
+        let mut separate = Vec::new();
+        for nal in split_annexb(&idr) {
+            if nal[0] & 31 == 7 {
+                assert_eq!(nal[1], 66, "CAVLC baseline fixture");
+            }
+            announced.extend_from_slice(&[0, 0, 0, 1]);
+            announced.extend_from_slice(nal);
+            if nal[0] & 31 == 8 {
+                separate.extend_from_slice(&[0, 0, 0, 1]);
+                separate.extend(fixture::with_pps_id(nal, 1));
+                announced.extend_from_slice(&separate);
+            }
+        }
+        let mut changed_delta = Vec::new();
+        for nal in split_annexb(&delta) {
+            changed_delta.extend_from_slice(&[0, 0, 0, 1]);
+            if nal[0] & 31 == 1 {
+                changed_delta.extend(fixture::with_pps_id(nal, 1));
+            } else {
+                changed_delta.extend_from_slice(nal);
+            }
+        }
+        for units in [
+            vec![announced, changed_delta.clone()],
+            vec![idr, separate, changed_delta],
+        ] {
+            let mut direct = Decoder::new().unwrap();
+            let direct_count = units
+                .iter()
+                .filter(|data| direct.decode(data).unwrap().is_some())
+                .count();
+            assert_eq!(
+                direct_count, 2,
+                "edited stream must decode without preparation"
+            );
+            assert_eq!(call_outputs(units), (direct_count, 0));
+        }
+    }
+
+    #[test]
+    fn unflagged_idr_starts_and_recovers_real_decoder() {
+        use openh264::encoder::{Encoder, EncoderConfig};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+        let mut encoder =
+            Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new())
+                .unwrap();
+        let pixels = vec![80; 32 * 32 * 3];
+        let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (32, 32)));
+        let idr = encoder.encode(&yuv).unwrap().to_vec();
+        let delta = encoder.encode(&yuv).unwrap().to_vec();
+        let mut sets = Vec::new();
+        for nal in super::super::recovery::h264::split_annexb(&idr)
+            .filter(|nal| matches!(nal[0] & 31, 7 | 8))
+        {
+            sets.extend_from_slice(&[0, 0, 0, 1]);
+            sets.extend_from_slice(nal);
+        }
+        let (sender, queue) = std::sync::mpsc::channel();
+        for gap in [false, true] {
+            for data in [&sets, &delta] {
+                sender
+                    .send(
+                        CallVideoFrame::new(
+                            "generated-call".into(),
+                            VideoStream::Remote,
+                            data.clone(),
+                            true,
+                            0,
+                        )
+                        .after_a_gap(gap),
+                    )
+                    .unwrap();
+            }
+            sender
+                .send(
+                    CallVideoFrame::new(
+                        "generated-call".into(),
+                        VideoStream::Remote,
+                        idr.clone(),
+                        false,
+                        0,
+                    )
+                    .after_a_gap(gap),
+                )
+                .unwrap();
+        }
+        drop(sender);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outputs = count.clone();
+        let frames: FrameSink = Arc::new(move |_| {
+            outputs.fetch_add(1, Ordering::Relaxed);
+        });
+        let recovery = Recovery::new(
+            "generated-call".into(),
+            VideoStream::Remote,
+            Arc::new(|_, _| true),
+        );
+        decode_loop(
+            "generated-call",
+            VideoStream::Remote,
+            &queue,
+            &frames,
+            &recovery,
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn decoder_failure_requests_the_failed_direction() {

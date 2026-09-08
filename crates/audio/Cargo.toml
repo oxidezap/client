@@ -99,3 +99,6 @@ web-sys = { version = "0.3", features = [
 
 [lints]
 workspace = true
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.77"

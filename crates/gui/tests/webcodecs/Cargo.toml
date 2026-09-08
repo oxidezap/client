@@ -12,6 +12,9 @@ ignored = ["js-sys", "wasm-bindgen-futures", "web-sys"]
 # The browser runner needs neither GPUI's shared memory nor its native tests.
 [workspace]
 
+[features]
+benchmarks = []
+
 [lib]
 path = "lib.rs"
 test = false
@@ -20,6 +23,14 @@ doctest = false
 [[test]]
 name = "readback"
 path = "readback.rs"
+
+[[test]]
+name = "recovery"
+path = "recovery.rs"
+
+[[test]]
+name = "transform"
+path = "transform.rs"
 
 [dependencies]
 image = { version = "0.25", default-features = false }

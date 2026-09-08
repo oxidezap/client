@@ -91,14 +91,28 @@ jobs:
           # and evicts least-recently-used, so letting every PR save a ~4 GB
           # entry would push out the one branch every PR restores from.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo fmt --all -- --check
+      - name: Check formatting
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path crates/gui/tests/webcodecs/Cargo.toml --all -- --check
+          cargo fmt --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml --all -- --check
       - name: Check unused dependencies
         run: cargo machete
+      - name: Test benchmark cleanup
+        run: |
+          node --version
+          node --test crates/gui/tests/webcodecs/benchmark-cleanup.test.mjs
+          node --test crates/gui/tests/webcodecs/transform-metadata.test.mjs
       # --all-features so the chat store's `search` feature (FTS5) is covered;
       # a default-features run silently skips its index and query tests.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo nextest run --workspace --all-features
+      - name: Test call playout statistics
+        run: |
+          CARGO_TARGET_DIR=target/call-playout-tests cargo test \
+            --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
+            --locked --test stats
       # nextest cannot run doctests (nextest-rs/nextest#16) and silently reports
       # none, so they need their own libtest step.
       - name: Run doctests
@@ -304,7 +318,31 @@ jobs:
           cargo test -p oxidezap-daemon -p oxidezap-session --lib --target wasm32-unknown-unknown
           CARGO_TARGET_DIR=target/webcodecs-tests cargo test \
             --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
-            --locked --target wasm32-unknown-unknown --test readback
+            --locked --target wasm32-unknown-unknown --test readback --test recovery --test transform
+          # Audio needs autoplay; shared-view rejection needs SharedArrayBuffer.
+          export WASM_BINDGEN_TEST_WEBDRIVER_JSON="$RUNNER_TEMP/call-playout-webdriver.json"
+          printf '%s\n' '{"goog:chromeOptions":{"args":["--enable-features=SharedArrayBuffer","--autoplay-policy=no-user-gesture-required"]}}' > "$WASM_BINDGEN_TEST_WEBDRIVER_JSON"
+          cargo test -p oxidezap-audio --target wasm32-unknown-unknown --test call_audio_lifecycle
+          CARGO_TARGET_DIR=target/call-playout-browser cargo test \
+            --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
+            --locked --target wasm32-unknown-unknown --test browser
+      - name: Install nightly for shared audio tests
+        run: rustup toolchain install nightly-2026-09-03 --profile minimal --component rust-src --target wasm32-unknown-unknown
+      - name: Test production audio with shared WASM memory
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: |
+          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+          export CHROMEDRIVER="${CHROMEWEBDRIVER:-}/chromedriver"
+          test -x "$CHROMEDRIVER" || CHROMEDRIVER=$(command -v chromedriver)
+          export WASM_BINDGEN_TEST_WEBDRIVER_JSON="$RUNNER_TEMP/call-playout-webdriver.json"
+          # Inherit the web bundle's root flags and rebuild std, as Pages does.
+          CARGO_TARGET_DIR=target/call-playout-shared cargo +nightly-2026-09-03 test \
+            --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
+            --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort --test browser
+          CARGO_TARGET_DIR=target/call-audio-shared cargo +nightly-2026-09-03 test \
+            -p oxidezap-audio --target wasm32-unknown-unknown \
+            -Z build-std=std,panic_abort --test call_audio_lifecycle
 
   # The library crates an embedder can depend on: the chat store, which lost
   # the MSRV job it had in whatsapp-rust when it moved here, and the IPC
