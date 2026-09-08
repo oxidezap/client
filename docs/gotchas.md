@@ -750,10 +750,11 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   `WAWebVoipVideoRenderer` applies clockwise `0,270,180,90` degrees, matching
   `Rotation::to_upright`. The receive oracle executes all 256 metadata bytes;
   the remaining bits do not change rotation at that rendering boundary.
-  At library revision `2b9a8d7`, received frames instead use signaling
-  `device_orientation`, ignoring RTP frame-info rotation. Camera changes can
-  therefore leave the GUI with stale orientation. Correcting the metadata
-  source upstream is required; adding 180 degrees in the GUI is not a fix.
+  The consumed upstream fixes use authenticated RTP metadata and parse frame-info
+  independently of optional extensions, falling back to signaling when absent.
+  See [received orientation](media-recovery.md#received-orientation) for the
+  parser revision and proof limits. Adding 180 degrees in the GUI is not a fix;
+  a live Android front/rear retest is still required.
 - **A camera is a request, not a state, and requests arrive out of order.**
   Opening one is device work — tens of milliseconds, and a permission prompt
   the first time — so two toggles spawned in order routinely start in the

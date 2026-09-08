@@ -158,5 +158,23 @@ receive oracle maps all 256 frame-info bytes to clockwise display turns of 0,
 270, 180 and 90 degrees for low bits 0, 1, 2 and 3. The upstream correction
 merged in
 [whatsapp-rust#1469](https://github.com/oxidezap/whatsapp-rust/pull/1469),
-which this branch consumes at `9f25ff96`. No 180-degree GUI compensation was
-added. A live Android front/rear retest is still required.
+which is included in the parser branch consumed below. No 180-degree GUI
+compensation was added. A live Android front/rear retest is still required.
+
+The client now consumes open
+[whatsapp-rust#1470](https://github.com/oxidezap/whatsapp-rust/pull/1470)
+from `fix/voip-frame-info-extension-parser` at
+`ca05aaaaef6b8c47dd005e86d385bafa72d50d02`, based on main at
+`47e1b5b41b63c23b59372828901ea945c8149565`. All WhatsApp dependency declarations
+use that source, with the revision recorded in the client lockfile.
+
+Authenticated receive packets now expose frame-info independently of optional
+timing and bandwidth extensions. Upstream compared 3,840 synthetic packets and
+285 boundary cases against the captured WASM parser, covering reordered,
+frame-info-only and extended layouts, duplicate precedence, padding and
+truncation. The outgoing extension layout and signaling fallback are unchanged.
+The client adds no production rotation policy. Upstream's separate passthrough
+test checks Annex-B bytes and renderer arguments, not decoded pixels, and its
+observed packet-metadata OR aggregation is not part of this fix. The live Android
+extension layout remains uncaptured, so the parser discrepancy does not prove
+the cause of the reported rear-camera image.
