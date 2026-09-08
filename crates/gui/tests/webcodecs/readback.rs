@@ -24,6 +24,8 @@ extern "C" {
     async fn settle(this: &ControlledDecoder, index: u32, reject: bool) -> Result<(), JsValue>;
     #[wasm_bindgen(method)]
     fn count(this: &ControlledDecoder) -> u32;
+    #[wasm_bindgen(method, catch, js_name = waitForCopies)]
+    async fn wait_for_copies(this: &ControlledDecoder, count: u32) -> Result<(), JsValue>;
     #[wasm_bindgen(method)]
     fn stamp(this: &ControlledDecoder, index: u32) -> i32;
     #[wasm_bindgen(method)]
@@ -57,8 +59,6 @@ extern "C" {
         rounds: u32,
         peer: &ControlledDecoder,
     ) -> Result<JsValue, JsValue>;
-    #[wasm_bindgen(catch)]
-    async fn drain() -> Result<(), JsValue>;
 }
 
 #[cfg(feature = "benchmarks")]
@@ -158,10 +158,9 @@ async fn active_a_pending_b_replaced_by_c_then_c_publishes() {
     let s = Scenario::new(true);
     s.decoder().enable_diagnostics(|_, _| {});
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     s.emit(2);
     s.emit(3);
-    drain().await.unwrap();
     assert_eq!(s.browser.count(), 1);
     assert!(!s.browser.closed(0));
     assert!(s.browser.closed(1), "B closes without copying");
@@ -209,12 +208,11 @@ async fn reset_closes_pending_and_keeps_one_active_copy_across_generations() {
     let s = Scenario::new(true);
     s.decoder().enable_diagnostics(|_, _| {});
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     s.emit(2);
     s.decoder().reset();
     assert!(s.browser.closed(1));
     s.emit(3);
-    drain().await.unwrap();
     assert_eq!(
         s.browser.count(),
         1,
@@ -247,7 +245,7 @@ async fn drop_closes_pending_and_rejects_active_completion_before_materializatio
         }
     });
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     s.emit(2);
     s.decoder.take();
     let final_stats = summaries.borrow()[0];
@@ -271,7 +269,7 @@ async fn rejected_copy_closes_pending_and_reset_can_resume() {
     let s = Scenario::new(true);
     s.decoder().enable_diagnostics(|_, _| {});
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     s.emit(2);
     s.browser.settle(0, true).await.unwrap();
     assert!(s.decoder().failure().is_none());
@@ -289,7 +287,7 @@ async fn rejected_copy_closes_pending_and_reset_can_resume() {
     assert_eq!(s.images(), 0);
     s.decoder().reset();
     s.emit(3);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(3).await.unwrap();
     assert_eq!(s.browser.count(), 3, "rejection released the active slot");
     s.browser.settle(2, false).await.unwrap();
     assert_eq!(s.stamps(), [3]);
@@ -306,7 +304,7 @@ async fn bgra_rejection_recovers_same_frame_and_caches_rgba() {
     let s = Scenario::new(true);
     s.decoder().enable_diagnostics(|_, _| {});
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     assert_eq!(s.browser.format(0), "BGRA");
     s.browser.settle(0, true).await.unwrap();
     assert!(s.decoder().failure().is_none());
@@ -321,7 +319,7 @@ async fn bgra_rejection_recovers_same_frame_and_caches_rgba() {
         &[80, 40, 0, 255]
     );
     s.emit(2);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(3).await.unwrap();
     assert_eq!(s.browser.format(2), "RGBA");
     s.browser.settle(2, false).await.unwrap();
     assert_eq!(s.stamps(), [1, 2]);
@@ -340,7 +338,7 @@ async fn reset_during_rgba_retry_cancels_publication() {
     let s = Scenario::new(true);
     s.decoder().enable_diagnostics(|_, _| {});
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     s.browser.settle(0, true).await.unwrap();
     s.decoder().reset();
     s.emit(2);
@@ -366,7 +364,7 @@ async fn bgra_allocation_rejection_uses_rgba_before_copy() {
     s.decoder().enable_diagnostics(|_, _| {});
     s.browser.reject_allocation();
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     assert_eq!(s.browser.count(), 1);
     assert_eq!(s.browser.format(0), "RGBA");
     s.browser.settle(0, false).await.unwrap();
@@ -393,7 +391,7 @@ async fn real_copy_colors_odd_dimensions_all_turns_and_older_formats() {
             let stamp = index as i32 + 1;
             feed(s.decoder(), stamp, orientation);
             s.browser.emit(stamp, 3, 5);
-            drain().await.unwrap();
+            s.browser.wait_for_copies(index as u32 + 1).await.unwrap();
             assert_eq!(
                 s.browser.format(index as u32),
                 if mode == 0 && orientation == 0 {
@@ -433,7 +431,7 @@ async fn old_generation_rejection_does_not_fail_the_reset_decoder() {
     let s = Scenario::new(true);
     s.decoder().enable_diagnostics(|_, _| {});
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     s.decoder().reset();
     s.emit(2);
     s.browser.settle(0, true).await.unwrap();
@@ -454,7 +452,7 @@ async fn attachment_overflow_counts_outputs_without_starting_extra_readbacks() {
     for stamp in 1..=9 {
         s.emit(stamp);
     }
-    drain().await.unwrap();
+    s.browser.wait_for_copies(8).await.unwrap();
     assert_eq!(s.browser.count(), 8);
     assert!(s.decoder().take_refusal());
     for index in 0..8 {
@@ -490,7 +488,7 @@ async fn sink_can_read_decoder_getters_with_diagnostics_enabled() {
     decoder.enable_diagnostics(|_, _| {});
     *owner.borrow_mut() = Some(decoder);
     browser.emit(1, 3, 2);
-    drain().await.unwrap();
+    browser.wait_for_copies(1).await.unwrap();
     browser.settle(0, false).await.unwrap();
     assert_eq!(observed.borrow().unwrap().materialized, 1);
     owner.borrow_mut().take();
@@ -503,7 +501,7 @@ async fn attachment_stale_completion_skips_to_vec_and_image_creation() {
     s.decoder().enable_diagnostics(|_, _| {});
     s.emit(1);
     s.emit(2);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(2).await.unwrap();
     assert_eq!(s.browser.count(), 2, "attachments still copy concurrently");
     s.browser.settle(1, false).await.unwrap();
     assert_eq!(s.images(), 1);
@@ -527,13 +525,15 @@ async fn diagnostics_are_per_decoder_and_disabled_by_default() {
     first.emit(1);
     second.browser.emit(1, 4, 3);
     disabled.emit(1);
-    drain().await.unwrap();
+    first.browser.wait_for_copies(1).await.unwrap();
+    second.browser.wait_for_copies(1).await.unwrap();
+    disabled.browser.wait_for_copies(1).await.unwrap();
     first.browser.settle(0, false).await.unwrap();
     second.browser.settle(0, false).await.unwrap();
     disabled.decoder().reset();
     disabled.browser.settle(0, false).await.unwrap();
     first.browser.emit(2, 2, 5);
-    drain().await.unwrap();
+    first.browser.wait_for_copies(2).await.unwrap();
     first.browser.settle(1, false).await.unwrap();
     let a = first.decoder().diagnostics().unwrap();
     let b = second.decoder().diagnostics().unwrap();
@@ -555,14 +555,14 @@ async fn diagnostics_are_per_decoder_and_disabled_by_default() {
 async fn idle_buffer_is_reused_but_resize_replaces_it() {
     let s = Scenario::new(true);
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     s.browser.settle(0, false).await.unwrap();
     s.emit(2);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(2).await.unwrap();
     assert!(s.browser.reused(0, 1));
     s.browser.settle(1, false).await.unwrap();
     s.browser.emit(3, 4, 2);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(3).await.unwrap();
     assert!(!s.browser.reused(1, 2));
     s.browser.settle(2, false).await.unwrap();
     assert_eq!(s.stamps(), [1, 2, 3]);
@@ -576,7 +576,7 @@ async fn idle_buffer_is_reused_but_resize_replaces_it() {
 async fn pending_frame_keeps_its_recorded_rotation() {
     let s = Scenario::new(true);
     s.emit(1);
-    drain().await.unwrap();
+    s.browser.wait_for_copies(1).await.unwrap();
     feed(s.decoder(), 2, 1);
     s.browser.emit(2, 3, 2);
     feed(s.decoder(), 3, 0);

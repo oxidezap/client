@@ -2,6 +2,7 @@ export class ControlledDecoder {
     constructor() {
         this.frames = [];
         this.reads = [];
+        this.waiters = new Set();
         this.closes = 0;
         this.decodes = 0;
     }
@@ -273,6 +274,31 @@ export class ControlledDecoder {
 
     rejectAllocation() { this.rejectBgraAllocation = true; }
 
+    waitFor(predicate, milestone) {
+        if (predicate()) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            const finish = error => {
+                clearTimeout(timer);
+                this.waiters.delete(waiter);
+                if (error) reject(error);
+                else resolve();
+            };
+            const waiter = {
+                check: () => { if (predicate()) finish(); },
+                cancel: () => finish(new Error(`test cleanup before ${milestone}`)),
+            };
+            const timer = setTimeout(() => finish(new Error(
+                `timed out waiting for ${milestone}; ${this.reads.length} copies started`)), 5000);
+            this.waiters.add(waiter);
+        });
+    }
+
+    waitForCopies(count) {
+        return this.waitFor(() => this.reads.length >= count, `copy count ${count}`);
+    }
+
+    notify() { for (const waiter of this.waiters) waiter.check(); }
+
     emit(timestamp, width, height) {
         const pixels = new Uint8Array(width * height * 4);
         for (let i = 0; i < width * height; i++) {
@@ -281,6 +307,8 @@ export class ControlledDecoder {
         const frame = new VideoFrame(pixels, {
             format: "RGBA", codedWidth: width, codedHeight: height, timestamp,
         });
+        const nativeClose = frame.close.bind(frame);
+        frame.close = () => { nativeClose(); this.notify(); };
         if (this.rejectBgraAllocation) {
             const nativeAllocation = frame.allocationSize.bind(frame);
             frame.allocationSize = options => {
@@ -292,7 +320,7 @@ export class ControlledDecoder {
         }
         const nativeCopy = frame.copyTo.bind(frame);
         frame.copyTo = (destination, options) => {
-            const read = { destination, timestamp, format: options.format, lengthReads: 0 };
+            const read = { frame, destination, timestamp, format: options.format, lengthReads: 0 };
             this.reads.push(read);
             Object.defineProperty(destination, "length", {
                 configurable: true,
@@ -305,6 +333,7 @@ export class ControlledDecoder {
                 read.reject = reject;
             });
             read.completed = Promise.all([read.copied, gate]).then(([layout]) => layout);
+            this.notify();
             return read.completed;
         };
         this.frames.push(frame);
@@ -323,8 +352,10 @@ export class ControlledDecoder {
         } catch (error) {
             if (!reject || error.message !== "forced copy rejection") throw error;
         }
-        // Cross a task boundary so both JS and Rust promise continuations drain.
-        await drain();
+        // Rust consumes the promise on its own scheduler before closing or retrying.
+        await this.waitFor(() => read.frame.codedWidth === 0 || this.reads.some(
+            (next, position) => position > index && next.frame === read.frame),
+            `copy ${index} consumption`);
     }
 
     count() { return this.reads.length; }
@@ -338,6 +369,7 @@ export class ControlledDecoder {
 
     cleanup() {
         if (this.originalCopy) VideoFrame.prototype.copyTo = this.originalCopy;
+        for (const waiter of this.waiters) waiter.cancel();
         for (const read of this.reads) read.reject(new Error("test cleanup"));
         for (const frame of this.frames) frame.close();
     }

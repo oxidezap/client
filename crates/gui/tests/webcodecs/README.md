@@ -9,9 +9,12 @@ production admission helper and a real `VideoDecoder`.
 The readback fixture replaces `VideoDecoder` only while constructing a decoder. It sends
 synthetic, real `VideoFrame` objects through the registered output callback.
 Each `copyTo` executes in the browser immediately, but a promise gate withholds
-its completion until the test releases it. Tests await the real copy and drain
-the promise continuations before asserting results. No camera or H.264 encoder
-is needed.
+its completion until the test releases it. Tests await actual copy entry before
+resetting, dropping, or checking the active/pending order. Releasing a copy waits
+for Rust to close its frame or enter a fallback copy on that same frame. Neither
+wait polls nor releases a gate; a five-second deadline fails missing milestones.
+Exact copy-count, pixel, and publication assertions remain separate from the waits.
+No camera or H.264 encoder is needed.
 
 The recovery fixture uses real `VideoEncoder` and `VideoDecoder` instances,
 without replacing either global. It encodes two synthetic 32x32 canvas pictures
@@ -57,10 +60,10 @@ RUSTFLAGS='--cfg web_sys_unstable_apis' \
 CARGO_TARGET_DIR=target/webcodecs-tests \
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
-    --locked --target wasm32-unknown-unknown --test readback --test recovery
+    --locked --target wasm32-unknown-unknown --test readback --test recovery --test transform
 ```
 
-Use both explicit test targets in the `Test (web)` CI job with the same runner
+Use explicit test targets in the `Test (web)` CI job with the same runner
 as the daemon and session tests. Do not substitute `--all-targets`, which also
 builds the library's imported native unit tests requiring OpenH264.
 The separate workspace avoids the daemon and session dependencies
@@ -73,6 +76,29 @@ If Chrome is not installed in its default location, set
 `{"goog:chromeOptions":{"binary":"/absolute/path/to/chrome"}}`.
 `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER` can likewise name an absolute path
 to the matching runner. Do not commit machine-specific paths.
+
+To exercise the atomics scheduler too, use nightly with `rust-src` installed and
+the root's shared-memory flags, without the ordinary run's `RUSTFLAGS` override:
+
+```bash
+env -u RUSTFLAGS \
+  CARGO_TARGET_DIR=target/webcodecs-shared \
+  CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo +nightly test --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
+    --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort \
+    --test readback --test recovery --test transform
+```
+
+Runner 0.2.127 serves isolation headers for the shared module. With Chrome and
+ChromeDriver 153.0.8010.12, the page exposed `SharedArrayBuffer` without a browser
+feature override. This still does not run GPUI's worker pool or upload images.
+
+The old readback wait used one zero-delay timer. It returned before the first
+copy in the shared build, whose pending Rust futures resume through
+`Atomics.waitAsync`. The BGRA probe adds promise continuations before that copy.
+The shared suite reproduced 14 failures and two passes, while ordinary wasm
+passed all 16. Copy-entry and consumption milestones passed all 16 in both builds;
+adding another timer would not establish the required ordering.
 
 ## Coverage
 
@@ -92,10 +118,11 @@ to the matching runner. Do not commit machine-specific paths.
   publishing early or marking the decoder failed. Reset cancels that retry.
 
 The recovery target decodes compressed reference chains but does not assert
-whether Chrome selects hardware or software codecs. Neither target measures
-camera performance or draws through GPUI. Both run without the application's
-shared-memory configuration. RGBA and BGRA copies are real;
-older-browser behavior is injected around the native copying method.
+whether Chrome selects hardware or software codecs. These targets do not measure
+camera performance or draw through GPUI. The ordinary command omits the
+application's shared-memory configuration; the nightly command includes it.
+RGBA and BGRA copies are real; older-browser behavior is injected around the
+native copying method.
 
 ## Readback benchmark
 
