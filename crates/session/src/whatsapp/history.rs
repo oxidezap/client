@@ -53,14 +53,15 @@ impl LoadedHistory {
 
 /// What a debounced window of store invalidations forces a reload to cover.
 ///
-/// The store names the chat behind every message-level change, and a change
-/// confined to message rows leaves the list's order, membership and names
-/// alone — so the window can be answered by rebuilding just those chats.
-/// Anything else in the window (or a gap in it) widens the reload back to the
-/// whole list, because that is the only load allowed to prune.
+/// The store names the chat behind every per-chat change, and a change
+/// confined to one chat's rows leaves the list's membership and names
+/// alone — so the window can be answered by rebuilding just those chats,
+/// with every merge re-sorting them into place. Anything else in the window
+/// (or a gap in it) widens the reload back to the whole list, because that
+/// is the only load allowed to prune.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ReloadScope {
-    /// Only these chats' message sets moved.
+    /// Only these chats moved.
     Chats(HashSet<String>),
     /// Rebuild the display list.
     Everything,

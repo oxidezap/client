@@ -94,6 +94,21 @@ pub fn survives_complete_load(
     }
 }
 
+/// The sidebar order: pinned chats lead, most recently pinned first; the
+/// rest follow by activity; ties by JID, so every load renders the same
+/// order.
+///
+/// One function because three paths maintain it: the merge sort below, and
+/// the live insertion and repositioning in `super`, which ordered by
+/// activity alone and let a live message stand an unpinned chat above an
+/// older pinned one until the next load sorted them again.
+pub(super) fn chat_list_order(a: &Chat, b: &Chat) -> std::cmp::Ordering {
+    b.pinned_at
+        .cmp(&a.pinned_at)
+        .then_with(|| b.last_message_time.cmp(&a.last_message_time))
+        .then_with(|| a.jid.cmp(&b.jid))
+}
+
 /// The conversation list as one frame will draw it.
 ///
 /// Rows are derived once and shared, rather than recomputed per visible item:
@@ -183,14 +198,7 @@ impl WhatsAppApp {
                 }
             }
         }
-        self.chats.sort_by(|a, b| {
-            // Pinned chats lead, most recently pinned first; the rest follow
-            // by activity. Ties by JID, so every load renders the same order.
-            b.pinned_at
-                .cmp(&a.pinned_at)
-                .then_with(|| b.last_message_time.cmp(&a.last_message_time))
-                .then_with(|| a.jid.cmp(&b.jid))
-        });
+        self.chats.sort_by(|a, b| chat_list_order(a, b));
     }
 
     /// Put chats into the list, with everything that installing them owes.
