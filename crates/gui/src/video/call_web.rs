@@ -202,6 +202,10 @@ struct Stream {
     fed: std::cell::Cell<i32>,
     /// Whether this stream's shape has been said once. See [`Stream::describe`].
     described: std::cell::Cell<bool>,
+    /// The orientation bits the pane is currently drawing with. Said when it
+    /// moves: a camera switch that changes only the sender's rotation bits is
+    /// otherwise invisible in the log, and the picture keeps the old turn.
+    applied: std::cell::Cell<Option<u8>>,
 }
 
 impl Stream {
@@ -217,6 +221,7 @@ impl Stream {
             waiting: std::cell::Cell::new(false),
             fed: std::cell::Cell::new(0),
             described: std::cell::Cell::new(false),
+            applied: std::cell::Cell::new(None),
         }
     }
 
@@ -387,7 +392,17 @@ impl Stream {
 
         // Their device, not their picture: drawing it upright is undoing the
         // turn rather than repeating it.
-        decoder.set_rotation(Rotation::to_upright(frame.orientation));
+        let rotation = Rotation::to_upright(frame.orientation);
+        if self.applied.get() != Some(frame.orientation) {
+            self.applied.set(Some(frame.orientation));
+            log::debug!(
+                "the {:?} stream draws orientation bits {} as {:?}",
+                frame.stream,
+                frame.orientation,
+                rotation,
+            );
+        }
+        decoder.set_rotation(rotation);
         let stamp = self.fed.get();
         self.fed.set(stamp.wrapping_add(1));
         decoder.decode(&frame.data, stamp, recovers);
