@@ -65,7 +65,9 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 use whatsapp_rust::voip::RelayEndpointParams;
 use whatsapp_rust::wacore::voip::demux::{RelayPacketKind, classify_relay_packet};
-use whatsapp_rust::wacore::voip::rtp::RTP_PAYLOAD_TYPE_H264;
+use whatsapp_rust::wacore::voip::rtp::{
+    RTP_PAYLOAD_TYPE_H264, is_whatsapp_opus_rtp_payload, parse_whatsapp_media_frame_info,
+};
 use whatsapp_rust::wacore::voip::transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };
@@ -257,17 +259,18 @@ struct BrowserRelayChannel {
     /// So a second `disconnect` — the driver's polite close and then the drop
     /// — does not close a connection twice and log twice.
     closed: std::cell::Cell<bool>,
-    /// Whether the last send found the channel over [`OUTBOUND_CEILING`], so
-    /// congestion is one line and one line again when it clears.
+    /// Held until the buffer reaches the soft ceiling, even if audio is sent.
     congested: std::cell::Cell<bool>,
-    /// Counted for that second line: how much media the ceiling has dropped.
     outbound_dropped: std::cell::Cell<u32>,
+    ordinal: u64,
+    traffic: RefCell<Traffic>,
+    last_report: std::cell::Cell<wacore::time::Instant>,
     /// Where the outbound video stream is between access-unit boundaries.
     ///
     /// The ceiling may only be consulted at a boundary, so the verdict taken
     /// at one has to survive until the next. See [`Outbound`].
     au: std::cell::Cell<Outbound>,
-    /// Whether anything has gone out yet; see [`RelayTransport::send`].
+    /// Whether a browser send has succeeded.
     sent_any: std::cell::Cell<bool>,
     /// What has come *in*, kept as two answers rather than one.
     ///
@@ -287,20 +290,101 @@ struct BrowserRelayChannel {
     inbound: std::rc::Rc<InboundSeen>,
 }
 
-/// The RTP payload types seen in one direction, in the order they appeared.
-///
-/// A call carries two streams and they are told apart by nothing else on this
-/// path: `RelayPacketKind::Rtp` says "media" and stops there, so a page
-/// sending only audio and a page sending audio and video are the same three
-/// words in a log. That mattered exactly once and it was expensive — every
-/// stage of the outbound video path was proven to work, right up to the media
-/// plane, while the peer drew nothing, and the one question left was whether
-/// the packets carrying it ever reached the wire. Nothing could answer it.
-///
-/// The payload type is one byte and stays fixed for a stream, so the *set* is
-/// the whole answer: one type outbound is one stream leaving.
-#[derive(Default)]
-struct PayloadTypes(RefCell<Vec<u8>>);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Traffic {
+    accepted_packets: u64,
+    accepted_bytes: u64,
+    audio_packets: u64,
+    audio_bytes: u64,
+    video_packets: u64,
+    video_bytes: u64,
+    video_markers: u64,
+    video_idr_markers: u64,
+    audio_drop_packets: u64,
+    video_drop_packets: u64,
+    other_drop_packets: u64,
+    video_attempts: u64,
+    // Connecting, open, closing, closed, unknown. Open failures are send throws.
+    video_attempts_by_state: [u64; 5],
+    video_failures_by_state: [u64; 5],
+    send_errors: u64,
+    buffer_high_water: u32,
+    sample_counter: u8,
+}
+
+#[derive(Clone, Copy)]
+enum SendOutcome {
+    Drop,
+    NotOpen(usize),
+    SendError,
+    Accepted,
+}
+
+impl Traffic {
+    fn note(&mut self, data: &[u8], buffered: u32, outcome: SendOutcome) -> bool {
+        self.buffer_high_water = self.buffer_high_water.max(buffered);
+        let rtp = matches!(classify_relay_packet(data), RelayPacketKind::Rtp);
+        let pt = data.get(1).copied().unwrap_or(0) & 0x7f;
+        let video = rtp && pt == RTP_PAYLOAD_TYPE_H264;
+        let marker = video && data[1] & 0x80 != 0;
+        if video && !matches!(outcome, SendOutcome::Drop) {
+            self.video_attempts = self.video_attempts.saturating_add(1);
+            let state = match outcome {
+                SendOutcome::NotOpen(state) => state,
+                _ => 1,
+            };
+            self.video_attempts_by_state[state] =
+                self.video_attempts_by_state[state].saturating_add(1);
+            if !matches!(outcome, SendOutcome::Accepted) {
+                self.video_failures_by_state[state] =
+                    self.video_failures_by_state[state].saturating_add(1);
+            }
+        }
+        match outcome {
+            SendOutcome::Drop => {
+                let count = if video {
+                    &mut self.video_drop_packets
+                } else if rtp && is_whatsapp_opus_rtp_payload(pt) {
+                    &mut self.audio_drop_packets
+                } else {
+                    &mut self.other_drop_packets
+                };
+                *count = count.saturating_add(1);
+            }
+            SendOutcome::Accepted => {
+                self.accepted_packets = self.accepted_packets.saturating_add(1);
+                self.accepted_bytes = self.accepted_bytes.saturating_add(data.len() as u64);
+                if rtp && is_whatsapp_opus_rtp_payload(pt) {
+                    self.audio_packets = self.audio_packets.saturating_add(1);
+                    self.audio_bytes = self.audio_bytes.saturating_add(data.len() as u64);
+                }
+                if video {
+                    self.video_packets = self.video_packets.saturating_add(1);
+                    self.video_bytes = self.video_bytes.saturating_add(data.len() as u64);
+                    if marker {
+                        self.video_markers = self.video_markers.saturating_add(1);
+                        if parse_whatsapp_media_frame_info(data).is_some_and(|info| info & 8 != 0) {
+                            self.video_idr_markers = self.video_idr_markers.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            SendOutcome::SendError => self.send_errors = self.send_errors.saturating_add(1),
+            SendOutcome::NotOpen(_) => {}
+        }
+        self.sample_counter = self.sample_counter.wrapping_add(1);
+        marker || self.sample_counter == 0
+    }
+}
+
+/// RTP PTs in first-seen order. Outbound means browser admission, not delivery.
+struct PayloadTypes(RefCell<([u8; 128], usize)>);
+
+impl Default for PayloadTypes {
+    fn default() -> Self {
+        Self(RefCell::new(([0; 128], 0)))
+    }
+}
 
 impl PayloadTypes {
     /// Record this packet's payload type if it is RTP and new.
@@ -313,13 +397,16 @@ impl PayloadTypes {
             return;
         };
         let mut seen = self.0.borrow_mut();
-        if !seen.contains(&pt) {
-            seen.push(pt);
+        let (types, len) = &mut *seen;
+        if !types[..*len].contains(&pt) {
+            types[*len] = pt;
+            *len += 1;
         }
     }
 
     fn describe(&self) -> String {
         let seen = self.0.borrow();
+        let seen = &seen.0[..seen.1];
         if seen.is_empty() {
             return "none".to_string();
         }
@@ -460,6 +547,35 @@ enum Outbound {
 }
 
 impl BrowserRelayChannel {
+    fn note_send(&self, data: &[u8], buffered: u32, outcome: SendOutcome) {
+        let sample = self.traffic.borrow_mut().note(data, buffered, outcome);
+        if sample && log::log_enabled!(log::Level::Debug) {
+            let now = wacore::time::Instant::now();
+            if now.saturating_duration_since(self.last_report.get())
+                >= std::time::Duration::from_secs(5)
+            {
+                self.last_report.set(now);
+                self.report("activity");
+            }
+        }
+    }
+
+    fn report(&self, phase: &str) {
+        debug!(
+            "voip: relay transport={} {} datachannel_admission_only=true peer_receipt=unknown \
+             marker_scope=admitted_packets_not_complete_aus \
+             state_order=connecting,open,closing,closed,unknown counters={:?} \
+             admitted_rtp_pts=[{}] inbound_rtp_pts=[{}] inbound={} inbound_media={}",
+            self.ordinal,
+            phase,
+            self.traffic.borrow(),
+            self.inbound.outbound_types.describe(),
+            self.inbound.inbound_types.describe(),
+            yes_no(self.inbound.any.get()),
+            yes_no(self.inbound.media.get()),
+        );
+    }
+
     /// Whether this packet goes out, holding the verdict across an access unit.
     ///
     /// Control traffic is never dropped: STUN keeps the relay binding alive
@@ -470,14 +586,13 @@ impl BrowserRelayChannel {
     /// Audio is decided per packet, because one packet *is* one frame there —
     /// the unit logic below would be wrong for it, since Opus sets the marker
     /// bit by its own rules rather than at frame ends.
-    fn au_verdict(&self, data: &[u8]) -> Outbound {
+    fn au_verdict(&self, data: &[u8], buffered: u32) -> Outbound {
         if matches!(
             classify_relay_packet(data),
             RelayPacketKind::Stun | RelayPacketKind::Rtcp
         ) {
             return Outbound::Send;
         }
-        let buffered = self.channel.buffered_amount();
         let over_ceiling = buffered > OUTBOUND_CEILING;
         let wedged = buffered > OUTBOUND_HARD_CEILING;
         // The payload type and the marker bit share RTP's second byte: the top
@@ -556,57 +671,44 @@ impl RelayTransport for BrowserRelayChannel {
         // and holds for the rest of it. A unit already begun is finished
         // whatever the ceiling now says — the bytes are spent either way, and
         // spending the remainder is what makes them worth anything.
-        let verdict = self.au_verdict(&data);
+        let buffered = self.channel.buffered_amount();
+        let verdict = self.au_verdict(&data, buffered);
         if verdict == Outbound::Drop {
+            self.note_send(&data, buffered, SendOutcome::Drop);
             self.outbound_dropped
                 .set(self.outbound_dropped.get().saturating_add(1));
-            // Said once per run of congestion rather than per packet: at a
-            // call's frame rate this is otherwise a line per 20ms.
             if !self.congested.replace(true) {
                 warn!(
-                    "the relay channel is {} bytes behind; dropping outbound media until it \
-                     drains",
-                    self.channel.buffered_amount()
+                    "voip: relay transport={} is {} bytes behind; dropping outbound media until it drains",
+                    self.ordinal, buffered,
                 );
             }
             return Ok(());
         }
-        // Against the ceiling rather than against "this packet went out": the
-        // voice is exempt up to the hard ceiling, so while video is being shed
-        // every accepted audio packet took this exit -- announcing a drain
-        // that had not happened and clearing the count mid-run. What that
-        // costs is not only a wrong line: the flag is what makes the warning
-        // above once-per-run, so re-arming it every 20ms restored exactly the
-        // per-packet spam it exists to prevent.
-        if self.channel.buffered_amount() <= OUTBOUND_CEILING && self.congested.replace(false) {
+        // Audio is exempt up to the hard ceiling. An accepted audio packet
+        // must not announce a drain or re-arm the warning while video is shed.
+        if buffered <= OUTBOUND_CEILING && self.congested.replace(false) {
             debug!(
-                "the relay channel drained; {} outbound packets were dropped while it was behind",
-                self.outbound_dropped.replace(0)
+                "voip: relay transport={} drained; {} outbound packets were dropped while it was behind",
+                self.ordinal,
+                self.outbound_dropped.replace(0),
             );
         }
-        // Recorded here, past the ceiling above: what this has to answer is
-        // which streams reached the wire, and a packet the ceiling refused
-        // did not. Both directions keep this, since "we sent one stream" and
-        // "they sent us two" are different sentences about the same call.
-        if matches!(classify_relay_packet(&data), RelayPacketKind::Rtp) {
-            self.inbound.outbound_types.note(&data);
-        }
-        // Asked rather than inferred from the send returning. A channel that
-        // is `closing` or `closed` does not throw: the specification has the
-        // agent *buffer* the data, so a send onto a transport that will never
-        // deliver it comes back `Ok` — which is the one answer this marker
-        // may not take at face value, since its whole job is to say whether a
-        // packet reached the relay. An explicit error also names the state,
-        // where a `DOMException` string names the browser's wording for it.
-        //
-        // About *this packet* and never about the channel's history: a call
-        // that talked for a minute and then lost its transport takes this
-        // exit too, and a line here claiming nothing was carried would
-        // contradict the release line that correctly says it was.
-        if self.channel.ready_state() != web_sys::RtcDataChannelState::Open {
+        // Check this packet's state, not whether the channel ever opened or
+        // sent anything. A channel that talked for a minute can still close;
+        // naming the current state distinguishes that from a send exception.
+        let state = self.channel.ready_state();
+        if state != web_sys::RtcDataChannelState::Open {
+            let index = match state {
+                web_sys::RtcDataChannelState::Connecting => 0,
+                web_sys::RtcDataChannelState::Closing => 2,
+                web_sys::RtcDataChannelState::Closed => 3,
+                _ => 4,
+            };
+            self.note_send(&data, buffered, SendOutcome::NotOpen(index));
             return Err(anyhow!(
                 "the relay channel is not open ({:?}); this packet was not sent",
-                self.channel.ready_state()
+                state
             ));
         }
         // Copied out of linear memory, not viewed into it — the same rule
@@ -625,22 +727,29 @@ impl RelayTransport for BrowserRelayChannel {
         self.channel
             .send_with_array_buffer(&bytes.buffer())
             .inspect_err(|e| {
-                // Said here because nowhere else will: the drive loop's
-                // in-flight send arm answers `Err` with `break 'drive` and
-                // discards the reason, so a transport that cannot write is
-                // otherwise a call that ends for no stated reason.
-                warn!("voip: the relay channel refused a packet: {}", describe(e));
+                self.note_send(&data, buffered, SendOutcome::SendError);
+                // The drive loop answers a failed send with `break 'drive`
+                // and discards the reason. Keep it visible without debug logs.
+                warn!(
+                    "voip: relay transport={} refused a packet: {}",
+                    self.ordinal,
+                    describe(e),
+                );
             })
             .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))?;
-        // Marked *here*, and nowhere earlier: the question this answers is
-        // whether the driver ever got a packet onto the transport, so a send
-        // the browser rejected and a packet this side dropped for congestion
-        // both have to leave it unset — either would otherwise let a channel
-        // that carried nothing be released claiming it had. The first one,
-        // and only the first: at a call's frame rate the rest is a line per
-        // 20ms.
+        if matches!(classify_relay_packet(&data), RelayPacketKind::Rtp) {
+            self.inbound.outbound_types.note(&data);
+        }
+        self.note_send(
+            &data,
+            buffered.max(self.channel.buffered_amount()),
+            SendOutcome::Accepted,
+        );
         if !self.sent_any.replace(true) {
-            debug!("voip: the relay channel carried its first outbound packet");
+            debug!(
+                "voip: relay transport={} first outbound packet admitted to browser buffer",
+                self.ordinal,
+            );
         }
         Ok(())
     }
@@ -668,34 +777,7 @@ impl Drop for BrowserRelayChannel {
         // early return below is what makes this the only safe place for it:
         // it skips the closes, and it must not skip this.
         detach(&self.channel);
-        // Paired with the first-send line: together they say whether the
-        // driver ever used this transport. Dropped having sent nothing means
-        // the call's driver returned without asking the relay for anything,
-        // which is a very different fault from one that sent and then lost
-        // the channel — and the two are indistinguishable from a teardown
-        // that reports neither.
-        // Three answers, because they fail apart. Outbound says whether the
-        // driver ever reached the transport; inbound says whether the relay
-        // ever answered us at all; media says whether the *peer* got through
-        // it. "Sent, heard the relay, never heard the peer" is a bridge that
-        // was never made — the shape the first call of a production session
-        // took — and it reads identically to a working call unless the last
-        // two are asked separately.
-        // The payload types alongside them, because "outbound: yes" counts a
-        // call's audio and says nothing about its video — which is the exact
-        // gap that left a proven-working camera and a peer with no picture
-        // with no next question to ask.
-        debug!(
-            "voip: the relay channel sent RTP stream(s) {} and received {}",
-            self.inbound.outbound_types.describe(),
-            self.inbound.inbound_types.describe()
-        );
-        debug!(
-            "voip: the relay channel is being released (outbound: {}, inbound: {}, peer media: {})",
-            yes_no(self.sent_any.get()),
-            yes_no(self.inbound.any.get()),
-            yes_no(self.inbound.media.get()),
-        );
+        self.report("final");
         if self.closed.replace(true) {
             return;
         }
@@ -889,11 +971,19 @@ async fn connect_peer_connection(
             closed: std::cell::Cell::new(false),
             congested: std::cell::Cell::new(false),
             outbound_dropped: std::cell::Cell::new(0),
+            ordinal: next_transport_ordinal(),
+            traffic: RefCell::new(Traffic::default()),
+            last_report: std::cell::Cell::new(wacore::time::Instant::now()),
             sent_any: std::cell::Cell::new(false),
             inbound: seen,
         }),
         events_rx,
     ))
+}
+
+fn next_transport_ordinal() -> u64 {
+    static NEXT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, portable_atomic::Ordering::Relaxed)
 }
 
 /// For a log line that answers three questions in a row.
@@ -911,4 +1001,270 @@ fn describe(value: &wasm_bindgen::JsValue) -> String {
         .map(|e| String::from(e.message()))
         .or_else(|| value.as_string())
         .unwrap_or_else(|| format!("{value:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen::prelude::wasm_bindgen;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    std::thread_local! {
+        static LOGS: RefCell<Vec<(log::Level, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct TestLogger;
+
+    impl log::Log for TestLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            LOGS.with_borrow_mut(|logs| logs.push((record.level(), record.args().to_string())));
+        }
+
+        fn flush(&self) {}
+    }
+
+    struct RestoreLogLevel(log::LevelFilter);
+
+    impl Drop for RestoreLogLevel {
+        fn drop(&mut self) {
+            log::set_max_level(self.0);
+            LOGS.with_borrow_mut(Vec::clear);
+        }
+    }
+
+    fn log_count(level: log::Level, text: &str) -> usize {
+        LOGS.with_borrow(|logs| {
+            logs.iter()
+                .filter(|(actual, message)| *actual == level && message.contains(text))
+                .count()
+        })
+    }
+
+    fn video(marker: bool, idr: bool) -> Bytes {
+        let mut packet = [0u8; 28];
+        packet[0] = 0x90;
+        packet[1] = RTP_PAYLOAD_TYPE_H264 | if marker { 0x80 } else { 0 };
+        packet[12..18].copy_from_slice(&[0xde, 0xbe, 0, 3, 0x30, if idr { 8 } else { 0 }]);
+        Bytes::copy_from_slice(&packet)
+    }
+
+    #[wasm_bindgen_test]
+    fn counters_distinguish_admission_from_drops_and_failures() {
+        let mut traffic = Traffic::default();
+        let packet = video(true, true);
+        for outcome in [
+            SendOutcome::Drop,
+            SendOutcome::NotOpen(0),
+            SendOutcome::NotOpen(2),
+            SendOutcome::NotOpen(3),
+            SendOutcome::NotOpen(4),
+            SendOutcome::SendError,
+        ] {
+            traffic.note(&packet, 900_000, outcome);
+        }
+        assert_eq!(traffic.accepted_packets, 0);
+        assert_eq!(traffic.accepted_bytes, 0);
+        assert_eq!(traffic.video_markers, 0);
+        assert_eq!(traffic.video_idr_markers, 0);
+        assert_eq!(traffic.video_drop_packets, 1);
+        assert_eq!(traffic.video_attempts, 5);
+        assert_eq!(traffic.video_failures_by_state, [1; 5]);
+        traffic.note(&video(false, true), 0, SendOutcome::Accepted);
+        traffic.note(&packet, 10, SendOutcome::Accepted);
+        traffic.note(&video(true, false), 0, SendOutcome::Accepted);
+        assert_eq!(traffic.accepted_packets, 3);
+        assert_eq!(traffic.accepted_bytes, 84);
+        assert_eq!(traffic.video_packets, 3);
+        assert_eq!(traffic.video_bytes, 84);
+        assert_eq!(traffic.video_markers, 2);
+        assert_eq!(traffic.video_idr_markers, 1);
+        assert_eq!(traffic.video_attempts_by_state, [1, 4, 1, 1, 1]);
+        assert_eq!(traffic.buffer_high_water, 900_000);
+        let mut audio = [0; 12];
+        audio[0] = 0x80;
+        audio[1] = 120;
+        traffic.note(&audio, 0, SendOutcome::Drop);
+        traffic.note(&[], 0, SendOutcome::Drop);
+        assert_eq!(traffic.audio_drop_packets, 1);
+        assert_eq!(traffic.other_drop_packets, 1);
+        assert_eq!(traffic.accepted_packets, 3);
+        wasm_bindgen_test::console_log!("admission sequence {traffic:?}");
+    }
+
+    #[wasm_bindgen_test]
+    fn sampling_and_payload_types_are_bounded() {
+        let mut traffic = Traffic::default();
+        for _ in 0..255 {
+            assert!(!traffic.note(&[], 0, SendOutcome::Accepted));
+        }
+        assert!(traffic.note(&[], 0, SendOutcome::Accepted));
+        assert!(traffic.note(&video(true, false), 0, SendOutcome::Drop));
+        assert!(!traffic.note(&video(false, true), 0, SendOutcome::Accepted));
+        let types = PayloadTypes::default();
+        for _ in 0..2 {
+            for pt in 0..128 {
+                types.note(&[0x80, pt]);
+            }
+        }
+        assert_eq!(types.0.borrow().1, 128);
+        assert_eq!(types.0.borrow().0[127], 127);
+        traffic.accepted_packets = u64::MAX;
+        traffic.note(&[], 0, SendOutcome::Accepted);
+        assert_eq!(traffic.accepted_packets, u64::MAX);
+        wasm_bindgen_test::console_log!(
+            "fixed diagnostic storage traffic={} bytes payload_types={} bytes",
+            std::mem::size_of::<Traffic>(),
+            std::mem::size_of::<PayloadTypes>(),
+        );
+    }
+
+    #[wasm_bindgen(inline_js = "
+        export function patchChannel(channel, state, buffered, throws) {
+            Object.defineProperty(channel, 'readyState', {configurable: true, value: state});
+            Object.defineProperty(channel, 'bufferedAmount', {configurable: true, value: buffered});
+            channel.send = function(buffer) {
+                if (!(buffer instanceof ArrayBuffer)) throw new Error('not an ArrayBuffer');
+                this.testCalls = (this.testCalls || 0) + 1;
+                if (throws) throw new Error('synthetic send failure');
+                this.testBytes = (this.testBytes || 0) + buffer.byteLength;
+            };
+        }
+        export function sentCalls(channel) { return channel.testCalls || 0; }
+        export function sentBytes(channel) { return channel.testBytes || 0; }
+    ")]
+    extern "C" {
+        #[wasm_bindgen(js_name = patchChannel)]
+        fn patch_channel(
+            channel: &web_sys::RtcDataChannel,
+            state: &str,
+            buffered: u32,
+            throws: bool,
+        );
+        #[wasm_bindgen(js_name = sentCalls)]
+        fn sent_calls(channel: &web_sys::RtcDataChannel) -> u32;
+        #[wasm_bindgen(js_name = sentBytes)]
+        fn sent_bytes(channel: &web_sys::RtcDataChannel) -> u32;
+    }
+
+    #[wasm_bindgen_test]
+    async fn production_send_accounts_only_successful_browser_calls() {
+        let memory = wasm_bindgen::memory().unchecked_into::<js_sys::WebAssembly::Memory>();
+        let shared = memory
+            .buffer()
+            .is_instance_of::<js_sys::SharedArrayBuffer>();
+        assert_eq!(shared, cfg!(target_feature = "atomics"));
+        wasm_bindgen_test::console_log!(
+            "WASM memory.buffer instanceof SharedArrayBuffer = {shared}"
+        );
+        log::set_logger(&TestLogger).unwrap();
+        let _restore = RestoreLogLevel(log::max_level());
+        log::set_max_level(log::LevelFilter::Info);
+        assert!(!log::log_enabled!(log::Level::Debug));
+        let connection = web_sys::RtcPeerConnection::new().unwrap();
+        let channel = connection.create_data_channel("test");
+        let relay = BrowserRelayChannel {
+            connection,
+            channel,
+            _wiring: Wiring {
+                _on_message: Closure::wrap(Box::new(|_: web_sys::MessageEvent| {})),
+                _on_close: Closure::wrap(Box::new(|_: web_sys::Event| {})),
+                _on_error: Closure::wrap(Box::new(|_: web_sys::Event| {})),
+                _on_state: Closure::wrap(Box::new(|_: web_sys::Event| {})),
+            },
+            closed: std::cell::Cell::new(false),
+            congested: std::cell::Cell::new(false),
+            outbound_dropped: std::cell::Cell::new(0),
+            ordinal: next_transport_ordinal(),
+            traffic: RefCell::new(Traffic::default()),
+            last_report: std::cell::Cell::new(wacore::time::Instant::now()),
+            au: std::cell::Cell::new(Outbound::Between),
+            sent_any: std::cell::Cell::new(false),
+            inbound: Rc::new(InboundSeen::default()),
+        };
+        patch_channel(&relay.channel, "open", OUTBOUND_CEILING + 1, false);
+        assert!(relay.send(video(false, true)).await.is_ok());
+        patch_channel(&relay.channel, "open", 0, false);
+        assert!(relay.send(video(true, true)).await.is_ok());
+        assert_eq!(sent_calls(&relay.channel), 0);
+        for state in ["connecting", "closing", "closed"] {
+            patch_channel(&relay.channel, state, 0, false);
+            assert!(relay.send(video(true, true)).await.is_err());
+        }
+        assert_eq!(sent_calls(&relay.channel), 0);
+        patch_channel(&relay.channel, "open", 0, true);
+        assert!(relay.send(video(true, true)).await.is_err());
+        assert_eq!(log_count(log::Level::Warn, "synthetic send failure"), 1);
+        assert_eq!(log_count(log::Level::Debug, ""), 0);
+        LOGS.with_borrow(|logs| wasm_bindgen_test::console_log!("info-level records {logs:?}"));
+        assert_eq!(relay.inbound.outbound_types.describe(), "none");
+        assert!(!relay.sent_any.get());
+        assert_eq!(relay.traffic.borrow().accepted_packets, 0);
+        log::set_max_level(log::LevelFilter::Debug);
+        patch_channel(&relay.channel, "open", 0, false);
+        assert!(relay.send(video(false, true)).await.is_ok());
+        patch_channel(&relay.channel, "open", OUTBOUND_HARD_CEILING + 1, false);
+        assert!(relay.send(video(true, true)).await.is_ok());
+        let mut audio = [0; 12];
+        audio[0] = 0x80;
+        audio[1] = 120;
+        assert!(relay.send(Bytes::copy_from_slice(&audio)).await.is_ok());
+        assert_eq!(relay.inbound.outbound_types.describe(), "97");
+        patch_channel(&relay.channel, "open", OUTBOUND_CEILING + 1, false);
+        assert!(relay.send(Bytes::copy_from_slice(&audio)).await.is_ok());
+        assert_eq!(relay.inbound.outbound_types.describe(), "97, 120");
+        let traffic = *relay.traffic.borrow();
+        assert_eq!(sent_calls(&relay.channel), 4);
+        assert_eq!(sent_bytes(&relay.channel), 68);
+        assert_eq!(traffic.accepted_packets, 3);
+        assert_eq!(traffic.accepted_bytes, 68);
+        assert_eq!(traffic.audio_packets, 1);
+        assert_eq!(traffic.audio_bytes, 12);
+        assert_eq!(traffic.video_packets, 2);
+        assert_eq!(traffic.video_markers, 1);
+        assert_eq!(traffic.video_idr_markers, 1);
+        assert_eq!(traffic.video_drop_packets, 2);
+        assert_eq!(traffic.audio_drop_packets, 1);
+        assert_eq!(traffic.video_attempts_by_state, [1, 3, 1, 1, 0]);
+        assert_eq!(traffic.video_failures_by_state, [1, 1, 1, 1, 0]);
+        assert_eq!(traffic.send_errors, 1);
+        assert_eq!(traffic.buffer_high_water, OUTBOUND_HARD_CEILING + 1);
+        wasm_bindgen_test::console_log!("production send calls=4 accepted_bytes=68 {traffic:?}");
+        assert_eq!(
+            log_count(
+                log::Level::Debug,
+                "first outbound packet admitted to browser buffer"
+            ),
+            1
+        );
+
+        patch_channel(&relay.channel, "open", 0, false);
+        assert!(relay.send(Bytes::copy_from_slice(&audio)).await.is_ok());
+        LOGS.with_borrow_mut(Vec::clear);
+        let calls_before_congestion = sent_calls(&relay.channel);
+        for _ in 0..8 {
+            patch_channel(&relay.channel, "open", OUTBOUND_CEILING + 1, false);
+            assert!(relay.send(video(true, false)).await.is_ok());
+            assert!(relay.send(Bytes::copy_from_slice(&audio)).await.is_ok());
+        }
+        assert_eq!(sent_calls(&relay.channel), calls_before_congestion + 8);
+        assert_eq!(log_count(log::Level::Warn, "dropping outbound media"), 1);
+        assert_eq!(log_count(log::Level::Debug, "drained"), 0);
+        patch_channel(&relay.channel, "open", OUTBOUND_CEILING, false);
+        assert!(relay.send(Bytes::copy_from_slice(&audio)).await.is_ok());
+        assert_eq!(
+            log_count(log::Level::Debug, "8 outbound packets were dropped"),
+            1
+        );
+        assert!(relay.send(Bytes::copy_from_slice(&audio)).await.is_ok());
+        assert_eq!(log_count(log::Level::Debug, "drained"), 1);
+        patch_channel(&relay.channel, "open", OUTBOUND_CEILING + 1, false);
+        assert!(relay.send(video(true, false)).await.is_ok());
+        assert_eq!(log_count(log::Level::Warn, "dropping outbound media"), 2);
+        LOGS.with_borrow(|logs| wasm_bindgen_test::console_log!("congestion records {logs:?}"));
+        relay.disconnect().await;
+    }
 }
