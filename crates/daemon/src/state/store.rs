@@ -204,11 +204,15 @@ impl StateStore {
     pub(super) fn snapshot(&self) -> StateSnapshot {
         let inner = self.lock();
         let mut chats: Vec<ChatSummary> = inner.chats.values().map(|e| e.summary.clone()).collect();
-        // Newest first, and by JID when timestamps tie, so two clients given
-        // the same state render the same order.
+        // Pinned first (most recently pinned at the top), then newest first,
+        // and by JID when timestamps tie, so two clients given the same state
+        // render the same order.
         chats.sort_by(|a, b| {
             let ts = |c: &ChatSummary| c.last_message.as_ref().map_or(i64::MIN, |m| m.timestamp_ms);
-            ts(b).cmp(&ts(a)).then_with(|| a.jid.cmp(&b.jid))
+            b.pinned_at_ms
+                .cmp(&a.pinned_at_ms)
+                .then_with(|| ts(b).cmp(&ts(a)))
+                .then_with(|| a.jid.cmp(&b.jid))
         });
         StateSnapshot {
             version: inner.version,
@@ -453,7 +457,75 @@ mod tests {
             unread,
             manually_unread: false,
             last_message: None,
+            pinned_at_ms: None,
         }))
+    }
+
+    fn pinned_chat(jid: &str, pinned_at_ms: i64, last_ms: i64) -> Change {
+        Change::live(DaemonEvent::ChatUpdated(ChatSummary {
+            jid: jid.into(),
+            name: jid.into(),
+            unread: 0,
+            manually_unread: false,
+            pinned_at_ms: Some(pinned_at_ms),
+            last_message: Some(oxidezap_ipc::MessagePreview {
+                id: None,
+                text: "t".into(),
+                from_me: false,
+                timestamp_ms: last_ms,
+            }),
+        }))
+    }
+
+    fn active_chat(jid: &str, last_ms: i64) -> Change {
+        Change::live(DaemonEvent::ChatUpdated(ChatSummary {
+            jid: jid.into(),
+            name: jid.into(),
+            unread: 0,
+            manually_unread: false,
+            pinned_at_ms: None,
+            last_message: Some(oxidezap_ipc::MessagePreview {
+                id: None,
+                text: "t".into(),
+                from_me: false,
+                timestamp_ms: last_ms,
+            }),
+        }))
+    }
+
+    /// Pinned chats lead the snapshot, most recently pinned first, whatever
+    /// their activity says: a pin is what puts a quiet chat above a loud one.
+    #[test]
+    fn a_snapshot_lists_pinned_chats_before_recent_ones() {
+        let store = store();
+        for change in [
+            active_chat("recent@s.whatsapp.net", 1_700_000_200_000),
+            pinned_chat(
+                "old-pin@s.whatsapp.net",
+                1_700_000_010_000,
+                1_700_000_000_000,
+            ),
+            pinned_chat(
+                "new-pin@s.whatsapp.net",
+                1_700_000_020_000,
+                1_699_999_000_000,
+            ),
+            active_chat("older@s.whatsapp.net", 1_700_000_100_000),
+        ] {
+            store.apply_unless_stale(change, None, || ());
+        }
+
+        let snapshot = store.snapshot();
+        let order: Vec<&str> = snapshot.chats.iter().map(|c| c.jid.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "new-pin@s.whatsapp.net",
+                "old-pin@s.whatsapp.net",
+                "recent@s.whatsapp.net",
+                "older@s.whatsapp.net",
+            ]
+        );
     }
 
     /// The claim exists so that publication is ordered, and the store's part

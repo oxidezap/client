@@ -428,7 +428,11 @@ pub struct MediaRef {
 pub enum StoreChange {
     /// Chat-list-level change: ordering, previews, unread counts, membership.
     Chats,
-    /// The message set of one chat changed (insert/edit/revoke/reaction/status).
+    /// One chat changed and only that chat needs rebuilding: its message set
+    /// (insert/edit/revoke/reaction/status), or a list-row field that moves
+    /// it without touching membership (a pin). The reloader answers with a
+    /// scoped load that fetches the chat by JID, so it reaches one that has
+    /// fallen past the first page.
     Messages { chat: Jid },
     /// Contact naming changed.
     Contacts,

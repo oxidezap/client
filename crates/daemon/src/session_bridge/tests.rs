@@ -153,6 +153,26 @@ fn a_complete_reload_does_not_wipe_a_chat_it_has_never_held() {
     );
 }
 
+/// A pin the store published reaches the hub's summary: without it the pin
+/// lived in the database and died on the way to every front end.
+#[test]
+fn a_reload_carries_a_chat_pin_into_the_summary() {
+    let mut pinned = stored_chat(
+        "1@s.whatsapp.net",
+        0,
+        vec![message("m1", "1@s.whatsapp.net", 10, false, true)],
+    );
+    pinned.pinned_at =
+        Some(chrono::DateTime::from_timestamp_millis(1_700_000_010_000).expect("a valid instant"));
+    let mut bridge = bridge();
+    bridge.observe(loaded(vec![pinned]));
+
+    assert_eq!(
+        bridge.hub.chat("1@s.whatsapp.net").unwrap().pinned_at_ms,
+        Some(1_700_000_010_000),
+    );
+}
+
 /// The other half of the same rule: once the store has published a chat,
 /// its absence from a complete reload really does mean deleted.
 #[test]

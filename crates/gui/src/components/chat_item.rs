@@ -114,6 +114,14 @@ fn render_name_row(
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child(name),
         )
+        .children(row.pinned.then(|| {
+            div()
+                .flex_shrink_0()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(metrics.text_meta())
+                .text_color(parts::subtle(cx))
+                .child("Pinned")
+        }))
         .children(row.timestamp.map(|timestamp| {
             div()
                 .flex_shrink_0()

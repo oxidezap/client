@@ -1805,7 +1805,7 @@ impl WhatsAppApp {
     fn add_message_to_chat(&mut self, jid: &str, message: ChatMessage, cx: &mut App) -> bool {
         if let Some(index) = self.chats.iter().position(|c| c.jid == jid) {
             if Arc::make_mut(&mut self.chats[index]).add_message(message) {
-                self.reposition_chat_by_time(index);
+                self.reposition_chat(index);
             }
             // Always invalidate chat cache since the chat's content changed
             // (even if it didn't move, the last message preview needs updating)
@@ -1839,7 +1839,11 @@ impl WhatsAppApp {
             Some(name) => Chat::with_name(jid.to_string(), name.clone()),
             None => Chat::new(jid.to_string()),
         };
-        self.chats.insert(0, Arc::new(chat));
+        // Into its sidebar slot, not index 0: a fresh chat carries no pin
+        // and no head, so it sorts at the end until traffic moves it.
+        let chat = Arc::new(chat);
+        let target = slot_for_chat(&self.chats, &chat);
+        self.chats.insert(target, chat);
         self.invalidate_chat_cache();
     }
 
@@ -1924,7 +1928,7 @@ impl WhatsAppApp {
         }
     }
 
-    /// Move a chat to where its `last_message_time` belongs, newest first.
+    /// Move a chat to where it belongs in the sidebar order.
     ///
     /// The one answer for every arrival, live traffic included. "Advanced" is
     /// a fact about that chat and not about the list: a catch-up drain after
@@ -1936,14 +1940,16 @@ impl WhatsAppApp {
     /// clock it arrived with, so it can advance its own conversation and
     /// still be older than another chat's head.
     ///
-    /// `None` sorts last, which is where `Reverse(last_message_time)` puts a
-    /// chat with nothing in it.
-    fn reposition_chat_by_time(&mut self, index: usize) {
+    /// Pinned chats keep their pin grouping here exactly as the merge sort
+    /// does: an unpinned chat with a newer head does not stand above an
+    /// older pinned one. `None` heads sort last, which is where the merge
+    /// sort puts a chat with nothing in it.
+    fn reposition_chat(&mut self, index: usize) {
         if index >= self.chats.len() {
             return;
         }
         let chat = self.chats.remove(index);
-        let target = slot_newest_first(&self.chats, chat.last_message_time);
+        let target = slot_for_chat(&self.chats, &chat);
         self.chats.insert(target, chat);
         // Note: chat cache invalidation is handled by the caller
     }
@@ -2681,7 +2687,7 @@ impl WhatsAppApp {
             // To where its own head belongs, newest first; duplicates and
             // older backfills do not reorder at all.
             if advanced {
-                self.reposition_chat_by_time(index);
+                self.reposition_chat(index);
             }
 
             // Always invalidate caches since chat content changed
@@ -2712,7 +2718,11 @@ impl WhatsAppApp {
             }
 
             new_chat.add_message(message);
-            self.chats.insert(0, Arc::new(new_chat));
+            // A live chat joins the same order a load would put it in, below
+            // the pinned block rather than above it.
+            let new_chat = Arc::new(new_chat);
+            let target = slot_for_chat(&self.chats, &new_chat);
+            self.chats.insert(target, new_chat);
             self.invalidate_chat_cache();
         }
 
@@ -2900,7 +2910,7 @@ impl WhatsAppApp {
         // conversation. Not the unread count: see above.
         if chat.last_message_time.is_none_or(|last| at > last) {
             chat.last_message_time = Some(at);
-            self.reposition_chat_by_time(index);
+            self.reposition_chat(index);
         }
 
         self.invalidate_message_cache(&chat_jid, cx);
@@ -3250,14 +3260,15 @@ fn over_budget(held: usize, entries: usize) -> bool {
     entries >= MAX_DECODED_IMAGES || (held > DECODED_IMAGE_BUDGET && entries > MIN_DECODED_IMAGES)
 }
 
-/// Where a chat whose head is `at` belongs in a newest-first list that does
-/// not contain it: the first slot whose neighbour is strictly older.
+/// Where `chat` belongs in a sidebar-ordered list that does not contain it:
+/// the first slot whose neighbour sorts strictly after it.
 ///
-/// `None` is older than any timestamp, so an empty conversation lands at the
-/// end — the same place `Reverse(last_message_time)` puts it.
-fn slot_newest_first(rest: &[Arc<Chat>], at: Option<chrono::DateTime<chrono::Utc>>) -> usize {
+/// An unpinned head sorts below every pinned one and a `None` head below
+/// every dated one, so an empty conversation lands behind every dated
+/// one — the same place the merge sort puts it.
+fn slot_for_chat(rest: &[Arc<Chat>], chat: &Chat) -> usize {
     rest.iter()
-        .position(|other| other.last_message_time < at)
+        .position(|other| chats::chat_list_order(chat, other) == std::cmp::Ordering::Less)
         .unwrap_or(rest.len())
 }
 
@@ -3312,6 +3323,12 @@ mod tests {
         let mut chat = Chat::new(jid.to_string());
         chat.last_message_time = secs.and_then(at);
         chat
+    }
+
+    fn pinned_chat(jid: &str, pin_secs: i64, secs: Option<i64>) -> Chat {
+        let mut pinned = chat(jid, secs);
+        pinned.pinned_at = at(pin_secs);
+        pinned
     }
 
     fn timeline_of(ids: &[&str]) -> MessageListCache {
@@ -3702,7 +3719,7 @@ mod tests {
     #[test]
     fn the_newest_head_goes_first() {
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(20)))];
-        assert_eq!(slot_newest_first(&rest, at(40)), 0);
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(40))), 0);
     }
 
     #[test]
@@ -3711,7 +3728,7 @@ mod tests {
         // after a history load advances its own conversation and is still
         // older than the chat above it.
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(10)))];
-        assert_eq!(slot_newest_first(&rest, at(20)), 1);
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(20))), 1);
     }
 
     /// Each entry holds a second full copy of the conversation, and nothing
@@ -3745,30 +3762,66 @@ mod tests {
     fn a_catch_up_arriving_out_of_order_still_lands_newest_first() {
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(20)))];
         // An older conversation catching up does not stand above a newer one.
-        assert_eq!(slot_newest_first(&rest, at(25)), 1);
-        assert_eq!(slot_newest_first(&rest, at(35)), 0);
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(25))), 1);
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(35))), 0);
     }
 
     #[test]
     fn the_oldest_head_goes_last() {
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(20)))];
-        assert_eq!(slot_newest_first(&rest, at(10)), 2);
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(10))), 2);
     }
 
-    /// `None` is below every `Some`, and the predicate is strict, so an empty
-    /// conversation clears neither the dated chat nor the empty one already
-    /// sitting there: it goes to the very end. That is the tie rule below,
-    /// applied to two chats that are equally undated.
+    /// `None` is below every `Some`, so an empty conversation clears every
+    /// dated chat — but equally undated chats still order by JID descending,
+    /// the store's rule (`ChatStore::chats_page` ranks ties by `jid DESC`
+    /// and pages on with `jid < cursor.jid`).
     #[test]
-    fn an_empty_conversation_sorts_last_of_all() {
+    fn an_empty_conversation_sorts_after_every_dated_one() {
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", None))];
-        assert_eq!(slot_newest_first(&rest, None), 2);
+        assert_eq!(slot_for_chat(&rest, &chat("d", None)), 1);
+        assert_eq!(
+            slot_for_chat(&rest, &chat("a", None)),
+            2,
+            "the lower JID trails the tied chat it follows"
+        );
     }
 
+    /// Ties break by JID descending, the store's rule: a tied head with the
+    /// higher JID stands above the incumbent rather than beneath it, which
+    /// is what keeps a page boundary from re-sorting rows the previous page
+    /// already drew.
     #[test]
-    fn an_equal_head_keeps_the_incumbent_above_it() {
+    fn a_tied_head_sorts_by_descending_jid() {
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(10)))];
-        assert_eq!(slot_newest_first(&rest, at(30)), 1);
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(30))), 0);
+        assert_eq!(slot_for_chat(&rest, &chat("a", Some(30))), 1);
+    }
+
+    /// The live slot keeps the pin grouping the merge sort maintains: a busy
+    /// unpinned chat must not stand above an older pinned one until the next
+    /// load, and a pinned one leads by pin time whatever its head says.
+    #[test]
+    fn live_slots_keep_the_pin_grouping() {
+        let rest = [
+            Arc::new(pinned_chat("p", 100, Some(10))),
+            Arc::new(chat("b", Some(30))),
+        ];
+        assert_eq!(
+            slot_for_chat(&rest, &chat("d", Some(40))),
+            1,
+            "newer but unpinned: below the pin, above the rest"
+        );
+        assert_eq!(
+            slot_for_chat(&rest, &pinned_chat("q", 200, Some(5))),
+            0,
+            "later pin leads the pinned block"
+        );
+        assert_eq!(
+            slot_for_chat(&rest, &pinned_chat("r", 50, Some(99))),
+            1,
+            "earlier pin trails it despite the newer head"
+        );
     }
 }
 

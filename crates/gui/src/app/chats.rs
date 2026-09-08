@@ -94,6 +94,28 @@ pub fn survives_complete_load(
     }
 }
 
+/// The sidebar order: pinned chats lead, most recently pinned first; the
+/// rest follow by activity; ties by JID descending, so every load renders
+/// the same order.
+///
+/// Descending, because that is the store's order: `ChatStore::chats_page`
+/// ranks equal `(pinned_at, last_message_ts)` rows by `jid DESC` and walks
+/// on with `jid < cursor.jid`. An ascending tie-breaker here sorted a tied
+/// row from the next page ahead of the rows the previous page had already
+/// drawn, instead of appending it behind them — and message timestamps are
+/// second-granular, so ties are ordinary.
+///
+/// One function because three paths maintain it: the merge sort below, and
+/// the live insertion and repositioning in `super`, which ordered by
+/// activity alone and let a live message stand an unpinned chat above an
+/// older pinned one until the next load sorted them again.
+pub(super) fn chat_list_order(a: &Chat, b: &Chat) -> std::cmp::Ordering {
+    b.pinned_at
+        .cmp(&a.pinned_at)
+        .then_with(|| b.last_message_time.cmp(&a.last_message_time))
+        .then_with(|| b.jid.cmp(&a.jid))
+}
+
 /// The conversation list as one frame will draw it.
 ///
 /// Rows are derived once and shared, rather than recomputed per visible item:
@@ -183,8 +205,7 @@ impl WhatsAppApp {
                 }
             }
         }
-        self.chats
-            .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
+        self.chats.sort_by(|a, b| chat_list_order(a, b));
     }
 
     /// Put chats into the list, with everything that installing them owes.
@@ -316,6 +337,44 @@ mod tests {
     fn filter_ids_are_stable_and_distinct() {
         let ids: Vec<&str> = ChatFilter::ALL.iter().map(|f| f.id()).collect();
         assert_eq!(ids, vec!["all", "unread", "groups"]);
+    }
+
+    fn tied_chat(jid: &str, pin_secs: Option<i64>, secs: Option<i64>) -> Chat {
+        let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0);
+        let mut chat = Chat::new(jid.to_string());
+        chat.pinned_at = pin_secs.and_then(at);
+        chat.last_message_time = secs.and_then(at);
+        chat
+    }
+
+    /// The store pages ties by JID descending (`jid < cursor.jid`), so the
+    /// list must too: an ascending tie-breaker sorted a tied row from the
+    /// next page ahead of the previous page's rows instead of appending it
+    /// behind them. Message timestamps are second-granular, so ties are
+    /// ordinary — and both runs (pinned and activity) share the rule.
+    #[test]
+    fn tied_chats_sort_like_the_store_page() {
+        for (pin_secs, secs) in [
+            (Some(1_700_000_100), Some(1_700_000_000)),
+            (None, Some(1_700_000_000)),
+        ] {
+            let lower = tied_chat("559900000001@s.whatsapp.net", pin_secs, secs);
+            let higher = tied_chat("559900000002@s.whatsapp.net", pin_secs, secs);
+            assert_eq!(
+                chat_list_order(&lower, &higher),
+                std::cmp::Ordering::Greater,
+                "the higher JID leads on a tie (pin {pin_secs:?})"
+            );
+            let mut chats = [lower.clone(), higher.clone()];
+            chats.sort_by(chat_list_order);
+            assert_eq!(
+                chats
+                    .iter()
+                    .map(|chat| chat.jid.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["559900000002@s.whatsapp.net", "559900000001@s.whatsapp.net"]
+            );
+        }
     }
 
     /// A stopwatch rather than an assertion: what finding a page's chats in

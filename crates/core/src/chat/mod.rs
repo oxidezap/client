@@ -96,6 +96,10 @@ pub struct Chat {
     pub unread_count: u32,
     /// Manually marked unread (WA's `-1` sentinel): badge without a count.
     pub manually_unread: bool,
+    /// When this chat was pinned, if it is. Pinned chats sort above the rest
+    /// of the list; the store owns the timestamp and hydration restores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<DateTime<Utc>>,
     /// Whether this is a group chat
     pub is_group: bool,
     /// Whether this is the status broadcast.
@@ -169,6 +173,7 @@ impl Chat {
             last_message_time: None,
             unread_count: 0,
             manually_unread: false,
+            pinned_at: None,
             is_group,
             is_status,
             participants: HashMap::new(),

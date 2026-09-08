@@ -148,6 +148,11 @@ pub struct ChatSummary {
     /// render such a chat as read.
     pub manually_unread: bool,
     pub last_message: Option<MessagePreview>,
+    /// When this chat was pinned, as millis since the epoch. `None` reads as
+    /// unpinned, which is also what a daemon built before this field says
+    /// about every chat — skipped when absent so those frames stay small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at_ms: Option<i64>,
 }
 
 impl ChatSummary {
@@ -155,6 +160,12 @@ impl ChatSummary {
     #[must_use]
     pub fn has_unread(&self) -> bool {
         self.unread > 0 || self.manually_unread
+    }
+
+    /// Whether this chat is pinned above the rest of the list.
+    #[must_use]
+    pub fn is_pinned(&self) -> bool {
+        self.pinned_at_ms.is_some()
     }
 
     /// Whether this row is the status broadcast rather than a conversation.
@@ -1131,6 +1142,7 @@ mod tests {
             unread,
             manually_unread: false,
             last_message: None,
+            pinned_at_ms: None,
         };
         let snapshot = StateSnapshot {
             version: StateVersion::INITIAL,
@@ -1190,6 +1202,7 @@ mod tests {
                 unread: 0,
                 manually_unread: false,
                 last_message: None,
+                pinned_at_ms: None,
             }),
             DaemonEvent::ChatRemoved {
                 jid: "559900000001@s.whatsapp.net".into(),
@@ -1311,6 +1324,7 @@ mod tests {
             unread,
             manually_unread: false,
             last_message: None,
+            pinned_at_ms: None,
         };
         let snapshot = StateSnapshot {
             version: StateVersion::INITIAL,
@@ -1334,6 +1348,7 @@ mod tests {
             unread: 0,
             manually_unread: true,
             last_message: None,
+            pinned_at_ms: None,
         };
         assert!(chat.has_unread(), "it carries a badge");
 
@@ -1453,6 +1468,7 @@ mod tests {
                 name: "Alice".into(),
                 unread: 2,
                 manually_unread: false,
+                pinned_at_ms: None,
                 last_message: Some(MessagePreview {
                     id: Some("3EB0".into()),
                     text: "hi".into(),

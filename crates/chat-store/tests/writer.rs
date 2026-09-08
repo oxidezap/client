@@ -80,6 +80,49 @@ async fn invalidation_broadcast_fires_per_batch() {
     assert!(got_chats && got_messages);
 }
 
+/// A pin moves one chat without touching membership, so it names the chat
+/// rather than buying the whole list: the scoped reload fetches it by JID
+/// even after unpinning drops it past the first page, where a whole-list
+/// reload would never reach it.
+#[tokio::test]
+async fn a_pin_names_its_chat_instead_of_the_whole_list() {
+    let (_store, chat_store) = test_store().await;
+    let mut changes = chat_store.subscribe();
+    feed(
+        &chat_store,
+        [Event::PinUpdate(
+            wacore::types::events::PinUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(ts(1_700_000_050))
+                .action(Box::new(wa::sync_action_value::PinAction {
+                    pinned: Some(true),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+
+    let mut named = false;
+    // The pin was sent before flush() returned; drain with a timeout so a
+    // regression fails fast instead of hanging.
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_secs(5), changes.recv()).await {
+            Ok(Ok(StoreChange::Messages { chat })) => {
+                assert_eq!(chat, jid(PEER));
+                named = true;
+            }
+            Ok(Ok(StoreChange::Chats)) => panic!("a pin must not buy the whole list"),
+            Ok(Ok(StoreChange::Contacts)) => {}
+            Ok(Err(_)) | Err(_) => break,
+        }
+        if named {
+            break;
+        }
+    }
+    assert!(named, "a pin names its chat");
+}
+
 fn inbound_message(id: &str) -> InboundMessage {
     InboundMessage::builder()
         .message(Arc::new(wa::Message::text("durable")))

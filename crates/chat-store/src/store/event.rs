@@ -158,7 +158,11 @@ pub(super) fn apply_event(
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::pinned_at.eq(pinned_at))
                 .execute(conn)?;
-            cs.chats = true;
+            // Named, not whole-list: a pin moves one chat without touching
+            // membership, so the debounced reload rebuilds just it — fetched
+            // by JID even when unpinning drops it past the first page, where
+            // the whole-list reload a `Chats` buys would never reach it.
+            cs.message_chats.insert(chat);
             Ok(())
         }
         Event::MuteUpdate(update) => {

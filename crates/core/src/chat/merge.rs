@@ -86,6 +86,13 @@ impl Chat {
         }
         self.unread_count = hydrated.unread_count;
         self.manually_unread = hydrated.manually_unread;
+        // The store owns the pin: a load that carries one sets it, and one
+        // that omits it (a live-built value, never a store row — every store
+        // read names the column) must not clear what an earlier load set.
+        // `None` here means "this value says nothing", not "unpinned".
+        if hydrated.pinned_at.is_some() || hydrated.from_store {
+            self.pinned_at = hydrated.pinned_at;
+        }
         if hydrated.last_message_time >= self.last_message_time {
             // What an absent preview means depends on whether the load
             // brought messages. With messages, the store simply has no TEXT
@@ -428,6 +435,45 @@ mod tests {
 
         chat.merge_history(Chat::new("12025550143@s.whatsapp.net".to_string()));
         assert!(chat.from_store);
+    }
+
+    #[test]
+    fn hydration_with_a_pin_pins_the_chat() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        assert!(chat.pinned_at.is_none());
+
+        let mut hydrated = Chat::from_store(jid, "Someone".to_string(), 0);
+        hydrated.pinned_at = Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        chat.merge_history(hydrated);
+
+        assert_eq!(
+            chat.pinned_at,
+            Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn hydration_without_a_pin_unpins_the_chat() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        chat.pinned_at = Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+
+        let hydrated = Chat::from_store(jid, "Someone".to_string(), 0);
+        chat.merge_history(hydrated);
+
+        assert!(chat.pinned_at.is_none());
+    }
+
+    #[test]
+    fn a_live_value_without_a_pin_does_not_unpin_the_chat() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        chat.pinned_at = Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+
+        chat.merge_history(Chat::new(jid));
+
+        assert!(chat.pinned_at.is_some());
     }
 
     #[test]
