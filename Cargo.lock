@@ -6346,6 +6346,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxidezap-call-fixture"
+version = "0.0.0"
+dependencies = [
+ "whatsapp-rust",
+]
+
+[[package]]
 name = "oxidezap-chat-store"
 version = "0.1.0"
 dependencies = [
@@ -6561,6 +6568,7 @@ dependencies = [
  "log",
  "mp4",
  "oxidezap-audio",
+ "oxidezap-call-fixture",
  "oxidezap-chat-store",
  "oxidezap-core",
  "oxidezap-platform",
@@ -9986,7 +9994,7 @@ dependencies = [
 [[package]]
 name = "wacore"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -10035,7 +10043,7 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "anyhow",
  "buffa",
@@ -10056,7 +10064,7 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "bytes",
  "compact_str",
@@ -10073,7 +10081,7 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10083,7 +10091,7 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "aes 0.9.3",
  "async-lock",
@@ -10114,7 +10122,7 @@ dependencies = [
 [[package]]
 name = "wacore-noise"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "anyhow",
  "buffa",
@@ -10166,7 +10174,7 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "buffa",
  "buffa-build",
@@ -10719,7 +10727,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10752,6 +10760,7 @@ dependencies = [
  "tokio",
  "wacore",
  "wacore-binary",
+ "wacore-noise",
  "waproto",
  "whatsapp-rust-sqlite-storage",
  "whatsapp-rust-tokio-transport",
@@ -10762,7 +10771,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "async-trait",
  "buffa",
@@ -10784,7 +10793,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10804,7 +10813,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=test%2Fvoip-call-fixture#a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -12,6 +12,9 @@ repository.workspace = true
 name = "oxidezapd"
 path = "src/main.rs"
 
+[features]
+test-support = ["oxidezap-session/test-support"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
