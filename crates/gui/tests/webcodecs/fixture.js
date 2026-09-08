@@ -47,60 +47,57 @@ export class ControlledDecoder {
     }
 
     async benchmark(width, height, format, rounds, peer) {
-        const decoded = format.startsWith("decoded:");
-        const mode = format.split(":")[1];
-        const codec = "avc1.42001f";
-        const encoderConfig = {codec, width, height, bitrate: 2500000,
-            framerate: 20, latencyMode: "realtime", avc: {format: "annexb"}};
-        const decoderConfig = {codec, codedWidth: width, codedHeight: height,
-            hardwareAcceleration: mode, optimizeForLatency: true};
-        const support = [];
-        const chunks = [];
-        const bursts = [];
-        let encoder, decoder, canvas, context, encoded, decodedFrame, failure;
-        let encodedCount = 0, decodedCount = 0, encodedBytes = 0;
-        if (decoded) {
-            for (const hardwareAcceleration of ["no-preference", "prefer-hardware", "prefer-software"]) {
-                support.push({hardwareAcceleration,
-                    encoder: await VideoEncoder.isConfigSupported({...encoderConfig, hardwareAcceleration}),
-                    decoder: await VideoDecoder.isConfigSupported({...decoderConfig, hardwareAcceleration})});
-            }
-            if (!support.find(s => s.hardwareAcceleration === mode).decoder.supported) {
-                if (this.originalCopy) {
-                    VideoFrame.prototype.copyTo = this.originalCopy;
-                    this.originalCopy = undefined;
-                }
-                return JSON.stringify({format, support, decodedCount: 0, copiedFrames: [0, 0],
-                    copiedBytes: [0, 0], skipped: "decoder configuration unsupported"});
-            }
-            encoder = new VideoEncoder({output(chunk) {
-                encodedCount++; encodedBytes += chunk.byteLength; encoded = chunk;
-                if (chunks.length < 66) chunks.push(chunk);
-            }, error(error) { failure = error; }});
-            encoder.configure(encoderConfig);
-            decoder = new VideoDecoder({output(frame) {
-                decodedCount++; decodedFrame(frame);
-            }, error(error) { failure = error; }});
-            decoder.configure(decoderConfig);
-            canvas = new OffscreenCanvas(width, height);
-            context = canvas.getContext("2d");
-        }
-        const size = format === "I420" ? width * height * 1.5 : width * height * 4;
-        const data = new Uint8Array(size).fill(128);
-        const samples = [[], []];
-        const copies = [[], []];
-        const calls = [[], []];
-        const materialization = [[], []];
-        const bytes = [0, 0];
-        const sourceFormats = new Set();
-        const firstOutputMs = [];
-        const copyFormats = [];
-        let template = decoded ? null : new VideoFrame(data, {
-            format, codedWidth: width, codedHeight: height, timestamp: 0,
-        });
-        const runStart = performance.now();
-        let elapsedMs;
+        let encoder, decoder, template;
         try {
+            const decoded = format.startsWith("decoded:");
+            const mode = format.split(":")[1];
+            const codec = "avc1.42001f";
+            const encoderConfig = {codec, width, height, bitrate: 2500000,
+                framerate: 20, latencyMode: "realtime", avc: {format: "annexb"}};
+            const decoderConfig = {codec, codedWidth: width, codedHeight: height,
+                hardwareAcceleration: mode, optimizeForLatency: true};
+            const support = [];
+            const chunks = [];
+            const bursts = [];
+            let canvas, context, encoded, decodedFrame, failure;
+            let encodedCount = 0, decodedCount = 0, encodedBytes = 0;
+            if (decoded) {
+                for (const hardwareAcceleration of ["no-preference", "prefer-hardware", "prefer-software"]) {
+                    support.push({hardwareAcceleration,
+                        encoder: await VideoEncoder.isConfigSupported({...encoderConfig, hardwareAcceleration}),
+                        decoder: await VideoDecoder.isConfigSupported({...decoderConfig, hardwareAcceleration})});
+                }
+                if (!support.find(s => s.hardwareAcceleration === mode).decoder.supported) {
+                    return JSON.stringify({format, support, decodedCount: 0, copiedFrames: [0, 0],
+                        copiedBytes: [0, 0], skipped: "decoder configuration unsupported"});
+                }
+                encoder = new VideoEncoder({output(chunk) {
+                    encodedCount++; encodedBytes += chunk.byteLength; encoded = chunk;
+                    if (chunks.length < 66) chunks.push(chunk);
+                }, error(error) { failure = error; }});
+                encoder.configure(encoderConfig);
+                decoder = new VideoDecoder({output(frame) {
+                    decodedCount++; decodedFrame(frame);
+                }, error(error) { failure = error; }});
+                decoder.configure(decoderConfig);
+                canvas = new OffscreenCanvas(width, height);
+                context = canvas.getContext("2d");
+            }
+            const size = format === "I420" ? width * height * 1.5 : width * height * 4;
+            const data = new Uint8Array(size).fill(128);
+            const samples = [[], []];
+            const copies = [[], []];
+            const calls = [[], []];
+            const materialization = [[], []];
+            const bytes = [0, 0];
+            const sourceFormats = new Set();
+            const firstOutputMs = [];
+            const copyFormats = [];
+            template = decoded ? null : new VideoFrame(data, {
+                format, codedWidth: width, codedHeight: height, timestamp: 0,
+            });
+            const runStart = performance.now();
+            let elapsedMs;
             for (let i = 0; i < rounds + 20; i++) {
                 if (decoded) {
                     await new Promise(resolve => setTimeout(resolve,
@@ -182,35 +179,39 @@ export class ControlledDecoder {
                     bursts.push(await fixture.benchmarkBurst(chunks, decoderConfig));
                 }
             }
+            if (copyFormats[0] !== "RGBA" || copyFormats[1] !== "BGRA") {
+                throw new Error(`benchmark did not compare RGBA/BGRA: ${copyFormats}`);
+            }
+            const stats = values => {
+                values.sort((a, b) => a - b);
+                return { mean: values.reduce((a, b) => a + b, 0) / values.length,
+                    median: values[Math.floor(values.length / 2)],
+                    p95: values[Math.floor(values.length * .95)] };
+            };
+            return JSON.stringify({ browser: navigator.userAgent, width, height, format,
+                rounds, warmup: 20, elapsedMs,
+                support, encodedCount, decodedCount, encodedBytes, sourceFormats: [...sourceFormats],
+                bursts,
+                copiedFrames: samples.map(s => s.length), copiedBytes: bytes,
+                firstOutputMs, copyFormats, baseline: { outputMs: stats(samples[0]), copyMs: stats(copies[0]),
+                    callMs: stats(calls[0]), postCopyMs: stats(materialization[0]) },
+                candidate: { outputMs: stats(samples[1]), copyMs: stats(copies[1]),
+                    callMs: stats(calls[1]), postCopyMs: stats(materialization[1]) } });
         } finally {
-            template?.close();
-            if (encoder && encoder.state !== "closed") encoder.close();
-            if (decoder && decoder.state !== "closed") decoder.close();
-            // A throw before the per-iteration restore must not leak the
-            // format override into later tests sharing this browser realm.
             if (this.originalCopy) {
                 VideoFrame.prototype.copyTo = this.originalCopy;
                 this.originalCopy = undefined;
             }
+            try {
+                template?.close();
+            } finally {
+                try {
+                    if (encoder && encoder.state !== "closed") encoder.close();
+                } finally {
+                    if (decoder && decoder.state !== "closed") decoder.close();
+                }
+            }
         }
-        if (copyFormats[0] !== "RGBA" || copyFormats[1] !== "BGRA") {
-            throw new Error(`benchmark did not compare RGBA/BGRA: ${copyFormats}`);
-        }
-        const stats = values => {
-            values.sort((a, b) => a - b);
-            return { mean: values.reduce((a, b) => a + b, 0) / values.length,
-                median: values[Math.floor(values.length / 2)],
-                p95: values[Math.floor(values.length * .95)] };
-        };
-        return JSON.stringify({ browser: navigator.userAgent, width, height, format,
-            rounds, warmup: 20, elapsedMs,
-            support, encodedCount, decodedCount, encodedBytes, sourceFormats: [...sourceFormats],
-            bursts,
-            copiedFrames: samples.map(s => s.length), copiedBytes: bytes,
-            firstOutputMs, copyFormats, baseline: { outputMs: stats(samples[0]), copyMs: stats(copies[0]),
-                callMs: stats(calls[0]), postCopyMs: stats(materialization[0]) },
-            candidate: { outputMs: stats(samples[1]), copyMs: stats(copies[1]),
-                callMs: stats(calls[1]), postCopyMs: stats(materialization[1]) } });
     }
 
     async benchmarkBurst(chunks, config) {
