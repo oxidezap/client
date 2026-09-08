@@ -246,6 +246,246 @@ async fn a_mention_of_a_stranger_hides_the_internal_digits() {
     );
 }
 
+/// A reply quoting a message that itself mentions someone: the quote bar
+/// draws the nested original verbatim, so its own mention list gets the same
+/// rewrite the body just got — on the hydrated page.
+#[tokio::test]
+async fn a_hydrated_quote_names_the_mentioned_contact() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const MENTIONED: &str = "559900000002@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-quote").await;
+    // The mentioned contact says who they are somewhere else entirely.
+    feed(
+        &chat_store,
+        from(
+            MENTIONED,
+            MENTIONED,
+            Some("Bia"),
+            wa::Message::text("estou por aqui"),
+            "MSG-BIA",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let reply = wa::Message {
+        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
+            text: Some("olha isso".to_string()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                stanza_id: Some("MSG-ORIG".to_string()),
+                participant: Some(MENTIONED.to_string()),
+                quoted_message: buffa::MessageField::some(wa::Message {
+                    extended_text_message: buffa::MessageField::some(
+                        message::ExtendedTextMessage {
+                            text: Some("oi @559900000002, vem".to_string()),
+                            context_info: buffa::MessageField::some(wa::ContextInfo {
+                                mentioned_jid: vec![MENTIONED.to_string()],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Ana"),
+            reply,
+            "MSG-REPLY",
+            1_700_000_100,
+        ),
+    )
+    .await;
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book_with(&chat_store),
+        TEST_GROUP.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+    assert_eq!(page.items[0].content, "olha isso");
+    assert_eq!(
+        page.items[0]
+            .quoted
+            .as_ref()
+            .expect("a reply carries its quote")
+            .preview,
+        "oi @Bia, vem"
+    );
+}
+
+/// The same quote on the live path: the inbound bubble's preview is rewritten
+/// before publishing, not only when reloaded.
+#[tokio::test]
+async fn a_live_quote_names_the_mentioned_contact() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const MENTIONED: &str = "559900000002@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-quote-live").await;
+    feed(
+        &chat_store,
+        from(
+            MENTIONED,
+            MENTIONED,
+            Some("Bia"),
+            wa::Message::text("estou por aqui"),
+            "MSG-BIA",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let reply = wa::Message {
+        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
+            text: Some("olha isso".to_string()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                stanza_id: Some("MSG-ORIG".to_string()),
+                participant: Some(MENTIONED.to_string()),
+                quoted_message: buffa::MessageField::some(wa::Message {
+                    extended_text_message: buffa::MessageField::some(
+                        message::ExtendedTextMessage {
+                            text: Some("oi @559900000002, vem".to_string()),
+                            context_info: buffa::MessageField::some(wa::ContextInfo {
+                                mentioned_jid: vec![MENTIONED.to_string()],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let info = live_info(
+        TEST_GROUP,
+        TEST_PEER,
+        Some("Ana"),
+        "MSG-REPLY",
+        1_700_000_100,
+    );
+    WhatsAppClient::handle_inbound_message(
+        &reply,
+        &info,
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        false,
+    )
+    .await;
+    match ui_rx.try_recv() {
+        Ok(oxidezap_core::UiEvent::MessageReceived { message, .. }) => {
+            assert_eq!(message.content, "olha isso");
+            assert_eq!(
+                message
+                    .quoted
+                    .as_ref()
+                    .expect("a reply carries its quote")
+                    .preview,
+                "oi @Bia, vem"
+            );
+        }
+        other => panic!("the reply never reached the window: {other:?}"),
+    }
+}
+
+/// An unknown group sender mentioning themselves: their push name is already
+/// on the envelope and labels their bubble, so the `@` inside it reads the
+/// same rather than falling back to digits the label just hid.
+#[tokio::test]
+async fn a_live_self_mention_uses_the_sender_push_name() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const SELF: &str = "559900000003@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-self").await;
+    let mention_self = wa::Message {
+        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
+            text: Some("oi @559900000003, sou eu".to_string()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                mentioned_jid: vec![SELF.to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let info = live_info(TEST_GROUP, SELF, Some("Cida"), "MSG-SELF", 1_700_000_100);
+    WhatsAppClient::handle_inbound_message(
+        &mention_self,
+        &info,
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        false,
+    )
+    .await;
+    match ui_rx.try_recv() {
+        Ok(oxidezap_core::UiEvent::MessageReceived {
+            message,
+            sender_name,
+            ..
+        }) => {
+            assert_eq!(
+                sender_name.as_deref(),
+                Some("Cida"),
+                "the premise: the bubble is already named"
+            );
+            assert_eq!(message.content, "oi @Cida, sou eu");
+        }
+        other => panic!("the mention never reached the window: {other:?}"),
+    }
+}
+
+/// One inbound message's envelope, spelled out: the same fields [`from`]
+/// builds, without the event around them, for driving the live path directly.
+fn live_info(
+    chat: &str,
+    sender: &str,
+    push_name: Option<&str>,
+    id: &str,
+    ts_secs: i64,
+) -> whatsapp_rust::wacore::types::message::MessageInfo {
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+    MessageInfo {
+        source: MessageSource {
+            chat: chat.parse().expect("test JID"),
+            sender: sender.parse().expect("test JID"),
+            ..Default::default()
+        },
+        id: id.to_string().into(),
+        timestamp: whatsapp_rust::wacore::time::from_secs(ts_secs).expect("test timestamp"),
+        push_name: push_name.unwrap_or_default().to_string().into(),
+        ..Default::default()
+    }
+}
+
 /// The stream reaches this side ordered and used to be handled on a task
 /// per event, so a call's later stanza could run before the offer that
 /// made it: the removal finds nothing, the offer's task files the call

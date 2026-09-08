@@ -51,7 +51,7 @@ pub(crate) async fn hydrate_mention_lists(
         if jids.is_empty() {
             continue;
         }
-        let pairs = mention_names(client, names, jids).await;
+        let pairs = mention_names(client, names, jids, None).await;
         if pairs.is_empty() {
             continue;
         }
@@ -62,6 +62,45 @@ pub(crate) async fn hydrate_mention_lists(
             media.caption = Some(apply_to(&pairs, caption));
         }
     }
+}
+
+/// Rewrite the `@`-mentions in hydrated quote bars to the names the book has.
+///
+/// A reply's preview is built verbatim from its nested `quoted_message`
+/// proto, whose own mention list the outer rewrite never touches — so without
+/// this a reloaded quote bar shows the digits the live one had just replaced.
+/// `quoted_lists` runs parallel to `msgs`, like `mention_lists` does; read
+/// them off with [`quoted_mention_lists_of`].
+pub(crate) async fn hydrate_quoted_mention_lists(
+    client: &Arc<Client>,
+    names: &NameBook,
+    quoted_lists: &[Vec<String>],
+    msgs: &mut [ChatMessage],
+) {
+    for (jids, msg) in quoted_lists.iter().zip(msgs.iter_mut()) {
+        if jids.is_empty() {
+            continue;
+        }
+        let pairs = mention_names(client, names, jids, None).await;
+        if pairs.is_empty() {
+            continue;
+        }
+        if let Some(quoted) = msg.quoted.as_mut() {
+            quoted.preview = apply_to(&pairs, std::mem::take(&mut quoted.preview));
+        }
+    }
+}
+
+/// Read the nested quoted mention lists off stored rows, in order.
+///
+/// Split from [`hydrate_quoted_mention_lists`] for the same reason
+/// [`mention_lists_of`] is split from [`hydrate_mention_lists`]: the
+/// conversion between them consumes the rows the lists are read off.
+pub(crate) fn quoted_mention_lists_of(stored: &[StoredMessage]) -> Vec<Vec<String>> {
+    stored
+        .iter()
+        .map(|row| mentioned_jids(nested_quoted(row.message.as_deref())))
+        .collect()
 }
 
 /// The JIDs `message` mentions, as written in its mention list.
@@ -108,6 +147,12 @@ pub(crate) fn mentioned_jids(message: Option<&wa::Message>) -> Vec<String> {
 /// the same last resort every other surface falls back to, so a stranger
 /// reads in a mention the way they read over their own bubble.
 ///
+/// `sender_offer` is the live envelope's `(sender, push name)`: an otherwise
+/// unknown group sender mentioning themselves would otherwise cache a miss
+/// and read as a number while their own bubble is already named. It is used
+/// only for the mentioned JID that identifies the sender, and only where the
+/// address book has nothing — the same order the bubble label uses.
+///
 /// Most messages mention nobody, and those cost nothing here: the list is
 /// read synchronously first, and the book is only asked when it names
 /// someone.
@@ -115,12 +160,31 @@ pub(crate) async fn resolve_for(
     client: &Arc<Client>,
     names: &NameBook,
     message: Option<&wa::Message>,
+    sender_offer: Option<(&Jid, &str)>,
 ) -> Vec<(String, String)> {
     let jids = mentioned_jids(message);
     if jids.is_empty() {
         return Vec::new();
     }
-    mention_names(client, names, &jids).await
+    mention_names(client, names, &jids, sender_offer).await
+}
+
+/// Rewrite the `@`-mentions in a reply's nested quoted preview.
+///
+/// The quote bar renders the original's text verbatim from its nested
+/// `quoted_message` proto, whose own mention list the outer rewrite never
+/// touches. For the live path; hydration reads the lists up front with
+/// [`quoted_mention_lists_of`] instead.
+pub(crate) async fn resolve_quoted_for(
+    client: &Arc<Client>,
+    names: &NameBook,
+    message: &wa::Message,
+) -> Vec<(String, String)> {
+    let jids = mentioned_jids(nested_quoted(Some(message)));
+    if jids.is_empty() {
+        return Vec::new();
+    }
+    mention_names(client, names, &jids, None).await
 }
 
 /// Apply resolved `(user part, display name)` pairs to `text.
@@ -145,19 +209,35 @@ pub(crate) fn apply_to(pairs: &[(String, String)], text: String) -> String {
 /// one, and the generic label otherwise. A JID that will not even parse names
 /// nothing and is skipped: its token stays as typed rather than gaining a
 /// name guessed from digits.
+///
+/// `sender_offer` carries the live sender's push name through to their own
+/// mention: it is offered only to the JID that identifies the sender —
+/// matched on the canonical identity, so a PN mention of a LID-addressed
+/// sender still counts — and `known` still prefers the address book over it.
 async fn mention_names(
     client: &Arc<Client>,
     names: &NameBook,
     jids: &[String],
+    sender_offer: Option<(&Jid, &str)>,
 ) -> Vec<(String, String)> {
+    let sender_identity = match sender_offer {
+        Some((sender, _)) => Some(names.identity(client, sender).await),
+        None => None,
+    };
     let mut out = Vec::with_capacity(jids.len());
     for jid in jids {
         let Ok(parsed) = jid.parse::<Jid>() else {
             continue;
         };
         let identity = names.identity(client, &parsed).await;
+        let offered = match (&sender_offer, &sender_identity) {
+            (Some((_, push)), Some(sender)) if identity.canonical_jid == sender.canonical_jid => {
+                Some(*push)
+            }
+            _ => None,
+        };
         let name = names
-            .known(client, &parsed, None)
+            .known(client, &parsed, offered)
             .await
             .unwrap_or_else(|| identity.fallback_name.clone());
         let user = parsed.user_base().to_string();
@@ -166,6 +246,37 @@ async fn mention_names(
         }
     }
     out
+}
+
+/// The nested original a reply quotes, if it quoted one.
+///
+/// The linkage lives on the reply body's context while the original's text
+/// and its own mention list live on the proto beside it — which is what the
+/// quote bar draws and what [`resolve_quoted_for`] renames by.
+fn nested_quoted(message: Option<&wa::Message>) -> Option<&wa::Message> {
+    let base = peel(message?);
+    macro_rules! quoted {
+        ($($field:ident),+ $(,)?) => {$(
+            if let Some(body) = base.$field.as_option()
+                && let Some(context) = body.context_info.as_option()
+                && let Some(quoted) = context.quoted_message.as_option()
+            {
+                return Some(quoted.get_base_message());
+            }
+        )+};
+    }
+    // The bodies a reply is ever sent as: the same set `crate::quoting`
+    // reads the quote itself off.
+    quoted!(
+        extended_text_message,
+        image_message,
+        video_message,
+        ptv_message,
+        audio_message,
+        document_message,
+        sticker_message,
+    );
+    None
 }
 
 /// The message under its envelopes.

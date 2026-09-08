@@ -406,10 +406,18 @@ impl WhatsAppClient {
                     status_views.extend(watched_ids(&page));
                 }
                 let mention_lists = crate::mentions::mention_lists_of(&page);
+                let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
                 crate::mentions::hydrate_mention_lists(client, names, &mention_lists, &mut msgs)
                     .await;
+                crate::mentions::hydrate_quoted_mention_lists(
+                    client,
+                    names,
+                    &quoted_lists,
+                    &mut msgs,
+                )
+                .await;
                 Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut msgs).await;
                 Self::hydrate_quoted_authors(client, names, &mut msgs).await;
                 // Groups *and* the status broadcast: both carry rows written
@@ -450,11 +458,19 @@ impl WhatsAppClient {
                 status_views.extend(watched_ids(&page));
             }
             let mention_lists = crate::mentions::mention_lists_of(&page);
+            let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             crate::mentions::hydrate_mention_lists(
                 client,
                 names,
                 &mention_lists,
+                &mut chat.messages,
+            )
+            .await;
+            crate::mentions::hydrate_quoted_mention_lists(
+                client,
+                names,
+                &quoted_lists,
                 &mut chat.messages,
             )
             .await;

@@ -19,6 +19,13 @@
 /// The scan is one pass over the bytes. Names are pushed literally and never
 /// re-scanned, so a name carrying `@` or digits cannot become a second
 /// mention.
+///
+/// A name carrying WhatsApp's markup markers is another matter: the GUI runs
+/// the whole content through `parse_rich_text`, so a contact called `_Ana_`
+/// would come out italic and could even pair with markers the sender typed
+/// around the mention. The markers in a substituted name are redrawn as their
+/// fullwidth lookalikes, which no marker scan treats as delimiters — the name
+/// stays literal while the sender's own markup around it still parses.
 pub fn format_mentions(text: &str, mentions: &[(&str, &str)]) -> String {
     if !text.contains('@') || mentions.is_empty() {
         return text.to_string();
@@ -51,13 +58,35 @@ pub fn format_mentions(text: &str, mentions: &[(&str, &str)]) -> String {
             Some(name) => {
                 out.push_str(&text[rest..token]);
                 out.push('@');
-                out.push_str(name);
+                out.push_str(&literal_name(name));
             }
             None => out.push_str(&text[rest..digits]),
         }
         rest = digits;
     }
     out
+}
+
+/// A substituted name with its markup markers neutralized.
+///
+/// Only the four ASCII delimiters `parse_rich_text` acts on are redrawn; a
+/// name without them borrows rather than allocates, which is nearly every
+/// name drawn.
+fn literal_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.bytes().any(|b| matches!(b, b'*' | b'_' | b'~' | b'`')) {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '*' => out.push('＊'),
+            '_' => out.push('＿'),
+            '~' => out.push('～'),
+            '`' => out.push('｀'),
+            _ => out.push(ch),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -147,5 +176,27 @@ mod tests {
             ),
             "bom dia @Ana"
         );
+    }
+
+    #[test]
+    fn a_name_carrying_markup_stays_literal() {
+        // The bubble is drawn through `parse_rich_text`, so a contact called
+        // `_Ana_` would otherwise come out italic — and could pair with
+        // markers the sender typed around the mention.
+        let drawn = format_mentions("oi @559900000002!", mentions(&[("559900000002", "_Ana_")]));
+        assert_eq!(drawn, "oi @＿Ana＿!");
+        let rich = crate::parse_rich_text(&drawn);
+        assert!(rich.is_plain(), "{rich:?} must carry no emphasis");
+        assert_eq!(rich.text, "oi @＿Ana＿!");
+    }
+
+    #[test]
+    fn markup_around_a_mention_still_parses() {
+        // Only the substituted name is neutralized; the sender's own markup
+        // keeps working.
+        let drawn = format_mentions("*oi* @559900000002", mentions(&[("559900000002", "_Ana_")]));
+        let rich = crate::parse_rich_text(&drawn);
+        assert_eq!(rich.text, "oi @＿Ana＿");
+        assert!(!rich.is_plain(), "{rich:?} must keep the sender's bold");
     }
 }
