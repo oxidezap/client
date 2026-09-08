@@ -22,7 +22,7 @@ use gpui_component::ActiveTheme as _;
 
 use crate::theme::ActiveProductTheme as _;
 
-use oxidezap_core::{Emphasis, LinkSpan, find_message_links, parse_rich_text};
+use oxidezap_core::{Emphasis, LinkSpan, find_links_in, parse_rich_text};
 
 /// One message's text, parsed once.
 ///
@@ -52,18 +52,32 @@ pub struct BubbleText {
     /// which is the common case, and the case that then costs one refcount
     /// per frame and nothing else.
     links: Arc<[LinkSpan]>,
+    /// What each link opens, shared the same way. Resolved once, here,
+    /// rather than once per repaint: turning every target `String` into a
+    /// `SharedString` on every frame copied peer-controlled text with the
+    /// message length, over and over, for no new information.
+    link_targets: Arc<[SharedString]>,
 }
 
 impl BubbleText {
     /// Parse `source` once, for the timeline that will draw it many times.
     pub fn of(source: &str) -> Self {
         let rich = parse_rich_text(source);
-        let links: Arc<[LinkSpan]> = find_message_links(&rich.text).into();
+        // Against the parsed text, not the source: the ranges describe what
+        // the reader sees, and the span edges count as boundaries where a
+        // removed delimiter stood — see `find_links_in` — so an address
+        // starting where formatting ends is still found.
+        let links: Arc<[LinkSpan]> = find_links_in(&rich).into();
+        let link_targets: Arc<[SharedString]> = links
+            .iter()
+            .map(|link| SharedString::from(link.target.as_str()))
+            .collect();
         if rich.is_plain() {
             return Self {
                 text: rich.text.into(),
                 runs: Arc::from([]),
                 links,
+                link_targets,
             };
         }
         let runs = rich.runs();
@@ -71,6 +85,7 @@ impl BubbleText {
             text: rich.text.into(),
             runs: runs.into(),
             links,
+            link_targets,
         }
     }
 
@@ -78,6 +93,13 @@ impl BubbleText {
     /// text box at all, because a media message routinely has no caption.
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    /// What each link opens, in link order. The message menu lists these, so
+    /// every address has an equivalent activation route beside the inline
+    /// pointer one.
+    pub fn link_targets(&self) -> &Arc<[SharedString]> {
+        &self.link_targets
     }
 }
 
@@ -210,11 +232,9 @@ fn render_with_links(parsed: &BubbleText, cx: &App) -> impl IntoElement + use<> 
         .with_highlights(highlights)
         .with_font_family_overrides(code);
     let ranges: Vec<Range<usize>> = parsed.links.iter().map(|link| link.range.clone()).collect();
-    let targets: Vec<SharedString> = parsed
-        .links
-        .iter()
-        .map(|link| SharedString::from(link.target.clone()))
-        .collect();
+    // A refcount per frame, not a copy per target: the strings were shared
+    // when the bubble was parsed.
+    let targets = parsed.link_targets.clone();
     // One instance per bubble, scoped under the row's own id.
     InteractiveText::new("message-links", styled).on_click(ranges, move |ix, _window, cx| {
         cx.open_url(&targets[ix]);
@@ -350,6 +370,56 @@ mod tests {
             "https://example.com"
         );
         assert_eq!(parsed.links[0].target, "https://example.com");
+    }
+
+    /// Removing the closing marker joins the label to the address, where it
+    /// reads as the middle of a word. The span edge marks where the
+    /// delimiter stood, so detection still sees the boundary and the
+    /// address stays clickable.
+    #[test]
+    fn a_link_right_after_formatted_text_is_still_a_link() {
+        let parsed = BubbleText::of("*label*https://example.com");
+        assert_eq!(parsed.text, "labelhttps://example.com");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(
+            &parsed.text[parsed.links[0].range.clone()],
+            "https://example.com"
+        );
+        assert_eq!(parsed.links[0].target, "https://example.com");
+        assert_eq!(parsed.link_targets().len(), 1);
+        assert_eq!(parsed.link_targets()[0], "https://example.com");
+    }
+
+    /// A closer followed by text ends the address at the closer: the marker
+    /// must not leak into the target the click opens.
+    #[test]
+    fn a_link_closer_followed_by_text_does_not_join_the_target() {
+        let parsed = BubbleText::of("*https://example.com*x");
+        assert_eq!(parsed.text, "https://example.comx");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(parsed.links[0].target, "https://example.comx");
+        assert!(!parsed.links[0].target.contains('*'));
+        assert_eq!(parsed.runs.len(), 1);
+        assert!(parsed.runs[0].1.bold);
+    }
+
+    /// The shared targets travel with the parsed links: one entry per link,
+    /// in order, holding exactly what the click opens. The repaint path
+    /// clones this `Arc`, never the strings, so this is also what the menu
+    /// lists without rescanning.
+    #[test]
+    fn link_targets_are_shared_once_per_bubble() {
+        let plain = BubbleText::of("nothing to open here");
+        assert!(plain.link_targets().is_empty());
+
+        let parsed = BubbleText::of("see https://one.example/x and http://two.example/y");
+        assert_eq!(parsed.links.len(), 2);
+        let targets = parsed.link_targets();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0], "https://one.example/x");
+        assert_eq!(targets[1], "http://two.example/y");
+        assert_eq!(targets[0].as_str(), parsed.links[0].target.as_str());
+        assert_eq!(targets[1].as_str(), parsed.links[1].target.as_str());
     }
 
     /// A stopwatch rather than an assertion: what a conversation pays to

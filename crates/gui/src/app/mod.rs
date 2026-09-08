@@ -323,6 +323,17 @@ pub struct CopyMessage {
     pub text: gpui::SharedString,
 }
 
+/// Open one of a message's links.
+///
+/// Carries its subject like [`CopyMessage`]: a timeline has no selection,
+/// and the menu listing the links is opened on a specific bubble.
+/// `no_json` for the same reason — there is no URL to write into a keymap.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct OpenMessageLink {
+    pub url: gpui::SharedString,
+}
+
 /// Send a message that failed again.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = message, no_json)]
@@ -3177,6 +3188,9 @@ impl Render for WhatsAppApp {
             }))
             .on_action(|copy: &CopyMessage, _window, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.text.to_string()));
+            })
+            .on_action(|link: &OpenMessageLink, _window, cx| {
+                cx.open_url(&link.url);
             });
 
         // Whether this frame draws the app rather than a screen on the way to

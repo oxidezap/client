@@ -30,7 +30,9 @@ use media::{MediaProps, render_media_content};
 use quote::render_quote;
 use reactions::{render_hover_actions, render_reactions};
 
-use crate::app::{BubbleIds, CopyMessage, ReplyToMessage, RetryMessage, WhatsAppApp};
+use crate::app::{
+    BubbleIds, CopyMessage, OpenMessageLink, ReplyToMessage, RetryMessage, WhatsAppApp,
+};
 use crate::components::parts;
 use crate::components::{BubbleText, bubble_status_ticks, render_rich_text};
 use crate::responsive::ResponsiveLayout;
@@ -148,6 +150,9 @@ pub fn render_message_bubble(
     let menu_id = message_id.clone();
     let menu_text = message.content.clone();
     let menu_failed = can_retry;
+    // A refcount, not a rescan: the row's text already parsed these when the
+    // timeline was built, and the targets were shared then.
+    let menu_links = content.link_targets().clone();
 
     div()
         .id(ids.row.clone())
@@ -348,6 +353,18 @@ pub fn render_message_bubble(
                     }),
                 )
             };
+            // One command per address, naming what it opens: the inline
+            // ranges answer only the pointer, and a menu item is activatable
+            // once the menu is open, which those ranges never are.
+            let mut menu = menu;
+            for target in menu_links.iter() {
+                menu = menu.menu(
+                    format!("Open {target}"),
+                    Box::new(OpenMessageLink {
+                        url: target.clone(),
+                    }),
+                );
+            }
             if menu_failed {
                 menu.separator().menu(
                     "Send again",

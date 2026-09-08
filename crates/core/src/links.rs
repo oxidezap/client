@@ -31,17 +31,27 @@ pub struct LinkSpan {
 /// punctuation (`.`, `,`, `!`, their CJK equivalents, a trailing quote, an
 /// unbalanced `)`) belongs to the sentence, not to the address.
 pub fn find_links(text: &str) -> Vec<LinkSpan> {
+    find_links_with_boundaries(text, &[])
+}
+
+/// Find the URLs in `text`, honouring markup boundaries.
+///
+/// Marker removals join what the sender separated:
+/// `*label*https://example.com` displays as `labelhttps://example.com`,
+/// where the address looks like the middle of a word. Each entry of
+/// `boundaries` is a display offset where a delimiter stood, and counts the
+/// way whitespace does — without them the address is unclickable although
+/// the source had a delimiter at its edge. Sorted; empty for text that was
+/// never marked up. See [`find_links_in`].
+pub fn find_links_with_boundaries(text: &str, boundaries: &[usize]) -> Vec<LinkSpan> {
     let bytes = text.as_bytes();
     let mut links = Vec::new();
     let mut at = 0;
-    // Where the whitespace-free token around the last examined candidate
-    // ends. A rejected candidate stays inside its token, so the next
-    // candidate in the same token reuses this instead of scanning the token
-    // again — without it one long token of repeated prefixes scans once per
-    // prefix, which is quadratic in the peer's message.
-    let mut token_end: Option<usize> = None;
+    // Reused across the candidates of one token, for the reason `TokenScan`
+    // states: one long token of repeated prefixes probes many candidates.
+    let mut scan = TokenScan::default();
     while at < bytes.len() {
-        let Some((end, bare)) = link_end_at(text, at, &mut token_end) else {
+        let Some((end, bare)) = link_end_at(text, at, &mut scan, boundaries) else {
             at += 1;
             continue;
         };
@@ -59,60 +69,146 @@ pub fn find_links(text: &str) -> Vec<LinkSpan> {
     links
 }
 
+/// Find the URLs in parsed message text.
+///
+/// The same as [`find_links`] on [`RichText::text`](crate::RichText::text),
+/// except the span edges count as boundaries: they are where the markup
+/// delimiters stood, so an address starting where a run ends was delimited
+/// in the source even though the display joins them. Without this,
+/// `*label*https://example.com` parses to `labelhttps://example.com` and
+/// the address reads as mid-word.
+pub fn find_links_in(rich: &crate::RichText) -> Vec<LinkSpan> {
+    let mut boundaries = Vec::with_capacity(rich.spans.len() * 2);
+    for span in &rich.spans {
+        boundaries.push(span.range.start);
+        boundaries.push(span.range.end);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    find_links_with_boundaries(&rich.text, &boundaries)
+}
+
+/// Scan state reused across the candidates of one whitespace-free token.
+///
+/// Both `find_links` and the markup parser probe every byte, so one token
+/// can hold thousands of rejected prefixes — `http:///` repeated is one
+/// token of nothing but prefixes. Caching only the token end still leaves
+/// `trim_trailing_punctuation` counting delimiter balances over the whole
+/// remaining suffix per candidate, which is quadratic in the peer's message.
+/// The end and both balances are computed once per token and then kept
+/// current: each new candidate subtracts the bytes it skipped past since the
+/// last one, and those skipped gaps partition the token, so the whole token
+/// costs one scan no matter how many prefixes it holds.
+#[derive(Debug, Default)]
+pub(crate) struct TokenScan {
+    state: Option<TokenState>,
+}
+
+#[derive(Debug)]
+struct TokenState {
+    end: usize,
+    rest: usize,
+    parens: i32,
+    brackets: i32,
+}
+
+impl TokenScan {
+    /// The token end and the delimiter balances over `rest..end`, kept
+    /// current across candidates inside one token.
+    fn balances(&mut self, text: &str, rest: usize) -> (usize, i32, i32) {
+        if let Some(state) = self.state.as_mut()
+            && rest >= state.rest
+            && rest <= state.end
+        {
+            // The new candidate starts inside the same token, past what the
+            // last one saw: un-count the skipped gap rather than recounting
+            // the suffix. An opener left behind stops opening, a closer left
+            // behind stops closing.
+            let from = state.rest;
+            for ch in text[from..rest].chars() {
+                match ch {
+                    '(' => state.parens -= 1,
+                    ')' => state.parens += 1,
+                    '[' => state.brackets -= 1,
+                    ']' => state.brackets += 1,
+                    _ => {}
+                }
+            }
+            state.rest = rest;
+            return (state.end, state.parens, state.brackets);
+        }
+        let (end, parens, brackets) = scan_token_balances(text, rest);
+        self.state = Some(TokenState {
+            end,
+            rest,
+            parens,
+            brackets,
+        });
+        (end, parens, brackets)
+    }
+}
+
 /// If a link opens at `at`, its end after trailing cleanup, and whether it
 /// is a bare `www.` needing a scheme. `None` is every other case: no prefix
 /// here, a prefix in the middle of a word, or a prefix with nothing
 /// link-shaped behind it.
 ///
-/// `token_end` caches the token end across calls. It is only reused while
-/// the next candidate sits inside the same token, so a token holding several
-/// prefixes still examines each of them — jumping straight past the token
-/// would drop a valid link hiding behind an invalid one.
+/// `scan` carries the token end and the delimiter balances across calls.
+/// They are only reused while the next candidate sits inside the same token,
+/// so a token holding several prefixes still examines each of them —
+/// jumping straight past the token would drop a valid link hiding behind an
+/// invalid one.
+///
+/// `boundaries` are display offsets where a markup delimiter stood; see
+/// [`find_links_with_boundaries`].
 pub(crate) fn link_end_at(
     text: &str,
     at: usize,
-    token_end: &mut Option<usize>,
+    scan: &mut TokenScan,
+    boundaries: &[usize],
 ) -> Option<(usize, bool)> {
     let bytes = text.as_bytes();
     let (prefix_len, bare) = prefix_at(bytes, at)?;
-    if preceded_by_word_char(bytes, at) {
+    if preceded_by_word_char(bytes, at, boundaries) {
         return None;
     }
     let rest = at + prefix_len;
-    let token = match *token_end {
-        Some(cached) if rest <= cached => cached,
-        _ => {
-            let scanned = scan_token_end(text, rest);
-            *token_end = Some(scanned);
-            scanned
-        }
-    };
-    let end = trim_trailing_punctuation(text, rest, token);
+    let (token, parens, brackets) = scan.balances(text, rest);
+    let end = trim_trailing_punctuation(text, rest, token, parens, brackets);
     if end == rest || !host_is_plausible(&text[rest..end], bare) {
         return None;
     }
     Some((end, bare))
 }
 
-/// Where the whitespace-free token starting at `from` ends. An apostrophe
-/// does not end one: it sits inside addresses like
-/// `https://example.com/O'Reilly`, and only a quote left trailing at the
-/// very end is stripped later. A double quote does end one, since no address
-/// ever contains a raw `"`.
-fn scan_token_end(text: &str, from: usize) -> usize {
+/// Where the whitespace-free token starting at `from` ends, and the
+/// delimiter balances over it. An apostrophe does not end one: it sits
+/// inside addresses like `https://example.com/O'Reilly`, and only a quote
+/// left trailing at the very end is stripped later. A double quote does end
+/// one, since no address ever contains a raw `"`.
+fn scan_token_balances(text: &str, from: usize) -> (usize, i32, i32) {
     let mut end = from;
+    let mut parens = 0i32;
+    let mut brackets = 0i32;
     while let Some(ch) = text[end..].chars().next() {
         if ch.is_whitespace() || matches!(ch, '<' | '>' | '"') {
             break;
         }
+        match ch {
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            _ => {}
+        }
         end += ch.len_utf8();
     }
-    end
+    (end, parens, brackets)
 }
 
 /// The link prefix opening at `at`, if any, and whether it is a bare `www.`
 /// that needs a scheme before it can be opened.
-fn prefix_at(bytes: &[u8], at: usize) -> Option<(usize, bool)> {
+pub(crate) fn prefix_at(bytes: &[u8], at: usize) -> Option<(usize, bool)> {
     let rest = &bytes[at.min(bytes.len())..];
     if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case(b"https://") {
         Some((8, false))
@@ -129,9 +225,13 @@ fn prefix_at(bytes: &[u8], at: usize) -> Option<(usize, bool)> {
 /// word: `abchttps://x` names no address, and neither does `foowww.bar`.
 /// Only the byte before matters, and only ASCII letters and digits count — a
 /// UTF-8 tail byte ending right here is neither, so no boundary check is
-/// needed to read it.
-fn preceded_by_word_char(bytes: &[u8], at: usize) -> bool {
-    at > 0 && bytes[at - 1].is_ascii_alphanumeric()
+/// needed to read it. A markup boundary counts as a break: the delimiter
+/// stood between the two, so the address never was mid-word.
+fn preceded_by_word_char(bytes: &[u8], at: usize, boundaries: &[usize]) -> bool {
+    if at == 0 || boundaries.binary_search(&at).is_ok() {
+        return false;
+    }
+    bytes[at - 1].is_ascii_alphanumeric()
 }
 
 /// Cut the sentence back off the address: trailing `.` `,` `;` `:` `!` `?`
@@ -142,22 +242,18 @@ fn preceded_by_word_char(bytes: &[u8], at: usize) -> bool {
 /// Only the trailing quote goes: an apostrophe inside the address, as in
 /// `https://example.com/O'Reilly`, is kept. A raw `"` never reaches this
 /// far, since it already ends the token.
-fn trim_trailing_punctuation(text: &str, rest: usize, mut end: usize) -> usize {
-    // Both balances up front, so trimming a run of unmatched closers is one
-    // scan plus one step per closer. Calling `closers_outnumber_openers` per
-    // removed character rescanned the whole shrinking candidate each time,
-    // which is quadratic in a peer-controlled message of `))))…`.
-    let mut parens = 0i32;
-    let mut brackets = 0i32;
-    for ch in text[rest..end].chars() {
-        match ch {
-            '(' => parens += 1,
-            ')' => parens -= 1,
-            '[' => brackets += 1,
-            ']' => brackets -= 1,
-            _ => {}
-        }
-    }
+///
+/// The delimiter balances arrive counted over `rest..end` — see
+/// [`TokenScan`] — so trimming a run of unmatched closers is one step per
+/// closer rather than a fresh scan per removed character, which is quadratic
+/// in a peer-controlled message of `))))…`.
+fn trim_trailing_punctuation(
+    text: &str,
+    rest: usize,
+    mut end: usize,
+    mut parens: i32,
+    mut brackets: i32,
+) -> usize {
     while end > rest {
         let Some(ch) = text[..end].chars().next_back() else {
             break;
@@ -436,5 +532,38 @@ mod tests {
             &source[links[0].range.clone()],
             "https://en.wikipedia.org/wiki/Rust_(language)"
         );
+    }
+
+    /// One whitespace-free token of repeated invalid prefixes ending in a
+    /// real address: each rejection reuses the token's delimiter balances
+    /// rather than recounting the remaining suffix, or this is quadratic in
+    /// the peer's message while still owing the trailing link its range.
+    #[test]
+    fn many_rejected_prefixes_before_a_valid_link_stay_fast() {
+        let source = format!("{}https://example.com/ok", "http:///".repeat(20_000));
+        let started = wacore::time::Instant::now();
+        let links = find_links(&source);
+        let elapsed = started.elapsed();
+        assert_eq!(links.len(), 1);
+        assert_eq!(&source[links[0].range.clone()], "https://example.com/ok");
+        assert_eq!(links[0].target, "https://example.com/ok");
+        assert!(
+            elapsed.as_secs() < 10,
+            "took {elapsed:?} for {} bytes",
+            source.len()
+        );
+    }
+
+    /// A delimiter the markup removed still separates: `*label*https://...`
+    /// displays joined, but the address was delimited in the source, so the
+    /// span edge counts as a boundary and the link is found.
+    #[test]
+    fn a_link_after_a_removed_marker_is_still_a_link() {
+        let rich = crate::rich_text::parse("*label*https://example.com");
+        assert_eq!(rich.text, "labelhttps://example.com");
+        let links = find_links_in(&rich);
+        assert_eq!(links.len(), 1);
+        assert_eq!(&rich.text[links[0].range.clone()], "https://example.com");
+        assert_eq!(links[0].target, "https://example.com");
     }
 }
