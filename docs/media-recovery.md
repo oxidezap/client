@@ -158,15 +158,14 @@ receive oracle maps all 256 frame-info bytes to clockwise display turns of 0,
 270, 180 and 90 degrees for low bits 0, 1, 2 and 3. The upstream correction
 merged in
 [whatsapp-rust#1469](https://github.com/oxidezap/whatsapp-rust/pull/1469),
-which is included in the parser branch consumed below. No 180-degree GUI
+which is included in the merged revision consumed below. No 180-degree GUI
 compensation was added. A live Android front/rear retest is still required.
 
-The client now consumes open
+The client now consumes merged
 [whatsapp-rust#1470](https://github.com/oxidezap/whatsapp-rust/pull/1470)
-from `fix/voip-frame-info-extension-parser` at
-`faee7f547e04dabc9ee62f5f7b6fc25381b485a0`, based on main at
-`47e1b5b41b63c23b59372828901ea945c8149565`. All WhatsApp dependency declarations
-use that source, with the revision recorded in the client lockfile.
+from `main` at `2681a687c35f8fc290c1ff62bb30a857a12df9e0`.
+All WhatsApp dependency declarations use that source, with the revision
+recorded in the client lockfile.
 
 Authenticated receive packets now expose frame-info independently of optional
 timing and bandwidth extensions. Upstream compared 3,840 synthetic packets and

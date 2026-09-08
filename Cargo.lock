@@ -9986,7 +9986,7 @@ dependencies = [
 [[package]]
 name = "wacore"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -10035,7 +10035,7 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "anyhow",
  "buffa",
@@ -10056,7 +10056,7 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "bytes",
  "compact_str",
@@ -10073,7 +10073,7 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10083,7 +10083,7 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "aes 0.9.3",
  "async-lock",
@@ -10114,7 +10114,7 @@ dependencies = [
 [[package]]
 name = "wacore-noise"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "anyhow",
  "buffa",
@@ -10166,7 +10166,7 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "buffa",
  "buffa-build",
@@ -10719,7 +10719,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10762,7 +10762,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "async-trait",
  "buffa",
@@ -10784,7 +10784,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10804,7 +10804,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=fix%2Fvoip-frame-info-extension-parser#faee7f547e04dabc9ee62f5f7b6fc25381b485a0"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#2681a687c35f8fc290c1ff62bb30a857a12df9e0"
 dependencies = [
  "anyhow",
  "async-trait",
