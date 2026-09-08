@@ -3264,8 +3264,8 @@ fn over_budget(held: usize, entries: usize) -> bool {
 /// the first slot whose neighbour sorts strictly after it.
 ///
 /// An unpinned head sorts below every pinned one and a `None` head below
-/// every dated one, so an empty conversation lands at the end — the same
-/// place the merge sort puts it.
+/// every dated one, so an empty conversation lands behind every dated
+/// one — the same place the merge sort puts it.
 fn slot_for_chat(rest: &[Arc<Chat>], chat: &Chat) -> usize {
     rest.iter()
         .position(|other| chats::chat_list_order(chat, other) == std::cmp::Ordering::Less)
@@ -3772,20 +3772,30 @@ mod tests {
         assert_eq!(slot_for_chat(&rest, &chat("d", Some(10))), 2);
     }
 
-    /// `None` is below every `Some`, and the predicate is strict, so an empty
-    /// conversation clears neither the dated chat nor the empty one already
-    /// sitting there: it goes to the very end. That is the tie rule below,
-    /// applied to two chats that are equally undated.
+    /// `None` is below every `Some`, so an empty conversation clears every
+    /// dated chat — but equally undated chats still order by JID descending,
+    /// the store's rule (`ChatStore::chats_page` ranks ties by `jid DESC`
+    /// and pages on with `jid < cursor.jid`).
     #[test]
-    fn an_empty_conversation_sorts_last_of_all() {
+    fn an_empty_conversation_sorts_after_every_dated_one() {
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", None))];
-        assert_eq!(slot_for_chat(&rest, &chat("d", None)), 2);
+        assert_eq!(slot_for_chat(&rest, &chat("d", None)), 1);
+        assert_eq!(
+            slot_for_chat(&rest, &chat("a", None)),
+            2,
+            "the lower JID trails the tied chat it follows"
+        );
     }
 
+    /// Ties break by JID descending, the store's rule: a tied head with the
+    /// higher JID stands above the incumbent rather than beneath it, which
+    /// is what keeps a page boundary from re-sorting rows the previous page
+    /// already drew.
     #[test]
-    fn an_equal_head_keeps_the_incumbent_above_it() {
+    fn a_tied_head_sorts_by_descending_jid() {
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(10)))];
-        assert_eq!(slot_for_chat(&rest, &chat("d", Some(30))), 1);
+        assert_eq!(slot_for_chat(&rest, &chat("d", Some(30))), 0);
+        assert_eq!(slot_for_chat(&rest, &chat("a", Some(30))), 1);
     }
 
     /// The live slot keeps the pin grouping the merge sort maintains: a busy

@@ -618,6 +618,32 @@ fn a_gap_in_the_window_widens_the_reload() {
     assert_eq!(scope.chats(), None);
 }
 
+/// A pin names its chat while a list-level change in the same window widens
+/// the reload to the whole list, which reads only the first page. The named
+/// chats stay alongside the flag, or a quiet chat that unpinning dropped
+/// past that boundary is never hydrated and stays pinned everywhere.
+#[test]
+fn a_widened_window_keeps_the_chats_it_named() {
+    let mut scope = ReloadScope::empty();
+    scope.widen(Some(&messages_change("12025550143@s.whatsapp.net")));
+    scope.widen(Some(&StoreChange::Chats));
+    scope.widen(Some(&messages_change("120363000000000001@g.us")));
+    scope.widen(None);
+    assert!(
+        scope.everything(),
+        "a list-level change still widens the reload"
+    );
+    assert_eq!(scope.chats(), None);
+    assert!(
+        scope.named().contains("12025550143@s.whatsapp.net"),
+        "named before the widening survives it"
+    );
+    assert!(
+        scope.named().contains("120363000000000001@g.us"),
+        "named after the widening survives it too"
+    );
+}
+
 #[test]
 fn history_fallbacks_do_not_expose_internal_lids() {
     let lid: Jid = "111222333444555@lid".parse().expect("test LID");
@@ -836,6 +862,133 @@ async fn a_scoped_load_finds_a_chat_the_page_left_out() {
         "the chat it was asked about, page or no page"
     );
     assert_eq!(chats[0].messages.len(), 1);
+}
+
+/// The window above, coalesced: the pin's named invalidation lands in the
+/// same batch as a list-level change, so the reload widens to the whole
+/// list — which reads only the first page. The named chat rides along
+/// anyway, looked up by JID past the boundary.
+#[tokio::test]
+async fn a_coalesced_reload_still_hydrates_the_named_chat() {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, Event, InboundMessage, MessageBatch};
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+    let (chat_store, client) = test_session("coalesced-load-keeps-named").await;
+    let target = "559900000000@s.whatsapp.net";
+    let mut batch = Vec::new();
+    for (index, jid) in std::iter::once(target.to_string())
+        .chain((1..=100).map(|n| format!("55990000{n:04}@s.whatsapp.net")))
+        .enumerate()
+    {
+        let sender: Jid = jid.parse().expect("test JID");
+        batch.push(
+            InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("oi")))
+                .info(Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: sender.clone(),
+                        sender,
+                        ..Default::default()
+                    },
+                    id: format!("MSG-{index}").into(),
+                    timestamp: whatsapp_rust::wacore::time::from_secs(1_700_000_000 + index as i64)
+                        .expect("test timestamp"),
+                    ..Default::default()
+                }))
+                .build(),
+        );
+    }
+    feed(
+        &chat_store,
+        Event::Messages(
+            MessageBatch::builder()
+                .messages(Arc::from(batch))
+                .origin(BatchOrigin::Live)
+                .build(),
+        ),
+    )
+    .await;
+
+    // The page alone never reaches the oldest chat: without the named
+    // lookup this test has nothing to prove.
+    let page = WhatsAppClient::load_history(&chat_store, &client, &book())
+        .await
+        .expect("history loads");
+    assert!(
+        page.chats.iter().all(|chat| chat.jid != target),
+        "the first page leaves the quiet chat out"
+    );
+
+    let mut scope = ReloadScope::empty();
+    scope.widen(Some(&messages_change(target)));
+    scope.widen(Some(&StoreChange::Chats));
+    assert!(scope.everything(), "the window widened");
+
+    let loaded = WhatsAppClient::load_history_for_scope(
+        &chat_store,
+        &client,
+        &scope,
+        &book(),
+        WhatsAppClient::HISTORY_CHAT_LIMIT as usize,
+        50,
+    )
+    .await
+    .expect("history loads");
+    assert!(
+        loaded.chats.iter().any(|chat| chat.jid == target),
+        "the named chat rides along with the whole list"
+    );
+}
+
+/// A pin on an archived chat must not resurrect it in the main list. The
+/// scoped page excludes archived rows, but the point-lookup fallback fetched
+/// them anyway — publishing a row `Chat` has no archived flag to reject, so
+/// the daemon and the GUI upserted it beside the chats it belongs with.
+#[tokio::test]
+async fn a_scoped_load_skips_an_archived_chat() {
+    use whatsapp_rust::wacore::types::events::Event;
+
+    let (chat_store, client) = test_session("scoped-load-archived").await;
+    let peer = "559900000007@s.whatsapp.net";
+    feed(
+        &chat_store,
+        incoming_in(peer, wa::Message::text("oi"), "MSG-ARC", 1_700_000_000),
+    )
+    .await;
+    feed(
+        &chat_store,
+        Event::ArchiveUpdate(
+            whatsapp_rust::wacore::types::events::ArchiveUpdate::builder()
+                .jid(peer.parse().expect("test JID"))
+                .timestamp(
+                    whatsapp_rust::wacore::time::from_secs(1_700_000_050).expect("test timestamp"),
+                )
+                .action(Box::new(wa::sync_action_value::ArchiveChatAction {
+                    archived: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+
+    let main = WhatsAppClient::load_history(&chat_store, &client, &book())
+        .await
+        .expect("history loads");
+    assert!(
+        main.chats.iter().all(|chat| chat.jid != peer),
+        "archived rows are not in the main list"
+    );
+
+    let only = std::collections::HashSet::from([peer.to_string()]);
+    let loaded = WhatsAppClient::load_history_scoped(&chat_store, &client, Some(&only), &book())
+        .await
+        .expect("history loads");
+    assert!(
+        loaded.chats.iter().all(|chat| chat.jid != peer),
+        "a scoped pin answer leaves an archived chat out"
+    );
 }
 
 /// A cursor is this crate's to write and to read, and the only thing that

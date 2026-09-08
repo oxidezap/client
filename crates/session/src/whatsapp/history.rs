@@ -58,43 +58,58 @@ impl LoadedHistory {
 /// alone — so the window can be answered by rebuilding just those chats,
 /// with every merge re-sorting them into place. Anything else in the window
 /// (or a gap in it) widens the reload back to the whole list, because that
-/// is the only load allowed to prune.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum ReloadScope {
-    /// Only these chats moved.
-    Chats(HashSet<String>),
-    /// Rebuild the display list.
-    Everything,
+/// is the only load allowed to prune. The named chats stay alongside the
+/// flag: a pin names its chat while a list-level change in the same window
+/// widens the reload, and the whole-list load that results reads only the
+/// first page — a chat unpinning dropped past that boundary still has to be
+/// looked up by JID afterwards.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ReloadScope {
+    /// A list-level change (or a gap) arrived: rebuild the display list.
+    everything: bool,
+    /// Chats named by per-chat changes in the window, kept even when it widens.
+    chats: HashSet<String>,
 }
 
 impl ReloadScope {
     pub(super) fn empty() -> Self {
-        ReloadScope::Chats(HashSet::new())
+        Self::default()
     }
 
     /// Fold one invalidation in. `None` is a lagged receiver: what it dropped
     /// is unknowable, so it counts as everything.
     pub(super) fn widen(&mut self, change: Option<&StoreChange>) {
-        match (&mut *self, change) {
-            (ReloadScope::Everything, _) => {}
+        match change {
             // Contacts too: a push name landing after the chat row must
             // refresh chats stuck on the JID placeholder, and naming is
             // resolved for the whole list at load time.
-            (_, None) | (_, Some(StoreChange::Chats | StoreChange::Contacts)) => {
-                *self = ReloadScope::Everything;
+            None | Some(StoreChange::Chats | StoreChange::Contacts) => {
+                self.everything = true;
             }
-            (ReloadScope::Chats(chats), Some(StoreChange::Messages { chat })) => {
-                chats.insert(chat.to_non_ad_string());
+            Some(StoreChange::Messages { chat }) => {
+                self.chats.insert(chat.to_non_ad_string());
             }
         }
     }
 
     /// The chats to rebuild, or `None` for the whole list.
     pub(super) fn chats(&self) -> Option<&HashSet<String>> {
-        match self {
-            ReloadScope::Chats(chats) => Some(chats),
-            ReloadScope::Everything => None,
+        if self.everything {
+            None
+        } else {
+            Some(&self.chats)
         }
+    }
+
+    /// Whether the window holds a list-level change: the reload rebuilds the
+    /// display list rather than just the chats above.
+    pub(super) fn everything(&self) -> bool {
+        self.everything
+    }
+
+    /// The chats per-chat changes named, even when the window widened.
+    pub(super) fn named(&self) -> &HashSet<String> {
+        &self.chats
     }
 }
 
@@ -206,10 +221,10 @@ impl WhatsAppClient {
                 // one names nothing the list shows (an archived chat, or one
                 // past the window) and has nothing to say.
                 let (chat_limit, message_limit) = history_budget.limits();
-                match Self::load_history_scoped_with_limits(
+                match Self::load_history_for_scope(
                     &chat_store,
                     &client,
-                    scope.chats(),
+                    &scope,
                     &names,
                     chat_limit,
                     message_limit,
@@ -270,6 +285,60 @@ impl WhatsAppClient {
         .await
     }
 
+    /// Answer one debounced window of invalidations: the whole list when it
+    /// widened, plus the named chats the first page missed.
+    ///
+    /// One caller — the reloader above — plus the regression test that feeds
+    /// it a coalesced window. A narrowed load already looks its chats up by
+    /// JID past the page; a widened one did not, so a quiet chat that
+    /// unpinning dropped beyond the boundary stayed pinned in every front
+    /// end until unrelated traffic brought it back.
+    pub(super) async fn load_history_for_scope(
+        chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        scope: &ReloadScope,
+        names: &NameBook,
+        chat_limit: usize,
+        message_limit: usize,
+    ) -> Result<LoadedHistory, oxidezap_chat_store::ChatStoreError> {
+        let mut loaded = Self::load_history_scoped_with_limits(
+            chat_store,
+            client,
+            scope.chats(),
+            names,
+            chat_limit,
+            message_limit,
+        )
+        .await?;
+        if scope.everything() && !scope.named().is_empty() {
+            let have: HashSet<&str> = loaded.chats.iter().map(|chat| chat.jid.as_str()).collect();
+            let missing: HashSet<String> = scope
+                .named()
+                .iter()
+                .filter(|jid| !have.contains(jid.as_str()))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                match Self::load_history_scoped_with_limits(
+                    chat_store,
+                    client,
+                    Some(&missing),
+                    names,
+                    chat_limit,
+                    message_limit,
+                )
+                .await
+                {
+                    Ok(extra) => loaded.chats.extend(extra.chats),
+                    Err(e) => {
+                        warn!("failed to reload named chats after a coalesced invalidation: {e}")
+                    }
+                }
+            }
+        }
+        Ok(loaded)
+    }
+
     pub(super) async fn load_history_scoped_with_limits(
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
@@ -319,6 +388,12 @@ impl WhatsAppClient {
                     continue;
                 };
                 match chat_store.chat(&parsed).await {
+                    // A pin on an archived chat must not resurrect it in the
+                    // main list: the page above excludes archived rows, and
+                    // `Chat` carries no archived flag for the daemon or the
+                    // GUI to reject it with — so an incomplete load carrying
+                    // it would be upserted beside the chats it belongs with.
+                    Ok(Some(entry)) if entry.archived => {}
                     Ok(Some(entry)) => entries.push(entry),
                     // No row: the chat is live-only, or gone. Either way this
                     // load has nothing to say about it, which is what a
