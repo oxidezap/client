@@ -28,34 +28,23 @@ pub struct LinkSpan {
 ///
 /// Never fails and never overlaps: anything that is not a completed link is
 /// left for the caller to draw as ordinary text. Trailing sentence
-/// punctuation (`.`, `,`, `!`, an unbalanced `)`) belongs to the sentence,
-/// not to the address.
+/// punctuation (`.`, `,`, `!`, their CJK equivalents, a trailing quote, an
+/// unbalanced `)`) belongs to the sentence, not to the address.
 pub fn find_links(text: &str) -> Vec<LinkSpan> {
     let bytes = text.as_bytes();
     let mut links = Vec::new();
     let mut at = 0;
+    // Where the whitespace-free token around the last examined candidate
+    // ends. A rejected candidate stays inside its token, so the next
+    // candidate in the same token reuses this instead of scanning the token
+    // again — without it one long token of repeated prefixes scans once per
+    // prefix, which is quadratic in the peer's message.
+    let mut token_end: Option<usize> = None;
     while at < bytes.len() {
-        let Some((prefix_len, bare)) = prefix_at(bytes, at) else {
+        let Some((end, bare)) = link_end_at(text, at, &mut token_end) else {
             at += 1;
             continue;
         };
-        if preceded_by_word_char(bytes, at) {
-            at += 1;
-            continue;
-        }
-        let rest = at + prefix_len;
-        let mut end = rest;
-        while let Some(ch) = text[end..].chars().next() {
-            if ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'') {
-                break;
-            }
-            end += ch.len_utf8();
-        }
-        let end = trim_trailing_punctuation(text, rest, end);
-        if end == rest || !host_is_plausible(&text[rest..end], bare) {
-            at += 1;
-            continue;
-        }
         let shown = &text[at..end];
         links.push(LinkSpan {
             range: at..end,
@@ -68,6 +57,57 @@ pub fn find_links(text: &str) -> Vec<LinkSpan> {
         at = end;
     }
     links
+}
+
+/// If a link opens at `at`, its end after trailing cleanup, and whether it
+/// is a bare `www.` needing a scheme. `None` is every other case: no prefix
+/// here, a prefix in the middle of a word, or a prefix with nothing
+/// link-shaped behind it.
+///
+/// `token_end` caches the token end across calls. It is only reused while
+/// the next candidate sits inside the same token, so a token holding several
+/// prefixes still examines each of them — jumping straight past the token
+/// would drop a valid link hiding behind an invalid one.
+pub(crate) fn link_end_at(
+    text: &str,
+    at: usize,
+    token_end: &mut Option<usize>,
+) -> Option<(usize, bool)> {
+    let bytes = text.as_bytes();
+    let (prefix_len, bare) = prefix_at(bytes, at)?;
+    if preceded_by_word_char(bytes, at) {
+        return None;
+    }
+    let rest = at + prefix_len;
+    let token = match *token_end {
+        Some(cached) if rest <= cached => cached,
+        _ => {
+            let scanned = scan_token_end(text, rest);
+            *token_end = Some(scanned);
+            scanned
+        }
+    };
+    let end = trim_trailing_punctuation(text, rest, token);
+    if end == rest || !host_is_plausible(&text[rest..end], bare) {
+        return None;
+    }
+    Some((end, bare))
+}
+
+/// Where the whitespace-free token starting at `from` ends. An apostrophe
+/// does not end one: it sits inside addresses like
+/// `https://example.com/O'Reilly`, and only a quote left trailing at the
+/// very end is stripped later. A double quote does end one, since no address
+/// ever contains a raw `"`.
+fn scan_token_end(text: &str, from: usize) -> usize {
+    let mut end = from;
+    while let Some(ch) = text[end..].chars().next() {
+        if ch.is_whitespace() || matches!(ch, '<' | '>' | '"') {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
 }
 
 /// The link prefix opening at `at`, if any, and whether it is a bare `www.`
@@ -95,13 +135,42 @@ fn preceded_by_word_char(bytes: &[u8], at: usize) -> bool {
 }
 
 /// Cut the sentence back off the address: trailing `.` `,` `;` `:` `!` `?`
+/// (and the fullwidth and ideographic equivalents CJK keyboards produce),
+/// a trailing quote that closed a quoted address but never belonged to it,
 /// and a `)` or `]` that closes nothing in the candidate.
+///
+/// Only the trailing quote goes: an apostrophe inside the address, as in
+/// `https://example.com/O'Reilly`, is kept. A raw `"` never reaches this
+/// far, since it already ends the token.
 fn trim_trailing_punctuation(text: &str, rest: usize, mut end: usize) -> usize {
     while end > rest {
         let Some(ch) = text[..end].chars().next_back() else {
             break;
         };
-        if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?') {
+        if matches!(
+            ch,
+            '.' | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | '。'
+                | '．'
+                | '，'
+                | '、'
+                | '！'
+                | '？'
+                | '；'
+                | '：'
+                | '…'
+                | '\''
+                | '’'
+                | '”'
+                | '»'
+                | '›'
+                | '」'
+                | '』'
+        ) {
             end -= ch.len_utf8();
         } else if matches!(ch, ')' | ']') {
             let (open, close) = if ch == ')' { ('(', ')') } else { ('[', ']') };
@@ -249,5 +318,86 @@ mod tests {
         let links = find_links(source);
         assert_eq!(links.len(), 1);
         assert_eq!(&source[links[0].range.clone()], "https://example.com/x");
+    }
+
+    #[test]
+    fn an_apostrophe_inside_a_link_is_kept() {
+        let source = "see https://example.com/O'Reilly now";
+        let links = find_links(source);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            &source[links[0].range.clone()],
+            "https://example.com/O'Reilly"
+        );
+        assert_eq!(links[0].target, "https://example.com/O'Reilly");
+    }
+
+    #[test]
+    fn surrounding_quotes_are_not_part_of_the_link() {
+        for (source, address) in [
+            ("'https://example.com/x'", "https://example.com/x"),
+            (
+                "see 'https://example.com/O'Reilly'",
+                "https://example.com/O'Reilly",
+            ),
+            ("“https://example.com/x”", "https://example.com/x"),
+            ("‘https://example.com/x’", "https://example.com/x"),
+            ("«https://example.com/x»", "https://example.com/x"),
+        ] {
+            let links = find_links(source);
+            assert_eq!(links.len(), 1, "for {source:?}");
+            assert_eq!(&source[links[0].range.clone()], address, "for {source:?}");
+            assert_eq!(links[0].target, address, "for {source:?}");
+        }
+    }
+
+    #[test]
+    fn cjk_sentence_punctuation_belongs_to_the_sentence() {
+        for (source, address) in [
+            ("see https://example.com/path。", "https://example.com/path"),
+            ("see https://example.com/path，", "https://example.com/path"),
+            ("see https://example.com/path、", "https://example.com/path"),
+            ("see https://example.com/path！", "https://example.com/path"),
+            ("see https://example.com/path？", "https://example.com/path"),
+            ("see https://example.com/path；", "https://example.com/path"),
+            ("see https://example.com/path：", "https://example.com/path"),
+            ("see https://example.com/path．", "https://example.com/path"),
+            ("see https://example.com/path…", "https://example.com/path"),
+        ] {
+            let links = find_links(source);
+            assert_eq!(links.len(), 1, "for {source:?}");
+            assert_eq!(&source[links[0].range.clone()], address, "for {source:?}");
+            assert_eq!(links[0].target, address, "for {source:?}");
+        }
+    }
+
+    /// A token can hold many prefixes and still one valid link at its end.
+    /// The rejection path reuses the token end rather than jumping past the
+    /// token, so the valid link behind the invalid prefixes is still found.
+    #[test]
+    fn a_valid_link_behind_rejected_prefixes_is_still_found() {
+        let source = format!("{}https://example.com/ok", "http:///".repeat(200));
+        let links = find_links(&source);
+        assert_eq!(links.len(), 1);
+        assert_eq!(&source[links[0].range.clone()], "https://example.com/ok");
+        assert_eq!(links[0].target, "https://example.com/ok");
+    }
+
+    /// One whitespace-free token of repeated invalid prefixes: each
+    /// rejection reuses the token end, so this is one forward scan plus one
+    /// cheap check per prefix. Rescanning the token per prefix would make
+    /// this quadratic in the peer's message.
+    #[test]
+    fn many_rejected_prefixes_in_one_token_stay_fast() {
+        let source = "http:///".repeat(8000);
+        let started = wacore::time::Instant::now();
+        let links = find_links(&source);
+        let elapsed = started.elapsed();
+        assert!(links.is_empty());
+        assert!(
+            elapsed.as_secs() < 10,
+            "took {elapsed:?} for {} bytes",
+            source.len()
+        );
     }
 }

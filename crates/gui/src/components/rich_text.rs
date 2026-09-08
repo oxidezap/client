@@ -15,11 +15,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString,
-    StrikethroughStyle, Styled, StyledText, UnderlineStyle, div,
+    App, FontStyle, FontWeight, HighlightStyle, InteractiveText, IntoElement, SharedString,
+    StrikethroughStyle, StyledText, UnderlineStyle,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::link::Link;
 
 use crate::theme::ActiveProductTheme as _;
 
@@ -138,127 +137,90 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
     }
 }
 
-/// Message text that holds links: plain stretches with one `Link` per
-/// address, wrapped into the line box the plain path fills.
+/// Message text that holds links, in one inline flow.
 ///
-/// A `StyledText` paints but answers no clicks, so an address has to be its
-/// own element. `Link` opens its `href` through `cx.open_url`, which is why
-/// this needs no platform split of its own: GPUI answers that on the desktop
-/// and in the page alike. Size and colour are inherited from the parent; only
-/// the link ink comes from the theme.
+/// A `StyledText` paints but answers no clicks, so the addresses ride along
+/// as clickable ranges on an `InteractiveText` instead of becoming elements
+/// of their own. Nothing is split into flex children, so a newline before an
+/// address starts a line the way it does without one, and a long address
+/// wraps the way plain text does rather than overflowing its item into the
+/// bubble's `overflow_hidden`. Clicks open the target through `cx.open_url`,
+/// which is why this needs no platform split of its own: GPUI answers that
+/// on the desktop and in the page alike. Size and colour are inherited from
+/// the parent; only the link ink comes from the theme.
 fn render_with_links(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
-    let mut children = Vec::new();
-    let mut at = 0;
-    for (ix, link) in parsed.links.iter().enumerate() {
-        if at < link.range.start {
-            children.push(render_plain_segment(parsed, at..link.range.start, cx));
-        }
-        children.push(render_link_segment(parsed, link, ix, cx));
-        at = link.range.end;
-    }
-    if at < parsed.text.len() {
-        children.push(render_plain_segment(parsed, at..parsed.text.len(), cx));
-    }
-    div()
-        .flex()
-        .flex_wrap()
-        .children(children)
-        .into_any_element()
-}
-
-/// One stretch without links, with the emphasis clipped to it. A stretch
-/// with nothing to say about any range goes out as a plain string, for the
-/// reason the plain path in [`render_rich_text`] does.
-fn render_plain_segment(parsed: &BubbleText, range: Range<usize>, cx: &App) -> gpui::AnyElement {
-    let metrics = cx.product().metrics;
-    let highlights: Vec<(Range<usize>, HighlightStyle)> = clip_runs(&parsed.runs, &range)
-        .map(|(range, emphasis)| (range, style_for(emphasis, metrics)))
-        .collect();
-    let code = code_overrides(&parsed.runs, &range, cx);
-    let slice: SharedString = parsed.text[range].to_string().into();
-    if highlights.is_empty() && code.is_empty() {
-        return slice.into_any_element();
-    }
-    StyledText::new(slice)
-        .with_highlights(highlights)
-        .with_font_family_overrides(code)
-        .into_any_element()
-}
-
-/// One address: a `Link` opening the target, drawn inked and underlined, with
-/// the emphasis it overlaps kept — a bold address stays bold.
-fn render_link_segment(
-    parsed: &BubbleText,
-    link: &LinkSpan,
-    ix: usize,
-    cx: &App,
-) -> gpui::AnyElement {
     let metrics = cx.product().metrics;
     let ink = cx.theme().link;
-    // The emphasis pieces inside the address, each carrying the link ink and
-    // its underline on top of its own weight and slant, and the ink alone
-    // over the gaps between them. Together they cover the address end to end
-    // with disjoint runs, which is what `StyledText` requires: two highlights
-    // for one byte is a panic, not a blend.
-    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-    let mut at = 0;
-    for (range, emphasis) in clip_runs(&parsed.runs, &link.range) {
-        if at < range.start {
-            highlights.push((
-                at..range.start,
-                link_style(Emphasis::default(), metrics, ink),
-            ));
-        }
-        highlights.push((range.clone(), link_style(emphasis, metrics, ink)));
-        at = range.end;
-    }
-    if at < link.range.len() {
-        highlights.push((
-            at..link.range.len(),
-            link_style(Emphasis::default(), metrics, ink),
-        ));
-    }
-    let code = code_overrides(&parsed.runs, &link.range, cx);
-    let slice: SharedString = parsed.text[link.range.clone()].to_string().into();
-    Link::new(ix)
-        .href(link.target.clone())
-        .child(
-            StyledText::new(slice)
-                .with_highlights(highlights)
-                .with_font_family_overrides(code),
-        )
-        .into_any_element()
-}
-
-/// The emphasis runs overlapping `range`, rebased to its start. Clipping a
-/// partition keeps it one — disjoint and ordered — which is the shape both
-/// `StyledText` callers above have to hand over.
-fn clip_runs<'a>(
-    runs: &'a [(Range<usize>, Emphasis)],
-    range: &Range<usize>,
-) -> impl Iterator<Item = (Range<usize>, Emphasis)> + use<'a> {
-    let (start, end) = (range.start, range.end);
-    runs.iter()
-        .filter(move |(run, _)| run.start < end && run.end > start)
-        .map(move |(run, emphasis)| {
-            (
-                run.start.max(start) - start..run.end.min(end) - start,
-                *emphasis,
-            )
-        })
-}
-
-/// The monospace swaps over `range`, resolved against this frame's theme.
-fn code_overrides(
-    runs: &[(Range<usize>, Emphasis)],
-    range: &Range<usize>,
-    cx: &App,
-) -> Vec<(Range<usize>, SharedString)> {
     let mono = cx.theme().mono_font_family.clone();
-    clip_runs(runs, range)
-        .filter(|(_, emphasis)| emphasis.code)
-        .map(|(range, _)| (range, mono.clone()))
-        .collect()
+    let text: SharedString = parsed.text.clone();
+    // Every emphasis edge and every link edge is a point where the
+    // appearance can change; between two adjacent edges it cannot, so each
+    // gap is one run. Both partitions arrive sorted and disjoint, which is
+    // what keeps the highlights handed to `StyledText` disjoint too: two
+    // highlights for one byte is a panic, not a blend.
+    let mut edges = Vec::with_capacity(parsed.runs.len() * 2 + parsed.links.len() * 2 + 2);
+    edges.push(0);
+    edges.push(text.len());
+    for (range, _) in parsed.runs.iter() {
+        edges.push(range.start);
+        edges.push(range.end);
+    }
+    for link in parsed.links.iter() {
+        edges.push(link.range.start);
+        edges.push(link.range.end);
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut code: Vec<(Range<usize>, SharedString)> = Vec::new();
+    let mut run_ix = 0;
+    let mut link_ix = 0;
+    for cell in edges.windows(2) {
+        let (start, end) = (cell[0], cell[1]);
+        if start == end {
+            continue;
+        }
+        while run_ix < parsed.runs.len() && parsed.runs[run_ix].0.end <= start {
+            run_ix += 1;
+        }
+        while link_ix < parsed.links.len() && parsed.links[link_ix].range.end <= start {
+            link_ix += 1;
+        }
+        let emphasis = match parsed.runs.get(run_ix) {
+            Some((range, emphasis)) if range.start < end && range.end > start => *emphasis,
+            _ => Emphasis::default(),
+        };
+        let linked = parsed
+            .links
+            .get(link_ix)
+            .is_some_and(|link| link.range.start <= start && start < link.range.end);
+        if emphasis.is_plain() && !linked {
+            continue;
+        }
+        if linked {
+            highlights.push((start..end, link_style(emphasis, metrics, ink)));
+        } else {
+            highlights.push((start..end, style_for(emphasis, metrics)));
+        }
+        if emphasis.code {
+            code.push((start..end, mono.clone()));
+        }
+    }
+    let styled = StyledText::new(text)
+        .with_highlights(highlights)
+        .with_font_family_overrides(code);
+    let ranges: Vec<Range<usize>> = parsed.links.iter().map(|link| link.range.clone()).collect();
+    let targets: Vec<SharedString> = parsed
+        .links
+        .iter()
+        .map(|link| SharedString::from(link.target.clone()))
+        .collect();
+    // One instance per bubble, scoped under the row's own id.
+    InteractiveText::new("message-links", styled)
+        .on_click(ranges, move |ix, _window, cx| {
+            cx.open_url(&targets[ix]);
+        })
+        .into_any_element()
 }
 
 /// One run's appearance inside a link: its own emphasis, inked and underlined
@@ -315,6 +277,33 @@ mod tests {
             &parsed.text[parsed.links[0].range.clone()],
             "https://example.com/x"
         );
+    }
+
+    /// Markup characters inside an address are address characters, not
+    /// formatting: the parser leaves them alone, so the target is exactly
+    /// what the sender wrote rather than the address with pieces missing.
+    #[test]
+    fn link_targets_keep_markup_characters_inside_the_address() {
+        let parsed = BubbleText::of("see https://example.com/foo_bar_baz now");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(
+            &parsed.text[parsed.links[0].range.clone()],
+            "https://example.com/foo_bar_baz"
+        );
+        assert_eq!(parsed.links[0].target, "https://example.com/foo_bar_baz");
+    }
+
+    /// A newline ends the line even when an address follows it: detection
+    /// runs over the whole text, and the single inline flow draws it.
+    #[test]
+    fn a_link_after_a_newline_is_still_one_link() {
+        let parsed = BubbleText::of("before\nhttps://example.com");
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(
+            &parsed.text[parsed.links[0].range.clone()],
+            "https://example.com"
+        );
+        assert_eq!(parsed.links[0].target, "https://example.com");
     }
 
     /// A stopwatch rather than an assertion: what a conversation pays to
