@@ -56,6 +56,18 @@ pub(super) fn bridge() -> Bridge {
     )
 }
 
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+#[cfg_attr(not(target_family = "wasm"), tokio::test)]
+#[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+async fn outgoing_accept_handler_reaches_authoritative_state() {
+    for case in OutgoingAcceptCase::ALL {
+        let states = outgoing_accept_states(case).await;
+        let state = states.last().unwrap();
+        assert_eq!(state.active().is_some(), case.connects(), "{case:?}");
+        assert_eq!(state.video().remote, case.remote_expected(), "{case:?}");
+    }
+}
+
 /// The participant who spoke is not the conversation. Naming a group after
 /// them publishes a misleading name to every client until a store reload
 /// happens to correct it.

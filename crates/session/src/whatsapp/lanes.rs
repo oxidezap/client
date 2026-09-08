@@ -203,6 +203,11 @@ pub(super) enum Subject {
 
 pub(super) fn event_subject(event: &Event) -> Option<Subject> {
     match event {
+        Event::RawNode(node) if node.get().tag == "call" => node
+            .get()
+            .get_optional_child("accept")
+            .and_then(|accept| accept.attrs().optional_string("call-id"))
+            .map(|id| Subject::Call(id.into_owned())),
         Event::IncomingCall(call) => Some(Subject::Call(call.action.call_id().to_string())),
         Event::MissedCall(missed) => Some(Subject::Call(missed.call_id.clone())),
         Event::CallEndedElsewhere(ended) => Some(Subject::Call(ended.call_id.clone())),

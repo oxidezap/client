@@ -37,6 +37,72 @@ have owners that stop tracks and detach the preview when the pending operation
 is dropped. Tests use real browser canvas tracks and controlled promises, not
 hardware or private media.
 
+## Outgoing acceptance
+
+The compared incoming and outgoing calls used the same preview bundle. In the
+outgoing failure, 166 remote access units reached the session and were published
+toward the GUI, but no remote decoder started. Acceptance only announced the
+local camera, leaving remote frame admission off without a later `Enabled`.
+The working incoming-call path explicitly announced both directions.
+
+Outgoing acceptance waits for the startups already in progress, then reads the
+registered `CallHandle`. It does not cache accepts under arbitrary call IDs.
+Registration, failure, cancellation and task drop wake the waiters. Each waiter
+retains startup stamps, so a redial cannot extend an old event's wait. There is
+no timer that silently discards a valid early accept.
+
+The library resolves the original PN target while placing the call. The client
+then reads that LID mapping without changing the builder's input or issuing an
+extra device lookup. Accepted media must name that target user, the
+handle's selected device and its creator. All direct-call video states and
+upgrade tokens come from `CallEvent::PeerVideoStateChanged` on the handle's
+ordered queue. Global `IncomingCall::VideoState` events do not update video.
+The legacy `VideoStateChanged` companion is ignored, including when it carries
+a token. There is no fallback that invents a sender from the selected handle.
+
+Before activation, the watcher retains one complete source-bearing operation
+within the registered call and waits. The bounded handle queue holds subsequent
+operations. Acceptance replays the retained operation only for the winner and
+shares the watcher's per-handle processing lock, then releases the watcher.
+This preserves `UpgradeAccept` followed by `Stopped`, and request followed by
+`Stopped`, without coalescing away a token or negotiation outcome. A losing
+sibling's `Stopped` cannot turn off the winner's picture. Group participant
+events remain roster-owned and are not fed into the 1:1 negotiation reducer.
+Orientation remains on the library's media-plane path.
+
+A raw-node lease preserves the accept's video-child presence, including accepts
+with missing or invalid orientation. Raw accepts and parsed call events share a
+lane. Advertisement metadata is retained only for a registered outgoing call
+and consumed by the corresponding parsed accept. Audio-only acceptance does
+not imply remote-on, and frame arrival does not grant video permission.
+
+Native tests use the upstream `CallFixture` to complete Noise XX and login,
+block the real offer send, and obtain real dormant handles from the public call
+builder. Injected stanzas pass through the library parser and handlers. The
+tests then exercise the client handler, daemon reducer and GUI `Frames` with
+generated H.264, including an IDR rejected before acceptance and a subsequent
+recovery request. They do not set the winning device or fabricate readiness.
+Ordering tests hold the watcher while the global lane drains, reverse that
+scheduling before activation, and fill the real bounded queue before injecting
+the final transitions. They require remote-off and no pending peer request
+after draining. A fault-injection case discards the source-bearing operation
+and leaves only its real legacy companion; the watcher ignores it and exits
+when the queue closes. Legacy-only custom producers cannot drive video state
+and must migrate to the source-bearing event. This does not promise recovery
+of an operation evicted from the bounded queue.
+
+The optional `tests/call-fixture` dependency keeps the upstream fixture feature
+out of web and default production builds. Web tests separately exercise raw
+advertisement parsing, source-event/token extraction, lane identity and registration waits; shared-memory
+WebCodecs tests exercise the real browser codecs.
+
+Stanza injection bypasses inbound Noise framing. No media relay or Android
+decoder runs in this fixture. Upstream still permits an unrung first winner
+and lets a later non-busy sibling reject end the call. Matching application
+metadata does not repair those policies. The existing standalone video
+announcement remains unchanged, and Android reception of this client's
+outbound video still needs a live retest.
+
 ## Incoming call log
 
 The separate incoming-call recording contains an offer receipt, ringing UI
@@ -98,7 +164,8 @@ the ringing state. [whatsapp-rust#1465](https://github.com/oxidezap/whatsapp-rus
 repairs the oracle host needed to investigate it; it is not a production
 directional-stop fix and is not a client dependency update.
 
-Established-call stop/resume, the physical camera LED after hangup, live browser
-rendering after the GPUI migration, and sustained native CPU still need real-call
-verification. Passing track-lifecycle tests is not a measurement of a hardware
-camera or proof of improved call FPS.
+The subsequent Android-initiated production retest confirmed correct front/rear
+rotation and camera LED shutdown after hangup on that setup. Established-call
+stop/resume, outbound video presentation on Android and sustained native CPU
+still need further verification. Passing track-lifecycle tests does not establish
+hardware behavior on every device or improved call FPS.

@@ -436,7 +436,7 @@ pub(crate) async fn open(
     ))
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(feature = "test-support", not(target_family = "wasm"))))]
 /// Real pumps without a capture device. The sender can simulate capture loss,
 /// and dropping the endpoints simulates library teardown.
 pub(crate) fn camera_fixture(

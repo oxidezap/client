@@ -39,6 +39,41 @@ use act::MAX_IN_FLIGHT;
 use read_tracker::ReadTracker;
 use translate::Answer;
 
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+pub use oxidezap_session::OutgoingAcceptCase;
+
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+pub async fn outgoing_accept_states(case: OutgoingAcceptCase) -> Vec<oxidezap_core::CallState> {
+    let events = oxidezap_session::outgoing_accept_events(case).await;
+    let recipient = events
+        .iter()
+        .find_map(|event| match event {
+            UiEvent::OutgoingCallStarted { recipient_jid, .. } => Some(recipient_jid.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let mut bridge = Bridge::new(
+        StateHub::new(),
+        Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+            |_| {},
+        ))),
+    );
+    bridge.hub.calls(|calls| {
+        calls.set_outgoing(oxidezap_core::OutgoingCall::new(
+            "placeholder",
+            recipient,
+            "Peer".into(),
+            true,
+        ))
+    });
+    let mut states = vec![bridge.hub.call_state()];
+    for event in events {
+        bridge.observe(event);
+        states.push(bridge.hub.call_state());
+    }
+    states
+}
+
 /// Whether the session is on its way out and must not be handed to anybody
 /// new.
 ///

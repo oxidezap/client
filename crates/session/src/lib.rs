@@ -13,6 +13,9 @@ mod store;
 mod video;
 mod whatsapp;
 
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+pub use whatsapp::{OutgoingAcceptCase, outgoing_accept_events};
+
 pub use exec::{Cancelled, Task, sleep, spawn, unblock, with_timeout};
 pub use whatsapp::{
     OutgoingFile, ReadBoundary, UiEventReceiver, UiEventTryRecvError, WhatsAppClient,

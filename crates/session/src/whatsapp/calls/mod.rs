@@ -24,3 +24,6 @@
 mod registry;
 
 pub(super) use registry::CallRegistry;
+
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+pub use registry::acceptance_fixture::{OutgoingAcceptCase, outgoing_accept_events};

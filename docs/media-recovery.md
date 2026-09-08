@@ -161,11 +161,15 @@ merged in
 which is included in the merged revision consumed below. No 180-degree GUI
 compensation was added. A live Android front/rear retest is still required.
 
-The client now consumes merged
+The parser correction merged in
 [whatsapp-rust#1470](https://github.com/oxidezap/whatsapp-rust/pull/1470)
-from `main` at `2681a687c35f8fc290c1ff62bb30a857a12df9e0`.
-All WhatsApp dependency declarations use that source, with the revision
-recorded in the client lockfile.
+at `2681a687c35f8fc290c1ff62bb30a857a12df9e0`. The client currently consumes
+`test/voip-call-fixture` at `a45320848ce4808bdcc2b4a7436f2a7f1e0c66a0`, based on
+that commit, for source-bearing call events and the native fixtures in
+[whatsapp-rust#1472](https://github.com/oxidezap/whatsapp-rust/pull/1472).
+The client-side ordering tests are described in [video lifecycle](video-lifecycle.md).
+All WhatsApp dependency declarations use the same branch and the root lockfile
+records the revision. The fixture adds no production call-policy correction.
 
 Authenticated receive packets now expose frame-info independently of optional
 timing and bandwidth extensions. Upstream compared 3,840 synthetic packets and
