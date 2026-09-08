@@ -160,7 +160,9 @@ impl WhatsAppClient {
             .then(|| page.last().map(message_cursor))
             .flatten();
         page.reverse(); // the store returns newest-first; a timeline is drawn the other way
+        let mention_lists = crate::mentions::mention_lists_of(&page);
         let mut messages: Vec<ChatMessage> = page.into_iter().map(stored_to_chat_message).collect();
+        crate::mentions::hydrate_mention_lists(client, names, &mention_lists, &mut messages).await;
         Self::hydrate_reactions(store, client, names, &chat, &mut messages).await;
         Self::hydrate_quoted_authors(client, names, &mut messages).await;
         if chat.is_group() || chat.is_status_broadcast() {

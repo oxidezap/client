@@ -1387,6 +1387,21 @@ impl WhatsAppClient {
                 }
             });
 
+        // A mention arrives as `@` plus the user part — the digits of a LID
+        // where the peer is LID-addressed — and a phone draws the contact's
+        // name there. Rewritten here, so the live bubble, the chat preview
+        // and the reloaded bubble agree rather than each deciding alone. The
+        // caption goes through the same pairs: the list preview reads it
+        // rather than the body.
+        let mention_names = crate::mentions::resolve_for(client, names, Some(base_msg)).await;
+        let content = crate::mentions::apply_to(&mention_names, content);
+        let media_result = media_result.map(|mut media| {
+            if let Some(caption) = media.caption.take() {
+                media.caption = Some(crate::mentions::apply_to(&mention_names, caption));
+            }
+            media
+        });
+
         let mut chat_message = ChatMessage {
             id: info.id.to_string(),
             sender: info.source.sender.to_string(),

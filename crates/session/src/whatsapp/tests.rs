@@ -134,6 +134,118 @@ async fn a_page_of_an_unread_chat_comes_back_unread() {
     );
 }
 
+/// A mention arrives as `@` plus the user part, and a reloaded bubble used
+/// to draw exactly that: `@559900000002` where a phone says `@Bia`. The
+/// hydrated row is rewritten from the proto's mention list through the same
+/// book that names its sender.
+#[tokio::test]
+async fn a_hydrated_mention_names_the_contact_not_the_digits() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const MENTIONED: &str = "559900000002@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-name").await;
+    // The mentioned contact says who they are somewhere else entirely.
+    feed(
+        &chat_store,
+        from(
+            MENTIONED,
+            MENTIONED,
+            Some("Bia"),
+            wa::Message::text("estou por aqui"),
+            "MSG-BIA",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let mention = wa::Message {
+        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
+            text: Some("oi @559900000002, vem".to_string()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                mentioned_jid: vec![MENTIONED.to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Ana"),
+            mention,
+            "MSG-MENTION",
+            1_700_000_100,
+        ),
+    )
+    .await;
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book_with(&chat_store),
+        TEST_GROUP.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+    assert_eq!(page.items[0].content, "oi @Bia, vem");
+}
+
+/// The digits of a LID are an internal address, not a name and not a number
+/// anybody can dial. A mention of a stranger nobody has named must not print
+/// them; it reads the way an unnamed bubble does.
+#[tokio::test]
+async fn a_mention_of_a_stranger_hides_the_internal_digits() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const STRANGER: &str = "111222333444556@lid";
+    let (chat_store, client) = test_session("mention-stranger").await;
+    let mention = wa::Message {
+        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
+            text: Some("oi @111222333444556".to_string()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                mentioned_jid: vec![STRANGER.to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Ana"),
+            mention,
+            "MSG-MENTION",
+            1_700_000_100,
+        ),
+    )
+    .await;
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book_with(&chat_store),
+        TEST_GROUP.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+    assert_eq!(page.items[0].content, "oi @Unknown contact");
+    assert!(
+        !page.items[0].content.contains("111222333444556"),
+        "no internal address reaches the bubble"
+    );
+}
+
 /// The stream reaches this side ordered and used to be handled on a task
 /// per event, so a call's later stanza could run before the offer that
 /// made it: the removal finds nothing, the offer's task files the call
