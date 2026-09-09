@@ -2320,8 +2320,18 @@ impl WhatsAppClient {
                     reports_video,
                     feedback,
                     ..
-                } if reports_video && feedback.iter().any(reports_loss) => {
-                    calls.ask_for_keyframe(&call_id);
+                } => {
+                    // Which streams the feedback names, off the decrypted
+                    // packet: the relay report cannot say, SRTCP encrypts
+                    // past byte 8. A PLI or NACK naming our video SSRC here
+                    // means the peer sees the stream but cannot decode it;
+                    // none across a call means it never locked the stream.
+                    if reports_video && let Some(targets) = describe_feedback(feedback.as_slice()) {
+                        debug!("call {call_id}: inbound RTCP feedback on our video: {targets}");
+                    }
+                    if reports_video && feedback.iter().any(reports_loss) {
+                        calls.ask_for_keyframe(&call_id);
+                    }
                 }
                 // The library asking for the one thing only the encoder
                 // can produce, and for a long time nobody answered.
@@ -2538,10 +2548,16 @@ impl WhatsAppClient {
 /// RTCP payload-specific feedback (RFC 4585), which is the *class* PLI and
 /// FIR belong to.
 const RTCP_PAYLOAD_FEEDBACK: u8 = 206;
+/// RTCP transport feedback (RFC 4585), which carries NACKs.
+const RTCP_TRANSPORT_FEEDBACK: u8 = 205;
 /// Picture Loss Indication: the peer cannot decode what we are sending.
 const RTCP_FMT_PLI: u8 = 1;
 /// Full Intra Request, which asks for the same thing more emphatically.
 const RTCP_FMT_FIR: u8 = 4;
+/// Generic NACK: the peer did not get named packets.
+const RTCP_FMT_NACK: u8 = 1;
+/// Receiver Estimated Maximum Bitrate: bandwidth advice, not a stream.
+const RTCP_FMT_REMB: u8 = 15;
 
 /// Whether one feedback message says the peer has lost our picture.
 ///
@@ -2552,6 +2568,59 @@ const RTCP_FMT_FIR: u8 = 4;
 fn reports_loss(feedback: &whatsapp_rust::wacore::voip::rtcp::RtcpFeedback) -> bool {
     feedback.packet_type == RTCP_PAYLOAD_FEEDBACK
         && matches!(feedback.fmt, RTCP_FMT_PLI | RTCP_FMT_FIR)
+}
+
+/// The feedback half of a decrypted `RtcpReceived`, in one log line — or
+/// nothing when the packet carried no feedback to read.
+///
+/// The pre-decryption relay report can only count leading RTCP headers:
+/// SRTCP encrypts past byte 8, so which streams the peer's feedback names
+/// is answered here, off the packet the engine already decrypted. PLI and
+/// NACK name theirs in the media-source field; FIR leaves that field zero
+/// and names its targets in 8-byte FCI rows instead; REMB estimates
+/// bandwidth rather than naming a stream and is noted without a target.
+fn describe_feedback(
+    feedback: &[whatsapp_rust::wacore::voip::rtcp::RtcpFeedback],
+) -> Option<String> {
+    if feedback.is_empty() {
+        return None;
+    }
+    let entries = feedback
+        .iter()
+        .map(|entry| {
+            let (packet_type, fmt) = (entry.packet_type, entry.fmt);
+            if packet_type == RTCP_TRANSPORT_FEEDBACK && fmt == RTCP_FMT_NACK {
+                return format!("{packet_type}/{fmt} nack media={:#010x}", entry.media_ssrc);
+            }
+            if packet_type == RTCP_PAYLOAD_FEEDBACK {
+                if fmt == RTCP_FMT_PLI {
+                    return format!("{packet_type}/{fmt} pli media={:#010x}", entry.media_ssrc);
+                }
+                if fmt == RTCP_FMT_FIR {
+                    let targets = entry
+                        .fci
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|row| {
+                            format!(
+                                "{:#010x}",
+                                u32::from_be_bytes([row[0], row[1], row[2], row[3]])
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return format!("{packet_type}/{fmt} fir=[{targets}]");
+                }
+                if fmt == RTCP_FMT_REMB {
+                    return format!("{packet_type}/{fmt} remb");
+                }
+            }
+            format!("{packet_type}/{fmt} media={:#010x}", entry.media_ssrc)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(entries)
 }
 
 /// Whether this peer state is a decoder of theirs being born on *our* stream.
@@ -3583,6 +3652,42 @@ mod tests {
         // and not a request to start over.
         assert!(!reports_loss(&feedback(205, 1)));
         assert!(!reports_loss(&feedback(200, 4)));
+    }
+
+    /// The decrypted feedback line names each stream the peer talks about,
+    /// decoding FIR targets out of the FCI rows its media-source field
+    /// leaves zero.
+    #[test]
+    fn decrypted_feedback_names_its_targets() {
+        use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
+
+        let feedback = |packet_type, fmt, media_ssrc, fci: &[u8]| RtcpFeedback {
+            packet_type,
+            fmt,
+            sender_ssrc: 1,
+            media_ssrc,
+            fci: fci.to_vec(),
+        };
+        assert_eq!(describe_feedback(&[]), None);
+        assert_eq!(
+            describe_feedback(&[feedback(206, 1, 0xa04f8fe9, &[])]),
+            Some("206/1 pli media=0xa04f8fe9".to_string())
+        );
+        // A NACK rides the transport class but names its stream the same
+        // way; a FIR leaves the media field zero and names its targets in
+        // 8-byte FCI rows instead.
+        let mut fci = vec![0u8; 16];
+        fci[0..4].copy_from_slice(&[1, 2, 3, 4]);
+        fci[8..12].copy_from_slice(&[5, 6, 7, 8]);
+        assert_eq!(
+            describe_feedback(&[feedback(205, 1, 0x01020304, &[]), feedback(206, 4, 0, &fci),]),
+            Some("205/1 nack media=0x01020304, 206/4 fir=[0x01020304, 0x05060708]".to_string())
+        );
+        // REMB estimates bandwidth rather than naming a stream.
+        assert_eq!(
+            describe_feedback(&[feedback(206, 15, 0, &[9u8; 8])]),
+            Some("206/15 remb".to_string())
+        );
     }
 
     /// The states that mean the peer now has somewhere to put our video, and

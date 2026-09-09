@@ -367,8 +367,12 @@ impl Traffic {
                     self.video_packets = self.video_packets.saturating_add(1);
                     // What the peer's jitter sees first: PT, sequence,
                     // timestamp and SSRC of the opening packet, kept for the
-                    // report. A zero SSRC or a payload type that is not 97
-                    // here is a broken association, not a broken encoder.
+                    // report. Gating on 97 cannot miss our stream: every
+                    // video packet here was stamped by our own packetizer
+                    // (`next_video_packet`), and the data channel carries no
+                    // browser-built RTP to surprise it — the answer is
+                    // `m=application` only. A zero SSRC here is a broken
+                    // association, not a broken encoder.
                     if self.video_packets == 1 && !self.first_video_seen && data.len() >= 12 {
                         self.first_video.copy_from_slice(&data[..12]);
                         self.first_video_seen = true;
@@ -452,11 +456,13 @@ struct InboundSeen {
     media: std::cell::Cell<bool>,
     /// The peer's RTP streams, by payload type. See [`PayloadTypes`].
     inbound_types: PayloadTypes,
-    /// The peer's RTCP, by subpacket type: 201 is a receiver report, 205/206
-    /// transport/payload feedback (NACK, PLI, REMB). Counted per subpacket,
-    /// since one datagram usually carries several. A peer that never sends
-    /// any never locked our stream; one sending feedback sees it but cannot
-    /// decode it. STUN answers the relay itself and is not counted here.
+    /// The peer's RTCP, by leading-subpacket type: 201 is a receiver report,
+    /// 205/206 transport/payload feedback (NACK, PLI, REMB). Counted per
+    /// datagram rather than per subpacket — SRTCP encrypts past byte 8, so
+    /// only the first header is readable here and the rest is answered off
+    /// the decrypted path. A peer that never sends any never locked our
+    /// stream; one sending feedback sees it but cannot decode it. STUN
+    /// answers the relay itself and is not counted here.
     rtcp_count: std::cell::Cell<u32>,
     rtcp_types: PayloadTypes,
     /// Ours, recorded on the way out for the same reason.
@@ -503,12 +509,17 @@ impl Inbound {
                 self.seen.inbound_types.note(&packet);
             }
             RelayPacketKind::Rtcp => {
-                each_rtcp_type(&packet, |pt| {
+                // The leading subpacket only: past byte 8 the wire carries
+                // SRTCP ciphertext, so a later header would usually stop the
+                // read and occasionally invent a packet type. Which streams
+                // feedback names is answered off the decrypted path instead,
+                // where the engine has already run `unprotect_srtcp`.
+                if let Some(pt) = first_rtcp_type(&packet) {
                     self.seen
                         .rtcp_count
                         .set(self.seen.rtcp_count.get().saturating_add(1));
                     self.seen.rtcp_types.note_pt(pt);
-                });
+                }
             }
             RelayPacketKind::Stun | RelayPacketKind::Other => {}
         }
@@ -604,7 +615,11 @@ impl BrowserRelayChannel {
     }
 
     fn report(&self, phase: &str) {
-        debug!(
+        debug!("{}", self.report_line(phase));
+    }
+
+    fn report_line(&self, phase: &str) -> String {
+        format!(
             "voip: relay transport={} {} datachannel_admission_only=true peer_receipt=unknown \
              marker_scope=admitted_packets_not_complete_aus \
              state_order=connecting,open,closing,closed,unknown counters={:?} \
@@ -622,7 +637,7 @@ impl BrowserRelayChannel {
             ),
             yes_no(self.inbound.any.get()),
             yes_no(self.inbound.media.get()),
-        );
+        )
     }
 
     /// Whether this packet goes out, holding the verdict across an access unit.
@@ -1046,21 +1061,19 @@ fn yes_no(answer: bool) -> &'static str {
 /// the message is asked for first and the debug form is the fallback.
 /// The opening outbound video header for the report, or `none` before any
 /// video was admitted. PT is masked to seven bits the way RTP defines it.
-/// One RTCP packet type per call, walking a compound datagram through each
-/// header's length field. Stops at a truncated or non-RTCP header rather
-/// than guessing past it; a relay datagram usually carries RR and feedback
-/// in one, and recording only the first would hide the feedback this
-/// instrumentation exists to see.
-fn each_rtcp_type(data: &[u8], mut f: impl FnMut(u8)) {
-    let mut offset = 0;
-    while let Some(header) = data.get(offset..offset + 4) {
-        if header[0] >> 6 != 2 || !(192..=223).contains(&header[1]) {
-            break;
-        }
-        f(header[1]);
-        let words = u16::from_be_bytes([header[2], header[3]]) as usize;
-        offset = offset.saturating_add((words + 1).saturating_mul(4));
+/// The leading RTCP subpacket's type, or nothing when the datagram does not
+/// open with one. SRTCP encrypts past byte 8 (`RTCP_HEADER_LEN` in the
+/// library's `e2e_srtp`, which decrypts from there), so the first header is
+/// the only one readable before decryption: walking on would read ciphertext
+/// as headers, usually stopping and occasionally inventing a packet type.
+/// Anything past the lead — which streams feedback names, what the reports
+/// say — is collected off the decrypted path instead.
+fn first_rtcp_type(data: &[u8]) -> Option<u8> {
+    let header = data.get(..4)?;
+    if header[0] >> 6 != 2 || !(192..=223).contains(&header[1]) {
+        return None;
     }
+    Some(header[1])
 }
 
 fn describe_first_video(seen: bool, header: [u8; 12]) -> String {
@@ -1229,22 +1242,24 @@ mod tests {
         assert_eq!(inbound.seen.inbound_types.describe(), "120");
         assert_eq!(inbound.seen.rtcp_count.get(), 3);
         assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
-        // A compound datagram counts every subpacket, not just the first.
+        // A compound datagram counts once, for its leading subpacket: past
+        // byte 8 the wire carries SRTCP ciphertext, not a second header.
         let mut compound = [0u8; 20];
         compound[0..8].copy_from_slice(&[0x80, 201, 0, 1, 0, 0, 0, 0]);
         compound[8..20].copy_from_slice(&[0x81, 206, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
         inbound.deliver(Bytes::copy_from_slice(&compound));
-        assert_eq!(inbound.seen.rtcp_count.get(), 5);
+        assert_eq!(inbound.seen.rtcp_count.get(), 4);
         assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
-        // Truncated and non-RTCP tails stop the walk instead of guessing.
+        // A leading header that overclaims its length still counts: the
+        // eight clear octets are there even when the body is not.
         // Eight bytes so the classifier admits it as RTCP first: shorter
-        // than that never reaches the walker at all.
+        // than that never reaches the reader at all.
         inbound.deliver(Bytes::copy_from_slice(&[0x80, 201, 0, 9, 0, 0, 0, 0]));
         let mut ragged = [0u8; 12];
         ragged[0..8].copy_from_slice(&[0x80, 201, 0, 1, 0, 0, 0, 0]);
         inbound.deliver(Bytes::copy_from_slice(&ragged));
         inbound.deliver(Bytes::copy_from_slice(&[0x00, 201, 0, 0]));
-        assert_eq!(inbound.seen.rtcp_count.get(), 7);
+        assert_eq!(inbound.seen.rtcp_count.get(), 6);
         assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
     }
 
