@@ -100,7 +100,10 @@ pub fn find_links_in(rich: &crate::RichText) -> Vec<LinkSpan> {
 /// partition the token, so the whole token costs one scan no matter how many
 /// prefixes it holds. The trailing cleanup is cached the same way: one
 /// backward walk per token records the suffix, and each candidate resolves
-/// its end from that record plus the current balances.
+/// its end from that record plus the current balances. A markup cut is
+/// cached a third way: one forward walk per token records the tail past
+/// every edge, and each candidate subtracts its own edge's tail rather than
+/// walking the unchanged suffix again.
 #[derive(Debug, Default)]
 pub(crate) struct TokenScan {
     state: Option<TokenState>,
@@ -115,6 +118,11 @@ struct TokenState {
     suffix_start: usize,
     paren_stops: Vec<usize>,
     bracket_stops: Vec<usize>,
+    /// The tail delimiter balances over `edge..end` for the markup edges
+    /// inside this token, sorted by edge. Recorded in one forward walk on
+    /// the first cut; see [`TokenScan::cut_balances`].
+    cut_tails: Vec<(usize, i32, i32)>,
+    cut_ready: bool,
 }
 
 impl TokenScan {
@@ -152,6 +160,8 @@ impl TokenScan {
             suffix_start,
             paren_stops,
             bracket_stops,
+            cut_tails: Vec::new(),
+            cut_ready: false,
         });
         (end, parens, brackets)
     }
@@ -184,6 +194,93 @@ impl TokenScan {
             end = end.max(*stop);
         }
         end.max(rest)
+    }
+
+    /// The delimiter balances over `rest..cut`, where `cut` is a markup edge
+    /// short of the token end.
+    ///
+    /// `parens` and `brackets` arrive counted over `rest..end`, so the cut
+    /// needs them minus the tail over `cut..end`. The tail never depends on
+    /// the candidate — only on the token — but the cut does: each candidate
+    /// stops at the next edge after its own start, so repeated bold prefixes
+    /// hand every candidate a different one. The first cut in a token
+    /// therefore walks `cut..end` once, recording the tail for every edge it
+    /// passes, and each later candidate answers from that record whatever
+    /// edge it stops at. Walking the unchanged tail per candidate instead
+    /// makes a formatted token of rejected prefixes joined to a long suffix
+    /// quadratic in the peer's message.
+    fn cut_balances(
+        &mut self,
+        text: &str,
+        cut: usize,
+        edges: &[usize],
+        parens: i32,
+        brackets: i32,
+    ) -> (i32, i32) {
+        let end = self.state.as_ref().expect("balances ran first").end;
+        if !self.state.as_ref().expect("balances ran first").cut_ready {
+            // One forward pass: the running balance over `cut..pos`, noted
+            // at every edge, so each edge's tail is the total minus what
+            // stood before it. In scan sign — `(` opens, `)` closes — which
+            // is what the caller subtracts.
+            let mut open = 0i32;
+            let mut open_brackets = 0i32;
+            let mut noted: Vec<(usize, i32, i32)> = Vec::new();
+            let mut edge = edges.partition_point(|at| *at < cut);
+            while edge < edges.len() && edges[edge] == cut {
+                noted.push((cut, 0, 0));
+                edge += 1;
+            }
+            for (offset, ch) in text[cut..end].char_indices() {
+                match ch {
+                    '(' => open += 1,
+                    ')' => open -= 1,
+                    '[' => open_brackets += 1,
+                    ']' => open_brackets -= 1,
+                    _ => {}
+                }
+                let pos = cut + offset + ch.len_utf8();
+                while edge < edges.len() && edges[edge] <= pos && edges[edge] <= end {
+                    noted.push((edges[edge], open, open_brackets));
+                    edge += 1;
+                }
+                if edge < edges.len() && edges[edge] > end {
+                    break;
+                }
+            }
+            let state = self.state.as_mut().expect("balances ran first");
+            state.cut_tails = noted
+                .into_iter()
+                .map(|(at, before, before_brackets)| {
+                    (at, open - before, open_brackets - before_brackets)
+                })
+                .collect();
+            state.cut_ready = true;
+        }
+        let state = self.state.as_ref().expect("balances ran first");
+        match state.cut_tails.binary_search_by_key(&cut, |(at, _, _)| *at) {
+            Ok(ix) => {
+                let (_, tail, tail_brackets) = state.cut_tails[ix];
+                (parens - tail, brackets - tail_brackets)
+            }
+            // A foreign edge table, which the callers never pass: every edge
+            // here comes from `edges`, so the record holds it. Walked once
+            // rather than cached, so the answer stays exact either way.
+            Err(_) => {
+                let mut tail = 0i32;
+                let mut tail_brackets = 0i32;
+                for ch in text[cut..end].chars() {
+                    match ch {
+                        '(' => tail += 1,
+                        ')' => tail -= 1,
+                        '[' => tail_brackets += 1,
+                        ']' => tail_brackets -= 1,
+                        _ => {}
+                    }
+                }
+                (parens - tail, brackets - tail_brackets)
+            }
+        }
     }
 }
 
@@ -225,20 +322,13 @@ pub(crate) fn link_end_at(
     };
     let end = if boundary < token {
         // Only text that was ever marked up has boundaries, so the plain
-        // walk is fine here: un-count the cut tail, then trim what is left.
+        // walk is fine here: the cut balances come from the token's cached
+        // tails rather than a fresh walk of the unchanged suffix per
+        // candidate, then the trim takes what is left.
         if boundary <= rest {
             return None;
         }
-        let (mut parens, mut brackets) = (parens, brackets);
-        for ch in text[boundary..token].chars() {
-            match ch {
-                '(' => parens -= 1,
-                ')' => parens += 1,
-                '[' => brackets -= 1,
-                ']' => brackets += 1,
-                _ => {}
-            }
-        }
+        let (parens, brackets) = scan.cut_balances(text, boundary, boundaries, parens, brackets);
         trim_trailing_punctuation(text, rest, boundary, parens, brackets)
     } else {
         scan.trim_end(rest, parens, brackets)
@@ -696,6 +786,31 @@ mod tests {
         let source = format!("{}{}", "http:///".repeat(20_000), ")".repeat(60_000));
         let started = wacore::time::Instant::now();
         let links = find_links(&source);
+        let elapsed = started.elapsed();
+        assert!(links.is_empty());
+        assert!(
+            elapsed.as_secs() < 10,
+            "took {elapsed:?} for {} bytes",
+            source.len()
+        );
+    }
+
+    /// A formatted token of rejected prefixes joined to a long unformatted
+    /// suffix: every candidate stops at the same markup boundary, so the
+    /// boundary-adjusted balances come from one walk of the unchanged tail —
+    /// otherwise each rejection rescans the whole suffix and this is
+    /// quadratic in the peer's message while finding nothing at all.
+    #[test]
+    fn many_rejected_prefixes_before_a_boundary_before_a_long_suffix_stay_fast() {
+        let repeats = 20_000;
+        let source = format!(
+            "*{}*{}",
+            "http:///".repeat(repeats),
+            "a".repeat(8 * repeats)
+        );
+        let started = wacore::time::Instant::now();
+        let rich = crate::rich_text::parse(&source);
+        let links = find_links_in(&rich);
         let elapsed = started.elapsed();
         assert!(links.is_empty());
         assert!(

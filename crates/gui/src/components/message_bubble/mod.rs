@@ -153,6 +153,10 @@ pub fn render_message_bubble(
     // A refcount, not a rescan: the row's text already parsed these when the
     // timeline was built, and the targets were shared then.
     let menu_links = content.link_targets().clone();
+    // The keyboard route to the same addresses, beside the menu entries
+    // below: the inline ranges answer only the pointer and the menu opens on
+    // right-click alone, so keyboard users tab to these instead.
+    let link_buttons = menu_links.clone();
 
     div()
         .id(ids.row.clone())
@@ -289,6 +293,33 @@ pub fn render_message_bubble(
                                 ),
                         ),
                 )
+                .when(!link_buttons.is_empty(), |el| {
+                    // Opening an address is a command, so each one is a
+                    // `Button` — that is what carries focus and keyboard
+                    // activation, which the inline ranges never have. One
+                    // per address, naming what it opens, like the menu
+                    // entries below.
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(metrics.space_xxs())
+                            .mt(metrics.space_xs())
+                            .children(link_buttons.iter().enumerate().map(|(ix, target)| {
+                                let url = target.clone();
+                                Button::new(SharedString::from(format!(
+                                    "open-link-{message_id}-{ix}"
+                                )))
+                                .label(format!("Open {target}"))
+                                .ghost()
+                                .xsmall()
+                                .tooltip(format!("Open {target}"))
+                                .on_click(move |_, _, cx| {
+                                    cx.open_url(&url);
+                                })
+                            })),
+                    )
+                })
                 .when(can_retry, |el| {
                     // Sending again is a command, not a surface: a styled div
                     // has no keyboard activation, so a failed message would
