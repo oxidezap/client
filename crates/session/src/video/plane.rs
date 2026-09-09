@@ -176,6 +176,15 @@ fn next_camera_id() -> CameraId {
     NEXT.fetch_add(1, portable_atomic::Ordering::Relaxed)
 }
 
+/// The NAL types inside one Annex-B access unit, in order: 7 is an SPS, 8
+/// a PPS, 5 a slice. Read for the log, so an IDR going out without its
+/// parameter sets is one line rather than a silent non-starter.
+fn idr_nal_types(data: &[u8]) -> Vec<u8> {
+    use whatsapp_rust::wacore::voip::h264::{nal_unit_type, split_annexb};
+
+    split_annexb(data).map(nal_unit_type).collect()
+}
+
 /// How many frames may wait for the daemon. Small: a backlog here is latency
 /// the person on screen can see.
 pub(crate) const PUBLISH_DEPTH: usize = 4;
@@ -582,6 +591,12 @@ async fn pump_local(pump: LocalPump<impl Fn()>) {
         if !live.load(Ordering::Relaxed) {
             continue;
         }
+        // What the peer's decoder has to work with, on every keyframe: an
+        // IDR without its parameter sets starts nothing, and without this
+        // line the log cannot tell one from a complete unit.
+        if keyframe {
+            debug!("local video IDR NALs: {:?}", idr_nal_types(&data));
+        }
         {
             let delivery = publish(&publisher, || {
                 CallVideoFrame::new(
@@ -778,6 +793,28 @@ async fn pump_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every IDR that goes out names the NALs a peer decoder needs in the
+    /// log, so a keyframe without parameter sets is visible rather than a
+    /// silent non-starter on the far side.
+    #[cfg_attr(not(target_family = "wasm"), test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    fn idr_nal_audit_names_parameter_sets_and_slices() {
+        let annexb = |types: &[u8]| {
+            let mut data = Vec::new();
+            for nal_type in types {
+                data.extend_from_slice(&[0, 0, 0, 1, 0x60 | nal_type]);
+            }
+            data
+        };
+        assert_eq!(idr_nal_types(&annexb(&[7, 8, 5, 5])), vec![7, 8, 5, 5]);
+        assert_eq!(idr_nal_types(&annexb(&[5])), vec![5]);
+        // No start codes: AVCC length words, not Annex-B — reported empty
+        // rather than misread, since the pipeline downstream splits on
+        // start codes and would yield nothing either.
+        assert!(idr_nal_types(&[0, 0, 0, 12, 0x65, 1, 2, 3]).is_empty());
+        assert!(idr_nal_types(&[]).is_empty());
+    }
 
     /// A camera we asked to stop is not a camera that was lost.
     ///
