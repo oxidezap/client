@@ -614,14 +614,13 @@ async fn pump_local(pump: LocalPump<impl Fn()>) {
         // What the peer's decoder has to work with, on every keyframe: an
         // IDR without its parameter sets starts nothing, and without this
         // line the log cannot tell one from a complete unit — or two
-        // complete units with different sets from each other.
-        if keyframe {
+        // complete units with different sets from each other. Read now,
+        // said only once the plane takes the unit: a refused IDR is not
+        // available to the peer however complete it looks.
+        let idr_audit = keyframe.then(|| {
             let (sps, pps) = idr_parameter_sets(&data);
-            debug!(
-                "local video IDR NALs: {:?} sps={sps} pps={pps}",
-                idr_nal_types(&data)
-            );
-        }
+            format!("{:?} sps={sps} pps={pps}", idr_nal_types(&data))
+        });
         {
             let delivery = publish(&publisher, || {
                 CallVideoFrame::new(
@@ -684,6 +683,9 @@ async fn pump_local(pump: LocalPump<impl Fn()>) {
                 // nothing while this line is present is a fault downstream of
                 // us — which is the distinction the log could not make.
                 debug!("the first frame of local video was handed to the media plane");
+            }
+            if let Some(audit) = idr_audit {
+                debug!("local video IDR NALs: {audit}");
             }
         } else {
             refused_by_the_plane += 1;
