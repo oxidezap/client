@@ -566,6 +566,9 @@ mod tests {
         assert!(matches!(second, DaemonMessage::Update { version, .. } if version == after));
     }
 
+    /// Ties break by JID descending, matching `ChatStore::chats_page` (which
+    /// ranks equal rows by `jid DESC`) and the GUI's `chat_list_order`: the
+    /// snapshot's head must be the rows the truncated history load hydrates.
     #[test]
     fn chats_are_ordered_newest_first_and_ties_break_deterministically() {
         let hub = StateHub::new();
@@ -576,8 +579,8 @@ mod tests {
         let jids: Vec<String> = hub.snapshot().chats.into_iter().map(|c| c.jid).collect();
         assert_eq!(
             jids,
-            ["c@s.whatsapp.net", "a@s.whatsapp.net", "b@s.whatsapp.net"],
-            "newest first, then JID so the order is stable across clients"
+            ["c@s.whatsapp.net", "b@s.whatsapp.net", "a@s.whatsapp.net"],
+            "newest first, then JID descending like the store page"
         );
     }
 

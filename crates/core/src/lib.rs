@@ -49,7 +49,7 @@ pub use chat::{
 pub use chat::{fallback_chat_name, fallback_sender_name};
 pub use events::{ReceiptType, UiEvent};
 pub use group::{GroupMember, GroupRoster};
-pub use links::{LinkSpan, find_links as find_message_links};
+pub use links::{LinkSpan, find_links as find_message_links, find_links_in};
 pub use log_level::{LogLevel, UnknownLogLevel};
 pub use media_budget::{
     DECODED_IMAGE_BUDGET_BYTES, RETAINED_MEDIA_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES,

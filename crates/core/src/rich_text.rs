@@ -177,9 +177,10 @@ pub fn parse(source: &str) -> RichText {
     let mut open: Vec<Open> = Vec::new();
     let bytes = source.as_bytes();
     let mut at = 0;
-    // Shared with the link probe below: rejected candidates in one token
-    // reuse the token end, for the reason `find_links` does.
-    let mut url_token_end: Option<usize> = None;
+    // Shared with the link probe below: one token holds many rejected
+    // candidates, and the scan state keeps the token end and the delimiter
+    // balances current across them, for the reason `find_links` does.
+    let mut url_scan = crate::links::TokenScan::default();
 
     while at < source.len() {
         // An address is copied verbatim, before any marker is read: `_` and
@@ -187,13 +188,37 @@ pub fn parse(source: &str) -> RichText {
         // parsing them as markup would hand link detection a target the
         // sender never wrote. Markers around the address still apply, so a
         // quoted address stays quoted.
-        if let Some((end, _)) = crate::links::link_end_at(source, at, &mut url_token_end) {
+        if let Some((end, _)) = crate::links::link_end_at(source, at, &mut url_scan, &[]) {
+            let mut end = end;
+            // A closer for a run still open ends the address even mid-token:
+            // in `*https://example.com*x` the `*` is followed by more token,
+            // so the trailing cleanup never sees it, and the copy swallowed
+            // it into the target while leaving both markers literal. The
+            // last marker in the candidate that matches an open run and can
+            // close it stops the copy, the way the same marker would close
+            // the run in plain text: an earlier match is an address
+            // character, as in `_https://example.com/foo_bar_`, where the
+            // path underscores precede the actual closer. A marker matching
+            // nothing open — the `_`s inside a bold address — stays an
+            // address character.
+            let mut stop = None;
+            for (offset, ch) in source[at..end].char_indices() {
+                if !matches!(ch, '*' | '_' | '~' | '`') {
+                    continue;
+                }
+                let pos = at + offset;
+                if open.iter().any(|run| run.marker == ch) && closes(bytes, pos) {
+                    stop = Some(pos);
+                }
+            }
+            if let Some(pos) = stop {
+                end = pos;
+            }
             // The verbatim copy would swallow the delimiter closing a run
             // the address sits in: `*https://example.com*` came out with no
             // bold span and a `*` on the target. A trailing marker that
             // matches a run still open closes that run instead, so only the
             // address is copied and the markup path sees its closer.
-            let mut end = end;
             while end > at {
                 let Some(ch) = source[..end].chars().next_back() else {
                     break;
@@ -209,9 +234,18 @@ pub fn parse(source: &str) -> RichText {
                 }
                 end -= ch.len_utf8();
             }
-            out.text.push_str(&source[at..end]);
-            at = end;
-            continue;
+            // Shortening can leave nothing but the scheme: `*http://*` stops
+            // at its would-be closer with an empty host. That is not a link,
+            // so the markup path handles it as ordinary text instead.
+            let rest = at
+                + crate::links::prefix_at(source.as_bytes(), at)
+                    .map(|(len, _)| len)
+                    .unwrap_or(0);
+            if end > rest {
+                out.text.push_str(&source[at..end]);
+                at = end;
+                continue;
+            }
         }
         // A fence is three backticks and means the same thing as one, but it
         // is not delimited the same way — see `Open::fenced`.
@@ -814,6 +848,52 @@ mod tests {
     fn a_wrapped_link_keeps_its_inner_markers() {
         let (text, spans) = only("*https://example.com/foo_bar_baz*");
         assert_eq!(text, "https://example.com/foo_bar_baz");
+        assert_eq!(spans, vec![(0..text.len(), bold())]);
+    }
+
+    /// The closer is the last match, not the first: in
+    /// `_https://example.com/foo_bar_` the path underscores precede the
+    /// actual closer, and stopping at the first ate `bar_` out of the
+    /// address while leaving the real closer in the target.
+    #[test]
+    fn a_wrapped_link_keeps_markers_of_its_own_kind() {
+        let (text, spans) = only("_https://example.com/foo_bar_");
+        assert_eq!(text, "https://example.com/foo_bar");
+        assert_eq!(
+            spans,
+            vec![(
+                0..text.len(),
+                Emphasis {
+                    italic: true,
+                    ..Default::default()
+                }
+            )]
+        );
+        let links = crate::links::find_links(&text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "https://example.com/foo_bar");
+    }
+
+    /// A closer followed by more text still closes: in
+    /// `*https://example.com*x` the `*` is mid-token, so the trailing
+    /// cleanup never sees it. Without the interior stop the copy swallowed
+    /// it into the address, leaving both markers literal and no bold run.
+    #[test]
+    fn a_link_closer_followed_by_text_still_closes() {
+        let (text, spans) = only("*https://example.com*x");
+        assert_eq!(text, "https://example.comx");
+        assert_eq!(spans, vec![(0.."https://example.com".len(), bold())]);
+    }
+
+    /// Shortening can leave nothing but the scheme: `*http://*` stops at
+    /// its would-be closer with an empty host. That is not a link, so the
+    /// markers are handled as ordinary text — the opener pairs with its
+    /// closer the way `*ab*` does, rather than copying a scheme-only
+    /// "address" verbatim.
+    #[test]
+    fn a_scheme_only_candidate_is_not_a_link() {
+        let (text, spans) = only("*http://*");
+        assert_eq!(text, "http://");
         assert_eq!(spans, vec![(0..text.len(), bold())]);
     }
 

@@ -205,14 +205,20 @@ impl StateStore {
         let inner = self.lock();
         let mut chats: Vec<ChatSummary> = inner.chats.values().map(|e| e.summary.clone()).collect();
         // Pinned first (most recently pinned at the top), then newest first,
-        // and by JID when timestamps tie, so two clients given the same state
-        // render the same order.
+        // and by JID descending when timestamps tie, so two clients given the
+        // same state render the same order — and the same end of a tied run
+        // as the store: `ChatStore::chats_page` ranks equal
+        // `(pinned_at, last_message_ts)` rows by `jid DESC`, and the GUI's
+        // `chat_list_order` does the same. An ascending tie-breaker here kept
+        // the opposite end past the 100-row `catch_up` window from the rows
+        // the truncated history load hydrates, exposing chats with no
+        // messages behind them.
         chats.sort_by(|a, b| {
             let ts = |c: &ChatSummary| c.last_message.as_ref().map_or(i64::MIN, |m| m.timestamp_ms);
             b.pinned_at_ms
                 .cmp(&a.pinned_at_ms)
                 .then_with(|| ts(b).cmp(&ts(a)))
-                .then_with(|| a.jid.cmp(&b.jid))
+                .then_with(|| b.jid.cmp(&a.jid))
         });
         StateSnapshot {
             version: inner.version,
@@ -525,6 +531,37 @@ mod tests {
                 "recent@s.whatsapp.net",
                 "older@s.whatsapp.net",
             ]
+        );
+    }
+
+    /// A tied run sorts the store's way past the snapshot window: with more
+    /// than 100 chats sharing pin and activity timestamps, the snapshot's
+    /// head must be the rows the truncated history load hydrates — the
+    /// descending-JID head `ChatStore::chats_page` serves — or `catch_up`
+    /// paints placeholders no load ever fills.
+    #[test]
+    fn a_tied_run_snapshot_matches_the_store_page() {
+        let store = store();
+        for i in 0..105 {
+            store.apply_unless_stale(
+                active_chat(&format!("{i:03}@s.whatsapp.net"), 1_700_000_000_000),
+                None,
+                || (),
+            );
+        }
+
+        let snapshot = store.snapshot();
+        // `catch_up` paints the snapshot's first 100 rows while the
+        // truncated history load hydrates the store's first page: identical
+        // order here is what keeps their union free of chats with no
+        // messages behind them.
+        let order: Vec<&str> = snapshot.chats.iter().map(|c| c.jid.as_str()).collect();
+        let mut expected: Vec<String> =
+            (0..105).map(|i| format!("{i:03}@s.whatsapp.net")).collect();
+        expected.sort_by(|a, b| b.cmp(a));
+        assert_eq!(
+            order,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
         );
     }
 
