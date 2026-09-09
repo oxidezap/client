@@ -76,5 +76,10 @@ web-sys = { version = "0.3", features = [
     "Window",
 ] }
 
+[dev-dependencies]
+# Round-trip test only: the send path's packetizer against an independent
+# decoder. Production code in this crate never touches the wire format.
+wacore = { workspace = true, features = ["voip"] }
+
 [lints]
 workspace = true
