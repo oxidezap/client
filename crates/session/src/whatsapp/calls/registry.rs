@@ -744,7 +744,7 @@ impl CallRegistry {
             return;
         };
         let _ordered = lane.lock().await;
-        let (announce, pending) = {
+        let pending = {
             let mut calls = self.calls.lock().expect("call registry poisoned");
             let peer = call.participant.as_ref().unwrap_or(&call.from);
             if !calls
@@ -779,7 +779,13 @@ impl CallRegistry {
             start.activated = true;
             start.advertisements.clear();
             let _ = ui.send(UiEvent::CallAccepted(call_id.to_string()));
-            let announce = if let Some(local) = calls.cameras.get(call_id).filter(|local| {
+            // No standalone `<video state=1>` announce goes out here: a call
+            // that offered video is already sending from the moment the peer
+            // accepts, and captured video-from-start calls carry no such
+            // stanza — the peer opens its pane off the offer and the media,
+            // not off an announcement. An unexpected one is worse than none:
+            // Android acks it and then never brings its decoder up.
+            if let Some(local) = calls.cameras.get(call_id).filter(|local| {
                 Some(local.camera_id()) == camera
                     && local.alive()
                     && !calls.upgrading.contains_key(call_id)
@@ -793,11 +799,8 @@ impl CallRegistry {
                         handle.request_peer_keyframe(KeyframeUrgency::Coalesced);
                     }
                 }
-                true
-            } else {
-                false
-            };
-            (announce, pending)
+            }
+            pending
         };
         self.registration.notify_waiters();
         if let Some(update) = pending {
@@ -809,9 +812,6 @@ impl CallRegistry {
                 update.upgrade_token,
             )
             .await;
-        }
-        if announce {
-            self.announce_our_video(call_id, &handle).await;
         }
     }
 
@@ -959,33 +959,6 @@ impl CallRegistry {
             taken.stop().await;
         }
         outcome
-    }
-
-    /// Tell the peer this side is sending video, on a call that always was.
-    ///
-    /// A video-from-start call describes its video in the `<offer>` and then
-    /// says nothing more, and for a long time that looked complete: the plane
-    /// is enabled ungated, the encoder runs, and the packets go out. The peer
-    /// still shows nothing, because the offer is a *capability* and the
-    /// receiving side brings its video stream up off an *announcement* — the
-    /// official client's own decoder is driven by `handle_peer_video_enabled`
-    /// and `update_video_info`, both fed by `<video state=…>` and neither by
-    /// the offer. Android duly told us its direction (`state="11"`, then
-    /// `state="0"` when nothing answered) and never opened a pane for ours.
-    ///
-    /// Only ever "1": this says which direction *we* are sending, and a call
-    /// that offered video is sending from the moment the peer accepts. A
-    /// mid-call camera goes through `start_video`, which announces already.
-    async fn announce_our_video(&self, call_id: &str, handle: &Arc<CallHandle>) {
-        if !self
-            .live(call_id)
-            .is_some_and(|current| Arc::ptr_eq(&current, handle))
-        {
-            return;
-        }
-        if let Err(e) = handle.announce_video_enabled().await {
-            warn!("Call {call_id}: could not announce our video direction: {e}");
-        }
     }
 
     /// Whether this side's camera is on for this call.

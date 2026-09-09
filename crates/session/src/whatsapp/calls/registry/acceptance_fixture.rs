@@ -480,15 +480,8 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
         })
         .count();
     assert_eq!(
-        announcements,
-        usize::from(
-            case.connects()
-                && !matches!(
-                    case,
-                    OutgoingAcceptCase::CameraClosed | OutgoingAcceptCase::CameraReplaced
-                )
-        ),
-        "{case:?}: changed standalone Enabled count"
+        announcements, 0,
+        "{case:?}: a video-from-start outgoing accept sends no standalone Enabled announce"
     );
     if let Some(camera) = calls.ended(&id) {
         camera.stop().await;

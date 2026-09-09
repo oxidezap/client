@@ -202,10 +202,11 @@ pub(crate) struct LocalVideo {
     /// draw them into, so publishing them would base64 a 720p stream across
     /// the socket, spin up a decoder and convert every frame to pixels, all
     /// of it to be thrown away on arrival. And the peer discards them too:
-    /// it opens its pane off the announcement sent at accept, not off the
-    /// offer, so a unit that arrives before that announcement is decoded by
-    /// nobody — after paying for its place in a relay channel whose
-    /// congestion window has only just opened. See `announce_our_video`.
+    /// it opens its pane off the offer and the media, not off a standalone
+    /// announcement — captured video-from-start calls carry none — so a unit
+    /// that arrives before the peer's pane exists is decoded by nobody,
+    /// after paying for its place in a relay channel whose congestion
+    /// window has only just opened.
     live: Arc<AtomicBool>,
     /// The fan-out task, stopped by closing the camera's channel.
     pump: Task<()>,
