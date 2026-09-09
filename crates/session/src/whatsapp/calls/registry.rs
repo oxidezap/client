@@ -2299,7 +2299,13 @@ impl WhatsAppClient {
                     // past byte 8. A PLI or NACK naming our video SSRC here
                     // means the peer sees the stream but cannot decode it;
                     // none across a call means it never locked the stream.
-                    if reports_video && let Some(targets) = describe_feedback(feedback.as_slice()) {
+                    // The line is built only when debug logging is on:
+                    // RTCP recurs for the whole call and the string is
+                    // otherwise allocated just to be dropped.
+                    if reports_video
+                        && log::log_enabled!(log::Level::Debug)
+                        && let Some(targets) = describe_feedback(feedback.as_slice())
+                    {
                         debug!("call {call_id}: inbound RTCP feedback on our video: {targets}");
                     }
                     if reports_video && feedback.iter().any(reports_loss) {
