@@ -188,10 +188,14 @@ mod tests {
             .expect("a first frame is never skipped");
         assert!(encoded.keyframe);
 
-        // Control: the unpacketized unit decodes.
-        let mut decoder = Decoder::new().expect("decoder builds");
+        // Control: the unpacketized unit decodes, on a decoder instance of
+        // its own — sharing one would prime it with the original's
+        // parameter sets and let a reassembled unit missing them decode
+        // anyway, passing for exactly the failure this test claims to
+        // catch.
+        let mut control = Decoder::new().expect("decoder builds");
         assert!(
-            decoder
+            control
                 .decode(&encoded.data)
                 .expect("control decodes")
                 .is_some(),
@@ -216,6 +220,9 @@ mod tests {
             }
         }
         let (_, au) = reassembled.expect("the fragments reassemble into one unit");
+        // A fresh instance: whatever parameter sets the reassembled unit
+        // needs must arrive inside it, not linger from the control.
+        let mut decoder = Decoder::new().expect("decoder builds");
         assert!(
             decoder
                 .decode(&au)
