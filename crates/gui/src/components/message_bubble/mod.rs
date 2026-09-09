@@ -303,6 +303,8 @@ pub fn render_message_bubble(
                         div()
                             .flex()
                             .flex_col()
+                            .min_w_0()
+                            .max_w(layout.max_bubble_width())
                             .gap(metrics.space_xxs())
                             .mt(metrics.space_xs())
                             .children(link_buttons.iter().enumerate().map(|(ix, target)| {
