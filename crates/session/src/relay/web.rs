@@ -310,6 +310,11 @@ struct Traffic {
     send_errors: u64,
     buffer_high_water: u32,
     sample_counter: u8,
+    /// Whether the opening video header below was stored.
+    first_video_seen: bool,
+    /// First twelve bytes of the first admitted video packet. See the note
+    /// at the store site.
+    first_video: [u8; 12],
 }
 
 #[derive(Clone, Copy)]
@@ -360,6 +365,14 @@ impl Traffic {
                 }
                 if video {
                     self.video_packets = self.video_packets.saturating_add(1);
+                    // What the peer's jitter sees first: PT, sequence,
+                    // timestamp and SSRC of the opening packet, kept for the
+                    // report. A zero SSRC or a payload type that is not 97
+                    // here is a broken association, not a broken encoder.
+                    if self.video_packets == 1 && !self.first_video_seen && data.len() >= 12 {
+                        self.first_video.copy_from_slice(&data[..12]);
+                        self.first_video_seen = true;
+                    }
                     self.video_bytes = self.video_bytes.saturating_add(data.len() as u64);
                     if marker {
                         self.video_markers = self.video_markers.saturating_add(1);
@@ -387,6 +400,21 @@ impl Default for PayloadTypes {
 }
 
 impl PayloadTypes {
+    /// Record the whole second byte if it is new. RTCP packet types live
+    /// there unmasked (200 SR, 201 RR, 205 RTPFB, 206 PSFB); recording them
+    /// masked would fold every one into the RTP dynamic range.
+    fn note_raw(&self, packet: &[u8]) {
+        let Some(pt) = packet.get(1).copied() else {
+            return;
+        };
+        let mut seen = self.0.borrow_mut();
+        let (types, len) = &mut *seen;
+        if *len < types.len() && !types[..*len].contains(&pt) {
+            types[*len] = pt;
+            *len += 1;
+        }
+    }
+
     /// Record this packet's payload type if it is RTP and new.
     ///
     /// Cheap on the hot path by construction: RTP's payload type is the low
@@ -427,6 +455,12 @@ struct InboundSeen {
     media: std::cell::Cell<bool>,
     /// The peer's RTP streams, by payload type. See [`PayloadTypes`].
     inbound_types: PayloadTypes,
+    /// The peer's RTCP, by packet type: 201 is a receiver report, 205/206
+    /// transport/payload feedback (NACK, PLI, REMB). A peer that never sends
+    /// any never locked our stream; one sending feedback sees it but cannot
+    /// decode it. STUN answers the relay itself and is not counted here.
+    rtcp_count: std::cell::Cell<u32>,
+    rtcp_types: PayloadTypes,
     /// Ours, recorded on the way out for the same reason.
     outbound_types: PayloadTypes,
 }
@@ -460,14 +494,23 @@ impl Inbound {
         // the length of a call, and the answer stops changing after the first
         // one. Written the other way round it classifies for a question
         // already answered.
-        if matches!(classify_relay_packet(&packet), RelayPacketKind::Rtp) {
-            if !self.seen.media.replace(true) {
-                debug!("voip: the relay channel received the peer's first media packet");
+        match classify_relay_packet(&packet) {
+            RelayPacketKind::Rtp => {
+                if !self.seen.media.replace(true) {
+                    debug!("voip: the relay channel received the peer's first media packet");
+                }
+                // Which streams, not just that there were some. The flag above
+                // stops changing after the first packet; this does not, because a
+                // peer that adds video mid-call adds a payload type mid-call.
+                self.seen.inbound_types.note(&packet);
             }
-            // Which streams, not just that there were some. The flag above
-            // stops changing after the first packet; this does not, because a
-            // peer that adds video mid-call adds a payload type mid-call.
-            self.seen.inbound_types.note(&packet);
+            RelayPacketKind::Rtcp => {
+                self.seen
+                    .rtcp_count
+                    .set(self.seen.rtcp_count.get().saturating_add(1));
+                self.seen.rtcp_types.note_raw(&packet);
+            }
+            RelayPacketKind::Stun | RelayPacketKind::Other => {}
         }
         let pending = self.dropped.get();
         if pending > 0
@@ -565,12 +608,18 @@ impl BrowserRelayChannel {
             "voip: relay transport={} {} datachannel_admission_only=true peer_receipt=unknown \
              marker_scope=admitted_packets_not_complete_aus \
              state_order=connecting,open,closing,closed,unknown counters={:?} \
-             admitted_rtp_pts=[{}] inbound_rtp_pts=[{}] inbound={} inbound_media={}",
+             admitted_rtp_pts=[{}] inbound_rtp_pts=[{}] inbound_rtcp_pts=[{}] rtcp_count={} first_video={} inbound={} inbound_media={}",
             self.ordinal,
             phase,
             self.traffic.borrow(),
             self.inbound.outbound_types.describe(),
             self.inbound.inbound_types.describe(),
+            self.inbound.rtcp_types.describe(),
+            self.inbound.rtcp_count.get(),
+            describe_first_video(
+                self.traffic.borrow().first_video_seen,
+                self.traffic.borrow().first_video
+            ),
             yes_no(self.inbound.any.get()),
             yes_no(self.inbound.media.get()),
         );
@@ -995,6 +1044,21 @@ fn yes_no(answer: bool) -> &'static str {
 ///
 /// `{:?}` on one prints `JsValue(Object)` for the errors that matter most, so
 /// the message is asked for first and the debug form is the fallback.
+/// The opening outbound video header for the report, or `none` before any
+/// video was admitted. PT is masked to seven bits the way RTP defines it.
+fn describe_first_video(seen: bool, header: [u8; 12]) -> String {
+    if !seen {
+        return "none".to_string();
+    }
+    let seq = u16::from_be_bytes([header[2], header[3]]);
+    let ts = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    let ssrc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+    format!(
+        "[pt={} seq={seq} ts={ts} ssrc={ssrc:#010x}]",
+        header[1] & 0x7f
+    )
+}
+
 fn describe(value: &wasm_bindgen::JsValue) -> String {
     value
         .dyn_ref::<js_sys::Error>()
@@ -1120,6 +1184,60 @@ mod tests {
             std::mem::size_of::<Traffic>(),
             std::mem::size_of::<PayloadTypes>(),
         );
+    }
+
+    fn rtcp(pt: u8) -> Bytes {
+        let mut packet = [0u8; 12];
+        packet[0] = 0x81;
+        packet[1] = pt;
+        Bytes::copy_from_slice(&packet)
+    }
+
+    #[wasm_bindgen_test]
+    fn inbound_rtcp_is_counted_by_packet_type() {
+        let inbound = Inbound {
+            events: async_channel::unbounded::<RelayTransportEvent>().0,
+            dropped: std::cell::Cell::new(0),
+            seen: std::rc::Rc::new(InboundSeen::default()),
+        };
+        let mut audio = [0u8; 12];
+        audio[0] = 0x80;
+        audio[1] = 120;
+        inbound.deliver(Bytes::copy_from_slice(&audio));
+        inbound.deliver(rtcp(201));
+        inbound.deliver(rtcp(206));
+        inbound.deliver(rtcp(205));
+        inbound.deliver(Bytes::copy_from_slice(&[0x00, 0x01, 0x00, 0x00]));
+        assert!(inbound.seen.media.get());
+        assert_eq!(inbound.seen.inbound_types.describe(), "120");
+        assert_eq!(inbound.seen.rtcp_count.get(), 3);
+        assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
+    }
+
+    #[wasm_bindgen_test]
+    fn first_video_header_is_kept_for_the_report() {
+        assert_eq!(describe_first_video(false, [0u8; 12]), "none");
+        let mut traffic = Traffic::default();
+        let mut first = [0u8; 28];
+        first[0] = 0x90;
+        first[1] = RTP_PAYLOAD_TYPE_H264 | 0x80;
+        first[2..4].copy_from_slice(&[0x12, 0x34]);
+        first[4..8].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        first[8..12].copy_from_slice(&[0xab, 0xcd, 0xef, 0x01]);
+        traffic.note(&first, 0, SendOutcome::Accepted);
+        assert_eq!(
+            describe_first_video(traffic.first_video_seen, traffic.first_video),
+            "[pt=97 seq=4660 ts=287454020 ssrc=0xabcdef01]"
+        );
+        let mut second = first;
+        second[8..12].copy_from_slice(&[0x00, 0x00, 0x00, 0x02]);
+        traffic.note(&second, 0, SendOutcome::Accepted);
+        assert_eq!(
+            describe_first_video(traffic.first_video_seen, traffic.first_video),
+            "[pt=97 seq=4660 ts=287454020 ssrc=0xabcdef01]"
+        );
+        let short = Traffic::default();
+        assert!(!short.first_video_seen);
     }
 
     #[wasm_bindgen(inline_js = "
