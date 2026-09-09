@@ -194,19 +194,25 @@ pub fn parse(source: &str) -> RichText {
             // in `*https://example.com*x` the `*` is followed by more token,
             // so the trailing cleanup never sees it, and the copy swallowed
             // it into the target while leaving both markers literal. The
-            // first marker in the candidate that matches an open run and can
+            // last marker in the candidate that matches an open run and can
             // close it stops the copy, the way the same marker would close
-            // the run in plain text; a marker matching nothing open — the
-            // `_`s inside a bold address — stays an address character.
+            // the run in plain text: an earlier match is an address
+            // character, as in `_https://example.com/foo_bar_`, where the
+            // path underscores precede the actual closer. A marker matching
+            // nothing open — the `_`s inside a bold address — stays an
+            // address character.
+            let mut stop = None;
             for (offset, ch) in source[at..end].char_indices() {
                 if !matches!(ch, '*' | '_' | '~' | '`') {
                     continue;
                 }
                 let pos = at + offset;
                 if open.iter().any(|run| run.marker == ch) && closes(bytes, pos) {
-                    end = pos;
-                    break;
+                    stop = Some(pos);
                 }
+            }
+            if let Some(pos) = stop {
+                end = pos;
             }
             // The verbatim copy would swallow the delimiter closing a run
             // the address sits in: `*https://example.com*` came out with no
@@ -843,6 +849,29 @@ mod tests {
         let (text, spans) = only("*https://example.com/foo_bar_baz*");
         assert_eq!(text, "https://example.com/foo_bar_baz");
         assert_eq!(spans, vec![(0..text.len(), bold())]);
+    }
+
+    /// The closer is the last match, not the first: in
+    /// `_https://example.com/foo_bar_` the path underscores precede the
+    /// actual closer, and stopping at the first ate `bar_` out of the
+    /// address while leaving the real closer in the target.
+    #[test]
+    fn a_wrapped_link_keeps_markers_of_its_own_kind() {
+        let (text, spans) = only("_https://example.com/foo_bar_");
+        assert_eq!(text, "https://example.com/foo_bar");
+        assert_eq!(
+            spans,
+            vec![(
+                0..text.len(),
+                Emphasis {
+                    italic: true,
+                    ..Default::default()
+                }
+            )]
+        );
+        let links = crate::links::find_links(&text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "https://example.com/foo_bar");
     }
 
     /// A closer followed by more text still closes: in

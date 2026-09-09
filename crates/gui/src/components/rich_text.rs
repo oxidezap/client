@@ -397,7 +397,11 @@ mod tests {
         let parsed = BubbleText::of("*https://example.com*x");
         assert_eq!(parsed.text, "https://example.comx");
         assert_eq!(parsed.links.len(), 1);
-        assert_eq!(parsed.links[0].target, "https://example.comx");
+        assert_eq!(
+            &parsed.text[parsed.links[0].range.clone()],
+            "https://example.com"
+        );
+        assert_eq!(parsed.links[0].target, "https://example.com");
         assert!(!parsed.links[0].target.contains('*'));
         assert_eq!(parsed.runs.len(), 1);
         assert!(parsed.runs[0].1.bold);

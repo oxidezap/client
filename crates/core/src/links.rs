@@ -93,12 +93,14 @@ pub fn find_links_in(rich: &crate::RichText) -> Vec<LinkSpan> {
 /// Both `find_links` and the markup parser probe every byte, so one token
 /// can hold thousands of rejected prefixes — `http:///` repeated is one
 /// token of nothing but prefixes. Caching only the token end still leaves
-/// `trim_trailing_punctuation` counting delimiter balances over the whole
-/// remaining suffix per candidate, which is quadratic in the peer's message.
-/// The end and both balances are computed once per token and then kept
-/// current: each new candidate subtracts the bytes it skipped past since the
-/// last one, and those skipped gaps partition the token, so the whole token
-/// costs one scan no matter how many prefixes it holds.
+/// the trailing cleanup walking the same closers per candidate, which is
+/// quadratic in the peer's message. The end and both balances are computed
+/// once per token and then kept current: each new candidate subtracts the
+/// bytes it skipped past since the last one, and those skipped gaps
+/// partition the token, so the whole token costs one scan no matter how many
+/// prefixes it holds. The trailing cleanup is cached the same way: one
+/// backward walk per token records the suffix, and each candidate resolves
+/// its end from that record plus the current balances.
 #[derive(Debug, Default)]
 pub(crate) struct TokenScan {
     state: Option<TokenState>,
@@ -110,6 +112,9 @@ struct TokenState {
     rest: usize,
     parens: i32,
     brackets: i32,
+    suffix_start: usize,
+    paren_stops: Vec<usize>,
+    bracket_stops: Vec<usize>,
 }
 
 impl TokenScan {
@@ -138,13 +143,47 @@ impl TokenScan {
             return (state.end, state.parens, state.brackets);
         }
         let (end, parens, brackets) = scan_token_balances(text, rest);
+        let (suffix_start, paren_stops, bracket_stops) = scan_trailing_suffix(text, end);
         self.state = Some(TokenState {
             end,
             rest,
             parens,
             brackets,
+            suffix_start,
+            paren_stops,
+            bracket_stops,
         });
         (end, parens, brackets)
+    }
+
+    /// The candidate end after trailing cleanup, resolved from the cached
+    /// suffix and the current balances rather than a fresh backward walk.
+    ///
+    /// Punctuation always trims, so the trim never stops inside it; each
+    /// `)` trims only while `parens` is still negative — each one spent
+    /// raising it back — and likewise for `]` and `brackets`. The trim then
+    /// stops at the start of the suffix, or just past the first closer the
+    /// balances cannot cover, whichever the walk would reach first.
+    fn trim_end(&self, rest: usize, parens: i32, brackets: i32) -> usize {
+        let state = self.state.as_ref().expect("balances ran first");
+        let mut end = state.suffix_start;
+        // The blocking closer is the one whose ordinal spends the budget:
+        // the first `)` in scan order spends one, so with a budget of `-p`
+        // the walk stops just past number `-p` — and with no budget left at
+        // all it stops at the very first.
+        let need_parens = if parens < 0 { (-parens) as usize } else { 0 };
+        if let Some(stop) = state.paren_stops.get(need_parens) {
+            end = end.max(*stop);
+        }
+        let need_brackets = if brackets < 0 {
+            (-brackets) as usize
+        } else {
+            0
+        };
+        if let Some(stop) = state.bracket_stops.get(need_brackets) {
+            end = end.max(*stop);
+        }
+        end.max(rest)
     }
 }
 
@@ -174,7 +213,36 @@ pub(crate) fn link_end_at(
     }
     let rest = at + prefix_len;
     let (token, parens, brackets) = scan.balances(text, rest);
-    let end = trim_trailing_punctuation(text, rest, token, parens, brackets);
+    // A markup boundary after the start ends the address: the display joins
+    // the run to whatever follows it, but the source delimited them — in
+    // `*https://example.com*x` the span ends before `x`, so the target stops
+    // there too. A boundary at the start itself is preserved: the delimiter
+    // stood before the address, which `preceded_by_word_char` already
+    // honours.
+    let boundary = match boundaries.partition_point(|edge| *edge <= at) {
+        ix if ix < boundaries.len() => boundaries[ix],
+        _ => usize::MAX,
+    };
+    let end = if boundary < token {
+        // Only text that was ever marked up has boundaries, so the plain
+        // walk is fine here: un-count the cut tail, then trim what is left.
+        if boundary <= rest {
+            return None;
+        }
+        let (mut parens, mut brackets) = (parens, brackets);
+        for ch in text[boundary..token].chars() {
+            match ch {
+                '(' => parens -= 1,
+                ')' => parens += 1,
+                '[' => brackets -= 1,
+                ']' => brackets += 1,
+                _ => {}
+            }
+        }
+        trim_trailing_punctuation(text, rest, boundary, parens, brackets)
+    } else {
+        scan.trim_end(rest, parens, brackets)
+    };
     if end == rest || !host_is_plausible(&text[rest..end], bare) {
         return None;
     }
@@ -234,6 +302,65 @@ fn preceded_by_word_char(bytes: &[u8], at: usize, boundaries: &[usize]) -> bool 
     bytes[at - 1].is_ascii_alphanumeric()
 }
 
+/// The token's trailing cleanup, walked once: where the run of trimmable
+/// characters starts, and — in scan order, from the token end backward —
+/// the end each `)` or `]` would leave behind if the balances ran out at
+/// it. A candidate's trim is then one lookup per delimiter kind against the
+/// current balances rather than a fresh walk of the closers.
+fn scan_trailing_suffix(text: &str, end: usize) -> (usize, Vec<usize>, Vec<usize>) {
+    let mut start = end;
+    let mut paren_stops = Vec::new();
+    let mut bracket_stops = Vec::new();
+    while start > 0 {
+        let Some(ch) = text[..start].chars().next_back() else {
+            break;
+        };
+        if trailing_punctuation(ch) {
+            start -= ch.len_utf8();
+        } else if ch == ')' {
+            // A walk blocked here would leave this closer in, so the end it
+            // leaves behind is just past it.
+            paren_stops.push(start);
+            start -= 1;
+        } else if ch == ']' {
+            bracket_stops.push(start);
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    (start, paren_stops, bracket_stops)
+}
+
+/// Sentence punctuation that never belongs to the address — the set
+/// [`trim_trailing_punctuation`] cuts back off it.
+fn trailing_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ','
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | '。'
+            | '．'
+            | '，'
+            | '、'
+            | '！'
+            | '？'
+            | '；'
+            | '：'
+            | '…'
+            | '\''
+            | '’'
+            | '”'
+            | '»'
+            | '›'
+            | '」'
+            | '』'
+    )
+}
+
 /// Cut the sentence back off the address: trailing `.` `,` `;` `:` `!` `?`
 /// (and the fullwidth and ideographic equivalents CJK keyboards produce),
 /// a trailing quote that closed a quoted address but never belonged to it,
@@ -246,7 +373,10 @@ fn preceded_by_word_char(bytes: &[u8], at: usize, boundaries: &[usize]) -> bool 
 /// The delimiter balances arrive counted over `rest..end` — see
 /// [`TokenScan`] — so trimming a run of unmatched closers is one step per
 /// closer rather than a fresh scan per removed character, which is quadratic
-/// in a peer-controlled message of `))))…`.
+/// in a peer-controlled message of `))))…`. The unmarked path avoids even
+/// that walk: [`TokenScan::trim_end`] answers from the cached suffix.
+/// This walk stays for the marked path, where a boundary cuts the token
+/// short of the cached end.
 fn trim_trailing_punctuation(
     text: &str,
     rest: usize,
@@ -258,30 +388,7 @@ fn trim_trailing_punctuation(
         let Some(ch) = text[..end].chars().next_back() else {
             break;
         };
-        if matches!(
-            ch,
-            '.' | ','
-                | ';'
-                | ':'
-                | '!'
-                | '?'
-                | '。'
-                | '．'
-                | '，'
-                | '、'
-                | '！'
-                | '？'
-                | '；'
-                | '：'
-                | '…'
-                | '\''
-                | '’'
-                | '”'
-                | '»'
-                | '›'
-                | '」'
-                | '』'
-        ) {
+        if trailing_punctuation(ch) {
             end -= ch.len_utf8();
         } else if ch == ')' {
             // Only a closer leaves; an opener never sits at the trailing
@@ -565,5 +672,36 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(&rich.text[links[0].range.clone()], "https://example.com");
         assert_eq!(links[0].target, "https://example.com");
+    }
+
+    /// A boundary after the start ends the address: `*https://example.com*x`
+    /// parses to `https://example.comx` with the span ending before `x`, so
+    /// the link stops at the boundary instead of swallowing the suffix into
+    /// the target. A boundary at the start itself still counts as a break.
+    #[test]
+    fn a_formatting_boundary_after_the_start_ends_the_link() {
+        let text = "https://example.comx";
+        let links = find_links_with_boundaries(text, &[0, "https://example.com".len()]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(&text[links[0].range.clone()], "https://example.com");
+        assert_eq!(links[0].target, "https://example.com");
+    }
+
+    /// Rejected prefixes ahead of a long run of unmatched closers: every
+    /// candidate shares the token, so the suffix is walked once and each
+    /// rejection reuses it — otherwise this is quadratic in the peer's
+    /// message while finding nothing at all.
+    #[test]
+    fn many_rejected_prefixes_before_unmatched_closers_stay_fast() {
+        let source = format!("{}{}", "http:///".repeat(20_000), ")".repeat(60_000));
+        let started = wacore::time::Instant::now();
+        let links = find_links(&source);
+        let elapsed = started.elapsed();
+        assert!(links.is_empty());
+        assert!(
+            elapsed.as_secs() < 10,
+            "took {elapsed:?} for {} bytes",
+            source.len()
+        );
     }
 }
