@@ -2570,6 +2570,24 @@ fn reports_loss(feedback: &whatsapp_rust::wacore::voip::rtcp::RtcpFeedback) -> b
         && matches!(feedback.fmt, RTCP_FMT_PLI | RTCP_FMT_FIR)
 }
 
+/// The SSRCs one REMB block estimates bandwidth for, in listed order.
+///
+/// Layout per draft-alvestrand-rmcat-remb: `REMB`, a Num-SSRC byte, three
+/// bitrate bytes, then the list. A count that overclaims is clamped to the
+/// bytes actually there; anything without the magic has an unknown layout
+/// and yields nothing rather than a guess.
+fn remb_ssrcs(fci: &[u8]) -> Vec<u32> {
+    let [b'R', b'E', b'M', b'B', count, _, _, _, rest @ ..] = fci else {
+        return Vec::new();
+    };
+    rest.as_chunks::<4>()
+        .0
+        .iter()
+        .take(*count as usize)
+        .map(|ssrc| u32::from_be_bytes(*ssrc))
+        .collect()
+}
+
 /// The feedback half of a decrypted `RtcpReceived`, in one log line — or
 /// nothing when the packet carried no feedback to read.
 ///
@@ -2578,7 +2596,8 @@ fn reports_loss(feedback: &whatsapp_rust::wacore::voip::rtcp::RtcpFeedback) -> b
 /// is answered here, off the packet the engine already decrypted. PLI and
 /// NACK name theirs in the media-source field; FIR leaves that field zero
 /// and names its targets in 8-byte FCI rows instead; REMB estimates
-/// bandwidth rather than naming a stream and is noted without a target.
+/// bandwidth for the SSRC list past its bitrate bytes, which is decoded
+/// above and noted bare only when the block carries no list to read.
 fn describe_feedback(
     feedback: &[whatsapp_rust::wacore::voip::rtcp::RtcpFeedback],
 ) -> Option<String> {
@@ -2613,7 +2632,16 @@ fn describe_feedback(
                     return format!("{packet_type}/{fmt} fir=[{targets}]");
                 }
                 if fmt == RTCP_FMT_REMB {
-                    return format!("{packet_type}/{fmt} remb");
+                    let list = remb_ssrcs(&entry.fci);
+                    if list.is_empty() {
+                        return format!("{packet_type}/{fmt} remb");
+                    }
+                    let targets = list
+                        .iter()
+                        .map(|ssrc| format!("{ssrc:#010x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return format!("{packet_type}/{fmt} remb=[{targets}]");
                 }
             }
             format!("{packet_type}/{fmt} media={:#010x}", entry.media_ssrc)
@@ -3686,6 +3714,42 @@ mod tests {
         // REMB estimates bandwidth rather than naming a stream.
         assert_eq!(
             describe_feedback(&[feedback(206, 15, 0, &[9u8; 8])]),
+            Some("206/15 remb".to_string())
+        );
+    }
+
+    /// A REMB block estimates bandwidth for the SSRC list past its bitrate
+    /// bytes, and the line names them rather than dropping the identity.
+    #[test]
+    fn remb_reports_the_ssrcs_it_estimates() {
+        use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
+
+        let remb = |fci: &[u8]| RtcpFeedback {
+            packet_type: 206,
+            fmt: 15,
+            sender_ssrc: 1,
+            media_ssrc: 0,
+            fci: fci.to_vec(),
+        };
+        // Magic, a two-stream count, three bitrate bytes, then the list.
+        let mut fci = b"REMB".to_vec();
+        fci.extend_from_slice(&[2, 3, 0x11, 0x22]);
+        fci.extend_from_slice(&[1, 2, 3, 4]);
+        fci.extend_from_slice(&[5, 6, 7, 8]);
+        assert_eq!(
+            describe_feedback(&[remb(&fci)]),
+            Some("206/15 remb=[0x01020304, 0x05060708]".to_string())
+        );
+        // A count that overclaims is clamped to the bytes actually there.
+        let mut short = b"REMB".to_vec();
+        short.extend_from_slice(&[9, 0, 0, 0, 1, 2, 3, 4]);
+        assert_eq!(
+            describe_feedback(&[remb(&short)]),
+            Some("206/15 remb=[0x01020304]".to_string())
+        );
+        // Without the magic the layout is unknown, so nothing is claimed.
+        assert_eq!(
+            describe_feedback(&[remb(&[9u8; 8])]),
             Some("206/15 remb".to_string())
         );
     }
