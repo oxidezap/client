@@ -185,6 +185,26 @@ fn idr_nal_types(data: &[u8]) -> Vec<u8> {
     split_annexb(data).map(nal_unit_type).collect()
 }
 
+/// The first SPS and PPS NALs of an access unit, hex, without start codes.
+/// A decoder configures off exactly these bytes, so two calls whose IDRs
+/// carry different sets are different streams even when the NAL type lists
+/// match — and the log can tell them apart.
+fn idr_parameter_sets(data: &[u8]) -> (String, String) {
+    use whatsapp_rust::wacore::voip::h264::{nal_unit_type, split_annexb};
+
+    let mut sps = String::from("none");
+    let mut pps = String::from("none");
+    for nal in split_annexb(data) {
+        let entry = match nal_unit_type(nal) {
+            7 if sps == "none" => &mut sps,
+            8 if pps == "none" => &mut pps,
+            _ => continue,
+        };
+        *entry = nal.iter().map(|byte| format!("{byte:02x}")).collect();
+    }
+    (sps, pps)
+}
+
 /// How many frames may wait for the daemon. Small: a backlog here is latency
 /// the person on screen can see.
 pub(crate) const PUBLISH_DEPTH: usize = 4;
@@ -593,9 +613,14 @@ async fn pump_local(pump: LocalPump<impl Fn()>) {
         }
         // What the peer's decoder has to work with, on every keyframe: an
         // IDR without its parameter sets starts nothing, and without this
-        // line the log cannot tell one from a complete unit.
+        // line the log cannot tell one from a complete unit — or two
+        // complete units with different sets from each other.
         if keyframe {
-            debug!("local video IDR NALs: {:?}", idr_nal_types(&data));
+            let (sps, pps) = idr_parameter_sets(&data);
+            debug!(
+                "local video IDR NALs: {:?} sps={sps} pps={pps}",
+                idr_nal_types(&data)
+            );
         }
         {
             let delivery = publish(&publisher, || {
@@ -814,6 +839,19 @@ mod tests {
         // start codes and would yield nothing either.
         assert!(idr_nal_types(&[0, 0, 0, 12, 0x65, 1, 2, 3]).is_empty());
         assert!(idr_nal_types(&[]).is_empty());
+        // The sets come out hex without start codes, first of each kind
+        // wins, and a unit without them says none rather than guessing.
+        let mut unit = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f];
+        unit.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x06, 0xe2]);
+        unit.extend_from_slice(&[0, 0, 0, 1, 0x65, 1, 2, 3]);
+        assert_eq!(
+            idr_parameter_sets(&unit),
+            ("6742c01f".to_string(), "68ce06e2".to_string())
+        );
+        assert_eq!(
+            idr_parameter_sets(&annexb(&[5])),
+            ("none".to_string(), "none".to_string())
+        );
     }
 
     /// A camera we asked to stop is not a camera that was lost.
