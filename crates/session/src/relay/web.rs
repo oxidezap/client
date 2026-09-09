@@ -400,13 +400,10 @@ impl Default for PayloadTypes {
 }
 
 impl PayloadTypes {
-    /// Record the whole second byte if it is new. RTCP packet types live
-    /// there unmasked (200 SR, 201 RR, 205 RTPFB, 206 PSFB); recording them
-    /// masked would fold every one into the RTP dynamic range.
-    fn note_raw(&self, packet: &[u8]) {
-        let Some(pt) = packet.get(1).copied() else {
-            return;
-        };
+    /// Record one packet type if it is new. RTCP types pass unmasked (200
+    /// SR, 201 RR, 205 RTPFB, 206 PSFB); recording them masked would fold
+    /// every one into the RTP dynamic range.
+    fn note_pt(&self, pt: u8) {
         let mut seen = self.0.borrow_mut();
         let (types, len) = &mut *seen;
         if *len < types.len() && !types[..*len].contains(&pt) {
@@ -455,8 +452,9 @@ struct InboundSeen {
     media: std::cell::Cell<bool>,
     /// The peer's RTP streams, by payload type. See [`PayloadTypes`].
     inbound_types: PayloadTypes,
-    /// The peer's RTCP, by packet type: 201 is a receiver report, 205/206
-    /// transport/payload feedback (NACK, PLI, REMB). A peer that never sends
+    /// The peer's RTCP, by subpacket type: 201 is a receiver report, 205/206
+    /// transport/payload feedback (NACK, PLI, REMB). Counted per subpacket,
+    /// since one datagram usually carries several. A peer that never sends
     /// any never locked our stream; one sending feedback sees it but cannot
     /// decode it. STUN answers the relay itself and is not counted here.
     rtcp_count: std::cell::Cell<u32>,
@@ -505,10 +503,12 @@ impl Inbound {
                 self.seen.inbound_types.note(&packet);
             }
             RelayPacketKind::Rtcp => {
-                self.seen
-                    .rtcp_count
-                    .set(self.seen.rtcp_count.get().saturating_add(1));
-                self.seen.rtcp_types.note_raw(&packet);
+                each_rtcp_type(&packet, |pt| {
+                    self.seen
+                        .rtcp_count
+                        .set(self.seen.rtcp_count.get().saturating_add(1));
+                    self.seen.rtcp_types.note_pt(pt);
+                });
             }
             RelayPacketKind::Stun | RelayPacketKind::Other => {}
         }
@@ -1046,6 +1046,23 @@ fn yes_no(answer: bool) -> &'static str {
 /// the message is asked for first and the debug form is the fallback.
 /// The opening outbound video header for the report, or `none` before any
 /// video was admitted. PT is masked to seven bits the way RTP defines it.
+/// One RTCP packet type per call, walking a compound datagram through each
+/// header's length field. Stops at a truncated or non-RTCP header rather
+/// than guessing past it; a relay datagram usually carries RR and feedback
+/// in one, and recording only the first would hide the feedback this
+/// instrumentation exists to see.
+fn each_rtcp_type(data: &[u8], mut f: impl FnMut(u8)) {
+    let mut offset = 0;
+    while let Some(header) = data.get(offset..offset + 4) {
+        if header[0] >> 6 != 2 || !(192..=223).contains(&header[1]) {
+            break;
+        }
+        f(header[1]);
+        let words = u16::from_be_bytes([header[2], header[3]]) as usize;
+        offset = offset.saturating_add((words + 1).saturating_mul(4));
+    }
+}
+
 fn describe_first_video(seen: bool, header: [u8; 12]) -> String {
     if !seen {
         return "none".to_string();
@@ -1211,6 +1228,23 @@ mod tests {
         assert!(inbound.seen.media.get());
         assert_eq!(inbound.seen.inbound_types.describe(), "120");
         assert_eq!(inbound.seen.rtcp_count.get(), 3);
+        assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
+        // A compound datagram counts every subpacket, not just the first.
+        let mut compound = [0u8; 20];
+        compound[0..8].copy_from_slice(&[0x80, 201, 0, 1, 0, 0, 0, 0]);
+        compound[8..20].copy_from_slice(&[0x81, 206, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+        inbound.deliver(Bytes::copy_from_slice(&compound));
+        assert_eq!(inbound.seen.rtcp_count.get(), 5);
+        assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
+        // Truncated and non-RTCP tails stop the walk instead of guessing.
+        // Eight bytes so the classifier admits it as RTCP first: shorter
+        // than that never reaches the walker at all.
+        inbound.deliver(Bytes::copy_from_slice(&[0x80, 201, 0, 9, 0, 0, 0, 0]));
+        let mut ragged = [0u8; 12];
+        ragged[0..8].copy_from_slice(&[0x80, 201, 0, 1, 0, 0, 0, 0]);
+        inbound.deliver(Bytes::copy_from_slice(&ragged));
+        inbound.deliver(Bytes::copy_from_slice(&[0x00, 201, 0, 0]));
+        assert_eq!(inbound.seen.rtcp_count.get(), 7);
         assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
     }
 
