@@ -945,6 +945,17 @@ impl WhatsAppClient {
         }
     }
 
+    /// Whether a `<reject>` ends our side of the call: only a decision
+    /// does. `busy` is in another call and `enc` could not decrypt the
+    /// offer, and neither speaks for the callee — the dismiss path already
+    /// keeps the rest ringing for both, so ending here would hang up a call
+    /// the peer is still answering.
+    fn reject_ends_call(reason: Option<&str>) -> bool {
+        use whatsapp_rust::wacore::stanza::call::{REJECT_REASON_BUSY, REJECT_REASON_ENC};
+
+        !matches!(reason, Some(REJECT_REASON_BUSY) | Some(REJECT_REASON_ENC))
+    }
+
     /// Handle events from the WhatsApp client
     async fn handle_event(
         event: Arc<Event>,
@@ -1032,7 +1043,14 @@ impl WhatsAppClient {
                     info!("Call {} accepted by peer", call_id);
                     calls.accepted(call, &ui_tx).await;
                 }
-                CallAction::Reject { call_id, .. } => {
+                CallAction::Reject {
+                    call_id, reason, ..
+                } => {
+                    // One stale device must not end the call: its siblings
+                    // are still ringing, and the primary may yet answer.
+                    if !Self::reject_ends_call(reason.as_deref()) {
+                        return;
+                    }
                     info!("Call {} rejected by peer", call_id);
                     calls.ended_remotely(call_id);
                     // Claimed, not assumed. The watcher parked on this call's
