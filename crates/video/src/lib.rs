@@ -126,10 +126,15 @@ pub(crate) const KEYFRAME_SECONDS: u32 = 3;
 /// seconds even if every request is coalesced away.
 pub(crate) const MIN_REQUESTED_KEYFRAME_SECONDS: u32 = 1;
 
-/// What WhatsApp Web itself offers on a desktop: Constrained Baseline at
-/// 720p20, a shade under 2 Mbps.
-const DEFAULT_WIDTH: u32 = 1280;
-const DEFAULT_HEIGHT: u32 = 720;
+/// Isolation preview, not the product default: 640x360 at the same frame
+/// rate and bitrate budget. 1280x720 sits exactly at Level 3.1's 3600
+/// macroblock ceiling, and a phone that enforces a tighter bound would
+/// fail closed there while decoding 360p (1440 macroblocks, nowhere near
+/// any ceiling) fine. One variable against the sibling preview: geometry
+/// only, so a render there isolates dimensions from structure. Revert
+/// before merge whatever it shows.
+const DEFAULT_WIDTH: u32 = 640;
+const DEFAULT_HEIGHT: u32 = 360;
 const DEFAULT_FPS: u32 = 20;
 const DEFAULT_BITRATE_KBPS: u32 = 1980;
 
