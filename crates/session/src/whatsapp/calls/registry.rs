@@ -3844,6 +3844,16 @@ mod tests {
             .lines()
             .rfind(|l| l.contains("counters=Traffic"))
             .unwrap_or_else(|| panic!("cycle {cycle}: the fixture must hold a relay report line"));
+        // The terminal counters, not a periodic sample: only the `final`
+        // phase sees drops or send failures past the last sample.
+        let phase = report
+            .split_once("relay transport=")
+            .and_then(|rest| rest.1.split_whitespace().nth(1))
+            .unwrap_or_else(|| panic!("cycle {cycle}: the report must carry its phase"));
+        assert_eq!(
+            phase, "final",
+            "cycle {cycle}: the fixture must end at the final report"
+        );
         let field = |name: &str| {
             let mut tokens = report
                 .split(['{', '}', ',', ' ', '[', ']'])
@@ -3882,12 +3892,17 @@ mod tests {
         );
     }
 
-    /// The same night's device logcat: the phone's AVC decoder for the call
-    /// window is configured without parameter sets at a geometry that is not
-    /// our stream, renders nothing, drops everything, and is released.
+    /// The native-app leg's device logcat, kept explicitly separate from the
+    /// page-call proof above: the log shows an incoming call screen with no
+    /// page log behind it, so this decoder belongs to captain-calling-from
+    /// native, not to either replayed call. It stays because it is the only
+    /// device-side decoder evidence in existence — a phone AVC decoder
+    /// configured without parameter sets at a geometry that is not a 720p
+    /// stream, rendering nothing, dropping everything, then released — and
+    /// the day a page-correlated capture exists, this fixture goes away.
     #[test]
-    fn failing_call_decoder_never_renders() {
-        let fixture = include_str!("testdata/failing-call-decoder.logcat");
+    fn native_leg_decoder_never_renders() {
+        let fixture = include_str!("testdata/native-leg-decoder.logcat");
         let configure = fixture
             .lines()
             .find(|l| l.contains("configure: ClientFormat"))

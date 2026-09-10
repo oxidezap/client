@@ -446,6 +446,39 @@ impl PayloadTypes {
     }
 }
 
+/// Sender SSRCs of outbound RTCP Sender Reports, in first-seen order.
+/// A second entry is the audio stream's; a call has no third.
+struct SsrcSeen(RefCell<([u32; 8], usize)>);
+
+impl Default for SsrcSeen {
+    fn default() -> Self {
+        Self(RefCell::new(([0; 8], 0)))
+    }
+}
+
+impl SsrcSeen {
+    fn note_ssrc(&self, ssrc: u32) {
+        let mut seen = self.0.borrow_mut();
+        let (ssrcs, len) = &mut *seen;
+        if *len < ssrcs.len() && !ssrcs[..*len].contains(&ssrc) {
+            ssrcs[*len] = ssrc;
+            *len += 1;
+        }
+    }
+
+    fn describe(&self) -> String {
+        let seen = self.0.borrow();
+        let seen = &seen.0[..seen.1];
+        if seen.is_empty() {
+            return "none".to_string();
+        }
+        seen.iter()
+            .map(|ssrc| format!("{ssrc:#010x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// What the relay has actually delivered, by kind that matters.
 #[derive(Default)]
 struct InboundSeen {
@@ -472,6 +505,11 @@ struct InboundSeen {
     /// the inbound side — what the engine encrypts past byte 8 is unreadable
     /// here, and the report line is where a missing SR would finally show.
     outbound_rtcp: PayloadTypes,
+    /// Which streams our Sender Reports speak for. PT 200 alone cannot say:
+    /// audio and video both report under it. The sender SSRC rides bytes 4-7
+    /// in the clear ahead of the SRTCP ciphertext, so a video SR shows up
+    /// here under the same SSRC `first_video` carries.
+    outbound_sr: SsrcSeen,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -628,12 +666,13 @@ impl BrowserRelayChannel {
             "voip: relay transport={} {} datachannel_admission_only=true peer_receipt=unknown \
              marker_scope=admitted_packets_not_complete_aus \
              state_order=connecting,open,closing,closed,unknown counters={:?} \
-             admitted_rtp_pts=[{}] outbound_rtcp_pts=[{}] inbound_rtp_pts=[{}] inbound_rtcp_pts=[{}] rtcp_count={} first_video={} inbound={} inbound_media={}",
+             admitted_rtp_pts=[{}] outbound_rtcp_pts=[{}] outbound_sr_ssrcs=[{}] inbound_rtp_pts=[{}] inbound_rtcp_pts=[{}] rtcp_count={} first_video={} inbound={} inbound_media={}",
             self.ordinal,
             phase,
             self.traffic.borrow(),
             self.inbound.outbound_types.describe(),
             self.inbound.outbound_rtcp.describe(),
+            self.inbound.outbound_sr.describe(),
             self.inbound.inbound_types.describe(),
             self.inbound.rtcp_types.describe(),
             self.inbound.rtcp_count.get(),
@@ -814,6 +853,19 @@ impl RelayTransport for BrowserRelayChannel {
             && let Some(pt) = first_rtcp_type(&data)
         {
             self.inbound.outbound_rtcp.note_pt(pt);
+            // A Sender Report names its stream past the header, still in the
+            // clear: bytes 4-7 are the sender SSRC, ciphertext starts at 8.
+            // Zero names nothing — the same broken association `first_video`
+            // already refuses — so it is not recorded.
+            if pt == 200
+                && let Some(ssrc) = data.get(4..8)
+                && let Ok(ssrc) = ssrc.try_into()
+            {
+                let ssrc = u32::from_be_bytes(ssrc);
+                if ssrc != 0 {
+                    self.inbound.outbound_sr.note_ssrc(ssrc);
+                }
+            }
         }
         self.note_send(
             &data,
@@ -1309,6 +1361,29 @@ mod tests {
                 .report_line("activity")
                 .contains("outbound_rtcp_pts=[200, 201]")
         );
+        // PT alone cannot answer the video-SR question: audio and video both
+        // report as 200. The sender SSRC in the clear bytes 4-7 names the
+        // stream, so a video SR must show up under our own video SSRC.
+        let ssrc = [0x1f, 0x16, 0x0e, 0xd3];
+        let mut video = [0u8; 28];
+        video[0] = 0x90;
+        video[1] = RTP_PAYLOAD_TYPE_H264 | 0x80;
+        video[8..12].copy_from_slice(&ssrc);
+        video[12..18].copy_from_slice(&[0xde, 0xbe, 0, 3, 0x30, 8]);
+        assert!(relay.send(Bytes::copy_from_slice(&video)).await.is_ok());
+        let mut sr = [0u8; 28];
+        sr[0] = 0x80;
+        sr[1] = 200;
+        sr[2..4].copy_from_slice(&[0, 6]);
+        sr[4..8].copy_from_slice(&ssrc);
+        assert!(relay.send(Bytes::copy_from_slice(&sr)).await.is_ok());
+        assert_eq!(relay.inbound.outbound_sr.describe(), "0x1f160ed3");
+        assert!(
+            relay
+                .report_line("activity")
+                .contains("outbound_sr_ssrcs=[0x1f160ed3]")
+        );
+        assert!(relay.report_line("activity").contains("ssrc=0x1f160ed3]"));
         relay.disconnect().await;
     }
 
