@@ -744,7 +744,7 @@ impl CallRegistry {
             return;
         };
         let _ordered = lane.lock().await;
-        let pending = {
+        let (re_request, pending) = {
             let mut calls = self.calls.lock().expect("call registry poisoned");
             let peer = call.participant.as_ref().unwrap_or(&call.from);
             if !calls
@@ -782,10 +782,14 @@ impl CallRegistry {
             // No standalone `<video state=1>` announce goes out here: a call
             // that offered video is already sending from the moment the peer
             // accepts, and captured video-from-start calls carry no such
-            // stanza — the peer opens its pane off the offer and the media,
-            // not off an announcement. An unexpected one is worse than none:
-            // Android acks it and then never brings its decoder up.
-            if let Some(local) = calls.cameras.get(call_id).filter(|local| {
+            // stanza. Instead the upgrade is re-requested as caller
+            // (`state=11`): Android-as-callee never completes its decoder
+            // setup off the offer and media alone — its `state=1` arrives
+            // without `dec` and never repeats — while Android-as-caller
+            // drives a transaction-bound video dialog and renders. The
+            // request is stanza-only; endpoints and media stay untouched,
+            // and a call without live video refuses it rather than sending.
+            let re_request = if let Some(local) = calls.cameras.get(call_id).filter(|local| {
                 Some(local.camera_id()) == camera
                     && local.alive()
                     && !calls.upgrading.contains_key(call_id)
@@ -799,8 +803,11 @@ impl CallRegistry {
                         handle.request_peer_keyframe(KeyframeUrgency::Coalesced);
                     }
                 }
-            }
-            pending
+                true
+            } else {
+                false
+            };
+            (re_request, pending)
         };
         self.registration.notify_waiters();
         if let Some(update) = pending {
@@ -812,6 +819,11 @@ impl CallRegistry {
                 update.upgrade_token,
             )
             .await;
+        }
+        if re_request {
+            if let Err(e) = handle.re_request_video_upgrade().await {
+                warn!("Call {call_id}: could not re-request the video upgrade: {e}");
+            }
         }
     }
 

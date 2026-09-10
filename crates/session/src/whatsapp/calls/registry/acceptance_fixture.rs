@@ -483,6 +483,29 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
         announcements, 0,
         "{case:?}: a video-from-start outgoing accept sends no standalone Enabled announce"
     );
+    let upgrade_requests = fixture
+        .outgoing_stanzas()
+        .unwrap()
+        .iter()
+        .filter(|node| {
+            node.as_node_ref()
+                .get_optional_child("video")
+                .is_some_and(|video| {
+                    video.attrs().optional_string("state").as_deref() == Some("11")
+                })
+        })
+        .count();
+    assert_eq!(
+        upgrade_requests,
+        usize::from(
+            case.connects()
+                && !matches!(
+                    case,
+                    OutgoingAcceptCase::CameraClosed | OutgoingAcceptCase::CameraReplaced
+                )
+        ),
+        "{case:?}: a video-from-start outgoing accept re-requests the upgrade as caller"
+    );
     if let Some(camera) = calls.ended(&id) {
         camera.stop().await;
     }
