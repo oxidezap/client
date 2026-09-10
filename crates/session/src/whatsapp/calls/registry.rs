@@ -1647,6 +1647,10 @@ impl WhatsAppClient {
             // depends on a request of ours still being outstanding when it
             // lands. Answering one of *theirs* owes nothing.
             let ours_to_be_answered = answering.is_none();
+            let resuming = answering.is_none()
+                && handle.video_states().is_some_and(|(local, peer)| {
+                    local == VideoState::Stopped && !peer.is_inactive_for_call_mode()
+                });
             // Recorded before the request goes out, for the reason every
             // other intent here is stamped before its task exists: the reply
             // is not ours to schedule. `start_video` puts `<video_state>` on
@@ -1658,7 +1662,7 @@ impl WhatsAppClient {
             // Registering late cannot be made safe by ordering; registering
             // early can, because every path out of here that is not a camera
             // held withdraws it again.
-            if ours_to_be_answered {
+            if ours_to_be_answered && !resuming {
                 calls.begin_upgrade(&call_id, local.camera_id());
             }
             let camera_id = local.camera_id();
@@ -1669,6 +1673,7 @@ impl WhatsAppClient {
                         .accept_video(token, endpoints.source, endpoints.sink)
                         .await
                 }
+                None if resuming => handle.resume_video(endpoints.source, endpoints.sink).await,
                 None => handle.start_video(endpoints.source, endpoints.sink).await,
             };
             match started {
@@ -1729,7 +1734,7 @@ impl WhatsAppClient {
                             // directions down. Answering one of theirs sets no
                             // such timeout, and every other outcome above
                             // already withdrew this attempt.
-                            if ours_to_be_answered {
+                            if ours_to_be_answered && !resuming {
                                 crate::exec::spawn(Self::watch_upgrade_attempt(
                                     calls.clone(),
                                     ui_sender.clone(),
@@ -1739,6 +1744,14 @@ impl WhatsAppClient {
                                     seq,
                                     Self::VIDEO_UPGRADE_ANSWER_WAIT,
                                 ));
+                            }
+                            if resuming {
+                                Self::announce_video(
+                                    &ui_sender,
+                                    &call_id,
+                                    VideoStream::Local,
+                                    true,
+                                );
                             }
                         }
                     }
@@ -1801,7 +1814,8 @@ impl WhatsAppClient {
     /// touching its own direction, and clears the library's pending request
     /// so its timeout finds nothing to cancel. Kept a full second under the
     /// library's so device-close latency on this side cannot lose the race.
-    const VIDEO_UPGRADE_ANSWER_WAIT: Duration = Duration::from_secs(4);
+    const VIDEO_UPGRADE_ANSWER_WAIT: Duration =
+        whatsapp_rust::voip::VIDEO_UPGRADE_TIMEOUT.saturating_sub(Duration::from_secs(1));
 
     /// Withdraw an upgrade of ours the peer never answers, before the
     /// library's own timeout does it destructively (see
