@@ -212,15 +212,11 @@ impl VideoQuality {
     /// decision a user has the information to make, and the one case that
     /// needs it — a machine too slow for 720p, a link too narrow for 2 Mbps —
     /// is one where a number in the environment is the right size of answer.
-    /// A page has no environment, so it reads the same knob off its own URL
-    /// (`?video_size=640x360`), which is how one preview serves both the
-    /// default path and an isolation geometry.
     #[must_use]
     pub fn from_environment() -> Self {
-        let size = imp::page_video_size().or_else(|| env_pair("OXIDEZAP_VIDEO_SIZE"));
         let wanted = Self {
-            width: size.map_or(DEFAULT_WIDTH, |(w, _)| w),
-            height: size.map_or(DEFAULT_HEIGHT, |(_, h)| h),
+            width: env_pair("OXIDEZAP_VIDEO_SIZE").map_or(DEFAULT_WIDTH, |(w, _)| w),
+            height: env_pair("OXIDEZAP_VIDEO_SIZE").map_or(DEFAULT_HEIGHT, |(_, h)| h),
             fps: env_u32("OXIDEZAP_VIDEO_FPS").unwrap_or(DEFAULT_FPS),
             bitrate_kbps: env_u32("OXIDEZAP_VIDEO_BITRATE_KBPS").unwrap_or(DEFAULT_BITRATE_KBPS),
         };
@@ -231,42 +227,6 @@ impl VideoQuality {
                 Self::default()
             }
         }
-    }
-}
-
-/// `?video_size=640x360` from the page URL, if present and well formed.
-/// Pure, so the host tests cover it; the window read itself is one line in
-/// `page_video_size` below. Compiled out of production host builds, where
-/// nothing reads a page URL.
-#[cfg(any(test, target_family = "wasm"))]
-fn query_pair(search: &str) -> Option<(u32, u32)> {
-    search
-        .strip_prefix('?')
-        .unwrap_or(search)
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| key.trim() == "video_size")
-        .and_then(|(_, value)| {
-            let (width, height) = value.trim().split_once(['x', 'X'])?;
-            Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
-        })
-}
-
-/// The page's own override, or nothing: native builds have no URL, and a
-/// page whose location cannot be read keeps the default. One function the
-/// caller names, two halves behind it, no `cfg` at the call.
-#[cfg(target_family = "wasm")]
-mod imp {
-    pub(super) fn page_video_size() -> Option<(u32, u32)> {
-        let search = web_sys::window()?.location().search().ok()?;
-        super::query_pair(&search)
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-mod imp {
-    pub(super) fn page_video_size() -> Option<(u32, u32)> {
-        None
     }
 }
 
@@ -303,22 +263,6 @@ mod tests {
         let quality = VideoQuality::default();
         assert!(quality.checked().is_ok());
         assert_eq!(quality.timestamp_stride(), 4_500);
-    }
-
-    /// One preview serves both geometries: `?video_size=640x360` overrides
-    /// the default without a rebuild per shape.
-    #[test]
-    fn the_page_url_selects_the_isolation_geometry() {
-        assert_eq!(query_pair("?video_size=640x360"), Some((640, 360)));
-        assert_eq!(
-            query_pair("?log=debug&video_size=640x360"),
-            Some((640, 360))
-        );
-        assert_eq!(query_pair("video_size=640X360"), Some((640, 360)));
-        assert_eq!(query_pair("?log=debug"), None);
-        assert_eq!(query_pair("?video_size=banana"), None);
-        assert_eq!(query_pair("?video_size=640"), None);
-        assert_eq!(query_pair(""), None);
     }
 
     #[test]
