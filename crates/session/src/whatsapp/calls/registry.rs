@@ -3762,4 +3762,170 @@ mod tests {
             assert!(!peer_can_receive_video(quiet), "{quiet:?}");
         }
     }
+
+    /// Replay of the 2026-09-10 web-originated failing call: every decrypted
+    /// feedback line off the wire, through the same renderer the debug log
+    /// used, naming the SSRC our first video packet carried.
+    ///
+    /// The fixture is `testdata/` verbatim production output with identities
+    /// redacted (call id, LIDs, relay address); counts, SSRCs, SPS bytes and
+    /// the line shapes are untouched, because those are the evidence. If the
+    /// renderer ever changes its line shape, this fails until the fixture is
+    /// re-captured — that coupling is the point: the 6.2 verdict procedure
+    /// (PLI names our video SSRC, so the peer sees but cannot decode) is only
+    /// as good as the lines it reads.
+    #[test]
+    fn failing_call_feedback_names_our_video_ssrc() {
+        use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
+
+        let fixture = include_str!("testdata/failing-call-feedback.log");
+        let ours = first_video_ssrc(include_str!("testdata/failing-call-relay.log"));
+        let mut lines = 0;
+        for raw in fixture.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let (packet_type, fmt, media) = parse_feedback_line(raw);
+            let rendered = describe_feedback(&[RtcpFeedback {
+                packet_type,
+                fmt,
+                sender_ssrc: 1,
+                media_ssrc: media,
+                fci: Vec::new(),
+            }]);
+            assert_eq!(rendered.as_deref(), Some(raw));
+            assert_eq!(media, ours, "feedback must name our video stream");
+            assert!(
+                reports_loss(&RtcpFeedback {
+                    packet_type,
+                    fmt,
+                    sender_ssrc: 1,
+                    media_ssrc: media,
+                    fci: Vec::new(),
+                }),
+                "every replayed line is a lost-picture report"
+            );
+            lines += 1;
+        }
+        assert!(lines > 0, "the fixture must hold the call's feedback");
+    }
+
+    /// The same call's relay report: our IDRs left the page with zero drops
+    /// and zero send errors, and the first video packet started at seq 0 ts 0.
+    #[test]
+    fn failing_call_relay_report_shows_clean_egress() {
+        let fixture = include_str!("testdata/failing-call-relay.log");
+        let report = fixture
+            .lines()
+            .rfind(|l| l.contains("counters=Traffic"))
+            .expect("the fixture must hold a relay report line");
+        let field = |name: &str| {
+            let mut tokens = report
+                .split(['{', '}', ',', ' ', '[', ']'])
+                .filter(|t| !t.is_empty());
+            while let Some(token) = tokens.next() {
+                if token == format!("{name}:") {
+                    return tokens
+                        .next()
+                        .unwrap_or_else(|| panic!("{name} needs a value"));
+                }
+            }
+            panic!("report must carry {name}")
+        };
+        assert!(field("video_idr_markers").parse::<u64>().unwrap() > 0);
+        assert!(field("video_packets").parse::<u64>().unwrap() > 0);
+        assert_eq!(field("video_drop_packets"), "0");
+        assert_eq!(field("audio_drop_packets"), "0");
+        assert_eq!(field("send_errors"), "0");
+        let after = report
+            .split_once("first_video=[")
+            .unwrap_or_else(|| panic!("report must carry first_video"))
+            .1;
+        let first = after
+            .split_once(']')
+            .unwrap_or_else(|| panic!("first_video needs its bracket"))
+            .0;
+        assert!(first.starts_with("pt=97 seq=0 ts=0 ssrc="), "{first}");
+    }
+
+    /// The same night's device logcat: the phone's AVC decoder for the call
+    /// window is configured without parameter sets at a geometry that is not
+    /// our stream, renders nothing, drops everything, and is released.
+    #[test]
+    fn failing_call_decoder_never_renders() {
+        let fixture = include_str!("testdata/failing-call-decoder.logcat");
+        let configure = fixture
+            .lines()
+            .find(|l| l.contains("configure: ClientFormat"))
+            .expect("the fixture must hold the decoder configure block");
+        assert!(configure.contains("video-debug-dec"));
+        let block: Vec<&str> = fixture
+            .lines()
+            .skip_while(|l| !l.contains("configure: ClientFormat"))
+            .take_while(|l| !l.trim_end().ends_with('}'))
+            .collect();
+        assert!(
+            !block.iter().any(|l| l.contains("csd-")),
+            "no parameter sets reach the decoder configure"
+        );
+        let size = |name: &str| {
+            block
+                .iter()
+                .find_map(|l| {
+                    l.split(&format!("{name} = ")).nth(1).and_then(|rest| {
+                        rest.split_whitespace()
+                            .next()
+                            .and_then(|v| v.parse::<u32>().ok())
+                    })
+                })
+                .unwrap_or_else(|| panic!("configure must carry {name}"))
+        };
+        assert_ne!((size("width"), size("height")), (1280, 720));
+        let mut renders = 0;
+        let mut saw_stop = false;
+        for line in fixture.lines() {
+            if let Some(stats) = line.split_once("Stats ") {
+                let render = stats
+                    .1
+                    .split(',')
+                    .find_map(|part| part.strip_prefix("Render:"))
+                    .unwrap_or_else(|| panic!("stats line must carry Render"));
+                renders += render.parse::<u32>().unwrap();
+            }
+            saw_stop |= line.contains("video-debug-dec] stop");
+        }
+        assert_eq!(renders, 0, "no decoded frame may reach the screen");
+        assert!(saw_stop, "the decoder is released with nothing rendered");
+    }
+
+    /// "206/1 pli media=0x5a29cf52" into its three numbers.
+    fn parse_feedback_line(line: &str) -> (u8, u8, u32) {
+        let mut words = line.split_whitespace();
+        let class = words
+            .next()
+            .unwrap_or_else(|| panic!("empty feedback line"));
+        let (packet_type, fmt) = class
+            .split_once('/')
+            .unwrap_or_else(|| panic!("no class in {line}"));
+        words.next();
+        let media = words
+            .next()
+            .unwrap_or_else(|| panic!("no media SSRC in {line}"));
+        (
+            packet_type.parse().unwrap(),
+            fmt.parse().unwrap(),
+            u32::from_str_radix(media.trim_start_matches("media=0x"), 16).unwrap(),
+        )
+    }
+
+    /// The SSRC after "ssrc=0x" in the fixture's first_video bracket.
+    fn first_video_ssrc(relay_fixture: &str) -> u32 {
+        let line = relay_fixture
+            .lines()
+            .find(|l| l.contains("first_video=["))
+            .expect("the relay fixture must hold first_video");
+        let hex = line
+            .split("ssrc=0x")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_hexdigit()).next())
+            .expect("first_video must carry an SSRC");
+        u32::from_str_radix(hex, 16).unwrap()
+    }
 }
