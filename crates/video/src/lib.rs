@@ -236,7 +236,9 @@ impl VideoQuality {
 
 /// `?video_size=640x360` from the page URL, if present and well formed.
 /// Pure, so the host tests cover it; the window read itself is one line in
-/// `page_video_size` below.
+/// `page_video_size` below. Compiled out of production host builds, where
+/// nothing reads a page URL.
+#[cfg(any(test, target_family = "wasm"))]
 fn query_pair(search: &str) -> Option<(u32, u32)> {
     search
         .strip_prefix('?')
