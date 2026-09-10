@@ -3763,59 +3763,87 @@ mod tests {
         }
     }
 
-    /// Replay of the 2026-09-10 web-originated failing call: every decrypted
+    /// Replay of the 2026-09-10 web-originated failing calls: every decrypted
     /// feedback line off the wire, through the same renderer the debug log
     /// used, naming the SSRC our first video packet carried.
     ///
-    /// The fixture is `testdata/` verbatim production output with identities
-    /// redacted (call id, LIDs, relay address); counts, SSRCs, SPS bytes and
-    /// the line shapes are untouched, because those are the evidence. If the
-    /// renderer ever changes its line shape, this fails until the fixture is
-    /// re-captured — that coupling is the point: the 6.2 verdict procedure
-    /// (PLI names our video SSRC, so the peer sees but cannot decode) is only
-    /// as good as the lines it reads.
+    /// Each fixture pair is `testdata/` verbatim production output with
+    /// identities redacted (call id, LIDs, relay address); counts, SSRCs, SPS
+    /// bytes and the line shapes are untouched, because those are the
+    /// evidence. If the renderer ever changes its line shape, this fails
+    /// until the fixture is re-captured — that coupling is the point: the 6.2
+    /// verdict procedure (PLI names our video SSRC, so the peer sees but
+    /// cannot decode) is only as good as the lines it reads.
     #[test]
     fn failing_call_feedback_names_our_video_ssrc() {
         use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
 
-        let fixture = include_str!("testdata/failing-call-feedback.log");
-        let ours = first_video_ssrc(include_str!("testdata/failing-call-relay.log"));
-        let mut lines = 0;
-        for raw in fixture.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let (packet_type, fmt, media) = parse_feedback_line(raw);
-            let rendered = describe_feedback(&[RtcpFeedback {
-                packet_type,
-                fmt,
-                sender_ssrc: 1,
-                media_ssrc: media,
-                fci: Vec::new(),
-            }]);
-            assert_eq!(rendered.as_deref(), Some(raw));
-            assert_eq!(media, ours, "feedback must name our video stream");
-            assert!(
-                reports_loss(&RtcpFeedback {
+        for (cycle, feedback, relay) in [
+            (
+                "1",
+                include_str!("testdata/failing-call-feedback.log"),
+                include_str!("testdata/failing-call-relay.log"),
+            ),
+            (
+                "2",
+                include_str!("testdata/failing-call-feedback-2.log"),
+                include_str!("testdata/failing-call-relay-2.log"),
+            ),
+        ] {
+            let ours = first_video_ssrc(relay);
+            let mut lines = 0;
+            for raw in feedback.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let (packet_type, fmt, media) = parse_feedback_line(raw);
+                let rendered = describe_feedback(&[RtcpFeedback {
                     packet_type,
                     fmt,
                     sender_ssrc: 1,
                     media_ssrc: media,
                     fci: Vec::new(),
-                }),
-                "every replayed line is a lost-picture report"
+                }]);
+                assert_eq!(rendered.as_deref(), Some(raw), "cycle {cycle}");
+                assert_eq!(
+                    media, ours,
+                    "cycle {cycle}: feedback must name our video stream"
+                );
+                assert!(
+                    reports_loss(&RtcpFeedback {
+                        packet_type,
+                        fmt,
+                        sender_ssrc: 1,
+                        media_ssrc: media,
+                        fci: Vec::new(),
+                    }),
+                    "cycle {cycle}: every replayed line is a lost-picture report"
+                );
+                lines += 1;
+            }
+            assert!(
+                lines > 0,
+                "cycle {cycle}: the fixture must hold the call's feedback"
             );
-            lines += 1;
         }
-        assert!(lines > 0, "the fixture must hold the call's feedback");
     }
 
-    /// The same call's relay report: our IDRs left the page with zero drops
-    /// and zero send errors, and the first video packet started at seq 0 ts 0.
+    /// Each failing call's relay report: our IDRs left the page with zero
+    /// drops and zero send errors, and the first video packet started at
+    /// seq 0 ts 0.
     #[test]
     fn failing_call_relay_report_shows_clean_egress() {
-        let fixture = include_str!("testdata/failing-call-relay.log");
+        for (cycle, fixture) in [
+            ("1", include_str!("testdata/failing-call-relay.log")),
+            ("2", include_str!("testdata/failing-call-relay-2.log")),
+        ] {
+            replay_clean_egress(cycle, fixture);
+        }
+    }
+
+    /// One cycle's end-of-call report, in full.
+    fn replay_clean_egress(cycle: &str, fixture: &str) {
         let report = fixture
             .lines()
             .rfind(|l| l.contains("counters=Traffic"))
-            .expect("the fixture must hold a relay report line");
+            .unwrap_or_else(|| panic!("cycle {cycle}: the fixture must hold a relay report line"));
         let field = |name: &str| {
             let mut tokens = report
                 .split(['{', '}', ',', ' ', '[', ']'])
@@ -3824,25 +3852,34 @@ mod tests {
                 if token == format!("{name}:") {
                     return tokens
                         .next()
-                        .unwrap_or_else(|| panic!("{name} needs a value"));
+                        .unwrap_or_else(|| panic!("cycle {cycle}: {name} needs a value"));
                 }
             }
-            panic!("report must carry {name}")
+            panic!("cycle {cycle}: report must carry {name}")
         };
-        assert!(field("video_idr_markers").parse::<u64>().unwrap() > 0);
-        assert!(field("video_packets").parse::<u64>().unwrap() > 0);
-        assert_eq!(field("video_drop_packets"), "0");
-        assert_eq!(field("audio_drop_packets"), "0");
-        assert_eq!(field("send_errors"), "0");
+        assert!(
+            field("video_idr_markers").parse::<u64>().unwrap() > 0,
+            "cycle {cycle}"
+        );
+        assert!(
+            field("video_packets").parse::<u64>().unwrap() > 0,
+            "cycle {cycle}"
+        );
+        assert_eq!(field("video_drop_packets"), "0", "cycle {cycle}");
+        assert_eq!(field("audio_drop_packets"), "0", "cycle {cycle}");
+        assert_eq!(field("send_errors"), "0", "cycle {cycle}");
         let after = report
             .split_once("first_video=[")
-            .unwrap_or_else(|| panic!("report must carry first_video"))
+            .unwrap_or_else(|| panic!("cycle {cycle}: report must carry first_video"))
             .1;
         let first = after
             .split_once(']')
-            .unwrap_or_else(|| panic!("first_video needs its bracket"))
+            .unwrap_or_else(|| panic!("cycle {cycle}: first_video needs its bracket"))
             .0;
-        assert!(first.starts_with("pt=97 seq=0 ts=0 ssrc="), "{first}");
+        assert!(
+            first.starts_with("pt=97 seq=0 ts=0 ssrc="),
+            "cycle {cycle}: {first}"
+        );
     }
 
     /// The same night's device logcat: the phone's AVC decoder for the call
