@@ -207,6 +207,28 @@ mod tests {
         // unit on the wire.
         let mut packetized = PacketizedAu::default();
         packetize_au(&encoded.data, &mut packetized);
+        // The STAP-A build: consecutive small parameter sets ride one
+        // aggregation packet (NAL type 24) instead of single NALs. The
+        // aggregation holds exactly SPS (7) then PPS (8), each length
+        // prefixed, which is the shape the phone's decoder learns csd from.
+        let mut payloads = packetized.iter();
+        let stap = payloads.next().expect("an IDR packetizes into payloads");
+        assert_eq!(
+            stap[0] & 0x1f,
+            24,
+            "the first payload aggregates the parameter sets"
+        );
+        let mut units = &stap[1..];
+        for expected in [7u8, 8u8] {
+            let len = u16::from_be_bytes([units[0], units[1]]) as usize;
+            units = &units[2..];
+            assert_eq!(units[0] & 0x1f, expected);
+            units = &units[len..];
+        }
+        assert!(
+            units.is_empty(),
+            "STAP-A carries only the two parameter sets"
+        );
         assert!(
             packetized.iter().any(|payload| payload[0] & 0x1f == 28),
             "a noisy IDR fragments into FU-A, not just single NALs"
