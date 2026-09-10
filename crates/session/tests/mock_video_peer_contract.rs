@@ -12,7 +12,7 @@
 //! --test mock_video_peer_contract -- --ignored`.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 /// The same convention as the upstream e2e suite: `MOCK_SERVER_URL` names the
@@ -28,13 +28,13 @@ fn admin_base() -> (String, String) {
 
 /// Minimal HTTP GET over a plain TCP stream: no client dependency for a probe.
 fn http_get(host_port: &str, path: &str) -> String {
-    let mut stream = TcpStream::connect_timeout(
-        &host_port
-            .parse()
-            .expect("MOCK_SERVER_URL must be host:port"),
-        Duration::from_secs(3),
-    )
-    .expect("mock lane: the bartender mock must be listening (step 1)");
+    let addr = host_port
+        .to_socket_addrs()
+        .expect("MOCK_SERVER_URL must resolve to host:port")
+        .next()
+        .expect("MOCK_SERVER_URL must resolve to host:port");
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .expect("mock lane: the bartender mock must be listening (step 1)");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("socket timeout");
