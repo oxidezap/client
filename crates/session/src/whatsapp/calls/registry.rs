@@ -820,10 +820,8 @@ impl CallRegistry {
             )
             .await;
         }
-        if re_request {
-            if let Err(e) = handle.re_request_video_upgrade().await {
-                warn!("Call {call_id}: could not re-request the video upgrade: {e}");
-            }
+        if re_request && let Err(e) = handle.re_request_video_upgrade().await {
+            warn!("Call {call_id}: could not re-request the video upgrade: {e}");
         }
     }
 

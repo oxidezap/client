@@ -178,7 +178,7 @@ async fn a_later_delta_can_use_pps_one_announced_with_or_after_the_idr() {
         .await
         .unwrap();
         assert_eq!(
-            js_sys::Array::from(&raw_outputs).length(),
+            js_sys::Array::from(&outputs).length(),
             4,
             "reset must retain cached PPS 1 for later deltas"
         );
@@ -215,7 +215,9 @@ async fn production_codec_sps_is_constrained_baseline_in_band() {
         0xc0,
         "constraint set 0+1: Constrained Baseline, as configured"
     );
-    assert!(sps[3] <= 0x1f, "level fits the 720p call: {:#04x}", sps[3]);
+    // Exactly 3.1: lower levels cannot describe 720p's 3600 macroblocks,
+    // and anything higher is outside the negotiated profile-level-id.
+    assert_eq!(sps[3], 0x1f, "the encoder answers the requested Level 3.1");
     assert!(
         split_annexb(&idr).any(|nal| nal_unit_type(nal) == 8),
         "the PPS rides with the keyframe"
