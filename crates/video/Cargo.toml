@@ -57,6 +57,7 @@ web-sys = { version = "0.3", features = [
     "HtmlMediaElement",
     "HtmlVideoElement",
     "LatencyMode",
+    "Location",
     "MediaDevices",
     "MediaStream",
     "MediaStreamConstraints",
