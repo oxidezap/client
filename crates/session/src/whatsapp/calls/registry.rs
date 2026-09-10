@@ -983,19 +983,27 @@ impl CallRegistry {
             .contains_key(call_id)
     }
 
-    /// Whether this camera is still the call's outstanding upgrade of ours.
+    /// Take this attempt's camera if the attempt is still the live one.
     ///
-    /// The fence every late upgrade action checks: answering clears the map
+    /// Check, claim and removal under one lock: answering clears the map
     /// rather than replacing the entry, and a newer attempt overwrites it,
-    /// so an identity match is what says the attempt this is about is still
-    /// the live one.
-    fn upgrade_attempt_current(&self, call_id: &str, camera_id: video::CameraId) -> bool {
-        self.calls
-            .lock()
-            .expect("call registry poisoned")
-            .upgrading
-            .get(call_id)
-            .is_some_and(|current| *current == camera_id)
+    /// so anything else holding the lock first disarms this take. An answer
+    /// landing between a separate check and this removal would be announced
+    /// onto a camera this task then stops silently, leaving a dead camera
+    /// under a lit UI — which is why the check here is not
+    /// [`Self::upgrade_attempt_current`] followed by [`Self::take_camera_if`].
+    /// The entry itself stays: it is cleared exactly once, by the id-fenced
+    /// withdrawal, so a late answer still finds and resolves it.
+    fn take_upgrade_attempt(
+        &self,
+        call_id: &str,
+        camera_id: video::CameraId,
+    ) -> Option<LocalVideo> {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        match calls.upgrading.get(call_id) {
+            Some(current) if *current == camera_id => calls.cameras.remove(call_id),
+            _ => None,
+        }
     }
 
     /// Take this call's camera out, for a caller that is going to close it.
@@ -1820,17 +1828,13 @@ impl WhatsAppClient {
         wait: Duration,
     ) {
         crate::exec::sleep(wait).await;
-        if !calls.upgrade_attempt_current(&call_id, camera_id) {
-            return;
-        }
-        let Some(local) = calls.take_camera_if(&call_id, Some(camera_id)) else {
+        // Claimed atomically: whoever holds the camera owns the truth about
+        // it. An answer that wins first clears the map and keeps the camera
+        // it announced on; a newer attempt keeps its own. Either way there
+        // is nothing here to retire.
+        let Some(local) = calls.take_upgrade_attempt(&call_id, camera_id) else {
             return;
         };
-        if !calls.upgrade_attempt_current(&call_id, camera_id) {
-            local.stop().await;
-            calls.end_camera_upgrade(&call_id, camera_id);
-            return;
-        }
         let Some(handle) = calls.live(&call_id) else {
             // Nobody left to tell, and the ending owns the rest: the call's
             // own watcher clears the maps and closes the device on its way
@@ -4445,5 +4449,89 @@ mod tests {
             "the newer attempt still owns the call"
         );
         assert!(calls.camera_on("current"), "the newer camera keeps running");
+    }
+
+    /// The race the watchdog must not lose: a peer answer landing between
+    /// the attempt check and the camera removal is announced onto the camera
+    /// this task then stops silently, leaving a dead camera under a lit UI.
+    /// Claiming under one lock makes that interleaving impossible: whoever
+    /// holds the camera owns the truth about it.
+    #[tokio::test]
+    async fn peer_answer_after_the_claim_announces_no_local_camera() {
+        let calls = CallRegistry::default();
+        let (ui, mut rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let (local, _endpoints, _capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+        let camera_id = local.camera_id();
+        calls.begin_upgrade("current", camera_id);
+        calls
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .cameras
+            .insert("current".into(), local);
+        // The claim: entry matches, so the camera comes out; the entry
+        // stays, cleared exactly once by the id-fenced withdrawal.
+        let taken = calls
+            .take_upgrade_attempt("current", camera_id)
+            .expect("a live attempt claims its camera");
+        assert_eq!(taken.camera_id(), camera_id);
+        assert_eq!(
+            calls.calls.lock().unwrap().upgrading.get("current"),
+            Some(&camera_id)
+        );
+        // The answer landing after the claim finds no camera: remote only,
+        // never a local-on for a camera about to be stopped.
+        WhatsAppClient::observe_peer_video(&calls, &ui, "current", VideoState::Enabled, None).await;
+        let mut remote_on = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                UiEvent::CallVideoChanged {
+                    stream: VideoStream::Remote,
+                    on: true,
+                    ..
+                } => remote_on = true,
+                other => panic!("unexpected event after the claim: {other:?}"),
+            }
+        }
+        assert!(remote_on, "their direction coming on is still news");
+        assert!(
+            !calls.upgrade_pending("current"),
+            "the answer clears the attempt it resolved"
+        );
+        taken.stop().await;
+    }
+
+    /// The other half of the claim: another attempt's camera is never
+    /// touched, even when this attempt's entry is already gone.
+    #[tokio::test]
+    async fn take_upgrade_attempt_leaves_a_replaced_attempt_untouched() {
+        let calls = CallRegistry::default();
+        let (old, _endpoints, _capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+        let old_id = old.camera_id();
+        old.stop().await;
+        calls.begin_upgrade("current", old_id);
+        let (new, _endpoints, _capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+        let new_id = new.camera_id();
+        calls.begin_upgrade("current", new_id);
+        calls
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .cameras
+            .insert("current".into(), new);
+        assert!(
+            calls.take_upgrade_attempt("current", old_id).is_none(),
+            "a replaced attempt claims nothing"
+        );
+        assert_eq!(
+            calls.calls.lock().unwrap().upgrading.get("current"),
+            Some(&new_id),
+            "the newer attempt still owns the call"
+        );
+        assert!(calls.camera_on("current"), "the newer camera keeps running");
+        calls.take_camera("current").unwrap().stop().await;
     }
 }
