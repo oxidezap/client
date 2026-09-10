@@ -495,16 +495,12 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
                 })
         })
         .count();
+    // The re-request API only retries an outstanding local upgrade, and a
+    // video-from-start call has none open: no upgrade stanza goes out here
+    // until initiating on live video is designed upstream.
     assert_eq!(
-        upgrade_requests,
-        usize::from(
-            case.connects()
-                && !matches!(
-                    case,
-                    OutgoingAcceptCase::CameraClosed | OutgoingAcceptCase::CameraReplaced
-                )
-        ),
-        "{case:?}: a video-from-start outgoing accept re-requests the upgrade as caller"
+        upgrade_requests, 0,
+        "{case:?}: a video-from-start outgoing accept sends no upgrade request"
     );
     if let Some(camera) = calls.ended(&id) {
         camera.stop().await;

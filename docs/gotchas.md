@@ -857,21 +857,19 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   decided against the same line. Audio is exempt now up to a hard ceiling
   eight times higher, past which the channel is not congested but wedged.
 
-- **A video-from-start call sends no standalone direction announce; it
-  re-requests the upgrade as caller instead.** The announce
-  (`<video state="1">` after accept) was added on the theory that the
-  receiving side brings its video stream up off an announcement rather than
-  the offer — and production retests kept failing with it in place: Android
-  acked it, PLI'd our exact SSRC seventeen times across twelve keyframes,
-  and never rendered. What Android-as-callee never does, Android-as-caller
-  does unprompted: drive a transaction-bound video dialog (`state="1"` with
-  `dec`, repeated) and render. So on accept with a live camera the caller
-  now sends one upgrade request (`state="11"`, stanza-only through the new
-  re-request API — endpoints and media stay untouched, and a call without
-  live video refuses it). Whether Android completes decoder setup off it is
-  unproven until a live preview: the direction matrix, the PLI signature,
-  and the `dec`-less lone `state="1"` are the reads to repeat there. A
-  mid-call camera still announces, through `start_video`.
+- **A video-from-start call sends no standalone direction announce and no
+  upgrade request; the offer carries the capability and the media does the
+  rest.** The announce (`<video state="1">` after accept) was added on the
+  theory that the receiving side brings its video stream up off an
+  announcement rather than the offer — and production retests kept failing
+  with it in place: Android acked it, PLI'd our exact SSRC seventeen times
+  across twelve keyframes, and never rendered. A caller-side upgrade
+  request (`state=11`) was tried next and likewise moved Android only as
+  far as an ack-with-relay, never to accept or render — and the re-request
+  API only retries an outstanding local upgrade, which a video-from-start
+  call never has open, so the call site warned and sent nothing. Initiating
+  upgrade on live video is an upstream design decision, not a client
+  stanza. A mid-call camera still announces, through `start_video`.
 - **Neither encoder may go without a periodic IDR, and it is not a quality
   setting.** The media plane drops every access unit that is not an IDR while
   one of its keyframe gates is closed — the engine's `keyframe_required` and

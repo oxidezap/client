@@ -106,16 +106,13 @@ decoder runs in this fixture. Upstream still permits an unrung first winner
 and lets a later sibling reject end the call unless it is per-device
 (`busy`, or `enc` for a device that could not decrypt the offer) — and our
 own event arm matches that rule rather than hanging up on one stale
-device. Matching application metadata does not repair those policies. The standalone post-accept video
-announcement is removed and replaced by one caller-side upgrade re-request
-(`state="11"`, stanza-only): production retests kept failing with the
-announce in place (acked by Android, seventeen PLIs on our SSRC, no
-render), while Android-as-caller drives a transaction-bound dialog itself.
-The fixture asserts zero bare announces and exactly one upgrade request on
-live-camera accepts. Whether Android completes decoder setup off the
-request is unproven: Android reception of this client's outbound video
-still needs a live retest, reading the direction matrix, the PLI signature,
-and Android's `state="1"` (transaction-ids, `dec`, repeats) there.
+device. Matching application metadata does not repair those policies. Neither a standalone post-accept
+video announcement nor a caller-side upgrade re-request goes out on a video-from-start accept:
+production retests kept failing with the announce in place, and the re-request API only retries an
+outstanding local upgrade, which such a call never has open. The fixture asserts zero of either on
+live-camera accepts. Android reception of this client's outbound video still needs a live retest,
+reading the direction matrix, the PLI signature, and Android's `state="1"` (transaction-ids, `dec`,
+repeats) there.
 
 Browser relay summaries now count successful `RTCDataChannel.send` calls
 separately from congestion drops, non-open channels and send exceptions.

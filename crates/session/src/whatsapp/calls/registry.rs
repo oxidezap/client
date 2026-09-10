@@ -744,7 +744,7 @@ impl CallRegistry {
             return;
         };
         let _ordered = lane.lock().await;
-        let (re_request, pending) = {
+        let pending = {
             let mut calls = self.calls.lock().expect("call registry poisoned");
             let peer = call.participant.as_ref().unwrap_or(&call.from);
             if !calls
@@ -779,17 +779,16 @@ impl CallRegistry {
             start.activated = true;
             start.advertisements.clear();
             let _ = ui.send(UiEvent::CallAccepted(call_id.to_string()));
-            // No standalone `<video state=1>` announce goes out here: a call
-            // that offered video is already sending from the moment the peer
-            // accepts, and captured video-from-start calls carry no such
-            // stanza. Instead the upgrade is re-requested as caller
-            // (`state=11`): Android-as-callee never completes its decoder
-            // setup off the offer and media alone — its `state=1` arrives
-            // without `dec` and never repeats — while Android-as-caller
-            // drives a transaction-bound video dialog and renders. The
-            // request is stanza-only; endpoints and media stay untouched,
-            // and a call without live video refuses it rather than sending.
-            let re_request = if let Some(local) = calls.cameras.get(call_id).filter(|local| {
+            // No standalone `<video state=1>` announce goes out here, and no
+            // upgrade request either: a call that offered video is already
+            // sending from the moment the peer accepts, and captured
+            // video-from-start calls carry neither stanza. A caller-side
+            // `state=11` was tried and reverted: the re-request API only
+            // retries an outstanding local upgrade, and a video-from-start
+            // call has none open, so the call site warned on every accept
+            // and sent nothing. Initiating upgrade on live video needs an
+            // upstream design decision, not a client stanza.
+            if let Some(local) = calls.cameras.get(call_id).filter(|local| {
                 Some(local.camera_id()) == camera
                     && local.alive()
                     && !calls.upgrading.contains_key(call_id)
@@ -803,11 +802,8 @@ impl CallRegistry {
                         handle.request_peer_keyframe(KeyframeUrgency::Coalesced);
                     }
                 }
-                true
-            } else {
-                false
-            };
-            (re_request, pending)
+            }
+            pending
         };
         self.registration.notify_waiters();
         if let Some(update) = pending {
@@ -819,9 +815,6 @@ impl CallRegistry {
                 update.upgrade_token,
             )
             .await;
-        }
-        if re_request && let Err(e) = handle.re_request_video_upgrade().await {
-            warn!("Call {call_id}: could not re-request the video upgrade: {e}");
         }
     }
 
