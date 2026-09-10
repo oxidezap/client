@@ -15,6 +15,7 @@ use super::super::*;
 // file's business alone: the session's own module has no use for one.
 use crate::video::LocalVideo;
 use oxidezap_audio::open_call_audio;
+use std::time::Duration;
 use whatsapp_rust::voip::{
     CallEvent, CallHandle, CallTermination, KeyframeUrgency, VideoState, VideoUpgradeToken,
 };
@@ -982,6 +983,21 @@ impl CallRegistry {
             .contains_key(call_id)
     }
 
+    /// Whether this camera is still the call's outstanding upgrade of ours.
+    ///
+    /// The fence every late upgrade action checks: answering clears the map
+    /// rather than replacing the entry, and a newer attempt overwrites it,
+    /// so an identity match is what says the attempt this is about is still
+    /// the live one.
+    fn upgrade_attempt_current(&self, call_id: &str, camera_id: video::CameraId) -> bool {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .upgrading
+            .get(call_id)
+            .is_some_and(|current| *current == camera_id)
+    }
+
     /// Take this call's camera out, for a caller that is going to close it.
     ///
     /// Taken rather than borrowed under the lock: closing waits on a capture
@@ -1698,7 +1714,25 @@ impl WhatsAppClient {
                         Camera::EndpointClosed => {
                             Self::announce_video(&ui_sender, &call_id, VideoStream::Remote, false);
                         }
-                        Camera::Held => {}
+                        Camera::Held => {
+                            // Initiated above, so the library armed its own
+                            // timeout for the peer's answer: withdraw first if
+                            // none comes, before that timeout tears both
+                            // directions down. Answering one of theirs sets no
+                            // such timeout, and every other outcome above
+                            // already withdrew this attempt.
+                            if ours_to_be_answered {
+                                crate::exec::spawn(Self::watch_upgrade_attempt(
+                                    calls.clone(),
+                                    ui_sender.clone(),
+                                    call_id.clone(),
+                                    camera_id,
+                                    lane.clone(),
+                                    seq,
+                                    Self::VIDEO_UPGRADE_ANSWER_WAIT,
+                                ));
+                            }
+                        }
                     }
                     if accepting_peer && calls.camera_on(&call_id) {
                         Self::announce_video(&ui_sender, &call_id, VideoStream::Remote, true);
@@ -1745,6 +1779,73 @@ impl WhatsAppClient {
             return;
         }
         Self::announce_video(ui_sender, call_id, VideoStream::Local, settled);
+    }
+
+    /// How long this side waits for the peer to answer an upgrade it asked
+    /// for before withdrawing it itself.
+    ///
+    /// Below the library's own upgrade timeout (five seconds): a request the
+    /// peer never answers — an upgrade asked of a call that is already video,
+    /// which the negotiation has no state change to answer with — would
+    /// otherwise end there, tearing the endpoints down under a live camera
+    /// and announcing both directions off. Withdrawing first sends `Stopped`
+    /// instead of `UpgradeCancelByTimeout`, which the peer applies without
+    /// touching its own direction, and clears the library's pending request
+    /// so its timeout finds nothing to cancel. Kept a full second under the
+    /// library's so device-close latency on this side cannot lose the race.
+    const VIDEO_UPGRADE_ANSWER_WAIT: Duration = Duration::from_secs(4);
+
+    /// Withdraw an upgrade of ours the peer never answers, before the
+    /// library's own timeout does it destructively (see
+    /// [`Self::VIDEO_UPGRADE_ANSWER_WAIT`]).
+    ///
+    /// Armed only for upgrades this side initiated: answering one of theirs
+    /// sets no such timeout. Fenced on the camera the attempt was armed for —
+    /// an answer clears the map, and a newer attempt overwrites it — and what
+    /// it retires is read back rather than assumed: the camera is taken only
+    /// if it is still this one, the peer is told only while the call is still
+    /// live, and the settle is the newest request's to speak. A late answer
+    /// landing anywhere in here still applies cleanly to the stopped
+    /// direction it finds.
+    ///
+    /// Private like the lane it settles through: armed from the request path
+    /// and driven directly by tests, including the fixture's.
+    async fn watch_upgrade_attempt(
+        calls: CallRegistry,
+        ui_sender: UiEventSender,
+        call_id: String,
+        camera_id: video::CameraId,
+        lane: Arc<VideoLane>,
+        seq: u64,
+        wait: Duration,
+    ) {
+        crate::exec::sleep(wait).await;
+        if !calls.upgrade_attempt_current(&call_id, camera_id) {
+            return;
+        }
+        let Some(local) = calls.take_camera_if(&call_id, Some(camera_id)) else {
+            return;
+        };
+        if !calls.upgrade_attempt_current(&call_id, camera_id) {
+            local.stop().await;
+            calls.end_camera_upgrade(&call_id, camera_id);
+            return;
+        }
+        let Some(handle) = calls.live(&call_id) else {
+            // Nobody left to tell, and the ending owns the rest: the call's
+            // own watcher clears the maps and closes the device on its way
+            // out, and the front end reads the ending, not a settle.
+            local.stop().await;
+            calls.end_camera_upgrade(&call_id, camera_id);
+            return;
+        };
+        // The bomb is disarmed by telling the peer ourselves, and that state
+        // change lands before the device close below: what the library's
+        // timeout checks is its own pending request, which stopping clears.
+        Self::stop_peer_video(&handle, &call_id).await;
+        local.stop().await;
+        calls.end_camera_upgrade(&call_id, camera_id);
+        Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
     }
 
     /// Close this side's camera and say so, for the reasons that are not a
@@ -4204,5 +4305,140 @@ mod tests {
                 .is_none(),
             "a parked peer request bars a fresh local upgrade"
         );
+    }
+
+    /// The reducer half of the re-enable death: an upgrade request arriving
+    /// where the receiver's own direction is already active is ignored — no
+    /// token, no event, nothing to answer with. Both sides run this reducer,
+    /// so our re-`11` while the peer's camera is on is unanswerable by
+    /// construction, and the send-gated plane it opened admits nothing until
+    /// the library's own timeout tears it down.
+    #[test]
+    fn upgrade_request_against_an_active_direction_is_ignored() {
+        use whatsapp_rust::wacore::voip::{CallSession, PeerVideoTransition};
+        let library = whatsapp_rust::wacore::voip::CallRegistry::default();
+        let generation = library.insert(CallSession::new_outgoing(
+            "current",
+            "peer@s.whatsapp.net".parse().unwrap(),
+            "self@s.whatsapp.net".parse().unwrap(),
+        ));
+        // Answerable while inactive: the audio-call upgrade both logs show
+        // completing with a peer `UpgradeAccept`.
+        let token = match library.apply_peer_video_state(
+            "current",
+            generation,
+            VideoState::UpgradeRequestV2,
+        ) {
+            PeerVideoTransition::UpgradeRequested(token) => token,
+            other => panic!("expected an actionable token, got {other:?}"),
+        };
+        // Active now — ours, the way the peer's camera is active when we
+        // re-enable into a video call — and the same request is dropped.
+        assert!(
+            library.complete_peer_video_request("current", token),
+            "answering parks nothing further"
+        );
+        assert!(matches!(
+            library.apply_peer_video_state("current", generation, VideoState::UpgradeRequestV2),
+            PeerVideoTransition::Ignored
+        ));
+        // A bare `Enabled` is not a request and always applies: it is the
+        // only re-add signal an already-video call answers.
+        assert!(matches!(
+            library.apply_peer_video_state("current", generation, VideoState::Enabled),
+            PeerVideoTransition::Applied { .. }
+        ));
+    }
+
+    /// The watchdog stands down once the peer answers: the parked attempt is
+    /// gone, so the camera must still be producing and no stop may go out.
+    #[tokio::test]
+    async fn upgrade_watchdog_stands_down_once_the_peer_answers() {
+        let calls = CallRegistry::default();
+        let (ui, mut rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let (local, _endpoints, _capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+        let camera_id = local.camera_id();
+        calls.begin_upgrade("current", camera_id);
+        calls
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .cameras
+            .insert("current".into(), local);
+        WhatsAppClient::observe_peer_video(&calls, &ui, "current", VideoState::Enabled, None).await;
+        assert!(!calls.upgrade_pending("current"));
+        while rx.try_recv().is_ok() {}
+        let lane = calls.video_lane("current");
+        let seq = {
+            let mut intent = lane.intent.lock().expect("video intent poisoned");
+            intent.seq += 1;
+            intent.seq
+        };
+        WhatsAppClient::watch_upgrade_attempt(
+            calls.clone(),
+            ui.clone(),
+            "current".to_string(),
+            camera_id,
+            lane,
+            seq,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(
+            calls.camera_on("current"),
+            "an answered camera keeps running"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a stood-down watchdog announces nothing"
+        );
+    }
+
+    /// The watchdog never touches a newer attempt: only the camera it was
+    /// armed for may be retired, and a replaced map entry disarms it.
+    #[tokio::test]
+    async fn upgrade_watchdog_yields_to_a_newer_attempt() {
+        let calls = CallRegistry::default();
+        let (ui, _rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let (old, _endpoints, _capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+        let old_id = old.camera_id();
+        calls.begin_upgrade("current", old_id);
+        calls
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .cameras
+            .insert("current".into(), old);
+        let (new, _endpoints, _capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+        let new_id = new.camera_id();
+        calls.begin_upgrade("current", new_id);
+        let lane = calls.video_lane("current");
+        let seq = {
+            let mut intent = lane.intent.lock().expect("video intent poisoned");
+            intent.seq += 1;
+            intent.seq
+        };
+        WhatsAppClient::watch_upgrade_attempt(
+            calls.clone(),
+            ui.clone(),
+            "current".to_string(),
+            old_id,
+            lane,
+            seq,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(
+            calls.calls.lock().unwrap().upgrading.get("current"),
+            Some(&new_id),
+            "the newer attempt still owns the call"
+        );
+        assert!(calls.camera_on("current"), "the newer camera keeps running");
     }
 }

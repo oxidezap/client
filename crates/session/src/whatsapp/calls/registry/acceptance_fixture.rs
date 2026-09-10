@@ -905,4 +905,149 @@ mod tests {
             fixture.shutdown().await.unwrap();
         }
     }
+
+    /// A re-enable the peer never answers must be withdrawn by us, well
+    /// before the library's own upgrade timeout: the timeout would send
+    /// `UpgradeCancelByTimeout`, which the peer applies by tearing its own
+    /// direction down too, collapsing the whole call. Withdrawing first sends
+    /// `Stopped`, spares the peer, and leaves the library with nothing
+    /// pending — so a later retry can begin rather than being refused.
+    #[tokio::test]
+    async fn unanswered_reenable_is_withdrawn_before_the_library_timeout() {
+        let fixture = Arc::new(CallFixture::new().await.unwrap());
+        let calls = CallRegistry::default();
+        let guard = StartGuard {
+            stamp: calls.begin_start("pending"),
+            calls: calls.clone(),
+            placeholder: "pending".into(),
+        };
+        let (ui, mut received) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let (_mic, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let starting = tokio::spawn({
+            let fixture = fixture.clone();
+            async move {
+                fixture
+                    .client()
+                    .voip()
+                    .call(fixture.peer())
+                    .audio(mic_rx, speaker)
+                    .start()
+                    .await
+            }
+        });
+        fixture.next_offer().await.unwrap().complete().unwrap();
+        let handle = Arc::new(starting.await.unwrap().unwrap());
+        let id = handle.call_id().to_string();
+        assert!(calls.finish_start("pending", &id, &handle));
+        calls.outgoing_ready(&id, &handle, fixture.peer().clone(), None);
+        drop(guard);
+        let (local, endpoints, _capture) = video::camera_fixture(&id, Arc::new(|_, _| {}));
+        let camera_id = local.camera_id();
+        calls.begin_upgrade(&id, camera_id);
+        handle
+            .start_video(endpoints.source, endpoints.sink)
+            .await
+            .unwrap();
+        local.live();
+        assert!(calls.hold_camera(&id, local).await == Camera::Held);
+        let lane = calls.video_lane(&id);
+        let seq = {
+            let mut intent = lane.intent.lock().expect("video intent poisoned");
+            intent.seq += 1;
+            intent.seq
+        };
+        while received.try_recv().is_ok() {}
+        // Silence, the way the retested call went: no accept, no enable.
+        WhatsAppClient::watch_upgrade_attempt(
+            calls.clone(),
+            ui.clone(),
+            id.clone(),
+            camera_id,
+            lane,
+            seq,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        let stanzas = fixture.outgoing_stanzas().unwrap();
+        let video_state = |wanted: &str| {
+            stanzas
+                .iter()
+                .filter(|node| {
+                    node.as_node_ref()
+                        .get_optional_child("video")
+                        .is_some_and(|video| {
+                            video.attrs().optional_string("state").as_deref() == Some(wanted)
+                        })
+                })
+                .count()
+        };
+        assert_eq!(video_state("11"), 1, "the attempt itself goes out");
+        assert_eq!(
+            video_state("6"),
+            1,
+            "an unanswered attempt is withdrawn with Stopped"
+        );
+        assert_eq!(
+            video_state("9"),
+            0,
+            "withdrawing first leaves the library timeout nothing to cancel"
+        );
+        assert!(
+            !calls.upgrade_pending(&id),
+            "the attempt is gone from our map too"
+        );
+        assert!(
+            !calls.calls.lock().unwrap().cameras.contains_key(&id),
+            "the attempt's camera is released"
+        );
+        assert!(
+            matches!(
+                received.try_recv(),
+                Ok(UiEvent::CallVideoChanged {
+                    stream: VideoStream::Local,
+                    on: false,
+                    ..
+                })
+            ),
+            "the attempt settles off"
+        );
+        // The disarm proof, without waiting out the five-second library
+        // timeout: a fresh upgrade begins, which a still-pending one refuses.
+        let (retry, retry_endpoints, _capture) = video::camera_fixture(&id, Arc::new(|_, _| {}));
+        calls.begin_upgrade(&id, retry.camera_id());
+        handle
+            .start_video(retry_endpoints.source, retry_endpoints.sink)
+            .await
+            .expect("a withdrawn attempt must not wedge the next one");
+        assert_eq!(
+            video_state("11"),
+            1,
+            "stanza counts were taken before the retry"
+        );
+        assert_eq!(
+            fixture
+                .outgoing_stanzas()
+                .unwrap()
+                .iter()
+                .filter(|node| {
+                    node.as_node_ref()
+                        .get_optional_child("video")
+                        .is_some_and(|video| {
+                            video.attrs().optional_string("state").as_deref() == Some("11")
+                        })
+                })
+                .count(),
+            2,
+            "the retry goes out as a new upgrade"
+        );
+        if let Some(camera) = calls.ended(&id) {
+            camera.stop().await;
+        }
+        handle.hangup_local().await;
+        fixture.shutdown().await.unwrap();
+    }
 }

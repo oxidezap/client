@@ -766,7 +766,11 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   never got, and a device unplugged mid-call all end with owner cleanup.
   `settle_video` checks that the registered camera is alive and withholds
   local-on while its upgrade is unanswered. Registry membership alone does
-  not prove that frames are going out.
+  not prove that frames are going out. An upgrade nobody answers is withdrawn
+  by a watchdog a second ahead of the library's own timeout: the timeout's
+  `UpgradeCancelByTimeout` takes the peer's direction down with ours, while
+  our earlier `Stopped` spares it — and an answered or replaced attempt
+  disarms the watch, fenced on the armed camera.
 - **A refusal is answered by whether one is outstanding, not by which camera
   asked.** The library does not match a refused upgrade to the request it
   refuses: its handler tears the local plane down whenever *some* request of
