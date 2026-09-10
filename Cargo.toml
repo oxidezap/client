@@ -101,9 +101,9 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fm/upstream-video-media-diff-working-versus-4b" }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fm/upstream-video-media-diff-working-versus-4b" }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fm/upstream-video-media-diff-working-versus-4b" }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 
 # The library and its satellites. One git source, one branch: cargo resolves
 # every entry below to the SAME commit, so `cargo update` moves them together
@@ -130,8 +130,8 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fm/upst
 # are the only place either is said — and a new upstream default has to be
 # adopted here by hand, which is the price of that split staying honest.
 #
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fm/upstream-video-media-diff-working-versus-4b", default-features = false }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "fm/upstream-video-media-diff-working-versus-4b", default-features = false }
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and
