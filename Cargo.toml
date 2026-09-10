@@ -122,8 +122,16 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 # crates that need none of it. `SharedSqlite` is also not re-exported, so the
 # chat store needs sqlite-storage directly regardless.
 #
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", features = ["voip"] }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+# Featureless on purpose: inheritance can only repeat `default-features`,
+# never override it, so the workspace says none and every host crate lists
+# exactly what it takes. The wasm halves then stay free of `voip` (UDP
+# sockets and C) and `bundled-sqlite` (a C toolchain) by simply not naming
+# them. A target split is still two entries, but the source and branch below
+# are the only place either is said — and a new upstream default has to be
+# adopted here by hand, which is the price of that split staying honest.
+#
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and

@@ -824,8 +824,11 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   the channel it is thrown away in.** The camera has to open before the offer
   -- an offer with no camera is not a video offer -- but nothing wants those
   frames. The window has no live call to draw them into, and the peer opens
-  its pane off the announcement sent at accept, not off the offer, so a unit
-  arriving before it is decoded by nobody. What made this expensive rather
+  its pane off the offer and the media rather than a standalone announcement
+  -- the post-accept `<video state="1">` was tried, acked, and changed nothing
+  (17 PLIs naming our SSRC across 12 keyframes, no render), so it no longer
+  goes out. A unit arriving before the peer's pane exists is decoded by
+  nobody. What made this expensive rather
   than merely wasteful is where the bytes go in the meantime: the relay
   channel is allocated when the server acks the offer, while the callee is
   still ringing, and SCTP starts in slow start with a congestion window of
@@ -854,15 +857,19 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   decided against the same line. Audio is exempt now up to a hard ceiling
   eight times higher, past which the channel is not congested but wedged.
 
-- **A video call announces its direction; the offer only advertises the
-  capability.** A call placed as video enables its plane ungated, encodes, and
-  packetises — and the peer shows nothing, because the receiving side brings
-  its video stream up off a `<video state="1">` *announcement*, not off the
-  offer. The official client's own decoder is driven by `handle_peer_video_enabled`
-  and `update_video_info`, both fed by `<video state=…>`. Android says its own
-  direction (`state="11"`) and, when nothing answers for ours, gives up
-  (`state="0"`). A mid-call camera already announced, through `start_video`;
-  the from-start path was the one that never did.
+- **A video-from-start call sends no standalone direction announce and no
+  upgrade request; the offer carries the capability and the media does the
+  rest.** The announce (`<video state="1">` after accept) was added on the
+  theory that the receiving side brings its video stream up off an
+  announcement rather than the offer — and production retests kept failing
+  with it in place: Android acked it, PLI'd our exact SSRC seventeen times
+  across twelve keyframes, and never rendered. A caller-side upgrade
+  request (`state=11`) was tried next and likewise moved Android only as
+  far as an ack-with-relay, never to accept or render — and the re-request
+  API only retries an outstanding local upgrade, which a video-from-start
+  call never has open, so the call site warned and sent nothing. Initiating
+  upgrade on live video is an upstream design decision, not a client
+  stanza. A mid-call camera still announces, through `start_video`.
 - **Neither encoder may go without a periodic IDR, and it is not a quality
   setting.** The media plane drops every access unit that is not an IDR while
   one of its keyframe gates is closed — the engine's `keyframe_required` and

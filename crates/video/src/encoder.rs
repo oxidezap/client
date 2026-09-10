@@ -161,4 +161,96 @@ mod tests {
         // 7 = SPS. A peer that gets a keyframe without one cannot start.
         assert_eq!(encoded.data[4] & 0x1f, 7);
     }
+
+    /// What the peer's decoder gets must decode: packetize one real IDR
+    /// access unit the way the send path does, reassemble it the way the
+    /// receive path does, and decode the result with an independent
+    /// decoder. A failure here is a packetization bug, not a network one —
+    /// and the self-view passing is no cover, since it reads the unit
+    /// before it is ever fragmented.
+    #[test]
+    fn packetized_idr_reassembles_into_a_decodable_access_unit() {
+        use openh264::decoder::Decoder;
+        use wacore::voip::h264::{H264Depacketizer, PacketizedAu, packetize_au};
+
+        let quality = VideoQuality::default();
+        let mut encoder = H264Encoder::new(quality).expect("the encoder is built in");
+        // Noise defeats compression, so the IDR overshoots the single-NAL
+        // ceiling and the fragments under test are real FU-A ones.
+        let mut frame = I420Buffer::new(320, 240).expect("even");
+        let noise: Vec<u8> = (0..320 * 240)
+            .map(|i: u32| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        frame.read_gray(&noise).expect("sized");
+        let encoded = encoder
+            .encode(&frame.as_source(), openh264::Timestamp::ZERO)
+            .expect("encodes")
+            .expect("a first frame is never skipped");
+        assert!(encoded.keyframe);
+
+        // Control: the unpacketized unit decodes, on a decoder instance of
+        // its own — sharing one would prime it with the original's
+        // parameter sets and let a reassembled unit missing them decode
+        // anyway, passing for exactly the failure this test claims to
+        // catch.
+        let mut control = Decoder::new().expect("decoder builds");
+        assert!(
+            control
+                .decode(&encoded.data)
+                .expect("control decodes")
+                .is_some(),
+            "the encoder's own output is a picture"
+        );
+
+        // The send path, then the receive path: one timestamp, marker on
+        // the last payload, sequences from zero, like the stream's first
+        // unit on the wire.
+        let mut packetized = PacketizedAu::default();
+        packetize_au(&encoded.data, &mut packetized);
+        // The STAP-A build: consecutive small parameter sets ride one
+        // aggregation packet (NAL type 24) instead of single NALs. The
+        // aggregation holds exactly SPS (7) then PPS (8), each length
+        // prefixed, which is the shape the phone's decoder learns csd from.
+        let mut payloads = packetized.iter();
+        let stap = payloads.next().expect("an IDR packetizes into payloads");
+        assert_eq!(
+            stap[0] & 0x1f,
+            24,
+            "the first payload aggregates the parameter sets"
+        );
+        let mut units = &stap[1..];
+        for expected in [7u8, 8u8] {
+            let len = u16::from_be_bytes([units[0], units[1]]) as usize;
+            units = &units[2..];
+            assert_eq!(units[0] & 0x1f, expected);
+            units = &units[len..];
+        }
+        assert!(
+            units.is_empty(),
+            "STAP-A carries only the two parameter sets"
+        );
+        assert!(
+            packetized.iter().any(|payload| payload[0] & 0x1f == 28),
+            "a noisy IDR fragments into FU-A, not just single NALs"
+        );
+        let mut depacketizer = H264Depacketizer::default();
+        let last = packetized.len() - 1;
+        let mut reassembled = None;
+        for (i, payload) in packetized.iter().enumerate() {
+            if let Some(ready) = depacketizer.push(i as u16, 0, payload, i == last) {
+                reassembled = Some(ready);
+            }
+        }
+        let (_, au) = reassembled.expect("the fragments reassemble into one unit");
+        // A fresh instance: whatever parameter sets the reassembled unit
+        // needs must arrive inside it, not linger from the control.
+        let mut decoder = Decoder::new().expect("decoder builds");
+        assert!(
+            decoder
+                .decode(&au)
+                .expect("reassembled output decodes")
+                .is_some(),
+            "the reassembled IDR yields a picture"
+        );
+    }
 }

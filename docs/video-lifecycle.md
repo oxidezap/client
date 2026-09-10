@@ -103,10 +103,16 @@ shared-memory WebCodecs tests exercise the real browser codecs.
 
 Stanza injection bypasses inbound Noise framing. No media relay or Android
 decoder runs in this fixture. Upstream still permits an unrung first winner
-and lets a later non-busy sibling reject end the call. Matching application
-metadata does not repair those policies. The existing standalone video
-announcement remains unchanged, and Android reception of this client's
-outbound video still needs a live retest.
+and lets a later sibling reject end the call unless it is per-device
+(`busy`, or `enc` for a device that could not decrypt the offer) — and our
+own event arm matches that rule rather than hanging up on one stale
+device. Matching application metadata does not repair those policies. Neither a standalone post-accept
+video announcement nor a caller-side upgrade re-request goes out on a video-from-start accept:
+production retests kept failing with the announce in place, and the re-request API only retries an
+outstanding local upgrade, which such a call never has open. The fixture asserts zero of either on
+live-camera accepts. Android reception of this client's outbound video still needs a live retest,
+reading the direction matrix, the PLI signature, and Android's `state="1"` (transaction-ids, `dec`,
+repeats) there.
 
 Browser relay summaries now count successful `RTCDataChannel.send` calls
 separately from congestion drops, non-open channels and send exceptions.

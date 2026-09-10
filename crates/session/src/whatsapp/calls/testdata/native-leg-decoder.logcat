@@ -1,0 +1,35 @@
+09-10 02:27:52.083 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: INITIALIZING
+09-10 02:27:52.083 21788 13657 D CCodec  : allocate(c2.qti.avc.decoder)
+09-10 02:27:52.225 21788 13657 I CCodec  : Created component [c2.qti.avc.decoder] for [c2.qti.avc.decoder]
+09-10 02:27:52.252 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: INITIALIZED
+09-10 02:27:52.254 21788 11954 I MediaCodec: [mId: 88] [video-debug-dec] configure: ClientName: com.whatsapp ComponentName: c2.qti.avc.decoder
+09-10 02:27:52.254 21788 11954 I MediaCodec: [mId: 88] [video-debug-dec] configure: ClientFormat: AMessage(what = 0x00000000) = {
+09-10 02:27:52.254 21788 11954 I MediaCodec:   int32_t color-format = 19
+09-10 02:27:52.254 21788 11954 I MediaCodec:   string mime = "video/avc"
+09-10 02:27:52.254 21788 11954 I MediaCodec:   int32_t width = 640
+09-10 02:27:52.254 21788 11954 I MediaCodec:   int32_t height = 600
+09-10 02:27:52.254 21788 11954 I MediaCodec:   string activity = "com.whatsapp.calling.ui.VoipActivityV2"
+09-10 02:27:52.254 21788 11954 I MediaCodec: }
+09-10 02:27:52.292 21788 11954 I VideoBox: [mId: 88] video-debug initVideobox: return false for videobox is not enabled
+09-10 02:27:52.312 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: CONFIGURING
+09-10 02:27:52.318 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: CONFIGURED
+09-10 02:27:52.318 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: STARTING
+09-10 02:27:52.340 21788 13657 I CCodecBufferChannel: [mId: 88] [video-debug-dec] start: inputFormat: AMessage(what = 0x00000000) = {
+09-10 02:27:52.340 21788 13657 I CCodecBufferChannel:   int32_t frame-rate = 30
+09-10 02:27:52.340 21788 13657 I CCodecBufferChannel:   int32_t height = 600
+09-10 02:27:52.340 21788 13657 I CCodecBufferChannel:   string mime = "video/avc"
+09-10 02:27:52.340 21788 13657 I CCodecBufferChannel:   int32_t width = 640
+09-10 02:27:52.340 21788 13657 I CCodecBufferChannel: }
+09-10 02:27:52.348 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: STARTED
+09-10 02:27:54.791 21788 13699 W MediaCodec: [mId: 88] [video-debug-dec] dequeueInputBuffer: Last successful request is 2473ms ago, 0 failures since then
+09-10 02:27:54.792 21788 13699 I MediaCodec: [mId: 88] [video-debug-dec] queueInputBuffer: index: 0 pts: 267403116000 timediff: 0
+09-10 02:27:54.844 21788 13699 I MediaCodec: [mId: 88] [video-debug-dec] queueInputBuffer: index: 1 pts: 267403168000 timediff: 52
+09-10 02:27:54.900 21788 13699 I MediaCodec: [mId: 88] [video-debug-dec] queueInputBuffer: index: 2 pts: 267403224000 timediff: 56
+09-10 02:27:57.323 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] state 6 mFlags 2080 Stats 5005ms:Client:com.whatsapp,Component:c2.qti.avc.decoder,Qin:51,DQin:51/51,Render:0,Drop:50,DQout:50/95
+09-10 02:28:02.359 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] state 6 mFlags 2048 Stats 5036ms:Client:com.whatsapp,Component:c2.qti.avc.decoder,Qin:100,DQin:100/101,Render:0,Drop:101,DQout:101/100
+09-10 02:28:03.906 21788 13837 I MediaCodec: [mId: 88] [video-debug-dec] stop
+09-10 02:28:03.906 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] state 6 mFlags 2048 Stats 1547ms:Client:com.whatsapp,Component:c2.qti.avc.decoder,Qin:20,DQin:20/19,Render:0,Drop:20,DQout:20/20
+09-10 02:28:03.906 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: STOPPING
+09-10 02:28:03.920 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: INITIALIZED
+09-10 02:28:03.920 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: RELEASING
+09-10 02:28:03.923 21788 13656 I MediaCodec: [mId: 88] [video-debug-dec] setState: UNINITIALIZED

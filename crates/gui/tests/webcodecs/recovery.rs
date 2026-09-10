@@ -12,6 +12,8 @@ mod h264_fixture;
 extern "C" {
     #[wasm_bindgen(catch, js_name = encodeRecoveryFrames)]
     async fn encode() -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch, js_name = encodeProductionFrames)]
+    async fn encode_production() -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch, js_name = decodeAcrossReset)]
     async fn decode(key: js_sys::Uint8Array, delta: js_sys::Uint8Array)
     -> Result<JsValue, JsValue>;
@@ -181,4 +183,47 @@ async fn a_later_delta_can_use_pps_one_announced_with_or_after_the_idr() {
             "reset must retain cached PPS 1 for later deltas"
         );
     }
+}
+
+/// The call's own encoder settings must emit a decoder-config the peer can
+/// take: Constrained Baseline at a level the call's resolution fits, with
+/// the parameter sets in band on the keyframe. A browser that answered the
+/// `avc1.42e01f` request with anything else would explain a peer that
+/// receives every IDR and decodes none of them.
+#[wasm_bindgen_test]
+async fn production_codec_sps_is_constrained_baseline_in_band() {
+    let chunks = js_sys::Array::from(&encode_production().await.expect("browser H.264 encoder"));
+    let idr = js_sys::Uint8Array::new(&chunks.get(0)).to_vec();
+    let sps = split_annexb(&idr)
+        .find(|nal| nal_unit_type(nal) == 7)
+        .expect("an Annex-B keyframe carries its SPS");
+    wasm_bindgen_test::console_log!(
+        "production SPS: {}",
+        sps.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join("")
+    );
+    assert!(
+        sps.len() >= 4,
+        "an SPS names profile, constraints and level"
+    );
+    assert_eq!(sps[0] & 0x1f, 7);
+    assert_eq!(sps[1], 66, "the encoder answers Baseline, not High");
+    assert_eq!(
+        sps[2] & 0xc0,
+        0xc0,
+        "constraint set 0+1: Constrained Baseline, as configured"
+    );
+    // Exactly 3.1: lower levels cannot describe 720p's 3600 macroblocks,
+    // and anything higher is outside the negotiated profile-level-id.
+    assert_eq!(sps[3], 0x1f, "the encoder answers the requested Level 3.1");
+    assert!(
+        split_annexb(&idr).any(|nal| nal_unit_type(nal) == 8),
+        "the PPS rides with the keyframe"
+    );
+    assert!(
+        split_annexb(&idr).any(|nal| nal_unit_type(nal) == 5),
+        "and so does a slice"
+    );
 }

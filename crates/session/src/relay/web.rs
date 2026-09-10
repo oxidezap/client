@@ -367,8 +367,12 @@ impl Traffic {
                     self.video_packets = self.video_packets.saturating_add(1);
                     // What the peer's jitter sees first: PT, sequence,
                     // timestamp and SSRC of the opening packet, kept for the
-                    // report. A zero SSRC or a payload type that is not 97
-                    // here is a broken association, not a broken encoder.
+                    // report. Gating on 97 cannot miss our stream: every
+                    // video packet here was stamped by our own packetizer
+                    // (`next_video_packet`), and the data channel carries no
+                    // browser-built RTP to surprise it — the answer is
+                    // `m=application` only. A zero SSRC here is a broken
+                    // association, not a broken encoder.
                     if self.video_packets == 1 && !self.first_video_seen && data.len() >= 12 {
                         self.first_video.copy_from_slice(&data[..12]);
                         self.first_video_seen = true;
@@ -442,6 +446,39 @@ impl PayloadTypes {
     }
 }
 
+/// Sender SSRCs of outbound RTCP Sender Reports, in first-seen order.
+/// A second entry is the audio stream's; a call has no third.
+struct SsrcSeen(RefCell<([u32; 8], usize)>);
+
+impl Default for SsrcSeen {
+    fn default() -> Self {
+        Self(RefCell::new(([0; 8], 0)))
+    }
+}
+
+impl SsrcSeen {
+    fn note_ssrc(&self, ssrc: u32) {
+        let mut seen = self.0.borrow_mut();
+        let (ssrcs, len) = &mut *seen;
+        if *len < ssrcs.len() && !ssrcs[..*len].contains(&ssrc) {
+            ssrcs[*len] = ssrc;
+            *len += 1;
+        }
+    }
+
+    fn describe(&self) -> String {
+        let seen = self.0.borrow();
+        let seen = &seen.0[..seen.1];
+        if seen.is_empty() {
+            return "none".to_string();
+        }
+        seen.iter()
+            .map(|ssrc| format!("{ssrc:#010x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// What the relay has actually delivered, by kind that matters.
 #[derive(Default)]
 struct InboundSeen {
@@ -452,15 +489,27 @@ struct InboundSeen {
     media: std::cell::Cell<bool>,
     /// The peer's RTP streams, by payload type. See [`PayloadTypes`].
     inbound_types: PayloadTypes,
-    /// The peer's RTCP, by subpacket type: 201 is a receiver report, 205/206
-    /// transport/payload feedback (NACK, PLI, REMB). Counted per subpacket,
-    /// since one datagram usually carries several. A peer that never sends
-    /// any never locked our stream; one sending feedback sees it but cannot
-    /// decode it. STUN answers the relay itself and is not counted here.
+    /// The peer's RTCP, by leading-subpacket type: 201 is a receiver report,
+    /// 205/206 transport/payload feedback (NACK, PLI, REMB). Counted per
+    /// datagram rather than per subpacket — SRTCP encrypts past byte 8, so
+    /// only the first header is readable here and the rest is answered off
+    /// the decrypted path. A peer that never sends any never locked our
+    /// stream; one sending feedback sees it but cannot decode it. STUN
+    /// answers the relay itself and is not counted here.
     rtcp_count: std::cell::Cell<u32>,
     rtcp_types: PayloadTypes,
     /// Ours, recorded on the way out for the same reason.
     outbound_types: PayloadTypes,
+    /// Our RTCP, by leading-subpacket type: 200 is a Sender Report, 201 a
+    /// receiver report, 205/206 our own feedback. Same one-header limit as
+    /// the inbound side — what the engine encrypts past byte 8 is unreadable
+    /// here, and the report line is where a missing SR would finally show.
+    outbound_rtcp: PayloadTypes,
+    /// Which streams our Sender Reports speak for. PT 200 alone cannot say:
+    /// audio and video both report under it. The sender SSRC rides bytes 4-7
+    /// in the clear ahead of the SRTCP ciphertext, so a video SR shows up
+    /// here under the same SSRC `first_video` carries.
+    outbound_sr: SsrcSeen,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -503,12 +552,17 @@ impl Inbound {
                 self.seen.inbound_types.note(&packet);
             }
             RelayPacketKind::Rtcp => {
-                each_rtcp_type(&packet, |pt| {
+                // The leading subpacket only: past byte 8 the wire carries
+                // SRTCP ciphertext, so a later header would usually stop the
+                // read and occasionally invent a packet type. Which streams
+                // feedback names is answered off the decrypted path instead,
+                // where the engine has already run `unprotect_srtcp`.
+                if let Some(pt) = first_rtcp_type(&packet) {
                     self.seen
                         .rtcp_count
                         .set(self.seen.rtcp_count.get().saturating_add(1));
                     self.seen.rtcp_types.note_pt(pt);
-                });
+                }
             }
             RelayPacketKind::Stun | RelayPacketKind::Other => {}
         }
@@ -604,15 +658,21 @@ impl BrowserRelayChannel {
     }
 
     fn report(&self, phase: &str) {
-        debug!(
+        debug!("{}", self.report_line(phase));
+    }
+
+    fn report_line(&self, phase: &str) -> String {
+        format!(
             "voip: relay transport={} {} datachannel_admission_only=true peer_receipt=unknown \
              marker_scope=admitted_packets_not_complete_aus \
              state_order=connecting,open,closing,closed,unknown counters={:?} \
-             admitted_rtp_pts=[{}] inbound_rtp_pts=[{}] inbound_rtcp_pts=[{}] rtcp_count={} first_video={} inbound={} inbound_media={}",
+             admitted_rtp_pts=[{}] outbound_rtcp_pts=[{}] outbound_sr_ssrcs=[{}] inbound_rtp_pts=[{}] inbound_rtcp_pts=[{}] rtcp_count={} first_video={} inbound={} inbound_media={}",
             self.ordinal,
             phase,
             self.traffic.borrow(),
             self.inbound.outbound_types.describe(),
+            self.inbound.outbound_rtcp.describe(),
+            self.inbound.outbound_sr.describe(),
             self.inbound.inbound_types.describe(),
             self.inbound.rtcp_types.describe(),
             self.inbound.rtcp_count.get(),
@@ -622,7 +682,7 @@ impl BrowserRelayChannel {
             ),
             yes_no(self.inbound.any.get()),
             yes_no(self.inbound.media.get()),
-        );
+        )
     }
 
     /// Whether this packet goes out, holding the verdict across an access unit.
@@ -788,6 +848,24 @@ impl RelayTransport for BrowserRelayChannel {
             .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))?;
         if matches!(classify_relay_packet(&data), RelayPacketKind::Rtp) {
             self.inbound.outbound_types.note(&data);
+        }
+        if matches!(classify_relay_packet(&data), RelayPacketKind::Rtcp)
+            && let Some(pt) = first_rtcp_type(&data)
+        {
+            self.inbound.outbound_rtcp.note_pt(pt);
+            // A Sender Report names its stream past the header, still in the
+            // clear: bytes 4-7 are the sender SSRC, ciphertext starts at 8.
+            // Zero names nothing — the same broken association `first_video`
+            // already refuses — so it is not recorded.
+            if pt == 200
+                && let Some(ssrc) = data.get(4..8)
+                && let Ok(ssrc) = ssrc.try_into()
+            {
+                let ssrc = u32::from_be_bytes(ssrc);
+                if ssrc != 0 {
+                    self.inbound.outbound_sr.note_ssrc(ssrc);
+                }
+            }
         }
         self.note_send(
             &data,
@@ -1046,21 +1124,19 @@ fn yes_no(answer: bool) -> &'static str {
 /// the message is asked for first and the debug form is the fallback.
 /// The opening outbound video header for the report, or `none` before any
 /// video was admitted. PT is masked to seven bits the way RTP defines it.
-/// One RTCP packet type per call, walking a compound datagram through each
-/// header's length field. Stops at a truncated or non-RTCP header rather
-/// than guessing past it; a relay datagram usually carries RR and feedback
-/// in one, and recording only the first would hide the feedback this
-/// instrumentation exists to see.
-fn each_rtcp_type(data: &[u8], mut f: impl FnMut(u8)) {
-    let mut offset = 0;
-    while let Some(header) = data.get(offset..offset + 4) {
-        if header[0] >> 6 != 2 || !(192..=223).contains(&header[1]) {
-            break;
-        }
-        f(header[1]);
-        let words = u16::from_be_bytes([header[2], header[3]]) as usize;
-        offset = offset.saturating_add((words + 1).saturating_mul(4));
+/// The leading RTCP subpacket's type, or nothing when the datagram does not
+/// open with one. SRTCP encrypts past byte 8 (`RTCP_HEADER_LEN` in the
+/// library's `e2e_srtp`, which decrypts from there), so the first header is
+/// the only one readable before decryption: walking on would read ciphertext
+/// as headers, usually stopping and occasionally inventing a packet type.
+/// Anything past the lead — which streams feedback names, what the reports
+/// say — is collected off the decrypted path instead.
+fn first_rtcp_type(data: &[u8]) -> Option<u8> {
+    let header = data.get(..4)?;
+    if header[0] >> 6 != 2 || !(192..=223).contains(&header[1]) {
+        return None;
     }
+    Some(header[1])
 }
 
 fn describe_first_video(seen: bool, header: [u8; 12]) -> String {
@@ -1229,23 +1305,86 @@ mod tests {
         assert_eq!(inbound.seen.inbound_types.describe(), "120");
         assert_eq!(inbound.seen.rtcp_count.get(), 3);
         assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
-        // A compound datagram counts every subpacket, not just the first.
+        // A compound datagram counts once, for its leading subpacket: past
+        // byte 8 the wire carries SRTCP ciphertext, not a second header.
         let mut compound = [0u8; 20];
         compound[0..8].copy_from_slice(&[0x80, 201, 0, 1, 0, 0, 0, 0]);
         compound[8..20].copy_from_slice(&[0x81, 206, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
         inbound.deliver(Bytes::copy_from_slice(&compound));
-        assert_eq!(inbound.seen.rtcp_count.get(), 5);
+        assert_eq!(inbound.seen.rtcp_count.get(), 4);
         assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
-        // Truncated and non-RTCP tails stop the walk instead of guessing.
+        // A leading header that overclaims its length still counts: the
+        // eight clear octets are there even when the body is not.
         // Eight bytes so the classifier admits it as RTCP first: shorter
-        // than that never reaches the walker at all.
+        // than that never reaches the reader at all.
         inbound.deliver(Bytes::copy_from_slice(&[0x80, 201, 0, 9, 0, 0, 0, 0]));
         let mut ragged = [0u8; 12];
         ragged[0..8].copy_from_slice(&[0x80, 201, 0, 1, 0, 0, 0, 0]);
         inbound.deliver(Bytes::copy_from_slice(&ragged));
         inbound.deliver(Bytes::copy_from_slice(&[0x00, 201, 0, 0]));
-        assert_eq!(inbound.seen.rtcp_count.get(), 7);
+        assert_eq!(inbound.seen.rtcp_count.get(), 6);
         assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
+    }
+
+    #[wasm_bindgen_test]
+    async fn outbound_rtcp_is_typed_by_leading_subpacket() {
+        let connection = web_sys::RtcPeerConnection::new().unwrap();
+        let channel = connection.create_data_channel("test");
+        let relay = BrowserRelayChannel {
+            connection,
+            channel,
+            _wiring: Wiring {
+                _on_message: Closure::wrap(Box::new(|_: web_sys::MessageEvent| {})),
+                _on_close: Closure::wrap(Box::new(|_: web_sys::Event| {})),
+                _on_error: Closure::wrap(Box::new(|_: web_sys::Event| {})),
+                _on_state: Closure::wrap(Box::new(|_: web_sys::Event| {})),
+            },
+            closed: std::cell::Cell::new(false),
+            congested: std::cell::Cell::new(false),
+            outbound_dropped: std::cell::Cell::new(0),
+            ordinal: next_transport_ordinal(),
+            traffic: RefCell::new(Traffic::default()),
+            last_report: std::cell::Cell::new(wacore::time::Instant::now()),
+            au: std::cell::Cell::new(Outbound::Between),
+            sent_any: std::cell::Cell::new(false),
+            inbound: Rc::new(InboundSeen::default()),
+        };
+        patch_channel(&relay.channel, "open", 0, false);
+        // A video Sender Report and a receiver report: the report line must
+        // say SRs leave the page, which is the runtime half of the RTCP
+        // audit — the engine emits them, but nothing here ever showed it.
+        assert!(relay.send(rtcp(200)).await.is_ok());
+        assert!(relay.send(rtcp(201)).await.is_ok());
+        assert_eq!(relay.inbound.outbound_rtcp.describe(), "200, 201");
+        assert!(
+            relay
+                .report_line("activity")
+                .contains("outbound_rtcp_pts=[200, 201]")
+        );
+        // PT alone cannot answer the video-SR question: audio and video both
+        // report as 200. The sender SSRC in the clear bytes 4-7 names the
+        // stream, so a video SR must show up under our own video SSRC.
+        let ssrc = [0x1f, 0x16, 0x0e, 0xd3];
+        let mut video = [0u8; 28];
+        video[0] = 0x90;
+        video[1] = RTP_PAYLOAD_TYPE_H264 | 0x80;
+        video[8..12].copy_from_slice(&ssrc);
+        video[12..18].copy_from_slice(&[0xde, 0xbe, 0, 3, 0x30, 8]);
+        assert!(relay.send(Bytes::copy_from_slice(&video)).await.is_ok());
+        let mut sr = [0u8; 28];
+        sr[0] = 0x80;
+        sr[1] = 200;
+        sr[2..4].copy_from_slice(&[0, 6]);
+        sr[4..8].copy_from_slice(&ssrc);
+        assert!(relay.send(Bytes::copy_from_slice(&sr)).await.is_ok());
+        assert_eq!(relay.inbound.outbound_sr.describe(), "0x1f160ed3");
+        assert!(
+            relay
+                .report_line("activity")
+                .contains("outbound_sr_ssrcs=[0x1f160ed3]")
+        );
+        assert!(relay.report_line("activity").contains("ssrc=0x1f160ed3]"));
+        relay.disconnect().await;
     }
 
     #[wasm_bindgen_test]

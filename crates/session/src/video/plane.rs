@@ -176,6 +176,35 @@ fn next_camera_id() -> CameraId {
     NEXT.fetch_add(1, portable_atomic::Ordering::Relaxed)
 }
 
+/// The NAL types inside one Annex-B access unit, in order: 7 is an SPS, 8
+/// a PPS, 5 a slice. Read for the log, so an IDR going out without its
+/// parameter sets is one line rather than a silent non-starter.
+fn idr_nal_types(data: &[u8]) -> Vec<u8> {
+    use whatsapp_rust::wacore::voip::h264::{nal_unit_type, split_annexb};
+
+    split_annexb(data).map(nal_unit_type).collect()
+}
+
+/// The first SPS and PPS NALs of an access unit, hex, without start codes.
+/// A decoder configures off exactly these bytes, so two calls whose IDRs
+/// carry different sets are different streams even when the NAL type lists
+/// match — and the log can tell them apart.
+fn idr_parameter_sets(data: &[u8]) -> (String, String) {
+    use whatsapp_rust::wacore::voip::h264::{nal_unit_type, split_annexb};
+
+    let mut sps = String::from("none");
+    let mut pps = String::from("none");
+    for nal in split_annexb(data) {
+        let entry = match nal_unit_type(nal) {
+            7 if sps == "none" => &mut sps,
+            8 if pps == "none" => &mut pps,
+            _ => continue,
+        };
+        *entry = nal.iter().map(|byte| format!("{byte:02x}")).collect();
+    }
+    (sps, pps)
+}
+
 /// How many frames may wait for the daemon. Small: a backlog here is latency
 /// the person on screen can see.
 pub(crate) const PUBLISH_DEPTH: usize = 4;
@@ -202,10 +231,11 @@ pub(crate) struct LocalVideo {
     /// draw them into, so publishing them would base64 a 720p stream across
     /// the socket, spin up a decoder and convert every frame to pixels, all
     /// of it to be thrown away on arrival. And the peer discards them too:
-    /// it opens its pane off the announcement sent at accept, not off the
-    /// offer, so a unit that arrives before that announcement is decoded by
-    /// nobody — after paying for its place in a relay channel whose
-    /// congestion window has only just opened. See `announce_our_video`.
+    /// it opens its pane off the offer and the media, not off a standalone
+    /// announcement — captured video-from-start calls carry none — so a unit
+    /// that arrives before the peer's pane exists is decoded by nobody,
+    /// after paying for its place in a relay channel whose congestion
+    /// window has only just opened.
     live: Arc<AtomicBool>,
     /// The fan-out task, stopped by closing the camera's channel.
     pump: Task<()>,
@@ -581,6 +611,16 @@ async fn pump_local(pump: LocalPump<impl Fn()>) {
         if !live.load(Ordering::Relaxed) {
             continue;
         }
+        // What the peer's decoder has to work with, on every keyframe: an
+        // IDR without its parameter sets starts nothing, and without this
+        // line the log cannot tell one from a complete unit — or two
+        // complete units with different sets from each other. Read now,
+        // said only once the plane takes the unit: a refused IDR is not
+        // available to the peer however complete it looks.
+        let idr_audit = keyframe.then(|| {
+            let (sps, pps) = idr_parameter_sets(&data);
+            format!("{:?} sps={sps} pps={pps}", idr_nal_types(&data))
+        });
         {
             let delivery = publish(&publisher, || {
                 CallVideoFrame::new(
@@ -643,6 +683,9 @@ async fn pump_local(pump: LocalPump<impl Fn()>) {
                 // nothing while this line is present is a fault downstream of
                 // us — which is the distinction the log could not make.
                 debug!("the first frame of local video was handed to the media plane");
+            }
+            if let Some(audit) = idr_audit {
+                debug!("local video IDR NALs: {audit}");
             }
         } else {
             refused_by_the_plane += 1;
@@ -777,6 +820,41 @@ async fn pump_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every IDR that goes out names the NALs a peer decoder needs in the
+    /// log, so a keyframe without parameter sets is visible rather than a
+    /// silent non-starter on the far side.
+    #[cfg_attr(not(target_family = "wasm"), test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    fn idr_nal_audit_names_parameter_sets_and_slices() {
+        let annexb = |types: &[u8]| {
+            let mut data = Vec::new();
+            for nal_type in types {
+                data.extend_from_slice(&[0, 0, 0, 1, 0x60 | nal_type]);
+            }
+            data
+        };
+        assert_eq!(idr_nal_types(&annexb(&[7, 8, 5, 5])), vec![7, 8, 5, 5]);
+        assert_eq!(idr_nal_types(&annexb(&[5])), vec![5]);
+        // No start codes: AVCC length words, not Annex-B — reported empty
+        // rather than misread, since the pipeline downstream splits on
+        // start codes and would yield nothing either.
+        assert!(idr_nal_types(&[0, 0, 0, 12, 0x65, 1, 2, 3]).is_empty());
+        assert!(idr_nal_types(&[]).is_empty());
+        // The sets come out hex without start codes, first of each kind
+        // wins, and a unit without them says none rather than guessing.
+        let mut unit = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f];
+        unit.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x06, 0xe2]);
+        unit.extend_from_slice(&[0, 0, 0, 1, 0x65, 1, 2, 3]);
+        assert_eq!(
+            idr_parameter_sets(&unit),
+            ("6742c01f".to_string(), "68ce06e2".to_string())
+        );
+        assert_eq!(
+            idr_parameter_sets(&annexb(&[5])),
+            ("none".to_string(), "none".to_string())
+        );
+    }
 
     /// A camera we asked to stop is not a camera that was lost.
     ///

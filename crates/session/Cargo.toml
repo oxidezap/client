@@ -58,15 +58,26 @@ tokio = { workspace = true, features = ["macros", "sync", "time"] }
 # The library, twice, because the two targets need different halves of it.
 #
 # Same git source and same branch as every other library crate — that rule is
-# about revisions moving together, and these do. What differs is the feature
-# set, which `workspace = true` can only add to: the defaults pull the Tokio
-# transport, the ureq client and `tokio/net`, and `tokio/net` is `mio`, which
-# says outright that it does not build for this target. So the browser build
+# about revisions moving together, and these do, because the source is said
+# once in the workspace and inherited here. What differs is the feature set,
+# which inheritance can only add to: the defaults pull the Tokio transport,
+# the ureq client and `tokio/net`, and `tokio/net` is `mio`, which says
+# outright that it does not build for this target. So the browser build
 # takes none of them and supplies its own through the library's own plugin
 # traits.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-whatsapp-rust = { workspace = true }
+# The workspace names no defaults, so the host half lists the full set it
+# used to get implicitly: the six upstream defaults plus `voip`.
+whatsapp-rust = { workspace = true, features = [
+    "voip",
+    "sqlite-storage",
+    "tokio-transport",
+    "tokio-runtime",
+    "ureq-client",
+    "tokio-native",
+    "signal",
+] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 # `voip-mlow` and not `voip`: the library's VoIP runtime is portable, and what
@@ -76,14 +87,14 @@ whatsapp-rust = { workspace = true }
 # used to get wrong, and the reason a browser was told it had none. What it
 # supplies instead of the socket is a `RelayTransportProvider`; see
 # `src/relay/`.
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false, features = [
+whatsapp-rust = { workspace = true, default-features = false, features = [
     "voip-mlow",
 ] }
 # Directly, because the library no longer re-exports it: `sqlite-storage` is
 # one of the defaults dropped above. Same crate the chat store opens, and
 # without the `bundled-sqlite` that wants a C toolchain — diesel supplies
 # SQLite itself on this target.
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+whatsapp-rust-sqlite-storage = { workspace = true, default-features = false }
 # The browser, bound from Rust: the WebSocket, `fetch` and `setTimeout` that
 # stand in for the transport, the HTTP client and the runtime the defaults
 # would have supplied.

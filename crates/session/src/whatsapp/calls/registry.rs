@@ -744,7 +744,7 @@ impl CallRegistry {
             return;
         };
         let _ordered = lane.lock().await;
-        let (announce, pending) = {
+        let pending = {
             let mut calls = self.calls.lock().expect("call registry poisoned");
             let peer = call.participant.as_ref().unwrap_or(&call.from);
             if !calls
@@ -779,7 +779,16 @@ impl CallRegistry {
             start.activated = true;
             start.advertisements.clear();
             let _ = ui.send(UiEvent::CallAccepted(call_id.to_string()));
-            let announce = if let Some(local) = calls.cameras.get(call_id).filter(|local| {
+            // No standalone `<video state=1>` announce goes out here, and no
+            // upgrade request either: a call that offered video is already
+            // sending from the moment the peer accepts, and captured
+            // video-from-start calls carry neither stanza. A caller-side
+            // `state=11` was tried and reverted: the re-request API only
+            // retries an outstanding local upgrade, and a video-from-start
+            // call has none open, so the call site warned on every accept
+            // and sent nothing. Initiating upgrade on live video needs an
+            // upstream design decision, not a client stanza.
+            if let Some(local) = calls.cameras.get(call_id).filter(|local| {
                 Some(local.camera_id()) == camera
                     && local.alive()
                     && !calls.upgrading.contains_key(call_id)
@@ -793,11 +802,8 @@ impl CallRegistry {
                         handle.request_peer_keyframe(KeyframeUrgency::Coalesced);
                     }
                 }
-                true
-            } else {
-                false
-            };
-            (announce, pending)
+            }
+            pending
         };
         self.registration.notify_waiters();
         if let Some(update) = pending {
@@ -809,9 +815,6 @@ impl CallRegistry {
                 update.upgrade_token,
             )
             .await;
-        }
-        if announce {
-            self.announce_our_video(call_id, &handle).await;
         }
     }
 
@@ -959,33 +962,6 @@ impl CallRegistry {
             taken.stop().await;
         }
         outcome
-    }
-
-    /// Tell the peer this side is sending video, on a call that always was.
-    ///
-    /// A video-from-start call describes its video in the `<offer>` and then
-    /// says nothing more, and for a long time that looked complete: the plane
-    /// is enabled ungated, the encoder runs, and the packets go out. The peer
-    /// still shows nothing, because the offer is a *capability* and the
-    /// receiving side brings its video stream up off an *announcement* — the
-    /// official client's own decoder is driven by `handle_peer_video_enabled`
-    /// and `update_video_info`, both fed by `<video state=…>` and neither by
-    /// the offer. Android duly told us its direction (`state="11"`, then
-    /// `state="0"` when nothing answered) and never opened a pane for ours.
-    ///
-    /// Only ever "1": this says which direction *we* are sending, and a call
-    /// that offered video is sending from the moment the peer accepts. A
-    /// mid-call camera goes through `start_video`, which announces already.
-    async fn announce_our_video(&self, call_id: &str, handle: &Arc<CallHandle>) {
-        if !self
-            .live(call_id)
-            .is_some_and(|current| Arc::ptr_eq(&current, handle))
-        {
-            return;
-        }
-        if let Err(e) = handle.announce_video_enabled().await {
-            warn!("Call {call_id}: could not announce our video direction: {e}");
-        }
     }
 
     /// Whether this side's camera is on for this call.
@@ -2320,8 +2296,24 @@ impl WhatsAppClient {
                     reports_video,
                     feedback,
                     ..
-                } if reports_video && feedback.iter().any(reports_loss) => {
-                    calls.ask_for_keyframe(&call_id);
+                } => {
+                    // Which streams the feedback names, off the decrypted
+                    // packet: the relay report cannot say, SRTCP encrypts
+                    // past byte 8. A PLI or NACK naming our video SSRC here
+                    // means the peer sees the stream but cannot decode it;
+                    // none across a call means it never locked the stream.
+                    // The line is built only when debug logging is on:
+                    // RTCP recurs for the whole call and the string is
+                    // otherwise allocated just to be dropped.
+                    if reports_video
+                        && log::log_enabled!(log::Level::Debug)
+                        && let Some(targets) = describe_feedback(feedback.as_slice())
+                    {
+                        debug!("call {call_id}: inbound RTCP feedback on our video: {targets}");
+                    }
+                    if reports_video && feedback.iter().any(reports_loss) {
+                        calls.ask_for_keyframe(&call_id);
+                    }
                 }
                 // The library asking for the one thing only the encoder
                 // can produce, and for a long time nobody answered.
@@ -2538,10 +2530,16 @@ impl WhatsAppClient {
 /// RTCP payload-specific feedback (RFC 4585), which is the *class* PLI and
 /// FIR belong to.
 const RTCP_PAYLOAD_FEEDBACK: u8 = 206;
+/// RTCP transport feedback (RFC 4585), which carries NACKs.
+const RTCP_TRANSPORT_FEEDBACK: u8 = 205;
 /// Picture Loss Indication: the peer cannot decode what we are sending.
 const RTCP_FMT_PLI: u8 = 1;
 /// Full Intra Request, which asks for the same thing more emphatically.
 const RTCP_FMT_FIR: u8 = 4;
+/// Generic NACK: the peer did not get named packets.
+const RTCP_FMT_NACK: u8 = 1;
+/// Receiver Estimated Maximum Bitrate: bandwidth advice, not a stream.
+const RTCP_FMT_REMB: u8 = 15;
 
 /// Whether one feedback message says the peer has lost our picture.
 ///
@@ -2552,6 +2550,87 @@ const RTCP_FMT_FIR: u8 = 4;
 fn reports_loss(feedback: &whatsapp_rust::wacore::voip::rtcp::RtcpFeedback) -> bool {
     feedback.packet_type == RTCP_PAYLOAD_FEEDBACK
         && matches!(feedback.fmt, RTCP_FMT_PLI | RTCP_FMT_FIR)
+}
+
+/// The SSRCs one REMB block estimates bandwidth for, in listed order.
+///
+/// Layout per draft-alvestrand-rmcat-remb: `REMB`, a Num-SSRC byte, three
+/// bitrate bytes, then the list. A count that overclaims is clamped to the
+/// bytes actually there; anything without the magic has an unknown layout
+/// and yields nothing rather than a guess.
+fn remb_ssrcs(fci: &[u8]) -> Vec<u32> {
+    let [b'R', b'E', b'M', b'B', count, _, _, _, rest @ ..] = fci else {
+        return Vec::new();
+    };
+    rest.as_chunks::<4>()
+        .0
+        .iter()
+        .take(*count as usize)
+        .map(|ssrc| u32::from_be_bytes(*ssrc))
+        .collect()
+}
+
+/// The feedback half of a decrypted `RtcpReceived`, in one log line — or
+/// nothing when the packet carried no feedback to read.
+///
+/// The pre-decryption relay report can only count leading RTCP headers:
+/// SRTCP encrypts past byte 8, so which streams the peer's feedback names
+/// is answered here, off the packet the engine already decrypted. PLI and
+/// NACK name theirs in the media-source field; FIR leaves that field zero
+/// and names its targets in 8-byte FCI rows instead; REMB estimates
+/// bandwidth for the SSRC list past its bitrate bytes, which is decoded
+/// above and noted bare only when the block carries no list to read.
+fn describe_feedback(
+    feedback: &[whatsapp_rust::wacore::voip::rtcp::RtcpFeedback],
+) -> Option<String> {
+    if feedback.is_empty() {
+        return None;
+    }
+    let entries = feedback
+        .iter()
+        .map(|entry| {
+            let (packet_type, fmt) = (entry.packet_type, entry.fmt);
+            if packet_type == RTCP_TRANSPORT_FEEDBACK && fmt == RTCP_FMT_NACK {
+                return format!("{packet_type}/{fmt} nack media={:#010x}", entry.media_ssrc);
+            }
+            if packet_type == RTCP_PAYLOAD_FEEDBACK {
+                if fmt == RTCP_FMT_PLI {
+                    return format!("{packet_type}/{fmt} pli media={:#010x}", entry.media_ssrc);
+                }
+                if fmt == RTCP_FMT_FIR {
+                    let targets = entry
+                        .fci
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|row| {
+                            format!(
+                                "{:#010x}",
+                                u32::from_be_bytes([row[0], row[1], row[2], row[3]])
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return format!("{packet_type}/{fmt} fir=[{targets}]");
+                }
+                if fmt == RTCP_FMT_REMB {
+                    let list = remb_ssrcs(&entry.fci);
+                    if list.is_empty() {
+                        return format!("{packet_type}/{fmt} remb");
+                    }
+                    let targets = list
+                        .iter()
+                        .map(|ssrc| format!("{ssrc:#010x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return format!("{packet_type}/{fmt} remb=[{targets}]");
+                }
+            }
+            format!("{packet_type}/{fmt} media={:#010x}", entry.media_ssrc)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(entries)
 }
 
 /// Whether this peer state is a decoder of theirs being born on *our* stream.
@@ -3585,6 +3664,78 @@ mod tests {
         assert!(!reports_loss(&feedback(200, 4)));
     }
 
+    /// The decrypted feedback line names each stream the peer talks about,
+    /// decoding FIR targets out of the FCI rows its media-source field
+    /// leaves zero.
+    #[test]
+    fn decrypted_feedback_names_its_targets() {
+        use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
+
+        let feedback = |packet_type, fmt, media_ssrc, fci: &[u8]| RtcpFeedback {
+            packet_type,
+            fmt,
+            sender_ssrc: 1,
+            media_ssrc,
+            fci: fci.to_vec(),
+        };
+        assert_eq!(describe_feedback(&[]), None);
+        assert_eq!(
+            describe_feedback(&[feedback(206, 1, 0xa04f8fe9, &[])]),
+            Some("206/1 pli media=0xa04f8fe9".to_string())
+        );
+        // A NACK rides the transport class but names its stream the same
+        // way; a FIR leaves the media field zero and names its targets in
+        // 8-byte FCI rows instead.
+        let mut fci = vec![0u8; 16];
+        fci[0..4].copy_from_slice(&[1, 2, 3, 4]);
+        fci[8..12].copy_from_slice(&[5, 6, 7, 8]);
+        assert_eq!(
+            describe_feedback(&[feedback(205, 1, 0x01020304, &[]), feedback(206, 4, 0, &fci),]),
+            Some("205/1 nack media=0x01020304, 206/4 fir=[0x01020304, 0x05060708]".to_string())
+        );
+        // REMB estimates bandwidth rather than naming a stream.
+        assert_eq!(
+            describe_feedback(&[feedback(206, 15, 0, &[9u8; 8])]),
+            Some("206/15 remb".to_string())
+        );
+    }
+
+    /// A REMB block estimates bandwidth for the SSRC list past its bitrate
+    /// bytes, and the line names them rather than dropping the identity.
+    #[test]
+    fn remb_reports_the_ssrcs_it_estimates() {
+        use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
+
+        let remb = |fci: &[u8]| RtcpFeedback {
+            packet_type: 206,
+            fmt: 15,
+            sender_ssrc: 1,
+            media_ssrc: 0,
+            fci: fci.to_vec(),
+        };
+        // Magic, a two-stream count, three bitrate bytes, then the list.
+        let mut fci = b"REMB".to_vec();
+        fci.extend_from_slice(&[2, 3, 0x11, 0x22]);
+        fci.extend_from_slice(&[1, 2, 3, 4]);
+        fci.extend_from_slice(&[5, 6, 7, 8]);
+        assert_eq!(
+            describe_feedback(&[remb(&fci)]),
+            Some("206/15 remb=[0x01020304, 0x05060708]".to_string())
+        );
+        // A count that overclaims is clamped to the bytes actually there.
+        let mut short = b"REMB".to_vec();
+        short.extend_from_slice(&[9, 0, 0, 0, 1, 2, 3, 4]);
+        assert_eq!(
+            describe_feedback(&[remb(&short)]),
+            Some("206/15 remb=[0x01020304]".to_string())
+        );
+        // Without the magic the layout is unknown, so nothing is claimed.
+        assert_eq!(
+            describe_feedback(&[remb(&[9u8; 8])]),
+            Some("206/15 remb".to_string())
+        );
+    }
+
     /// The states that mean the peer now has somewhere to put our video, and
     /// so has a decoder that has never seen a keyframe.
     ///
@@ -3610,5 +3761,223 @@ mod tests {
         ] {
             assert!(!peer_can_receive_video(quiet), "{quiet:?}");
         }
+    }
+
+    /// Replay of the 2026-09-10 web-originated failing calls: every decrypted
+    /// feedback line off the wire, through the same renderer the debug log
+    /// used, naming the SSRC our first video packet carried.
+    ///
+    /// Each fixture pair is `testdata/` verbatim production output with
+    /// identities redacted (call id, LIDs, relay address); counts, SSRCs, SPS
+    /// bytes and the line shapes are untouched, because those are the
+    /// evidence. If the renderer ever changes its line shape, this fails
+    /// until the fixture is re-captured — that coupling is the point: the 6.2
+    /// verdict procedure (PLI names our video SSRC, so the peer sees but
+    /// cannot decode) is only as good as the lines it reads.
+    #[test]
+    fn failing_call_feedback_names_our_video_ssrc() {
+        use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
+
+        for (cycle, feedback, relay) in [
+            (
+                "1",
+                include_str!("testdata/failing-call-feedback.log"),
+                include_str!("testdata/failing-call-relay.log"),
+            ),
+            (
+                "2",
+                include_str!("testdata/failing-call-feedback-2.log"),
+                include_str!("testdata/failing-call-relay-2.log"),
+            ),
+        ] {
+            let ours = first_video_ssrc(relay);
+            let mut lines = 0;
+            for raw in feedback.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let (packet_type, fmt, media) = parse_feedback_line(raw);
+                let rendered = describe_feedback(&[RtcpFeedback {
+                    packet_type,
+                    fmt,
+                    sender_ssrc: 1,
+                    media_ssrc: media,
+                    fci: Vec::new(),
+                }]);
+                assert_eq!(rendered.as_deref(), Some(raw), "cycle {cycle}");
+                assert_eq!(
+                    media, ours,
+                    "cycle {cycle}: feedback must name our video stream"
+                );
+                assert!(
+                    reports_loss(&RtcpFeedback {
+                        packet_type,
+                        fmt,
+                        sender_ssrc: 1,
+                        media_ssrc: media,
+                        fci: Vec::new(),
+                    }),
+                    "cycle {cycle}: every replayed line is a lost-picture report"
+                );
+                lines += 1;
+            }
+            assert!(
+                lines > 0,
+                "cycle {cycle}: the fixture must hold the call's feedback"
+            );
+        }
+    }
+
+    /// Each failing call's relay report: our IDRs left the page with zero
+    /// drops and zero send errors, and the first video packet started at
+    /// seq 0 ts 0.
+    #[test]
+    fn failing_call_relay_report_shows_clean_egress() {
+        for (cycle, fixture) in [
+            ("1", include_str!("testdata/failing-call-relay.log")),
+            ("2", include_str!("testdata/failing-call-relay-2.log")),
+        ] {
+            replay_clean_egress(cycle, fixture);
+        }
+    }
+
+    /// One cycle's end-of-call report, in full.
+    fn replay_clean_egress(cycle: &str, fixture: &str) {
+        let report = fixture
+            .lines()
+            .rfind(|l| l.contains("counters=Traffic"))
+            .unwrap_or_else(|| panic!("cycle {cycle}: the fixture must hold a relay report line"));
+        // The terminal counters, not a periodic sample: only the `final`
+        // phase sees drops or send failures past the last sample.
+        let phase = report
+            .split_once("relay transport=")
+            .and_then(|rest| rest.1.split_whitespace().nth(1))
+            .unwrap_or_else(|| panic!("cycle {cycle}: the report must carry its phase"));
+        assert_eq!(
+            phase, "final",
+            "cycle {cycle}: the fixture must end at the final report"
+        );
+        let field = |name: &str| {
+            let mut tokens = report
+                .split(['{', '}', ',', ' ', '[', ']'])
+                .filter(|t| !t.is_empty());
+            while let Some(token) = tokens.next() {
+                if token == format!("{name}:") {
+                    return tokens
+                        .next()
+                        .unwrap_or_else(|| panic!("cycle {cycle}: {name} needs a value"));
+                }
+            }
+            panic!("cycle {cycle}: report must carry {name}")
+        };
+        assert!(
+            field("video_idr_markers").parse::<u64>().unwrap() > 0,
+            "cycle {cycle}"
+        );
+        assert!(
+            field("video_packets").parse::<u64>().unwrap() > 0,
+            "cycle {cycle}"
+        );
+        assert_eq!(field("video_drop_packets"), "0", "cycle {cycle}");
+        assert_eq!(field("audio_drop_packets"), "0", "cycle {cycle}");
+        assert_eq!(field("send_errors"), "0", "cycle {cycle}");
+        let after = report
+            .split_once("first_video=[")
+            .unwrap_or_else(|| panic!("cycle {cycle}: report must carry first_video"))
+            .1;
+        let first = after
+            .split_once(']')
+            .unwrap_or_else(|| panic!("cycle {cycle}: first_video needs its bracket"))
+            .0;
+        assert!(
+            first.starts_with("pt=97 seq=0 ts=0 ssrc="),
+            "cycle {cycle}: {first}"
+        );
+    }
+
+    /// The native-app leg's device logcat, kept explicitly separate from the
+    /// page-call proof above: the log shows an incoming call screen with no
+    /// page log behind it, so this decoder belongs to captain-calling-from
+    /// native, not to either replayed call. It stays because it is the only
+    /// device-side decoder evidence in existence — a phone AVC decoder
+    /// configured without parameter sets at a geometry that is not a 720p
+    /// stream, rendering nothing, dropping everything, then released — and
+    /// the day a page-correlated capture exists, this fixture goes away.
+    #[test]
+    fn native_leg_decoder_never_renders() {
+        let fixture = include_str!("testdata/native-leg-decoder.logcat");
+        let configure = fixture
+            .lines()
+            .find(|l| l.contains("configure: ClientFormat"))
+            .expect("the fixture must hold the decoder configure block");
+        assert!(configure.contains("video-debug-dec"));
+        let block: Vec<&str> = fixture
+            .lines()
+            .skip_while(|l| !l.contains("configure: ClientFormat"))
+            .take_while(|l| !l.trim_end().ends_with('}'))
+            .collect();
+        assert!(
+            !block.iter().any(|l| l.contains("csd-")),
+            "no parameter sets reach the decoder configure"
+        );
+        let size = |name: &str| {
+            block
+                .iter()
+                .find_map(|l| {
+                    l.split(&format!("{name} = ")).nth(1).and_then(|rest| {
+                        rest.split_whitespace()
+                            .next()
+                            .and_then(|v| v.parse::<u32>().ok())
+                    })
+                })
+                .unwrap_or_else(|| panic!("configure must carry {name}"))
+        };
+        assert_ne!((size("width"), size("height")), (1280, 720));
+        let mut renders = 0;
+        let mut saw_stop = false;
+        for line in fixture.lines() {
+            if let Some(stats) = line.split_once("Stats ") {
+                let render = stats
+                    .1
+                    .split(',')
+                    .find_map(|part| part.strip_prefix("Render:"))
+                    .unwrap_or_else(|| panic!("stats line must carry Render"));
+                renders += render.parse::<u32>().unwrap();
+            }
+            saw_stop |= line.contains("video-debug-dec] stop");
+        }
+        assert_eq!(renders, 0, "no decoded frame may reach the screen");
+        assert!(saw_stop, "the decoder is released with nothing rendered");
+    }
+
+    /// "206/1 pli media=0x5a29cf52" into its three numbers.
+    fn parse_feedback_line(line: &str) -> (u8, u8, u32) {
+        let mut words = line.split_whitespace();
+        let class = words
+            .next()
+            .unwrap_or_else(|| panic!("empty feedback line"));
+        let (packet_type, fmt) = class
+            .split_once('/')
+            .unwrap_or_else(|| panic!("no class in {line}"));
+        words.next();
+        let media = words
+            .next()
+            .unwrap_or_else(|| panic!("no media SSRC in {line}"));
+        (
+            packet_type.parse().unwrap(),
+            fmt.parse().unwrap(),
+            u32::from_str_radix(media.trim_start_matches("media=0x"), 16).unwrap(),
+        )
+    }
+
+    /// The SSRC after "ssrc=0x" in the fixture's first_video bracket.
+    fn first_video_ssrc(relay_fixture: &str) -> u32 {
+        let line = relay_fixture
+            .lines()
+            .find(|l| l.contains("first_video=["))
+            .expect("the relay fixture must hold first_video");
+        let hex = line
+            .split("ssrc=0x")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_hexdigit()).next())
+            .expect("first_video must carry an SSRC");
+        u32::from_str_radix(hex, 16).unwrap()
     }
 }

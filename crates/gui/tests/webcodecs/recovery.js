@@ -37,6 +37,44 @@ export async function encodeRecoveryFrames() {
     }
 }
 
+// The call's own encoder settings: Constrained Baseline 3.1 at call
+// resolution, Annex-B, realtime. One keyframe is all the SPS verdict needs.
+export async function encodeProductionFrames() {
+    const chunks = [];
+    let failure;
+    const encoder = new VideoEncoder({
+        output(chunk) {
+            const bytes = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(bytes);
+            chunks.push(bytes);
+        },
+        error(error) { failure = error; },
+    });
+    try {
+        encoder.configure({
+            codec: "avc1.42e01f", width: 1280, height: 720,
+            bitrate: 1980000, framerate: 20,
+            avc: {format: "annexb"}, latencyMode: "realtime",
+        });
+        const canvas = new OffscreenCanvas(1280, 720);
+        const context = canvas.getContext("2d");
+        context.fillStyle = "#336699";
+        context.fillRect(0, 0, 1280, 720);
+        const frame = new VideoFrame(canvas, {timestamp: 0});
+        try {
+            encoder.encode(frame, {keyFrame: true});
+        } finally {
+            frame.close();
+        }
+        await encoder.flush();
+        if (failure) throw failure;
+        if (chunks.length !== 1) throw new Error(`Expected one keyframe, got ${chunks.length}`);
+        return chunks;
+    } finally {
+        if (encoder.state !== "closed") encoder.close();
+    }
+}
+
 export async function decodeAcrossReset(key, delta) {
     const timestamps = [];
     let failure;

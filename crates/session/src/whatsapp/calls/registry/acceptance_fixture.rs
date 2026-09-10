@@ -480,15 +480,27 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
         })
         .count();
     assert_eq!(
-        announcements,
-        usize::from(
-            case.connects()
-                && !matches!(
-                    case,
-                    OutgoingAcceptCase::CameraClosed | OutgoingAcceptCase::CameraReplaced
-                )
-        ),
-        "{case:?}: changed standalone Enabled count"
+        announcements, 0,
+        "{case:?}: a video-from-start outgoing accept sends no standalone Enabled announce"
+    );
+    let upgrade_requests = fixture
+        .outgoing_stanzas()
+        .unwrap()
+        .iter()
+        .filter(|node| {
+            node.as_node_ref()
+                .get_optional_child("video")
+                .is_some_and(|video| {
+                    video.attrs().optional_string("state").as_deref() == Some("11")
+                })
+        })
+        .count();
+    // The re-request API only retries an outstanding local upgrade, and a
+    // video-from-start call has none open: no upgrade stanza goes out here
+    // until initiating on live video is designed upstream.
+    assert_eq!(
+        upgrade_requests, 0,
+        "{case:?}: a video-from-start outgoing accept sends no upgrade request"
     );
     if let Some(camera) = calls.ended(&id) {
         camera.stop().await;

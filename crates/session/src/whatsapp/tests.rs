@@ -1599,3 +1599,14 @@ async fn closing_takes_the_client_away_with_the_store() {
         "nothing is left for a racing send to use"
     );
 }
+
+/// A per-device `<reject>` must not end our side of the call: `busy` is in
+/// another call and `enc` could not decrypt the offer, and neither speaks
+/// for the callee. Only a decision — any other reason, or none — hangs up.
+#[test]
+fn only_a_decision_reject_ends_our_side_of_the_call() {
+    assert!(!super::WhatsAppClient::reject_ends_call(Some("busy")));
+    assert!(!super::WhatsAppClient::reject_ends_call(Some("enc")));
+    assert!(super::WhatsAppClient::reject_ends_call(None));
+    assert!(super::WhatsAppClient::reject_ends_call(Some("declined")));
+}
