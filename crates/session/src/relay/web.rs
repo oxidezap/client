@@ -467,6 +467,11 @@ struct InboundSeen {
     rtcp_types: PayloadTypes,
     /// Ours, recorded on the way out for the same reason.
     outbound_types: PayloadTypes,
+    /// Our RTCP, by leading-subpacket type: 200 is a Sender Report, 201 a
+    /// receiver report, 205/206 our own feedback. Same one-header limit as
+    /// the inbound side — what the engine encrypts past byte 8 is unreadable
+    /// here, and the report line is where a missing SR would finally show.
+    outbound_rtcp: PayloadTypes,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -623,11 +628,12 @@ impl BrowserRelayChannel {
             "voip: relay transport={} {} datachannel_admission_only=true peer_receipt=unknown \
              marker_scope=admitted_packets_not_complete_aus \
              state_order=connecting,open,closing,closed,unknown counters={:?} \
-             admitted_rtp_pts=[{}] inbound_rtp_pts=[{}] inbound_rtcp_pts=[{}] rtcp_count={} first_video={} inbound={} inbound_media={}",
+             admitted_rtp_pts=[{}] outbound_rtcp_pts=[{}] inbound_rtp_pts=[{}] inbound_rtcp_pts=[{}] rtcp_count={} first_video={} inbound={} inbound_media={}",
             self.ordinal,
             phase,
             self.traffic.borrow(),
             self.inbound.outbound_types.describe(),
+            self.inbound.outbound_rtcp.describe(),
             self.inbound.inbound_types.describe(),
             self.inbound.rtcp_types.describe(),
             self.inbound.rtcp_count.get(),
@@ -803,6 +809,11 @@ impl RelayTransport for BrowserRelayChannel {
             .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))?;
         if matches!(classify_relay_packet(&data), RelayPacketKind::Rtp) {
             self.inbound.outbound_types.note(&data);
+        }
+        if matches!(classify_relay_packet(&data), RelayPacketKind::Rtcp)
+            && let Some(pt) = first_rtcp_type(&data)
+        {
+            self.inbound.outbound_rtcp.note_pt(pt);
         }
         self.note_send(
             &data,
@@ -1261,6 +1272,44 @@ mod tests {
         inbound.deliver(Bytes::copy_from_slice(&[0x00, 201, 0, 0]));
         assert_eq!(inbound.seen.rtcp_count.get(), 6);
         assert_eq!(inbound.seen.rtcp_types.describe(), "201, 206, 205");
+    }
+
+    #[wasm_bindgen_test]
+    async fn outbound_rtcp_is_typed_by_leading_subpacket() {
+        let connection = web_sys::RtcPeerConnection::new().unwrap();
+        let channel = connection.create_data_channel("test");
+        let relay = BrowserRelayChannel {
+            connection,
+            channel,
+            _wiring: Wiring {
+                _on_message: Closure::wrap(Box::new(|_: web_sys::MessageEvent| {})),
+                _on_close: Closure::wrap(Box::new(|_: web_sys::Event| {})),
+                _on_error: Closure::wrap(Box::new(|_: web_sys::Event| {})),
+                _on_state: Closure::wrap(Box::new(|_: web_sys::Event| {})),
+            },
+            closed: std::cell::Cell::new(false),
+            congested: std::cell::Cell::new(false),
+            outbound_dropped: std::cell::Cell::new(0),
+            ordinal: next_transport_ordinal(),
+            traffic: RefCell::new(Traffic::default()),
+            last_report: std::cell::Cell::new(wacore::time::Instant::now()),
+            au: std::cell::Cell::new(Outbound::Between),
+            sent_any: std::cell::Cell::new(false),
+            inbound: Rc::new(InboundSeen::default()),
+        };
+        patch_channel(&relay.channel, "open", 0, false);
+        // A video Sender Report and a receiver report: the report line must
+        // say SRs leave the page, which is the runtime half of the RTCP
+        // audit — the engine emits them, but nothing here ever showed it.
+        assert!(relay.send(rtcp(200)).await.is_ok());
+        assert!(relay.send(rtcp(201)).await.is_ok());
+        assert_eq!(relay.inbound.outbound_rtcp.describe(), "200, 201");
+        assert!(
+            relay
+                .report_line("activity")
+                .contains("outbound_rtcp_pts=[200, 201]")
+        );
+        relay.disconnect().await;
     }
 
     #[wasm_bindgen_test]
