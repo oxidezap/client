@@ -1839,6 +1839,11 @@ impl WhatsAppClient {
             calls.end_camera_upgrade(&call_id, camera_id);
             return;
         };
+        // Named before anything is told or closed: the peer stanza goes out
+        // first so the library's timeout finds nothing pending, and the
+        // endpoint release in between the stanza and the device close must
+        // read as asked-for rather than as a device that died.
+        local.mark_stopping();
         // The bomb is disarmed by telling the peer ourselves, and that state
         // change lands before the device close below: what the library's
         // timeout checks is its own pending request, which stopping clears.

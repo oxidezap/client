@@ -303,6 +303,15 @@ impl LocalVideo {
         self.alive.load(Ordering::Relaxed) && !self.frames.is_closed() && !self.endpoint_closed()
     }
 
+    /// Name an ending asked-for before carrying it out, so a pump that
+    /// observes the teardown first reads it the way [`Self::stop`] would
+    /// have told it: withdrawing an upgrade stops the peer stanza before
+    /// closing the device, and the endpoint release in between must not
+    /// report the camera that release was for as lost.
+    pub(crate) fn mark_stopping(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
+    }
+
     pub(crate) fn endpoint_closed(&self) -> bool {
         self.plane.is_closed()
     }
