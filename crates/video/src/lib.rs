@@ -217,7 +217,7 @@ impl VideoQuality {
     /// default path and an isolation geometry.
     #[must_use]
     pub fn from_environment() -> Self {
-        let size = page_video_size().or_else(|| env_pair("OXIDEZAP_VIDEO_SIZE"));
+        let size = imp::page_video_size().or_else(|| env_pair("OXIDEZAP_VIDEO_SIZE"));
         let wanted = Self {
             width: size.map_or(DEFAULT_WIDTH, |(w, _)| w),
             height: size.map_or(DEFAULT_HEIGHT, |(_, h)| h),
@@ -253,15 +253,19 @@ fn query_pair(search: &str) -> Option<(u32, u32)> {
 }
 
 /// The page's own override, or nothing: native builds have no URL, and a
-/// page whose location cannot be read keeps the default.
-fn page_video_size() -> Option<(u32, u32)> {
-    #[cfg(target_family = "wasm")]
-    {
+/// page whose location cannot be read keeps the default. One function the
+/// caller names, two halves behind it, no `cfg` at the call.
+#[cfg(target_family = "wasm")]
+mod imp {
+    pub(super) fn page_video_size() -> Option<(u32, u32)> {
         let search = web_sys::window()?.location().search().ok()?;
-        query_pair(&search)
+        super::query_pair(&search)
     }
-    #[cfg(not(target_family = "wasm"))]
-    {
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod imp {
+    pub(super) fn page_video_size() -> Option<(u32, u32)> {
         None
     }
 }
