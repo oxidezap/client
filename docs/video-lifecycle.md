@@ -103,8 +103,10 @@ shared-memory WebCodecs tests exercise the real browser codecs.
 
 Stanza injection bypasses inbound Noise framing. No media relay or Android
 decoder runs in this fixture. Upstream still permits an unrung first winner
-and lets a later non-busy sibling reject end the call. Matching application
-metadata does not repair those policies. The standalone post-accept video
+and lets a later sibling reject end the call unless it is per-device
+(`busy`, or `enc` for a device that could not decrypt the offer) — and our
+own event arm matches that rule rather than hanging up on one stale
+device. Matching application metadata does not repair those policies. The standalone post-accept video
 announcement is removed and replaced by one caller-side upgrade re-request
 (`state="11"`, stanza-only): production retests kept failing with the
 announce in place (acked by Android, seventeen PLIs on our SSRC, no
