@@ -857,17 +857,21 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   decided against the same line. Audio is exempt now up to a hard ceiling
   eight times higher, past which the channel is not congested but wedged.
 
-- **A video-from-start call sends no standalone direction announce; the
-  offer carries the capability and the media does the rest.** The announce
+- **A video-from-start call sends no standalone direction announce; it
+  re-requests the upgrade as caller instead.** The announce
   (`<video state="1">` after accept) was added on the theory that the
   receiving side brings its video stream up off an announcement rather than
   the offer — and production retests kept failing with it in place: Android
   acked it, PLI'd our exact SSRC seventeen times across twelve keyframes,
-  and never rendered. Captured video-from-start calls carry no such stanza,
-  and the working direction (Android-originated) carries none from us either,
-  so the from-start path no longer sends one. A mid-call camera still
-  announces, through `start_video`, which sends a proper upgrade request
-  (`state="11"`) rather than a bare `state="1"`.
+  and never rendered. What Android-as-callee never does, Android-as-caller
+  does unprompted: drive a transaction-bound video dialog (`state="1"` with
+  `dec`, repeated) and render. So on accept with a live camera the caller
+  now sends one upgrade request (`state="11"`, stanza-only through the new
+  re-request API — endpoints and media stay untouched, and a call without
+  live video refuses it). Whether Android completes decoder setup off it is
+  unproven until a live preview: the direction matrix, the PLI signature,
+  and the `dec`-less lone `state="1"` are the reads to repeat there. A
+  mid-call camera still announces, through `start_video`.
 - **Neither encoder may go without a periodic IDR, and it is not a quality
   setting.** The media plane drops every access unit that is not an IDR while
   one of its keyframe gates is closed — the engine's `keyframe_required` and

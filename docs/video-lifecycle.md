@@ -105,10 +105,15 @@ Stanza injection bypasses inbound Noise framing. No media relay or Android
 decoder runs in this fixture. Upstream still permits an unrung first winner
 and lets a later non-busy sibling reject end the call. Matching application
 metadata does not repair those policies. The standalone post-accept video
-announcement is removed: production retests kept failing with it in place
-(acked by Android, seventeen PLIs on our SSRC, no render), captured
-video-from-start calls carry none, and the fixture asserts zero go out.
-Android reception of this client's outbound video still needs a live retest.
+announcement is removed and replaced by one caller-side upgrade re-request
+(`state="11"`, stanza-only): production retests kept failing with the
+announce in place (acked by Android, seventeen PLIs on our SSRC, no
+render), while Android-as-caller drives a transaction-bound dialog itself.
+The fixture asserts zero bare announces and exactly one upgrade request on
+live-camera accepts. Whether Android completes decoder setup off the
+request is unproven: Android reception of this client's outbound video
+still needs a live retest, reading the direction matrix, the PLI signature,
+and Android's `state="1"` (transaction-ids, `dec`, repeats) there.
 
 Browser relay summaries now count successful `RTCDataChannel.send` calls
 separately from congestion drops, non-open channels and send exceptions.
