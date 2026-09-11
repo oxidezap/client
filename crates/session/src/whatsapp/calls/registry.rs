@@ -255,6 +255,13 @@ struct Calls {
     /// the whole of "our video is off": there is no second flag to disagree
     /// with, and removing the entry is what closes the device.
     cameras: HashMap<String, LocalVideo>,
+    /// Owners whose local half has been retired while the call stays up.
+    ///
+    /// Stopping our camera must not end the peer's pump: it outlives the
+    /// `cameras` entry under this map until the call ends, a new local
+    /// camera replaces it, or the endpoint itself closes. The pump reads the
+    /// call id per frame, so no rename is needed when it changes hands.
+    remotes: HashMap<String, LocalVideo>,
     /// A peer's outstanding request to turn a call into a video one.
     ///
     /// Kept here rather than handed to the front end because the token is
@@ -1156,8 +1163,16 @@ impl CallRegistry {
             .remove(call_id);
         // The camera outlives nothing: a call that ended with video on would
         // otherwise keep the device open, with its light on, for as long as
-        // the process lived.
-        calls.cameras.remove(call_id)
+        // the process lived. The retained remote half goes with it: its pump
+        // reads the same call id, so leaving it publishing would draw one
+        // call's peer into whatever call comes next.
+        let camera = calls.cameras.remove(call_id);
+        if let Some(remote) = calls.remotes.remove(call_id) {
+            crate::exec::spawn(async move {
+                remote.stop().await;
+            });
+        }
+        camera
     }
 
     /// The lane serializing one call's camera transitions, made if nothing
@@ -1926,7 +1941,22 @@ impl WhatsAppClient {
     ) {
         let endpoint_closed = local.endpoint_closed();
         calls.end_camera_upgrade(call_id, local.camera_id());
-        local.stop().await;
+        // Local-direction stops retire only the capture half: the peer's
+        // pump and sink stay attached, and the library keeps decoding
+        // inbound. A closed endpoint means the library already released the
+        // pair, so the full stop retires both halves together.
+        if endpoint_closed {
+            local.stop().await;
+        } else {
+            let remote = local.stop_local().await;
+            let mut held = calls.calls.lock().expect("call registry poisoned");
+            // Absent on purpose: the whole of "our video is off" is the
+            // entry being gone, and an entry that stays would keep the next
+            // toggle reading the camera as on and wedging the re-enable.
+            // The remote pump lives on the retained owner below instead.
+            debug_assert!(!held.cameras.contains_key(call_id));
+            held.remotes.insert(call_id.to_string(), remote);
+        }
         // Asked for out of the registry rather than held across the wait:
         // telling the peer is a stanza on the wire, and holding the lock
         // across it stalls every other call's bookkeeping behind one peer.
@@ -4371,6 +4401,49 @@ mod tests {
             library.apply_peer_video_state("current", generation, VideoState::Enabled),
             PeerVideoTransition::Applied { .. }
         ));
+    }
+
+    /// Turning this side's camera off retires only the local half. The
+    /// peer's pump stays registered under the retained owner, so its sink
+    /// stays open and its frames keep flowing while our direction is off —
+    /// the shape the retested call needed and the old shared stop broke.
+    #[tokio::test]
+    async fn local_stop_leaves_the_remote_pump_attached() {
+        let calls = CallRegistry::default();
+        let (ui, _rx) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let (local, endpoints, _capture) = video::camera_fixture("current", Arc::new(|_, _| {}));
+        let camera_id = local.camera_id();
+        calls
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .cameras
+            .insert("current".into(), local);
+        WhatsAppClient::stop_local_video(&calls, &ui, "current", Some(camera_id)).await;
+        assert!(
+            !calls.camera_on("current"),
+            "our direction reads as off once its camera is gone"
+        );
+        let retained = calls
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .remotes
+            .remove("current")
+            .expect("the remote half is retained, not dropped");
+        assert_eq!(retained.camera_id(), camera_id);
+        assert!(
+            !endpoints.sink.is_closed(),
+            "the peer's sink stays attached across local stop"
+        );
+        retained.stop().await;
+        assert!(
+            endpoints.sink.is_closed(),
+            "full teardown still retires the remote half too"
+        );
     }
 
     /// The watchdog stands down once the peer answers: the parked attempt is

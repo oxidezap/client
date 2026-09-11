@@ -238,7 +238,10 @@ pub(crate) struct LocalVideo {
     /// window has only just opened.
     live: Arc<AtomicBool>,
     /// The fan-out task, stopped by closing the camera's channel.
-    pump: Task<()>,
+    ///
+    /// Taken when joined: the same owner is stopped in two stages
+    /// (`stop_local`, then `stop`), and a task joined twice panics.
+    pump: Option<Task<()>>,
     /// The camera's own frame channel, so [`Self::stop`] can end the pump on
     /// a page, where a spawned task cannot be aborted.
     frames: async_channel::Receiver<EncodedFrame>,
@@ -247,7 +250,7 @@ pub(crate) struct LocalVideo {
     /// The peer's half of the same `Endpoints` pair, held for the same
     /// reason: nothing else here can end it, and one that outlived the pair
     /// publishes into whatever call the id slot names next.
-    remote_pump: Task<()>,
+    remote_pump: Option<Task<()>>,
     /// The peer half's channel, closed for the same reason as `frames`.
     sink: async_channel::Receiver<VideoFrame>,
     /// Whether this camera is still producing, cleared by the pump on every
@@ -328,6 +331,26 @@ impl LocalVideo {
         }
     }
 
+    /// Retire only this side's capture and its local pump, keeping the
+    /// peer's pump and sink attached.
+    ///
+    /// The library now gates outbound off while inbound keeps decoding when
+    /// our camera stops, so ending the shared remote half here would do what
+    /// the network no longer does: freeze the picture we are still being
+    /// sent. Full call teardown still goes through [`Self::stop`], which
+    /// retires both halves together.
+    pub(crate) async fn stop_local(mut self) -> LocalVideo {
+        self.stopping.store(true, Ordering::Relaxed);
+        self.frames.close();
+        if let Some(camera) = self.camera.take() {
+            camera.stop().await;
+        }
+        if let Some(pump) = self.pump.take() {
+            let _ = pump.await;
+        }
+        self
+    }
+
     /// Close the device and wait for the thread to let go of it.
     ///
     /// Waited for because the next call opens the same camera, and a backend
@@ -360,9 +383,14 @@ impl LocalVideo {
         }
         // And the pumps, so a camera reported as stopped is one that has
         // stopped: a pump still draining its queue can publish a frame after
-        // the call that owned it is gone.
-        let _ = (&mut self.pump).await;
-        let _ = (&mut self.remote_pump).await;
+        // the call that owned it is gone. Taken, because `stop_local` may
+        // already have joined the local half.
+        if let Some(pump) = self.pump.take() {
+            let _ = pump.await;
+        }
+        if let Some(remote_pump) = self.remote_pump.take() {
+            let _ = remote_pump.await;
+        }
     }
 }
 
@@ -454,9 +482,9 @@ pub(crate) async fn open(
     Ok((
         LocalVideo {
             camera: Some(camera),
-            pump,
+            pump: Some(pump),
             frames,
-            remote_pump,
+            remote_pump: Some(remote_pump),
             sink: sink_rx,
             id: call_id,
             camera_id,
@@ -517,10 +545,10 @@ pub(crate) fn camera_fixture(
         LocalVideo {
             camera: None,
             live,
-            pump,
+            pump: Some(pump),
             frames,
             stopping,
-            remote_pump,
+            remote_pump: Some(remote_pump),
             sink,
             alive,
             id,
@@ -1163,10 +1191,10 @@ mod tests {
             let owner = LocalVideo {
                 camera: None,
                 live,
-                pump,
+                pump: Some(pump),
                 frames,
                 stopping,
-                remote_pump,
+                remote_pump: Some(remote_pump),
                 sink,
                 alive: alive.clone(),
                 id,
