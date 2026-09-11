@@ -1574,19 +1574,22 @@ impl WhatsAppClient {
             if !on {
                 // Taken out of the registry before it is waited on: closing a
                 // device means waiting for its capture thread, and every
-                // other call's bookkeeping would queue behind it.
+                // other call's bookkeeping would queue behind it. Retired
+                // through the shared owner path rather than a bare stop: only
+                // the local half ends here, and the peer's pump stays
+                // attached. The device is still released before the stanza,
+                // matching `stop_video` itself: the user asked for the camera
+                // to go off, and a failed stanza must not leave it running.
                 if let Some(local) = calls.take_camera(&call_id) {
-                    // The device is released first, matching `stop_video`
-                    // itself: the user asked for the camera to go off, and a
-                    // failed stanza must not leave it running.
-                    local.stop().await;
+                    Self::stop_owned_video(&calls, &ui_sender, &call_id, local).await;
+                } else {
+                    Self::stop_peer_video(&handle, &call_id).await;
+                    // `stop_video` clears the library's pending request, so a
+                    // refusal after it is one the library ignores — and so is
+                    // this.
+                    calls.end_upgrade(&call_id);
+                    Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                 }
-                Self::stop_peer_video(&handle, &call_id).await;
-                // `stop_video` clears the library's pending request, so a
-                // refusal after it is one the library ignores — and so is
-                // this.
-                calls.end_upgrade(&call_id);
-                Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                 return;
             }
 
@@ -1864,6 +1867,12 @@ impl WhatsAppClient {
         let Some(local) = calls.take_upgrade_attempt(&call_id, camera_id) else {
             return;
         };
+        // Read before telling the peer: our own release below drops the
+        // plane receiver, so checking after would always take the full stop
+        // and the split would be dead code. Closed here means the library
+        // already released the pair, and only then is the remote half
+        // truly gone.
+        let endpoint_closed = local.endpoint_closed();
         let Some(handle) = calls.live(&call_id) else {
             // Nobody left to tell, and the ending owns the rest: the call's
             // own watcher clears the maps and closes the device on its way
@@ -1881,7 +1890,17 @@ impl WhatsAppClient {
         // change lands before the device close below: what the library's
         // timeout checks is its own pending request, which stopping clears.
         Self::stop_peer_video(&handle, &call_id).await;
-        local.stop().await;
+        // Split stop, mirroring `stop_owned_video`: only the local half ends
+        // here. A closed endpoint means the library already released the
+        // pair, so the full stop retires both halves together.
+        if endpoint_closed {
+            local.stop().await;
+        } else {
+            let remote = local.stop_local().await;
+            let mut held = calls.calls.lock().expect("call registry poisoned");
+            debug_assert!(!held.cameras.contains_key(&call_id));
+            held.remotes.insert(call_id.clone(), remote);
+        }
         calls.end_camera_upgrade(&call_id, camera_id);
         Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
     }

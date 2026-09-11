@@ -246,7 +246,15 @@ pub(crate) struct LocalVideo {
     /// a page, where a spawned task cannot be aborted.
     frames: async_channel::Receiver<EncodedFrame>,
     /// Told to the pump before its channel closes; see [`LocalPump::stopping`].
+    ///
+    /// Local only. The peer's pump answers to [`Self::remote_stopping`]:
+    /// sharing one flag would end the picture we are still being sent one
+    /// frame after our own camera stops.
     stopping: Arc<AtomicBool>,
+    /// Told to the peer's pump only by a full teardown ([`Self::stop`]).
+    /// Never set by [`Self::stop_local`], which is what keeps remote video
+    /// playing while our direction is off.
+    remote_stopping: Arc<AtomicBool>,
     /// The peer's half of the same `Endpoints` pair, held for the same
     /// reason: nothing else here can end it, and one that outlived the pair
     /// publishes into whatever call the id slot names next.
@@ -359,8 +367,9 @@ impl LocalVideo {
         // Said before the channel closes, and that order is the whole point:
         // the pump reads this on its way out to tell a device that died from
         // one that was asked to stop, and the two reach it as the same closed
-        // channel.
+        // channel. Both flags: this is the full teardown, local and remote.
         self.stopping.store(true, Ordering::Relaxed);
+        self.remote_stopping.store(true, Ordering::Relaxed);
         // Closed rather than aborted. An abort is a request the task may
         // never be polled to hear, and on a page there is no abort at all --
         // a `spawn_local` task is cancelled by nothing. Closing the channel a
@@ -397,6 +406,7 @@ impl LocalVideo {
 impl Drop for LocalVideo {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Relaxed);
+        self.remote_stopping.store(true, Ordering::Relaxed);
         self.alive.store(false, Ordering::Relaxed);
         self.frames.close();
         self.sink.close();
@@ -458,6 +468,7 @@ pub(crate) async fn open(
 
     let frames = camera.frames();
     let stopping = Arc::new(AtomicBool::new(false));
+    let remote_stopping = Arc::new(AtomicBool::new(false));
     let control = camera.control();
     let pump = crate::exec::spawn(pump_local(LocalPump {
         call_id: Arc::clone(&call_id),
@@ -476,7 +487,7 @@ pub(crate) async fn open(
         sink_rx.clone(),
         publisher,
         picture_lost,
-        Arc::clone(&stopping),
+        Arc::clone(&remote_stopping),
     ));
 
     Ok((
@@ -491,6 +502,7 @@ pub(crate) async fn open(
             live,
             alive,
             stopping,
+            remote_stopping,
             plane: source_tx,
         },
         Endpoints {
@@ -518,6 +530,7 @@ pub(crate) fn camera_fixture(
     let alive = Arc::new(AtomicBool::new(true));
     let live = Arc::new(AtomicBool::new(false));
     let stopping = Arc::new(AtomicBool::new(false));
+    let remote_stopping = Arc::new(AtomicBool::new(false));
     let publisher = VideoPublisher {
         sender: Arc::new(std::sync::Mutex::new(None)),
         watched: Arc::new(AtomicBool::new(false)),
@@ -539,7 +552,7 @@ pub(crate) fn camera_fixture(
         sink.clone(),
         publisher,
         Arc::new(|_| {}),
-        stopping.clone(),
+        remote_stopping.clone(),
     ));
     (
         LocalVideo {
@@ -548,6 +561,7 @@ pub(crate) fn camera_fixture(
             pump: Some(pump),
             frames,
             stopping,
+            remote_stopping,
             remote_pump: Some(remote_pump),
             sink,
             alive,
@@ -941,6 +955,61 @@ mod tests {
         );
     }
 
+    /// The peer's pump answers to its own flag, not the local one: stopping
+    /// our camera must not end the picture we are still being sent. A shared
+    /// flag ended remote video one frame after every local stop, freezing the
+    /// peer's pane until our camera came back on.
+    #[cfg_attr(not(target_family = "wasm"), tokio::test)]
+    #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn remote_pump_survives_a_local_stop() {
+        let (sender, mut published) = tokio::sync::mpsc::channel(4);
+        let publisher = VideoPublisher {
+            sender: Arc::new(std::sync::Mutex::new(Some(sender))),
+            watched: Arc::new(AtomicBool::new(true)),
+        };
+        let (sink_tx, sink) = async_channel::bounded::<VideoFrame>(PLANE_DEPTH);
+        let local_stopping = Arc::new(AtomicBool::new(false));
+        let remote_stopping = Arc::new(AtomicBool::new(false));
+        let pump = crate::exec::spawn(pump_remote(
+            slot("call-1"),
+            sink.clone(),
+            publisher,
+            Arc::new(|_| panic!("no loss on a healthy stream")),
+            Arc::clone(&remote_stopping),
+        ));
+        async fn next_published(
+            published: &mut tokio::sync::mpsc::Receiver<CallVideoFrame>,
+        ) -> CallVideoFrame {
+            crate::exec::with_timeout(published.recv(), std::time::Duration::from_secs(2))
+                .await
+                .expect("the remote pump keeps producing")
+                .expect("publisher still subscribed")
+        }
+        sink_tx
+            .send(VideoFrame::new(vec![0, 0, 0, 1, 0x65]))
+            .await
+            .expect("sink accepts");
+        assert_eq!(
+            next_published(&mut published).await.stream,
+            VideoStream::Remote
+        );
+        // What `stop_local` does to the shared state: the local flag goes up
+        // while the remote flag stays clear and the sink stays open.
+        local_stopping.store(true, Ordering::Relaxed);
+        sink_tx
+            .send(VideoFrame::new(vec![0, 0, 0, 1, 0x65]))
+            .await
+            .expect("sink accepts");
+        let second = next_published(&mut published).await;
+        assert_eq!(second.stream, VideoStream::Remote);
+        assert_eq!(second.call_id, "call-1");
+        // Full teardown still retires the remote half too.
+        remote_stopping.store(true, Ordering::Relaxed);
+        sink.close();
+        let _ = pump.await;
+        assert!(sink_tx.is_closed());
+    }
+
     /// A window that could not keep up is the one loss nothing below this can
     /// see: the library handed the access unit over intact, so the peer is
     /// never told, and its decoder waits on a reference we threw away.
@@ -1193,7 +1262,8 @@ mod tests {
                 live,
                 pump: Some(pump),
                 frames,
-                stopping,
+                stopping: Arc::clone(&stopping),
+                remote_stopping: Arc::clone(&stopping),
                 remote_pump: Some(remote_pump),
                 sink,
                 alive: alive.clone(),

@@ -978,6 +978,7 @@ mod tests {
         for cycle in 1..=2 {
             let (local, endpoints, _capture) = video::camera_fixture(&id, lost_callback.clone());
             let camera_id = local.camera_id();
+            let sink_probe = endpoints.sink.clone();
             calls.begin_upgrade(&id, camera_id);
             handle
                 .start_video(endpoints.source, endpoints.sink)
@@ -1020,6 +1021,14 @@ mod tests {
             assert!(
                 !calls.calls.lock().unwrap().cameras.contains_key(&id),
                 "the attempt's camera is released"
+            );
+            assert!(
+                calls.calls.lock().unwrap().remotes.contains_key(&id),
+                "the withdrawn attempt's remote half is retained, not dropped"
+            );
+            assert!(
+                !sink_probe.is_closed(),
+                "the peer's sink stays attached across the withdrawal"
             );
             assert!(
                 lost.lock().unwrap().is_empty(),
