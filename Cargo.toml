@@ -101,9 +101,9 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "61b43bb41a179e733e79633742a89dbecc9e75ca" }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "61b43bb41a179e733e79633742a89dbecc9e75ca" }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "61b43bb41a179e733e79633742a89dbecc9e75ca" }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "ff6a6fea293ed8f6a3e3905bf1d92e910c5a32bc" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "ff6a6fea293ed8f6a3e3905bf1d92e910c5a32bc" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "ff6a6fea293ed8f6a3e3905bf1d92e910c5a32bc" }
 
 # The library and its satellites. One git source, one revision: cargo resolves
 # every entry below to the SAME commit, so `cargo update` moves them together
@@ -130,8 +130,8 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "61b43bb41a
 # are the only place either is said — and a new upstream default has to be
 # adopted here by hand, which is the price of that split staying honest.
 #
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "61b43bb41a179e733e79633742a89dbecc9e75ca", default-features = false }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "61b43bb41a179e733e79633742a89dbecc9e75ca", default-features = false }
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "ff6a6fea293ed8f6a3e3905bf1d92e910c5a32bc", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "ff6a6fea293ed8f6a3e3905bf1d92e910c5a32bc", default-features = false }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and
