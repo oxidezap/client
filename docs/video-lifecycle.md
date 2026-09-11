@@ -30,6 +30,18 @@ The local camera is not announced as sending while its upgrade is unanswered.
 These changes use the existing library state machine, with contract tests against
 the actual reducer. They add no negotiation stanzas.
 
+Re-enabling our video into a call where the peer's direction is still active
+cannot complete as an upgrade: the reducer ignores an upgrade request against
+an already-active direction, so no accept ever comes, the send-gated plane
+admits nothing (the relay counters freeze), and the library's five-second
+timeout cancels with `UpgradeCancelByTimeout` — which the peer applies by
+tearing its own direction down too, collapsing the whole call. The registry
+therefore watches each upgrade it initiates and withdraws it at four seconds
+when unanswered: a `Stopped` the peer applies without touching its direction,
+clearing the library's pending request so its timeout finds nothing to cancel
+and a later retry can begin. Fenced on the armed camera and settled through
+the newest intent, so an answer or a newer attempt disarms it.
+
 Browser tests reproduced two more resource leaks. A cancelled camera acquisition
 could abandon a stream returned later by `getUserMedia`; cancellation during
 preview playback could leave an attached element holding the stream. Both now
