@@ -32,11 +32,11 @@ pub enum InputAreaEvent {
     /// nor waits for.
     AttachFiles,
     /// An image pasted into this conversation.
-    PasteImage(Rc<RefCell<Option<crate::platform::picker::Picked>>>),
+    PasteImage(u64, Rc<RefCell<Option<crate::platform::picker::Picked>>>),
     /// An image paste was rejected before it could be sent.
-    PasteImageError(String),
+    PasteImageError(u64, String),
     /// An image paste started and its destination should be captured.
-    PasteImageStarted,
+    PasteImageStarted(u64),
     /// User started PTT recording
     StartRecording,
     /// User stopped PTT recording (send the audio)
@@ -136,6 +136,7 @@ pub struct InputAreaView {
     /// configured and closed, real work, on every render of the composer,
     /// for a value that cannot change while the tab is open.
     can_record: bool,
+    paste_id: u64,
 }
 
 impl EventEmitter<InputAreaEvent> for InputAreaView {}
@@ -173,6 +174,7 @@ impl InputAreaView {
             // to send what it encodes: a daemon over the bridge, the tab
             // holding the account, or the page's own session.
             can_record: oxidezap_audio::can_record(),
+            paste_id: 0,
         }
     }
 
@@ -196,22 +198,25 @@ impl InputAreaView {
         }
     }
 
-    fn paste_image(&self, cx: &mut Context<Self>) {
-        cx.emit(InputAreaEvent::PasteImageStarted);
+    fn paste_image(&mut self, cx: &mut Context<Self>) {
+        let paste_id = self.paste_id;
+        self.paste_id = self.paste_id.wrapping_add(1);
+        cx.emit(InputAreaEvent::PasteImageStarted(paste_id));
         let entity = cx.entity().downgrade();
         let task = crate::platform::clipboard::read(cx);
         cx.spawn(async move |_, cx| match task.await {
             Ok(Some(file)) => {
                 let _ = entity.update(cx, |_, cx| {
-                    cx.emit(InputAreaEvent::PasteImage(Rc::new(RefCell::new(Some(
-                        file,
-                    )))))
+                    cx.emit(InputAreaEvent::PasteImage(
+                        paste_id,
+                        Rc::new(RefCell::new(Some(file))),
+                    ))
                 });
             }
             Ok(None) => {}
             Err(error) => {
                 let _ = entity.update(cx, |_, cx| {
-                    cx.emit(InputAreaEvent::PasteImageError(error));
+                    cx.emit(InputAreaEvent::PasteImageError(paste_id, error));
                 });
             }
         })

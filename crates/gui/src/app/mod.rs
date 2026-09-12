@@ -608,7 +608,7 @@ pub struct WhatsAppApp {
     /// WhatsApp client wrapper
     client: Option<Session>,
     /// Destination captured while an asynchronous clipboard read is pending.
-    pending_paste: Option<(String, Option<ReplyDraft>)>,
+    pending_pastes: HashMap<u64, (String, Option<ReplyDraft>)>,
     /// Scroll handle for chat list
     chat_list_scroll: VirtualListScrollHandle,
     /// The Status sidebar's scroll position, so that list can have a
@@ -1004,7 +1004,7 @@ impl WhatsAppApp {
             chats: Vec::new(),
             selected_chat: None,
             client: None,
-            pending_paste: None,
+            pending_pastes: HashMap::new(),
             chat_list_scroll: VirtualListScrollHandle::new(),
             status_list_scroll: gpui::ScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
@@ -2373,11 +2373,11 @@ impl WhatsAppApp {
             InputAreaEvent::AttachFiles => {
                 self.attach_files(cx);
             }
-            InputAreaEvent::PasteImage(file) => {
+            InputAreaEvent::PasteImage(paste_id, file) => {
                 let Some(file) = file.borrow_mut().take() else {
                     return;
                 };
-                let Some((jid, reply)) = self.pending_paste.take() else {
+                let Some((jid, reply)) = self.pending_pastes.remove(paste_id) else {
                     return;
                 };
                 let quoted = self.take_reply_draft(reply, cx);
@@ -2387,15 +2387,15 @@ impl WhatsAppApp {
                     self.scroll_to_last_message();
                 }
             }
-            InputAreaEvent::PasteImageError(error) => {
-                self.pending_paste = None;
+            InputAreaEvent::PasteImageError(paste_id, error) => {
+                self.pending_pastes.remove(paste_id);
                 self.notify_user(error, notices::Tone::Problem, cx);
             }
-            InputAreaEvent::PasteImageStarted => {
-                self.pending_paste = self
-                    .selected_chat
-                    .clone()
-                    .map(|jid| (jid, self.reply_to.clone()));
+            InputAreaEvent::PasteImageStarted(paste_id) => {
+                if let Some(jid) = self.selected_chat.clone() {
+                    self.pending_pastes
+                        .insert(*paste_id, (jid, self.reply_to.clone()));
+                }
             }
             InputAreaEvent::StartRecording => {
                 self.start_recording(cx);
