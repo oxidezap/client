@@ -16,6 +16,61 @@ use oxidezap_core::OutgoingMedia;
 use super::*;
 
 impl WhatsAppApp {
+    pub(crate) fn ensure_file_drop(&mut self, cx: &mut Context<Self>) {
+        if self.file_drop_listener.is_none() {
+            match crate::platform::drop::install(cx.entity().downgrade()) {
+                Ok(listener) => self.file_drop_listener = Some(listener),
+                Err(error) => warn!("file drops are unavailable: {error}"),
+            }
+        }
+    }
+
+    pub(crate) fn drop_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        let Some(jid) = self.selected_chat.clone() else {
+            return;
+        };
+        if !self.is_connected() {
+            self.notify_user(
+                "Files cannot be sent right now: not connected.",
+                notices::Tone::Problem,
+                cx,
+            );
+            return;
+        }
+        let reply = self.reply_to.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::platform::drop::read_paths(paths) });
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let chosen = task.await;
+            let _ = entity.update(cx, |app, cx| app.finish_attaching(&jid, reply, chosen, cx));
+        })
+        .detach();
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(super) fn drop_file_list(&mut self, files: web_sys::FileList, cx: &mut Context<Self>) {
+        let Some(jid) = self.selected_chat.clone() else {
+            return;
+        };
+        if !self.is_connected() {
+            self.notify_user(
+                "Files cannot be sent right now: not connected.",
+                notices::Tone::Problem,
+                cx,
+            );
+            return;
+        }
+        let reply = self.reply_to.clone();
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let chosen = crate::platform::drop::read_files(files).await;
+            let _ = entity.update(cx, |app, cx| {
+                app.finish_attaching(&jid, reply, Ok(chosen), cx)
+            });
+        })
+        .detach();
+    }
+
     /// Ask for files and send them into the open conversation.
     ///
     /// The choosing is asynchronous on both platforms — a modal on one, a

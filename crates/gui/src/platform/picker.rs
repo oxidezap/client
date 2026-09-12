@@ -222,7 +222,7 @@ const SELECTION_BUDGET_BYTES: u64 = oxidezap_ipc::MAX_STAGED_BYTES;
 /// charging it at the question would hold budget for bytes nobody is holding,
 /// so the files after it are refused to make room for one that is not there.
 #[derive(Default)]
-struct Budget {
+pub(crate) struct Budget {
     held: u64,
 }
 
@@ -231,7 +231,7 @@ impl Budget {
     ///
     /// Counts nothing: the caller reads the file and says [`took`](Self::took)
     /// if the read worked.
-    fn refuse(&self, file_name: &str, size: u64) -> Option<String> {
+    pub(crate) fn refuse(&self, file_name: &str, size: u64) -> Option<String> {
         if let Some(refusal) = unsendable(file_name, size) {
             return Some(refusal);
         }
@@ -249,7 +249,7 @@ impl Budget {
     }
 
     /// Count a file that is now in hand.
-    fn took(&mut self, size: u64) {
+    pub(crate) fn took(&mut self, size: u64) {
         self.held = self.held.saturating_add(size);
     }
 }
@@ -328,6 +328,10 @@ mod imp {
         chosen
     }
 
+    pub(crate) fn read_paths(paths: &[PathBuf]) -> Chosen {
+        read_all(paths)
+    }
+
     /// One file, or the sentence to show instead.
     fn read_one(path: &Path, budget: &mut super::Budget) -> Result<Picked, String> {
         // The last component, and never the path: this becomes the name on
@@ -359,6 +363,16 @@ mod imp {
             bytes,
         })
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn read_paths(paths: &[std::path::PathBuf]) -> Chosen {
+    imp::read_paths(paths)
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn new_budget() -> Budget {
+    Budget::default()
 }
 
 #[cfg(target_family = "wasm")]

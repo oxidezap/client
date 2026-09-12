@@ -29,6 +29,7 @@
 mod capabilities;
 pub mod clock;
 pub mod download;
+pub mod drop;
 pub mod fonts;
 pub mod identity;
 pub mod launch;
