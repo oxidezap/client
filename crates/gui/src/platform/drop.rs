@@ -72,15 +72,6 @@ mod imp {
         let mut app = cx;
         let drop = Closure::new(move |event: web_sys::DragEvent| {
             event.prevent_default();
-            let Some(target) = event
-                .target()
-                .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
-            else {
-                return;
-            };
-            if target.closest("#chat-area").ok().flatten().is_none() {
-                return;
-            }
             let Some(files) = event.data_transfer().and_then(|data| data.files()) else {
                 return;
             };
@@ -88,11 +79,20 @@ mod imp {
                 .filter_map(|index| files.get(index))
                 .collect::<Vec<_>>();
             let entity = drop_entity.clone();
+            let Some((jid, reply)) = entity
+                .update(&mut app, |app, cx| app.prepare_file_drop(cx))
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
             let mut task_app = app.clone();
             app.foreground_executor()
                 .spawn(async move {
                     let chosen = read_files(files).await;
-                    let _ = entity.update(&mut task_app, |app, cx| app.drop_chosen(chosen, cx));
+                    let _ = entity.update(&mut task_app, |app, cx| {
+                        app.finish_attaching(&jid, reply, Ok(chosen), cx)
+                    });
                 })
                 .detach();
         });

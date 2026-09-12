@@ -26,18 +26,9 @@ impl WhatsAppApp {
     }
 
     pub(crate) fn drop_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
-        let Some(jid) = self.selected_chat.clone() else {
+        let Some((jid, reply)) = self.prepare_file_drop(cx) else {
             return;
         };
-        if !self.is_connected() {
-            self.notify_user(
-                "Files cannot be sent right now: not connected.",
-                notices::Tone::Problem,
-                cx,
-            );
-            return;
-        }
-        let reply = self.reply_to.clone();
         let task = cx
             .background_executor()
             .spawn(async move { crate::platform::drop::read_paths(paths) });
@@ -48,14 +39,15 @@ impl WhatsAppApp {
         .detach();
     }
 
-    #[cfg(target_family = "wasm")]
-    pub(crate) fn drop_chosen(
+    pub(crate) fn prepare_file_drop(
         &mut self,
-        chosen: crate::platform::picker::Chosen,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<(String, Option<ReplyDraft>)> {
+        if self.destination != Destination::Chats {
+            return None;
+        }
         let Some(jid) = self.selected_chat.clone() else {
-            return;
+            return None;
         };
         if !self.is_connected() {
             self.notify_user(
@@ -63,10 +55,9 @@ impl WhatsAppApp {
                 notices::Tone::Problem,
                 cx,
             );
-            return;
+            return None;
         }
-        let reply = self.reply_to.clone();
-        self.finish_attaching(&jid, reply, Ok(chosen), cx);
+        Some((jid, self.reply_to.clone()))
     }
 
     /// Ask for files and send them into the open conversation.
@@ -103,7 +94,7 @@ impl WhatsAppApp {
     }
 
     /// Send what was chosen, and say what could not be.
-    fn finish_attaching(
+    pub(crate) fn finish_attaching(
         &mut self,
         jid: &str,
         reply: Option<ReplyDraft>,
