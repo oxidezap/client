@@ -72,10 +72,29 @@ mod imp {
         let mut app = cx;
         let drop = Closure::new(move |event: web_sys::DragEvent| {
             event.prevent_default();
+            let Some(target) = event
+                .target()
+                .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+            else {
+                return;
+            };
+            if target.closest("#chat-area").ok().flatten().is_none() {
+                return;
+            }
             let Some(files) = event.data_transfer().and_then(|data| data.files()) else {
                 return;
             };
-            let _ = drop_entity.update(&mut app, |app, cx| app.drop_file_list(files, cx));
+            let files = (0..files.length())
+                .filter_map(|index| files.get(index))
+                .collect::<Vec<_>>();
+            let entity = drop_entity.clone();
+            let mut task_app = app.clone();
+            app.foreground_executor()
+                .spawn(async move {
+                    let chosen = read_files(files).await;
+                    let _ = entity.update(&mut task_app, |app, cx| app.drop_chosen(chosen, cx));
+                })
+                .detach();
         });
         let target: &web_sys::EventTarget = document.as_ref();
         target
@@ -95,13 +114,10 @@ mod imp {
         Err("native file paths are unavailable in the browser".to_string())
     }
 
-    pub async fn read_files(files: web_sys::FileList) -> Chosen {
+    pub async fn read_files(files: Vec<web_sys::File>) -> Chosen {
         let mut chosen = Chosen::default();
         let mut budget = crate::platform::picker::new_budget();
-        for index in 0..files.length() {
-            let Some(file) = files.get(index) else {
-                continue;
-            };
+        for file in files {
             let file_name = file.name();
             #[expect(
                 clippy::cast_possible_truncation,

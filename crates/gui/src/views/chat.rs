@@ -410,6 +410,7 @@ fn render_chat_area(
     base.flex()
         .flex_col()
         .h_full()
+        .id("chat-area")
         .bg(cx.theme().background)
         .map(|el| match selected_chat {
             // Centred by the same container the startup screens use, which

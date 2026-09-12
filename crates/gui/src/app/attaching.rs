@@ -49,7 +49,11 @@ impl WhatsAppApp {
     }
 
     #[cfg(target_family = "wasm")]
-    pub(crate) fn drop_file_list(&mut self, files: web_sys::FileList, cx: &mut Context<Self>) {
+    pub(crate) fn drop_chosen(
+        &mut self,
+        chosen: crate::platform::picker::Chosen,
+        cx: &mut Context<Self>,
+    ) {
         let Some(jid) = self.selected_chat.clone() else {
             return;
         };
@@ -62,13 +66,7 @@ impl WhatsAppApp {
             return;
         }
         let reply = self.reply_to.clone();
-        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let chosen = crate::platform::drop::read_files(files).await;
-            let _ = entity.update(cx, |app, cx| {
-                app.finish_attaching(&jid, reply, Ok(chosen), cx)
-            });
-        })
-        .detach();
+        self.finish_attaching(&jid, reply, Ok(chosen), cx);
     }
 
     /// Ask for files and send them into the open conversation.
