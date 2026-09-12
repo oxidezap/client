@@ -486,7 +486,12 @@ impl InputAreaView {
                     .min_w_0()
                     .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
                         let modifiers = &event.keystroke.modifiers;
-                        if event.keystroke.key.eq_ignore_ascii_case("v") && modifiers.secondary() {
+                        if event.keystroke.key.eq_ignore_ascii_case("v")
+                            && modifiers.secondary()
+                            && !modifiers.alt
+                            && !modifiers.shift
+                            && !modifiers.function
+                        {
                             view.paste_image(cx);
                         }
                     }))
