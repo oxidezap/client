@@ -18,7 +18,7 @@ use super::*;
 impl WhatsAppApp {
     pub(crate) fn ensure_file_drop(&mut self, cx: &mut Context<Self>) {
         if self.file_drop_listener.is_none() {
-            match crate::platform::drop::install(cx.entity().downgrade()) {
+            match crate::platform::drop::install(cx.entity().downgrade(), cx.to_async()) {
                 Ok(listener) => self.file_drop_listener = Some(listener),
                 Err(error) => warn!("file drops are unavailable: {error}"),
             }

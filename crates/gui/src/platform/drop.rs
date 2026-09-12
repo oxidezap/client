@@ -8,8 +8,8 @@ use gpui::WeakEntity;
 
 pub struct Listener(imp::Listener);
 
-pub fn install(entity: WeakEntity<WhatsAppApp>) -> Result<Listener, String> {
-    imp::install(entity).map(Listener)
+pub fn install(entity: WeakEntity<WhatsAppApp>, cx: gpui::AsyncApp) -> Result<Listener, String> {
+    imp::install(entity, cx).map(Listener)
 }
 
 pub fn read_paths(paths: Vec<PathBuf>) -> Result<Chosen, String> {
@@ -22,7 +22,10 @@ mod imp {
 
     pub struct Listener;
 
-    pub fn install(_entity: WeakEntity<WhatsAppApp>) -> Result<Listener, String> {
+    pub fn install(
+        _entity: WeakEntity<WhatsAppApp>,
+        _cx: gpui::AsyncApp,
+    ) -> Result<Listener, String> {
         Ok(Listener)
     }
 
@@ -57,18 +60,22 @@ mod imp {
         }
     }
 
-    pub fn install(entity: WeakEntity<WhatsAppApp>) -> Result<Listener, String> {
+    pub fn install(
+        entity: WeakEntity<WhatsAppApp>,
+        cx: gpui::AsyncApp,
+    ) -> Result<Listener, String> {
         let document = web_sys::window()
             .and_then(|window| window.document())
             .ok_or_else(|| "the browser document is unavailable".to_string())?;
         let dragover = Closure::new(|event: web_sys::DragEvent| event.prevent_default());
         let drop_entity = entity;
+        let mut app = cx;
         let drop = Closure::new(move |event: web_sys::DragEvent| {
             event.prevent_default();
             let Some(files) = event.data_transfer().and_then(|data| data.files()) else {
                 return;
             };
-            let _ = drop_entity.update(|app: &mut WhatsAppApp, cx| app.drop_file_list(files, cx));
+            let _ = drop_entity.update(&mut app, |app, cx| app.drop_file_list(files, cx));
         });
         let target: &web_sys::EventTarget = document.as_ref();
         target
