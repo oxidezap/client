@@ -1146,9 +1146,6 @@ fn keyboard_owner_for(
         // the list holding the arrow keys it is being walked with.
         None if surfaces.composer && composing => KeyboardOwner::Composer,
         None if surfaces.chat_list => KeyboardOwner::ChatList,
-        // A phone drawing a conversation is not drawing its list, so there is
-        // nowhere else for it to go — whatever the gesture was.
-        None if surfaces.composer => KeyboardOwner::Composer,
         None => KeyboardOwner::Root,
     }
 }
@@ -1316,7 +1313,7 @@ mod keyboard_owner_tests {
 
     /// A phone drawing a conversation is not drawing its list.
     #[test]
-    fn a_preview_with_no_list_on_screen_still_lands_somewhere() {
+    fn a_preview_with_no_list_on_screen_keeps_focus_on_the_root() {
         assert_eq!(
             keyboard_owner_for(
                 None,
@@ -1327,7 +1324,7 @@ mod keyboard_owner_tests {
                 ChatOpen::ToPreview,
                 false
             ),
-            KeyboardOwner::Composer
+            KeyboardOwner::Root
         );
     }
 }

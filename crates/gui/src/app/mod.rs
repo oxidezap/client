@@ -629,6 +629,8 @@ pub struct WhatsAppApp {
     /// keyboard ended up belonging to nobody until the first click.
     /// See `sync_overlay_focus`.
     keyboard_owner: Option<KeyboardOwner>,
+    window_focused: bool,
+    window_activation: Option<gpui::Subscription>,
     /// Whether the last gesture that touched a conversation was someone
     /// meaning to *talk* to it or meaning to *look* at it.
     ///
@@ -1008,6 +1010,8 @@ impl WhatsAppApp {
             call_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
             keyboard_owner: None,
+            window_focused: false,
+            window_activation: None,
             // Nothing has been opened to talk to yet, and a window that comes
             // up on a restored selection is one nobody has typed into.
             keyboard_intent: ChatOpen::ToPreview,
@@ -1543,6 +1547,52 @@ impl WhatsAppApp {
         if moved {
             self.sweep_retained_media(cx);
         }
+    }
+
+    fn observe_window_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.window_activation.is_some() {
+            return;
+        }
+        self.window_focused = cx
+            .active_window()
+            .is_some_and(|active| active == window.window_handle());
+        self.window_activation = Some(cx.observe_window_activation(window, |app, window, cx| {
+            let focused = cx
+                .active_window()
+                .is_some_and(|active| active == window.window_handle());
+            if app.window_focused == focused {
+                return;
+            }
+            app.window_focused = focused;
+            if focused {
+                app.resume_visible_read(cx);
+            }
+            cx.notify();
+        }));
+    }
+
+    fn resume_visible_read(&mut self, cx: &mut Context<Self>) {
+        let Some(jid) = self.visible_chat.clone() else {
+            return;
+        };
+        let Some(chat) = self
+            .find_chat(&jid)
+            .filter(|chat| chat.unread_count > 0 || chat.manually_unread)
+        else {
+            return;
+        };
+        let ReadBound::Now(newest) = read_bound(chat) else {
+            self.owed_reads.insert(jid);
+            return;
+        };
+        if let Some(client) = &self.client {
+            client.mark_chat_read(&jid, newest);
+        }
+        if let Some(chat) = self.find_chat_mut(&jid) {
+            chat.mark_as_read();
+        }
+        self.invalidate_chat_cache();
+        self.invalidate_message_cache(&jid, cx);
     }
 
     /// Whether the chat list this frame draws has no rows in it at all.
@@ -2179,9 +2229,10 @@ impl WhatsAppApp {
         // action separately: the daemon owns both, along with the boundary
         // that keeps a read from swallowing anything newer. All it needs from
         // here is the message this side is looking at.
-        if let Some(chat) = self
-            .find_chat(&jid)
-            .filter(|c| c.unread_count > 0 || c.manually_unread)
+        if self.window_focused
+            && let Some(chat) = self
+                .find_chat(&jid)
+                .filter(|c| c.unread_count > 0 || c.manually_unread)
         {
             match read_bound(chat) {
                 ReadBound::Now(newest) => {
@@ -2646,8 +2697,11 @@ impl WhatsAppApp {
         // the pane that shows it, so reading statuses, opening Settings or
         // walking the chat list on a phone would otherwise send a read
         // receipt for a message nobody had laid eyes on.
-        let read_now =
-            !message.is_from_me && self.visible_chat.as_deref() == Some(chat_jid.as_str());
+        let read_now = read_is_allowed(
+            self.window_focused,
+            self.visible_chat.as_deref() == Some(chat_jid.as_str()),
+            message.is_from_me,
+        );
 
         // Cache the sender's name if provided
         if let Some(ref name) = sender_name {
@@ -3020,6 +3074,10 @@ fn read_bound(chat: &Chat) -> ReadBound {
     }
 }
 
+fn read_is_allowed(window_focused: bool, chat_visible: bool, is_from_me: bool) -> bool {
+    window_focused && chat_visible && !is_from_me
+}
+
 /// The newest message in `chat` that the daemon has also seen.
 ///
 /// Which excludes a send this window has drawn but not yet had named, as well
@@ -3134,6 +3192,7 @@ impl Focusable for WhatsAppApp {
 
 impl Render for WhatsAppApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.observe_window_activation(window, cx);
         // First, because every dimension below resolves from the scale this
         // settles: the window's size is folded into the base font here and
         // nowhere else, which is what lets a 480×640 handheld get the whole
@@ -3328,6 +3387,14 @@ fn timeline_may_page(visible: Option<&str>, anchored: Option<&str>, chat_jid: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_require_a_focused_visible_chat() {
+        assert!(!read_is_allowed(false, true, false));
+        assert!(!read_is_allowed(true, false, false));
+        assert!(!read_is_allowed(true, true, true));
+        assert!(read_is_allowed(true, true, false));
+    }
 
     fn at(secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {
         chrono::DateTime::from_timestamp(secs, 0)
