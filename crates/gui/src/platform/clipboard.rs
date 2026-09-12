@@ -44,9 +44,10 @@ mod imp {
     pub(super) fn read(cx: &gpui::App) -> gpui::Task<Result<Option<Picked>, String>> {
         let task = cx.read_from_clipboard_async();
         cx.foreground_executor().spawn(async move {
-            task.await
-                .and_then(|item| item.map_or(Ok(None), image_from_item))
-                .or_else(|_| Ok(None))
+            match task.await {
+                Ok(Some(item)) => image_from_item(item),
+                Ok(None) | Err(_) => Ok(None),
+            }
         })
     }
 }
