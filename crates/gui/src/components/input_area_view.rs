@@ -3,11 +3,14 @@
 //! This component is designed for performance: when the user types,
 //! only this component re-renders, NOT the parent app.
 
-use std::time::Duration;
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use wacore::time::Instant;
 
-use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*};
+use gpui::{
+    App, Entity, EventEmitter, Focusable as _, KeyDownEvent, Task, WeakEntity, Window, div,
+    prelude::*,
+};
 use gpui_component::{
     ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants},
@@ -28,6 +31,14 @@ pub enum InputAreaEvent {
     /// files are chosen after the press — a dialog the composer neither owns
     /// nor waits for.
     AttachFiles,
+    /// An image pasted into this conversation.
+    PasteImage(u64, Rc<RefCell<Option<crate::platform::picker::Picked>>>),
+    /// An image paste was rejected before it could be sent.
+    PasteImageError(u64, String),
+    /// An image paste read completed without an image.
+    PasteImageFinished(u64),
+    /// An image paste started and its destination should be captured.
+    PasteImageStarted(u64),
     /// User started PTT recording
     StartRecording,
     /// User stopped PTT recording (send the audio)
@@ -127,6 +138,7 @@ pub struct InputAreaView {
     /// configured and closed, real work, on every render of the composer,
     /// for a value that cannot change while the tab is open.
     can_record: bool,
+    paste_id: u64,
 }
 
 impl EventEmitter<InputAreaEvent> for InputAreaView {}
@@ -164,6 +176,7 @@ impl InputAreaView {
             // to send what it encodes: a daemon over the bridge, the tab
             // holding the account, or the page's own session.
             can_record: oxidezap_audio::can_record(),
+            paste_id: 0,
         }
     }
 
@@ -185,6 +198,35 @@ impl InputAreaView {
             }
             _ => {}
         }
+    }
+
+    fn paste_image(&mut self, cx: &mut Context<Self>) {
+        let paste_id = self.paste_id;
+        self.paste_id = self.paste_id.wrapping_add(1);
+        cx.emit(InputAreaEvent::PasteImageStarted(paste_id));
+        let entity = cx.entity().downgrade();
+        let task = crate::platform::clipboard::read(cx);
+        cx.spawn(async move |_, cx| match task.await {
+            Ok(Some(file)) => {
+                let _ = entity.update(cx, |_, cx| {
+                    cx.emit(InputAreaEvent::PasteImage(
+                        paste_id,
+                        Rc::new(RefCell::new(Some(file))),
+                    ))
+                });
+            }
+            Ok(None) => {
+                let _ = entity.update(cx, |_, cx| {
+                    cx.emit(InputAreaEvent::PasteImageFinished(paste_id));
+                });
+            }
+            Err(error) => {
+                let _ = entity.update(cx, |_, cx| {
+                    cx.emit(InputAreaEvent::PasteImageError(paste_id, error));
+                });
+            }
+        })
+        .detach();
     }
 
     /// Handle a keystroke - updates typing state
@@ -442,6 +484,17 @@ impl InputAreaView {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
+                        let modifiers = &event.keystroke.modifiers;
+                        if event.keystroke.key.eq_ignore_ascii_case("v")
+                            && modifiers.secondary()
+                            && !modifiers.alt
+                            && !modifiers.shift
+                            && !modifiers.function
+                        {
+                            view.paste_image(cx);
+                        }
+                    }))
                     .child(Textarea::new(&self.input).w_full()),
             )
             .child(
