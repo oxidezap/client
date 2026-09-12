@@ -40,6 +40,9 @@ pub fn key(jid: &str, id: &str) -> String {
 }
 
 pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
+    if !chat.avatar_loaded {
+        return;
+    }
     let jid = chat.jid.clone();
     let source = chat.avatar_source.clone();
     let id = chat.avatar_key.clone();

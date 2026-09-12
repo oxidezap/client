@@ -562,6 +562,7 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
                     }
                 }
             }
+            UiEvent::AvatarReady { key, .. } => keys.push(key.clone()),
             _ => {}
         },
         // A page is media-bearing exactly like a load is, and is answered on
