@@ -421,10 +421,11 @@ impl WhatsAppClient {
             // chats somebody named rather than from a page.
             entries
         };
-        let chats = Self::hydrate_entries(chat_store, client, names, entries, |entry| {
+        let mut chats = Self::hydrate_entries(chat_store, client, names, entries, |entry| {
             Self::attach_page_with_ceiling(entry, message_limit as i64)
         })
         .await?;
+        Self::hydrate_avatar_sources(client, &mut chats).await;
         Ok(LoadedHistory {
             chats,
             complete,

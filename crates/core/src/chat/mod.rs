@@ -115,7 +115,7 @@ pub struct Chat {
     pub avatar_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_id: Option<String>,
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub avatar_loaded: bool,
     /// Participant names in group chats (sender JID -> display name)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

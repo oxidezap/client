@@ -234,7 +234,7 @@ impl WhatsAppClient {
         })
     }
 
-    async fn hydrate_avatar_sources(client: &Arc<Client>, chats: &mut [Chat]) {
+    pub(super) async fn hydrate_avatar_sources(client: &Arc<Client>, chats: &mut [Chat]) {
         for chat in chats.iter_mut() {
             chat.avatar_url = None;
             chat.avatar_id = None;
@@ -262,11 +262,25 @@ impl WhatsAppClient {
             }
         }
 
-        for chat in chats.iter_mut().filter(|chat| !chat.is_group) {
-            let Ok(jid) = chat.jid.parse() else { continue };
-            if let Ok(Some(picture)) = client.contacts().get_profile_picture(&jid, true).await {
-                chat.avatar_url = Some(picture.url);
-                chat.avatar_id = Some(picture.id);
+        let direct: Vec<(usize, Jid)> = chats
+            .iter()
+            .enumerate()
+            .filter(|(_, chat)| !chat.is_group)
+            .filter_map(|(index, chat)| chat.jid.parse().ok().map(|jid| (index, jid)))
+            .collect();
+        let pictures = whatsapp_rust::futures::future::join_all(direct.into_iter().map(
+            |(index, jid)| async move {
+                (
+                    index,
+                    client.contacts().get_profile_picture(&jid, true).await,
+                )
+            },
+        ))
+        .await;
+        for (index, picture) in pictures {
+            if let Ok(Some(picture)) = picture {
+                chats[index].avatar_url = Some(picture.url);
+                chats[index].avatar_id = Some(picture.id);
             }
         }
     }
