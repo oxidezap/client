@@ -46,9 +46,7 @@ impl WhatsAppApp {
         if self.destination != Destination::Chats {
             return None;
         }
-        let Some(jid) = self.selected_chat.clone() else {
-            return None;
-        };
+        let jid = self.selected_chat.clone()?;
         if !self.is_connected() {
             self.notify_user(
                 "Files cannot be sent right now: not connected.",
