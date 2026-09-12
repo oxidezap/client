@@ -2389,8 +2389,9 @@ impl WhatsAppApp {
                 }
             }
             InputAreaEvent::PasteImageError(paste_id, error) => {
-                self.pending_pastes.remove(paste_id);
-                self.notify_user(error, notices::Tone::Problem, cx);
+                if self.pending_pastes.remove(paste_id).is_some() {
+                    self.notify_user(error, notices::Tone::Problem, cx);
+                }
             }
             InputAreaEvent::PasteImageFinished(paste_id) => {
                 self.pending_pastes.remove(paste_id);
