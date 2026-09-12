@@ -7,6 +7,23 @@
 use super::*;
 
 impl WhatsAppApp {
+    /// Move the open conversation by one viewport and let normal paging fetch
+    /// older rows when the movement reaches the loaded history's start.
+    pub fn page_chat_history(&mut self, forward: bool, window: &Window, cx: &mut Context<Self>) {
+        let Some(selected_chat) = self.selected_chat.as_deref() else {
+            return;
+        };
+        if self.visible_chat.as_deref() != Some(selected_chat)
+            || self.message_list.item_count() == 0
+        {
+            return;
+        }
+        let distance = crate::platform::keyboard::page_scroll_distance(window);
+        self.message_list
+            .scroll_by(if forward { distance } else { -distance });
+        cx.notify();
+    }
+
     /// Move focus to the conversation search field.
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Only where there is a list to search. Every case below reaches the
@@ -127,6 +144,12 @@ impl WhatsAppApp {
     /// only way out other than Escape, and a control that can only open is
     /// half a control.
     pub fn toggle_conversation_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected_chat) = self.selected_chat.as_deref() else {
+            return;
+        };
+        if self.visible_chat.as_deref() != Some(selected_chat) {
+            return;
+        }
         if self.search.read(cx).conversation().is_some() {
             self.close_conversation_search(cx);
             return;
@@ -179,6 +202,7 @@ impl WhatsAppApp {
             .search
             .update(cx, |search, cx| search.close_conversation(cx));
         if closed {
+            self.keyboard_owner = None;
             cx.notify();
         }
         closed
