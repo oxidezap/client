@@ -211,7 +211,19 @@ pub(super) fn render_media_content(
                         // A sticker must stay a sticker when its WebP payload
                         // cannot be decoded. Never send it through the photo
                         // renderer, which hides the actual media failure.
-                        if let Some(dl) = media_content.downloadable.clone() {
+                        if media_content.downloadable.is_none()
+                            && let Some(format) = still_image_format(&media_content)
+                            && format != gpui::ImageFormat::Webp
+                        {
+                            el.child(render_image_from_bytes(
+                                media_content.data,
+                                format,
+                                display_w,
+                                display_h,
+                                cx.product().metrics.radius_lg(),
+                                false,
+                            ))
+                        } else if let Some(dl) = media_content.downloadable.clone() {
                             el.child(render_download_placeholder(
                                 "sticker-dl",
                                 "[Sticker] Tap to download",
@@ -453,6 +465,9 @@ fn valid_webp_payload(bytes: &[u8]) -> bool {
         let Ok(byte_count) = usize::try_from(decoder.total_bytes()) else {
             return false;
         };
+        if byte_count > oxidezap_core::DECODED_IMAGE_BUDGET_BYTES as usize {
+            return false;
+        }
         let mut decoded = vec![0; byte_count];
         decoder.read_image(&mut decoded).is_ok()
     }

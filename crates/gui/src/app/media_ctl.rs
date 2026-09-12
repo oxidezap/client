@@ -773,6 +773,8 @@ impl WhatsAppApp {
         }
 
         if media.media_type == oxidezap_core::MediaType::Sticker
+            && !media.data_is_preview
+            && mime_to_image_format(&media.mime_type) == Some(gpui::ImageFormat::Webp)
             && !self.sticker_payload_is_valid(message_id, media)
         {
             return None;
