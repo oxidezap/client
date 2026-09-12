@@ -5,7 +5,11 @@ mod native;
 #[cfg(target_family = "wasm")]
 mod web;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::{LazyLock, Mutex};
+
+use portable_atomic::{AtomicU64, Ordering};
 
 use crate::state::StateHub;
 
@@ -16,9 +20,58 @@ struct AvatarResponse {
 use oxidezap_core::Chat;
 use oxidezap_ipc::DaemonMessage;
 
-pub fn key(id: &str) -> String {
-    let mut result = String::from("a-");
-    for byte in id.bytes() {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Selection {
+    account_generation: usize,
+    cache_epoch: usize,
+    token: u64,
+}
+
+static LATEST: LazyLock<Mutex<HashMap<(usize, String), Selection>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+pub fn key(jid: &str, id: &str) -> String {
+    let jid = safe_component(jid);
+    let id = safe_component(id);
+    format!("a-{}-{jid}-{}-{id}", jid.len(), id.len())
+}
+
+pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
+    let jid = chat.jid.clone();
+    let selection = record_selection(hub, &jid);
+    let Some(source) = chat.avatar_source.clone() else {
+        return;
+    };
+    let Some(id) = chat.avatar_key.clone() else {
+        return;
+    };
+    let hub = Arc::clone(hub);
+    let key = key(&jid, &id);
+    if crate::media::has(&key) {
+        oxidezap_session::spawn(async move {
+            if is_current(&hub, &jid, &selection) {
+                hub.signal(&DaemonMessage::AvatarReady { jid, key });
+            }
+        });
+        return;
+    }
+    oxidezap_session::spawn(async move {
+        let Ok(response) = fetch(&source).await else {
+            return;
+        };
+        let Ok(bytes) = accept(response) else { return };
+        if crate::media::put_since(selection.cache_epoch, &key, &bytes).is_ok()
+            && is_current(&hub, &jid, &selection)
+        {
+            hub.signal(&DaemonMessage::AvatarReady { jid, key });
+        }
+    });
+}
+
+fn safe_component(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
             result.push(char::from(byte));
         } else {
@@ -29,32 +82,33 @@ pub fn key(id: &str) -> String {
     result
 }
 
-pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
-    let Some(source) = chat.avatar_source.clone() else {
-        return;
+fn record_selection(hub: &StateHub, jid: &str) -> Selection {
+    let mut latest = LATEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let selection = Selection {
+        account_generation: hub.account_generation(),
+        cache_epoch: crate::media::epoch(),
+        token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
     };
-    let Some(id) = chat.avatar_key.clone() else {
-        return;
-    };
-    let jid = chat.jid.clone();
-    let hub = Arc::clone(hub);
-    let key = key(&id);
-    let epoch = crate::media::epoch();
-    if crate::media::has(&key) {
-        oxidezap_session::spawn(async move {
-            hub.signal(&DaemonMessage::AvatarReady { jid, key });
-        });
-        return;
+    latest.insert((hub_id(hub), jid.to_owned()), selection.clone());
+    selection
+}
+
+fn is_current(hub: &StateHub, jid: &str, selection: &Selection) -> bool {
+    if selection.account_generation != hub.account_generation()
+        || selection.cache_epoch != crate::media::epoch()
+    {
+        return false;
     }
-    oxidezap_session::spawn(async move {
-        let Ok(response) = fetch(&source).await else {
-            return;
-        };
-        let Ok(bytes) = accept(response) else { return };
-        if crate::media::put_since(epoch, &key, &bytes).is_ok() {
-            hub.signal(&DaemonMessage::AvatarReady { jid, key });
-        }
-    });
+    let latest = LATEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    latest.get(&(hub_id(hub), jid.to_owned())) == Some(selection)
+}
+
+fn hub_id(hub: &StateHub) -> usize {
+    std::ptr::from_ref(hub) as usize
 }
 
 async fn fetch(url: &str) -> anyhow::Result<AvatarResponse> {
@@ -83,13 +137,25 @@ fn accept(response: AvatarResponse) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AvatarResponse, accept, key};
+    use super::{AvatarResponse, accept, is_current, key, record_selection};
+    use crate::state::StateHub;
 
     #[test]
     fn avatar_keys_are_safe_and_distinct() {
-        assert_eq!(key("picture-1"), "a-picture-1");
-        assert_ne!(key("a/b"), key("a?b"));
-        assert!(!key("../../avatar").contains('/'));
+        assert_eq!(key("jid-1", "picture-1"), "a-5-jid-1-9-picture-1");
+        assert_ne!(key("jid-1", "picture-1"), key("jid-2", "picture-1"));
+        assert_ne!(key("a/b", "picture"), key("a?b", "picture"));
+        assert!(!key("../../avatar", "picture").contains('/'));
+    }
+
+    #[test]
+    fn superseded_avatar_completion_is_rejected() {
+        let hub = StateHub::new();
+        let first = record_selection(&hub, "jid-superseded");
+        let second = record_selection(&hub, "jid-superseded");
+
+        assert!(!is_current(&hub, "jid-superseded", &first));
+        assert!(is_current(&hub, "jid-superseded", &second));
     }
 
     #[test]
