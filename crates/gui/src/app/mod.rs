@@ -1177,7 +1177,7 @@ impl WhatsAppApp {
 
         let filtered: Vec<&Chat> = self.conversations().filter(|c| matches(c)).collect();
 
-        let rows: Arc<[ChatRow]> = filtered
+        let mut rows: Vec<ChatRow> = filtered
             .into_iter()
             .map(|chat| {
                 ChatRow::new(
@@ -1192,6 +1192,8 @@ impl WhatsAppApp {
                 )
             })
             .collect();
+        chat_row::disambiguate_names(&mut rows);
+        let rows: Arc<[ChatRow]> = rows.into();
 
         let new_cache = ChatListCache {
             version,

@@ -114,6 +114,17 @@ fn render_name_row(
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child(name),
         )
+        .children(row.kind.label().map(|label| {
+            div()
+                .flex_shrink_0()
+                .rounded(metrics.radius_sm())
+                .bg(cx.theme().secondary)
+                .px(metrics.space_xs())
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(metrics.text_micro())
+                .text_color(cx.theme().secondary_foreground)
+                .child(label)
+        }))
         .children(row.pinned.then(|| {
             div()
                 .flex_shrink_0()

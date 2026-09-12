@@ -9,6 +9,7 @@ use oxidezap_core::{
     Chat, ChatMessage, MediaType, MessageStatus, SystemNotice, TypingSummary, format_duration,
     plain_message_text,
 };
+use std::collections::HashMap;
 
 /// The badge at the end of a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,33 @@ pub enum Unread {
     /// Marked unread by hand. WhatsApp's `-1` sentinel: a badge with no
     /// number, so it is drawn as a dot rather than a pill containing a bullet.
     Marked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatKind {
+    Direct,
+    Group,
+    Channel,
+}
+
+impl ChatKind {
+    pub fn of(chat: &Chat) -> Self {
+        if chat.jid.ends_with("@newsletter") {
+            Self::Channel
+        } else if chat.is_group {
+            Self::Group
+        } else {
+            Self::Direct
+        }
+    }
+
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Direct => None,
+            Self::Group => Some("Group"),
+            Self::Channel => Some("Channel"),
+        }
+    }
 }
 
 /// The glyph in front of a media preview, so `Photo` is recognisable before
@@ -80,6 +108,7 @@ pub enum Preview {
 pub struct ChatRow {
     pub jid: String,
     pub name: String,
+    pub kind: ChatKind,
     pub is_group: bool,
     pub timestamp: Option<DateTime<Utc>>,
     pub unread: Unread,
@@ -101,6 +130,7 @@ impl ChatRow {
         Self {
             jid: chat.jid.clone(),
             name: display_name(&chat.name, is_own_number),
+            kind: ChatKind::of(chat),
             is_group: chat.is_group,
             timestamp: chat.last_message_time,
             unread: if chat.unread_count > 0 {
@@ -119,6 +149,23 @@ impl ChatRow {
     /// here for you".
     pub fn has_unread(&self) -> bool {
         !matches!(self.unread, Unread::None)
+    }
+}
+
+pub fn disambiguate_names(rows: &mut [ChatRow]) {
+    let names: Vec<String> = rows.iter().map(|row| row.name.clone()).collect();
+    let mut totals = HashMap::new();
+    for name in &names {
+        *totals.entry(name).or_insert(0usize) += 1;
+    }
+    let mut occurrences = HashMap::new();
+    for index in 0..rows.len() {
+        let name = &names[index];
+        if totals[name] > 1 {
+            let occurrence = occurrences.entry(name).or_insert(0usize);
+            *occurrence += 1;
+            rows[index].name = format!("{name} · {occurrence}");
+        }
     }
 }
 
@@ -426,5 +473,48 @@ mod tests {
             Unread::Count(3),
             "a real count wins over the sentinel"
         );
+    }
+
+    #[test]
+    fn group_and_channel_rows_have_distinct_kinds() {
+        let mut group = Chat::new("group@g.us".into());
+        group.is_group = true;
+        let channel = Chat::new("channel@newsletter".into());
+
+        assert_eq!(
+            ChatRow::new(&group, None, None, false).kind,
+            ChatKind::Group
+        );
+        assert_eq!(
+            ChatRow::new(&channel, None, None, false).kind,
+            ChatKind::Channel
+        );
+    }
+
+    #[test]
+    fn overlapping_names_get_stable_display_numbers() {
+        let mut first = chat(true);
+        first.jid = "first@g.us".into();
+        let mut second = chat(true);
+        second.jid = "second@g.us".into();
+        let mut rows = vec![
+            ChatRow::new(&first, None, None, false),
+            ChatRow::new(&second, None, None, false),
+        ];
+
+        disambiguate_names(&mut rows);
+
+        assert_eq!(rows[0].name, "Test · 1");
+        assert_eq!(rows[1].name, "Test · 2");
+    }
+
+    #[test]
+    fn a_unique_group_name_stays_unchanged() {
+        let group = chat(true);
+        let mut rows = vec![ChatRow::new(&group, None, None, false)];
+
+        disambiguate_names(&mut rows);
+
+        assert_eq!(rows[0].name, "Test");
     }
 }
