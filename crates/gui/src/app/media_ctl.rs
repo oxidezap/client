@@ -765,7 +765,9 @@ impl WhatsAppApp {
                 // case the entry describes a picture that is gone and the
                 // insert below overwrites it.
                 if cache.get_index(at).is_some_and(|(_, (seen, image))| {
-                    *seen == cached
+                    seen.bytes == cached.bytes
+                        && seen.format == cached.format
+                        && seen.preview == cached.preview
                         && (seen.identity == cached.identity
                             || image.bytes.as_slice() == data.as_slice())
                 }) {
@@ -833,15 +835,27 @@ impl WhatsAppApp {
             identity: media_identity(&media.data),
         };
         if let Some((seen, valid, bytes)) = self.sticker_validation.borrow().get(message_id)
-            && *seen == cached
+            && seen.bytes == cached.bytes
+            && seen.format == cached.format
+            && seen.preview == cached.preview
             && (seen.identity == cached.identity || bytes.as_slice() == media.data.as_slice())
         {
             return *valid;
         }
         let valid = crate::components::message_bubble::sticker_payload_is_valid(media);
+        const STICKER_VALIDATION_CACHE_BYTES: usize = 64 * 1024 * 1024;
+        if media.data.len() > STICKER_VALIDATION_CACHE_BYTES {
+            return valid;
+        }
         let mut validation = self.sticker_validation.borrow_mut();
-        if validation.len() >= MAX_DECODED_IMAGES {
-            validation.shift_remove_index(0);
+        let mut held: usize = validation.values().map(|(_, _, bytes)| bytes.len()).sum();
+        while validation.len() >= MAX_DECODED_IMAGES
+            || held.saturating_add(media.data.len()) > STICKER_VALIDATION_CACHE_BYTES
+        {
+            let Some((_, (_, _, bytes))) = validation.shift_remove_index(0) else {
+                break;
+            };
+            held = held.saturating_sub(bytes.len());
         }
         validation.insert(
             message_id.to_string(),
