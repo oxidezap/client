@@ -12,6 +12,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, IconName};
+use image::{AnimationDecoder as _, ImageDecoder as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::ProductIcon;
@@ -422,8 +423,22 @@ enum StickerRenderKind {
 fn sticker_render_kind(media: &oxidezap_core::MediaContent) -> Option<StickerRenderKind> {
     if media.data.is_empty()
         || mime_to_image_format(&media.mime_type) != Some(gpui::ImageFormat::Webp)
-        || image::codecs::webp::WebPDecoder::new(Cursor::new(media.data.as_slice())).is_err()
     {
+        return None;
+    }
+
+    let decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(media.data.as_slice())).ok()?;
+    let valid = if decoder.has_animation() {
+        let mut frames = decoder.into_frames();
+        frames
+            .next()
+            .is_some_and(|frame| frame.is_ok() && frames.all(|frame| frame.is_ok()))
+    } else {
+        let byte_count = usize::try_from(decoder.total_bytes()).ok()?;
+        let mut decoded = vec![0; byte_count];
+        decoder.read_image(&mut decoded).is_ok()
+    };
+    if !valid {
         return None;
     }
 
