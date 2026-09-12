@@ -271,8 +271,6 @@ pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -3304,7 +3302,7 @@ pub struct Cached {
     bytes: usize,
     format: gpui::ImageFormat,
     preview: bool,
-    fingerprint: u64,
+    identity: usize,
 }
 
 /// Whether the timeline this frame is building may ask for the page before
@@ -3492,13 +3490,13 @@ mod tests {
             bytes: 4_096,
             format: gpui::ImageFormat::Jpeg,
             preview: true,
-            fingerprint: 1,
+            identity: 1,
         };
         let full = Cached {
             bytes: 812_344,
             format: gpui::ImageFormat::Jpeg,
             preview: false,
-            fingerprint: 2,
+            identity: 2,
         };
         assert_ne!(preview, full);
 
@@ -3507,7 +3505,7 @@ mod tests {
                 bytes: 4_096,
                 format: gpui::ImageFormat::Jpeg,
                 preview: true,
-                fingerprint: 2,
+                identity: 2,
             },
             preview
         );
@@ -3519,7 +3517,7 @@ mod tests {
                 bytes: 4_096,
                 format: gpui::ImageFormat::Png,
                 preview: true,
-                fingerprint: 3,
+                identity: 3,
             },
             preview
         );
@@ -3530,7 +3528,7 @@ mod tests {
         assert_ne!(
             Cached {
                 preview: false,
-                fingerprint: 1,
+                identity: 1,
                 ..preview
             },
             preview
