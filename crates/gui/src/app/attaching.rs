@@ -49,7 +49,7 @@ impl WhatsAppApp {
     }
 
     #[cfg(target_family = "wasm")]
-    pub(super) fn drop_file_list(&mut self, files: web_sys::FileList, cx: &mut Context<Self>) {
+    pub(crate) fn drop_file_list(&mut self, files: web_sys::FileList, cx: &mut Context<Self>) {
         let Some(jid) = self.selected_chat.clone() else {
             return;
         };
