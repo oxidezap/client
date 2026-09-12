@@ -347,7 +347,7 @@ fn write_new(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[derive(Default)]
 pub struct Held {
     bytes: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
-    avatars: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+    avatars: std::sync::Mutex<AvatarCache>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -364,7 +364,7 @@ impl Held {
         self.avatars
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, Arc::new(bytes));
+            .put(key, bytes);
     }
 
     /// Forget whatever the last frame did not use.
@@ -405,7 +405,6 @@ impl Held {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(key)
-                    .map(Arc::clone)
             })
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
@@ -423,6 +422,69 @@ impl Held {
             .unwrap_or_else(|e| e.into_inner())
             .remove(key)
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Default)]
+struct AvatarCache {
+    entries: std::collections::HashMap<String, AvatarEntry>,
+    clock: u64,
+    bytes: u64,
+}
+
+#[cfg(target_family = "wasm")]
+struct AvatarEntry {
+    bytes: Arc<Vec<u8>>,
+    touched: u64,
+}
+
+#[cfg(target_family = "wasm")]
+impl AvatarCache {
+    fn put(&mut self, key: String, bytes: Vec<u8>) {
+        if let Some(entry) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes.len() as u64);
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+        self.entries.insert(
+            key,
+            AvatarEntry {
+                bytes: Arc::new(bytes),
+                touched: self.clock,
+            },
+        );
+        self.evict();
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<Vec<u8>>> {
+        let clock = self.clock.wrapping_add(1);
+        self.clock = clock;
+        self.entries.get_mut(key).map(|entry| {
+            entry.touched = clock;
+            Arc::clone(&entry.bytes)
+        })
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    fn evict(&mut self) {
+        while self.bytes > oxidezap_core::WEB_MEDIA_BUDGET_BYTES as u64 {
+            let Some(key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes.len() as u64);
+            }
+        }
     }
 }
 
