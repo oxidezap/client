@@ -15,7 +15,7 @@ use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 use whatsapp_rust::waproto::whatsapp as wa;
 
-use oxidezap_core::ChatMessage;
+use oxidezap_core::{Chat, ChatMessage};
 
 use super::WhatsAppClient;
 use super::convert::{mark_unread_tail, stored_to_chat_message};
@@ -226,11 +226,49 @@ impl WhatsAppClient {
             // the status broadcast is nobody's conversation to open. A page
             // that carried the newest row alone let a window read a chat
             // whose older unread messages then went unacknowledged.
-            let chats = Self::hydrate_entries(store, client, names, entries, Self::attach_page)
+            let mut chats = Self::hydrate_entries(store, client, names, entries, Self::attach_page)
                 .await
                 .map_err(|e| e.to_string())?;
+            Self::hydrate_avatar_sources(client, &mut chats).await;
             Ok(Page { items: chats, next })
         })
+    }
+
+    async fn hydrate_avatar_sources(client: &Arc<Client>, chats: &mut [Chat]) {
+        for chat in chats.iter_mut() {
+            chat.avatar_url = None;
+            chat.avatar_id = None;
+            chat.avatar_loaded = true;
+        }
+        let groups: Vec<Jid> = chats
+            .iter()
+            .filter(|chat| chat.is_group)
+            .filter_map(|chat| chat.jid.parse().ok())
+            .collect();
+        if !groups.is_empty()
+            && let Ok(pictures) = client
+                .groups()
+                .get_profile_pictures(groups, whatsapp_rust::features::PictureType::Preview)
+                .await
+        {
+            for picture in pictures {
+                if let Some(chat) = chats
+                    .iter_mut()
+                    .find(|chat| chat.jid == picture.group_jid.to_string())
+                {
+                    chat.avatar_url = picture.url;
+                    chat.avatar_id = picture.photo_id;
+                }
+            }
+        }
+
+        for chat in chats.iter_mut().filter(|chat| !chat.is_group) {
+            let Ok(jid) = chat.jid.parse() else { continue };
+            if let Ok(Some(picture)) = client.contacts().get_profile_picture(&jid, true).await {
+                chat.avatar_url = Some(picture.url);
+                chat.avatar_id = Some(picture.id);
+            }
+        }
     }
 }
 

@@ -111,6 +111,8 @@ pub struct ChatRow {
     pub kind: ChatKind,
     pub disambiguator: Option<String>,
     pub is_group: bool,
+    pub avatar_url: Option<String>,
+    pub avatar_id: Option<String>,
     pub timestamp: Option<DateTime<Utc>>,
     pub unread: Unread,
     pub preview: Preview,
@@ -134,6 +136,8 @@ impl ChatRow {
             kind: ChatKind::of(chat),
             disambiguator: None,
             is_group: chat.is_group,
+            avatar_url: chat.avatar_url.clone(),
+            avatar_id: chat.avatar_id.clone(),
             timestamp: chat.last_message_time,
             unread: if chat.unread_count > 0 {
                 Unread::Count(chat.unread_count)
@@ -538,5 +542,36 @@ mod tests {
         disambiguate_names(&mut rows);
 
         assert_eq!(rows[0].name, "Test");
+    }
+
+    #[test]
+    fn an_avatar_without_a_source_keeps_the_placeholder() {
+        let row = ChatRow::new(&chat(false), None, None, false);
+        assert_eq!(row.avatar_url, None);
+        assert_eq!(row.avatar_id, None);
+    }
+
+    #[test]
+    fn an_unchanged_avatar_source_is_preserved_for_the_image_cache() {
+        let mut chat = chat(false);
+        chat.avatar_url = Some("https://avatar.invalid/one".to_string());
+        chat.avatar_id = Some("picture-1".to_string());
+        let first = ChatRow::new(&chat, None, None, false);
+        let second = ChatRow::new(&chat, None, None, false);
+        assert_eq!(first.avatar_url, second.avatar_url);
+        assert_eq!(first.avatar_id, second.avatar_id);
+    }
+
+    #[test]
+    fn a_changed_avatar_source_replaces_the_cached_picture() {
+        let mut chat = chat(false);
+        chat.avatar_url = Some("https://avatar.invalid/one".to_string());
+        chat.avatar_id = Some("picture-1".to_string());
+        let old = ChatRow::new(&chat, None, None, false);
+        chat.avatar_url = Some("https://avatar.invalid/two".to_string());
+        chat.avatar_id = Some("picture-2".to_string());
+        let new = ChatRow::new(&chat, None, None, false);
+        assert_ne!(old.avatar_url, new.avatar_url);
+        assert_ne!(old.avatar_id, new.avatar_id);
     }
 }

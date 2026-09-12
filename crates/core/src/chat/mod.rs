@@ -110,6 +110,13 @@ pub struct Chat {
     /// talk to.
     #[serde(default)]
     pub is_status: bool,
+    /// The current signed preview URL and the source identifier that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_id: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub avatar_loaded: bool,
     /// Participant names in group chats (sender JID -> display name)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub participants: HashMap<String, String>,
@@ -176,6 +183,9 @@ impl Chat {
             pinned_at: None,
             is_group,
             is_status,
+            avatar_url: None,
+            avatar_id: None,
+            avatar_loaded: false,
             participants: HashMap::new(),
             messages: Vec::new(),
             from_store: false,
