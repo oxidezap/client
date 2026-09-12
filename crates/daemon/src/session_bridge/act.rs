@@ -216,6 +216,12 @@ impl Bridge {
                             // locally, sends no receipt and comes straight
                             // back on the next hydration.
                             for chat in &mut page.items {
+                                crate::avatar::queue(&hub, chat);
+                                if let Some(picture_id) = chat.avatar_key.as_deref() {
+                                    chat.avatar_key =
+                                        Some(crate::avatar::key(&chat.jid, picture_id));
+                                }
+                                chat.avatar_source = None;
                                 externalize_messages(epoch, &mut chat.messages);
                                 let mut reads =
                                     reads.lock().unwrap_or_else(|held| held.into_inner());

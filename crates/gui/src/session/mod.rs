@@ -28,6 +28,8 @@ mod attach;
 mod embedded;
 mod frames;
 mod media;
+pub use media::MediaCache;
+pub(crate) use media::clear_image_sources;
 #[cfg(not(target_family = "wasm"))]
 mod native;
 mod recovery;
@@ -92,7 +94,6 @@ use oxidezap_ipc::{
 use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
 
-use self::media::MediaCache;
 pub use self::sink::Events;
 use self::sink::{ReaderSink, UiSink};
 
@@ -138,6 +139,8 @@ pub enum FromDaemon {
     Calls(Box<CallState>),
     /// Who this device is linked as, at the moment this client attached.
     Account(Option<oxidezap_ipc::AccountIdentity>),
+    /// A profile picture is ready in the daemon media cache.
+    Avatar { jid: String, key: String },
     /// Every plugin the daemon has loaded, and what each wants drawn.
     ///
     /// State, and whole every time: a plugin published its interface when it
@@ -745,6 +748,12 @@ pub struct Session {
         expect(dead_code, reason = "a page's socket goes with the page")
     )]
     teardown: Teardown,
+}
+
+impl Session {
+    pub fn media_cache(&self) -> Arc<dyn MediaCache> {
+        Arc::clone(&self.handle.conn.media)
+    }
 }
 
 impl std::ops::Deref for Session {
@@ -1527,6 +1536,7 @@ impl SessionHandle {
     /// The daemon owns that file and stops itself once it is gone, so this is
     /// the last thing this connection will be told anything on.
     pub fn forget_session(&self) {
+        self.conn.media.clear_cached();
         self.tell(ClientRequest::ForgetSession);
     }
 
@@ -1547,6 +1557,7 @@ impl SessionHandle {
     /// the files still had, which looks exactly like a clear that did not
     /// work.
     pub fn clear_media_cache(&self) -> oneshot::Receiver<()> {
+        self.conn.media.clear_cached();
         let (tx, rx) = oneshot::channel();
         self.ask(ClientRequest::ClearMediaCache, Awaiting::Acted(tx));
         rx

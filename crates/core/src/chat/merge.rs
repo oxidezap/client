@@ -78,6 +78,11 @@ impl Chat {
         // store owns it from here on.
         self.from_store |= hydrated.from_store;
         self.set_name_if_not_worse(hydrated.name, hydrated.name_priority);
+        if hydrated.avatar_loaded {
+            self.avatar_source = hydrated.avatar_source;
+            self.avatar_key = hydrated.avatar_key;
+            self.avatar_loaded = true;
+        }
         // Read before the messages are moved out: it decides what an absent
         // preview below means.
         let hydrated_has_messages = !hydrated.messages.is_empty();

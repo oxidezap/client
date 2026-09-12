@@ -576,7 +576,10 @@ impl WhatsAppApp {
             if cleared.await.is_err() {
                 return;
             }
-            let _ = entity.update(cx, |app, cx| app.refresh_storage_usage(cx));
+            let _ = entity.update(cx, |app, cx| {
+                crate::session::clear_image_sources();
+                app.refresh_storage_usage(cx);
+            });
         })
         .detach();
     }

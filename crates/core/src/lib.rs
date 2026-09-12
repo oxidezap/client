@@ -52,7 +52,8 @@ pub use group::{GroupMember, GroupRoster};
 pub use links::{LinkSpan, find_links as find_message_links, find_links_in};
 pub use log_level::{LogLevel, UnknownLogLevel};
 pub use media_budget::{
-    DECODED_IMAGE_BUDGET_BYTES, RETAINED_MEDIA_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES,
+    DECODED_IMAGE_BUDGET_BYTES, MAX_AVATAR_DIMENSION, MAX_AVATAR_PIXELS,
+    RETAINED_MEDIA_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES,
 };
 pub use mentions::format_mentions;
 pub use message_status::MessageStatus;

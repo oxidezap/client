@@ -307,7 +307,11 @@ mod page {
                 match fetch(&key, ration).await {
                     Ok(bytes) => {
                         so_far = so_far.saturating_add(bytes.len() as u64);
-                        into.put(key, bytes);
+                        if key.starts_with("a-") {
+                            into.put_avatar(key, bytes);
+                        } else {
+                            into.put(key, bytes);
+                        }
                     }
                     Err(e) => log::debug!("media {key} is not available: {e}"),
                 }

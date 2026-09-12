@@ -300,6 +300,11 @@ impl<'a> Frames<'a> {
                     None => error!("daemon refused a request: {error}"),
                 }
             }
+            DaemonMessage::AvatarReady { jid, key } => {
+                // Avatar keys are also carried by the owning chat frame. The
+                // readiness signal only announces that its cache entry is ready.
+                self.publish(FromDaemon::Avatar { jid, key })?;
+            }
             // The daemon truncated our stream, so arbitrary events are gone.
             // Asking for the history back would restore the chats and nothing
             // else: a `LoggedOut`, a `CallEnded`, a `SendFailed` cannot be
@@ -539,17 +544,25 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
         into.push(key);
     }
 
+    fn avatar_key_of(chat: &Chat, into: &mut Vec<String>) {
+        if let Some(key) = &chat.avatar_key {
+            into.push(key.clone());
+        }
+    }
+
     let mut keys = Vec::new();
     match message {
         DaemonMessage::Session { event } => match event.as_ref() {
             UiEvent::MessageReceived { message, .. } => key_of(&message.media, &mut keys),
             UiEvent::HistoryLoaded { chats, .. } => {
                 for chat in chats {
+                    avatar_key_of(chat, &mut keys);
                     for message in &chat.messages {
                         key_of(&message.media, &mut keys);
                     }
                 }
             }
+            UiEvent::AvatarReady { key, .. } => keys.push(key.clone()),
             _ => {}
         },
         // A page is media-bearing exactly like a load is, and is answered on
@@ -562,6 +575,7 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
         }
         DaemonMessage::Chats { chats, .. } => {
             for chat in chats {
+                avatar_key_of(chat, &mut keys);
                 for message in &chat.messages {
                     key_of(&message.media, &mut keys);
                 }
@@ -579,6 +593,7 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
                 log::debug!("not fetching {key}: nobody is waiting on {id} any more");
             }
         }
+        DaemonMessage::AvatarReady { key, .. } => keys.push(key.clone()),
         _ => {}
     }
     // A download key is the media's *content*, so one photo forwarded into

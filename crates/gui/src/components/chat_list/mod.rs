@@ -38,6 +38,7 @@ pub struct ChatListProps<'a> {
     pub is_searching: bool,
     pub search_input: Option<&'a Entity<InputState>>,
     pub account: Option<AccountSummary>,
+    pub media: Option<Arc<dyn crate::session::MediaCache>>,
 }
 
 /// The linked-device row at the foot of the sidebar.
@@ -234,6 +235,7 @@ fn render_rows(
 ) -> impl IntoElement + use<> {
     let rows = Arc::clone(&props.cache.rows);
     let selected = props.selected_jid.clone();
+    let media = props.media.clone();
     let row_height = layout.chat_item_height() + metrics.chat_row_gap();
 
     // Row sizes are resolved geometry, so they have to be rebuilt whenever the
@@ -272,6 +274,7 @@ fn render_rows(
                                         is_selected,
                                         entity_for_rows.clone(),
                                         layout,
+                                        media.clone(),
                                         cx,
                                     ))
                             })

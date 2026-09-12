@@ -729,10 +729,9 @@ impl WhatsAppClient {
         let hydrating = wacore::time::Instant::now();
         let mut hydrated = 0;
         let (chat_limit, message_limit) = history_budget.limits();
-        match Self::load_history_scoped_with_limits(
+        match Self::load_history_before_connection(
             chat_store,
             &bot.client(),
-            None,
             names,
             chat_limit,
             message_limit,
@@ -824,6 +823,7 @@ impl WhatsAppClient {
             let ui_tx = ui_tx.clone();
             let calls = calls.clone();
             let names = names.clone();
+            let reload = reload.clone();
             let control_fault_ui = ui_tx.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
@@ -838,8 +838,10 @@ impl WhatsAppClient {
                         let ui_tx = ui_tx.clone();
                         let calls = calls.clone();
                         let names = names.clone();
+                        let reload = reload.clone();
                         async move {
-                            Self::handle_event(event, client, ui_tx, calls, names).await;
+                            Self::handle_event(event, client, ui_tx, calls, names, Some(reload))
+                                .await;
                         }
                     },
                     stopping.clone(),
@@ -963,6 +965,7 @@ impl WhatsAppClient {
         ui_tx: UiEventSender,
         calls: CallRegistry,
         names: Arc<NameBook>,
+        reload: Option<Arc<tokio::sync::Notify>>,
     ) {
         match &*event {
             Event::RawNode(node) => calls.accept_advertisement(node).await,
@@ -991,6 +994,9 @@ impl WhatsAppClient {
             }
             Event::Connected(_) => {
                 info!("Connected to WhatsApp!");
+                if let Some(reload) = reload {
+                    reload.notify_one();
+                }
                 let _ = ui_tx.send(UiEvent::Connected);
                 // Who this device is linked as. Read from the device store
                 // rather than remembered from pairing: a client attaching

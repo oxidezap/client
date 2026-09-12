@@ -6396,6 +6396,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "getrandom 0.4.3",
+ "image",
  "js-sys",
  "ksni",
  "log",
@@ -6411,6 +6412,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tray-icon",
+ "ureq",
  "wacore",
  "wacore-binary",
  "wasm-bindgen",
@@ -9754,6 +9756,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "972d7902c8735f2695410b8aed7df6ed12a47394aa1c8d7af49f0497b731a94d"
 dependencies = [
  "base64 0.23.1",
+ "flate2",
  "log",
  "percent-encoding",
  "rustls",

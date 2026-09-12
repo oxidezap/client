@@ -16,6 +16,7 @@
 //! meet at [`state::StateHub`], which is the only thing that mutates, and each
 //! observes it through the channel that suits it.
 
+pub mod avatar;
 mod claim;
 pub mod embedded;
 pub mod media;

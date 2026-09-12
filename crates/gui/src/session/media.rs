@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use gpui::{ImageSource, RenderImage};
+
 /// What to do once a payload is staged, or once staging has failed.
 ///
 /// Boxed because it is handed across a trait whose implementations finish at
@@ -40,6 +42,12 @@ pub trait MediaCache: Send + Sync {
     /// allocated a hundred copies of it, so a 10 MiB photo could cost a
     /// gigabyte against a budget that had counted it once.
     fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String>;
+
+    fn image_source(&self, key: &str) -> Option<ImageSource> {
+        cached_image_source(key, || self.read(key))
+    }
+
+    fn clear_cached(&self) {}
 
     /// The bytes answering a request somebody is waiting on.
     ///
@@ -99,10 +107,122 @@ pub trait MediaCache: Send + Sync {
     fn discard(&self, key: &str);
 }
 
+fn cached_image_source(
+    key: &str,
+    read: impl FnOnce() -> Result<Arc<Vec<u8>>, String>,
+) -> Option<ImageSource> {
+    AVATAR_IMAGES.with(|images| {
+        let mut images = images.borrow_mut();
+        if let Some(source) = images.get(key) {
+            return Some(source);
+        }
+        let bytes = read().ok()?;
+        let (source, decoded_size) = decode_avatar(&bytes)?;
+        let size = (bytes.len() as u64).saturating_add(decoded_size);
+        images.put(key.to_string(), source.clone(), size);
+        Some(source)
+    })
+}
+
+fn decode_avatar(bytes: &[u8]) -> Option<(ImageSource, u64)> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    limits.max_image_height = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    limits.max_alloc = Some(oxidezap_core::MAX_AVATAR_PIXELS * 4);
+    reader.limits(limits);
+    let image = reader.decode().ok()?;
+    let (width, height) = (image.width(), image.height());
+    let pixels = u64::from(width).checked_mul(u64::from(height))?;
+    if pixels > oxidezap_core::MAX_AVATAR_PIXELS {
+        return None;
+    }
+    let decoded_size = pixels.checked_mul(4)?;
+    let image = image.to_rgba8();
+    Some((
+        ImageSource::from(Arc::new(RenderImage::new(smallvec::smallvec![
+            image::Frame::new(image),
+        ]))),
+        decoded_size,
+    ))
+}
+
+pub(crate) fn clear_image_sources() {
+    AVATAR_IMAGES.with(|images| images.borrow_mut().clear());
+}
+
 /// The media cache as a process that shares the daemon's filesystem sees it:
 /// a directory both of them can open.
 #[cfg(not(target_family = "wasm"))]
 pub struct Directory;
+
+thread_local! {
+    static AVATAR_IMAGES: std::cell::RefCell<SourceCache> =
+        std::cell::RefCell::new(SourceCache::default());
+}
+
+#[derive(Default)]
+struct SourceCache {
+    entries: std::collections::HashMap<String, SourceEntry>,
+    clock: u64,
+    bytes: u64,
+}
+
+const MAX_SOURCE_ENTRIES: usize = 256;
+
+struct SourceEntry {
+    source: ImageSource,
+    bytes: u64,
+    touched: u64,
+}
+
+impl SourceCache {
+    fn get(&mut self, key: &str) -> Option<ImageSource> {
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.get_mut(key).map(|entry| {
+            entry.touched = self.clock;
+            entry.source.clone()
+        })
+    }
+
+    fn put(&mut self, key: String, source: ImageSource, bytes: u64) {
+        if let Some(entry) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.insert(
+            key,
+            SourceEntry {
+                source,
+                bytes,
+                touched: self.clock,
+            },
+        );
+        while self.bytes > oxidezap_core::DECODED_IMAGE_BUDGET_BYTES
+            || self.entries.len() > MAX_SOURCE_ENTRIES
+        {
+            let Some(key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
 
 #[cfg(not(target_family = "wasm"))]
 impl MediaCache for Directory {
@@ -111,6 +231,25 @@ impl MediaCache for Directory {
             .ok_or_else(|| format!("the daemon named an unusable cache key: {key}"))
             .and_then(|path| std::fs::read(path).map_err(|e| e.to_string()))
             .map(Arc::new)
+    }
+
+    fn image_source(&self, key: &str) -> Option<ImageSource> {
+        AVATAR_IMAGES.with(|images| {
+            let mut images = images.borrow_mut();
+            if let Some(source) = images.get(key) {
+                return Some(source);
+            }
+            let path = oxidezap_ipc::media_path(key)?;
+            let bytes = std::fs::read(path).ok()?;
+            let (source, decoded_size) = decode_avatar(&bytes)?;
+            let size = (bytes.len() as u64).saturating_add(decoded_size);
+            images.put(key.to_string(), source.clone(), size);
+            Some(source)
+        })
+    }
+
+    fn clear_cached(&self) {
+        clear_image_sources();
     }
 
     fn stage(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
@@ -327,6 +466,7 @@ fn write_new(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[derive(Default)]
 pub struct Held {
     bytes: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+    avatars: std::sync::Mutex<AvatarCache>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -339,9 +479,23 @@ impl Held {
             .insert(key, Arc::new(bytes));
     }
 
+    pub fn put_avatar(&self, key: String, bytes: Vec<u8>) {
+        self.avatars
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(key, bytes);
+    }
+
     /// Forget whatever the last frame did not use.
     pub fn clear(&self) {
         self.bytes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    pub fn clear_avatars(&self) {
+        self.avatars
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Forget one key, whether or not the frame is done with it.
@@ -365,6 +519,12 @@ impl Held {
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
             .map(Arc::clone)
+            .or_else(|| {
+                self.avatars
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(key)
+            })
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
 
@@ -381,6 +541,70 @@ impl Held {
             .unwrap_or_else(|e| e.into_inner())
             .remove(key)
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Default)]
+struct AvatarCache {
+    entries: std::collections::HashMap<String, AvatarEntry>,
+    clock: u64,
+    bytes: u64,
+}
+
+#[cfg(target_family = "wasm")]
+struct AvatarEntry {
+    bytes: Arc<Vec<u8>>,
+    touched: u64,
+}
+
+#[cfg(target_family = "wasm")]
+impl AvatarCache {
+    fn put(&mut self, key: String, bytes: Vec<u8>) {
+        let bytes = Arc::new(bytes);
+        if let Some(entry) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes.len() as u64);
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+        self.entries.insert(
+            key,
+            AvatarEntry {
+                bytes,
+                touched: self.clock,
+            },
+        );
+        self.evict();
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<Vec<u8>>> {
+        let clock = self.clock.wrapping_add(1);
+        self.clock = clock;
+        self.entries.get_mut(key).map(|entry| {
+            entry.touched = clock;
+            Arc::clone(&entry.bytes)
+        })
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    fn evict(&mut self) {
+        while self.bytes > oxidezap_core::WEB_MEDIA_BUDGET_BYTES as u64 {
+            let Some(key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes.len() as u64);
+            }
+        }
     }
 }
 
@@ -413,6 +637,11 @@ impl MediaCache for Fetched {
 
     fn read_once(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
         self.held.read_once(key)
+    }
+
+    fn clear_cached(&self) {
+        self.held.clear_avatars();
+        clear_image_sources();
     }
 
     /// Refused, because staging from a page is not synchronous.
@@ -574,6 +803,48 @@ mod tests {
             "the cache was left reachable by other accounts on this machine"
         );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn image_sources_follow_the_media_budget() {
+        let mut cache = SourceCache::default();
+        let source = || ImageSource::from("avatar");
+
+        cache.put(
+            "old".to_string(),
+            source(),
+            oxidezap_core::DECODED_IMAGE_BUDGET_BYTES,
+        );
+        cache.put("new".to_string(), source(), 1);
+
+        assert!(cache.get("old").is_none());
+        assert!(cache.get("new").is_some());
+    }
+
+    #[test]
+    fn image_sources_have_an_entry_ceiling_when_their_cost_is_unknown() {
+        let mut cache = SourceCache::default();
+        for index in 0..=MAX_SOURCE_ENTRIES {
+            cache.put(index.to_string(), ImageSource::from("avatar"), 0);
+        }
+
+        assert_eq!(cache.entries.len(), MAX_SOURCE_ENTRIES);
+        assert!(cache.get("0").is_none());
+        assert!(cache.get(&MAX_SOURCE_ENTRIES.to_string()).is_some());
+    }
+
+    #[test]
+    fn avatar_decoder_rejects_excessive_pixel_count() {
+        let image = image::DynamicImage::new_rgb8(2048, 2048);
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        assert!(decode_avatar(&bytes).is_none());
     }
 
     /// And the payload does not go through whatever is at the name. A staged

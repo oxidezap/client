@@ -15,6 +15,7 @@ use wacore_binary::jid::{Jid, JidExt};
 use super::Bridge;
 use super::read_tracker::ReadTracker;
 use crate::state::Change;
+use crate::state::StateHub;
 
 /// What the session has to be told after an event was folded into daemon
 /// state.
@@ -36,7 +37,8 @@ impl Bridge {
     ///
     /// Folding does not touch the client, so this stays testable without a
     /// store: what it cannot do itself it returns, and the run loop performs.
-    pub(super) fn observe(&mut self, event: UiEvent) -> Answer {
+    pub(super) fn observe(&mut self, mut event: UiEvent) -> Answer {
+        prepare_avatars(&self.hub, &mut event);
         let mut answer = Answer::Nothing;
         // Before anything is published, so a `MarkRead` that arrives right
         // behind a message already covers it. What it answers is whether the
@@ -375,6 +377,19 @@ impl Bridge {
             ConnectionState::Pairing { qr, pair_code } => (qr, pair_code),
             _ => (None, None),
         }
+    }
+}
+
+fn prepare_avatars(hub: &std::sync::Arc<StateHub>, event: &mut UiEvent) {
+    let UiEvent::HistoryLoaded { chats, .. } = event else {
+        return;
+    };
+    for chat in chats {
+        crate::avatar::queue(hub, chat);
+        if let Some(picture_id) = chat.avatar_key.as_deref() {
+            chat.avatar_key = Some(crate::avatar::key(&chat.jid, picture_id));
+        }
+        chat.avatar_source = None;
     }
 }
 

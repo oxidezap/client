@@ -6,13 +6,16 @@
 //! by a push name in one chat and a phone number in another — keeps the same
 //! colour, which is the whole point of having one.
 
+use std::sync::Arc;
+
 use gpui::{
-    AnyElement, App, Hsla, IntoElement, ParentElement, Pixels, RenderOnce, SharedString, Styled,
-    Window, div, linear_color_stop, linear_gradient,
+    AnyElement, App, Hsla, ImageSource, IntoElement, ParentElement, Pixels, RenderOnce,
+    SharedString, Styled, Window, div, img, linear_color_stop, linear_gradient,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::{Icon, IconName};
 
+use crate::session::MediaCache;
 use crate::theme::ActiveProductTheme as _;
 
 /// Where a contact is, as far as the avatar needs to know.
@@ -43,6 +46,7 @@ pub struct Avatar {
     /// The surface the avatar sits on, which the badge's ring has to match to
     /// read as a cut-out rather than a second circle.
     ground: Option<Hsla>,
+    picture: Option<ImageSource>,
 }
 
 impl Avatar {
@@ -60,6 +64,7 @@ impl Avatar {
             size,
             badge: None,
             ground: None,
+            picture: None,
         }
     }
 
@@ -87,6 +92,11 @@ impl Avatar {
         self.ground = Some(ground);
         self
     }
+
+    pub fn picture(mut self, key: Option<String>, cache: Option<Arc<dyn MediaCache>>) -> Self {
+        self.picture = key.and_then(|key| cache?.image_source(&key));
+        self
+    }
 }
 
 impl RenderOnce for Avatar {
@@ -107,8 +117,8 @@ impl RenderOnce for Avatar {
             .relative()
             .flex_shrink_0()
             .size(self.size)
-            .child(
-                div()
+            .child({
+                let fallback = div()
                     .size(self.size)
                     .rounded_full()
                     .border_1()
@@ -124,8 +134,16 @@ impl RenderOnce for Avatar {
                     .text_size(self.size * 0.38)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(product.hsla(hue))
-                    .child(self.initial.to_string()),
-            )
+                    .child(self.initial.to_string());
+                match self.picture {
+                    Some(url) => div()
+                        .relative()
+                        .size(self.size)
+                        .child(fallback)
+                        .child(img(url).absolute().inset_0().size(self.size).rounded_full()),
+                    None => fallback,
+                }
+            })
             .children(
                 self.badge
                     .map(|badge| render_badge(badge, badge_size, ground, cx)),

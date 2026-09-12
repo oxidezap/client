@@ -110,6 +110,14 @@ pub struct Chat {
     /// talk to.
     #[serde(default)]
     pub is_status: bool,
+    /// The signed source URL used by the daemon to fetch the picture.
+    #[serde(default, skip_serializing)]
+    pub avatar_source: Option<String>,
+    /// The daemon media key for the cached profile picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_key: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub avatar_loaded: bool,
     /// Participant names in group chats (sender JID -> display name)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub participants: HashMap<String, String>,
@@ -176,6 +184,9 @@ impl Chat {
             pinned_at: None,
             is_group,
             is_status,
+            avatar_source: None,
+            avatar_key: None,
+            avatar_loaded: false,
             participants: HashMap::new(),
             messages: Vec::new(),
             from_store: false,

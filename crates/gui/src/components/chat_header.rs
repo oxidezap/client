@@ -1,5 +1,7 @@
 //! The bar above a conversation: who it is, and what can be done with them.
 
+use std::sync::Arc;
+
 use gpui::{
     App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder as _,
 };
@@ -145,6 +147,7 @@ pub fn render_chat_header(
     // goes and nothing about what a plugin is.
     plugin_actions: Vec<gpui::AnyElement>,
     layout: ResponsiveLayout,
+    media: Option<Arc<dyn crate::session::MediaCache>>,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
@@ -183,7 +186,7 @@ pub fn render_chat_header(
         .border_b_1()
         .border_color(cx.theme().border)
         .child(render_identity(
-            chat, name, subtitle, presence, &entity, layout, metrics, cx,
+            chat, name, subtitle, presence, &entity, layout, metrics, media, cx,
         ))
         .child(render_actions(
             chat,
@@ -205,6 +208,7 @@ fn render_identity(
     entity: &Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     metrics: Metrics,
+    media: Option<Arc<dyn crate::session::MediaCache>>,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let back_entity = entity.clone();
@@ -233,6 +237,7 @@ fn render_identity(
         .child(
             Avatar::new(chat.jid.clone(), &chat.name, metrics.avatar_header())
                 .group(chat.is_group)
+                .picture(chat.avatar_key.clone(), media)
                 .presence(presence)
                 .on(cx.theme().sidebar),
         )

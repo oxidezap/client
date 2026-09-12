@@ -82,6 +82,10 @@ pub enum UiEvent {
         message_id: String,
         reason: String,
     },
+    AvatarReady {
+        jid: String,
+        key: String,
+    },
     ReactionReceived {
         chat_jid: String,
         message_id: String,

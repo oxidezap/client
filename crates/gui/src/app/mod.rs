@@ -887,6 +887,9 @@ pub struct WhatsAppApp {
 }
 
 impl WhatsAppApp {
+    pub fn media_cache(&self) -> Option<std::sync::Arc<dyn crate::session::MediaCache>> {
+        self.client.as_ref().map(Session::media_cache)
+    }
     /// Spawn the event handling task that processes UI events from the WhatsApp client
     fn spawn_event_task(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -933,6 +936,13 @@ impl WhatsAppApp {
                         app.account_jid = account.as_ref().and_then(|a| a.jid.clone());
                         app.account_lid = account.and_then(|a| a.lid);
                         cx.notify();
+                    }),
+                    FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
+                        if let Some(chat) = app.find_chat_mut(&jid) {
+                            chat.avatar_key = Some(key);
+                            app.invalidate_chat_cache();
+                            cx.notify();
+                        }
                     }),
                     // Refused, or it never left this process. The ring came
                     // down when the update was opened, which is right — a

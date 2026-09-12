@@ -216,6 +216,10 @@ impl MediaCache for InProcess {
         oxidezap_daemon::media::deliver(key).ok_or_else(|| format!("media {key} is not cached"))
     }
 
+    fn clear_cached(&self) {
+        super::media::clear_image_sources();
+    }
+
     fn stage(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
         oxidezap_daemon::media::put(key, bytes)
             .map(|_| ())
