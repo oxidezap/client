@@ -170,7 +170,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   callback or a connection task would skip disconnecting the session and
   closing SQLite. A signal would have been the obvious carrier and is not one
   Windows has, so the signal handlers feed the same in-process notification
-  rather than being a second route.
+  rather than being a second route. The first signal starts that graceful
+  shutdown; a second one while it drains exits on 128-plus-signal-number
+  rather than waiting it out, because the teardown has joins without a
+  deadline and a repeated signal is somebody saying the wait is the problem.
 - **The front end owns no session.** `oxidezap` starts `oxidezapd` when none is
   listening and speaks to it; the two ship together and the release packages
   them in one directory. A front end that cannot reach the daemon has no

@@ -197,15 +197,27 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
                 Err(e) => Err(anyhow::anyhow!("the web bridge panicked: {e}")),
             }
         }
-        () = termination.recv() => {
-            log::info!("shutting down");
+        stop = termination.recv() => {
+            match stop {
+                Stop::Signal(signal) => log::info!("shutting down on {}", signal.name()),
+                Stop::Asked => log::info!("shutting down"),
+            }
             Ok(())
         }
     };
 
     // Whichever ended, the session still has to disconnect and close SQLite.
     stop.notify_one();
-    finish(session.await, tray, server_outcome)
+    // While that drains, a repeated signal escalates rather than queues
+    // behind it: the teardown has joins without a deadline, and a second
+    // signal is somebody saying the first one is taking too long.
+    tokio::select! {
+        joined = &mut session => finish(joined, tray, server_outcome),
+        code = termination.escalation() => {
+            log::warn!("a second stop signal arrived while shutting down; exiting without finishing the teardown");
+            std::process::exit(code);
+        }
+    }
 }
 
 /// Fold the session's outcome into the server's and drop the tray.
@@ -227,6 +239,18 @@ fn finish(
     server_outcome.and(session_outcome)
 }
 
+/// Why `run` is stopping: a signal from outside, or an ask from inside.
+enum Stop {
+    /// SIGINT (Ctrl-C where there are no signals) or SIGTERM, caught once.
+    /// Drives the graceful shutdown; a second one while that drains
+    /// escalates instead.
+    Signal(shutdown::Signal),
+    /// The tray's Quit or a client's `Shutdown`. Already graceful, and a
+    /// repeated ask while draining stays that way rather than escalating —
+    /// only an outside signal says the wait itself is the problem.
+    Asked,
+}
+
 /// Everything that means "stop": a signal from outside, or an ask from
 /// inside.
 ///
@@ -239,6 +263,10 @@ fn finish(
 /// manager as by a terminal, and leaving SIGTERM to the default handler would
 /// skip the teardown below it. Ctrl-C where there are no signals at all.
 struct Termination {
+    /// First signal graceful, second escalates. Owned here rather than kept
+    /// as a flag because the policy is the library's to test; this only
+    /// carries what the operating system delivered to it.
+    gate: shutdown::SignalGate,
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
@@ -251,26 +279,104 @@ impl Termination {
         {
             use tokio::signal::unix::{SignalKind, signal};
             Ok(Self {
+                gate: shutdown::SignalGate::new(),
                 interrupt: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
                 terminate: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
             })
         }
         #[cfg(not(unix))]
-        Ok(Self {})
+        Ok(Self {
+            gate: shutdown::SignalGate::new(),
+        })
     }
 
     /// Resolve when anything asks the daemon to stop.
-    async fn recv(&mut self) {
+    ///
+    /// Always the graceful answer: this is the first stop, by construction —
+    /// the drain below is the only thing that waits again, and it waits
+    /// through [`Termination::escalation`].
+    async fn recv(&mut self) -> Stop {
         #[cfg(unix)]
         tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
-            () = shutdown::requested() => {}
+            _ = self.interrupt.recv() => {
+                // Observed unconditionally: a `debug_assert` alone would
+                // vanish in release builds and leave the gate believing no
+                // signal has arrived yet.
+                let first = self.gate.observe(shutdown::Signal::Interrupt);
+                debug_assert_eq!(first, shutdown::SignalDecision::Graceful);
+                Stop::Signal(shutdown::Signal::Interrupt)
+            }
+            _ = self.terminate.recv() => {
+                let first = self.gate.observe(shutdown::Signal::Terminate);
+                debug_assert_eq!(first, shutdown::SignalDecision::Graceful);
+                Stop::Signal(shutdown::Signal::Terminate)
+            }
+            () = shutdown::requested() => Stop::Asked,
         }
         #[cfg(not(unix))]
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            () = shutdown::requested() => {}
+            _ = tokio::signal::ctrl_c() => {
+                let first = self.gate.observe(shutdown::Signal::Interrupt);
+                debug_assert_eq!(first, shutdown::SignalDecision::Graceful);
+                Stop::Signal(shutdown::Signal::Interrupt)
+            }
+            () = shutdown::requested() => Stop::Asked,
+        }
+    }
+
+    /// Resolve when a further signal arrives while the teardown drains.
+    ///
+    /// Signals only: an ask from inside while draining is already underway
+    /// and stays graceful, so it is not waited on here. Answers the
+    /// conventional exit status for the signal that arrived, and the caller
+    /// exits on it without finishing the teardown — never panics, never
+    /// dumps core, never waits out the joins the graceful path is stuck in.
+    async fn escalation(&mut self) -> i32 {
+        #[cfg(unix)]
+        {
+            use shutdown::{Signal, SignalDecision};
+            let (signal, decision) = tokio::select! {
+                _ = self.interrupt.recv() => {
+                    (Signal::Interrupt, self.gate.observe(Signal::Interrupt))
+                }
+                _ = self.terminate.recv() => {
+                    (Signal::Terminate, self.gate.observe(Signal::Terminate))
+                }
+            };
+            match decision {
+                // Reached when the first stop was an ask from inside rather
+                // than a signal, so the gate is seeing its first one now. A
+                // signal during the drain still ends the wait — the outside
+                // world is saying the wait itself is the problem — on that
+                // signal's own status.
+                // Matched rather than unwrapped so a future reordering ends
+                // the wait instead of panicking on this path.
+                SignalDecision::Graceful => {
+                    log::error!("a stop signal arrived while shutting down; exiting on its status");
+                    signal.escalation_code()
+                }
+                SignalDecision::Escalate(code) => code,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => match self.gate.observe(shutdown::Signal::Interrupt) {
+                    shutdown::SignalDecision::Escalate(code) => code,
+                    shutdown::SignalDecision::Graceful => {
+                        shutdown::Signal::Interrupt.escalation_code()
+                    }
+                },
+                // No console to be interrupted from: installing the listener
+                // failed, so there is no second signal coming — wait for the
+                // teardown rather than exiting over nothing.
+                Err(e) => {
+                    log::error!(
+                        "cannot listen for a repeated Ctrl-C ({e}); waiting out the shutdown"
+                    );
+                    std::future::pending().await
+                }
+            }
         }
     }
 }
