@@ -221,6 +221,11 @@ impl MediaCache for Fetched {
         self.held.read_once(key)
     }
 
+    fn clear_cached(&self) {
+        self.held.clear_avatars();
+        super::media::clear_image_sources();
+    }
+
     /// Refused, because staging to another tab is not synchronous.
     ///
     /// The loud failure rather than a silent one, exactly as the socket path

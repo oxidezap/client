@@ -44,15 +44,7 @@ pub trait MediaCache: Send + Sync {
     fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String>;
 
     fn image_source(&self, key: &str) -> Option<ImageSource> {
-        let bytes = self.read(key).ok()?;
-        Some(ImageSource::from(
-            move |_window: &mut gpui::Window, _cx: &mut gpui::App| {
-                let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
-                Some(Ok(Arc::new(RenderImage::new(smallvec::smallvec![
-                    image::Frame::new(image),
-                ]))))
-            },
-        ))
+        cached_image_source(key, || self.read(key))
     }
 
     fn clear_cached(&self) {}
@@ -115,10 +107,98 @@ pub trait MediaCache: Send + Sync {
     fn discard(&self, key: &str);
 }
 
+fn cached_image_source(
+    key: &str,
+    read: impl FnOnce() -> Result<Arc<Vec<u8>>, String>,
+) -> Option<ImageSource> {
+    AVATAR_IMAGES.with(|images| {
+        let mut images = images.borrow_mut();
+        if let Some(source) = images.get(key) {
+            return Some(source);
+        }
+        let bytes = read().ok()?;
+        let size = bytes.len() as u64;
+        let source = ImageSource::from(move |_window: &mut gpui::Window, _cx: &mut gpui::App| {
+            let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            Some(Ok(Arc::new(RenderImage::new(smallvec::smallvec![
+                image::Frame::new(image),
+            ]))))
+        });
+        images.put(key.to_string(), source.clone(), size);
+        Some(source)
+    })
+}
+
+pub(crate) fn clear_image_sources() {
+    AVATAR_IMAGES.with(|images| images.borrow_mut().clear());
+}
+
 /// The media cache as a process that shares the daemon's filesystem sees it:
 /// a directory both of them can open.
 #[cfg(not(target_family = "wasm"))]
 pub struct Directory;
+
+thread_local! {
+    static AVATAR_IMAGES: std::cell::RefCell<SourceCache> =
+        std::cell::RefCell::new(SourceCache::default());
+}
+
+#[derive(Default)]
+struct SourceCache {
+    entries: std::collections::HashMap<String, SourceEntry>,
+    clock: u64,
+    bytes: u64,
+}
+
+struct SourceEntry {
+    source: ImageSource,
+    bytes: u64,
+    touched: u64,
+}
+
+impl SourceCache {
+    fn get(&mut self, key: &str) -> Option<ImageSource> {
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.get_mut(key).map(|entry| {
+            entry.touched = self.clock;
+            entry.source.clone()
+        })
+    }
+
+    fn put(&mut self, key: String, source: ImageSource, bytes: u64) {
+        if let Some(entry) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.insert(
+            key,
+            SourceEntry {
+                source,
+                bytes,
+                touched: self.clock,
+            },
+        );
+        while self.bytes > oxidezap_core::WEB_MEDIA_BUDGET_BYTES {
+            let Some(key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
 
 #[cfg(not(target_family = "wasm"))]
 impl MediaCache for Directory {
@@ -130,7 +210,19 @@ impl MediaCache for Directory {
     }
 
     fn image_source(&self, key: &str) -> Option<ImageSource> {
-        oxidezap_ipc::media_path(key).map(ImageSource::from)
+        AVATAR_IMAGES.with(|images| {
+            let mut images = images.borrow_mut();
+            if let Some(source) = images.get(key) {
+                return Some(source);
+            }
+            let source = oxidezap_ipc::media_path(key).map(ImageSource::from)?;
+            images.put(key.to_string(), source.clone(), 0);
+            Some(source)
+        })
+    }
+
+    fn clear_cached(&self) {
+        clear_image_sources();
     }
 
     fn stage(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
@@ -442,6 +534,7 @@ struct AvatarEntry {
 #[cfg(target_family = "wasm")]
 impl AvatarCache {
     fn put(&mut self, key: String, bytes: Vec<u8>) {
+        let bytes = Arc::new(bytes);
         if let Some(entry) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(entry.bytes.len() as u64);
         }
@@ -450,7 +543,7 @@ impl AvatarCache {
         self.entries.insert(
             key,
             AvatarEntry {
-                bytes: Arc::new(bytes),
+                bytes,
                 touched: self.clock,
             },
         );
@@ -521,6 +614,7 @@ impl MediaCache for Fetched {
 
     fn clear_cached(&self) {
         self.held.clear_avatars();
+        clear_image_sources();
     }
 
     /// Refused, because staging from a page is not synchronous.
@@ -682,6 +776,22 @@ mod tests {
             "the cache was left reachable by other accounts on this machine"
         );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn image_sources_follow_the_media_budget() {
+        let mut cache = SourceCache::default();
+        let source = || ImageSource::from("avatar");
+
+        cache.put(
+            "old".to_string(),
+            source(),
+            oxidezap_core::WEB_MEDIA_BUDGET_BYTES,
+        );
+        cache.put("new".to_string(), source(), 1);
+
+        assert!(cache.get("old").is_none());
+        assert!(cache.get("new").is_some());
     }
 
     /// And the payload does not go through whatever is at the name. A staged
