@@ -1566,8 +1566,6 @@ impl WhatsAppApp {
             app.window_focused = focused;
             if focused {
                 app.resume_visible_read(cx);
-            } else {
-                app.owed_reads.clear();
             }
             cx.notify();
         }));

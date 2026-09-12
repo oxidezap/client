@@ -176,7 +176,7 @@ impl WhatsAppApp {
                     // same reason: a reload while the reader is in Status
                     // would otherwise clear the badge of a conversation nobody
                     // was looking at.
-                    if self.visible_chat.as_deref() == Some(jid.as_str()) {
+                    if self.window_focused && self.visible_chat.as_deref() == Some(jid.as_str()) {
                         Arc::make_mut(&mut self.chats[at]).mark_as_read();
                     }
                     // The read a row without messages could not bound. Spent
