@@ -289,6 +289,12 @@ actions!(
     [
         /// Move focus to the conversation search field.
         FocusSearch,
+        /// Open or close the search for messages in the open conversation.
+        ToggleConversationSearch,
+        /// Move one page through the open conversation.
+        PageChatHistoryUp,
+        /// Move one page through the open conversation.
+        PageChatHistoryDown,
         /// Open the Settings screen.
         OpenSettings,
         /// Dismiss the topmost overlay: Settings, the media viewer, a reply.
@@ -544,6 +550,21 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
         // Window-wide: reachable whatever owns focus, because both are ways
         // *out* of wherever the user currently is.
         KeyBinding::new("secondary-k", FocusSearch, None),
+        KeyBinding::new(
+            crate::platform::keyboard::conversation_search_key(),
+            ToggleConversationSearch,
+            None,
+        ),
+        KeyBinding::new(
+            crate::platform::keyboard::chat_history_page_keys().0,
+            PageChatHistoryUp,
+            None,
+        ),
+        KeyBinding::new(
+            crate::platform::keyboard::chat_history_page_keys().1,
+            PageChatHistoryDown,
+            None,
+        ),
         KeyBinding::new("secondary-,", OpenSettings, None),
         // Scoped to the call so Enter and Escape keep their composer meaning
         // while nothing is ringing.
@@ -3166,6 +3187,17 @@ impl Render for WhatsAppApp {
             .relative()
             .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
                 app.focus_search(window, cx);
+            }))
+            .on_action(
+                cx.listener(|app, _: &ToggleConversationSearch, window, cx| {
+                    app.toggle_conversation_search(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|app, _: &PageChatHistoryUp, window, cx| {
+                app.page_chat_history(false, window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &PageChatHistoryDown, window, cx| {
+                app.page_chat_history(true, window, cx);
             }))
             .on_action(cx.listener(|app, _: &OpenSettings, window, cx| {
                 app.open_settings(window, cx);

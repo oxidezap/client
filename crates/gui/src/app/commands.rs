@@ -7,6 +7,18 @@
 use super::*;
 
 impl WhatsAppApp {
+    /// Move the open conversation by one viewport and let normal paging fetch
+    /// older rows when the movement reaches the loaded history's start.
+    pub fn page_chat_history(&mut self, forward: bool, window: &Window, cx: &mut Context<Self>) {
+        if self.selected_chat.is_none() || self.message_list.item_count() == 0 {
+            return;
+        }
+        let distance = crate::platform::keyboard::page_scroll_distance(window);
+        self.message_list
+            .scroll_by(if forward { distance } else { -distance });
+        cx.notify();
+    }
+
     /// Move focus to the conversation search field.
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Only where there is a list to search. Every case below reaches the

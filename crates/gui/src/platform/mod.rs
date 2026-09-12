@@ -31,6 +31,7 @@ pub mod clock;
 pub mod download;
 pub mod fonts;
 pub mod identity;
+pub mod keyboard;
 pub mod launch;
 pub mod lifecycle;
 pub mod log_store;
