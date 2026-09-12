@@ -5,6 +5,12 @@
 
 use super::*;
 
+fn media_fingerprint(data: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
 impl WhatsAppApp {
     /// Let go of the media the conversations are holding beyond their share.
     ///
@@ -744,6 +750,7 @@ impl WhatsAppApp {
             // has: `adopt_full_bytes` clears it, on the app's path and on the
             // one that never reaches the app.
             preview: media.data_is_preview,
+            fingerprint: media_fingerprint(data),
         };
         // A hit moves the entry to the back, which is what makes the order
         // below least-recently-used rather than insertion order. By
@@ -824,6 +831,7 @@ impl WhatsAppApp {
             bytes: media.data.len(),
             format: mime_to_image_format(&media.mime_type).unwrap_or(gpui::ImageFormat::Png),
             preview: media.data_is_preview,
+            fingerprint: media_fingerprint(media.data.as_slice()),
         };
         if let Some((seen, valid)) = self.sticker_validation.borrow().get(message_id)
             && *seen == cached

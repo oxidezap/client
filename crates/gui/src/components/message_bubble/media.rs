@@ -193,7 +193,7 @@ pub(super) fn render_media_content(
                             .object_fit(gpui::ObjectFit::Contain);
                         el.child(image)
                     }
-                    _ => {
+                    (_, cached_image) => {
                         // A sticker must stay a sticker when its WebP payload
                         // cannot be decoded. Never send it through the photo
                         // renderer, which hides the actual media failure.
@@ -201,14 +201,22 @@ pub(super) fn render_media_content(
                             && let Some(format) = still_image_format(&media_content)
                             && format != gpui::ImageFormat::Webp
                         {
-                            el.child(render_image_from_bytes(
-                                media_content.data,
-                                format,
-                                display_w,
-                                display_h,
-                                cx.product().metrics.radius_lg(),
-                                false,
-                            ))
+                            el.child(match cached_image {
+                                Some(cached) => img(ImageSource::Image(cached))
+                                    .w(px(display_w))
+                                    .h(px(display_h))
+                                    .object_fit(gpui::ObjectFit::Contain)
+                                    .into_any_element(),
+                                None => render_image_from_bytes(
+                                    media_content.data,
+                                    format,
+                                    display_w,
+                                    display_h,
+                                    cx.product().metrics.radius_lg(),
+                                    false,
+                                )
+                                .into_any_element(),
+                            })
                         } else if let Some(dl) = media_content.downloadable.clone() {
                             el.child(render_download_placeholder(
                                 "sticker-dl",
@@ -454,9 +462,16 @@ fn valid_webp_payload(bytes: &[u8]) -> bool {
     }
     if decoder.has_animation() {
         let mut frames = decoder.into_frames();
-        frames
-            .next()
-            .is_some_and(|frame| frame.is_ok() && frames.all(|frame| frame.is_ok()))
+        const MAX_STICKER_FRAMES: usize = 256;
+        for frame_number in 0..=MAX_STICKER_FRAMES {
+            let Some(frame) = frames.next() else {
+                return frame_number > 0;
+            };
+            if frame.is_err() {
+                return false;
+            }
+        }
+        false
     } else {
         let Ok(byte_count) = usize::try_from(decoder.total_bytes()) else {
             return false;
