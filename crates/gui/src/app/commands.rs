@@ -202,6 +202,7 @@ impl WhatsAppApp {
             .search
             .update(cx, |search, cx| search.close_conversation(cx));
         if closed {
+            self.keyboard_owner = None;
             cx.notify();
         }
         closed
