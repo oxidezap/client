@@ -764,13 +764,17 @@ impl WhatsAppApp {
                 // Unless the bytes behind it have been replaced, in which
                 // case the entry describes a picture that is gone and the
                 // insert below overwrites it.
-                if cache.get_index(at).is_some_and(|(_, (seen, image))| {
+                let hit = cache.get_index(at).is_some_and(|(_, (seen, image))| {
                     seen.bytes == cached.bytes
                         && seen.format == cached.format
                         && seen.preview == cached.preview
                         && (seen.identity == cached.identity
                             || image.bytes.as_slice() == data.as_slice())
-                }) {
+                });
+                if hit {
+                    if let Some((_, (seen, _))) = cache.get_index_mut(at) {
+                        seen.identity = cached.identity;
+                    }
                     let last = cache.len() - 1;
                     cache.move_index(at, last);
                     return cache
@@ -834,13 +838,17 @@ impl WhatsAppApp {
             preview: media.data_is_preview,
             identity: media_identity(&media.data),
         };
-        if let Some((seen, valid, bytes)) = self.sticker_validation.borrow().get(message_id)
-            && seen.bytes == cached.bytes
-            && seen.format == cached.format
-            && seen.preview == cached.preview
-            && (seen.identity == cached.identity || bytes.as_slice() == media.data.as_slice())
         {
-            return *valid;
+            let mut validation = self.sticker_validation.borrow_mut();
+            if let Some((seen, valid, bytes)) = validation.get_mut(message_id)
+                && seen.bytes == cached.bytes
+                && seen.format == cached.format
+                && seen.preview == cached.preview
+                && (seen.identity == cached.identity || bytes.as_slice() == media.data.as_slice())
+            {
+                seen.identity = cached.identity;
+                return *valid;
+            }
         }
         let valid = crate::components::message_bubble::sticker_payload_is_valid(media);
         const STICKER_VALIDATION_CACHE_BYTES: usize = 64 * 1024 * 1024;
