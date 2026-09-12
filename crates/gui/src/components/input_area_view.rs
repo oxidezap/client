@@ -3,7 +3,7 @@
 //! This component is designed for performance: when the user types,
 //! only this component re-renders, NOT the parent app.
 
-use std::time::Duration;
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use wacore::time::Instant;
 
@@ -32,7 +32,11 @@ pub enum InputAreaEvent {
     /// nor waits for.
     AttachFiles,
     /// An image pasted into this conversation.
-    PasteImage(crate::platform::picker::Picked),
+    PasteImage(Rc<RefCell<Option<crate::platform::picker::Picked>>>),
+    /// An image paste was rejected before it could be sent.
+    PasteImageError(String),
+    /// An image paste started and its destination should be captured.
+    PasteImageStarted,
     /// User started PTT recording
     StartRecording,
     /// User stopped PTT recording (send the audio)
@@ -193,14 +197,23 @@ impl InputAreaView {
     }
 
     fn paste_image(&self, cx: &mut Context<Self>) {
+        cx.emit(InputAreaEvent::PasteImageStarted);
         let entity = cx.entity().downgrade();
         let task = crate::platform::clipboard::read(cx);
         cx.spawn(async move |_, cx| match task.await {
             Ok(Some(file)) => {
-                let _ = entity.update(cx, |_, cx| cx.emit(InputAreaEvent::PasteImage(file)));
+                let _ = entity.update(cx, |_, cx| {
+                    cx.emit(InputAreaEvent::PasteImage(Rc::new(RefCell::new(Some(
+                        file,
+                    )))))
+                });
             }
             Ok(None) => {}
-            Err(error) => log::debug!("image clipboard is unavailable: {error}"),
+            Err(error) => {
+                let _ = entity.update(cx, |_, cx| {
+                    cx.emit(InputAreaEvent::PasteImageError(error));
+                });
+            }
         })
         .detach();
     }
@@ -462,9 +475,7 @@ impl InputAreaView {
                     .min_w_0()
                     .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
                         let modifiers = &event.keystroke.modifiers;
-                        if event.keystroke.key.eq_ignore_ascii_case("v")
-                            && (modifiers.control || modifiers.platform)
-                        {
+                        if event.keystroke.key.eq_ignore_ascii_case("v") && modifiers.secondary() {
                             view.paste_image(cx);
                         }
                     }))
