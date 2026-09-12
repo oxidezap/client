@@ -764,10 +764,11 @@ impl WhatsAppApp {
                 // Unless the bytes behind it have been replaced, in which
                 // case the entry describes a picture that is gone and the
                 // insert below overwrites it.
-                if cache
-                    .get_index(at)
-                    .is_some_and(|(_, (seen, _))| *seen == cached)
-                {
+                if cache.get_index(at).is_some_and(|(_, (seen, image))| {
+                    *seen == cached
+                        && (seen.identity == cached.identity
+                            || image.bytes.as_slice() == data.as_slice())
+                }) {
                     let last = cache.len() - 1;
                     cache.move_index(at, last);
                     return cache
@@ -831,8 +832,9 @@ impl WhatsAppApp {
             preview: media.data_is_preview,
             identity: media_identity(&media.data),
         };
-        if let Some((seen, valid)) = self.sticker_validation.borrow().get(message_id)
+        if let Some((seen, valid, bytes)) = self.sticker_validation.borrow().get(message_id)
             && *seen == cached
+            && (seen.identity == cached.identity || bytes.as_slice() == media.data.as_slice())
         {
             return *valid;
         }
@@ -841,7 +843,10 @@ impl WhatsAppApp {
         if validation.len() >= MAX_DECODED_IMAGES {
             validation.shift_remove_index(0);
         }
-        validation.insert(message_id.to_string(), (cached, valid));
+        validation.insert(
+            message_id.to_string(),
+            (cached, valid, Arc::clone(&media.data)),
+        );
         valid
     }
 

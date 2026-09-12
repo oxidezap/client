@@ -811,7 +811,7 @@ pub struct WhatsAppApp {
     /// Uses RefCell for interior mutability since we need to cache during immutable render.
     /// Uses IndexMap to maintain insertion order for deterministic FIFO eviction.
     decoded_images: RefCell<IndexMap<String, (Cached, Arc<Image>)>>,
-    sticker_validation: RefCell<IndexMap<String, (Cached, bool)>>,
+    sticker_validation: RefCell<IndexMap<String, StickerValidation>>,
     /// Cache of message list data per chat to avoid expensive recomputation on every render.
     /// Key is the chat JID, value is the cached data.
     message_list_cache: RefCell<HashMap<String, MessageListCache>>,
@@ -3304,6 +3304,8 @@ pub struct Cached {
     preview: bool,
     identity: usize,
 }
+
+type StickerValidation = (Cached, bool, Arc<Vec<u8>>);
 
 /// Whether the timeline this frame is building may ask for the page before
 /// it.

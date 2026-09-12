@@ -463,6 +463,7 @@ fn valid_webp_payload(bytes: &[u8]) -> bool {
     if decoder.has_animation() {
         let mut frames = decoder.into_frames();
         const MAX_STICKER_FRAMES: usize = 256;
+        const MAX_STICKER_VALIDATION_BYTES: usize = 256 * 1024 * 1024;
         let mut decoded_bytes = 0usize;
         for frame_number in 0..=MAX_STICKER_FRAMES {
             let Some(frame) = frames.next() else {
@@ -474,7 +475,7 @@ fn valid_webp_payload(bytes: &[u8]) -> bool {
             let Some(total) = decoded_bytes.checked_add(frame.buffer().len()) else {
                 return false;
             };
-            if total > oxidezap_core::DECODED_IMAGE_BUDGET_BYTES as usize {
+            if total > MAX_STICKER_VALIDATION_BYTES {
                 return false;
             }
             decoded_bytes = total;
