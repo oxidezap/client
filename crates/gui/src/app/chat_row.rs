@@ -168,12 +168,12 @@ pub fn disambiguate_names(rows: &mut [ChatRow]) {
 }
 
 fn stable_disambiguator(jid: &str) -> String {
-    let mut hash = 2_166_136_261u32;
+    let mut hash = 14_695_981_039_346_656_037u64;
     for byte in jid.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(16_777_619);
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
     }
-    format!("{hash:08x}")
+    format!("{hash:016x}")
 }
 
 fn preview_for(
