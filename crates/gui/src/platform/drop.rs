@@ -68,7 +68,7 @@ mod imp {
             let Some(files) = event.data_transfer().and_then(|data| data.files()) else {
                 return;
             };
-            let _ = drop_entity.update(|app, cx| app.drop_file_list(files, cx));
+            let _ = drop_entity.update(|app: &mut WhatsAppApp, cx| app.drop_file_list(files, cx));
         });
         let target: &web_sys::EventTarget = document.as_ref();
         target
