@@ -347,6 +347,46 @@ impl WhatsAppClient {
         chat_limit: usize,
         message_limit: usize,
     ) -> Result<LoadedHistory, oxidezap_chat_store::ChatStoreError> {
+        Self::load_history_scoped_with_limits_impl(
+            chat_store,
+            client,
+            only,
+            names,
+            chat_limit,
+            message_limit,
+            true,
+        )
+        .await
+    }
+
+    pub(super) async fn load_history_before_connection(
+        chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
+        chat_limit: usize,
+        message_limit: usize,
+    ) -> Result<LoadedHistory, oxidezap_chat_store::ChatStoreError> {
+        Self::load_history_scoped_with_limits_impl(
+            chat_store,
+            client,
+            None,
+            names,
+            chat_limit,
+            message_limit,
+            false,
+        )
+        .await
+    }
+
+    async fn load_history_scoped_with_limits_impl(
+        chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        only: Option<&HashSet<String>>,
+        names: &NameBook,
+        chat_limit: usize,
+        message_limit: usize,
+        hydrate_avatars: bool,
+    ) -> Result<LoadedHistory, oxidezap_chat_store::ChatStoreError> {
         // A whole-list load is the pass that re-reads the address book, so it
         // is the one that drops what the book remembers: a contact renamed on
         // the phone appears under its new name without a restart, and the
@@ -425,7 +465,9 @@ impl WhatsAppClient {
             Self::attach_page_with_ceiling(entry, message_limit as i64)
         })
         .await?;
-        Self::hydrate_avatar_sources(client, &mut chats).await;
+        if hydrate_avatars {
+            Self::hydrate_avatar_sources(client, &mut chats).await;
+        }
         Ok(LoadedHistory {
             chats,
             complete,

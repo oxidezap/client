@@ -729,10 +729,9 @@ impl WhatsAppClient {
         let hydrating = wacore::time::Instant::now();
         let mut hydrated = 0;
         let (chat_limit, message_limit) = history_budget.limits();
-        match Self::load_history_scoped_with_limits(
+        match Self::load_history_before_connection(
             chat_store,
             &bot.client(),
-            None,
             names,
             chat_limit,
             message_limit,
