@@ -183,7 +183,7 @@ pub(super) fn render_media_content(
                         .child(image),
                 )
             } else {
-                match sticker_render_kind(&media_content) {
+                match sticker_render_kind(&media_content, decoded_image.is_some()) {
                     Some(kind) => {
                         let sticker_id: SharedString = format!("sticker-{}", message_id).into();
                         let image = match (decoded_image, kind) {
@@ -420,25 +420,18 @@ enum StickerRenderKind {
     Animated,
 }
 
-fn sticker_render_kind(media: &oxidezap_core::MediaContent) -> Option<StickerRenderKind> {
+fn sticker_render_kind(
+    media: &oxidezap_core::MediaContent,
+    already_validated: bool,
+) -> Option<StickerRenderKind> {
     if media.data.is_empty()
         || mime_to_image_format(&media.mime_type) != Some(gpui::ImageFormat::Webp)
+        || (!already_validated && !sticker_payload_is_valid(media))
     {
         return None;
     }
 
-    let decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(media.data.as_slice())).ok()?;
-    let valid = if decoder.has_animation() {
-        let mut frames = decoder.into_frames();
-        frames
-            .next()
-            .is_some_and(|frame| frame.is_ok() && frames.all(|frame| frame.is_ok()))
-    } else {
-        let byte_count = usize::try_from(decoder.total_bytes()).ok()?;
-        let mut decoded = vec![0; byte_count];
-        decoder.read_image(&mut decoded).is_ok()
-    };
-    if !valid {
+    if !already_validated && !valid_webp_payload(media.data.as_slice()) {
         return None;
     }
 
@@ -447,6 +440,30 @@ fn sticker_render_kind(media: &oxidezap_core::MediaContent) -> Option<StickerRen
     } else {
         StickerRenderKind::Static
     })
+}
+
+pub(crate) fn sticker_payload_is_valid(media: &oxidezap_core::MediaContent) -> bool {
+    !media.data.is_empty()
+        && mime_to_image_format(&media.mime_type) == Some(gpui::ImageFormat::Webp)
+        && valid_webp_payload(media.data.as_slice())
+}
+
+fn valid_webp_payload(bytes: &[u8]) -> bool {
+    let Ok(decoder) = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)) else {
+        return false;
+    };
+    if decoder.has_animation() {
+        let mut frames = decoder.into_frames();
+        frames
+            .next()
+            .is_some_and(|frame| frame.is_ok() && frames.all(|frame| frame.is_ok()))
+    } else {
+        let Ok(byte_count) = usize::try_from(decoder.total_bytes()) else {
+            return false;
+        };
+        let mut decoded = vec![0; byte_count];
+        decoder.read_image(&mut decoded).is_ok()
+    }
 }
 
 /// The bytes, drawn.
@@ -874,7 +891,7 @@ mod tests {
     #[test]
     fn static_webp_uses_the_dedicated_sticker_path() {
         assert_eq!(
-            sticker_render_kind(&webp_sticker(false)),
+            sticker_render_kind(&webp_sticker(false), false),
             Some(StickerRenderKind::Static)
         );
     }
@@ -882,7 +899,7 @@ mod tests {
     #[test]
     fn animated_webp_keeps_its_animation_metadata() {
         assert_eq!(
-            sticker_render_kind(&webp_sticker(true)),
+            sticker_render_kind(&webp_sticker(true), false),
             Some(StickerRenderKind::Animated)
         );
     }
@@ -891,18 +908,18 @@ mod tests {
     fn invalid_or_non_webp_stickers_use_the_fallback() {
         let mut invalid = webp_sticker(false);
         invalid.data = Arc::new(vec![1, 2, 3]);
-        assert_eq!(sticker_render_kind(&invalid), None);
+        assert_eq!(sticker_render_kind(&invalid, false), None);
 
         let mut image = webp_sticker(false);
         image.mime_type = "image/png".into();
-        assert_eq!(sticker_render_kind(&image), None);
+        assert_eq!(sticker_render_kind(&image, false), None);
     }
 
     #[test]
     fn image_attachments_are_not_sticker_payloads() {
         let image = MediaContent::image(Arc::new(vec![1, 2, 3]), "image/webp".into(), false);
         assert_eq!(image.media_type, oxidezap_core::MediaType::Image);
-        assert_eq!(sticker_render_kind(&image), None);
+        assert_eq!(sticker_render_kind(&image, false), None);
     }
 
     #[test]

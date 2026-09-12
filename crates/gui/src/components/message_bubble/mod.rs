@@ -26,6 +26,7 @@ use gpui_component::{Sizable as _, h_flex, v_flex};
 pub use audio::SPEEDS;
 pub use system::render_encryption_notice;
 
+pub(crate) use media::sticker_payload_is_valid;
 use media::{MediaProps, render_media_content};
 use quote::render_quote;
 use reactions::{render_hover_actions, render_reactions};

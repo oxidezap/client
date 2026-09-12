@@ -765,6 +765,12 @@ impl WhatsAppApp {
             }
         }
 
+        if media.media_type == oxidezap_core::MediaType::Sticker
+            && !crate::components::message_bubble::sticker_payload_is_valid(media)
+        {
+            return None;
+        }
+
         let image = Arc::new(Image::from_bytes(format, data.to_vec()));
 
         // What is on screen right now, which may not be evicted whatever the
