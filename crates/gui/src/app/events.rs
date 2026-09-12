@@ -114,9 +114,10 @@ impl WhatsAppApp {
             }
             UiEvent::AvatarReady { jid, key } => {
                 if let Some(chat) = self.find_chat_mut(&jid) {
-                    chat.avatar_key = Some(key);
-                    self.invalidate_chat_cache();
-                    cx.notify();
+                    if chat.avatar_key.as_deref() == Some(key.as_str()) {
+                        self.invalidate_chat_cache();
+                        cx.notify();
+                    }
                 }
             }
             UiEvent::QrCode { code, timeout_secs } => {
