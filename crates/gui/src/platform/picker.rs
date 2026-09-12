@@ -24,6 +24,7 @@
 use oxidezap_core::OutgoingMedia;
 
 /// A file somebody chose, read.
+#[derive(Clone, Debug)]
 pub struct Picked {
     /// What it was called where it was picked. Sanitized by whoever writes
     /// it, here and on the other side alike — this is a name, not a path.

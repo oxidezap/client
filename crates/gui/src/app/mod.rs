@@ -2370,6 +2370,17 @@ impl WhatsAppApp {
             InputAreaEvent::AttachFiles => {
                 self.attach_files(cx);
             }
+            InputAreaEvent::PasteImage(file) => {
+                let Some(jid) = self.selected_chat.clone() else {
+                    return;
+                };
+                let quoted = self.take_reply_draft(self.reply_to.clone(), cx);
+                if self.send_attachment(&jid, file.clone(), quoted, cx)
+                    && self.visible_chat.as_deref() == Some(&jid)
+                {
+                    self.scroll_to_last_message();
+                }
+            }
             InputAreaEvent::StartRecording => {
                 self.start_recording(cx);
             }

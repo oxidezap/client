@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use wacore::time::Instant;
 
-use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*};
+use gpui::{
+    App, Entity, EventEmitter, Focusable as _, KeyDownEvent, Task, WeakEntity, Window, div,
+    prelude::*,
+};
 use gpui_component::{
     ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants},
@@ -28,6 +31,8 @@ pub enum InputAreaEvent {
     /// files are chosen after the press — a dialog the composer neither owns
     /// nor waits for.
     AttachFiles,
+    /// An image pasted into this conversation.
+    PasteImage(crate::platform::picker::Picked),
     /// User started PTT recording
     StartRecording,
     /// User stopped PTT recording (send the audio)
@@ -185,6 +190,19 @@ impl InputAreaView {
             }
             _ => {}
         }
+    }
+
+    fn paste_image(&self, cx: &mut Context<Self>) {
+        let entity = cx.entity().downgrade();
+        let task = crate::platform::clipboard::read(cx);
+        cx.spawn(async move |_, cx| match task.await {
+            Ok(Some(file)) => {
+                let _ = entity.update(cx, |_, cx| cx.emit(InputAreaEvent::PasteImage(file)));
+            }
+            Ok(None) => {}
+            Err(error) => log::debug!("image clipboard is unavailable: {error}"),
+        })
+        .detach();
     }
 
     /// Handle a keystroke - updates typing state
@@ -442,6 +460,14 @@ impl InputAreaView {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
+                        let modifiers = &event.keystroke.modifiers;
+                        if event.keystroke.key.eq_ignore_ascii_case("v")
+                            && (modifiers.control || modifiers.platform)
+                        {
+                            view.paste_image(cx);
+                        }
+                    }))
                     .child(Textarea::new(&self.input).w_full()),
             )
             .child(

@@ -107,7 +107,7 @@ impl WhatsAppApp {
     ///
     /// One picked while the chooser was open is answering something else, and
     /// clearing it would take down a reply bar the person is still using.
-    fn take_reply_draft(
+    pub(super) fn take_reply_draft(
         &mut self,
         reply: Option<ReplyDraft>,
         cx: &mut Context<Self>,
@@ -130,7 +130,7 @@ impl WhatsAppApp {
     ///
     /// Answers whether a bubble was added, which is what decides if the
     /// timeline should follow it down.
-    fn send_attachment(
+    pub(super) fn send_attachment(
         &mut self,
         jid: &str,
         file: crate::platform::picker::Picked,

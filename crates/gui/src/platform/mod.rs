@@ -27,6 +27,7 @@
 //! hold one line is ceremony; the rule starts where there is a body to name.
 
 mod capabilities;
+pub mod clipboard;
 pub mod clock;
 pub mod download;
 pub mod fonts;
