@@ -109,7 +109,7 @@ pub struct ChatRow {
     pub jid: String,
     pub name: String,
     pub kind: ChatKind,
-    pub disambiguator: Option<usize>,
+    pub disambiguator: Option<String>,
     pub is_group: bool,
     pub timestamp: Option<DateTime<Utc>>,
     pub unread: Unread,
@@ -161,10 +161,19 @@ pub fn disambiguate_names(rows: &mut [ChatRow]) {
     }
     for indices in by_name.values_mut().filter(|indices| indices.len() > 1) {
         indices.sort_by(|left, right| rows[*left].jid.cmp(&rows[*right].jid));
-        for (ordinal, index) in indices.iter().enumerate() {
-            rows[*index].disambiguator = Some(ordinal + 1);
+        for index in indices {
+            rows[*index].disambiguator = Some(stable_disambiguator(&rows[*index].jid));
         }
     }
+}
+
+fn stable_disambiguator(jid: &str) -> String {
+    let mut hash = 2_166_136_261u32;
+    for byte in jid.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    format!("{hash:08x}")
 }
 
 fn preview_for(
@@ -504,8 +513,21 @@ mod tests {
 
         assert_eq!(rows[0].name, "Test");
         assert_eq!(rows[1].name, "Test");
-        assert_eq!(rows[0].disambiguator, Some(1));
-        assert_eq!(rows[1].disambiguator, Some(2));
+        assert_eq!(
+            rows[0].disambiguator,
+            Some(stable_disambiguator("first@g.us"))
+        );
+        assert_eq!(
+            rows[1].disambiguator,
+            Some(stable_disambiguator("second@g.us"))
+        );
+
+        let first_id = rows[0].disambiguator.clone();
+        let mut earlier = chat(true);
+        earlier.jid = "earlier@g.us".into();
+        rows.push(ChatRow::new(&earlier, None, None, false));
+        disambiguate_names(&mut rows);
+        assert_eq!(rows[0].disambiguator, first_id);
     }
 
     #[test]

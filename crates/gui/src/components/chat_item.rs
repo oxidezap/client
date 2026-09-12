@@ -112,7 +112,7 @@ fn render_name_row(
                 .text_size(metrics.text_body())
                 .text_color(cx.theme().foreground)
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .children(row.disambiguator.map(|ordinal| {
+                .children(row.disambiguator.as_ref().map(|ordinal| {
                     div()
                         .flex_shrink_0()
                         .text_color(cx.theme().primary)
