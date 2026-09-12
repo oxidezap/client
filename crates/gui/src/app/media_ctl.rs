@@ -5,6 +5,10 @@
 
 use super::*;
 
+fn media_identity(data: &Arc<Vec<u8>>) -> usize {
+    Arc::as_ptr(data) as usize
+}
+
 impl WhatsAppApp {
     /// Let go of the media the conversations are holding beyond their share.
     ///
@@ -121,6 +125,10 @@ impl WhatsAppApp {
             for id in &released_rows {
                 decoded.shift_remove(id);
             }
+            let mut validation = self.sticker_validation.borrow_mut();
+            for id in &released_rows {
+                validation.shift_remove(id);
+            }
         }
         for jid in touched {
             self.invalidate_message_cache(&jid, cx);
@@ -140,6 +148,9 @@ impl WhatsAppApp {
                     media.adopt_full_bytes(data);
                     // Drop any render-cached image built from the old bytes
                     self.decoded_images.borrow_mut().shift_remove(message_id);
+                    self.sticker_validation
+                        .borrow_mut()
+                        .shift_remove(message_id);
                     info!("Cached media data for message {}", message_id);
                     touched = Some(chat.jid.clone());
                 }
@@ -737,6 +748,7 @@ impl WhatsAppApp {
             // has: `adopt_full_bytes` clears it, on the app's path and on the
             // one that never reaches the app.
             preview: media.data_is_preview,
+            identity: media_identity(data),
         };
         // A hit moves the entry to the back, which is what makes the order
         // below least-recently-used rather than insertion order. By
@@ -752,10 +764,17 @@ impl WhatsAppApp {
                 // Unless the bytes behind it have been replaced, in which
                 // case the entry describes a picture that is gone and the
                 // insert below overwrites it.
-                if cache
-                    .get_index(at)
-                    .is_some_and(|(_, (seen, _))| *seen == cached)
-                {
+                let hit = cache.get_index(at).is_some_and(|(_, (seen, image))| {
+                    seen.bytes == cached.bytes
+                        && seen.format == cached.format
+                        && seen.preview == cached.preview
+                        && (seen.identity == cached.identity
+                            || image.bytes.as_slice() == data.as_slice())
+                });
+                if hit {
+                    if let Some((_, (seen, _))) = cache.get_index_mut(at) {
+                        seen.identity = cached.identity;
+                    }
                     let last = cache.len() - 1;
                     cache.move_index(at, last);
                     return cache
@@ -763,6 +782,14 @@ impl WhatsAppApp {
                         .map(|(_, (_, image))| Arc::clone(image));
                 }
             }
+        }
+
+        if media.media_type == oxidezap_core::MediaType::Sticker
+            && !media.data_is_preview
+            && mime_to_image_format(&media.mime_type) == Some(gpui::ImageFormat::Webp)
+            && !self.sticker_payload_is_valid(message_id, media)
+        {
+            return None;
         }
 
         let image = Arc::new(Image::from_bytes(format, data.to_vec()));
@@ -803,6 +830,48 @@ impl WhatsAppApp {
         cache.insert(message_id.to_string(), (cached, Arc::clone(&image)));
         Some(image)
     }
+
+    fn sticker_payload_is_valid(&self, message_id: &str, media: &MediaContent) -> bool {
+        let cached = Cached {
+            bytes: media.data.len(),
+            format: mime_to_image_format(&media.mime_type).unwrap_or(gpui::ImageFormat::Png),
+            preview: media.data_is_preview,
+            identity: media_identity(&media.data),
+        };
+        {
+            let mut validation = self.sticker_validation.borrow_mut();
+            if let Some((seen, valid, bytes)) = validation.get_mut(message_id)
+                && seen.bytes == cached.bytes
+                && seen.format == cached.format
+                && seen.preview == cached.preview
+                && (seen.identity == cached.identity || bytes.as_slice() == media.data.as_slice())
+            {
+                seen.identity = cached.identity;
+                return *valid;
+            }
+        }
+        let valid = crate::components::message_bubble::sticker_payload_is_valid(media);
+        const STICKER_VALIDATION_CACHE_BYTES: usize = 64 * 1024 * 1024;
+        if media.data.len() > STICKER_VALIDATION_CACHE_BYTES {
+            return valid;
+        }
+        let mut validation = self.sticker_validation.borrow_mut();
+        let mut held: usize = validation.values().map(|(_, _, bytes)| bytes.len()).sum();
+        while validation.len() >= MAX_DECODED_IMAGES
+            || held.saturating_add(media.data.len()) > STICKER_VALIDATION_CACHE_BYTES
+        {
+            let Some((_, (_, _, bytes))) = validation.shift_remove_index(0) else {
+                break;
+            };
+            held = held.saturating_sub(bytes.len());
+        }
+        validation.insert(
+            message_id.to_string(),
+            (cached, valid, Arc::clone(&media.data)),
+        );
+        valid
+    }
+
     /// Toggle video playback for a message
     pub fn toggle_video(
         &mut self,

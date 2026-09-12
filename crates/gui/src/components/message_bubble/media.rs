@@ -1,5 +1,6 @@
 //! Media attachments inside a message bubble: images, video, documents.
 
+use std::io::Cursor;
 use std::sync::Arc;
 
 use gpui::StyledImage as _;
@@ -11,6 +12,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, IconName};
+use image::{AnimationDecoder as _, ImageDecoder as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::ProductIcon;
@@ -180,45 +182,63 @@ pub(super) fn render_media_content(
                         })
                         .child(image),
                 )
-            } else if let Some(cached_image) = decoded_image {
-                let sticker_id: SharedString = format!("sticker-{}", message_id).into();
-                el.child(
-                    img(ImageSource::Image(cached_image))
-                        .id(sticker_id)
-                        .w(px(display_w))
-                        .h(px(display_h))
-                        .object_fit(gpui::ObjectFit::Contain),
-                )
-            } else if let Some(format) = still_image_format(&media_content) {
-                el.child(render_image_from_bytes(
-                    media_content.data,
-                    format,
-                    display_w,
-                    display_h,
-                    cx.product().metrics.radius_lg(),
-                    false,
-                ))
-            } else if let Some(dl) = media_content.downloadable.clone() {
-                // Hydrated stickers (and failed eager downloads without a
-                // thumbnail) carry only metadata: fetch on tap like images.
-                el.child(render_download_placeholder(
-                    "sticker-dl",
-                    "[Sticker] Tap to download",
-                    message_id,
-                    dl,
-                    entity,
-                    is_downloading,
-                    display_w,
-                    display_h,
-                    cx,
-                ))
             } else {
-                el.child(render_media_placeholder(
-                    "[Sticker]",
-                    display_w,
-                    display_h,
-                    cx,
-                ))
+                match (sticker_render_kind(&media_content), decoded_image) {
+                    (Some(_kind), Some(cached_image)) => {
+                        let sticker_id: SharedString = format!("sticker-{}", message_id).into();
+                        let image = img(ImageSource::Image(cached_image))
+                            .id(sticker_id)
+                            .w(px(display_w))
+                            .h(px(display_h))
+                            .object_fit(gpui::ObjectFit::Contain);
+                        el.child(image)
+                    }
+                    (_, cached_image) => {
+                        // A sticker must stay a sticker when its WebP payload
+                        // cannot be decoded. Never send it through the photo
+                        // renderer, which hides the actual media failure.
+                        if media_content.downloadable.is_none()
+                            && let Some(format) = still_image_format(&media_content)
+                            && format != gpui::ImageFormat::Webp
+                        {
+                            el.child(match cached_image {
+                                Some(cached) => img(ImageSource::Image(cached))
+                                    .w(px(display_w))
+                                    .h(px(display_h))
+                                    .object_fit(gpui::ObjectFit::Contain)
+                                    .into_any_element(),
+                                None => render_image_from_bytes(
+                                    media_content.data,
+                                    format,
+                                    display_w,
+                                    display_h,
+                                    cx.product().metrics.radius_lg(),
+                                    false,
+                                )
+                                .into_any_element(),
+                            })
+                        } else if let Some(dl) = media_content.downloadable.clone() {
+                            el.child(render_download_placeholder(
+                                "sticker-dl",
+                                "[Sticker] Tap to download",
+                                message_id,
+                                dl,
+                                entity,
+                                is_downloading,
+                                display_w,
+                                display_h,
+                                cx,
+                            ))
+                        } else {
+                            el.child(render_media_placeholder(
+                                "[Sticker]",
+                                display_w,
+                                display_h,
+                                cx,
+                            ))
+                        }
+                    }
+                }
             }
         }
         MediaType::Video => el.child(render_video_player(
@@ -398,6 +418,76 @@ fn still_image_format(media: &oxidezap_core::MediaContent) -> Option<gpui::Image
         .has_still_image()
         .then(|| mime_to_image_format(&media.mime_type))
         .flatten()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StickerRenderKind {
+    Static,
+    Animated,
+}
+
+fn sticker_render_kind(media: &oxidezap_core::MediaContent) -> Option<StickerRenderKind> {
+    if media.data.is_empty()
+        || mime_to_image_format(&media.mime_type) != Some(gpui::ImageFormat::Webp)
+    {
+        return None;
+    }
+
+    Some(if media.is_animated {
+        StickerRenderKind::Animated
+    } else {
+        StickerRenderKind::Static
+    })
+}
+
+pub(crate) fn sticker_payload_is_valid(media: &oxidezap_core::MediaContent) -> bool {
+    !media.data.is_empty()
+        && mime_to_image_format(&media.mime_type) == Some(gpui::ImageFormat::Webp)
+        && valid_webp_payload(media.data.as_slice())
+}
+
+fn valid_webp_payload(bytes: &[u8]) -> bool {
+    let Ok(decoder) = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)) else {
+        return false;
+    };
+    let (width, height) = decoder.dimensions();
+    let Some(decoded_bytes) = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return false;
+    };
+    if decoded_bytes > oxidezap_core::DECODED_IMAGE_BUDGET_BYTES {
+        return false;
+    }
+    if decoder.has_animation() {
+        let mut frames = decoder.into_frames();
+        const MAX_STICKER_FRAMES: usize = 256;
+        const MAX_STICKER_VALIDATION_BYTES: usize = 128 * 1024 * 1024;
+        let mut decoded_bytes = 0usize;
+        for frame_number in 0..=MAX_STICKER_FRAMES {
+            let Some(frame) = frames.next() else {
+                return frame_number > 0;
+            };
+            let Ok(frame) = frame else {
+                return false;
+            };
+            let Some(total) = decoded_bytes.checked_add(frame.buffer().len()) else {
+                return false;
+            };
+            if total > MAX_STICKER_VALIDATION_BYTES {
+                return false;
+            }
+            decoded_bytes = total;
+        }
+        false
+    } else {
+        let Ok(byte_count) = usize::try_from(decoder.total_bytes()) else {
+            return false;
+        };
+        let mut decoded = vec![0; byte_count];
+        decoder.read_image(&mut decoded).is_ok()
+    }
 }
 
 /// The bytes, drawn.
@@ -802,7 +892,97 @@ fn render_video_player(
 
 #[cfg(test)]
 mod tests {
-    use super::{extension_of, format_bytes};
+    use std::sync::Arc;
+
+    use oxidezap_core::MediaContent;
+
+    use super::{StickerRenderKind, extension_of, format_bytes, sticker_render_kind};
+
+    fn webp_sticker(is_animated: bool) -> MediaContent {
+        let mut bytes = Vec::new();
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
+            .encode(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("test WebP should encode");
+        MediaContent::sticker(Arc::new(bytes), "image/webp".into(), false, is_animated)
+    }
+
+    fn animated_webp_metadata_fixture() -> MediaContent {
+        let bytes = vec![
+            0x52, 0x49, 0x46, 0x46, 0xc0, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50,
+            0x38, 0x58, 0x0a, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x41, 0x4e, 0x49, 0x4d, 0x06, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+            0x00, 0x00, 0x41, 0x4e, 0x4d, 0x46, 0x48, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0xe8, 0x03, 0x00, 0x02, 0x56, 0x50,
+            0x38, 0x20, 0x30, 0x00, 0x00, 0x00, 0xd0, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x02, 0x00,
+            0x02, 0x00, 0x02, 0x00, 0x34, 0x25, 0xa0, 0x02, 0x74, 0xba, 0x01, 0xf8, 0x00, 0x03,
+            0xb0, 0x00, 0xfe, 0xf0, 0xe8, 0xf7, 0xff, 0x20, 0xb9, 0x61, 0x75, 0xc8, 0xd7, 0xff,
+            0x20, 0x3f, 0xe4, 0x07, 0xfc, 0x80, 0xff, 0xf8, 0xf2, 0x00, 0x00, 0x00, 0x41, 0x4e,
+            0x4d, 0x46, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x01, 0x00, 0x00, 0xe8, 0x03, 0x00, 0x00, 0x56, 0x50, 0x38, 0x20, 0x2c,
+            0x00, 0x00, 0x00, 0x94, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x02, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x34, 0x25, 0xa0, 0x02, 0x74, 0xba, 0x00, 0x03, 0x98, 0x00, 0xfe, 0xf9, 0x93,
+            0x6f, 0xff, 0x90, 0x1f, 0xff, 0x90, 0x1f, 0xff, 0x90, 0x1f, 0xff, 0x20, 0x3f, 0xe2,
+            0x17, 0x7b, 0x20, 0x30, 0x00,
+        ];
+        MediaContent::sticker(Arc::new(bytes), "image/webp".into(), false, true)
+    }
+
+    fn animated_webp_sticker() -> MediaContent {
+        let encoded = "52494646c000000057454250565038580a00000002000000010000010000414e494d06000000ffffffff0000414e4d4648000000000000000000010000010000e80300025650382030000000d001009d012a0200020002003425a00274ba01f80003b000fef0e8f7ff20b96175c8d7ff203fe407fc80fff8f2000000414e4d4644000000000000000000010000010000e8030000565038202c0000009401009d012a0200020000003425a00274ba00039800fef9936fff901fff901fff901fff203fe2177b203000";
+        let bytes = encoded
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        MediaContent::sticker(Arc::new(bytes), "image/webp".into(), false, true)
+    }
+
+    #[test]
+    fn static_webp_uses_the_dedicated_sticker_path() {
+        assert_eq!(
+            sticker_render_kind(&webp_sticker(false)),
+            Some(StickerRenderKind::Static)
+        );
+    }
+
+    #[test]
+    fn animated_webp_keeps_its_animation_metadata() {
+        assert_eq!(
+            sticker_render_kind(&animated_webp_metadata_fixture()),
+            Some(StickerRenderKind::Animated)
+        );
+    }
+
+    #[test]
+    fn animated_webp_payload_reaches_the_animation_decoder() {
+        assert!(super::sticker_payload_is_valid(&animated_webp_sticker()));
+    }
+
+    #[test]
+    fn invalid_or_non_webp_stickers_use_the_fallback() {
+        let mut invalid = webp_sticker(false);
+        invalid.data = Arc::new(vec![1, 2, 3]);
+        assert!(!super::sticker_payload_is_valid(&invalid));
+
+        let mut image = webp_sticker(false);
+        image.mime_type = "image/png".into();
+        assert!(!super::sticker_payload_is_valid(&image));
+    }
+
+    #[test]
+    fn image_attachments_are_not_sticker_payloads() {
+        let image = MediaContent::image(Arc::new(vec![1, 2, 3]), "image/webp".into(), false);
+        assert_eq!(image.media_type, oxidezap_core::MediaType::Image);
+        assert_eq!(sticker_render_kind(&image), Some(StickerRenderKind::Static));
+    }
 
     #[test]
     fn a_real_extension_becomes_the_tile_label() {

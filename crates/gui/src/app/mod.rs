@@ -837,6 +837,7 @@ pub struct WhatsAppApp {
     /// Uses RefCell for interior mutability since we need to cache during immutable render.
     /// Uses IndexMap to maintain insertion order for deterministic FIFO eviction.
     decoded_images: RefCell<IndexMap<String, (Cached, Arc<Image>)>>,
+    sticker_validation: RefCell<IndexMap<String, StickerValidation>>,
     /// Cache of message list data per chat to avoid expensive recomputation on every render.
     /// Key is the chat JID, value is the cached data.
     message_list_cache: RefCell<HashMap<String, MessageListCache>>,
@@ -1080,6 +1081,7 @@ impl WhatsAppApp {
             video_players: HashMap::new(),
             video_update_task: None,
             decoded_images: RefCell::new(IndexMap::new()),
+            sticker_validation: RefCell::new(IndexMap::new()),
             message_list_cache: RefCell::new(HashMap::new()),
             chat_list_cache: RefCell::new(None),
             chat_cache_version: std::cell::Cell::new(0),
@@ -1690,6 +1692,7 @@ impl WhatsAppApp {
         self.chat_list_cache.borrow_mut().take();
         *self.status_feed_cache.borrow_mut() = None;
         self.decoded_images.borrow_mut().clear();
+        self.sticker_validation.borrow_mut().clear();
         self.timeline_anchor = None;
         // Composed text, and the reply bar it may be answering.
         self.drafts.clear();
@@ -3421,19 +3424,15 @@ fn slot_for_chat(rest: &[Arc<Chat>], chat: &Chat) -> usize {
 /// enough to notice, rather than trusting whoever swapped the bytes to have
 /// evicted the entry.
 ///
-/// The length, the format and whether it was a preview — not a hash: the
-/// point is to spot a picture being replaced, and hashing every byte is
-/// exactly what this cache exists to avoid. The preview flag is what makes
-/// the answer exact for the case that matters rather than merely unlikely:
-/// a thumbnail and the picture that replaces it can in principle encode to
-/// the same length in the same format, and `adopt_full_bytes` always clears
-/// that flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cached {
     bytes: usize,
     format: gpui::ImageFormat,
     preview: bool,
+    identity: usize,
 }
+
+type StickerValidation = (Cached, bool, Arc<Vec<u8>>);
 
 /// Whether the timeline this frame is building may ask for the page before
 /// it.
@@ -3628,13 +3627,25 @@ mod tests {
             bytes: 4_096,
             format: gpui::ImageFormat::Jpeg,
             preview: true,
+            identity: 1,
         };
         let full = Cached {
             bytes: 812_344,
             format: gpui::ImageFormat::Jpeg,
             preview: false,
+            identity: 2,
         };
         assert_ne!(preview, full);
+
+        assert_ne!(
+            Cached {
+                bytes: 4_096,
+                format: gpui::ImageFormat::Jpeg,
+                preview: true,
+                identity: 2,
+            },
+            preview
+        );
 
         // And a sticker's preview is a PNG where the real thing is a WebP,
         // which the format half is for.
@@ -3643,6 +3654,7 @@ mod tests {
                 bytes: 4_096,
                 format: gpui::ImageFormat::Png,
                 preview: true,
+                identity: 3,
             },
             preview
         );
@@ -3653,6 +3665,7 @@ mod tests {
         assert_ne!(
             Cached {
                 preview: false,
+                identity: 1,
                 ..preview
             },
             preview
