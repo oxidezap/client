@@ -183,31 +183,17 @@ pub(super) fn render_media_content(
                         .child(image),
                 )
             } else {
-                match sticker_render_kind(&media_content) {
-                    Some(kind) => {
+                match (sticker_render_kind(&media_content), decoded_image) {
+                    (Some(_kind), Some(cached_image)) => {
                         let sticker_id: SharedString = format!("sticker-{}", message_id).into();
-                        let image = match (decoded_image, kind) {
-                            (Some(cached_image), _) => img(ImageSource::Image(cached_image))
-                                .id(sticker_id)
-                                .w(px(display_w))
-                                .h(px(display_h))
-                                .object_fit(gpui::ObjectFit::Contain)
-                                .into_any_element(),
-                            (None, StickerRenderKind::Static | StickerRenderKind::Animated) => {
-                                render_image_from_bytes(
-                                    media_content.data,
-                                    gpui::ImageFormat::Webp,
-                                    display_w,
-                                    display_h,
-                                    cx.product().metrics.radius_lg(),
-                                    false,
-                                )
-                                .into_any_element()
-                            }
-                        };
+                        let image = img(ImageSource::Image(cached_image))
+                            .id(sticker_id)
+                            .w(px(display_w))
+                            .h(px(display_h))
+                            .object_fit(gpui::ObjectFit::Contain);
                         el.child(image)
                     }
-                    None => {
+                    _ => {
                         // A sticker must stay a sticker when its WebP payload
                         // cannot be decoded. Never send it through the photo
                         // renderer, which hides the actual media failure.
@@ -456,6 +442,16 @@ fn valid_webp_payload(bytes: &[u8]) -> bool {
     let Ok(decoder) = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)) else {
         return false;
     };
+    let (width, height) = decoder.dimensions();
+    let Some(decoded_bytes) = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return false;
+    };
+    if decoded_bytes > oxidezap_core::DECODED_IMAGE_BUDGET_BYTES {
+        return false;
+    }
     if decoder.has_animation() {
         let mut frames = decoder.into_frames();
         frames
@@ -465,9 +461,6 @@ fn valid_webp_payload(bytes: &[u8]) -> bool {
         let Ok(byte_count) = usize::try_from(decoder.total_bytes()) else {
             return false;
         };
-        if byte_count > oxidezap_core::DECODED_IMAGE_BUDGET_BYTES as usize {
-            return false;
-        }
         let mut decoded = vec![0; byte_count];
         decoder.read_image(&mut decoded).is_ok()
     }
