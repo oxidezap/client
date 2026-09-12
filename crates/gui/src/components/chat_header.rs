@@ -233,7 +233,7 @@ fn render_identity(
         .child(
             Avatar::new(chat.jid.clone(), &chat.name, metrics.avatar_header())
                 .group(chat.is_group)
-                .picture(chat.avatar_url.clone())
+                .picture(chat.avatar_key.clone())
                 .presence(presence)
                 .on(cx.theme().sidebar),
         )

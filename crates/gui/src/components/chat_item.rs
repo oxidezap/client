@@ -82,7 +82,7 @@ pub fn render_chat_item(
         .child(
             Avatar::new(row.jid.clone(), &row.name, layout.avatar_size())
                 .group(row.is_group)
-                .picture(row.avatar_url.clone())
+                .picture(row.avatar_key.clone())
                 .on(ground),
         )
         .child(

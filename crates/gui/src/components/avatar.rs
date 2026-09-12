@@ -90,10 +90,25 @@ impl Avatar {
         self
     }
 
-    pub fn picture(mut self, url: Option<String>) -> Self {
-        self.picture = url.map(Into::into);
+    pub fn picture(mut self, key: Option<String>) -> Self {
+        self.picture = key.and_then(media_source).map(Into::into);
         self
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn media_source(key: String) -> Option<String> {
+    oxidezap_ipc::media_path(&key).map(|path| path.to_string_lossy().into_owned())
+}
+
+#[cfg(target_family = "wasm")]
+fn media_source(key: String) -> Option<String> {
+    Some(format!(
+        "{}/{}{}",
+        oxidezap_ipc::web::media_base_url(),
+        key,
+        oxidezap_ipc::web::media_token()
+    ))
 }
 
 impl RenderOnce for Avatar {

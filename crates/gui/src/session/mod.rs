@@ -138,6 +138,8 @@ pub enum FromDaemon {
     Calls(Box<CallState>),
     /// Who this device is linked as, at the moment this client attached.
     Account(Option<oxidezap_ipc::AccountIdentity>),
+    /// A profile picture is ready in the daemon media cache.
+    Avatar { jid: String, key: String },
     /// Every plugin the daemon has loaded, and what each wants drawn.
     ///
     /// State, and whole every time: a plugin published its interface when it

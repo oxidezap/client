@@ -158,7 +158,8 @@ impl Wipe {
         match self {
             Self::Everything => true,
             Self::Cache => {
-                (name.starts_with("f-") || name.starts_with("d-")) && !is_in_progress(name)
+                (name.starts_with("f-") || name.starts_with("d-") || name.starts_with("a-"))
+                    && !is_in_progress(name)
             }
         }
     }

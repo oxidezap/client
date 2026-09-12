@@ -236,8 +236,8 @@ impl WhatsAppClient {
 
     pub(super) async fn hydrate_avatar_sources(client: &Arc<Client>, chats: &mut [Chat]) {
         for chat in chats.iter_mut() {
-            chat.avatar_url = None;
-            chat.avatar_id = None;
+            chat.avatar_source = None;
+            chat.avatar_key = None;
             chat.avatar_loaded = true;
         }
         let groups: Vec<Jid> = chats
@@ -256,8 +256,8 @@ impl WhatsAppClient {
                     .iter_mut()
                     .find(|chat| chat.jid == picture.group_jid.to_string())
                 {
-                    chat.avatar_url = picture.url;
-                    chat.avatar_id = picture.photo_id;
+                    chat.avatar_source = picture.url;
+                    chat.avatar_key = picture.photo_id;
                 }
             }
         }
@@ -279,8 +279,8 @@ impl WhatsAppClient {
         .await;
         for (index, picture) in pictures {
             if let Ok(Some(picture)) = picture {
-                chats[index].avatar_url = Some(picture.url);
-                chats[index].avatar_id = Some(picture.id);
+                chats[index].avatar_source = Some(picture.url);
+                chats[index].avatar_key = Some(picture.id);
             }
         }
     }

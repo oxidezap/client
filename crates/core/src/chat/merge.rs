@@ -79,8 +79,8 @@ impl Chat {
         self.from_store |= hydrated.from_store;
         self.set_name_if_not_worse(hydrated.name, hydrated.name_priority);
         if hydrated.avatar_loaded {
-            self.avatar_url = hydrated.avatar_url;
-            self.avatar_id = hydrated.avatar_id;
+            self.avatar_source = hydrated.avatar_source;
+            self.avatar_key = hydrated.avatar_key;
             self.avatar_loaded = true;
         }
         // Read before the messages are moved out: it decides what an absent

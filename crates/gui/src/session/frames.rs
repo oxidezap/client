@@ -300,6 +300,9 @@ impl<'a> Frames<'a> {
                     None => error!("daemon refused a request: {error}"),
                 }
             }
+            DaemonMessage::AvatarReady { jid, key } => {
+                self.publish(FromDaemon::Avatar { jid, key })?;
+            }
             // The daemon truncated our stream, so arbitrary events are gone.
             // Asking for the history back would restore the chats and nothing
             // else: a `LoggedOut`, a `CallEnded`, a `SendFailed` cannot be

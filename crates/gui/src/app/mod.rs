@@ -932,6 +932,13 @@ impl WhatsAppApp {
                         app.account_lid = account.and_then(|a| a.lid);
                         cx.notify();
                     }),
+                    FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
+                        if let Some(chat) = app.find_chat_mut(&jid) {
+                            chat.avatar_key = Some(key);
+                            app.invalidate_chat_cache();
+                            cx.notify();
+                        }
+                    }),
                     // Refused, or it never left this process. The ring came
                     // down when the update was opened, which is right — a
                     // view that waits for a round trip flickers — so the

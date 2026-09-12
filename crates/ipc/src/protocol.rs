@@ -455,6 +455,8 @@ pub enum DaemonMessage {
     /// front end reports it against the chat, which is where a user is
     /// looking when they wonder whether their message went out.
     SendFailed { jid: String, reason: String },
+    /// A profile picture was fetched into the daemon media cache.
+    AvatarReady { jid: String, key: String },
     /// One encoded frame of a live call's video.
     ///
     /// The third kind of frame, beside state and news, and it obeys neither's
