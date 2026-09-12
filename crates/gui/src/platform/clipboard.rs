@@ -46,7 +46,7 @@ mod imp {
         cx.foreground_executor().spawn(async move {
             task.await
                 .and_then(|item| item.map_or(Ok(None), image_from_item))
-                .map_err(|error| error.to_string())
+                .or_else(|_| Ok(None))
         })
     }
 }

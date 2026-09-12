@@ -1580,6 +1580,7 @@ impl WhatsAppApp {
         // epoch nothing had bumped, and send the old account's note from the
         // newly paired one.
         self.leave_connected_view(cx);
+        self.pending_pastes.clear();
         // A call is account state as much as a chat is. See
         // [`calls_ctl::Calls::forget`].
         self.calls.update(cx, |calls, cx| calls.forget(cx));
@@ -2390,6 +2391,9 @@ impl WhatsAppApp {
             InputAreaEvent::PasteImageError(paste_id, error) => {
                 self.pending_pastes.remove(paste_id);
                 self.notify_user(error, notices::Tone::Problem, cx);
+            }
+            InputAreaEvent::PasteImageFinished(paste_id) => {
+                self.pending_pastes.remove(paste_id);
             }
             InputAreaEvent::PasteImageStarted(paste_id) => {
                 if let Some(jid) = self.selected_chat.clone() {

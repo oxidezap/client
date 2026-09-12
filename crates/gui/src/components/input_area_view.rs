@@ -35,6 +35,8 @@ pub enum InputAreaEvent {
     PasteImage(u64, Rc<RefCell<Option<crate::platform::picker::Picked>>>),
     /// An image paste was rejected before it could be sent.
     PasteImageError(u64, String),
+    /// An image paste read completed without an image.
+    PasteImageFinished(u64),
     /// An image paste started and its destination should be captured.
     PasteImageStarted(u64),
     /// User started PTT recording
@@ -213,7 +215,11 @@ impl InputAreaView {
                     ))
                 });
             }
-            Ok(None) => {}
+            Ok(None) => {
+                let _ = entity.update(cx, |_, cx| {
+                    cx.emit(InputAreaEvent::PasteImageFinished(paste_id));
+                });
+            }
             Err(error) => {
                 let _ = entity.update(cx, |_, cx| {
                     cx.emit(InputAreaEvent::PasteImageError(paste_id, error));
