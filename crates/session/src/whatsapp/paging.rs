@@ -238,7 +238,7 @@ impl WhatsAppClient {
         for chat in chats.iter_mut() {
             chat.avatar_source = None;
             chat.avatar_key = None;
-            chat.avatar_loaded = true;
+            chat.avatar_loaded = false;
         }
         let groups: Vec<Jid> = chats
             .iter()
@@ -260,6 +260,9 @@ impl WhatsAppClient {
                     chat.avatar_key = picture.photo_id;
                 }
             }
+            for chat in chats.iter_mut().filter(|chat| chat.is_group) {
+                chat.avatar_loaded = true;
+            }
         }
 
         let direct: Vec<(usize, Jid)> = chats
@@ -278,9 +281,12 @@ impl WhatsAppClient {
         ))
         .await;
         for (index, picture) in pictures {
-            if let Ok(Some(picture)) = picture {
-                chats[index].avatar_source = Some(picture.url);
-                chats[index].avatar_key = Some(picture.id);
+            if let Ok(picture) = picture {
+                chats[index].avatar_loaded = true;
+                if let Some(picture) = picture {
+                    chats[index].avatar_source = Some(picture.url);
+                    chats[index].avatar_key = Some(picture.id);
+                }
             }
         }
     }

@@ -117,16 +117,36 @@ fn cached_image_source(
             return Some(source);
         }
         let bytes = read().ok()?;
-        let size = bytes.len() as u64;
-        let source = ImageSource::from(move |_window: &mut gpui::Window, _cx: &mut gpui::App| {
-            let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
-            Some(Ok(Arc::new(RenderImage::new(smallvec::smallvec![
-                image::Frame::new(image),
-            ]))))
-        });
+        let (source, decoded_size) = decode_avatar(&bytes)?;
+        let size = (bytes.len() as u64).saturating_add(decoded_size);
         images.put(key.to_string(), source.clone(), size);
         Some(source)
     })
+}
+
+fn decode_avatar(bytes: &[u8]) -> Option<(ImageSource, u64)> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    limits.max_image_height = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    limits.max_alloc = Some(oxidezap_core::MAX_AVATAR_PIXELS * 4);
+    reader.limits(limits);
+    let image = reader.decode().ok()?;
+    let (width, height) = (image.width(), image.height());
+    let pixels = u64::from(width).checked_mul(u64::from(height))?;
+    if pixels > oxidezap_core::MAX_AVATAR_PIXELS {
+        return None;
+    }
+    let decoded_size = pixels.checked_mul(4)?;
+    let image = image.to_rgba8();
+    Some((
+        ImageSource::from(Arc::new(RenderImage::new(smallvec::smallvec![
+            image::Frame::new(image),
+        ]))),
+        decoded_size,
+    ))
 }
 
 pub(crate) fn clear_image_sources() {
@@ -219,8 +239,11 @@ impl MediaCache for Directory {
             if let Some(source) = images.get(key) {
                 return Some(source);
             }
-            let source = oxidezap_ipc::media_path(key).map(ImageSource::from)?;
-            images.put(key.to_string(), source.clone(), 0);
+            let path = oxidezap_ipc::media_path(key)?;
+            let bytes = std::fs::read(path).ok()?;
+            let (source, decoded_size) = decode_avatar(&bytes)?;
+            let size = (bytes.len() as u64).saturating_add(decoded_size);
+            images.put(key.to_string(), source.clone(), size);
             Some(source)
         })
     }
@@ -808,6 +831,20 @@ mod tests {
         assert_eq!(cache.entries.len(), MAX_SOURCE_ENTRIES);
         assert!(cache.get("0").is_none());
         assert!(cache.get(&MAX_SOURCE_ENTRIES.to_string()).is_some());
+    }
+
+    #[test]
+    fn avatar_decoder_rejects_excessive_pixel_count() {
+        let image = image::DynamicImage::new_rgb8(2048, 2048);
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        assert!(decode_avatar(&bytes).is_none());
     }
 
     /// And the payload does not go through whatever is at the name. A staged

@@ -279,6 +279,7 @@ pub async fn run(
             log::error!("could not clear the media cache: {e}");
         }
     }
+    crate::avatar::purge(&bridge.hub);
     Ok(())
 }
 

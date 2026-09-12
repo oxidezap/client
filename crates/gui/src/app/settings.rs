@@ -577,9 +577,7 @@ impl WhatsAppApp {
                 return;
             }
             let _ = entity.update(cx, |app, cx| {
-                if let Some(client) = &app.client {
-                    client.load_chats(None);
-                }
+                crate::session::clear_image_sources();
                 app.refresh_storage_usage(cx);
             });
         })

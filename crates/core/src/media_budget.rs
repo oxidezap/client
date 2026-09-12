@@ -62,3 +62,6 @@ pub const RETAINED_MEDIA_BUDGET_BYTES: u64 = WEB_MEDIA_BUDGET_BYTES / 4;
 /// the entry count did not simply give way to this one: bytes here measure
 /// the smaller half.
 pub const DECODED_IMAGE_BUDGET_BYTES: u64 = WEB_MEDIA_BUDGET_BYTES / 4;
+
+pub const MAX_AVATAR_DIMENSION: u32 = 4096;
+pub const MAX_AVATAR_PIXELS: u64 = DECODED_IMAGE_BUDGET_BYTES / 4;

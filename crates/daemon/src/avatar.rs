@@ -52,7 +52,7 @@ pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
     if crate::media::has(&key) {
         oxidezap_session::spawn(async move {
             if is_current(&hub, &jid, &selection) {
-                hub.signal(&DaemonMessage::AvatarReady { jid, key });
+                publish_ready(&hub, jid, key);
             }
         });
         return;
@@ -65,9 +65,26 @@ pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
         if crate::media::put_since(selection.cache_epoch, &key, &bytes).is_ok()
             && is_current(&hub, &jid, &selection)
         {
-            hub.signal(&DaemonMessage::AvatarReady { jid, key });
+            publish_ready(&hub, jid, key);
         }
     });
+}
+
+fn publish_ready(hub: &StateHub, jid: String, key: String) {
+    let event = oxidezap_core::UiEvent::AvatarReady { jid, key };
+    match serde_json::to_string(&DaemonMessage::Session {
+        event: Box::new(event),
+    }) {
+        Ok(frame) => hub.publish_session(frame),
+        Err(error) => log::error!("could not serialize avatar readiness: {error}"),
+    }
+}
+
+pub fn purge(hub: &StateHub) {
+    let mut latest = LATEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    latest.retain(|(id, _), _| *id != hub_id(hub));
 }
 
 fn safe_component(value: &str) -> String {
@@ -151,14 +168,42 @@ fn accept(response: AvatarResponse) -> anyhow::Result<Vec<u8>> {
     if response.body.is_empty() {
         anyhow::bail!("avatar response was empty");
     }
-    image::load_from_memory(&response.body)
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(&response.body));
+    reader = reader
+        .with_guessed_format()
+        .map_err(|e| anyhow::anyhow!("invalid avatar format: {e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    limits.max_image_height = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    limits.max_alloc = Some(oxidezap_core::MAX_AVATAR_PIXELS * 4);
+    reader.limits(limits);
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|e| anyhow::anyhow!("invalid avatar image: {e}"))?;
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| anyhow::anyhow!("avatar dimensions overflow"))?;
+    if pixels > oxidezap_core::MAX_AVATAR_PIXELS {
+        anyhow::bail!("avatar has too many pixels");
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(&response.body));
+    reader = reader
+        .with_guessed_format()
+        .map_err(|e| anyhow::anyhow!("invalid avatar format: {e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    limits.max_image_height = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    limits.max_alloc = Some(oxidezap_core::MAX_AVATAR_PIXELS * 4);
+    reader.limits(limits);
+    reader
+        .decode()
         .map_err(|e| anyhow::anyhow!("invalid avatar image: {e}"))?;
     Ok(response.body)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AvatarResponse, accept, is_current, key, record_selection};
+    use super::{AvatarResponse, accept, is_current, key, purge, record_selection};
     use crate::state::StateHub;
 
     #[test]
@@ -190,6 +235,15 @@ mod tests {
     }
 
     #[test]
+    fn purging_a_hub_removes_its_pending_selection() {
+        let hub = StateHub::new();
+        let selection = record_selection(&hub, "jid-purged", Some("one"), Some("url"));
+        purge(&hub);
+
+        assert!(!is_current(&hub, "jid-purged", &selection));
+    }
+
+    #[test]
     fn mocked_avatar_fetch_accepts_only_non_empty_success_data() {
         assert_eq!(
             accept(AvatarResponse {
@@ -217,6 +271,21 @@ mod tests {
             accept(AvatarResponse {
                 status: 200,
                 body: vec![1, 2, 3]
+            })
+            .is_err()
+        );
+        let oversized = image::DynamicImage::new_rgb8(2048, 2048);
+        let mut bytes = Vec::new();
+        oversized
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        assert!(
+            accept(AvatarResponse {
+                status: 200,
+                body: bytes
             })
             .is_err()
         );

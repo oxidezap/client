@@ -112,6 +112,13 @@ impl WhatsAppApp {
                 self.install_chats(chats, &agreed, cx);
                 cx.notify();
             }
+            UiEvent::AvatarReady { jid, key } => {
+                if let Some(chat) = self.find_chat_mut(&jid) {
+                    chat.avatar_key = Some(key);
+                    self.invalidate_chat_cache();
+                    cx.notify();
+                }
+            }
             UiEvent::QrCode { code, timeout_secs } => {
                 // The phone code keeps the deadline it was issued with. A
                 // QR rotates every few seconds and a phone code lives for

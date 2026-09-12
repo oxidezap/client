@@ -29,6 +29,7 @@ mod embedded;
 mod frames;
 mod media;
 pub use media::MediaCache;
+pub(crate) use media::clear_image_sources;
 #[cfg(not(target_family = "wasm"))]
 mod native;
 mod recovery;
