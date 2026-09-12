@@ -182,7 +182,9 @@ impl WhatsAppApp {
                     // The read a row without messages could not bound. Spent
                     // here because this is what gave it a message to name; see
                     // `owed_reads`.
-                    if self.owed_reads.contains(&jid)
+                    if self.window_focused
+                        && self.visible_chat.as_deref() == Some(jid.as_str())
+                        && self.owed_reads.contains(&jid)
                         && let Some(newest) = newest_shared_message(&self.chats[at])
                     {
                         self.owed_reads.remove(&jid);

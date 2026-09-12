@@ -317,6 +317,17 @@ impl WhatsAppApp {
             self.clear_search(window, cx);
             return;
         }
+        let composer_focused = self
+            .input_area
+            .as_ref()
+            .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        if self.keyboard_owner == Some(KeyboardOwner::Composer) || composer_focused {
+            self.keyboard_intent = ChatOpen::ToPreview;
+            self.keyboard_owner = Some(KeyboardOwner::Root);
+            window.focus(&self.root_focus, cx);
+            cx.notify();
+            return;
+        }
         // Nothing was open. On mobile the way "out" of a conversation is back
         // to the list, which is the same gesture.
         if self.mobile_panel.is_chat() {

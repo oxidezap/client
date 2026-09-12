@@ -331,6 +331,33 @@ mod tests {
     }
 
     #[test]
+    fn escape_unfocuses_the_composer() {
+        let (mut cx, window, app) = setup();
+        window
+            .update(&mut cx, |_, window, cx| {
+                window.activate_window();
+                app.update(cx, |app, cx| {
+                    app.app_state = AppState::Connected;
+                    app.destination = Destination::Chats;
+                    app.select_chat(
+                        "peer@example.invalid".into(),
+                        ChatOpen::ToCompose,
+                        window,
+                        cx,
+                    );
+                    app.close_overlay(window, cx);
+                });
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let app = app.read(cx);
+            let composer = app.input_area.as_ref().unwrap().read(cx).focus_handle(cx);
+            assert!(!composer.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn body_invalidates_for_controllers_theme_resize_and_focus() {
         let (mut cx, window, app) = setup();
         let controllers = cx.update(|cx| {
