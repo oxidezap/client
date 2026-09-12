@@ -301,6 +301,8 @@ impl<'a> Frames<'a> {
                 }
             }
             DaemonMessage::AvatarReady { jid, key } => {
+                // Avatar keys are also carried by the owning chat frame. The
+                // readiness signal only announces that its cache entry is ready.
                 self.publish(FromDaemon::Avatar { jid, key })?;
             }
             // The daemon truncated our stream, so arbitrary events are gone.
@@ -582,6 +584,7 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
                 log::debug!("not fetching {key}: nobody is waiting on {id} any more");
             }
         }
+        DaemonMessage::AvatarReady { key, .. } => keys.push(key.clone()),
         _ => {}
     }
     // A download key is the media's *content*, so one photo forwarded into

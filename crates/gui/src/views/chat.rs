@@ -83,6 +83,7 @@ pub fn render_connected_view(
     app.prune_departed_chats(cx);
 
     let viewer_focus = app.viewer_focus(cx).clone();
+    let media = app.media_cache();
 
     let list_props = ChatListProps {
         cache: app.get_chat_list_cache(cx),
@@ -92,6 +93,7 @@ pub fn render_connected_view(
         is_searching: app.is_searching(cx),
         search_input: chat_search_input.as_ref(),
         account: app.account_summary(),
+        media: media.clone(),
     };
     // A filter that matches none of the chats this window holds is not the
     // same as one that matches nothing: the rest of the list has not been
@@ -300,6 +302,7 @@ pub fn render_connected_view(
                         is_offline,
                         is_own_number,
                         plugin_actions,
+                        media: media.clone(),
                     },
                     &message_list,
                     entity.clone(),
@@ -376,6 +379,7 @@ struct ChatAreaProps<'a> {
     /// `Context`. Empty when no plugin drew there, which is the ordinary
     /// case.
     plugin_actions: Vec<gpui::AnyElement>,
+    media: Option<std::sync::Arc<dyn crate::session::MediaCache>>,
 }
 
 fn render_chat_area(
@@ -398,6 +402,7 @@ fn render_chat_area(
         is_offline,
         is_own_number,
         plugin_actions,
+        media,
     } = props;
     let metrics = *layout.metrics();
     let base = if layout.is_mobile() {
@@ -446,6 +451,7 @@ fn render_chat_area(
                     entity.clone(),
                     plugin_actions,
                     layout,
+                    media,
                     cx,
                 ))
                 .children(search_bar)

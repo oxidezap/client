@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use gpui::{ImageSource, RenderImage};
+
 /// What to do once a payload is staged, or once staging has failed.
 ///
 /// Boxed because it is handed across a trait whose implementations finish at
@@ -40,6 +42,20 @@ pub trait MediaCache: Send + Sync {
     /// allocated a hundred copies of it, so a 10 MiB photo could cost a
     /// gigabyte against a budget that had counted it once.
     fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String>;
+
+    fn image_source(&self, key: &str) -> Option<ImageSource> {
+        let bytes = self.read(key).ok()?;
+        Some(ImageSource::from(
+            move |_window: &mut gpui::Window, _cx: &mut gpui::App| {
+                let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+                Some(Ok(Arc::new(RenderImage::new(smallvec::smallvec![
+                    image::Frame::new(image),
+                ]))))
+            },
+        ))
+    }
+
+    fn clear_cached(&self) {}
 
     /// The bytes answering a request somebody is waiting on.
     ///
@@ -111,6 +127,10 @@ impl MediaCache for Directory {
             .ok_or_else(|| format!("the daemon named an unusable cache key: {key}"))
             .and_then(|path| std::fs::read(path).map_err(|e| e.to_string()))
             .map(Arc::new)
+    }
+
+    fn image_source(&self, key: &str) -> Option<ImageSource> {
+        oxidezap_ipc::media_path(key).map(ImageSource::from)
     }
 
     fn stage(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
@@ -327,6 +347,7 @@ fn write_new(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[derive(Default)]
 pub struct Held {
     bytes: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+    avatars: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -339,9 +360,23 @@ impl Held {
             .insert(key, Arc::new(bytes));
     }
 
+    pub fn put_avatar(&self, key: String, bytes: Vec<u8>) {
+        self.avatars
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Arc::new(bytes));
+    }
+
     /// Forget whatever the last frame did not use.
     pub fn clear(&self) {
         self.bytes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    pub fn clear_avatars(&self) {
+        self.avatars
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Forget one key, whether or not the frame is done with it.
@@ -365,6 +400,13 @@ impl Held {
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
             .map(Arc::clone)
+            .or_else(|| {
+                self.avatars
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(key)
+                    .map(Arc::clone)
+            })
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
 
@@ -413,6 +455,10 @@ impl MediaCache for Fetched {
 
     fn read_once(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
         self.held.read_once(key)
+    }
+
+    fn clear_cached(&self) {
+        self.held.clear_avatars();
     }
 
     /// Refused, because staging from a page is not synchronous.

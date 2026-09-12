@@ -885,6 +885,9 @@ pub struct WhatsAppApp {
 }
 
 impl WhatsAppApp {
+    pub fn media_cache(&self) -> Option<std::sync::Arc<dyn crate::session::MediaCache>> {
+        self.client.as_ref().map(Session::media_cache)
+    }
     /// Spawn the event handling task that processes UI events from the WhatsApp client
     fn spawn_event_task(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {

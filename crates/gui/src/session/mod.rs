@@ -28,6 +28,7 @@ mod attach;
 mod embedded;
 mod frames;
 mod media;
+pub use media::MediaCache;
 #[cfg(not(target_family = "wasm"))]
 mod native;
 mod recovery;
@@ -92,7 +93,6 @@ use oxidezap_ipc::{
 use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
 
-use self::media::MediaCache;
 pub use self::sink::Events;
 use self::sink::{ReaderSink, UiSink};
 
@@ -747,6 +747,12 @@ pub struct Session {
         expect(dead_code, reason = "a page's socket goes with the page")
     )]
     teardown: Teardown,
+}
+
+impl Session {
+    pub fn media_cache(&self) -> Arc<dyn MediaCache> {
+        Arc::clone(&self.handle.conn.media)
+    }
 }
 
 impl std::ops::Deref for Session {
@@ -1549,6 +1555,7 @@ impl SessionHandle {
     /// the files still had, which looks exactly like a clear that did not
     /// work.
     pub fn clear_media_cache(&self) -> oneshot::Receiver<()> {
+        self.conn.media.clear_cached();
         let (tx, rx) = oneshot::channel();
         self.ask(ClientRequest::ClearMediaCache, Awaiting::Acted(tx));
         rx

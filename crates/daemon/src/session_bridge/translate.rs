@@ -387,7 +387,6 @@ fn prepare_avatars(hub: &std::sync::Arc<StateHub>, event: &mut UiEvent) {
     for chat in chats {
         crate::avatar::queue(hub, chat);
         chat.avatar_source = None;
-        chat.avatar_key = None;
     }
 }
 

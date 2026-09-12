@@ -6,6 +6,8 @@
 //! by a push name in one chat and a phone number in another — keeps the same
 //! colour, which is the whole point of having one.
 
+use std::sync::Arc;
+
 use gpui::{
     AnyElement, App, Hsla, ImageSource, IntoElement, ParentElement, Pixels, RenderOnce,
     SharedString, Styled, Window, div, img, linear_color_stop, linear_gradient,
@@ -13,6 +15,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::{Icon, IconName};
 
+use crate::session::MediaCache;
 use crate::theme::ActiveProductTheme as _;
 
 /// Where a contact is, as far as the avatar needs to know.
@@ -43,7 +46,7 @@ pub struct Avatar {
     /// The surface the avatar sits on, which the badge's ring has to match to
     /// read as a cut-out rather than a second circle.
     ground: Option<Hsla>,
-    picture: Option<SharedString>,
+    picture: Option<ImageSource>,
 }
 
 impl Avatar {
@@ -90,25 +93,10 @@ impl Avatar {
         self
     }
 
-    pub fn picture(mut self, key: Option<String>) -> Self {
-        self.picture = key.and_then(media_source).map(Into::into);
+    pub fn picture(mut self, key: Option<String>, cache: Option<Arc<dyn MediaCache>>) -> Self {
+        self.picture = key.and_then(|key| cache?.image_source(&key));
         self
     }
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn media_source(key: String) -> Option<String> {
-    oxidezap_ipc::media_path(&key).map(|path| path.to_string_lossy().into_owned())
-}
-
-#[cfg(target_family = "wasm")]
-fn media_source(key: String) -> Option<String> {
-    Some(format!(
-        "{}/{}{}",
-        oxidezap_ipc::web::media_base_url(),
-        key,
-        oxidezap_ipc::web::media_token()
-    ))
 }
 
 impl RenderOnce for Avatar {
@@ -148,13 +136,11 @@ impl RenderOnce for Avatar {
                     .text_color(product.hsla(hue))
                     .child(self.initial.to_string());
                 match self.picture {
-                    Some(url) => div().relative().size(self.size).child(fallback).child(
-                        img(ImageSource::from(url))
-                            .absolute()
-                            .inset_0()
-                            .size(self.size)
-                            .rounded_full(),
-                    ),
+                    Some(url) => div()
+                        .relative()
+                        .size(self.size)
+                        .child(fallback)
+                        .child(img(url).absolute().inset_0().size(self.size).rounded_full()),
                     None => fallback,
                 }
             })

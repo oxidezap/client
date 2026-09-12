@@ -5,6 +5,8 @@
 //! is what carries the state. Everything it draws is decided in
 //! [`crate::app::ChatRow`]; this file only lays it out.
 
+use std::sync::Arc;
+
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Entity, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
@@ -26,6 +28,7 @@ pub fn render_chat_item(
     is_selected: bool,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
+    media: Option<Arc<dyn crate::session::MediaCache>>,
     cx: &App,
     // `use<>`: the element reads colours out of the theme but retains nothing
     // borrowed from `cx`, so it must not inherit its lifetime — the virtual
@@ -82,7 +85,7 @@ pub fn render_chat_item(
         .child(
             Avatar::new(row.jid.clone(), &row.name, layout.avatar_size())
                 .group(row.is_group)
-                .picture(row.avatar_key.clone())
+                .picture(row.avatar_key.clone(), media)
                 .on(ground),
         )
         .child(

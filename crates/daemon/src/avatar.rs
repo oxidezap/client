@@ -39,6 +39,7 @@ pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
     let jid = chat.jid.clone();
     let hub = Arc::clone(hub);
     let key = key(&id);
+    let epoch = crate::media::epoch();
     if crate::media::has(&key) {
         oxidezap_session::spawn(async move {
             hub.signal(&DaemonMessage::AvatarReady { jid, key });
@@ -50,7 +51,7 @@ pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
             return;
         };
         let Ok(bytes) = accept(response) else { return };
-        if crate::media::put(&key, &bytes).is_ok() {
+        if crate::media::put_since(epoch, &key, &bytes).is_ok() {
             hub.signal(&DaemonMessage::AvatarReady { jid, key });
         }
     });

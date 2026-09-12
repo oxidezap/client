@@ -218,7 +218,6 @@ impl Bridge {
                             for chat in &mut page.items {
                                 crate::avatar::queue(&hub, chat);
                                 chat.avatar_source = None;
-                                chat.avatar_key = None;
                                 externalize_messages(epoch, &mut chat.messages);
                                 let mut reads =
                                     reads.lock().unwrap_or_else(|held| held.into_inner());
