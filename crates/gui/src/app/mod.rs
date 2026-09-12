@@ -811,6 +811,7 @@ pub struct WhatsAppApp {
     /// Uses RefCell for interior mutability since we need to cache during immutable render.
     /// Uses IndexMap to maintain insertion order for deterministic FIFO eviction.
     decoded_images: RefCell<IndexMap<String, (Cached, Arc<Image>)>>,
+    sticker_validation: RefCell<IndexMap<String, (Cached, bool)>>,
     /// Cache of message list data per chat to avoid expensive recomputation on every render.
     /// Key is the chat JID, value is the cached data.
     message_list_cache: RefCell<HashMap<String, MessageListCache>>,
@@ -1050,6 +1051,7 @@ impl WhatsAppApp {
             video_players: HashMap::new(),
             video_update_task: None,
             decoded_images: RefCell::new(IndexMap::new()),
+            sticker_validation: RefCell::new(IndexMap::new()),
             message_list_cache: RefCell::new(HashMap::new()),
             chat_list_cache: RefCell::new(None),
             chat_cache_version: std::cell::Cell::new(0),
@@ -1611,6 +1613,7 @@ impl WhatsAppApp {
         self.chat_list_cache.borrow_mut().take();
         *self.status_feed_cache.borrow_mut() = None;
         self.decoded_images.borrow_mut().clear();
+        self.sticker_validation.borrow_mut().clear();
         self.timeline_anchor = None;
         // Composed text, and the reply bar it may be answering.
         self.drafts.clear();

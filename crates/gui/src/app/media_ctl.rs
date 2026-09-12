@@ -121,6 +121,10 @@ impl WhatsAppApp {
             for id in &released_rows {
                 decoded.shift_remove(id);
             }
+            let mut validation = self.sticker_validation.borrow_mut();
+            for id in &released_rows {
+                validation.shift_remove(id);
+            }
         }
         for jid in touched {
             self.invalidate_message_cache(&jid, cx);
@@ -140,6 +144,9 @@ impl WhatsAppApp {
                     media.adopt_full_bytes(data);
                     // Drop any render-cached image built from the old bytes
                     self.decoded_images.borrow_mut().shift_remove(message_id);
+                    self.sticker_validation
+                        .borrow_mut()
+                        .shift_remove(message_id);
                     info!("Cached media data for message {}", message_id);
                     touched = Some(chat.jid.clone());
                 }
@@ -766,7 +773,7 @@ impl WhatsAppApp {
         }
 
         if media.media_type == oxidezap_core::MediaType::Sticker
-            && !crate::components::message_bubble::sticker_payload_is_valid(media)
+            && !self.sticker_payload_is_valid(message_id, media)
         {
             return None;
         }
@@ -809,6 +816,27 @@ impl WhatsAppApp {
         cache.insert(message_id.to_string(), (cached, Arc::clone(&image)));
         Some(image)
     }
+
+    fn sticker_payload_is_valid(&self, message_id: &str, media: &MediaContent) -> bool {
+        let cached = Cached {
+            bytes: media.data.len(),
+            format: mime_to_image_format(&media.mime_type).unwrap_or(gpui::ImageFormat::Png),
+            preview: media.data_is_preview,
+        };
+        if let Some((seen, valid)) = self.sticker_validation.borrow().get(message_id)
+            && *seen == cached
+        {
+            return *valid;
+        }
+        let valid = crate::components::message_bubble::sticker_payload_is_valid(media);
+        let mut validation = self.sticker_validation.borrow_mut();
+        if validation.len() >= MAX_DECODED_IMAGES {
+            validation.shift_remove_index(0);
+        }
+        validation.insert(message_id.to_string(), (cached, valid));
+        valid
+    }
+
     /// Toggle video playback for a message
     pub fn toggle_video(
         &mut self,
