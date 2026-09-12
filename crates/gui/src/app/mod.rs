@@ -747,6 +747,7 @@ pub struct WhatsAppApp {
     timeline_anchor: Option<TimelineAnchor>,
     /// Isolated input area view (has its own render cycle for performance)
     input_area: Option<Entity<InputAreaView>>,
+    file_drop_listener: Option<crate::platform::drop::Listener>,
     /// Chat a composing indicator was last sent to: paused must go back to
     /// this chat even if the user switched chats before the typing timeout
     composing_chat: Option<String>,
@@ -1054,6 +1055,7 @@ impl WhatsAppApp {
             message_list: new_timeline_state(0, crate::theme::Metrics::default()),
             timeline_anchor: None,
             input_area: None,
+            file_drop_listener: None,
             composing_chat: None,
             drafts: HashMap::new(),
             event_task: None,

@@ -16,6 +16,48 @@ use oxidezap_core::OutgoingMedia;
 use super::*;
 
 impl WhatsAppApp {
+    pub(crate) fn ensure_file_drop(&mut self, cx: &mut Context<Self>) {
+        if self.file_drop_listener.is_none() {
+            match crate::platform::drop::install(cx.entity().downgrade(), cx.to_async()) {
+                Ok(listener) => self.file_drop_listener = Some(listener),
+                Err(error) => warn!("file drops are unavailable: {error}"),
+            }
+        }
+    }
+
+    pub(crate) fn drop_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        let Some((jid, reply)) = self.prepare_file_drop(cx) else {
+            return;
+        };
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::platform::drop::read_paths(paths) });
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let chosen = task.await;
+            let _ = entity.update(cx, |app, cx| app.finish_attaching(&jid, reply, chosen, cx));
+        })
+        .detach();
+    }
+
+    pub(crate) fn prepare_file_drop(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, Option<ReplyDraft>)> {
+        if self.destination != Destination::Chats {
+            return None;
+        }
+        let jid = self.selected_chat.clone()?;
+        if !self.is_connected() {
+            self.notify_user(
+                "Files cannot be sent right now: not connected.",
+                notices::Tone::Problem,
+                cx,
+            );
+            return None;
+        }
+        Some((jid, self.reply_to.clone()))
+    }
+
     /// Ask for files and send them into the open conversation.
     ///
     /// The choosing is asynchronous on both platforms — a modal on one, a
@@ -50,7 +92,7 @@ impl WhatsAppApp {
     }
 
     /// Send what was chosen, and say what could not be.
-    fn finish_attaching(
+    pub(crate) fn finish_attaching(
         &mut self,
         jid: &str,
         reply: Option<ReplyDraft>,

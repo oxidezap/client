@@ -1,8 +1,8 @@
 //! The connected view: sidebar, conversation, and whatever floats over them.
 
 use gpui::{
-    AnyElement, App, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Window,
-    div, prelude::FluentBuilder as _,
+    AnyElement, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
+    Styled, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -25,6 +25,7 @@ pub fn render_connected_view(
     window: &mut Window,
     cx: &mut Context<WhatsAppApp>,
 ) -> impl IntoElement + use<> {
+    app.ensure_file_drop(cx);
     app.ensure_input_area(window, cx);
     app.ensure_chat_search_input(window, cx);
     // Before anything reads a plugin's tree: a field the plugin added this
@@ -468,6 +469,14 @@ fn render_chat_area(
                         el.child(render_offline_strip(entity.clone(), metrics, cx))
                     } else {
                         el.children(input_area)
+                    }
+                })
+                .on_drop({
+                    let entity = entity.clone();
+                    move |paths: &gpui::ExternalPaths, _window, cx| {
+                        entity.update(cx, |app, cx| {
+                            app.drop_paths(paths.paths().to_vec(), cx);
+                        });
                     }
                 })
             }
