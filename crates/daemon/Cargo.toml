@@ -18,6 +18,7 @@ test-support = ["oxidezap-session/test-support"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 log = { workspace = true }
 
 oxidezap-core = { workspace = true }

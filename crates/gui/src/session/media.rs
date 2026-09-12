@@ -150,6 +150,8 @@ struct SourceCache {
     bytes: u64,
 }
 
+const MAX_SOURCE_ENTRIES: usize = 256;
+
 struct SourceEntry {
     source: ImageSource,
     bytes: u64,
@@ -179,7 +181,9 @@ impl SourceCache {
                 touched: self.clock,
             },
         );
-        while self.bytes > oxidezap_core::WEB_MEDIA_BUDGET_BYTES {
+        while self.bytes > oxidezap_core::DECODED_IMAGE_BUDGET_BYTES
+            || self.entries.len() > MAX_SOURCE_ENTRIES
+        {
             let Some(key) = self
                 .entries
                 .iter()
@@ -786,12 +790,24 @@ mod tests {
         cache.put(
             "old".to_string(),
             source(),
-            oxidezap_core::WEB_MEDIA_BUDGET_BYTES,
+            oxidezap_core::DECODED_IMAGE_BUDGET_BYTES,
         );
         cache.put("new".to_string(), source(), 1);
 
         assert!(cache.get("old").is_none());
         assert!(cache.get("new").is_some());
+    }
+
+    #[test]
+    fn image_sources_have_an_entry_ceiling_when_their_cost_is_unknown() {
+        let mut cache = SourceCache::default();
+        for index in 0..=MAX_SOURCE_ENTRIES {
+            cache.put(index.to_string(), ImageSource::from("avatar"), 0);
+        }
+
+        assert_eq!(cache.entries.len(), MAX_SOURCE_ENTRIES);
+        assert!(cache.get("0").is_none());
+        assert!(cache.get(&MAX_SOURCE_ENTRIES.to_string()).is_some());
     }
 
     /// And the payload does not go through whatever is at the name. A staged

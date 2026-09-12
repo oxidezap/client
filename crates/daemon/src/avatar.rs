@@ -24,6 +24,8 @@ use oxidezap_ipc::DaemonMessage;
 struct Selection {
     account_generation: usize,
     cache_epoch: usize,
+    picture_id: Option<String>,
+    source: Option<String>,
     token: u64,
 }
 
@@ -39,11 +41,10 @@ pub fn key(jid: &str, id: &str) -> String {
 
 pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
     let jid = chat.jid.clone();
-    let selection = record_selection(hub, &jid);
-    let Some(source) = chat.avatar_source.clone() else {
-        return;
-    };
-    let Some(id) = chat.avatar_key.clone() else {
+    let source = chat.avatar_source.clone();
+    let id = chat.avatar_key.clone();
+    let selection = record_selection(hub, &jid, id.as_deref(), source.as_deref());
+    let (Some(source), Some(id)) = (source, id) else {
         return;
     };
     let hub = Arc::clone(hub);
@@ -82,16 +83,34 @@ fn safe_component(value: &str) -> String {
     result
 }
 
-fn record_selection(hub: &StateHub, jid: &str) -> Selection {
+fn record_selection(
+    hub: &StateHub,
+    jid: &str,
+    picture_id: Option<&str>,
+    source: Option<&str>,
+) -> Selection {
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let account_generation = hub.account_generation();
+    let cache_epoch = crate::media::epoch();
+    let key = (hub_id(hub), jid.to_owned());
+    if let Some(selection) = latest.get(&key)
+        && selection.account_generation == account_generation
+        && selection.cache_epoch == cache_epoch
+        && selection.picture_id.as_deref() == picture_id
+        && selection.source.as_deref() == source
+    {
+        return selection.clone();
+    }
     let selection = Selection {
-        account_generation: hub.account_generation(),
-        cache_epoch: crate::media::epoch(),
+        account_generation,
+        cache_epoch,
+        picture_id: picture_id.map(str::to_owned),
+        source: source.map(str::to_owned),
         token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
     };
-    latest.insert((hub_id(hub), jid.to_owned()), selection.clone());
+    latest.insert(key, selection.clone());
     selection
 }
 
@@ -132,6 +151,8 @@ fn accept(response: AvatarResponse) -> anyhow::Result<Vec<u8>> {
     if response.body.is_empty() {
         anyhow::bail!("avatar response was empty");
     }
+    image::load_from_memory(&response.body)
+        .map_err(|e| anyhow::anyhow!("invalid avatar image: {e}"))?;
     Ok(response.body)
 }
 
@@ -151,11 +172,21 @@ mod tests {
     #[test]
     fn superseded_avatar_completion_is_rejected() {
         let hub = StateHub::new();
-        let first = record_selection(&hub, "jid-superseded");
-        let second = record_selection(&hub, "jid-superseded");
+        let first = record_selection(&hub, "jid-superseded", Some("one"), Some("url"));
+        let second = record_selection(&hub, "jid-superseded", Some("two"), Some("url"));
 
         assert!(!is_current(&hub, "jid-superseded", &first));
         assert!(is_current(&hub, "jid-superseded", &second));
+    }
+
+    #[test]
+    fn identical_avatar_selection_keeps_the_in_flight_completion_current() {
+        let hub = StateHub::new();
+        let first = record_selection(&hub, "jid-identical", Some("one"), Some("url"));
+        let second = record_selection(&hub, "jid-identical", Some("one"), Some("url"));
+
+        assert_eq!(first, second);
+        assert!(is_current(&hub, "jid-identical", &first));
     }
 
     #[test]
@@ -163,10 +194,10 @@ mod tests {
         assert_eq!(
             accept(AvatarResponse {
                 status: 200,
-                body: vec![1, 2, 3]
+                body: valid_png(),
             })
             .unwrap(),
-            vec![1, 2, 3]
+            valid_png()
         );
         assert!(
             accept(AvatarResponse {
@@ -182,5 +213,23 @@ mod tests {
             })
             .is_err()
         );
+        assert!(
+            accept(AvatarResponse {
+                status: 200,
+                body: vec![1, 2, 3]
+            })
+            .is_err()
+        );
+    }
+
+    fn valid_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
     }
 }

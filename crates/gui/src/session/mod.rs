@@ -1535,6 +1535,7 @@ impl SessionHandle {
     /// The daemon owns that file and stops itself once it is gone, so this is
     /// the last thing this connection will be told anything on.
     pub fn forget_session(&self) {
+        self.conn.media.clear_cached();
         self.tell(ClientRequest::ForgetSession);
     }
 

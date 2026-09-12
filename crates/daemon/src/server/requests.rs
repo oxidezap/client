@@ -245,7 +245,16 @@ pub(super) async fn handle_request(
             })
             .await;
             acted(match cleared {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(())) => {
+                    if hub.connection().is_connected()
+                        && let Err(error) = dispatch(hub, commands, Action::ReloadHistory).await
+                    {
+                        log::warn!(
+                            "media cache cleared but avatar refresh was not queued: {error}"
+                        );
+                    }
+                    Ok(())
+                }
                 Ok(Err(e)) => Err(ProtocolError::Malformed {
                     detail: format!("could not clear the media cache: {e}"),
                 }),

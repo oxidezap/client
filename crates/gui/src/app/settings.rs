@@ -576,7 +576,12 @@ impl WhatsAppApp {
             if cleared.await.is_err() {
                 return;
             }
-            let _ = entity.update(cx, |app, cx| app.refresh_storage_usage(cx));
+            let _ = entity.update(cx, |app, cx| {
+                if let Some(client) = &app.client {
+                    client.load_chats(None);
+                }
+                app.refresh_storage_usage(cx);
+            });
         })
         .detach();
     }
