@@ -109,6 +109,7 @@ pub struct ChatRow {
     pub jid: String,
     pub name: String,
     pub kind: ChatKind,
+    pub disambiguator: Option<usize>,
     pub is_group: bool,
     pub timestamp: Option<DateTime<Utc>>,
     pub unread: Unread,
@@ -131,6 +132,7 @@ impl ChatRow {
             jid: chat.jid.clone(),
             name: display_name(&chat.name, is_own_number),
             kind: ChatKind::of(chat),
+            disambiguator: None,
             is_group: chat.is_group,
             timestamp: chat.last_message_time,
             unread: if chat.unread_count > 0 {
@@ -153,18 +155,14 @@ impl ChatRow {
 }
 
 pub fn disambiguate_names(rows: &mut [ChatRow]) {
-    let names: Vec<String> = rows.iter().map(|row| row.name.clone()).collect();
-    let mut totals = HashMap::new();
-    for name in &names {
-        *totals.entry(name).or_insert(0usize) += 1;
+    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        by_name.entry(row.name.clone()).or_default().push(index);
     }
-    let mut occurrences = HashMap::new();
-    for index in 0..rows.len() {
-        let name = &names[index];
-        if totals[name] > 1 {
-            let occurrence = occurrences.entry(name).or_insert(0usize);
-            *occurrence += 1;
-            rows[index].name = format!("{name} · {occurrence}");
+    for indices in by_name.values_mut().filter(|indices| indices.len() > 1) {
+        indices.sort_by(|left, right| rows[*left].jid.cmp(&rows[*right].jid));
+        for (ordinal, index) in indices.iter().enumerate() {
+            rows[*index].disambiguator = Some(ordinal + 1);
         }
     }
 }
@@ -504,8 +502,10 @@ mod tests {
 
         disambiguate_names(&mut rows);
 
-        assert_eq!(rows[0].name, "Test · 1");
-        assert_eq!(rows[1].name, "Test · 2");
+        assert_eq!(rows[0].name, "Test");
+        assert_eq!(rows[1].name, "Test");
+        assert_eq!(rows[0].disambiguator, Some(1));
+        assert_eq!(rows[1].disambiguator, Some(2));
     }
 
     #[test]

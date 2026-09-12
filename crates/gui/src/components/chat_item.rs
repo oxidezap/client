@@ -112,19 +112,14 @@ fn render_name_row(
                 .text_size(metrics.text_body())
                 .text_color(cx.theme().foreground)
                 .font_weight(gpui::FontWeight::MEDIUM)
+                .children(row.disambiguator.map(|ordinal| {
+                    div()
+                        .flex_shrink_0()
+                        .text_color(cx.theme().primary)
+                        .child(format!("#{ordinal}"))
+                }))
                 .child(name),
         )
-        .children(row.kind.label().map(|label| {
-            div()
-                .flex_shrink_0()
-                .rounded(metrics.radius_sm())
-                .bg(cx.theme().secondary)
-                .px(metrics.space_xs())
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_size(metrics.text_micro())
-                .text_color(cx.theme().secondary_foreground)
-                .child(label)
-        }))
         .children(row.pinned.then(|| {
             div()
                 .flex_shrink_0()
@@ -160,6 +155,17 @@ fn render_preview_row(
         .items_center()
         .gap(metrics.space_sm())
         .min_w_0()
+        .children(row.kind.label().map(|label| {
+            div()
+                .flex_shrink_0()
+                .rounded(metrics.radius_sm())
+                .bg(cx.theme().secondary)
+                .px(metrics.space_xs())
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(metrics.text_micro())
+                .text_color(cx.theme().secondary_foreground)
+                .child(label)
+        }))
         .child(render_preview(&row.preview, row.is_group, metrics, cx))
         .children(render_unread(&row.unread, has_unread, metrics, cx))
 }
