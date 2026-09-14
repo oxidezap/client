@@ -59,6 +59,23 @@
       rel="copy-file"
       href="../crates/gui/assets/fonts/noto-emoji/NotoEmoji-Regular.ttf"
     />
+    <!-- Preload the emoji font so the browser downloads it in parallel with
+         the wasm module rather than waiting until the module has loaded and
+         run `main()`. `as="fetch"` and `crossorigin` match the `fetch()` call
+         in `crates/gui/src/platform/fonts.rs`. -->
+    <link
+      rel="preload"
+      href="NotoEmoji-Regular.ttf"
+      as="fetch"
+      crossorigin="anonymous"
+    />
+
+    <!-- Warm up DNS and TLS for the WhatsApp WebSocket endpoint while the
+         module is downloading and compiling, reducing cold start time to the
+         initial QR code. -->
+    <link rel="dns-prefetch" href="https://web.whatsapp.com" />
+    <link rel="preconnect" href="https://web.whatsapp.com" crossorigin="anonymous" />
+
 
     <!-- The window itself. `data-bin` names the binary; wasm-bindgen turns
          its `main` into the module's start function.

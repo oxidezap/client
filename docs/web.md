@@ -408,6 +408,9 @@ keeps that from being a page that never draws. Opening first and adding the
 face later looks cheaper and is not: gpui's `LineLayoutCache` keeps a shaped
 line for as long as something asks for it every frame, so the chat list a page
 opens onto would have kept its boxes until it was scrolled away and back.
+To prevent this fetch from adding an idle waterfall step after the WebAssembly
+module instantiates, `web/index.html` preloads the font (`rel="preload" as="fetch"`)
+so it downloads concurrently with the `.wasm` binary.
 
 **A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
 is there because cross-origin isolation needs two response headers GitHub Pages
