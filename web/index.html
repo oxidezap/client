@@ -70,12 +70,6 @@
       crossorigin="anonymous"
     />
 
-    <!-- Warm up DNS and TLS for the WhatsApp WebSocket endpoint while the
-         module is downloading and compiling, reducing cold start time to the
-         initial QR code. -->
-    <link rel="dns-prefetch" href="https://web.whatsapp.com" />
-    <link rel="preconnect" href="https://web.whatsapp.com" crossorigin="anonymous" />
-
 
     <!-- The window itself. `data-bin` names the binary; wasm-bindgen turns
          its `main` into the module's start function.
