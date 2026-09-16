@@ -195,6 +195,63 @@ impl WhatsAppClient {
         })
     }
 
+    /// Answer an interactive list message by selecting one of its rows.
+    ///
+    /// The row id is the caller's, taken from the list message the sender
+    /// wrote. The library has no named helper for this, so the response proto
+    /// is composed here and sent through the generic send, which is what
+    /// `send select` in the CLI needs and what a script automating a bot
+    /// menu is for.
+    pub fn send_list_response(
+        &self,
+        to: String,
+        title: String,
+        row_id: String,
+        reply_to: Option<String>,
+    ) -> Task<Result<SendId, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = to.parse().map_err(|_| "not a chat address".to_string())?;
+            if row_id.is_empty() {
+                return Err("a list selection needs a row id".to_string());
+            }
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let context = match reply_to {
+                Some(id) => Some(super::convert::quote_context(
+                    &super::sends::quoted_for_reply(&live.chat_store, &chat, &id).await?,
+                )),
+                None => None,
+            };
+            let message = wa::Message {
+                list_response_message: whatsapp_rust::buffa::MessageField::some(
+                    wa::message::ListResponseMessage {
+                        title: Some(title),
+                        list_type: Some(wa::message::list_response_message::ListType::SingleSelect),
+                        single_select_reply: whatsapp_rust::buffa::MessageField::some(
+                            wa::message::list_response_message::SingleSelectReply {
+                                selected_row_id: Some(row_id),
+                            },
+                        ),
+                        context_info: context
+                            .map(whatsapp_rust::buffa::MessageField::some)
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            };
+            let msg_id = live.client.generate_message_id();
+            let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
+            live.client
+                .send_message_with_options(chat, message, options)
+                .await
+                .map(|result| result.message_id.clone())
+                .map_err(|e| e.to_string())
+        })
+    }
+
     /// Pin or unpin a conversation.
     pub fn pin_chat(&self, chat_jid: String, pin: bool) -> Task<Result<(), String>> {
         let session = self.session.clone();

@@ -81,6 +81,10 @@ impl WhatsAppClient {
     }
 
     /// Every group this account participates in, by subject.
+    ///
+    /// The participating query always reaches the server, so there is no
+    /// cached variant to opt out of and no refresh flag to honour: listing is
+    /// the refresh.
     pub fn list_groups(&self) -> Task<Result<Vec<GroupListEntry>, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {

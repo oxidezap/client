@@ -19,5 +19,14 @@ serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
 usage = { workspace = true }
 
+# `CREATE_NO_WINDOW`, so a daemon the CLI starts does not pop a console window
+# of its own. The same flag the window's own launch passes.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+# The surface tests parse the JSON contract the binary prints.
+serde_json = { workspace = true, features = ["std"] }
+
 [lints]
 workspace = true

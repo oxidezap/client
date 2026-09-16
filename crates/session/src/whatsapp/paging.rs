@@ -82,6 +82,18 @@ pub(super) fn participant_keyed_chat(jid: &Jid) -> bool {
     jid.is_group() || jid.is_broadcast_list() || jid.is_status_broadcast()
 }
 
+/// Whether a stored message's class carries an attachment.
+///
+/// The search filter `has_media` reads, kept here beside the message class so
+/// the two move together.
+fn carries_media(kind: &oxidezap_chat_store::MessageKind) -> bool {
+    use oxidezap_chat_store::MessageKind as K;
+    matches!(
+        kind,
+        K::Image | K::Video | K::VideoNote | K::Audio | K::VoiceNote | K::Sticker | K::Document
+    )
+}
+
 impl WhatsAppClient {
     /// One page of a conversation, for a front end that asked for one.
     ///
@@ -131,11 +143,44 @@ impl WhatsAppClient {
         })
     }
 
+    /// One page of a chat's messages *after* a cursor, oldest first.
+    ///
+    /// The forward twin of [`Self::load_messages`], for a caller that holds a
+    /// row and wants what came later. A page shorter than it asked for is the
+    /// end of what the store holds.
+    pub fn load_messages_after(
+        &self,
+        jid: String,
+        after: String,
+        limit: i64,
+    ) -> Task<Result<Page<ChatMessage>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            Self::message_page_after(
+                &live.chat_store,
+                &live.client,
+                &live.names,
+                jid,
+                after,
+                limit,
+            )
+            .await
+        })
+    }
+
     /// Full-text search over message history with optional chat filter.
+    ///
+    /// `has_media` keeps only rows whose content class carries an attachment,
+    /// which is the one filter the CLI promises and the store can answer
+    /// without a second query: the row's `kind` is already materialized.
     pub fn search_messages(
         &self,
         query: String,
         chat_jid: Option<String>,
+        has_media: bool,
         limit: i64,
     ) -> Task<Result<Vec<ChatMessage>, String>> {
         let session = self.session.clone();
@@ -161,6 +206,13 @@ impl WhatsAppClient {
                     .search_messages(&query, limit.clamp(1, 100))
                     .await
                     .map_err(|e| format!("search failed: {e}"))?
+            };
+            let hits = if has_media {
+                hits.into_iter()
+                    .filter(|m| carries_media(&m.kind))
+                    .collect()
+            } else {
+                hits
             };
             let mut messages: Vec<ChatMessage> =
                 hits.into_iter().map(stored_to_chat_message).collect();
@@ -336,13 +388,69 @@ impl WhatsAppClient {
             .then(|| page.last().map(message_cursor))
             .flatten();
         page.reverse(); // the store returns newest-first; a timeline is drawn the other way
+        let messages = Self::hydrate_message_page(store, client, names, &chat, page, unread).await;
+        Ok(Page {
+            items: messages,
+            next,
+        })
+    }
+
+    /// One page of a chat's messages *after* a cursor, oldest first.
+    ///
+    /// The forward twin of [`Self::message_page`], hydrated through the same
+    /// function so a bubble read forwards and the same bubble read backwards
+    /// say the same thing. `next` is the last row's cursor, or `None` when the
+    /// store had nothing left to hand over.
+    pub(super) async fn message_page_after(
+        store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
+        jid: String,
+        after: String,
+        limit: i64,
+    ) -> Result<Page<ChatMessage>, String> {
+        let chat: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
+        let after = parse_message_cursor(&after).ok_or_else(|| "unreadable cursor".to_string())?;
+
+        let limit = limit.clamp(1, Self::MESSAGE_PAGE);
+        let page = store
+            .messages_after(&chat, after, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        let next = ((page.len() as i64) == limit)
+            .then(|| page.last().map(message_cursor))
+            .flatten();
+        // A forward page carries no unread tail: those rows are older than the
+        // cursor the caller already holds, and a receipt for them was sent
+        // when they were shown.
+        let messages = Self::hydrate_message_page(store, client, names, &chat, page, 0).await;
+        Ok(Page {
+            items: messages,
+            next,
+        })
+    }
+
+    /// Hydrate stored rows into the messages a front end draws.
+    ///
+    /// One path for both directions: reactions, mentions, quoted authors and
+    /// sender names, exactly as the attach load does them, so a page read
+    /// forwards and a page read backwards are the same rows with the same
+    /// names, and neither leaves an unread tail nobody sends a receipt for.
+    async fn hydrate_message_page(
+        store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
+        chat: &Jid,
+        page: Vec<oxidezap_chat_store::StoredMessage>,
+        unread: i64,
+    ) -> Vec<ChatMessage> {
         let mention_lists = crate::mentions::mention_lists_of(&page);
         let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
         let mut messages: Vec<ChatMessage> = page.into_iter().map(stored_to_chat_message).collect();
         crate::mentions::hydrate_mention_lists(client, names, &mention_lists, &mut messages).await;
         crate::mentions::hydrate_quoted_mention_lists(client, names, &quoted_lists, &mut messages)
             .await;
-        Self::hydrate_reactions(store, client, names, &chat, &mut messages).await;
+        Self::hydrate_reactions(store, client, names, chat, &mut messages).await;
         Self::hydrate_quoted_authors(client, names, &mut messages).await;
         if chat.is_group() || chat.is_status_broadcast() {
             Self::hydrate_sender_names(
@@ -358,10 +466,7 @@ impl WhatsAppClient {
         // paragraph above promises: a page hydrated any other way is one whose
         // unread tail nobody ever sends a receipt for.
         mark_unread_tail(&mut messages, unread.clamp(0, u32::MAX as i64) as u32);
-        Ok(Page {
-            items: messages,
-            next,
-        })
+        messages
     }
 
     /// One page of the chat list, after `after`.

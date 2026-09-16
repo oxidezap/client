@@ -918,11 +918,12 @@ impl WhatsAppClient {
 
     /// Backfill history: warm the chat page and report the coverage.
     ///
-    /// The library offers no on-demand phone fetch, so this is a local
-    /// backfill — everything the store holds, re-read — rather than bytes
-    /// pulled off the phone. The daemon pairs it with a history reload, so
-    /// the lane republish lands where this read it. The count bounds how
-    /// deep the warm reads.
+    /// Asks the primary phone first, through PDO, for whatever came before the
+    /// oldest row the store holds — the library's `fetch_message_history`,
+    /// which is the on-demand sync WA Web itself uses. What arrives lands on
+    /// the normal history-sync path, so the local re-read that follows drains
+    /// it. A phone that refuses the request is not fatal: the local backfill is
+    /// still worth having, and what it warms is what already exists here.
     pub fn history_backfill(
         &self,
         chat_jid: String,
@@ -936,6 +937,27 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let oldest = live
+                .chat_store
+                .oldest_message(&chat)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?;
+            if let Some(oldest) = oldest {
+                let from_me = oldest.from_me;
+                if let Err(e) = live
+                    .client
+                    .fetch_message_history(
+                        &chat,
+                        &oldest.id,
+                        from_me,
+                        oldest.timestamp.timestamp_millis(),
+                        count.clamp(1, 500) as i32,
+                    )
+                    .await
+                {
+                    log::warn!("the phone was not asked for older history: {e}");
+                }
+            }
             let warmed = Self::message_page(
                 &live.chat_store,
                 &live.client,

@@ -1,19 +1,37 @@
 //! OxideZap CLI: A lightweight, scriptable command-line interface for WhatsApp.
+//!
+//! One contract for every command: a result crosses [`output`], a failure
+//! exits nonzero, and `--json` never carries a human sentence. The daemon
+//! holds the session; this process holds a socket, and starts the daemon
+//! beside it when nothing is listening, exactly as the window does.
 
+// `std::time::Instant` is banned across the tree so a wait goes through the
+// pluggable clock, which is what `wacore::time::Instant` is. This binary has
+// no session and no clock provider to install: the only instant it reads is a
+// spawn deadline for the daemon beside it, and pulling `wacore` in to read it
+// would put the whole session graph behind the 2 MiB budget this crate exists
+// to stay under. Scoped to this file, and to that one concern.
+#![allow(clippy::disallowed_methods)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod args;
 mod output;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use args::{Commands, OxidezapCli};
-use output::{OutputMode, print_error, print_event, print_result};
+use output::{OutputMode, print_action, print_error, print_event, print_result};
 use oxidezap_ipc::IpcClient;
 use oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION;
 use oxidezap_wire::request::ClientRequest;
 use oxidezap_wire::response::DaemonResponse;
+
+/// How long to keep trying before giving up on a daemon we started.
+const START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to leave a daemon we started to take its lock and bind.
+const START_ATTEMPT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     let cli = OxidezapCli::parse();
@@ -34,23 +52,8 @@ fn main() -> ExitCode {
         }
     };
 
-    // Commands that execute locally without requiring daemon connection
+    // Commands that execute locally without a daemon connection.
     match command {
-        // Selecting an account is choosing a socket, so it needs no
-        // daemon. Eval the line to apply it:
-        // `eval $(oxidezap-cli accounts use work)`.
-        Commands::Accounts(ref accounts)
-            if matches!(accounts.command, Some(args::AccountsSubcommand::Use(_))) =>
-        {
-            if let Some(args::AccountsSubcommand::Use(u)) = &accounts.command {
-                if u.id == "default" {
-                    println!("unset OXIDEZAP_ACCOUNT");
-                } else {
-                    println!("export OXIDEZAP_ACCOUNT={}", u.id);
-                }
-            }
-            return ExitCode::SUCCESS;
-        }
         Commands::Completion(comp) => {
             let shell = match comp.shell.as_str() {
                 "bash" => usage::complete::Shell::Bash,
@@ -64,25 +67,91 @@ fn main() -> ExitCode {
             print!("{}", OxidezapCli::to_kdl());
             return ExitCode::SUCCESS;
         }
+        Commands::Accounts(ref accounts)
+            if matches!(accounts.command, Some(args::AccountsSubcommand::Use(_))) =>
+        {
+            if let Some(args::AccountsSubcommand::Use(u)) = &accounts.command {
+                match resolve_account_arg(&u.id, output_mode) {
+                    Ok(Some(id)) => println!("export OXIDEZAP_ACCOUNT={id}"),
+                    Ok(None) => println!("unset OXIDEZAP_ACCOUNT"),
+                    Err(code) => return code,
+                }
+            }
+            return ExitCode::SUCCESS;
+        }
         _ => {}
     }
 
-    // A named account profile owns its socket; without one this is the
-    // default profile on the historic path. An explicit socket always wins.
-    // Set before connecting, so the endpoint derived below agrees.
-    if let Some(account) = cli.account.as_deref()
-        && std::env::var_os("OXIDEZAP_ACCOUNT").is_none()
-    {
+    // A named account profile owns its socket; without one this is the default
+    // profile on the historic path. An explicit socket always wins. Rejected,
+    // never sanitized, before the endpoint is derived: `wo/rk` must not
+    // converge onto `work`, and the same value is echoed by `accounts use`
+    // into a shell, so it must not carry a quote either.
+    let account = match cli.account.as_deref() {
+        Some(id) => match oxidezap_wire::validate_account_id(id) {
+            Some(clean) => Some(clean),
+            None => {
+                print_error(
+                    output_mode,
+                    "invalid_account_id",
+                    &format!("--account must match [A-Za-z0-9][A-Za-z0-9_-]*, got {id:?}"),
+                );
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    if account.is_some() && std::env::var_os("OXIDEZAP_ACCOUNT").is_none() {
         // Single-threaded startup, before any thread exists: no thread can
         // observe the environment changing under it.
         unsafe {
-            std::env::set_var("OXIDEZAP_ACCOUNT", account);
+            std::env::set_var("OXIDEZAP_ACCOUNT", account.as_deref().unwrap());
+        }
+    }
+    if let Some(raw) = std::env::var_os("OXIDEZAP_ACCOUNT")
+        && oxidezap_wire::validate_account_id(&raw.to_string_lossy()).is_none()
+    {
+        print_error(
+            output_mode,
+            "invalid_account_id",
+            &format!(
+                "OXIDEZAP_ACCOUNT must match [A-Za-z0-9][A-Za-z0-9_-]*, got {:?}",
+                raw.to_string_lossy()
+            ),
+        );
+        return ExitCode::from(2);
+    }
+
+    // Local-only account management, which owns its own connection semantics.
+    if let Commands::Accounts(accounts) = &command {
+        match &accounts.command {
+            Some(args::AccountsSubcommand::Add(add)) => {
+                return match account_add(&add.id, output_mode) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(err) => {
+                        print_error(output_mode, &err.code, &err.message);
+                        ExitCode::from(1)
+                    }
+                };
+            }
+            Some(args::AccountsSubcommand::Remove(remove)) => {
+                return match account_remove(&remove.id, output_mode) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(err) => {
+                        print_error(output_mode, &err.code, &err.message);
+                        ExitCode::from(1)
+                    }
+                };
+            }
+            _ => {}
         }
     }
 
-    // Connect to daemon
-    let mut client = match cli.socket.as_deref() {
-        Some(socket_path) => match IpcClient::connect_at(&PathBuf::from(socket_path)) {
+    // Connect, starting the daemon beside this binary when nothing is
+    // listening. An explicit socket never spawns: the caller named a daemon it
+    // expects to exist.
+    let client = if let Some(socket_path) = cli.socket.as_deref() {
+        match IpcClient::connect_at(&PathBuf::from(socket_path)) {
             Ok(c) => c,
             Err(e) => {
                 print_error(
@@ -92,21 +161,21 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::from(2);
             }
-        },
-        None => match IpcClient::connect() {
+        }
+    } else {
+        match connect_or_start() {
             Ok(c) => c,
             Err(e) => {
                 print_error(
                     output_mode,
                     "daemon_not_running",
-                    &format!(
-                        "no oxidezapd daemon listening: {e}. Start the daemon or ensure it is running."
-                    ),
+                    &format!("could not reach or start oxidezapd: {e}"),
                 );
                 return ExitCode::from(2);
             }
-        },
+        }
     };
+    let mut client = client;
 
     // Perform handshake
     let handshake_req = ClientRequest::Hello {
@@ -129,6 +198,241 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Validate an id a user named, or resolve `default` to "unset".
+fn resolve_account_arg(id: &str, output_mode: OutputMode) -> Result<Option<String>, ExitCode> {
+    if id == "default" {
+        return Ok(None);
+    }
+    match oxidezap_wire::validate_account_id(id) {
+        Some(clean) => Ok(Some(clean)),
+        None => {
+            print_error(
+                output_mode,
+                "invalid_account_id",
+                &format!("an account id must match [A-Za-z0-9][A-Za-z0-9_-]*, got {id:?}"),
+            );
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// Connect to a daemon for the profile in force, starting one when nothing is
+/// listening.
+///
+/// One daemon per profile takes a per-user lock and the loser exits, so
+/// starting one is safe to race and one attempt is not enough: a daemon
+/// started while another is tearing down loses the lock, and the socket was
+/// unlinked before that lock was released. Retrying until the deadline closes
+/// that window.
+fn connect_or_start() -> std::io::Result<IpcClient> {
+    let Some(path) = oxidezap_ipc::endpoint_path() else {
+        return Err(std::io::Error::other(
+            "no per-user directory to look for the daemon in",
+        ));
+    };
+    let program = match daemon_program() {
+        Some(program) => program,
+        None => {
+            // No daemon to start, but one may still be running: try to connect
+            // and report the connect error if there is not.
+            return IpcClient::connect();
+        }
+    };
+    let deadline = std::time::Instant::now() + START_TIMEOUT;
+    let mut started: Option<std::process::Child> = None;
+
+    loop {
+        if let Ok(client) = IpcClient::connect() {
+            reap(started.take());
+            return Ok(client);
+        }
+        if std::time::Instant::now() >= deadline {
+            reap(started.take());
+            return Err(std::io::Error::other(format!(
+                "no daemon listening on {} after {START_TIMEOUT:?}",
+                path.display()
+            )));
+        }
+
+        // Only when the last one is not still coming up, for the same reason
+        // the window waits: a connect can fail for reasons that are not
+        // "nobody is listening", and spawning per turn would start several
+        // daemons, all but one losing the lock.
+        match started.as_mut().map(std::process::Child::try_wait) {
+            Some(Ok(None)) => {}
+            _ => {
+                started = Some(spawn_daemon(&program)?);
+            }
+        }
+
+        let attempt = std::time::Instant::now() + START_ATTEMPT;
+        while std::time::Instant::now() < attempt {
+            if let Ok(client) = IpcClient::connect() {
+                reap(started.take());
+                return Ok(client);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Where to find the daemon, beside this binary and nowhere else: the two ship
+/// together and a release directory is not on anybody's `PATH`.
+fn daemon_program() -> Option<PathBuf> {
+    const NAME: &str = if cfg!(windows) {
+        "oxidezapd.exe"
+    } else {
+        "oxidezapd"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
+        .filter(|path| path.exists())
+}
+
+/// Launch the daemon for the profile in force, detached and quiet.
+fn spawn_daemon(program: &Path) -> std::io::Result<std::process::Child> {
+    let mut command = std::process::Command::new(program);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    if let Ok(account) = std::env::var("OXIDEZAP_ACCOUNT")
+        && !account.is_empty()
+    {
+        command.arg("--account").arg(account);
+    }
+    command.spawn()
+}
+
+/// Wait for a daemon this process started, in a thread of its own, so it does
+/// not become a zombie while the CLI exits.
+fn reap(child: Option<std::process::Child>) {
+    let Some(mut child) = child else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("oxidezap-daemon-wait".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+/// Register a profile: validate the id and bring its daemon up.
+fn account_add(id: &str, output_mode: OutputMode) -> Result<(), oxidezap_wire::ApiError> {
+    let Some(clean) = oxidezap_wire::validate_account_id(id) else {
+        return Err(oxidezap_wire::ApiError::invalid_argument(format!(
+            "an account id must match [A-Za-z0-9][A-Za-z0-9_-]*, got {id:?}"
+        )));
+    };
+    if clean == "default" {
+        return Err(oxidezap_wire::ApiError::invalid_argument(
+            "the default profile exists already; add a named one",
+        ));
+    }
+    if let Some(path) = oxidezap_ipc::endpoint_path_for_account(&clean)
+        && oxidezap_ipc::Endpoint::connect_at(&path).is_ok()
+    {
+        print_action(output_mode, "account_exists", || {
+            println!("Account {clean} is already running.");
+        });
+        return Ok(());
+    }
+    unsafe {
+        std::env::set_var("OXIDEZAP_ACCOUNT", &clean);
+    }
+    let Some(program) = daemon_program() else {
+        return Err(oxidezap_wire::ApiError::not_connected(
+            "no daemon beside this binary to start; the two ship in one directory",
+        ));
+    };
+    let child = spawn_daemon(&program)
+        .map_err(|e| oxidezap_wire::ApiError::internal(format!("could not start it: {e}")))?;
+    let Some(path) = oxidezap_ipc::endpoint_path() else {
+        return Err(oxidezap_wire::ApiError::internal(
+            "no per-user directory to look for the daemon in",
+        ));
+    };
+    let deadline = std::time::Instant::now() + START_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        match oxidezap_ipc::Endpoint::connect_at(&path) {
+            Ok(_) => {
+                reap(Some(child));
+                print_action(output_mode, "account_added", || {
+                    println!("Account {clean} is up.");
+                });
+                return Ok(());
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    reap(Some(child));
+    Err(oxidezap_wire::ApiError::timeout(format!(
+        "the daemon for {clean} did not come up"
+    )))
+}
+
+/// Delete a profile: stop its daemon and wipe its store.
+///
+/// The wipe is the daemon's own `ForgetSession`, which is the one process that
+/// holds the database; the media cache lives in the runtime directory beside
+/// the socket, so it is removed here once the daemon is gone.
+fn account_remove(id: &str, output_mode: OutputMode) -> Result<(), oxidezap_wire::ApiError> {
+    let Some(clean) = oxidezap_wire::validate_account_id(id) else {
+        return Err(oxidezap_wire::ApiError::invalid_argument(format!(
+            "an account id must match [A-Za-z0-9][A-Za-z0-9_-]*, got {id:?}"
+        )));
+    };
+    if clean == "default" {
+        return Err(oxidezap_wire::ApiError::invalid_argument(
+            "the default profile shares the historic paths; use `auth --logout` for it",
+        ));
+    }
+    let path = oxidezap_ipc::endpoint_path_for_account(&clean).ok_or_else(|| {
+        oxidezap_wire::ApiError::internal("no per-user directory to look for the daemon in")
+    })?;
+    let mut client = IpcClient::connect_at(&path).map_err(|e| {
+        oxidezap_wire::ApiError::not_connected(format!(
+            "no daemon for {clean} on {}: {e}",
+            path.display()
+        ))
+    })?;
+    client.request(ClientRequest::ForgetSession)?;
+    client.request(ClientRequest::Shutdown)?;
+    // Wait for the daemon to release the endpoint. Probed by connecting, not
+    // by a path: on Windows the endpoint is a named pipe, which never exists
+    // as a file, so `Path::exists` would wait out the deadline every time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if oxidezap_ipc::Endpoint::connect_at(&path).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The media cache is per-profile and lives beside the socket.
+    unsafe {
+        std::env::set_var("OXIDEZAP_ACCOUNT", &clean);
+    }
+    if let Some(media) = oxidezap_ipc::media_dir()
+        && let Err(e) = std::fs::remove_dir_all(&media)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(oxidezap_wire::ApiError::internal(format!(
+            "the store was wiped but the media cache at {} was not: {e}",
+            media.display()
+        )));
+    }
+    print_action(output_mode, "account_removed", || {
+        println!("Account {clean} removed.");
+    });
+    Ok(())
 }
 
 fn execute_command(
@@ -158,7 +462,22 @@ fn execute_command(
         Commands::Auth(auth) => {
             if auth.logout {
                 client.request(ClientRequest::ForgetSession)?;
-                println!("Logged out successfully.");
+                print_action(output_mode, "logged_out", || {
+                    println!("Logged out successfully.");
+                });
+            } else if let Some(phone) = auth.phone {
+                let resp = client.request(ClientRequest::RequestPairCode { phone })?;
+                if let DaemonResponse::PairCode {
+                    code,
+                    expires_at_ms,
+                } = resp
+                {
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "code": code, "expires_at_ms": expires_at_ms }),
+                        |_| println!("Pairing Code: {code}"),
+                    );
+                }
             } else {
                 let resp = client.request(ClientRequest::GetStatus)?;
                 if let DaemonResponse::Status(s) = resp {
@@ -212,12 +531,16 @@ fn execute_command(
                     chat_jid: arg.jid,
                     through_message_id: None,
                 })?;
-                println!("Chat marked as read.");
+                print_action(output_mode, "chat_marked_read", || {
+                    println!("Chat marked as read.");
+                });
                 Ok(())
             }
             Some(args::ChatsSubcommand::MarkUnread(arg)) => {
                 client.request(ClientRequest::MarkUnread { chat_jid: arg.jid })?;
-                println!("Chat marked as unread.");
+                print_action(output_mode, "chat_marked_unread", || {
+                    println!("Chat marked as unread.");
+                });
                 Ok(())
             }
             Some(args::ChatsSubcommand::Pin(arg)) => {
@@ -225,7 +548,7 @@ fn execute_command(
                     chat_jid: arg.jid,
                     pin: true,
                 })?;
-                println!("Chat pinned.");
+                print_action(output_mode, "chat_pinned", || println!("Chat pinned."));
                 Ok(())
             }
             Some(args::ChatsSubcommand::Unpin(arg)) => {
@@ -233,7 +556,7 @@ fn execute_command(
                     chat_jid: arg.jid,
                     pin: false,
                 })?;
-                println!("Chat unpinned.");
+                print_action(output_mode, "chat_unpinned", || println!("Chat unpinned."));
                 Ok(())
             }
             Some(args::ChatsSubcommand::Mute(arg)) => {
@@ -241,7 +564,7 @@ fn execute_command(
                     chat_jid: arg.jid,
                     mute_duration_seconds: None,
                 })?;
-                println!("Chat muted.");
+                print_action(output_mode, "chat_muted", || println!("Chat muted."));
                 Ok(())
             }
             Some(args::ChatsSubcommand::Unmute(arg)) => {
@@ -249,7 +572,7 @@ fn execute_command(
                     chat_jid: arg.jid,
                     mute_duration_seconds: Some(0),
                 })?;
-                println!("Chat unmuted.");
+                print_action(output_mode, "chat_unmuted", || println!("Chat unmuted."));
                 Ok(())
             }
             Some(args::ChatsSubcommand::Archive(arg)) => {
@@ -257,7 +580,7 @@ fn execute_command(
                     chat_jid: arg.jid,
                     archive: true,
                 })?;
-                println!("Chat archived.");
+                print_action(output_mode, "chat_archived", || println!("Chat archived."));
                 Ok(())
             }
             Some(args::ChatsSubcommand::Unarchive(arg)) => {
@@ -265,18 +588,23 @@ fn execute_command(
                     chat_jid: arg.jid,
                     archive: false,
                 })?;
-                println!("Chat unarchived.");
+                print_action(output_mode, "chat_unarchived", || {
+                    println!("Chat unarchived.");
+                });
                 Ok(())
             }
             Some(args::ChatsSubcommand::Cleanup(_)) => {
                 let resp = client.request(ClientRequest::CleanupChats)?;
                 if let DaemonResponse::ChatsCleaned { removed } = resp {
-                    println!("Cleaned {removed} empty chats.");
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "removed": removed }),
+                        |_| println!("Cleaned {removed} empty chats."),
+                    );
                 }
                 Ok(())
             }
             None => {
-                // Default to list
                 let resp = client.request(ClientRequest::ListChats {
                     limit: 50,
                     offset: None,
@@ -383,7 +711,9 @@ fn execute_command(
                     message_id: e.id,
                     new_text: e.text,
                 })?;
-                println!("Message edited.");
+                print_action(output_mode, "message_edited", || {
+                    println!("Message edited.");
+                });
                 Ok(())
             }
             Some(args::MessagesSubcommand::Revoke(r)) => {
@@ -392,7 +722,9 @@ fn execute_command(
                     message_id: r.id,
                     for_everyone: r.for_everyone,
                 })?;
-                println!("Message revoked.");
+                print_action(output_mode, "message_revoked", || {
+                    println!("Message revoked.");
+                });
                 Ok(())
             }
             Some(args::MessagesSubcommand::Forward(f)) => {
@@ -402,7 +734,9 @@ fn execute_command(
                     target_chat_jid: f.to,
                 })?;
                 if let DaemonResponse::MessageSent { id, .. } = resp {
-                    println!("Message forwarded with ID: {id}");
+                    print_result(output_mode, &serde_json::json!({ "id": id }), |_| {
+                        println!("Message forwarded with ID: {id}")
+                    });
                 }
                 Ok(())
             }
@@ -434,14 +768,15 @@ fn execute_command(
                 if let Some(path) = e.output {
                     let json = serde_json::to_string_pretty(&exported).unwrap_or_default();
                     if let Err(err) = std::fs::write(&path, json) {
-                        print_error(
-                            output_mode,
-                            "export_write_failed",
-                            &format!("could not write {path}: {err}"),
-                        );
-                        return Ok(());
+                        return Err(oxidezap_wire::ApiError::internal(format!(
+                            "could not write {path}: {err}"
+                        )));
                     }
-                    println!("Exported {} messages to {path}.", exported.len());
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "path": path, "count": exported.len() }),
+                        |_| println!("Exported {} messages to {path}.", exported.len()),
+                    );
                 } else {
                     print_result(output_mode, &exported, |items| {
                         for m in items {
@@ -455,7 +790,11 @@ fn execute_command(
             Some(args::MessagesSubcommand::Purge(p)) => {
                 let resp = client.request(ClientRequest::PurgeMessages { chat_jid: p.chat })?;
                 if let DaemonResponse::MessagesPurged { purged } = resp {
-                    println!("Purged payload of {purged} revoked messages.");
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "purged": purged }),
+                        |_| println!("Purged payload of {purged} revoked messages."),
+                    );
                 }
                 Ok(())
             }
@@ -471,11 +810,17 @@ fn execute_command(
                     enqueue_only: t.enqueue,
                 })?;
                 if let DaemonResponse::MessageSent { id, enqueued, .. } = resp {
-                    if enqueued {
-                        println!("Message enqueued with ID: {id}");
-                    } else {
-                        println!("Message sent with ID: {id}");
-                    }
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "id": id, "enqueued": enqueued }),
+                        |_| {
+                            if enqueued {
+                                println!("Message enqueued with ID: {id}");
+                            } else {
+                                println!("Message sent with ID: {id}");
+                            }
+                        },
+                    );
                 }
                 Ok(())
             }
@@ -488,7 +833,9 @@ fn execute_command(
                     as_document: f.as_document,
                 })?;
                 if let DaemonResponse::MessageSent { id, .. } = resp {
-                    println!("File sent with ID: {id}");
+                    print_result(output_mode, &serde_json::json!({ "id": id }), |_| {
+                        println!("File sent with ID: {id}")
+                    });
                 }
                 Ok(())
             }
@@ -499,7 +846,9 @@ fn execute_command(
                     ptt: true,
                 })?;
                 if let DaemonResponse::MessageSent { id, .. } = resp {
-                    println!("Voice note sent with ID: {id}");
+                    print_result(output_mode, &serde_json::json!({ "id": id }), |_| {
+                        println!("Voice note sent with ID: {id}")
+                    });
                 }
                 Ok(())
             }
@@ -510,7 +859,9 @@ fn execute_command(
                     emoji: r.emoji,
                 })?;
                 if let DaemonResponse::MessageSent { id, .. } = resp {
-                    println!("Reaction sent with ID: {id}");
+                    print_result(output_mode, &serde_json::json!({ "id": id }), |_| {
+                        println!("Reaction sent with ID: {id}")
+                    });
                 }
                 Ok(())
             }
@@ -522,7 +873,9 @@ fn execute_command(
                     selectable_count: p.selectable,
                 })?;
                 if let DaemonResponse::MessageSent { id, .. } = resp {
-                    println!("Poll sent with ID: {id}");
+                    print_result(output_mode, &serde_json::json!({ "id": id }), |_| {
+                        println!("Poll sent with ID: {id}")
+                    });
                 }
                 Ok(())
             }
@@ -534,14 +887,18 @@ fn execute_command(
                     name: loc.name,
                 })?;
                 if let DaemonResponse::MessageSent { id, .. } = resp {
-                    println!("Location sent with ID: {id}");
+                    print_result(output_mode, &serde_json::json!({ "id": id }), |_| {
+                        println!("Location sent with ID: {id}")
+                    });
                 }
                 Ok(())
             }
             Some(args::SendSubcommand::Status(st)) => {
                 let resp = client.request(ClientRequest::SendStatus { text: st.text })?;
                 if let DaemonResponse::MessageSent { id, .. } = resp {
-                    println!("Status broadcast sent with ID: {id}");
+                    print_result(output_mode, &serde_json::json!({ "id": id }), |_| {
+                        println!("Status broadcast sent with ID: {id}")
+                    });
                 }
                 Ok(())
             }
@@ -551,7 +908,23 @@ fn execute_command(
                     file_path: s.file,
                 })?;
                 if let DaemonResponse::MessageSent { id, .. } = resp {
-                    println!("Sticker sent with ID: {id}");
+                    print_result(output_mode, &serde_json::json!({ "id": id }), |_| {
+                        println!("Sticker sent with ID: {id}")
+                    });
+                }
+                Ok(())
+            }
+            Some(args::SendSubcommand::Select(s)) => {
+                let resp = client.request(ClientRequest::SendListResponse {
+                    to: s.to,
+                    title: s.title,
+                    row_id: s.row_id,
+                    reply_to: s.reply_to,
+                })?;
+                if let DaemonResponse::MessageSent { id, .. } = resp {
+                    print_result(output_mode, &serde_json::json!({ "id": id }), |_| {
+                        println!("Selection sent with ID: {id}")
+                    });
                 }
                 Ok(())
             }
@@ -597,9 +970,7 @@ fn execute_command(
             Some(args::ContactsSubcommand::Show(s)) => {
                 let resp = client.request(ClientRequest::GetContact { jid: s.jid })?;
                 if let DaemonResponse::Contact(c) = resp {
-                    print_result(output_mode, &c, |contact| {
-                        print_contact(contact);
-                    });
+                    print_result(output_mode, &c, print_contact);
                 }
                 Ok(())
             }
@@ -620,9 +991,7 @@ fn execute_command(
                     alias: a.alias,
                 })?;
                 if let DaemonResponse::Contact(c) = resp {
-                    print_result(output_mode, &c, |contact| {
-                        print_contact(contact);
-                    });
+                    print_result(output_mode, &c, print_contact);
                 }
                 Ok(())
             }
@@ -632,9 +1001,7 @@ fn execute_command(
                     tag: t.tag,
                 })?;
                 if let DaemonResponse::Contact(c) = resp {
-                    print_result(output_mode, &c, |contact| {
-                        print_contact(contact);
-                    });
+                    print_result(output_mode, &c, print_contact);
                 }
                 Ok(())
             }
@@ -644,17 +1011,15 @@ fn execute_command(
                     tag: u.tag,
                 })?;
                 if let DaemonResponse::Contact(c) = resp {
-                    print_result(output_mode, &c, |contact| {
-                        print_contact(contact);
-                    });
+                    print_result(output_mode, &c, print_contact);
                 }
                 Ok(())
             }
             None => Ok(()),
         },
         Commands::Groups(groups) => match groups.command {
-            Some(args::GroupsSubcommand::List(l)) => {
-                let resp = client.request(ClientRequest::ListGroups { refresh: l.refresh })?;
+            Some(args::GroupsSubcommand::List(_)) => {
+                let resp = client.request(ClientRequest::ListGroups)?;
                 if let DaemonResponse::Groups { groups } = resp {
                     print_result(output_mode, &groups, |items| {
                         println!("{:<32} {:<8} SUBJECT", "JID", "MEMBERS");
@@ -687,7 +1052,9 @@ fn execute_command(
                     participants: c.participants,
                 })?;
                 if let DaemonResponse::GroupCreated { jid } = resp {
-                    println!("Group created: {jid}");
+                    print_result(output_mode, &serde_json::json!({ "jid": jid }), |_| {
+                        println!("Group created: {jid}")
+                    });
                 }
                 Ok(())
             }
@@ -696,7 +1063,9 @@ fn execute_command(
                     group_jid: r.jid,
                     topic: r.title,
                 })?;
-                println!("Group renamed.");
+                print_action(output_mode, "group_renamed", || {
+                    println!("Group renamed.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Description(d)) => {
@@ -704,7 +1073,9 @@ fn execute_command(
                     group_jid: d.jid,
                     description: d.description,
                 })?;
-                println!("Group description updated.");
+                print_action(output_mode, "group_description_updated", || {
+                    println!("Group description updated.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Add(p)) => {
@@ -713,7 +1084,9 @@ fn execute_command(
                     participant_jid: p.participant,
                     action: oxidezap_wire::dto::GroupParticipantAction::Add,
                 })?;
-                println!("Participant added.");
+                print_action(output_mode, "participant_added", || {
+                    println!("Participant added.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Remove(p)) => {
@@ -722,7 +1095,9 @@ fn execute_command(
                     participant_jid: p.participant,
                     action: oxidezap_wire::dto::GroupParticipantAction::Remove,
                 })?;
-                println!("Participant removed.");
+                print_action(output_mode, "participant_removed", || {
+                    println!("Participant removed.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Promote(p)) => {
@@ -731,7 +1106,9 @@ fn execute_command(
                     participant_jid: p.participant,
                     action: oxidezap_wire::dto::GroupParticipantAction::Promote,
                 })?;
-                println!("Participant promoted to admin.");
+                print_action(output_mode, "participant_promoted", || {
+                    println!("Participant promoted to admin.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Demote(p)) => {
@@ -740,12 +1117,16 @@ fn execute_command(
                     participant_jid: p.participant,
                     action: oxidezap_wire::dto::GroupParticipantAction::Demote,
                 })?;
-                println!("Admin demoted to regular participant.");
+                print_action(output_mode, "participant_demoted", || {
+                    println!("Admin demoted to regular participant.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Leave(l)) => {
                 client.request(ClientRequest::LeaveGroup { group_jid: l.jid })?;
-                println!("Left group successfully.");
+                print_action(output_mode, "left_group", || {
+                    println!("Left group successfully.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Invite(i)) => {
@@ -754,7 +1135,9 @@ fn execute_command(
                     reset: i.reset,
                 })?;
                 if let DaemonResponse::GroupInviteLink { link } = resp {
-                    println!("{link}");
+                    print_result(output_mode, &serde_json::json!({ "link": link }), |_| {
+                        println!("{link}")
+                    });
                 }
                 Ok(())
             }
@@ -767,11 +1150,17 @@ fn execute_command(
                     pending_approval,
                 } = resp
                 {
-                    if pending_approval {
-                        println!("Join requested for {jid}, awaiting admin approval.");
-                    } else {
-                        println!("Joined group: {jid}");
-                    }
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "jid": jid, "pending_approval": pending_approval }),
+                        |_| {
+                            if pending_approval {
+                                println!("Join requested for {jid}, awaiting admin approval.");
+                            } else {
+                                println!("Joined group: {jid}");
+                            }
+                        },
+                    );
                 }
                 Ok(())
             }
@@ -781,7 +1170,9 @@ fn execute_command(
                     announce_only: p.announce_only,
                     locked: p.locked,
                 })?;
-                println!("Group permissions updated.");
+                print_action(output_mode, "group_permissions_updated", || {
+                    println!("Group permissions updated.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Requests(r)) => {
@@ -802,7 +1193,9 @@ fn execute_command(
                     participant_jid: a.participant,
                     approve: true,
                 })?;
-                println!("Membership request approved.");
+                print_action(output_mode, "membership_request_approved", || {
+                    println!("Membership request approved.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Reject(r)) => {
@@ -811,13 +1204,19 @@ fn execute_command(
                     participant_jid: r.participant,
                     approve: false,
                 })?;
-                println!("Membership request rejected.");
+                print_action(output_mode, "membership_request_rejected", || {
+                    println!("Membership request rejected.");
+                });
                 Ok(())
             }
             Some(args::GroupsSubcommand::Prune(_)) => {
                 let resp = client.request(ClientRequest::CleanupChats)?;
                 if let DaemonResponse::ChatsCleaned { removed } = resp {
-                    println!("Pruned {removed} empty chats.");
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "removed": removed }),
+                        |_| println!("Pruned {removed} empty chats."),
+                    );
                 }
                 Ok(())
             }
@@ -859,7 +1258,9 @@ fn execute_command(
                     poll_id: v.poll,
                     selected_option_indices: v.options,
                 })?;
-                println!("Vote registered.");
+                print_action(output_mode, "vote_registered", || {
+                    println!("Vote registered.");
+                });
                 Ok(())
             }
             None => Ok(()),
@@ -878,22 +1279,30 @@ fn execute_command(
             }
             Some(args::ProfileSubcommand::SetAbout(a)) => {
                 client.request(ClientRequest::SetProfileAbout { about: a.text })?;
-                println!("Profile about updated.");
+                print_action(output_mode, "profile_about_updated", || {
+                    println!("Profile about updated.");
+                });
                 Ok(())
             }
             Some(args::ProfileSubcommand::SetName(n)) => {
                 client.request(ClientRequest::SetProfileName { name: n.name })?;
-                println!("Profile name updated.");
+                print_action(output_mode, "profile_name_updated", || {
+                    println!("Profile name updated.");
+                });
                 Ok(())
             }
             Some(args::ProfileSubcommand::SetPicture(p)) => {
                 client.request(ClientRequest::SetProfilePicture { file_path: p.file })?;
-                println!("Profile picture updated.");
+                print_action(output_mode, "profile_picture_updated", || {
+                    println!("Profile picture updated.");
+                });
                 Ok(())
             }
             Some(args::ProfileSubcommand::RemovePicture(_)) => {
                 client.request(ClientRequest::RemoveProfilePicture)?;
-                println!("Profile picture removed.");
+                print_action(output_mode, "profile_picture_removed", || {
+                    println!("Profile picture removed.");
+                });
                 Ok(())
             }
             Some(args::ProfileSubcommand::Business(b)) => {
@@ -906,8 +1315,9 @@ fn execute_command(
                     },
                 };
                 if jid.is_empty() {
-                    print_error(output_mode, "not_connected", "no account JID available");
-                    return Ok(());
+                    return Err(oxidezap_wire::ApiError::not_connected(
+                        "no account JID available; the account is not linked",
+                    ));
                 }
                 let resp = client.request(ClientRequest::GetBusinessProfile { jid })?;
                 if let DaemonResponse::Profile(p) = resp {
@@ -927,7 +1337,9 @@ fn execute_command(
                     chat_jid: t.chat,
                     state: oxidezap_wire::dto::PresenceState::Composing,
                 })?;
-                println!("Sent composing indicator.");
+                print_action(output_mode, "composing_sent", || {
+                    println!("Sent composing indicator.");
+                });
                 Ok(())
             }
             Some(args::PresenceSubcommand::Paused(p)) => {
@@ -935,7 +1347,9 @@ fn execute_command(
                     chat_jid: p.chat,
                     state: oxidezap_wire::dto::PresenceState::Paused,
                 })?;
-                println!("Sent paused indicator.");
+                print_action(output_mode, "paused_sent", || {
+                    println!("Sent paused indicator.");
+                });
                 Ok(())
             }
             Some(args::PresenceSubcommand::Recording(r)) => {
@@ -943,7 +1357,9 @@ fn execute_command(
                     chat_jid: r.chat,
                     state: oxidezap_wire::dto::PresenceState::Recording,
                 })?;
-                println!("Sent recording indicator.");
+                print_action(output_mode, "recording_sent", || {
+                    println!("Sent recording indicator.");
+                });
                 Ok(())
             }
             Some(args::PresenceSubcommand::Online(_)) => {
@@ -951,7 +1367,7 @@ fn execute_command(
                     chat_jid: None,
                     state: oxidezap_wire::dto::PresenceState::Available,
                 })?;
-                println!("Appearing online.");
+                print_action(output_mode, "online", || println!("Appearing online."));
                 Ok(())
             }
             Some(args::PresenceSubcommand::Offline(_)) => {
@@ -959,7 +1375,7 @@ fn execute_command(
                     chat_jid: None,
                     state: oxidezap_wire::dto::PresenceState::Unavailable,
                 })?;
-                println!("Appearing offline.");
+                print_action(output_mode, "offline", || println!("Appearing offline."));
                 Ok(())
             }
             None => Ok(()),
@@ -1010,7 +1426,11 @@ fn execute_command(
                     count: b.count,
                 })?;
                 if let DaemonResponse::HistoryCoverage { stored_count, .. } = resp {
-                    println!("Backfilled history ({stored_count} messages stored).");
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "stored_count": stored_count }),
+                        |_| println!("Backfilled history ({stored_count} messages stored)."),
+                    );
                 }
                 Ok(())
             }
@@ -1046,13 +1466,19 @@ fn execute_command(
             Some(args::ChannelsSubcommand::Join(j)) => {
                 let resp = client.request(ClientRequest::JoinChannel { channel_jid: j.jid })?;
                 if let DaemonResponse::Channel(c) = resp {
-                    println!("Following channel: {}", c.name);
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "jid": c.jid, "name": c.name }),
+                        |_| println!("Following channel: {}", c.name),
+                    );
                 }
                 Ok(())
             }
             Some(args::ChannelsSubcommand::Leave(l)) => {
                 client.request(ClientRequest::LeaveChannel { channel_jid: l.jid })?;
-                println!("Unfollowed channel.");
+                print_action(output_mode, "channel_unfollowed", || {
+                    println!("Unfollowed channel.");
+                });
                 Ok(())
             }
             None => Ok(()),
@@ -1077,6 +1503,9 @@ fn execute_command(
             }
             // Handled locally before connecting; unreachable here.
             Some(args::AccountsSubcommand::Use(_)) => Ok(()),
+            Some(args::AccountsSubcommand::Add(_)) | Some(args::AccountsSubcommand::Remove(_)) => {
+                Ok(())
+            }
             None => Ok(()),
         },
         Commands::Calls(c) => {
@@ -1109,7 +1538,13 @@ fn execute_command(
                     ..
                 } = resp
                 {
-                    println!("Media downloaded to {local_path} ({size_bytes} bytes).");
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "path": local_path, "size_bytes": size_bytes }),
+                        |_| {
+                            println!("Media downloaded to {local_path} ({size_bytes} bytes).");
+                        },
+                    );
                 }
                 Ok(())
             }
@@ -1118,7 +1553,9 @@ fn execute_command(
                     chat_jid: r.chat,
                     message_id: r.id,
                 })?;
-                println!("Requested media re-upload from primary device.");
+                print_action(output_mode, "media_retry_requested", || {
+                    println!("Requested media re-upload from primary device.");
+                });
                 Ok(())
             }
             Some(args::MediaSubcommand::Backfill(b)) => {
@@ -1131,7 +1568,13 @@ fn execute_command(
                     downloaded,
                 } = resp
                 {
-                    println!("Backfilled {downloaded} of {requested} media files.");
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({ "requested": requested, "downloaded": downloaded }),
+                        |_| {
+                            println!("Backfilled {downloaded} of {requested} media files.");
+                        },
+                    );
                 }
                 Ok(())
             }
@@ -1157,7 +1600,9 @@ fn execute_command(
             }
             Some(args::StoreSubcommand::Cleanup(_)) => {
                 client.request(ClientRequest::ClearMediaCache)?;
-                println!("Media cache cleaned.");
+                print_action(output_mode, "media_cache_cleaned", || {
+                    println!("Media cache cleaned.");
+                });
                 Ok(())
             }
             None => Ok(()),
@@ -1195,7 +1640,9 @@ fn execute_command(
         }
         Commands::Sync(sync) => {
             if sync.follow {
-                println!("Following events stream (Ctrl+C to stop)...");
+                if output_mode == OutputMode::Human {
+                    eprintln!("Following events stream (Ctrl+C to stop)...");
+                }
                 while let Ok(Some(event)) = client.next_event() {
                     print_event(&event);
                 }

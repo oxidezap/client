@@ -4,6 +4,7 @@
 //! SQLite, GPUI, or media codecs, allowing thin client binaries (`oxidezap-cli`)
 //! to stay minimal in size (< 2 MiB) and fast to compile.
 
+pub mod accounts;
 pub mod dto;
 pub mod envelope;
 pub mod error;
@@ -11,10 +12,12 @@ pub mod event;
 pub mod request;
 pub mod response;
 
+pub use accounts::validate_account_id;
 pub use dto::*;
 pub use envelope::*;
 pub use error::ApiError;
 pub use event::DaemonEvent;
+pub use request::Access;
 pub use request::ClientRequest;
 pub use response::DaemonResponse;
 

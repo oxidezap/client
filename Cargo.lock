@@ -6377,6 +6377,7 @@ dependencies = [
  "serde",
  "serde_json",
  "usage-rs",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6580,6 +6581,7 @@ dependencies = [
  "oxidezap-core",
  "oxidezap-platform",
  "oxidezap-video",
+ "oxidezap-wire",
  "portable-atomic",
  "serde_json",
  "sqlite-wasm-rs",

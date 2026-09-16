@@ -577,6 +577,54 @@ impl ChatStore {
             .await?;
         Ok(messages)
     }
+
+    /// One page of a chat's messages *after* a cursor, in the same oldest-first
+    /// order a timeline is drawn in.
+    ///
+    /// The mirror of [`messages`](Self::messages): that one walks backwards
+    /// from the newest row, this one walks forwards from a row the caller
+    /// already holds. Both ends use the same tiebreak, or a page boundary
+    /// inside a same-second run would skip or repeat rows.
+    pub async fn messages_after(
+        &self,
+        chat: &Jid,
+        after: MessageCursor,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        use schema::messages::dsl;
+        let limit = limit.max(0);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let device_id = self.device_id();
+        let chat = chat.to_string();
+        let messages: Vec<StoredMessage> = self
+            .db()
+            .read(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                let rows: Vec<MessageRow> = dsl::messages
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::chat_jid.eq_any(keys))
+                            .and(
+                                dsl::timestamp_ms
+                                    .gt(after.timestamp_ms)
+                                    .or(dsl::timestamp_ms
+                                        .eq(after.timestamp_ms)
+                                        .and(dsl::id.gt(after.seq))),
+                            ),
+                    )
+                    .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
+                    .limit(limit)
+                    .load(conn)
+                    .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
+            })
+            .await?;
+        Ok(messages)
+    }
 }
 
 /// One page of `limit` *unique* rows, not `limit` raw ones.
@@ -1009,6 +1057,31 @@ impl ChatStore {
             })
             .await?;
         Ok(messages)
+    }
+
+    /// The oldest stored message of one chat, if it holds any.
+    ///
+    /// What an on-demand history request anchors on: the phone is asked for
+    /// what came before this row, so the row itself is the argument.
+    pub async fn oldest_message(&self, chat: &Jid) -> Result<Option<StoredMessage>> {
+        use schema::messages::dsl;
+        let device_id = self.device_id();
+        let chat = chat.to_string();
+        let messages: Vec<StoredMessage> = self
+            .db()
+            .read(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                let rows: Vec<MessageRow> = dsl::messages
+                    .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
+                    .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
+                    .limit(1)
+                    .load(conn)
+                    .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
+            })
+            .await?;
+        Ok(messages.into_iter().next())
     }
 
     pub async fn message(&self, chat: &Jid, msg_id: &str) -> Result<Option<StoredMessage>> {

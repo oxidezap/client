@@ -105,6 +105,13 @@ pub enum DaemonResponse {
         accounts: Vec<AccountDto>,
     },
 
+    // --- Auth ---
+    /// A phone-number pairing code, with the deadline the server gave it.
+    PairCode {
+        code: String,
+        expires_at_ms: i64,
+    },
+
     // --- Profile ---
     Profile(ProfileDto),
 

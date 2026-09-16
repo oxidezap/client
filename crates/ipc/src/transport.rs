@@ -406,19 +406,18 @@ pub fn media_dir() -> Option<PathBuf> {
 
 /// The account profile in force, from `OXIDEZAP_ACCOUNT`.
 ///
-/// Sanitized to file-safe characters; unset or empty means the default
-/// profile. One account is one daemon over one store: the socket, the lock,
-/// the media cache and the database all derive from this, so two profiles
-/// never share state.
+/// Validated, never sanitized: an invalid value falls back to the default
+/// profile rather than converging onto a real one (see
+/// [`oxidezap_wire::validate_account_id`]). Entry points that take an id
+/// from the user — CLI `--account`, `accounts use`, daemon `--account` —
+/// reject invalid ids outright instead of reaching this fallback. Unset or
+/// empty means the default profile. One account is one daemon over one
+/// store: the socket, the lock, the media cache and the database all derive
+/// from this, so two profiles never share state.
 #[must_use]
 pub fn account_id() -> Option<String> {
     let raw = std::env::var_os("OXIDEZAP_ACCOUNT")?;
-    let id: String = raw
-        .to_string_lossy()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    (!id.is_empty()).then_some(id)
+    oxidezap_wire::validate_account_id(&raw.to_string_lossy())
 }
 
 /// Every account socket the state directory holds: the default
@@ -460,15 +459,12 @@ pub fn account_sockets() -> Vec<(String, PathBuf)> {
 }
 
 /// The socket file for one account: the default name, or a suffixed one.
+///
+/// `None` for an invalid id: callers already handle `None` as "no endpoint",
+/// so a rejected id never converges onto another profile's socket.
 #[must_use]
 pub fn endpoint_path_for_account(id: &str) -> Option<PathBuf> {
-    let clean: String = id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    if clean.is_empty() {
-        return None;
-    }
+    let clean = oxidezap_wire::validate_account_id(id)?;
     #[cfg(unix)]
     {
         Some(state_dir()?.join(format!("daemon-{clean}.sock")))
@@ -619,6 +615,26 @@ mod tests {
                 "a pipe name is machine-wide, so it has to say whose it is: {name}"
             );
         }
+    }
+
+    /// An invalid account id resolves to no endpoint rather than to
+    /// another profile's socket: `wo/rk` must not converge onto `work`.
+    #[test]
+    fn an_invalid_account_id_resolves_to_no_endpoint() {
+        for id in ["", "-work", "wo/rk", "wo!rk", "wo rk", "../x"] {
+            assert_eq!(endpoint_path_for_account(id), None, "{id}");
+        }
+    }
+
+    /// A valid account id names its own suffixed socket.
+    #[cfg(unix)]
+    #[test]
+    fn a_valid_account_id_names_its_own_socket() {
+        let path = endpoint_path_for_account("work").expect("a valid id");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("daemon-work.sock")
+        );
     }
 
     /// Both live under the same per-user directory, so whatever protects one

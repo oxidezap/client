@@ -8,6 +8,9 @@ pub use calls::{OutgoingAcceptCase, outgoing_accept_events};
 /// A stored row and a composed quote, read as the other side's shape.
 mod convert;
 
+/// Pairing a companion device by phone-number code.
+mod auth;
+
 /// The inbound commit hook that makes the chat store the ack durability point.
 mod durability;
 

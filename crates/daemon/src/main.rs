@@ -7,7 +7,9 @@
 // A background service, not a console program: on Windows release builds no
 // terminal comes with it, whether it was started from the GUI or by hand.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-#![allow(clippy::print_stdout)]
+// A rejected `--account` is reported before the logging subsystem exists, so
+// this binary's own stderr is the only stream there is at that point.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use oxidezap_daemon::{listener, media, plugins, server, session_bridge, shutdown, state, tray};
 
@@ -31,6 +33,7 @@ fn main() -> Result<()> {
     // A named account profile owns its socket, lock, database and media
     // cache; without one this is the default profile on the historic paths.
     // Read here, before the claim, so every path derived below agrees.
+    // Validated, never sanitized: `wo/rk` must not converge onto `work`.
     let mut account_from_flag: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -43,11 +46,26 @@ fn main() -> Result<()> {
     if let Some(id) = account_from_flag
         && std::env::var_os("OXIDEZAP_ACCOUNT").is_none()
     {
+        if oxidezap_wire::validate_account_id(&id).is_none() {
+            eprintln!(
+                "error [invalid_account_id]: --account must match [A-Za-z0-9][A-Za-z0-9_-]*, got {id:?}"
+            );
+            std::process::exit(2);
+        }
         // Single-threaded startup, before the runtime exists: no thread can
         // observe the environment changing under it.
         unsafe {
             std::env::set_var("OXIDEZAP_ACCOUNT", id);
         }
+    }
+    if let Some(raw) = std::env::var_os("OXIDEZAP_ACCOUNT")
+        && oxidezap_wire::validate_account_id(&raw.to_string_lossy()).is_none()
+    {
+        eprintln!(
+            "error [invalid_account_id]: OXIDEZAP_ACCOUNT must match [A-Za-z0-9][A-Za-z0-9_-]*, got {:?}",
+            raw.to_string_lossy()
+        );
+        std::process::exit(2);
     }
 
     // The level the last person to change it chose, unless `RUST_LOG` says

@@ -758,8 +758,9 @@ pub(super) async fn handle_wire_request(
         | WireRequest::SendLocation { .. }
         | WireRequest::SendStatus { .. }
         | WireRequest::SendSticker { .. }
+        | WireRequest::SendListResponse { .. }
         | WireRequest::ListStarredMessages { .. }
-        | WireRequest::ListGroups { .. }
+        | WireRequest::ListGroups
         | WireRequest::GetGroupInfo { .. }
         | WireRequest::CreateGroup { .. }
         | WireRequest::SetGroupTopic { .. }
@@ -794,6 +795,7 @@ pub(super) async fn handle_wire_request(
         | WireRequest::MuteChat { .. }
         | WireRequest::ArchiveChat { .. }
         | WireRequest::SetPresence { .. }
+        | WireRequest::RequestPairCode { .. }
         | WireRequest::ListCalls { .. } => {
             out_of_band_wire(hub, commands, outbox, id, request).await
         }

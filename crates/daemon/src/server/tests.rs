@@ -1349,7 +1349,7 @@ async fn wire_phase56_requests_reach_the_session() {
             file_path: "/tmp/fig.webp".into(),
         },
         WireRequest::ListStarredMessages { limit: 10 },
-        WireRequest::ListGroups { refresh: false },
+        WireRequest::ListGroups,
         WireRequest::GetGroupInfo {
             group_jid: group.clone(),
         },

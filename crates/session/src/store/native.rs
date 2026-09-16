@@ -80,14 +80,10 @@ fn database_dir() -> Option<std::path::PathBuf> {
     // One database per account profile: a second daemon over the same file
     // would lose the startup race by design, so each profile gets its own
     // directory. Unset means the default profile and the historic path.
+    // Validated with the one shared rule, so the database can never read a
+    // profile name differently from the socket beside it.
     let dir = match std::env::var_os("OXIDEZAP_ACCOUNT")
-        .map(|v| v.to_string_lossy().into_owned())
-        .map(|raw| {
-            raw.chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .collect::<String>()
-        })
-        .filter(|id| !id.is_empty())
+        .and_then(|v| oxidezap_wire::validate_account_id(&v.to_string_lossy()))
     {
         None => data_root.map(|root| root.join(DATA_DIR))?,
         Some(id) => data_root.map(|root| root.join(format!("{DATA_DIR}-{id}")))?,

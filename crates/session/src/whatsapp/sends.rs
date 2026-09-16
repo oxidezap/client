@@ -25,12 +25,18 @@ impl WhatsAppClient {
     /// caller: the wire carries a message id, and the sender, preview and
     /// kind behind it are facts this side holds. An unknown id is refused
     /// rather than sent as a hollow quote.
+    ///
+    /// `announce` exists for the one flow whose answer is the id *before* the
+    /// send resolves: an enqueued send tells a client what to watch for, and
+    /// the id it is told has to be the one the store records and WhatsApp is
+    /// handed. It is sent the moment the id is chosen, then the send runs on.
     pub fn send_text_wire(
         &self,
         to: String,
         text: String,
         reply_to: Option<String>,
         mentions: Vec<String>,
+        announce: Option<tokio::sync::oneshot::Sender<String>>,
     ) -> Task<Result<SentReceipt, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
@@ -72,6 +78,9 @@ impl WhatsAppClient {
 
             let client = &live.client;
             let msg_id = client.generate_message_id();
+            if let Some(announce) = announce {
+                let _ = announce.send(msg_id.clone());
+            }
             super::record_outgoing(&live.chat_store, &chat, &msg_id, &message);
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
@@ -300,7 +309,7 @@ impl WhatsAppClient {
 }
 
 /// The quote behind a reply id, read from the store.
-async fn quoted_for_reply(
+pub(super) async fn quoted_for_reply(
     store: &oxidezap_chat_store::ChatStore,
     chat: &Jid,
     message_id: &str,

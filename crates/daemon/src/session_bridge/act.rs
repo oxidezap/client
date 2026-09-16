@@ -339,9 +339,19 @@ impl Bridge {
                 chat_jid,
                 limit,
                 before,
-                ..
+                after,
             } => {
-                let page = client.load_messages(chat_jid.clone(), before, limit as i64);
+                // One cursor or the other, never both: `after` walks forward
+                // from a row the caller holds, `before` walks back from the
+                // newest. A request carrying both is answered as the forward
+                // page, because that is the one whose position the caller
+                // cannot infer.
+                let page = match after {
+                    Some(after) => {
+                        client.load_messages_after(chat_jid.clone(), after, limit as i64)
+                    }
+                    None => client.load_messages(chat_jid.clone(), before, limit as i64),
+                };
                 let answer_to = answer_to.clone();
                 oxidezap_session::spawn(async move {
                     let result = match page.await {
@@ -416,10 +426,10 @@ impl Bridge {
             WireRequest::SearchMessages {
                 query,
                 chat_jid,
+                has_media,
                 limit,
-                ..
             } => {
-                let task = client.search_messages(query, chat_jid.clone(), limit as i64);
+                let task = client.search_messages(query, chat_jid.clone(), has_media, limit as i64);
                 let answer_to = answer_to.clone();
                 oxidezap_session::spawn(async move {
                     let result = match task.await {
@@ -522,25 +532,65 @@ impl Bridge {
             } => {
                 if enqueue_only {
                     // Dispatched, not awaited: the GUI's own acknowledgement
-                    // semantics. The id is this side's — the server rename
-                    // arrives on the event stream, like every optimistic send.
-                    let local_id = next_local_id();
-                    let pending = client.send_text_wire(to, message, reply_to, mentions);
-                    let answer = DaemonResponse::MessageSent {
-                        id: local_id,
-                        timestamp_ms: wacore::time::now_millis(),
-                        enqueued: true,
-                    };
-                    send_wire_result(&answer_to, id, Ok(answer));
-                    let _ = reply.send(CommandOutcome::Accepted);
+                    // semantics. The id is announced by the send itself, so
+                    // the id the client is answered with is the same one the
+                    // store records and WhatsApp is told. Waited for through a
+                    // timeout: a session that dies before it picks the id must
+                    // answer, not hang. The task is created here, so what the
+                    // spawned future owns is the `Task` rather than the
+                    // borrowed client.
+                    let (announce, announced) = tokio::sync::oneshot::channel();
+                    let pending =
+                        client.send_text_wire(to, message, reply_to, mentions, Some(announce));
+                    let answer_to = answer_to.clone();
                     oxidezap_session::spawn(async move {
-                        if let Ok(Err(e)) = pending.await {
-                            log::warn!("an enqueued send failed after its answer: {e}");
+                        let announced = oxidezap_session::with_timeout(
+                            announced,
+                            std::time::Duration::from_secs(10),
+                        )
+                        .await;
+                        match announced {
+                            Some(Ok(local_id)) => {
+                                let answer = DaemonResponse::MessageSent {
+                                    id: local_id,
+                                    timestamp_ms: wacore::time::now_millis(),
+                                    enqueued: true,
+                                };
+                                send_wire_result(&answer_to, id, Ok(answer));
+                                let _ = reply.send(CommandOutcome::Accepted);
+                                if let Ok(Err(e)) = pending.await {
+                                    log::warn!("an enqueued send failed after its answer: {e}");
+                                }
+                            }
+                            _ => {
+                                // The id is announced before the send touches
+                                // the network, so a channel that closed
+                                // without one means the send refused before
+                                // it started — a bad JID, empty text. Await
+                                // the task to report that rather than
+                                // inventing a session failure; it has
+                                // already resolved in that case.
+                                let detail = match oxidezap_session::with_timeout(
+                                    pending,
+                                    std::time::Duration::from_secs(5),
+                                )
+                                .await
+                                {
+                                    Some(Ok(Err(e))) => e,
+                                    _ => "the session stopped before the send started".to_string(),
+                                };
+                                send_wire_result(
+                                    &answer_to,
+                                    id,
+                                    Err(ApiError::invalid_argument(detail)),
+                                );
+                                let _ = reply.send(CommandOutcome::Accepted);
+                            }
                         }
                         drop(permit);
                     });
                 } else {
-                    let task = client.send_text_wire(to, message, reply_to, mentions);
+                    let task = client.send_text_wire(to, message, reply_to, mentions, None);
                     run_wire(
                         answer_to.clone(),
                         id,
@@ -835,6 +885,21 @@ impl Bridge {
                     },
                 );
             }
+            WireRequest::SendListResponse {
+                to,
+                title,
+                row_id,
+                reply_to,
+            } => {
+                let task = client.send_list_response(to, title, row_id, reply_to);
+                run_wire(answer_to.clone(), id, reply, permit, task, |sent_id| {
+                    DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: wacore::time::now_millis(),
+                        enqueued: false,
+                    }
+                });
+            }
             WireRequest::ListStarredMessages { limit } => {
                 let task = client.list_starred(limit as i64);
                 run_wire(answer_to.clone(), id, reply, permit, task, |starred| {
@@ -847,7 +912,7 @@ impl Bridge {
                     }
                 });
             }
-            WireRequest::ListGroups { .. } => {
+            WireRequest::ListGroups => {
                 let task = client.list_groups();
                 run_wire(answer_to.clone(), id, reply, permit, task, |groups| {
                     DaemonResponse::Groups {
@@ -1156,6 +1221,26 @@ impl Bridge {
                         newest_ts: coverage.newest_ms,
                         stored_count: coverage.stored_count,
                     }
+                });
+            }
+            WireRequest::RequestPairCode { phone } => {
+                // The session publishes the `PairCode` event and hands the
+                // code back here, so a script that asked synchronously gets
+                // the code rather than having to subscribe for it.
+                let task = client.request_pair_code(phone);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(pair)) => Ok(DaemonResponse::PairCode {
+                            code: pair.code,
+                            expires_at_ms: pair.expires_at_ms,
+                        }),
+                        Ok(Err(e)) => Err(ApiError::invalid_argument(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
                 });
             }
             WireRequest::BackfillMedia { chat_jid, limit } => {

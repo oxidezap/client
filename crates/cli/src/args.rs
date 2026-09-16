@@ -316,6 +316,24 @@ pub enum SendSubcommand {
     Status(SendStatusArgs),
     /// Send a WebP sticker
     Sticker(SendStickerArgs),
+    /// Answer an interactive list message by selecting a row
+    Select(SendSelectArgs),
+}
+
+#[derive(Args)]
+pub struct SendSelectArgs {
+    /// Recipient phone number or JID
+    #[usage(long)]
+    pub to: String,
+    /// Row id from the list message being answered
+    #[usage(long)]
+    pub row_id: String,
+    /// Title of the list being answered
+    #[usage(long, default = "")]
+    pub title: String,
+    /// Quoted message ID to reply to
+    #[usage(long)]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Args)]
@@ -564,11 +582,7 @@ pub struct GroupPermissionsArgs {
 pub struct GroupsPruneArgs {}
 
 #[derive(Args)]
-pub struct GroupsListArgs {
-    /// Fetch updated groups from server
-    #[usage(long)]
-    pub refresh: bool,
-}
+pub struct GroupsListArgs {}
 
 #[derive(Args)]
 pub struct GroupInfoArgs {
@@ -819,6 +833,10 @@ pub enum AccountsSubcommand {
     List(AccountsListArgs),
     /// Print the export line selecting an account (eval it)
     Use(AccountsUseArgs),
+    /// Register a new account profile and spawn its daemon
+    Add(AccountsAddArgs),
+    /// Stop a profile's daemon and delete its store
+    Remove(AccountsRemoveArgs),
 }
 
 #[derive(Args)]
@@ -827,6 +845,18 @@ pub struct AccountsListArgs {}
 #[derive(Args)]
 pub struct AccountsUseArgs {
     /// Account profile id (or "default")
+    pub id: String,
+}
+
+#[derive(Args)]
+pub struct AccountsAddArgs {
+    /// Account profile id (must match [A-Za-z0-9][A-Za-z0-9_-]*)
+    pub id: String,
+}
+
+#[derive(Args)]
+pub struct AccountsRemoveArgs {
+    /// Account profile id (must match [A-Za-z0-9][A-Za-z0-9_-]*)
     pub id: String,
 }
 
