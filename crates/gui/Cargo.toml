@@ -46,7 +46,7 @@ oxidezap-audio = { workspace = true }
 oxidezap-core = { workspace = true }
 # The daemon's protocol, not the session itself: this front end has not owned
 # a WhatsApp connection since the daemon took it over.
-oxidezap-ipc = { workspace = true }
+oxidezap-ipc = { workspace = true, features = ["legacy-protocol"] }
 # The log level: one place decides where it is kept and how it is changed
 # while the process runs, because the daemon reads the same answer.
 oxidezap-logging = { workspace = true }

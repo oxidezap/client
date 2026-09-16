@@ -5,6 +5,7 @@
 members = [
     "crates/audio",
     "crates/chat-store",
+    "crates/cli",
     "crates/core",
     "crates/daemon",
     "crates/gui",
@@ -86,7 +87,7 @@ oxidezap-audio = { path = "crates/audio" }
 oxidezap-chat-store = { path = "crates/chat-store" }
 oxidezap-core = { path = "crates/core" }
 oxidezap-daemon = { path = "crates/daemon" }
-oxidezap-ipc = { path = "crates/ipc" }
+oxidezap-ipc = { path = "crates/ipc", default-features = false }
 oxidezap-logging = { path = "crates/logging" }
 oxidezap-platform = { path = "crates/platform" }
 oxidezap-plugin-abi = { path = "crates/plugin-abi" }
