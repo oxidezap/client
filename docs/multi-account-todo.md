@@ -224,53 +224,68 @@ abaixo para o diagnóstico completo.
   commit `fix(chat-store): make the cascade migration sort unambiguously
   before stable-id` na branch.
 
+### Validação desta sessão (fiação do `AccountSupervisor`)
+
+- Depois de ligar `AccountSupervisor` em `main.rs` (startup/shutdown) e nas
+  três requests de lifecycle em `serve_control_client`: `cargo test -p
+  oxidezap-daemon --all-features` — passou por completo (224+ testes na
+  suíte inline, mais os arquivos de teste de integração), incluindo os dois
+  testes novos (`supervisor_attaches_itself_to_its_registry_and_lets_it_go_when_dropped`
+  em `account/mod.rs`; `create_account_is_refused_without_a_supervisor_attached`
+  e `a_control_connection_resets_and_removes_a_named_account` em
+  `server/tests.rs`) — rodados 3x seguidas para descartar flakiness, todas
+  estáveis.
+- `cargo check -p oxidezap-daemon --lib --target wasm32-unknown-unknown` —
+  passou: `serve_control_client` e seus dois novos helpers
+  (`create_account`/`change_account`) compilam para wasm, onde
+  `AccountSupervisor` não existe — o split de `cfg` fica dentro de
+  `create_account`, nenhum listener precisou de um branch próprio.
+- Matriz completa novamente: `cargo fmt --all -- --check`, `cargo clippy
+  --workspace --all-targets --all-features -- -D warnings`, `cargo test
+  --workspace --all-features --no-fail-fast` (mesma única exceção
+  pré-existente de antes), `cargo check --workspace --all-targets`, `cargo
+  test --workspace --all-features --doc`, os dois comandos de wasm do CI —
+  todos passaram.
+
 ## Bloqueio arquitetural atual
 
 ~~A implementação de lifecycle de contas depende do WR-1 no
-`whatsapp-rust`.~~ **Resolvido**: WR-1 está mergeado e a dependência já
-aponta pro commit que o contém. ~~Falta orquestração em tempo de execução
-no daemon (`AccountSupervisor`).~~ **Resolvido**: `AccountSupervisor` existe
-e está testado em isolamento (ver item acima) — o `ShutdownSignal` que
-precisava virar broadcast antes de qualquer spawn dinâmico em produção
-também já foi corrigido. O que falta agora é só **fiação** (nenhuma peça
-nova de arquitetura, só ligar o que já existe):
+`whatsapp-rust`.~~ **Resolvido**. ~~Falta orquestração em tempo de execução
+no daemon (`AccountSupervisor`).~~ **Resolvido**. ~~Falta ligar
+`AccountSupervisor` em `main.rs` e nas três mutations do control plane.~~
+**Resolvido nesta rodada**: `main.rs` agora usa `AccountSupervisor` no
+startup (lista `StoreRegistry::accounts()`, spawna a conta legada pelo hub
+pré-construído e as demais por `spawn`) e no shutdown (`join_all()` no lugar
+do `JoinHandle` único; `shutdown::request()` no lugar do `Arc<Notify>`
+local). `serve_control_client` responde de verdade `CreateAccount`
+(`AccountSupervisor::create_and_spawn`, resposta `AccountCreated`) e
+`ResetAccount`/`RemoveAccount` (despacha `Action::ForgetSession(disposition)`
+para o `Commands` da conta alvo, resposta `Accepted`; id desconhecido
+responde `NoSession`). `AccountRegistry` carrega um `Weak<AccountSupervisor>`
+(setado por `AccountSupervisor::new`/`with_shutdown`) para que a conexão de
+controle alcance o supervisor sem que nenhum listener precise passar um
+segundo `Arc` — `Weak` porque o supervisor já segura um
+`Arc<AccountRegistry>`, e um ponteiro forte de volta seria um ciclo que
+nenhum dos dois solta.
 
-1. **Conectar `AccountSupervisor` ao `main.rs`.** Hoje `main.rs` ainda
-   constrói manualmente exatamente um `AccountRuntime` inline para
-   `AccountId::LEGACY` e segura seu `JoinHandle` num `select!` — o processo
-   inteiro vive ou morre com essa única sessão. Precisa virar: no startup,
-   listar `StoreRegistry::accounts()`; se vazia, `AccountId::LEGACY` (primeiro
-   launch); para a primeira conta (ou a única), usar
-   `AccountSupervisor::spawn_with_hub` (o hub pré-construído na main thread
-   pro tray do macOS); para as demais, `AccountSupervisor::spawn`. No
-   shutdown, `supervisor.join_all()` no lugar do join único; o `stop:
-   Arc<Notify>` local do `main.rs` deveria sumir em favor de
-   `crate::shutdown` (agora broadcast-safe).
-2. **Conectar `CreateAccount`/`ResetAccount`/`RemoveAccount` no
-   `serve_control_client`** (`crates/daemon/src/server/mod.rs`), que hoje
-   ainda responde `Refused` para as três. Design já fechado, reaproveitando
-   peças que já existem e já são testadas:
-   - `CreateAccount`: `stores.create_account()` → id, depois
-     `supervisor.spawn(id).await`, responde
-     `DaemonMessage::AccountCreated { id, account }`.
-   - `ResetAccount { account }` / `RemoveAccount { account }`: acha a
-     `AccountRuntime` alvo via `registry.get(account)`, monta um
-     `SessionCommand { action: Action::ForgetSession(Reset|Remove), reply }`
-     e manda pelo `Commands` **daquela** conta — reaproveitando exatamente o
-     mesmo caminho de teardown self-service que o cliente da própria conta já
-     usa, nenhum código novo de teardown — espera o oneshot de resposta,
-     responde `DaemonMessage::Accepted { id }`. O stop+respawn/remove
-     de fato acontece depois, em background, via `AccountSupervisor::hold()`
-     (já implementado). Falta decidir onde o `Arc<AccountSupervisor>` fica
-     acessível a partir de onde a conexão de controle roda hoje (ao lado do
-     `Arc<AccountRegistry>`, ou dentro dele).
-3. **A GUI depende de (1)-(2)**: `ControlSession`/`AccountWorkspace`,
-   switcher, Add/Reset/Remove na UI.
+**Não sobrou nenhuma peça de arquitetura pendente para o lifecycle dinâmico
+de contas no daemon nativo.** O que falta agora é a camada acima:
 
-Nenhum desses pontos precisa mais de nenhuma peça de arquitetura nova —
-`AccountSupervisor`, `AccountDisposition` e o protocolo de wire
-(`AccountCreated`) já existem e já passam na sua própria suíte; falta ligar
-tudo isso ao processo real (`main.rs`) e ao servidor de controle.
+1. **A GUI depende de tudo isso**: `ControlSession`/`AccountWorkspace`,
+   switcher, Add/Reset/Remove na UI — hoje a GUI nem fala v30 do jeito
+   multi-conta, só usa o wrapper de conta legada.
+2. **Web/embedded continuam de fora**: `embedded.rs` continua construindo um
+   `AccountRuntime` único à mão (não usa `AccountSupervisor`, que exige
+   `Send` e o host de plugin web não é); o registry ali nunca tem um
+   supervisor anexado, então as três mutations respondem `Refused` lá —
+   correto para hoje, mas item 8 do plano (registry multi-conta próprio pra
+   web) segue pendente.
+3. **Coordenação global (tray, calls) ainda não existe**: o `hub`
+   pré-construído passado a `spawn_with_hub` continua fixo em
+   `AccountId::LEGACY`; a tray só observa esse hub. Com múltiplas contas
+   reais, a tray precisa saber agregar mais de uma — item 9 do plano,
+   pendente de decisão de produto sobre o que uma chamada ativa faz quando o
+   usuário troca de conta (seção 20 do plano).
 
 ## Sequência de implementação
 
@@ -283,22 +298,21 @@ tudo isso ao processo real (`main.rs`) e ao servidor de controle.
       no web (`Origin`/`localStorage` ainda não é keyed por `AccountId,
       seção 13.3 do plano) e o staging global de instalação de plugin
       (seção 13.2).
-- [~] **3. `AccountRuntime`** — encapsula `StateHub`, commands, plugin host e
-      lifecycle por conta; o daemon/embedded/listeners já compartilham um
-      `AccountRegistry` e o bridge abre e reseta a sessão com o `AccountId`
-      correto. `AccountSupervisor` (spawn/respawn dinâmico) já existe e está
-      testado — falta só ligá-lo em `main.rs` ("Bloqueio arquitetural atual"
-      acima, item 1).
-- [x] **4. `AccountRegistry`** — N runtimes e snapshot/status isolados estão
-      prontos para o daemon; `AccountSupervisor` é o supervisor de tarefa por
-      conta que o spawn dinâmico de reset/remove/create precisa — falta só a
-      fiação em `main.rs`/`serve_control_client`.
-- [~] **5. IPC v30** — scopes `Control`/`Account`, handshake com `AccountId`,
+- [x] **3. `AccountRuntime`** — encapsula `StateHub`, commands, plugin host e
+      lifecycle por conta; o daemon/embedded/listeners compartilham um
+      `AccountRegistry`, o bridge abre e reseta a sessão com o `AccountId`
+      correto, e `AccountSupervisor` liga tudo isso em `main.rs`
+      (spawn/respawn dinâmico, nativo). Falta só web/embedded (item 8) e a
+      coordenação global do item 9 no bloqueio acima.
+- [x] **4. `AccountRegistry`** — N runtimes e snapshot/status isolados,
+      `AccountSupervisor` como supervisor de tarefa por conta, e o
+      `Weak<AccountSupervisor>` que deixa `serve_control_client` alcançá-lo
+      sem uma segunda `Arc` em cada listener — tudo pronto e testado.
+- [x] **5. IPC v30** — scopes `Control`/`Account`, handshake com `AccountId`,
       conexão de conta imutavelmente bound, listagem do registry, enforcement
-      de requests e a resposta `AccountCreated` estão prontos; as três
-      mutações de lifecycle ainda respondem `Refused` em
-      `serve_control_client` — falta só a fiação (item 2 do bloqueio acima),
-      não mais nenhuma peça de arquitetura.
+      de requests, e as três mutações de lifecycle (`CreateAccount` ->
+      `AccountCreated`, `ResetAccount`/`RemoveAccount` -> `Accepted`) todas
+      respondendo de verdade em `serve_control_client`.
 - [ ] **6. GUI** — `ControlSession` + `AccountWorkspace`, attach/detach e
       completions assíncronas protegidas contra switch.
 - [ ] **7. UX** — switcher, Add, Reset, Remove, pairing por runtime e estado
