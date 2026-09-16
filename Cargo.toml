@@ -16,6 +16,7 @@ members = [
     "crates/plugin-sdk",
     "crates/session",
     "crates/video",
+    "crates/wire",
 ]
 # Example plugins build for `wasm32-unknown-unknown` and link against imports
 # only the daemon provides, so they are not workspace members: `cargo build`
@@ -92,7 +93,9 @@ oxidezap-plugin-abi = { path = "crates/plugin-abi" }
 oxidezap-plugin-host = { path = "crates/plugin-host" }
 oxidezap-session = { path = "crates/session" }
 oxidezap-video = { path = "crates/video" }
+oxidezap-wire = { path = "crates/wire" }
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+usage = { package = "usage-rs", version = "6.9", default-features = false, features = ["spec", "help", "diagnostics", "completions"] }
 # The Unix syscalls the daemon and the IPC crate need (flock, getuid, kill),
 # as safe wrappers. Already in the tree transitively; declared because both
 # crates import it directly, and it replaces hand-written `extern "C"` blocks.
