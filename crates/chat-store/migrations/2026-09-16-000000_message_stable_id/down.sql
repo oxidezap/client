@@ -2,6 +2,11 @@
 -- (SQLite numbers fresh rows `max(rowid) + 1`), so arrival cursors and the
 -- FTS mapping do not survive a downgrade the way they survive the upgrade;
 -- the FTS objects are dropped here and rebuilt by `ensure_fts` at next open.
+--
+-- Carries the `device_id` foreign key forward rather than dropping it: this
+-- downgrade returns the table to the shape the multi-account cascade
+-- migration left it in (that migration runs before this one), and that shape
+-- already had the constraint.
 DROP TRIGGER IF EXISTS messages_fts_ai;
 DROP TRIGGER IF EXISTS messages_fts_ad;
 DROP TRIGGER IF EXISTS messages_fts_au;
@@ -21,7 +26,8 @@ CREATE TABLE messages_old (
     starred BOOLEAN NOT NULL DEFAULT FALSE,
     edited_at_ms BIGINT,
     revoked BOOLEAN NOT NULL DEFAULT FALSE,
-    PRIMARY KEY (device_id, chat_jid, msg_id, sender_jid)
+    PRIMARY KEY (device_id, chat_jid, msg_id, sender_jid),
+    FOREIGN KEY (device_id) REFERENCES device(id) ON DELETE CASCADE
 );
 
 -- Compressed protos cannot go back: the old shape has no codec slot, and

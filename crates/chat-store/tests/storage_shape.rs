@@ -145,6 +145,10 @@ async fn file_store(tag: &str) -> (SqliteStore, Arc<ChatStore>, String) {
     let path_str = path.to_str().expect("temp path").to_owned();
     let _ = std::fs::remove_file(&path);
     let store = SqliteStore::new(&path_str).await.expect("create store");
+    // Production's BotBuilder creates the device row; open directly here, so
+    // seed the same legacy account before the FK cascade migration accepts
+    // chat rows (see `common::test_store`'s comment).
+    store.create_new_device().await.expect("seed device parent");
     let chat_store = ChatStore::new(&store).await.expect("create chat store");
     (store, chat_store, path_str)
 }
