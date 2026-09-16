@@ -535,11 +535,14 @@ mod tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     use super::serve;
+    use crate::account::{AccountRegistry, AccountRuntime};
     use crate::state::StateHub;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    /// A daemon with nothing in it, and something to answer its commands.
+    /// A daemon with nothing in it beyond one account bound to
+    /// [`oxidezap_core::AccountId::LEGACY`], and something to answer its
+    /// commands.
     ///
     /// The stand-in bridge is not decoration. A front end that says it has a
     /// window is asked for a keyframe the moment its handshake lands, and
@@ -547,11 +550,12 @@ mod tests {
     /// receiver open would hang exactly where a real daemon would have
     /// replied. It answers everything the same way; nothing here asks a
     /// second thing.
-    fn a_daemon() -> (
-        Arc<StateHub>,
-        Arc<oxidezap_plugin_host::Plugins>,
-        crate::session_bridge::Commands,
-    ) {
+    ///
+    /// Returns the registry [`serve`] now takes, rather than the hub/plugins/
+    /// commands triple it used to: a tab's rendezvous routes a hello by
+    /// `AccountId` exactly as every other listener does, so what it needs is
+    /// the same [`AccountRegistry`] a real daemon builds one runtime into.
+    fn a_daemon() -> Arc<AccountRegistry> {
         let (commands, mut asked) = tokio::sync::mpsc::channel::<
             crate::session_bridge::SessionCommand,
         >(crate::server::MAX_CLIENTS);
@@ -562,13 +566,22 @@ mod tests {
                     .send(crate::session_bridge::CommandOutcome::Accepted);
             }
         });
-        (
-            StateHub::new(),
-            Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
-                |_| {},
-            ))),
+        let hub = StateHub::new();
+        let plugins = Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+            |_| {},
+        )));
+        let registry = AccountRegistry::new();
+        let runtime = Arc::new(AccountRuntime::new(
+            hub.account_id(),
+            hub,
+            plugins,
             commands,
-        )
+        ));
+        assert!(
+            registry.insert(runtime),
+            "the legacy account registers once"
+        );
+        registry
     }
 
     /// How long the whole exchange may take before it is a failure.
@@ -591,8 +604,8 @@ mod tests {
     /// read and accepted a hello.
     #[wasm_bindgen_test]
     async fn a_served_tab_is_heard_as_well_as_answered() {
-        let (hub, plugins, commands) = a_daemon();
-        let _serving = serve(&hub, &plugins, &commands).expect("the rendezvous opens");
+        let registry = a_daemon();
+        let _serving = serve(&registry).expect("the rendezvous opens");
 
         let mut tab = oxidezap_ipc::tab::connect()
             .await

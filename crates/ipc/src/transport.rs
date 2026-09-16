@@ -9,8 +9,11 @@ use std::path::PathBuf;
 /// or one immutable `AccountId`; control listings and lifecycle requests have
 /// separate wire messages, and account requests no longer carry an account id
 /// in their payload. `owns_window` and `call_video` are independent
-/// capabilities. Older v29 peers would either omit the scope or treat a
-/// control frame as account state, so the daemon refuses the mismatch.
+/// capabilities. `CreateAccount`/`ResetAccount`/`RemoveAccount` allocate,
+/// reset and remove a local account and are answered by
+/// `DaemonMessage::AccountCreated`/`Accepted`. Older v29 peers would either
+/// omit the scope or treat a control frame as account state, so the daemon
+/// refuses the mismatch.
 ///
 /// 28: `CallAction::RequestVideoKeyframe` names the call and direction whose
 /// compressed reference chain was lost. Older daemons reject the request,

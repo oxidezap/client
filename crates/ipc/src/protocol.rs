@@ -368,6 +368,15 @@ pub enum DaemonMessage {
         id: RequestId,
         snapshot: AccountsSnapshot,
     },
+    /// The id [`ClientRequest::CreateAccount`] allocated, and the account it
+    /// named is already registered and running — an [`ClientScope::Account`]
+    /// connection to it can be opened as soon as this arrives, and
+    /// [`DaemonMessage::AccountsChanged`] will have named it too, in whatever
+    /// order the two frames arrive in.
+    AccountCreated {
+        id: RequestId,
+        account: oxidezap_core::AccountId,
+    },
     /// First frame on every account connection. Establishes the protocol version and
     /// the state to apply events onto.
     Hello {
@@ -849,18 +858,27 @@ pub enum ClientRequest {
     },
     /// Ask for the current account set on a control connection.
     ListAccounts,
-    /// Allocate a new account slot.
+    /// Allocate a new, unpaired account slot and start its runtime.
     ///
-    /// The daemon returns an explicit refusal until the upstream WR-1 device
-    /// lifecycle API is available. Keeping the request in the wire contract
-    /// lets clients ship the control plane without pretending the operation is
-    /// safe to implement locally.
+    /// Answered by [`DaemonMessage::AccountCreated`], naming the id the
+    /// daemon allocated (SQLite's own `AUTOINCREMENT`, so it is never one a
+    /// removed account held). The new account has no session yet; a client
+    /// opens an [`ClientScope::Account`] connection to it and pairs exactly
+    /// as it would a first install.
     CreateAccount,
-    /// Reset one account while retaining its id.
+    /// Reset one account while retaining its id: every credential, chat and
+    /// piece of local state this account holds is purged, and a fresh
+    /// session under the same id is ready to pair again once the old one has
+    /// finished closing. Answered by [`DaemonMessage::Accepted`] once the
+    /// daemon has asked the account's own runtime to do this — not once it
+    /// has finished; watch [`DaemonMessage::AccountsChanged`] for that.
     ResetAccount {
         account: oxidezap_core::AccountId,
     },
-    /// Remove one account permanently.
+    /// Remove one account permanently: every credential, chat and piece of
+    /// local state this account holds is purged, and the id is retired for
+    /// good — never reissued to a later [`ClientRequest::CreateAccount`].
+    /// Answered the same way as [`ClientRequest::ResetAccount`].
     RemoveAccount {
         account: oxidezap_core::AccountId,
     },
@@ -1238,6 +1256,13 @@ mod tests {
         };
         let line = serde_json::to_string(&hello).expect("control hello serializes");
         assert_eq!(serde_json::from_str::<DaemonMessage>(&line).unwrap(), hello);
+
+        let created = DaemonMessage::AccountCreated { id: 9, account: id };
+        let line = serde_json::to_string(&created).expect("account_created serializes");
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            created
+        );
     }
 
     #[test]
