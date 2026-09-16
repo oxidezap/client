@@ -360,28 +360,31 @@ async fn a_query_of_punctuation_is_an_invalid_query_not_a_storage_error() {
 
 /// `has_media` filters in the query, so the limit counts media rows.
 ///
-/// Filtering after the page would return however few media rows happened to
-/// be among the top `limit` matches; a caller asking for two photos would get
-/// one because the surrounding conversation outranked them.
+/// The fixture makes every text row outrank every media row: filtering after
+/// the page would then return whichever media rows happened to fall inside
+/// the top `limit`, so asking for two photos over three text matches would
+/// come back empty. The unfiltered order is asserted first, because the test
+/// is only about premature limiting if the media rows really are behind the
+/// text ones.
 #[cfg(feature = "search")]
 #[tokio::test]
 async fn a_media_search_returns_a_full_page_of_media() {
     let (_store, chat_store) = test_store().await;
 
     let mut events = Vec::new();
-    // Five text matches that rank above the media ones.
+    // Five text rows whose term is dense, so they score above the media ones.
     for i in 0..5 {
         events.push(message_event(
-            wa::Message::text(format!("foto do almoço {i}")),
+            wa::Message::text("foto foto foto"),
             incoming_info(PEER, PEER, &format!("MSG-T{i}"), 1_700_000_000 + i),
         ));
     }
-    // Two media rows with the same term rank below them.
+    // Two media rows where the term is rare in a long caption.
     for i in 0..2 {
         events.push(message_event(
             wa::Message {
                 image_message: MessageField::some(wa::message::ImageMessage {
-                    caption: Some(format!("foto do almoço em foto {i}")),
+                    caption: Some(format!("foto {}", "palavra ".repeat(30))),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -390,6 +393,13 @@ async fn a_media_search_returns_a_full_page_of_media() {
         ));
     }
     feed(&chat_store, events).await;
+
+    let ranked = chat_store.search_messages("foto", 10).await.unwrap();
+    assert!(
+        ranked.iter().take(5).all(|m| m.id.starts_with("MSG-T")),
+        "the fixture must rank every text row above the media ones, got {:?}",
+        ranked.iter().map(|m| m.id.as_str()).collect::<Vec<_>>()
+    );
 
     let media = chat_store
         .search_media_messages("foto", None, 2)

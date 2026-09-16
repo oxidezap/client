@@ -132,7 +132,8 @@ fn an_invalid_account_flag_is_refused() {
 
 /// `--account` overrides the environment when the connection is resolved,
 /// which is what makes the flag usable in a shell that already exports a
-/// default profile. The error names the endpoint for `work`, not `other`.
+/// default profile. The error names the endpoint for the flag's profile, not
+/// the environment's.
 ///
 /// Run from a private directory holding a copy of the binary and nothing
 /// else, with a private runtime directory: no `oxidezapd` sits beside it to
@@ -152,9 +153,13 @@ fn the_account_flag_beats_the_environment() {
     });
     std::fs::copy(env!("CARGO_BIN_EXE_oxidezap-cli"), &binary).expect("a copy of the cli");
 
+    // A profile name no real daemon uses, so a socket that somehow already
+    // exists for it cannot be what this test reaches.
+    let chosen = "flagprobe";
+    let inherited = "envprobe";
     let out = Command::new(&binary)
-        .args(["--json", "--account", "work", "status"])
-        .env("OXIDEZAP_ACCOUNT", "other")
+        .args(["--json", "--account", chosen, "status"])
+        .env("OXIDEZAP_ACCOUNT", inherited)
         .env("XDG_RUNTIME_DIR", &dir)
         .env("TMPDIR", &dir)
         .output()
@@ -172,13 +177,13 @@ fn the_account_flag_beats_the_environment() {
     );
     let message = parsed["error"]["message"].as_str().unwrap_or_default();
     // The profile is suffixed onto the endpoint name on every platform: a
-    // Unix socket is `daemon-work.sock` and a Windows pipe ends `...-work`.
+    // Unix socket is `daemon-<id>.sock` and a Windows pipe ends `...-<id>`.
     assert!(
-        message.contains("-work"),
+        message.contains(chosen),
         "the flag did not select its profile: {message}"
     );
     assert!(
-        !message.contains("-other"),
+        !message.contains(inherited),
         "the environment profile was selected over the flag: {message}"
     );
 }
@@ -247,4 +252,44 @@ fn an_unknown_flag_is_refused() {
         .output()
         .expect("run the cli");
     assert!(!out.status.success());
+}
+
+/// `--json` on a command that writes raw text is refused, not ignored: a
+/// script asking for JSON must not get a shell fragment on stdout.
+#[test]
+fn json_is_refused_for_raw_text_commands() {
+    for args in [
+        vec!["--json", "completion", "--shell", "bash"],
+        vec!["--json", "mcp"],
+        vec!["--json", "accounts", "use", "work"],
+    ] {
+        let out = cli().args(&args).output().expect("run the cli");
+        assert_ne!(out.status.code(), Some(0), "accepted {args:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "{args:?} wrote raw text to stdout under --json"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stderr).expect("structured json error on stderr");
+        assert_eq!(parsed["ok"], serde_json::json!(false));
+        assert_eq!(
+            parsed["error"]["code"],
+            serde_json::json!("output_mode_unsupported")
+        );
+    }
+}
+
+/// The same commands still work without `--json`.
+#[test]
+fn raw_text_commands_still_run_by_default() {
+    let out = cli()
+        .args(["accounts", "use", "work"])
+        .output()
+        .expect("run the cli");
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "export OXIDEZAP_ACCOUNT=work"
+    );
 }

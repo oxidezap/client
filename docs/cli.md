@@ -27,6 +27,11 @@ and errors to stderr as
 exit. Every command, read or write, returns a DTO in `data`; no command
 prints a human sentence in `--json`, and none exits zero after a failure.
 
+Three commands write raw text rather than a DTO: `completion` (a shell
+script), `mcp` (a usage spec) and `accounts use` (an `eval` line). They
+refuse `--json`/`--events` with `output_mode_unsupported` and a nonzero
+exit instead of putting non-JSON on stdout.
+
 `--events` subscribes the connection to lifecycle events. `sync --follow`
 prints one `DaemonEvent` per line as NDJSON and nothing else, so a follower
 can parse every line it reads. Exit codes: `0` ok, `1` daemon refused, `2`

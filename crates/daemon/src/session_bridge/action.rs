@@ -94,15 +94,7 @@ impl Action {
     /// window has already drawn the ring as watched.
     pub fn needs_network(&self) -> bool {
         match self {
-            // Pairing is the connection attempt itself: the account is in
-            // `Pairing`, never `Connected`, for the whole of it, so gating it
-            // on a live connection refuses it exactly when it is wanted. The
-            // request reaches a client that exists, which is all it needs.
-            Self::Wire {
-                request: oxidezap_wire::request::ClientRequest::RequestPairCode { .. },
-                ..
-            } => false,
-            Self::Wire { request, .. } => request.is_mutation(),
+            Self::Wire { request, .. } => wire_needs_network(request),
             _ => !matches!(
                 self,
                 Self::ReloadHistory
@@ -114,6 +106,105 @@ impl Action {
                     | Self::GroupMembers { .. }
             ),
         }
+    }
+}
+
+/// Whether carrying a wire request out needs the account's connection.
+///
+/// Independent of [`ClientRequest::access`](oxidezap_wire::ClientRequest::access):
+/// that answers "is this a write" for the read-only gate, and this answers
+/// "does this reach WhatsApp" for the live-connection gate. A local mutation
+/// (a tag, a cache wipe) needs no connection, and a network read (a profile,
+/// a channel list) does.
+///
+/// Exhaustive on purpose. The version this replaced inferred the answer from
+/// `is_mutation`, which is wrong in both directions: it gated local writes
+/// that work fine offline, and let network reads through to fail deeper down
+/// with a session error instead of the `not_connected` the gate would have
+/// given them. A variant added here fails to compile until it says which it is.
+fn wire_needs_network(request: &oxidezap_wire::request::ClientRequest) -> bool {
+    use oxidezap_wire::request::ClientRequest as R;
+    match request {
+        // Local, or the handshake itself.
+        R::Hello { .. }
+        | R::GetStatus
+        | R::ListMessages { .. }
+        | R::GetMessage { .. }
+        | R::GetMessageContext { .. }
+        | R::SearchMessages { .. }
+        | R::ListStarredMessages { .. }
+        | R::ListChats { .. }
+        | R::GetChat { .. }
+        | R::ListContacts { .. }
+        | R::GetContact { .. }
+        | R::SetContactAlias { .. }
+        | R::TagContact { .. }
+        | R::UntagContact { .. }
+        | R::ListPolls { .. }
+        | R::GetPoll { .. }
+        | R::ListCalls { .. }
+        | R::HistoryCoverage { .. }
+        | R::CleanupChats
+        | R::PurgeMessages { .. }
+        | R::ListAccounts
+        | R::GetStorageUsage
+        | R::ClearMediaCache
+        | R::DoctorCheck
+        | R::ForgetSession
+        | R::Shutdown
+        // Pairing is the connection attempt itself: the account is in
+        // `Pairing`, never `Connected`, for the whole of it, so gating it on
+        // a live connection refuses the one request trying to establish one.
+        | R::RequestPairCode { .. } => false,
+
+        // Reaches WhatsApp.
+        R::CheckContact { .. }
+        | R::RefreshContacts { .. }
+        | R::ListGroups
+        | R::GetGroupInfo { .. }
+        | R::CreateGroup { .. }
+        | R::SetGroupTopic { .. }
+        | R::SetGroupDescription { .. }
+        | R::ManageGroupParticipant { .. }
+        | R::GetGroupInviteLink { .. }
+        | R::JoinGroup { .. }
+        | R::LeaveGroup { .. }
+        | R::SetGroupPermissions { .. }
+        | R::ListGroupJoinRequests { .. }
+        | R::ManageGroupJoinRequest { .. }
+        | R::ListChannels
+        | R::GetChannelInfo { .. }
+        | R::JoinChannel { .. }
+        | R::LeaveChannel { .. }
+        | R::GetProfile { .. }
+        | R::GetBusinessProfile { .. }
+        | R::SetProfileAbout { .. }
+        | R::SetProfileName { .. }
+        | R::SetProfilePicture { .. }
+        | R::RemoveProfilePicture
+        | R::SetPresence { .. }
+        | R::MarkRead { .. }
+        | R::MarkUnread { .. }
+        | R::PinChat { .. }
+        | R::MuteChat { .. }
+        | R::ArchiveChat { .. }
+        | R::EditMessage { .. }
+        | R::RevokeMessage { .. }
+        | R::ForwardMessage { .. }
+        | R::SendText { .. }
+        | R::SendMedia { .. }
+        | R::SendAudio { .. }
+        | R::SendReaction { .. }
+        | R::SendPoll { .. }
+        | R::VotePoll { .. }
+        | R::SendLocation { .. }
+        | R::SendStatus { .. }
+        | R::SendSticker { .. }
+        | R::SendListResponse { .. }
+        | R::DownloadMedia { .. }
+        | R::RetryMedia { .. }
+        | R::BackfillMedia { .. }
+        | R::HistoryBackfill { .. } => true,
     }
 }
 

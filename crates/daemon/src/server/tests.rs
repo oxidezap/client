@@ -703,6 +703,50 @@ fn requesting_a_pair_code_does_not_need_a_live_connection() {
     assert!(request.is_mutation());
 }
 
+/// Network dependency is classified per request, not inferred from whether
+/// it writes: a local mutation works with no connection, and a network read
+/// needs one.
+#[test]
+fn wire_requests_classify_their_network_dependency() {
+    use oxidezap_wire::request::ClientRequest as R;
+
+    let action = |request: R| Action::Wire {
+        id: 1,
+        request,
+        answer_to: outbox(),
+    };
+
+    // Local mutations: the store or the cache, no stanza.
+    for request in [
+        R::CleanupChats,
+        R::PurgeMessages { chat_jid: None },
+        R::TagContact {
+            jid: "a@s.whatsapp.net".into(),
+            tag: "x".into(),
+        },
+        R::ClearMediaCache,
+    ] {
+        assert!(!action(request.clone()).needs_network(), "{request:?}");
+    }
+
+    // Network reads: a live connection is what makes them answerable.
+    for request in [
+        R::ListChannels,
+        R::GetProfile { jid: None },
+        R::GetBusinessProfile {
+            jid: "a@s.whatsapp.net".into(),
+        },
+        R::CheckContact {
+            phone: "5511999999999".into(),
+        },
+        R::GetChannelInfo {
+            channel_jid: "1@newsletter".into(),
+        },
+    ] {
+        assert!(action(request.clone()).needs_network(), "{request:?}");
+    }
+}
+
 /// A connection's own answer channel, with the end that reads it.
 ///
 /// Everything about a plugin folder is answered *later*, on this channel,

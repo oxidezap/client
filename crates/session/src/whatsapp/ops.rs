@@ -962,28 +962,34 @@ impl WhatsAppClient {
                     )
                     .await
                 {
+                    // Nothing was asked, so nothing is coming: waiting for a
+                    // history sync would spend the whole budget on an answer
+                    // that will never arrive. The local backfill below still
+                    // runs.
                     log::warn!("the phone was not asked for older history: {e}");
-                }
-                // The phone answers asynchronously: the messages arrive as a
-                // history-sync notification the store materializes, not as the
-                // return of the request above. Reading coverage straight away
-                // would report what was here before the ask. Bounded, so a
-                // phone that never answers costs a wait and not a hang.
-                let before = oldest.timestamp.timestamp_millis();
-                let deadline = wacore::time::Instant::now() + HISTORY_SYNC_WAIT;
-                loop {
-                    match live.chat_store.oldest_message(&chat).await {
-                        Ok(Some(now)) if now.timestamp.timestamp_millis() < before => break,
-                        Ok(_) => {}
-                        Err(e) => {
-                            log::warn!("could not read the chat while waiting on history: {e}");
+                } else {
+                    // The phone answers asynchronously: the messages arrive as
+                    // a history-sync notification the store materializes, not
+                    // as the return of the request above. Reading coverage
+                    // straight away would report what was here before the ask.
+                    // Bounded, so a phone that never answers costs a wait and
+                    // not a hang.
+                    let before = oldest.timestamp.timestamp_millis();
+                    let deadline = wacore::time::Instant::now() + HISTORY_SYNC_WAIT;
+                    loop {
+                        match live.chat_store.oldest_message(&chat).await {
+                            Ok(Some(now)) if now.timestamp.timestamp_millis() < before => break,
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::warn!("could not read the chat while waiting on history: {e}");
+                                break;
+                            }
+                        }
+                        if wacore::time::Instant::now() >= deadline {
                             break;
                         }
+                        crate::exec::sleep(std::time::Duration::from_millis(200)).await;
                     }
-                    if wacore::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    crate::exec::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
             let warmed = Self::message_page(

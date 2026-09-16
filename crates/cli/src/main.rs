@@ -52,9 +52,18 @@ fn main() -> ExitCode {
         }
     };
 
-    // Commands that execute locally without a daemon connection.
+    // Commands that execute locally without a daemon connection. Three of
+    // them emit raw text meant for a shell to consume — a completion script,
+    // the usage spec, an `export` line for `eval` — which is not a DTO and
+    // cannot be wrapped in `{"ok": true, "data": ...}` without breaking the
+    // thing that reads it. So `--json`/`--events` are refused for those
+    // rather than silently ignored: a script that asked for JSON gets a
+    // structured error and a nonzero exit, not a shell fragment on stdout.
     match command {
         Commands::Completion(comp) => {
+            if !machine_output_allowed(output_mode, "completion", "a shell script") {
+                return ExitCode::from(1);
+            }
             let shell = match comp.shell.as_str() {
                 "bash" => usage::complete::Shell::Bash,
                 "zsh" => usage::complete::Shell::Zsh,
@@ -64,12 +73,18 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Commands::Mcp(_mcp) => {
+            if !machine_output_allowed(output_mode, "mcp", "a usage spec") {
+                return ExitCode::from(1);
+            }
             print!("{}", OxidezapCli::to_kdl());
             return ExitCode::SUCCESS;
         }
         Commands::Accounts(ref accounts)
             if matches!(accounts.command, Some(args::AccountsSubcommand::Use(_))) =>
         {
+            if !machine_output_allowed(output_mode, "accounts use", "an `eval` line") {
+                return ExitCode::from(1);
+            }
             if let Some(args::AccountsSubcommand::Use(u)) = &accounts.command {
                 match resolve_account_arg(&u.id, output_mode) {
                     Ok(Some(id)) => println!("export OXIDEZAP_ACCOUNT={id}"),
@@ -203,6 +218,25 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Whether a command whose output is raw text may run under the requested
+/// output mode.
+///
+/// `completion`, `mcp` and `accounts use` write something a shell or a tool
+/// consumes directly, so there is no DTO to wrap. Refusing is the honest
+/// answer under `--json`/`--events`: the alternative is machine output that
+/// is not JSON, which is what a script would choke on.
+fn machine_output_allowed(mode: OutputMode, command: &str, what: &str) -> bool {
+    if mode == OutputMode::Human {
+        return true;
+    }
+    print_error(
+        mode,
+        "output_mode_unsupported",
+        &format!("`{command}` writes {what}, not a JSON DTO; drop --json/--events"),
+    );
+    false
 }
 
 /// Validate an id a user named, or resolve `default` to "unset".
