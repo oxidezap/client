@@ -163,6 +163,31 @@ pub struct CallEventDto {
     pub outcome: String, // "connected", "missed", "declined", "cancelled"
 }
 
+/// A broadcast channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelDto {
+    pub jid: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub subscriber_count: u64,
+    pub picture_url: Option<String>,
+}
+
+/// One pending group membership request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupJoinRequestDto {
+    pub jid: String,
+    pub request_time_secs: Option<u64>,
+}
+
+/// One locally known account profile: a daemon socket with a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountDto {
+    pub id: String,
+    pub socket_path: String,
+    pub active: bool,
+}
+
 /// Local storage usage diagnostics.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageDto {

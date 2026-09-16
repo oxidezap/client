@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dto::{
-    CallEventDto, ChatDto, ConnectionStatusDto, ContactDto, DoctorDto, GroupDto, MessageDto,
-    PollDto, ProfileDto, StorageDto,
+    AccountDto, CallEventDto, ChannelDto, ChatDto, ConnectionStatusDto, ContactDto, DoctorDto,
+    GroupDto, GroupJoinRequestDto, MessageDto, PollDto, ProfileDto, StorageDto,
 };
 use crate::envelope::PageCursor;
 
@@ -50,6 +50,7 @@ pub enum DaemonResponse {
     Contacts {
         contacts: Vec<ContactDto>,
     },
+    Contact(ContactDto),
     ContactCheck {
         phone: String,
         is_registered: bool,
@@ -64,12 +65,45 @@ pub enum DaemonResponse {
     GroupInviteLink {
         link: String,
     },
+    GroupCreated {
+        jid: String,
+    },
+    GroupJoined {
+        jid: String,
+        pending_approval: bool,
+    },
+    GroupJoinRequests {
+        requests: Vec<GroupJoinRequestDto>,
+    },
 
     // --- Polls ---
     Polls {
         polls: Vec<PollDto>,
     },
     Poll(PollDto),
+
+    // --- Channels ---
+    Channels {
+        channels: Vec<ChannelDto>,
+    },
+    Channel(ChannelDto),
+
+    // --- Maintenance ---
+    MediaBackfilled {
+        requested: u64,
+        downloaded: u64,
+    },
+    ChatsCleaned {
+        removed: u64,
+    },
+    MessagesPurged {
+        purged: u64,
+    },
+
+    // --- Accounts ---
+    Accounts {
+        accounts: Vec<AccountDto>,
+    },
 
     // --- Profile ---
     Profile(ProfileDto),

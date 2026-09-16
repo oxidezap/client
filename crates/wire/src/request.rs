@@ -121,6 +121,10 @@ pub enum ClientRequest {
     SendStatus {
         text: String,
     },
+    SendSticker {
+        to: String,
+        file_path: String,
+    },
 
     // --- Chats ---
     ListChats {
@@ -179,6 +183,26 @@ pub enum ClientRequest {
     },
     CheckContact {
         phone: String,
+    },
+    GetContact {
+        jid: String,
+    },
+    RefreshContacts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jid: Option<String>,
+    },
+    SetContactAlias {
+        jid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+    },
+    TagContact {
+        jid: String,
+        tag: String,
+    },
+    UntagContact {
+        jid: String,
+        tag: String,
     },
 
     // --- Groups ---
@@ -239,6 +263,30 @@ pub enum ClientRequest {
         state: PresenceState,
     },
 
+    // --- Polls ---
+    ListPolls {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_jid: Option<String>,
+        #[serde(default = "default_limit")]
+        limit: usize,
+    },
+    GetPoll {
+        chat_jid: String,
+        poll_id: String,
+    },
+
+    // --- Channels ---
+    ListChannels,
+    GetChannelInfo {
+        channel_jid: String,
+    },
+    JoinChannel {
+        channel_jid: String,
+    },
+    LeaveChannel {
+        channel_jid: String,
+    },
+
     // --- Calls & History ---
     ListCalls {
         #[serde(default = "default_limit")]
@@ -253,6 +301,42 @@ pub enum ClientRequest {
         #[serde(default = "default_backfill_count")]
         count: u32,
     },
+
+    // --- Media & Store maintenance ---
+    BackfillMedia {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_jid: Option<String>,
+        #[serde(default = "default_limit")]
+        limit: usize,
+    },
+    CleanupChats,
+    PurgeMessages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_jid: Option<String>,
+    },
+
+    // --- Profile extra ---
+    GetBusinessProfile {
+        jid: String,
+    },
+
+    // --- Groups extra ---
+    SetGroupPermissions {
+        group_jid: String,
+        announce_only: bool,
+        locked: bool,
+    },
+    ListGroupJoinRequests {
+        group_jid: String,
+    },
+    ManageGroupJoinRequest {
+        group_jid: String,
+        participant_jid: String,
+        approve: bool,
+    },
+
+    // --- Accounts ---
+    ListAccounts,
 
     // --- Diagnostics & Storage ---
     GetStorageUsage,
@@ -278,6 +362,16 @@ impl ClientRequest {
                 | Self::VotePoll { .. }
                 | Self::SendLocation { .. }
                 | Self::SendStatus { .. }
+                | Self::SendSticker { .. }
+                | Self::SetContactAlias { .. }
+                | Self::TagContact { .. }
+                | Self::UntagContact { .. }
+                | Self::SetGroupPermissions { .. }
+                | Self::ManageGroupJoinRequest { .. }
+                | Self::JoinChannel { .. }
+                | Self::LeaveChannel { .. }
+                | Self::CleanupChats
+                | Self::PurgeMessages { .. }
                 | Self::MarkRead { .. }
                 | Self::MarkUnread { .. }
                 | Self::PinChat { .. }
