@@ -817,10 +817,18 @@ pub struct AccountsArgs {
 pub enum AccountsSubcommand {
     /// List known account profiles and their sockets
     List(AccountsListArgs),
+    /// Print the export line selecting an account (eval it)
+    Use(AccountsUseArgs),
 }
 
 #[derive(Args)]
 pub struct AccountsListArgs {}
+
+#[derive(Args)]
+pub struct AccountsUseArgs {
+    /// Account profile id (or "default")
+    pub id: String,
+}
 
 #[derive(Args)]
 pub struct MediaArgs {

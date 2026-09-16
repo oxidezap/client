@@ -36,6 +36,21 @@ fn main() -> ExitCode {
 
     // Commands that execute locally without requiring daemon connection
     match command {
+        // Selecting an account is choosing a socket, so it needs no
+        // daemon. Eval the line to apply it:
+        // `eval $(oxidezap-cli accounts use work)`.
+        Commands::Accounts(ref accounts)
+            if matches!(accounts.command, Some(args::AccountsSubcommand::Use(_))) =>
+        {
+            if let Some(args::AccountsSubcommand::Use(u)) = &accounts.command {
+                if u.id == "default" {
+                    println!("unset OXIDEZAP_ACCOUNT");
+                } else {
+                    println!("export OXIDEZAP_ACCOUNT={}", u.id);
+                }
+            }
+            return ExitCode::SUCCESS;
+        }
         Commands::Completion(comp) => {
             let shell = match comp.shell.as_str() {
                 "bash" => usage::complete::Shell::Bash,
@@ -1060,6 +1075,8 @@ fn execute_command(
                 }
                 Ok(())
             }
+            // Handled locally before connecting; unreachable here.
+            Some(args::AccountsSubcommand::Use(_)) => Ok(()),
             None => Ok(()),
         },
         Commands::Calls(c) => {
