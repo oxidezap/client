@@ -480,6 +480,11 @@ pub fn endpoint_path_for_account(id: &str) -> Option<PathBuf> {
     }
 }
 
+/// Only a Unix endpoint is a file with a name: Windows listens on a named
+/// pipe and a page reaches its daemon over the loopback bridge, so neither
+/// has a socket file to name. Gated like [`SOCKET_NAME`] itself, beside the
+/// one caller that is gated the same way.
+#[cfg(unix)]
 fn socket_file_name() -> String {
     match account_id() {
         None => SOCKET_NAME.to_string(),
