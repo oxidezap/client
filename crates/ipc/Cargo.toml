@@ -8,10 +8,19 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = ["legacy-protocol"]
+legacy-protocol = ["dep:oxidezap-core"]
+
+[[test]]
+name = "session_frames"
+required-features = ["legacy-protocol"]
+
 [dependencies]
 log = { workspace = true }
-oxidezap-core = { workspace = true }
-serde = { workspace = true }
+oxidezap-core = { workspace = true, optional = true }
+oxidezap-wire = { workspace = true }
+serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 

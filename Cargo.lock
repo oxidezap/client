@@ -6475,6 +6475,7 @@ dependencies = [
  "libc",
  "log",
  "oxidezap-core",
+ "oxidezap-wire",
  "rustix 1.1.4",
  "serde",
  "serde_json",
