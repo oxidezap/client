@@ -247,14 +247,15 @@ pub struct StoredMessage {
     /// and something has to break the tie — this is the order the socket
     /// delivered them in, which is the order both ends display.
     ///
-    /// Comparable, not durable: a `VACUUM` preserves the relative order these
-    /// values encode but may renumber the values themselves, and SQLite hands
-    /// out the implicit rowid as `max(rowid) + 1`, so deleting the newest
-    /// message gives its number to the next arrival and clearing a chat
-    /// entirely restarts at 1. A `seq` (or a [`MessageCursor`]/[`ArrivalCursor`]
-    /// built from one) is good for a live paging session and must not be
-    /// persisted across restarts or compared against a remembered value — a new
-    /// message can legitimately land below one.
+    /// The `messages.id` column (`INTEGER PRIMARY KEY`): persisted content,
+    /// so a `VACUUM` or table rewrite preserves the values themselves, and
+    /// the FTS index keys off them. Still `max(id) + 1` allocation, so
+    /// deleting the newest message hands its number to the next arrival and
+    /// clearing a chat entirely restarts at 1. A `seq` (or a
+    /// [`MessageCursor`]/[`ArrivalCursor`] built from one) is good for a live
+    /// paging session and must not be persisted across restarts or compared
+    /// against a remembered value — a new message can legitimately land below
+    /// one.
     ///
     /// It is *store* arrival, not wire arrival. Inbound rows are inserted as
     /// the socket delivers them, but an outgoing row is inserted when the host

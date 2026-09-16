@@ -17,7 +17,13 @@ diesel::table! {
 }
 
 diesel::table! {
-    messages (device_id, chat_jid, msg_id, sender_jid) {
+    messages (id) {
+        // Explicit, persisted alias of the rowid: the arrival counter the
+        // readers sort and page on, by a name a VACUUM or table rewrite
+        // preserves. Never written: the INSERT assigns it (`max(id) + 1`)
+        // and every UPDATE the writer does leaves it alone, which is exactly
+        // the "order the socket delivered this row" the message sort needs.
+        id -> BigInt,
         device_id -> Integer,
         chat_jid -> Text,
         msg_id -> Text,
@@ -27,15 +33,13 @@ diesel::table! {
         kind -> Text,
         text_content -> Nullable<Text>,
         proto -> Nullable<Binary>,
+        // Storage representation of `proto`: 0 = raw protobuf,
+        // 1 = zlib-compressed protobuf. See `proto_codec`.
+        proto_codec -> Integer,
         status -> Integer,
         starred -> Bool,
         edited_at_ms -> Nullable<BigInt>,
         revoked -> Bool,
-        // SQLite's implicit arrival counter, declared so the reader can sort
-        // and page on it. Never written: it is assigned by the INSERT and
-        // survives every UPDATE the writer does, which is exactly the
-        // "order the socket delivered this row" the message sort needs.
-        rowid -> BigInt,
     }
 }
 

@@ -20,6 +20,8 @@ search = []
 
 [dependencies]
 buffa = { workspace = true }
+# Selective proto compression (zlib-rs backend: pure Rust, same code on wasm).
+flate2 = { workspace = true }
 # `now` implies `std` and skips the local-timezone backends; only `Utc` is used.
 chrono = { workspace = true, features = ["now"] }
 diesel = { workspace = true }
@@ -56,7 +58,6 @@ getrandom = { workspace = true }
 getrandom_02 = { workspace = true }
 
 [dev-dependencies]
-flate2 = { workspace = true }
 portable-atomic = { workspace = true }
 tokio = { workspace = true, features = [
     "sync",

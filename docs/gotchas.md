@@ -1623,3 +1623,34 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   past PENDING already has a real server answer and must never be regressed.
 - **An invalidation is a claim that something changed.** A subscriber answers
   `StoreChange` by re-querying, so emitting one for a batch that wro
+- **Message storage is compacted on write and rehydrated on read, and the
+  `id` is the rowid by a durable name.** `messages.id INTEGER PRIMARY KEY`
+  carries the old rowid values across the rewrite, so arrival cursors, the
+  `(timestamp_ms, id)` page order and the FTS mapping (`content_rowid='id'`)
+  survive a `VACUUM` — there is a test that vacuums a file database and
+  asserts identical ids, pages and search hits. `idx_messages_by_id` is
+  partial (`WHERE from_me = TRUE`) because the only device-wide
+  `(device_id, msg_id)` lookup is the chatless server-ack path, which always
+  filters outbound; everything else is chat-scoped and rides the identity
+  UNIQUE autoindex. A reply's embedded `quotedMessage` is dropped when the
+  parent is materialized (same chat, stanza id, author — exact or PN/LID
+  counterpart, never a bare id match), kept inline otherwise, and rehydrated
+  in batch on read: one identity resolution per chat on the page plus one
+  parent lookup per chat, never one per reply, and the injected copy is never
+  written back. A `MessageContextInfo` holding only the `messageSecret` is
+  stripped because the secret is already captured into `whatsapp-rust`'s own
+  secret store before the event reaches the materializer — the stored copy is
+  never a secret source, and nothing here reads it back. Large protos
+  (≥ 8 KiB, ≥ 15% saving) are zlib-compressed behind `proto_codec`; edits
+  stay raw and reset the codec, revokes reset it with the tombstone.
+  Deliberately not done: `MsgSecretPolicy::Disabled` (a resolver reading
+  secrets out of these rows would find them stripped — dropping that store
+  needs its own equivalence proof for the unparented ~2.5%), plain-text proto
+  elision (`proto = NULL` already means tombstone, so elision needs a
+  representation this schema does not have; the codec slot is reserved),
+  any FTS architecture change, and flipping `auto_vacuum` (a safe manual
+  `VACUUM` is the point of the stable `id`; an automatic rewrite at startup
+  is a blocking operation, not a migration). Measured on a 10k-message
+  skewed fixture: protos 944 KiB → 546 KiB (−42%), the ack index 168 KiB →
+  12 KiB (−93%), chat/arrival pages single-digit ms, search ~27 ms/page in a
+  debug build.

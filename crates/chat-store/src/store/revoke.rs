@@ -45,6 +45,9 @@ pub(super) fn apply_revoke(
         dsl::revoked.eq(true),
         dsl::text_content.eq(None::<String>),
         dsl::proto.eq(None::<Vec<u8>>),
+        // No bytes left to decode; reset the representation so a `NULL`
+        // tombstone never claims a codec.
+        dsl::proto_codec.eq(crate::storage_proto::CODEC_RAW),
     ))
     .execute(conn)?;
     if updated == 0 {

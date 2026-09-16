@@ -15,6 +15,8 @@ pub(super) struct NewMessage<'a> {
     pub(super) kind: &'a str,
     pub(super) text: Option<&'a str>,
     pub(super) proto: Option<&'a [u8]>,
+    /// [`crate::storage_proto`] representation of `proto` (raw vs zlib).
+    pub(super) proto_codec: i32,
     pub(super) status: i32,
     pub(super) starred: bool,
     /// Live redeliveries refresh content in place (PDO recovery replaces an
@@ -68,6 +70,7 @@ pub(super) fn insert_message(
         dsl::kind.eq(new.kind),
         dsl::text_content.eq(new.text),
         dsl::proto.eq(new.proto),
+        dsl::proto_codec.eq(new.proto_codec),
         dsl::status.eq(new.status),
         dsl::starred.eq(new.starred),
     );
@@ -80,19 +83,26 @@ pub(super) fn insert_message(
         return Ok(StoredRow::Inserted);
     }
     if new.overwrite {
-        type ExistingMessage = (String, bool, Option<String>, Option<Vec<u8>>);
+        type ExistingMessage = (String, bool, Option<String>, Option<Vec<u8>>, i32);
         let existing: Option<ExistingMessage> = message_row(device_id, new.chat_jid, new.msg_id)
             .filter(dsl::sender_jid.eq(new.sender_jid))
-            .select((dsl::sender_jid, dsl::revoked, dsl::text_content, dsl::proto))
+            .select((
+                dsl::sender_jid,
+                dsl::revoked,
+                dsl::text_content,
+                dsl::proto,
+                dsl::proto_codec,
+            ))
             .first(conn)
             .optional()?;
         if existing
             .as_ref()
-            .is_some_and(|(sender, revoked, text, proto)| {
+            .is_some_and(|(sender, revoked, text, proto, codec)| {
                 sender == new.sender_jid
                     && !revoked
                     && text.as_deref() == new.text
                     && proto.as_deref() == new.proto
+                    && *codec == new.proto_codec
             })
         {
             return Ok(StoredRow::Skipped);
@@ -109,6 +119,7 @@ pub(super) fn insert_message(
             dsl::kind.eq(new.kind),
             dsl::text_content.eq(new.text),
             dsl::proto.eq(new.proto),
+            dsl::proto_codec.eq(new.proto_codec),
         ))
         .execute(conn)?;
         if refreshed > 0 {

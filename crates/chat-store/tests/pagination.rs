@@ -731,11 +731,11 @@ async fn arrival_feed_window_honors_sub_millisecond_bounds() {
     );
 }
 
-/// The fact that rules out a remembered `seq`: SQLite assigns the implicit
-/// rowid as `max(rowid) + 1`, so deleting the newest message hands its number
-/// to the next arrival. A consumer that stopped at a saved watermark would read
-/// that brand-new message as already seen and drop it — silently, and after an
-/// ordinary delete-for-me, not an exotic one.
+/// The fact that rules out a remembered `seq`: SQLite assigns the `id`
+/// (`INTEGER PRIMARY KEY`) as `max(id) + 1`, so deleting the newest message
+/// hands its number to the next arrival. A consumer that stopped at a saved
+/// watermark would read that brand-new message as already seen and drop it —
+/// silently, and after an ordinary delete-for-me, not an exotic one.
 #[tokio::test]
 async fn a_new_message_can_land_at_a_previously_used_seq() {
     let (_store, chat_store) = test_store().await;
