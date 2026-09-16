@@ -262,6 +262,46 @@ pub enum ClientRequest {
     Shutdown,
 }
 
+impl ClientRequest {
+    /// Whether this request mutates account or local state.
+    pub fn is_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::EditMessage { .. }
+                | Self::RevokeMessage { .. }
+                | Self::ForwardMessage { .. }
+                | Self::SendText { .. }
+                | Self::SendMedia { .. }
+                | Self::SendAudio { .. }
+                | Self::SendReaction { .. }
+                | Self::SendPoll { .. }
+                | Self::VotePoll { .. }
+                | Self::SendLocation { .. }
+                | Self::SendStatus { .. }
+                | Self::MarkRead { .. }
+                | Self::MarkUnread { .. }
+                | Self::PinChat { .. }
+                | Self::MuteChat { .. }
+                | Self::ArchiveChat { .. }
+                | Self::RetryMedia { .. }
+                | Self::CreateGroup { .. }
+                | Self::SetGroupTopic { .. }
+                | Self::SetGroupDescription { .. }
+                | Self::ManageGroupParticipant { .. }
+                | Self::JoinGroup { .. }
+                | Self::LeaveGroup { .. }
+                | Self::SetProfileAbout { .. }
+                | Self::SetProfileName { .. }
+                | Self::SetProfilePicture { .. }
+                | Self::RemoveProfilePicture
+                | Self::SetPresence { .. }
+                | Self::ClearMediaCache
+                | Self::ForgetSession
+                | Self::Shutdown
+        )
+    }
+}
+
 fn default_limit() -> usize {
     50
 }

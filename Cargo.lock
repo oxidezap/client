@@ -6416,6 +6416,7 @@ dependencies = [
  "oxidezap-logging",
  "oxidezap-plugin-host",
  "oxidezap-session",
+ "oxidezap-wire",
  "portable-atomic",
  "rustix 1.1.4",
  "serde_json",

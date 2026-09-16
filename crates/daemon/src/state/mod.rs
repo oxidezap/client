@@ -130,7 +130,7 @@ impl StateHub {
         })
     }
 
-    fn snapshot(&self) -> StateSnapshot {
+    pub(crate) fn snapshot(&self) -> StateSnapshot {
         self.state.snapshot()
     }
 

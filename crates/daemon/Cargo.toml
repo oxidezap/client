@@ -28,6 +28,7 @@ oxidezap-ipc = { workspace = true, features = ["legacy-protocol"] }
 oxidezap-logging = { workspace = true }
 oxidezap-plugin-host = { workspace = true }
 oxidezap-session = { workspace = true }
+oxidezap-wire = { workspace = true }
 portable-atomic = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 # What both targets have. The rest is per target below: `net` is `mio`, which

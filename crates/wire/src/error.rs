@@ -54,4 +54,16 @@ impl ApiError {
     pub fn timeout(message: impl Into<String>) -> Self {
         Self::new("timeout", message)
     }
+
+    pub fn permission_denied(message: impl Into<String>) -> Self {
+        Self::new("permission_denied", message)
+    }
+
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::new("unsupported", message)
+    }
+
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::new("invalid_request", message)
+    }
 }

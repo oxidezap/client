@@ -53,7 +53,7 @@ use crate::session_bridge::{Action, Commands};
 use crate::state::StateHub;
 
 use handshake::{handshake, read_frame};
-use requests::{dispatch, handle_request};
+use requests::{dispatch, handle_request, handle_wire_request};
 
 /// How long a client has to send its hello.
 ///
@@ -200,8 +200,18 @@ where
     // to whoever asked, and the ids are client-chosen.
     let (outbox, mut inbox) = tokio::sync::mpsc::channel::<String>(OUTBOX_CAPACITY);
 
-    let hello = hub.hello_frame().context("serializing the snapshot")?;
-    write_line(&mut writer, &hello).await?;
+    if attached.is_wire {
+        let resp = oxidezap_wire::envelope::ResponseEnvelope {
+            id: attached.wire_hello_id,
+            result: oxidezap_wire::envelope::ResponseResult::Ok {
+                payload: Box::new(oxidezap_wire::response::DaemonResponse::Ack),
+            },
+        };
+        write_line(&mut writer, &serde_json::to_string(&resp)?).await?;
+    } else {
+        let hello = hub.hello_frame().context("serializing the snapshot")?;
+        write_line(&mut writer, &hello).await?;
+    }
 
     if attached.session_events {
         // Nothing in the store has changed, so the session's invalidation
@@ -324,6 +334,45 @@ where
             // `buf` across losing this race. See its documentation.
             frame = read_frame(&mut reader, &mut buf) => match frame? {
                 Some(oxidezap_ipc::FrameRead::Line(line)) => {
+                    if attached.is_wire {
+                        let env: oxidezap_wire::envelope::RequestEnvelope = match serde_json::from_str(&line) {
+                            Ok(env) => env,
+                            Err(e) => {
+                                let err_resp = oxidezap_wire::envelope::ResponseEnvelope {
+                                    id: None,
+                                    result: oxidezap_wire::envelope::ResponseResult::Error {
+                                        error: oxidezap_wire::error::ApiError::invalid_request(e.to_string()),
+                                    },
+                                };
+                                write_line(&mut writer, &serde_json::to_string(&err_resp)?).await?;
+                                continue;
+                            }
+                        };
+
+                        if attached.read_only && env.request.is_mutation() {
+                            let err_resp = oxidezap_wire::envelope::ResponseEnvelope {
+                                id: Some(env.id),
+                                result: oxidezap_wire::envelope::ResponseResult::Error {
+                                    error: oxidezap_wire::error::ApiError::permission_denied(
+                                        "read-only connection cannot mutate state",
+                                    ),
+                                },
+                            };
+                            write_line(&mut writer, &serde_json::to_string(&err_resp)?).await?;
+                            continue;
+                        }
+
+                        let answer = handle_wire_request(env, &hub, &plugins, &commands, &outbox).await;
+                        if let Some(frame) = answer.frame {
+                            write_line(&mut writer, &frame).await?;
+                        }
+                        if answer.shutdown {
+                            crate::shutdown::request("ipc client");
+                            return Ok(());
+                        }
+                        continue;
+                    }
+
                     // Parsed once, here: gating update delivery and answering
                     // are two decisions about one frame, and reading it twice
                     // is how they drift apart.

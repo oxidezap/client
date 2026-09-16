@@ -6,8 +6,8 @@
 
 // A background service, not a console program: on Windows release builds no
 // terminal comes with it, whether it was started from the GUI or by hand.
-// Debug keeps its console so `cargo run --bin oxidezapd` still shows logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+#![allow(clippy::print_stdout)]
 
 use oxidezap_daemon::{listener, media, plugins, server, session_bridge, shutdown, state, tray};
 
@@ -21,6 +21,13 @@ use crate::state::StateHub;
 mod macos_main;
 
 fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "Usage: oxidezapd [OPTIONS]\n\nOptions:\n      --headless  Run headless without system tray integration\n  -h, --help      Print help"
+        );
+        return Ok(());
+    }
+
     // The level the last person to change it chose, unless `RUST_LOG` says
     // otherwise for this run — and changeable while the daemon runs, which is
     // the point: nearly everything worth reading about a session is written
@@ -82,12 +89,19 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     // headless session) is a reason to run without an icon, not to refuse to
     // start. On macOS the icon lives on the main thread instead (see
     // `macos_main`), so there is nothing to spawn here.
+    let headless = std::env::args().any(|a| a == "--headless")
+        || std::env::var_os("OXIDEZAPD_HEADLESS").is_some();
     #[cfg(not(target_os = "macos"))]
-    let tray = match tray::spawn(Arc::clone(&hub)).await {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            log::warn!("no tray presence: {e}");
-            None
+    let tray = if headless {
+        log::info!("running in headless mode: system tray disabled");
+        None
+    } else {
+        match tray::spawn(Arc::clone(&hub)).await {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::warn!("no tray presence: {e}");
+                None
+            }
         }
     };
     #[cfg(target_os = "macos")]

@@ -616,3 +616,135 @@ fn no_session(detail: impl Into<String>) -> ProtocolError {
         detail: detail.into(),
     }
 }
+
+fn wire_ok(id: u64, payload: oxidezap_wire::response::DaemonResponse) -> Answer {
+    let env = oxidezap_wire::envelope::ResponseEnvelope {
+        id: Some(id),
+        result: oxidezap_wire::envelope::ResponseResult::Ok {
+            payload: Box::new(payload),
+        },
+    };
+    Answer::frame(serde_json::to_string(&env).ok())
+}
+
+fn wire_err(id: u64, error: oxidezap_wire::error::ApiError) -> Answer {
+    let env = oxidezap_wire::envelope::ResponseEnvelope {
+        id: Some(id),
+        result: oxidezap_wire::envelope::ResponseResult::Error { error },
+    };
+    Answer::frame(serde_json::to_string(&env).ok())
+}
+
+pub(super) async fn handle_wire_request(
+    oxidezap_wire::envelope::RequestEnvelope { id, request }: oxidezap_wire::envelope::RequestEnvelope,
+    hub: &StateHub,
+    _plugins: &Arc<oxidezap_plugin_host::Plugins>,
+    _commands: &Commands,
+    _outbox: &Outbox,
+) -> Answer {
+    use oxidezap_wire::dto::{ConnectionStatusDto, DoctorDto, StorageDto};
+    use oxidezap_wire::request::ClientRequest as WireRequest;
+    use oxidezap_wire::response::DaemonResponse as WireResponse;
+
+    match request {
+        WireRequest::Hello { .. } => wire_ok(id, WireResponse::Ack),
+        WireRequest::GetStatus => {
+            let snap = hub.snapshot();
+            let state_str = match &snap.connection {
+                oxidezap_ipc::ConnectionState::Connected => "connected",
+                oxidezap_ipc::ConnectionState::Connecting => "connecting",
+                oxidezap_ipc::ConnectionState::Syncing => "syncing",
+                oxidezap_ipc::ConnectionState::Disconnected { .. } => "disconnected",
+                oxidezap_ipc::ConnectionState::Pairing { .. } => "pairing",
+                oxidezap_ipc::ConnectionState::LoggedOut { .. } => "logged_out",
+            }
+            .to_string();
+            let (phone, name, jid, lid) = match &snap.account {
+                Some(acc) => (
+                    acc.jid
+                        .as_deref()
+                        .and_then(|j| j.split('@').next().map(str::to_string)),
+                    acc.name.clone(),
+                    acc.jid.clone(),
+                    acc.lid.clone(),
+                ),
+                None => (None, None, None, None),
+            };
+            let (qr_ascii, pair_code, pair_expires_at_ms) = match &snap.connection {
+                oxidezap_ipc::ConnectionState::Pairing { qr, pair_code } => {
+                    let qr_ascii = qr.as_ref().map(|q| q.code.clone());
+                    let p_code = pair_code.as_ref().map(|p| p.code.clone());
+                    let expires = pair_code
+                        .as_ref()
+                        .map(|p| p.expires_at_ms)
+                        .or_else(|| qr.as_ref().map(|q| q.expires_at_ms));
+                    (qr_ascii, p_code, expires)
+                }
+                _ => (None, None, None),
+            };
+            let status = ConnectionStatusDto {
+                state: state_str,
+                phone,
+                name,
+                jid,
+                lid,
+                qr_ascii,
+                pair_code,
+                pair_expires_at_ms,
+            };
+            wire_ok(id, WireResponse::Status(status))
+        }
+        WireRequest::DoctorCheck => {
+            let endpoint_path = oxidezap_ipc::endpoint_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let db_bytes = database_bytes();
+            let (media_bytes, _) = crate::media::cache_usage();
+            let media_dir_str = oxidezap_ipc::media_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let snap = hub.snapshot();
+            let doctor = DoctorDto {
+                daemon_running: true,
+                socket_path: endpoint_path,
+                connection_state: format!("{:?}", snap.connection),
+                database_ok: true,
+                database_bytes: db_bytes,
+                media_cache_dir: media_dir_str,
+                media_cache_bytes: media_bytes,
+            };
+            wire_ok(id, WireResponse::Doctor(doctor))
+        }
+        WireRequest::GetStorageUsage => {
+            let (media_bytes, media_files) = crate::media::cache_usage();
+            let db_bytes = database_bytes();
+            let storage = StorageDto {
+                database_bytes: db_bytes,
+                media_bytes,
+                media_files,
+            };
+            wire_ok(id, WireResponse::Storage(storage))
+        }
+        WireRequest::ClearMediaCache => {
+            let _ = oxidezap_session::unblock(|| {
+                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| e.to_string())
+            })
+            .await;
+            wire_ok(id, WireResponse::Ack)
+        }
+        WireRequest::Shutdown => Answer {
+            frame: serde_json::to_string(&oxidezap_wire::envelope::ResponseEnvelope {
+                id: Some(id),
+                result: oxidezap_wire::envelope::ResponseResult::Ok {
+                    payload: Box::new(WireResponse::Ack),
+                },
+            })
+            .ok(),
+            shutdown: true,
+        },
+        _ => wire_err(
+            id,
+            oxidezap_wire::error::ApiError::unsupported("action not yet implemented"),
+        ),
+    }
+}

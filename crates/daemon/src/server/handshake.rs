@@ -126,13 +126,31 @@ pub(super) async fn handshake<S: AsyncRead + AsyncWrite>(
 }
 
 /// What an accepted hello asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Attached {
     /// Whether this client wants the session's own events as well as
     /// summaries. See [`ClientRequest::Hello`].
     pub(super) session_events: bool,
     /// Whether this client owns a window. See [`ClientRequest::Hello`].
     pub(super) has_window: bool,
+    /// Whether this client requested read-only safety mode.
+    pub(super) read_only: bool,
+    /// Whether this client speaks the wire protocol.
+    pub(super) is_wire: bool,
+    /// Wire hello request ID.
+    pub(super) wire_hello_id: Option<u64>,
+}
+
+impl Attached {
+    pub(super) fn legacy(session_events: bool, has_window: bool) -> Self {
+        Self {
+            session_events,
+            has_window,
+            read_only: false,
+            is_wire: false,
+            wire_hello_id: None,
+        }
+    }
 }
 
 /// Validate the client's opening frame.
@@ -140,6 +158,51 @@ pub(super) struct Attached {
 /// `Err` carries the rejection to send; `Ok` carries what the client asked to
 /// be served.
 pub(super) fn check_hello(line: &str) -> Result<Attached, Option<String>> {
+    // 1. Try parsing as a wire protocol RequestEnvelope
+    if let Ok(env) = serde_json::from_str::<oxidezap_wire::envelope::RequestEnvelope>(line) {
+        return match env.request {
+            oxidezap_wire::request::ClientRequest::Hello {
+                protocol,
+                client_name: _,
+                read_only,
+                session_events,
+            } => {
+                if protocol == oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION {
+                    Ok(Attached {
+                        session_events,
+                        has_window: false,
+                        read_only,
+                        is_wire: true,
+                        wire_hello_id: Some(env.id),
+                    })
+                } else {
+                    let err = oxidezap_wire::envelope::ResponseEnvelope {
+                        id: Some(env.id),
+                        result: oxidezap_wire::envelope::ResponseResult::Error {
+                            error: oxidezap_wire::error::ApiError::invalid_request(format!(
+                                "protocol version mismatch: client {protocol}, daemon {}",
+                                oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION
+                            )),
+                        },
+                    };
+                    Err(serde_json::to_string(&err).ok())
+                }
+            }
+            _ => {
+                let err = oxidezap_wire::envelope::ResponseEnvelope {
+                    id: Some(env.id),
+                    result: oxidezap_wire::envelope::ResponseResult::Error {
+                        error: oxidezap_wire::error::ApiError::invalid_request(
+                            "first frame must be a hello action",
+                        ),
+                    },
+                };
+                Err(serde_json::to_string(&err).ok())
+            }
+        };
+    }
+
+    // 2. Fall back to legacy Request
     let Request { id, request } = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => return Err(always(None, malformed(&e.to_string()))),
@@ -150,10 +213,7 @@ pub(super) fn check_hello(line: &str) -> Result<Attached, Option<String>> {
             protocol,
             session_events,
             has_window,
-        } if protocol == PROTOCOL_VERSION => Ok(Attached {
-            session_events,
-            has_window,
-        }),
+        } if protocol == PROTOCOL_VERSION => Ok(Attached::legacy(session_events, has_window)),
         ClientRequest::Hello { protocol, .. } => Err(always(
             id,
             error_frame(

@@ -44,10 +44,7 @@ fn hello(protocol: u32, session_events: bool) -> String {
 fn a_matching_hello_is_accepted() {
     assert_eq!(
         check_hello(&hello(PROTOCOL_VERSION, false)),
-        Ok(Attached {
-            session_events: false,
-            has_window: true
-        })
+        Ok(Attached::legacy(false, true))
     );
 }
 
@@ -58,23 +55,11 @@ fn a_matching_hello_is_accepted() {
 #[test]
 fn a_client_is_a_window_unless_it_says_otherwise() {
     let silent = format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION}}}"#);
-    assert_eq!(
-        check_hello(&silent),
-        Ok(Attached {
-            session_events: false,
-            has_window: true
-        })
-    );
+    assert_eq!(check_hello(&silent), Ok(Attached::legacy(false, true)));
 
     let watcher =
         format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION},"has_window":false}}"#);
-    assert_eq!(
-        check_hello(&watcher),
-        Ok(Attached {
-            session_events: false,
-            has_window: false
-        })
-    );
+    assert_eq!(check_hello(&watcher), Ok(Attached::legacy(false, false)));
 }
 
 /// The session stream is opt-in: a tray that never asked must not be sent
@@ -83,21 +68,12 @@ fn a_client_is_a_window_unless_it_says_otherwise() {
 fn the_session_stream_is_only_served_when_asked_for() {
     assert_eq!(
         check_hello(&hello(PROTOCOL_VERSION, true)),
-        Ok(Attached {
-            session_events: true,
-            has_window: true
-        })
+        Ok(Attached::legacy(true, true))
     );
     // An older client that does not know the field at all still connects,
     // and gets summaries.
     let line = format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION}}}"#);
-    assert_eq!(
-        check_hello(&line),
-        Ok(Attached {
-            session_events: false,
-            has_window: true
-        })
-    );
+    assert_eq!(check_hello(&line), Ok(Attached::legacy(false, true)));
 }
 
 /// A client speaking another version must be turned away before it is
@@ -1061,4 +1037,71 @@ fn a_loose_but_owned_dir_is_tightened_rather_than_refused() {
     assert_eq!(mode, 0o700, "left readable by other users");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn wire_hello_and_diagnostics_flow() {
+    use oxidezap_wire::envelope::{RequestEnvelope, ResponseEnvelope, ResponseResult};
+    use oxidezap_wire::request::ClientRequest as WireRequest;
+    use oxidezap_wire::response::DaemonResponse as WireResponse;
+
+    let wire_hello = serde_json::to_string(&RequestEnvelope {
+        id: 1,
+        request: WireRequest::Hello {
+            protocol: oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION,
+            client_name: "test-client".into(),
+            read_only: true,
+            session_events: false,
+        },
+    })
+    .unwrap();
+
+    let attached = check_hello(&wire_hello).expect("wire hello must be accepted");
+    assert!(attached.is_wire);
+    assert!(attached.read_only);
+    assert_eq!(attached.wire_hello_id, Some(1));
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let (commands, _) = bridge(CommandOutcome::Accepted);
+    let outbox = outbox();
+
+    // Doctor check
+    let doctor_req = RequestEnvelope {
+        id: 2,
+        request: WireRequest::DoctorCheck,
+    };
+    let ans = handle_wire_request(doctor_req, &hub, &plugins, &commands, &outbox).await;
+    let resp: ResponseEnvelope = serde_json::from_str(&ans.frame.unwrap()).unwrap();
+    assert_eq!(resp.id, Some(2));
+    assert!(
+        matches!(resp.result, ResponseResult::Ok { payload } if matches!(*payload, WireResponse::Doctor(_)))
+    );
+
+    // Storage usage
+    let storage_req = RequestEnvelope {
+        id: 3,
+        request: WireRequest::GetStorageUsage,
+    };
+    let ans = handle_wire_request(storage_req, &hub, &plugins, &commands, &outbox).await;
+    let resp: ResponseEnvelope = serde_json::from_str(&ans.frame.unwrap()).unwrap();
+    assert_eq!(resp.id, Some(3));
+    assert!(
+        matches!(resp.result, ResponseResult::Ok { payload } if matches!(*payload, WireResponse::Storage(_)))
+    );
+
+    // Verify is_mutation flag
+    assert!(
+        WireRequest::SendText {
+            to: "123".into(),
+            message: "hi".into(),
+            reply_to: None,
+            mentions: vec![],
+            enqueue_only: false,
+        }
+        .is_mutation()
+    );
+    assert!(!WireRequest::DoctorCheck.is_mutation());
+    assert!(!WireRequest::GetStatus.is_mutation());
+    assert!(!WireRequest::GetStorageUsage.is_mutation());
 }
