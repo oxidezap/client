@@ -239,6 +239,10 @@ fn apply_writer_msg(
             timestamp_ms,
         } => {
             let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
+            // Same compaction as inbound (a reply sent from here embeds the
+            // parent the same way); undecodable input is kept as-is.
+            let (proto_bytes, proto_codec) =
+                crate::storage_proto::compact_encoded_proto(conn, device_id, &chat_str, proto)?;
             let stored = insert_message(
                 conn,
                 device_id,
@@ -250,7 +254,8 @@ fn apply_writer_msg(
                     timestamp_ms: *timestamp_ms,
                     kind,
                     text: text.as_deref(),
-                    proto: Some(proto),
+                    proto: Some(&proto_bytes),
+                    proto_codec,
                     status: wa::web_message_info::Status::PENDING as i32,
                     starred: false,
                     overwrite: true,

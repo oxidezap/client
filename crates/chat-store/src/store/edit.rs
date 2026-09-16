@@ -42,6 +42,10 @@ pub(super) fn apply_edit(
         dsl::text_content.eq(new_text),
         dsl::kind.eq(new_kind),
         dsl::proto.eq(Some(new_proto)),
+        // Edit protos are stored raw (see the module docs in
+        // `storage_proto`): a row compressed earlier must come back to raw
+        // here, or the reader would decompress plain protobuf.
+        dsl::proto_codec.eq(crate::storage_proto::CODEC_RAW),
         dsl::edited_at_ms.eq(Some(ts_ms)),
     ))
     .execute(conn)?;

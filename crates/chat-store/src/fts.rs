@@ -5,11 +5,13 @@
 //! idempotently at open instead of in a migration, so builds without the
 //! feature leave no FTS objects behind.
 //!
-//! Caveat: the index maps by implicit rowid; after a manual `VACUUM`, run
-//! `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`. The same goes
-//! for any migration that rewrites `messages` rather than altering it: a
-//! `DROP TABLE` fires no trigger and renumbers rowids, so the index is left
-//! describing rows that no longer exist under those numbers.
+//! The index maps by the stable `messages.id` (`content_rowid='id'`), so a
+//! `VACUUM` is safe: ids are persisted content and survive the rewrite with
+//! the mapping intact. The one case that still needs a rebuild is a migration
+//! that rewrites `messages` with `DROP TABLE` rather than altering it — that
+//! fires no trigger and takes the FTS triggers with the table, so the index
+//! is left describing rows no trigger maintains. Such a migration drops the
+//! FTS objects itself and `ensure_fts` rebuilds at the next open.
 
 use diesel::prelude::*;
 use wacore_binary::Jid;
@@ -36,10 +38,11 @@ fn ensure_fts_inner(conn: &mut SqliteConnection) -> QueryResult<()> {
     // Both halves, because either can be missing on its own. A migration that
     // rewrites `messages` the way this crate's own migrations do — `_new`,
     // `INSERT SELECT`, `DROP`, `RENAME` — takes the triggers with it (a
-    // `DROP TABLE` fires none of them) and renumbers rowids, so the table
-    // surviving is no evidence the index still describes it. Whoever writes
-    // such a migration owes the index a rebuild; this is what notices when
-    // they did not.
+    // `DROP TABLE` fires none of them), so the table surviving is no evidence
+    // the index still describes it. (Ids survive the rewrite — the mapping
+    // stays valid — but with no triggers nothing maintains it.) Whoever
+    // writes such a migration owes the index a rebuild; this is what notices
+    // when they did not.
     let indexed: i32 = diesel::sql_query(
         "SELECT COUNT(*) AS n FROM sqlite_master \
          WHERE (type = 'table' AND name = 'messages_fts') \
@@ -57,18 +60,18 @@ fn ensure_fts_inner(conn: &mut SqliteConnection) -> QueryResult<()> {
     // corrupts rank queries.
     for statement in [
         "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-             text_content, content='messages', content_rowid='rowid')",
+             text_content, content='messages', content_rowid='id')",
         "CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
-             INSERT INTO messages_fts(rowid, text_content) VALUES (new.rowid, new.text_content);
+             INSERT INTO messages_fts(rowid, text_content) VALUES (new.id, new.text_content);
              END",
         "CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
              INSERT INTO messages_fts(messages_fts, rowid, text_content)
-             VALUES ('delete', old.rowid, old.text_content);
+             VALUES ('delete', old.id, old.text_content);
              END",
         "CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF text_content ON messages BEGIN
              INSERT INTO messages_fts(messages_fts, rowid, text_content)
-             VALUES ('delete', old.rowid, old.text_content);
-             INSERT INTO messages_fts(rowid, text_content) VALUES (new.rowid, new.text_content);
+             VALUES ('delete', old.id, old.text_content);
+             INSERT INTO messages_fts(rowid, text_content) VALUES (new.id, new.text_content);
              END",
     ] {
         diesel::sql_query(statement).execute(conn)?;
@@ -119,18 +122,18 @@ fn build_match_query(input: &str) -> Option<String> {
 /// page the caller asked for. A one- or two-character prefix matches a large
 /// fraction of a real store, which is how a single keystroke turned into a
 /// multi-second query. Below this length the search orders by arrival instead:
-/// FTS5 walks its index in rowid order and stops at `LIMIT`, and "the newest
+/// FTS5 walks its index in id order and stops at `LIMIT`, and "the newest
 /// things that start with this" is a defensible answer for a term that short.
 const MIN_RANKED_TERM_LEN: usize = 3;
 
-/// Max rowids per hydration statement, under SQLite's default 999
+/// Max ids per hydration statement, under SQLite's default 999
 /// host-parameter limit.
 const ID_PARAM_CHUNK: usize = 900;
 
 #[derive(QueryableByName)]
 struct FtsHit {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
-    rowid: i64,
+    id: i64,
 }
 
 impl ChatStore {
@@ -179,7 +182,7 @@ impl ChatStore {
             return Ok(Vec::new());
         }
         let device_id = self.device_id();
-        let rows: Vec<MessageRow> =
+        let messages: Vec<StoredMessage> =
             self.db()
                 .read(move |conn| {
                     let keys = match &chat {
@@ -197,12 +200,12 @@ impl ChatStore {
                     // trips). `limit` is the caller's, so the id list is chunked
                     // rather than trusted to stay under SQLite's host-parameter
                     // ceiling.
-                    let ids: Vec<i64> = hits.iter().map(|hit| hit.rowid).collect();
+                    let ids: Vec<i64> = hits.iter().map(|hit| hit.id).collect();
                     let mut rows: Vec<MessageRow> = Vec::with_capacity(ids.len());
                     for chunk in ids.chunks(ID_PARAM_CHUNK) {
                         rows.extend(
                             schema::messages::dsl::messages
-                                .filter(schema::messages::dsl::rowid.eq_any(chunk))
+                                .filter(schema::messages::dsl::id.eq_any(chunk))
                                 .load::<MessageRow>(conn)
                                 .map_err(db_err)?,
                         );
@@ -212,16 +215,16 @@ impl ChatStore {
                     // scan) put them in.
                     let rank_of: std::collections::HashMap<i64, usize> =
                         ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
-                    rows.sort_by_key(|row| rank_of.get(&row.rowid).copied().unwrap_or(usize::MAX));
-                    Ok(rows)
+                    rows.sort_by_key(|row| rank_of.get(&row.id).copied().unwrap_or(usize::MAX));
+                    crate::queries::finalize_messages(conn, device_id, rows)
                 })
                 .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(messages)
     }
 }
 
-/// Matching rowids, best first. `keys` scopes the search to one chat's storage
-/// identities; empty searches every chat.
+/// Matching message ids, best first. `keys` scopes the search to one chat's
+/// storage identities; empty searches every chat.
 fn fts_hits(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -236,11 +239,15 @@ fn fts_hits(
     // only unambiguous today by accident — `messages` has no such column, and
     // an unqualified reference would silently start resolving to it if one were
     // ever added.
+    //
+    // The FTS side is still `rowid` (an external-content table's own rowid
+    // keeps that name; `content_rowid='id'` only says which content column it
+    // maps to), so the join crosses `m.id = f.rowid`.
     let order = if ranked { "f.rank" } else { "f.rowid DESC" };
     let Some(first_key) = keys.first() else {
         return diesel::sql_query(format!(
-            "SELECT f.rowid AS rowid
-             FROM messages_fts f JOIN messages m ON m.rowid = f.rowid
+            "SELECT f.rowid AS id
+             FROM messages_fts f JOIN messages m ON m.id = f.rowid
              WHERE messages_fts MATCH ? AND m.device_id = ?
              ORDER BY {order} LIMIT ?"
         ))
@@ -255,8 +262,8 @@ fn fts_hits(
     // instead of a variadic one; `IN (x, x)` is `IN (x)`.
     let second_key = keys.get(1).unwrap_or(first_key);
     diesel::sql_query(format!(
-        "SELECT f.rowid AS rowid
-         FROM messages_fts f JOIN messages m ON m.rowid = f.rowid
+        "SELECT f.rowid AS id
+         FROM messages_fts f JOIN messages m ON m.id = f.rowid
          WHERE messages_fts MATCH ? AND m.device_id = ? AND m.chat_jid IN (?, ?)
          ORDER BY {order} LIMIT ?"
     ))
@@ -313,9 +320,10 @@ mod tests {
 
     /// A migration that rewrites `messages` — the `_new`/`INSERT SELECT`/
     /// `DROP`/`RENAME` shape this crate's own migrations use — takes the
-    /// triggers with it and renumbers rowids. The table surviving used to be
-    /// the whole test, so the next open skipped the rebuild and the index
-    /// went on describing rows that were no longer there.
+    /// triggers with it (the stable ids survive, but nothing maintains the
+    /// index). The table surviving used to be the whole test, so the next
+    /// open skipped the rebuild and the index went on describing rows that
+    /// were no longer there.
     #[test]
     fn an_index_whose_triggers_went_out_from_under_it_is_rebuilt() {
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");

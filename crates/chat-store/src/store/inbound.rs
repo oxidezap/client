@@ -46,6 +46,13 @@ pub(super) fn apply_inbound(
 
     match classify(&inbound.message) {
         MessageOp::Store { kind, text } => {
+            // Compacted storage copy (quote snapshot dropped when the parent
+            // is local, secret-only envelope stripped, large protos
+            // compressed); the live message above is untouched.
+            let stored =
+                crate::storage_proto::storage_bytes_for(conn, device_id, &chat, &inbound.message)?;
+            let proto_bytes = stored.bytes;
+            let proto_codec = stored.codec;
             let inserted = insert_message(
                 conn,
                 device_id,
@@ -57,7 +64,8 @@ pub(super) fn apply_inbound(
                     timestamp_ms: ts_ms,
                     kind,
                     text: text.as_deref(),
-                    proto: Some(&waproto::codec::message_to_vec(&inbound.message)),
+                    proto: Some(&proto_bytes),
+                    proto_codec,
                     status: if info.source.is_from_me {
                         wa::web_message_info::Status::SERVER_ACK as i32
                     } else {

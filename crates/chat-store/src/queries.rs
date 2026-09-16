@@ -117,6 +117,8 @@ impl From<ChatRow> for ChatEntry {
 
 #[derive(Clone, Queryable)]
 pub(crate) struct MessageRow {
+    // Positioned first to match the table's column order.
+    pub(crate) id: i64,
     #[allow(dead_code)]
     device_id: i32,
     chat_jid: String,
@@ -127,17 +129,17 @@ pub(crate) struct MessageRow {
     kind: String,
     text_content: Option<String>,
     proto: Option<Vec<u8>>,
+    pub(crate) proto_codec: i32,
     status: i32,
     starred: bool,
     edited_at_ms: Option<i64>,
     revoked: bool,
-    pub(crate) rowid: i64,
 }
 
 impl From<MessageRow> for StoredMessage {
     fn from(row: MessageRow) -> Self {
         let message = row.proto.as_deref().and_then(|bytes| {
-            match waproto::codec::message_decode(bytes) {
+            match crate::storage_proto::decode_storage_proto(bytes, row.proto_codec) {
                 Ok(msg) => Some(Box::new(msg)),
                 Err(e) => {
                     // Denormalized columns still render; only the proto is lost.
@@ -162,14 +164,16 @@ impl From<MessageRow> for StoredMessage {
             starred: row.starred,
             edited_at: row.edited_at_ms.and_then(ms_to_utc),
             revoked: row.revoked,
-            seq: row.rowid,
+            seq: row.id,
         }
     }
 }
 
 /// The session-wide arrival page, as a query. Split out so a test can pin its
-/// plan: this read is only cheap while SQLite answers `ORDER BY rowid DESC` by
-/// walking the table's own B-tree backwards, and nothing in the SQL says so.
+/// plan: this read is only cheap while SQLite answers `ORDER BY id DESC` by
+/// walking the table's own B-tree backwards, and nothing in the SQL says so
+/// (`id INTEGER PRIMARY KEY` *is* the rowid, so the table's B-tree is keyed
+/// by arrival).
 fn arrival_page_query(
     device_id: i32,
     after: Option<ArrivalCursor>,
@@ -179,17 +183,21 @@ fn arrival_page_query(
 ) -> schema::messages::BoxedQuery<'static, diesel::sqlite::Sqlite> {
     use diesel::sql_types::{Bool, Integer};
     use schema::messages::dsl;
-    // The unary `+` keeps `device_id` off the index the planner would otherwise
-    // reach for. `idx_messages_by_id` leads with `device_id`, so SQLite scores
-    // it as the better entry point and then pays a temp B-tree to put the whole
-    // device's messages back in rowid order — a full sort of the table on every
-    // page, to return one page. Denied that index, it reads the table backwards
-    // and stops at LIMIT, which is the plan this feed is designed around.
+    // The unary `+` keeps `device_id` off the indexes the planner would
+    // otherwise reach for. Both the identity UNIQUE autoindex and
+    // `idx_messages_chat_time` lead with `device_id`, so SQLite scores one as
+    // the better entry point and then pays a temp B-tree to put the whole
+    // device's messages back in arrival order — a full sort of the table on
+    // every page, to return one page. (The partial `idx_messages_by_id` needs
+    // a `from_me` predicate this query has no use for, so it is not a
+    // candidate here either way.) Denied every index, the planner reads the
+    // table backwards and stops at LIMIT, which is the plan this feed is
+    // designed around.
     let mut query = dsl::messages
         .filter(diesel::dsl::sql::<Bool>("+device_id = ").bind::<Integer, _>(device_id))
         .into_boxed();
     if let Some(cursor) = after {
-        query = query.filter(dsl::rowid.lt(cursor.seq));
+        query = query.filter(dsl::id.lt(cursor.seq));
     }
     // Wall-clock bounds are predicates over the arrival scan, never the
     // ordering key: see `messages_by_arrival_in_range`.
@@ -199,7 +207,7 @@ fn arrival_page_query(
     if let Some(until_ms) = until_ms {
         query = query.filter(dsl::timestamp_ms.lt(until_ms));
     }
-    query.order(dsl::rowid.desc()).limit(limit)
+    query.order(dsl::id.desc()).limit(limit)
 }
 
 impl ChatStore {
@@ -414,17 +422,18 @@ impl ChatStore {
         let limit = limit.max(0);
         let device_id = self.device_id();
         let chat = chat.to_string();
-        let (rows, unread): (Vec<MessageRow>, i64) = self
+        let (messages, unread): (Vec<StoredMessage>, i64) = self
             .db()
             .read(move |conn| {
                 use schema::chats::dsl as chats;
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 let rows: Vec<MessageRow> = page_query(device_id, &keys, before.as_ref())
-                    .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+                    .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
                     .limit(limit)
                     .load(conn)
                     .map_err(db_err)?;
+                let messages = finalize_messages(conn, device_id, rows)?;
 
                 let counts: Vec<i32> = chats::chats
                     .filter(
@@ -439,7 +448,7 @@ impl ChatStore {
                 // tail of rows: it owes no receipts.
                 let unread: i64 = counts.iter().map(|c| (*c).max(0) as i64).sum();
                 let Some(cursor) = before else {
-                    return Ok((rows, unread));
+                    return Ok((messages, unread));
                 };
                 let ahead: i64 = dsl::messages
                     .filter(
@@ -452,16 +461,16 @@ impl ChatStore {
                                     .gt(cursor.timestamp_ms)
                                     .or(dsl::timestamp_ms
                                         .eq(cursor.timestamp_ms)
-                                        .and(dsl::rowid.ge(cursor.seq))),
+                                        .and(dsl::id.ge(cursor.seq))),
                             ),
                     )
                     .count()
                     .get_result(conn)
                     .map_err(db_err)?;
-                Ok((rows, (unread - ahead).max(0)))
+                Ok((messages, (unread - ahead).max(0)))
             })
             .await?;
-        Ok((rows.into_iter().map(Into::into).collect(), unread))
+        Ok((messages, unread))
     }
 
     /// One page of a chat's messages, newest first. Pass the cursor of the
@@ -478,15 +487,16 @@ impl ChatStore {
         let limit = limit.max(0);
         let device_id = self.device_id();
         let chat = chat.to_string();
-        let rows: Vec<MessageRow> = self
+        let messages: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                fill_unique(conn, device_id, &keys, before, limit)
+                let rows = fill_unique(conn, device_id, &keys, before, limit)?;
+                finalize_messages(conn, device_id, rows)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(messages)
     }
 }
 
@@ -522,14 +532,14 @@ fn fill_unique(
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
         let rows: Vec<MessageRow> = page_query(device_id, keys, before.as_ref())
-            .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+            .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
             .limit(wanted)
             .load(conn)
             .map_err(db_err)?;
         let exhausted = (rows.len() as i64) < wanted;
         before = rows.last().map(|row| MessageCursor {
             timestamp_ms: row.timestamp_ms,
-            seq: row.rowid,
+            seq: row.id,
         });
         for row in rows {
             let identity = if dedupe_by_sender {
@@ -574,10 +584,173 @@ fn page_query<'a>(
                 .lt(cursor.timestamp_ms)
                 .or(dsl::timestamp_ms
                     .eq(cursor.timestamp_ms)
-                    .and(dsl::rowid.lt(cursor.seq))),
+                    .and(dsl::id.lt(cursor.seq))),
         );
     }
     query
+}
+
+/// Rows into messages, with the quotes the writer stripped filled back in.
+///
+/// The writer drops a reply's embedded snapshot when the parent is stored
+/// locally and keeps only the linkage (stanza id, participant), so a read
+/// has to rehydrate: find every stripped quote on the page, fetch the
+/// parents, and inject the snapshots into the in-memory copies. One identity
+/// resolution for every chat on the page plus one parent lookup per chat — a
+/// page of fifty stripped replies costs chats + 1 statements, never fifty.
+///
+/// Replies whose parent is gone (or was never local) keep the bare linkage
+/// the stripped row carries; resends always did. The injected snapshot is
+/// never written back.
+fn hydrate_quotes(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    messages: &mut [StoredMessage],
+) -> std::result::Result<(), wacore::store::error::StoreError> {
+    use crate::storage_proto::{
+        decode_storage_proto, inject_quoted, pick_quote_parent, quote_link, quote_snapshot,
+    };
+
+    struct Need {
+        idx: usize,
+        chat: String,
+        stanza: String,
+        participant: String,
+    }
+    let mut needs = Vec::new();
+    for (idx, message) in messages.iter().enumerate() {
+        let Some(decoded) = message.message.as_deref() else {
+            continue;
+        };
+        // A snapshot still on the row, or no linkage at all: nothing to do.
+        if quote_snapshot(decoded).is_some() {
+            continue;
+        }
+        let Some(link) = quote_link(decoded) else {
+            continue;
+        };
+        needs.push(Need {
+            idx,
+            chat: message.chat_jid.to_string(),
+            stanza: link.stanza_id,
+            participant: link.participant,
+        });
+    }
+    if needs.is_empty() {
+        return Ok(());
+    }
+    // One identity resolution for every chat on the page.
+    let mut chats: Vec<String> = needs.iter().map(|need| need.chat.clone()).collect();
+    chats.sort();
+    chats.dedup();
+    let candidates =
+        crate::lid::chat_key_candidates_batch(conn, device_id, &chats).map_err(db_err)?;
+    // One parent lookup per chat, then per-reply matching in memory.
+    let mut by_chat: std::collections::HashMap<&str, Vec<&Need>> = std::collections::HashMap::new();
+    for need in &needs {
+        by_chat.entry(need.chat.as_str()).or_default().push(need);
+    }
+    // Counterpart identities, resolved once per distinct participant and only
+    // when the exact author misses (the common case never gets here).
+    let mut aliases: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for (chat, chat_needs) in by_chat {
+        let keys = candidates
+            .get(chat)
+            .cloned()
+            .unwrap_or_else(|| vec![chat.to_string()]);
+        let stanzas: Vec<&str> = chat_needs
+            .iter()
+            .map(|need| need.stanza.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut parents: std::collections::HashMap<String, Vec<crate::storage_proto::ParentRow>> =
+            std::collections::HashMap::new();
+        for chunk in stanzas.chunks(BIND_CHUNK) {
+            for row in parent_chunk(conn, device_id, &keys, chunk).map_err(db_err)? {
+                parents.entry(row.msg_id.clone()).or_default().push(row);
+            }
+        }
+        for need in chat_needs {
+            let rows: &[crate::storage_proto::ParentRow] =
+                parents.get(&need.stanza).map(Vec::as_slice).unwrap_or(&[]);
+            if rows.iter().all(|row| row.sender != need.participant)
+                && !aliases.contains_key(&need.participant)
+            {
+                // A mapping read that fails is not a read failure: without
+                // the alias the quote resolves by exact author only.
+                let alias = if need.participant.is_empty() {
+                    None
+                } else {
+                    crate::lid::counterpart_chat_key(conn, device_id, &need.participant)
+                        .unwrap_or(None)
+                };
+                aliases.insert(need.participant.clone(), alias);
+            }
+            let alias = aliases.get(&need.participant).and_then(|a| a.as_deref());
+            let Some(parent) = pick_quote_parent(rows, &need.participant, alias) else {
+                continue;
+            };
+            let Some(bytes) = parent.proto.as_deref() else {
+                continue;
+            };
+            let Ok(parent_msg) = decode_storage_proto(bytes, parent.codec) else {
+                continue;
+            };
+            if let Some(message) = messages
+                .get_mut(need.idx)
+                .and_then(|message| message.message.as_deref_mut())
+            {
+                inject_quoted(message, &need.stanza, &parent_msg);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One page of parent rows: `(msg_id, sender, proto, codec)` for a chunk of
+/// stanza ids under either storage identity of one chat.
+fn parent_chunk(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    keys: &[String],
+    stanzas: &[&str],
+) -> QueryResult<Vec<crate::storage_proto::ParentRow>> {
+    use crate::storage_proto::ParentRow;
+    use schema::messages::dsl;
+    dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq_any(keys.to_vec()))
+                .and(dsl::msg_id.eq_any(stanzas.to_vec())),
+        )
+        .select((dsl::msg_id, dsl::sender_jid, dsl::proto, dsl::proto_codec))
+        .load::<(String, String, Option<Vec<u8>>, i32)>(conn)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(msg_id, sender, proto, codec)| ParentRow {
+                    msg_id,
+                    sender,
+                    proto,
+                    codec,
+                })
+                .collect()
+        })
+}
+
+/// The conversion every read ends with: rows into messages, quotes
+/// rehydrated. Runs inside the read closure, where the connection the
+/// hydration queries need is still at hand.
+pub(crate) fn finalize_messages(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    rows: Vec<MessageRow>,
+) -> std::result::Result<Vec<StoredMessage>, wacore::store::error::StoreError> {
+    let mut messages: Vec<StoredMessage> = rows.into_iter().map(Into::into).collect();
+    hydrate_quotes(conn, device_id, &mut messages)?;
+    Ok(messages)
 }
 
 impl ChatStore {
@@ -607,16 +780,20 @@ impl ChatStore {
             .iter()
             .map(|(jid, limit)| (jid.to_string(), (*limit).max(0)))
             .collect();
-        let pages: HashMap<String, Vec<MessageRow>> = self
+        let pages: HashMap<String, Vec<StoredMessage>> = self
             .db()
             .read(move |conn| {
-                let mut pages = HashMap::with_capacity(wanted.len());
                 // Every chat's other identity in one statement. Asked per
                 // chat, this read paid a mapping query for each of them
                 // inside the one snapshot it exists to hold.
                 let chats: Vec<String> = wanted.iter().map(|(chat, _)| chat.clone()).collect();
                 let candidates = crate::lid::chat_key_candidates_batch(conn, device_id, &chats)
                     .map_err(db_err)?;
+                // Convert first and hydrate once across every chat, so the
+                // quote parents resolve in one batched pass per chat rather
+                // than one per page.
+                let mut order: Vec<(String, usize)> = Vec::with_capacity(wanted.len());
+                let mut flat: Vec<StoredMessage> = Vec::new();
                 for (chat, limit) in wanted {
                     let keys = candidates
                         .get(&chat)
@@ -624,16 +801,20 @@ impl ChatStore {
                         .unwrap_or_else(|| vec![chat.clone()]);
                     let rows = fill_unique(conn, device_id, &keys, None, limit)?;
                     if !rows.is_empty() {
-                        pages.insert(chat, rows);
+                        order.push((chat, rows.len()));
+                        flat.extend(rows.into_iter().map(StoredMessage::from));
                     }
+                }
+                hydrate_quotes(conn, device_id, &mut flat)?;
+                let mut pages = HashMap::with_capacity(order.len());
+                let mut rest = flat.into_iter();
+                for (chat, count) in order {
+                    pages.insert(chat, rest.by_ref().take(count).collect());
                 }
                 Ok(pages)
             })
             .await?;
-        Ok(pages
-            .into_iter()
-            .map(|(chat, rows)| (chat, rows.into_iter().map(Into::into).collect()))
-            .collect())
+        Ok(pages)
     }
 
     /// One page of the whole session's messages, every chat interleaved, newest
@@ -666,11 +847,12 @@ impl ChatStore {
     /// reads like — it asks for rows *older* than that point, so the consumer
     /// walks back into its own history and never sees a new message.
     ///
-    /// Stopping at a remembered `seq` skips messages. `seq` is the implicit
-    /// rowid, which SQLite assigns as `max(rowid) + 1`: deleting the newest
-    /// message hands its number to the next arrival, clearing a chat entirely
-    /// restarts at 1, and a `VACUUM` renumbers independently of all that. Each
-    /// of those puts a genuinely new message at or below a remembered value,
+    /// Stopping at a remembered `seq` skips messages. `seq` is the `id`
+    /// column (`INTEGER PRIMARY KEY`), which SQLite assigns as `max(id) + 1`:
+    /// deleting the newest message hands its number to the next arrival, and
+    /// clearing a chat entirely restarts at 1. A `VACUUM` preserves the values
+    /// (unlike the implicit rowid this column replaces), but the reuse cases
+    /// still put a genuinely new message at or below a remembered value,
     /// where a watermark comparison reads it as already seen. Deleting and
     /// clearing are ordinary app-state events this store applies, so it is
     /// routine rather than a corner case. Compare content across passes —
@@ -737,15 +919,17 @@ impl ChatStore {
         let device_id = self.device_id();
         let since_ms = since.map(ceil_to_ms);
         let until_ms = until.map(ceil_to_ms);
-        let rows: Vec<MessageRow> = self
+        let messages: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
-                arrival_page_query(device_id, after, since_ms, until_ms, limit)
-                    .load(conn)
-                    .map_err(db_err)
+                let rows: Vec<MessageRow> =
+                    arrival_page_query(device_id, after, since_ms, until_ms, limit)
+                        .load(conn)
+                        .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(messages)
     }
 
     pub async fn message(&self, chat: &Jid, msg_id: &str) -> Result<Option<StoredMessage>> {
@@ -753,12 +937,12 @@ impl ChatStore {
         let device_id = self.device_id();
         let chat = chat.to_string();
         let msg_id = msg_id.to_owned();
-        let rows: Vec<MessageRow> = self
+        let messages: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                dsl::messages
+                let rows: Vec<MessageRow> = dsl::messages
                     .filter(
                         dsl::device_id
                             .eq(device_id)
@@ -766,13 +950,17 @@ impl ChatStore {
                             .and(dsl::msg_id.eq(&msg_id)),
                     )
                     .load(conn)
-                    .map_err(db_err)
+                    .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
             })
             .await?;
-        match rows.as_slice() {
-            [] => Ok(None),
-            [row] => Ok(Some(row.clone().into())),
-            _ => Err(ChatStoreError::AmbiguousMessageId),
+        // `message()` names no sender, so same-id rows from two group
+        // participants come back together; the page (which carries sender
+        // identity) is the disambiguator.
+        match <[StoredMessage; 1]>::try_from(messages) {
+            Ok([message]) => Ok(Some(message)),
+            Err(messages) if messages.is_empty() => Ok(None),
+            Err(_) => Err(ChatStoreError::AmbiguousMessageId),
         }
     }
 
@@ -1060,9 +1248,42 @@ mod tests {
             .join("\n")
     }
 
+    /// [`plan`] with the binds the writer actually sends. Explaining bare
+    /// `?` placeholders plans `idx_messages_chat_time` for everything — with
+    /// nothing bound the planner has no values to weigh — which is not the
+    /// runtime plan: bound, it enters the partial index (verified against
+    /// `sqlite3` with and without `ANALYZE`, empty and seeded).
+    fn plan_bound(sql: &str) -> String {
+        use diesel::sql_types::{BigInt, Bool, Integer, Text};
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        conn.run_pending_migrations(MIGRATIONS).expect("migrate");
+        // Placeholder order is the filter order diesel renders:
+        // `device_id = ? AND msg_id = ? AND from_me = ? ... LIMIT ?`.
+        let rows: Vec<PlanRow> = diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
+            .bind::<Integer, _>(1)
+            .bind::<Text, _>("m")
+            .bind::<Bool, _>(true)
+            .bind::<BigInt, _>(2)
+            .load(&mut conn)
+            .expect("explain");
+        rows.into_iter()
+            .map(|row| row.detail)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn rendered_sql(after: Option<ArrivalCursor>, since_ms: Option<i64>) -> String {
         let query = arrival_page_query(1, after, since_ms, None, 50);
-        let debug = diesel::debug_query::<diesel::sqlite::Sqlite, _>(&query).to_string();
+        rendered(&query)
+    }
+
+    /// The SQL diesel actually renders for `query`. Binds stay unbound: the
+    /// planner does not need their values, and asking it about hand-written
+    /// SQL would pin a string this crate never runs.
+    fn rendered(
+        query: &impl diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite>,
+    ) -> String {
+        let debug = diesel::debug_query::<diesel::sqlite::Sqlite, _>(query).to_string();
         // `debug_query` appends the bind list after the statement.
         match debug.split_once(" -- binds") {
             Some((sql, _)) => sql.to_string(),
@@ -1070,16 +1291,53 @@ mod tests {
         }
     }
 
+    /// The chatless server-ack lookup keeps its index after the index goes
+    /// partial (`WHERE from_me = TRUE`).
+    ///
+    /// Same shape as the chatless branch of `resolve_server_ack_message`
+    /// (`store/ack.rs`): device-wide, outbound only. The partial index only
+    /// shrinks the ack path if the planner actually enters it for the bound
+    /// `from_me = ?` diesel emits — this is the test that notices if it
+    /// stops. (Every other `msg_id` lookup is chat-scoped and served by the
+    /// identity UNIQUE autoindex, which is why narrowing this one is safe.)
+    #[test]
+    fn chatless_ack_uses_the_partial_by_id_index() {
+        use crate::schema::messages::dsl;
+        let query = dsl::messages
+            .filter(
+                dsl::device_id
+                    .eq(1)
+                    .and(dsl::msg_id.eq("m"))
+                    .and(dsl::from_me.eq(true)),
+            )
+            .select((dsl::chat_jid, dsl::timestamp_ms))
+            .limit(2);
+        // Bound: explaining bare `?` plans `idx_messages_chat_time`, which
+        // is not the runtime plan.
+        let plan = plan_bound(&rendered(&query));
+        assert!(
+            plan.contains("USING INDEX idx_messages_by_id")
+                || plan.contains("USING COVERING INDEX idx_messages_by_id"),
+            "chatless ack must enter the partial index, got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "chatless ack must not sort, got:\n{plan}"
+        );
+    }
+
     /// The whole point of ordering the feed by arrival: SQLite answers it by
     /// walking the `messages` B-tree backwards — a plain reverse `SCAN`, or a
     /// `SEARCH ... USING INTEGER PRIMARY KEY` that seeks to the cursor first —
     /// so a page costs no index and no sort.
     ///
-    /// Left to itself the planner does the opposite: `idx_messages_by_id` leads
-    /// with `device_id`, so it enters there and pays a temp B-tree to recover
-    /// rowid order, turning every page into a full sort of the device's
-    /// messages. That is what the `+device_id` in the query prevents, and this
-    /// is the test that notices if it stops working.
+    /// Left to itself the planner does the opposite: the identity UNIQUE
+    /// autoindex leads with `device_id`, so it enters there and pays a temp
+    /// B-tree to recover arrival order, turning every page into a full sort
+    /// of the device's messages. That is what the `+device_id` in the query
+    /// prevents, and this is the test that notices if it stops working.
+    /// (The partial `idx_messages_by_id` is not a candidate here — it needs
+    /// a `from_me` predicate — but the autoindex is, so the guard stays.)
     #[test]
     fn arrival_page_reads_the_table_in_arrival_order_without_sorting() {
         for (label, sql) in [

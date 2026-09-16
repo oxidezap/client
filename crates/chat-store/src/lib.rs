@@ -36,6 +36,7 @@ mod materialize;
 mod queries;
 mod schema;
 mod spawn;
+mod storage_proto;
 mod store;
 pub mod types;
 

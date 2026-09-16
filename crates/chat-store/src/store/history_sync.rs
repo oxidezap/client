@@ -8,10 +8,11 @@ use waproto::whatsapp as wa;
 
 use crate::materialize::{MessageOp, classify};
 use crate::schema;
+use crate::storage_proto::{PendingQuote, strip_pending_quotes};
 use crate::store::chat_rows::recompute_chat_preview;
 use crate::store::contacts::upsert_contact_push_name;
 use crate::store::edit::apply_edit;
-use crate::store::message_rows::{NewMessage, insert_message};
+use crate::store::message_rows::{NewMessage, StoredRow, insert_message};
 use crate::store::reaction::apply_reaction;
 use crate::store::read_state::UNREAD_MARKER;
 use crate::store::revoke::apply_revoke;
@@ -115,12 +116,17 @@ fn apply_history_conversation(
             .execute(conn)?;
     }
 
+    // Replies whose parent lands later in this same conversation keep their
+    // inline snapshot at insert time (the parent is not visible yet); the
+    // post-pass strips them once everything is in.
+    let mut pending_quotes: Vec<PendingQuote> = Vec::new();
     for hist_msg in &conv.messages {
         let Some(wmi) = hist_msg.message.as_option() else {
             continue;
         };
-        apply_history_message(conn, device_id, chat, wmi, cs)?;
+        apply_history_message(conn, device_id, chat, wmi, cs, &mut pending_quotes)?;
     }
+    strip_pending_quotes(conn, device_id, chat, &pending_quotes)?;
     // Backfill the denormalized preview from the newest materialized row, so a
     // freshly-paired client's chat list isn't blank until live traffic.
     recompute_chat_preview(conn, device_id, chat)?;
@@ -135,6 +141,7 @@ fn apply_history_message(
     chat: &str,
     wmi: &wa::WebMessageInfo,
     cs: &mut ChangeSet,
+    pending_quotes: &mut Vec<PendingQuote>,
 ) -> QueryResult<()> {
     let Some(key) = wmi.key.as_option() else {
         return Ok(());
@@ -165,7 +172,17 @@ fn apply_history_message(
     if let Some(message) = wmi.message.as_option() {
         match classify(message) {
             MessageOp::Store { kind, text } => {
-                let _ = insert_message(
+                // Same compaction as the live path. A parent later in this
+                // same conversation is not visible yet, so the post-pass
+                // below re-checks the replies that kept their snapshot.
+                let stored =
+                    crate::storage_proto::storage_bytes_for(conn, device_id, chat, message)?;
+                let crate::storage_proto::StorageBytes {
+                    bytes: proto_bytes,
+                    codec: proto_codec,
+                    kept_quote,
+                } = stored;
+                let stored_row = insert_message(
                     conn,
                     device_id,
                     NewMessage {
@@ -176,7 +193,8 @@ fn apply_history_message(
                         timestamp_ms: ts_ms,
                         kind,
                         text: text.as_deref(),
-                        proto: Some(&waproto::codec::message_to_vec(message)),
+                        proto: Some(&proto_bytes),
+                        proto_codec,
                         status: wmi
                             .status
                             .map(|s| s as i32)
@@ -186,6 +204,19 @@ fn apply_history_message(
                         overwrite: false,
                     },
                 )?;
+                // A reply whose parent lands LATER in this conversation kept
+                // its inline snapshot above (the parent was not visible yet).
+                // Record it for the post-pass rather than re-reading every
+                // row of the conversation afterwards.
+                if stored_row == StoredRow::Inserted
+                    && let Some(target) = kept_quote
+                {
+                    pending_quotes.push(PendingQuote {
+                        msg_id: msg_id.to_string(),
+                        sender: sender.to_string(),
+                        target,
+                    });
+                }
             }
             MessageOp::Reaction { target_id, emoji } => {
                 apply_reaction(conn, device_id, chat, &target_id, sender, &emoji, ts_ms)?;
