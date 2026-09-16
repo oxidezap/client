@@ -10,8 +10,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use oxidezap_daemon::{
-    account::{AccountRegistry, AccountRuntime},
-    listener, media, plugins, server, shutdown, state, tray,
+    account::{AccountRegistry, AccountSupervisor},
+    listener, media, server, shutdown, state, tray,
 };
 
 use std::sync::Arc;
@@ -98,50 +98,47 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     #[cfg(target_os = "macos")]
     let tray: Option<tray::TrayHandle> = None;
 
-    // One shutdown signal, watched by the bridge and raised by whoever stops
-    // first. The bridge must never be cancelled: it owns the session thread,
-    // and a future dropped mid-await cannot wait for anything. Racing it in a
-    // `select!` is exactly what would drop it, so the server's exit becomes a
-    // notification rather than a competing branch.
-    //
-    // `notify_one`, not `notify_waiters`: the latter wakes only tasks already
-    // parked, so a server that fails fast (a socket it cannot bind) would
-    // signal before the bridge ever waits, and the bridge would then wait
-    // forever on a notification that was already spent.
-    let stop = Arc::new(tokio::sync::Notify::new());
-
-    // Bounded, and sized to the client cap it can never exceed: a connection
-    // waits for its command's answer before reading the next request, so at
-    // most one command per connection is ever outstanding. That is what keeps
-    // one broken front end from accumulating work — an unbounded channel
-    // would let it queue payloads, and spawn session tasks, without limit.
-    let (commands, command_rx) = tokio::sync::mpsc::channel(server::MAX_CLIENTS);
-
-    // After the command channel, because a plugin acts through it, and before
-    // the session, because a plugin subscribed to messages must not miss the
-    // ones that arrive while it is still loading.
-    let plugins = plugins::start(&hub, commands.clone()).await;
-
+    // `AccountSupervisor` stops every runtime it holds on the same
+    // process-wide `shutdown::request`, so there is no separate local signal
+    // to plumb through here the way a single-account `Notify` used to be: a
+    // multi-account daemon has one running task per account, all of which
+    // have to stop on the same ask, and `shutdown::requested()` already
+    // broadcasts to as many waiters as are watching it.
     let registry = AccountRegistry::new();
     let stores = Arc::new(StoreRegistry::new(oxidezap_session::resolve_database_path()));
-    let runtime = Arc::new(AccountRuntime::new_with_registry(
-        AccountId::LEGACY,
-        Arc::clone(&hub),
-        Arc::clone(&plugins),
-        commands.clone(),
-        stores,
-    ));
-    assert!(registry.insert(Arc::clone(&runtime)));
-    let mut session = {
-        let registry = Arc::clone(&registry);
-        let runtime = Arc::clone(&runtime);
-        let stop = Arc::clone(&stop);
-        tokio::spawn(async move {
-            registry
-                .run(runtime, command_rx, async move { stop.notified().await })
-                .await
-        })
-    };
+    let supervisor = AccountSupervisor::new(
+        Arc::clone(&registry),
+        Arc::clone(&stores),
+        server::MAX_CLIENTS,
+    );
+
+    // The hub built on this thread (see `main`) is always for
+    // `AccountId::LEGACY`: on macOS the tray already attached to it before
+    // this function ever ran, so that account's runtime is spawned through
+    // it rather than through a second, disconnected hub `spawn` would build.
+    // This covers a fresh install (no rows yet) and an existing single- or
+    // multi-account database that still has this id — which today is every
+    // reachable state, since nothing in this daemon can remove the legacy
+    // slot yet (only reset it, which keeps the id).
+    supervisor
+        .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
+        .await;
+
+    // Every other account this database already knows about, started the
+    // same way `CreateAccount` will start a brand new one — its own hub,
+    // plugin host and command channel, none of it shared with the legacy
+    // slot above.
+    match stores.accounts().await {
+        Ok(existing) => {
+            for account in existing {
+                if account.id == AccountId::LEGACY {
+                    continue; // already spawned above, through the pre-built hub.
+                }
+                supervisor.spawn(account.id).await;
+            }
+        }
+        Err(e) => log::error!("could not list existing accounts at startup: {e:#}"),
+    }
 
     // Off unless asked for. The local endpoint is protected by the
     // filesystem and a peer uid check; a TCP port is protected by neither,
@@ -181,13 +178,6 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
             // stop and never restarts it.
             result.context("ipc server stopped")
         }
-        // Watched here too, because the bridge can fail synchronously: a
-        // runtime it cannot build, a thread it cannot spawn. Those emit no
-        // event, so without this arm the daemon would keep serving an initial
-        // `Connecting` snapshot for a session that does not exist.
-        joined = &mut session => {
-            return finish(joined, tray, Ok(()));
-        }
         // A bridge that cannot bind is a front end nobody can reach, and it
         // was asked for explicitly — so it fails the daemon rather than
         // leaving a browser waiting on a port nothing is listening on. Only
@@ -209,13 +199,17 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
         }
     };
 
-    // Whichever ended, the session still has to disconnect and close SQLite.
-    stop.notify_one();
+    // Whichever ended, every account still has to disconnect and close
+    // SQLite — one account's session ending on its own is no longer a reason
+    // for the daemon itself to exit (that would take every other account
+    // down with it), so unlike before this request is unconditional rather
+    // than gated on which branch above returned.
+    shutdown::request("daemon exiting");
     // While that drains, a repeated signal escalates rather than queues
     // behind it: the teardown has joins without a deadline, and a second
     // signal is somebody saying the first one is taking too long.
     tokio::select! {
-        joined = &mut session => finish(joined, tray, server_outcome),
+        () = supervisor.join_all() => finish(tray, server_outcome),
         code = termination.escalation() => {
             log::warn!("a second stop signal arrived while shutting down; exiting without finishing the teardown");
             std::process::exit(code);
@@ -223,23 +217,18 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     }
 }
 
-/// Fold the session's outcome into the server's and drop the tray.
+/// Drop the tray and return the server's outcome.
 ///
 /// The tray goes before returning so the icon disappears with the process
-/// rather than lingering until the host notices the name leave the bus.
-fn finish(
-    joined: Result<Result<()>, tokio::task::JoinError>,
-    tray: Option<tray::TrayHandle>,
-    server_outcome: Result<()>,
-) -> Result<()> {
-    let session_outcome = match joined {
-        Ok(result) => result.context("session ended"),
-        Err(e) => Err(anyhow::anyhow!("session task panicked: {e}")),
-    };
+/// rather than lingering until the host notices the name leave the bus. No
+/// single account's outcome is folded in here any more: with N accounts each
+/// running its own task, one of them ending (successfully or not) is no
+/// longer a reason for the whole daemon's exit status to reflect it — that
+/// account's own status, visible through the control plane, is where it
+/// belongs instead.
+fn finish(tray: Option<tray::TrayHandle>, server_outcome: Result<()>) -> Result<()> {
     drop(tray);
-    // The server's failure is the more actionable one when both fail: the
-    // session error is usually a consequence of tearing down.
-    server_outcome.and(session_outcome)
+    server_outcome
 }
 
 /// Why `run` is stopping: a signal from outside, or an ask from inside.
