@@ -20,7 +20,8 @@
 
 use std::sync::Arc;
 
-use oxidezap_ipc::{ClientRequest, Link, PROTOCOL_VERSION};
+use oxidezap_core::AccountId;
+use oxidezap_ipc::{ClientRequest, ClientScope, Link, PROTOCOL_VERSION};
 
 use super::media::MediaCache;
 use super::sink::{self, Events, ReaderSink};
@@ -70,12 +71,28 @@ pub(super) fn begin(
     media: Arc<dyn MediaCache>,
     has_window: bool,
 ) -> std::io::Result<Attached> {
+    begin_for_account(link, media, AccountId::LEGACY, has_window, has_window)
+}
+
+/// Attach a frontend to one immutable account scope.
+///
+/// The legacy wrapper above keeps current transports unchanged while the GUI
+/// grows its control connection and account switcher.
+pub(super) fn begin_for_account(
+    link: Link,
+    media: Arc<dyn MediaCache>,
+    account: AccountId,
+    owns_window: bool,
+    call_video: bool,
+) -> std::io::Result<Attached> {
     let (sink, events) = sink::channel();
     let session = Session::new(link, sink.ui(), media);
     session.send(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account { account },
         session_events: true,
-        has_window,
+        owns_window,
+        call_video,
     })?;
     let pending = Arc::clone(&session.conn.pending);
     let pictures = session.call_frames().clone();

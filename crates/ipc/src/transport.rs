@@ -5,6 +5,13 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 30: `ClientRequest::Hello` binds a connection to either the control plane
+/// or one immutable `AccountId`; control listings and lifecycle requests have
+/// separate wire messages, and account requests no longer carry an account id
+/// in their payload. `owns_window` and `call_video` are independent
+/// capabilities. Older v29 peers would either omit the scope or treat a
+/// control frame as account state, so the daemon refuses the mismatch.
+///
 /// 28: `CallAction::RequestVideoKeyframe` names the call and direction whose
 /// compressed reference chain was lost. Older daemons reject the request,
 /// leaving a remote decoder waiting for an IDR the peer may never send.
@@ -215,7 +222,9 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 29;
+/// v30 binds a connection to either the control plane or one AccountId and
+/// separates global-window ownership from account call-video subscription.
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

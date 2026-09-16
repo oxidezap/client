@@ -1,8 +1,8 @@
 //! Messages exchanged over the socket.
 
 use oxidezap_core::{
-    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, GroupRoster, LogLevel,
-    OutgoingMedia, PluginAction, PluginSurface, QuotedMessage, UiEvent,
+    AccountId, CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, GroupRoster,
+    LogLevel, OutgoingMedia, PluginAction, PluginSurface, QuotedMessage, UiEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -243,6 +243,33 @@ pub struct AccountIdentity {
     pub lid: Option<String>,
 }
 
+/// Lifecycle of an account runtime as seen by the control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountStatus {
+    Starting,
+    Running,
+    Stopping,
+    Resetting,
+    Removing,
+    Stopped,
+    Error,
+}
+
+/// The account-level summary sent by the control plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountOverview {
+    pub id: oxidezap_core::AccountId,
+    pub status: AccountStatus,
+}
+
+/// Current set of local accounts. Intermediate lifecycle states may be
+/// coalesced because consumers need the latest set, not every transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountsSnapshot {
+    pub accounts: Vec<AccountOverview>,
+}
+
 impl StateSnapshot {
     /// How many unread *messages* there are across every chat.
     ///
@@ -312,11 +339,36 @@ pub enum DaemonEvent {
     },
 }
 
+/// Which daemon plane a frontend connection belongs to.
+///
+/// A control connection manages the daemon and account list; an account
+/// connection is permanently bound to one local account. Switching accounts
+/// therefore creates a new connection instead of rebinding request ids,
+/// versions, session events, or video in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum ClientScope {
+    Control,
+    Account { account: AccountId },
+}
+
 /// A daemon-to-client frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMessage {
-    /// First frame on every connection. Establishes the protocol version and
+    /// The first frame on a control connection.
+    ControlHello {
+        protocol: u32,
+        accounts: AccountsSnapshot,
+    },
+    /// The current account set, published to control connections.
+    AccountsChanged(AccountsSnapshot),
+    /// A point-in-time account listing, answering [`ClientRequest::ListAccounts`].
+    Accounts {
+        id: RequestId,
+        snapshot: AccountsSnapshot,
+    },
+    /// First frame on every account connection. Establishes the protocol version and
     /// the state to apply events onto.
     Hello {
         protocol: u32,
@@ -523,7 +575,34 @@ impl Request {
     }
 }
 
-/// The default for [`ClientRequest::Hello::has_window`]. See the field.
+impl ClientRequest {
+    /// Whether a request is valid on the selected connection plane.
+    #[must_use]
+    pub fn is_control_request(&self) -> bool {
+        matches!(
+            self,
+            Self::ListAccounts
+                | Self::CreateAccount
+                | Self::ResetAccount { .. }
+                | Self::RemoveAccount { .. }
+                | Self::SetLogLevel { .. }
+                | Self::ShowWindow
+                | Self::ReloadPlugins
+                | Self::InstallPlugin(_)
+                | Self::RemovePlugin { .. }
+                | Self::ListInstalledPlugins
+                | Self::Shutdown
+        )
+    }
+
+    /// Whether a request operates on the account bound to this connection.
+    #[must_use]
+    pub fn is_account_request(&self) -> bool {
+        !self.is_control_request() && !matches!(self, Self::Hello { .. })
+    }
+}
+
+/// The default for [`ClientRequest::Hello::owns_window`]. See the field.
 fn owns_a_window() -> bool {
     true
 }
@@ -746,6 +825,8 @@ pub enum ClientRequest {
     /// commands should not act on them.
     Hello {
         protocol: u32,
+        /// The plane this connection is bound to for its whole lifetime.
+        scope: ClientScope,
         /// Whether to stream [`DaemonMessage::Session`] as well as summaries.
         ///
         /// Opt-in, because it is the whole traffic of the account: a tray or a
@@ -755,21 +836,33 @@ pub enum ClientRequest {
         /// chats before the next thing that happens to change.
         #[serde(default)]
         session_events: bool,
-        /// Whether this client owns a window that can be raised.
+        /// Whether this connection owns the global application window.
         ///
-        /// The daemon relays [`DaemonMessage::ShowWindow`] to everyone and
-        /// starts a front end when nobody owns one, so it has to be able to
-        /// tell a window from a subscriber that merely watches — a TUI
-        /// reading summaries, a notifier, a monitoring client. Only the
-        /// client knows, so only the client can say.
-        ///
-        /// Defaults to `true`, unlike `session_events`: every client that
-        /// exists today is a window, and a silent one is far more likely to
-        /// be a build that predates this field than a headless tool. The
-        /// costly mistake is the other way round — launching a second window
-        /// over a live one — so the default is the one that never does.
+        /// This is independent from the account connection's video stream:
+        /// the active workspace may request call frames without counting as a
+        /// second daemon window.
         #[serde(default = "owns_a_window")]
-        has_window: bool,
+        owns_window: bool,
+        /// Whether this connection wants the account's live call video.
+        #[serde(default)]
+        call_video: bool,
+    },
+    /// Ask for the current account set on a control connection.
+    ListAccounts,
+    /// Allocate a new account slot.
+    ///
+    /// The daemon returns an explicit refusal until the upstream WR-1 device
+    /// lifecycle API is available. Keeping the request in the wire contract
+    /// lets clients ship the control plane without pretending the operation is
+    /// safe to implement locally.
+    CreateAccount,
+    /// Reset one account while retaining its id.
+    ResetAccount {
+        account: oxidezap_core::AccountId,
+    },
+    /// Remove one account permanently.
+    RemoveAccount {
+        account: oxidezap_core::AccountId,
     },
     /// Ask for a fresh snapshot, after a [`DaemonMessage::Resync`] or on
     /// reconnect.
@@ -1108,6 +1201,61 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_messages_and_lifecycle_requests_round_trip() {
+        let id = oxidezap_core::AccountId::new(2).expect("positive account id");
+        let requests = [
+            ClientRequest::ListAccounts,
+            ClientRequest::CreateAccount,
+            ClientRequest::ResetAccount { account: id },
+            ClientRequest::RemoveAccount { account: id },
+        ];
+        for request in requests {
+            assert!(request.is_control_request());
+            assert!(!request.is_account_request());
+            let line = serde_json::to_string(&Request {
+                id: Some(7),
+                request: request.clone(),
+            })
+            .expect("control request serializes");
+            assert_eq!(
+                serde_json::from_str::<Request>(&line)
+                    .expect("control request parses")
+                    .request,
+                request
+            );
+        }
+
+        let hello = DaemonMessage::ControlHello {
+            protocol: crate::transport::PROTOCOL_VERSION,
+            accounts: AccountsSnapshot {
+                accounts: vec![AccountOverview {
+                    id,
+                    status: AccountStatus::Starting,
+                }],
+            },
+        };
+        let line = serde_json::to_string(&hello).expect("control hello serializes");
+        assert_eq!(serde_json::from_str::<DaemonMessage>(&line).unwrap(), hello);
+    }
+
+    #[test]
+    fn account_requests_do_not_carry_an_account_id() {
+        let request = ClientRequest::Snapshot;
+        assert!(!request.is_control_request());
+        assert!(request.is_account_request());
+        let hello = ClientRequest::Hello {
+            protocol: crate::transport::PROTOCOL_VERSION,
+            scope: ClientScope::Account {
+                account: oxidezap_core::AccountId::LEGACY,
+            },
+            session_events: true,
+            owns_window: false,
+            call_video: true,
+        };
+        assert!(!hello.is_account_request());
+    }
 
     #[test]
     fn video_recovery_roundtrips_call_and_direction() {
