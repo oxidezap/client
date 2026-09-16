@@ -436,13 +436,16 @@ fn class_of(event: &UiEvent) -> Class {
         UiEvent::MessageReceived { .. }
         | UiEvent::HistoryLoaded { .. }
         | UiEvent::ReceiptReceived { .. }
-        | UiEvent::ReactionReceived { .. }
-        // Recoverable in the sense that losing it costs a picture, not the
-        // session: the resolver has already marked the chats asked, and the
-        // next connect resolves them again. It is deliberately *not* in
-        // `needs_recovery` — a batch of pictures is not worth a history reload.
-        | UiEvent::AvatarsResolved { .. } => Class::Recoverable,
+        | UiEvent::ReactionReceived { .. } => Class::Recoverable,
         UiEvent::ChatPresence { .. } | UiEvent::PresenceUpdated { .. } => Class::Ephemeral,
+        // A batch of resolved pictures is control, not data. It is bounded by
+        // the chunk the resolver publishes (a handful of small strings), and
+        // losing one silently would be worse than dropping a message: the
+        // resolver marks a chat resolved only after the send succeeds, so a
+        // batch that never arrived is asked again, while one evicted after the
+        // send would leave the daemon with no picture and no retry until the
+        // next connection. Control is admitted ahead of data and never
+        // reclaimed for age, which is the guarantee this event needs.
         _ => Class::Control,
     }
 }

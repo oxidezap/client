@@ -1662,21 +1662,36 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   the daemon and another below it made persistence and comparison a matter of
   arrival order. The signed CDN URL is `avatar_source`, transient, never
   serialized and never stored. `chat-store`'s `avatar_descriptors` table keeps
-  only the two ids and a timestamp, so a restarted process can address bytes
-  it fetched in an earlier run without a network round trip; the write is
+  only the two ids, a timestamp and a `seq`, so a restarted process can address
+  bytes it fetched in an earlier run without a network round trip; the write is
   two-phase — bytes land in the media cache first, the descriptor is committed
   after — so the pointer never names bytes that are not there, and a transient
-  fetch failure leaves the previous picture intact. The lookup itself runs in
-  `session/whatsapp/avatar.rs`, bounded to eight in flight, deduplicated by
-  JID, triggered by `Connected` and by paging, and deliberately *not* by the
-  history reload path: receipts and acknowledgements used to query WhatsApp
-  for a picture because they reloaded history, and a picture is stable
-  metadata that a receipt says nothing about. `HistoryLoaded` carries whatever
-  the durable descriptors already said and never waits on an IQ. Every kind
-  goes through the generic `ProfilePictureSpec` path: the library already
-  skips the privacy-token dance for anything that is not a plain PN, so a
-  group, a channel and a contact are one call, which is also what removed the
-  group-only batch that read `url` and ignored the `direct_path` it needed as
-  a fallback. The status broadcast, broadcast lists and the system account are
-  never asked about.
+  fetch failure leaves the previous picture intact. `seq` is the resolution's
+  order rather than the write's: two pictures resolved moments apart have their
+  commits issued from separate tasks, and the row keeps the higher `seq` so the
+  older one cannot land last (`store::avatar::upsert`). The lookup itself runs
+  in `session/whatsapp/avatar.rs`, bounded to eight in flight, deduplicated by
+  JID within a connection generation, published a chunk at a time so the first
+  eight pictures are drawn while the next eight are in flight, triggered by
+  `Connected` and by paging, and deliberately *not* by the history reload path:
+  receipts and acknowledgements used to query WhatsApp for a picture because
+  they reloaded history, and a picture is stable metadata that a receipt says
+  nothing about. A new connection advances the generation, so every chat is
+  revalidated once per connect — a picture can change while the process is
+  offline. `HistoryLoaded` carries whatever the durable descriptors already
+  said and never waits on an IQ. Ordinary contacts, groups and channels go
+  through the generic `ProfilePictureSpec` path: the library already skips the
+  privacy-token dance for anything that is not a plain PN, so they are one
+  call, which is also what removed the group-only batch that read `url` and
+  ignored the `direct_path` it needed as a fallback. The status broadcast,
+  broadcast lists and the system account are never asked about.
+
+  Two things are deliberately not claimed here. `Ok(None)` is *not* an answer
+  about removal — the library folds `404`, `401`, `304` and a partial response
+  into it, so the session reads it as `Lookup::Unknown` and the daemon never
+  deletes a descriptor; a privacy refusal must not erase a valid picture.
+  And a community parent has no explicit path: WhatsApp Web queries it through
+  `w:g2` with a `parent_group_jid` hint, which the upstream library does not
+  expose, so it currently fails silently rather than wrongly. Both are in
+  docs/roadmap.md.
 

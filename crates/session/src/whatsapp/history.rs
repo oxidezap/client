@@ -475,8 +475,10 @@ impl WhatsAppClient {
 
     /// Give each chat the picture a durable descriptor says it is showing.
     ///
-    /// Local and cheap: one query for the whole account, then a cache-key
-    /// derivation per chat. What it buys is the cold start that draws the
+    /// Local, and keyed by the chats this load actually carries rather than
+    /// the whole account: a scoped reload is a receipt or an ack about one
+    /// conversation, and reading every descriptor to look up one row is a full
+    /// scan per acknowledgement. What it buys is the cold start that draws the
     /// avatar it had before the process restarted, without waiting for the
     /// network. A chat with no descriptor is left blank rather than cleared,
     /// because this load is not an answer about pictures.
@@ -484,7 +486,11 @@ impl WhatsAppClient {
         chat_store: &Arc<ChatStore>,
         chats: &mut [oxidezap_core::Chat],
     ) {
-        let Ok(descriptors) = chat_store.avatar_descriptors().await else {
+        if chats.is_empty() {
+            return;
+        }
+        let jids: Vec<String> = chats.iter().map(|chat| chat.jid.clone()).collect();
+        let Ok(descriptors) = chat_store.avatar_descriptors_for(&jids).await else {
             // The read failed; the chats are still drawn, just without the
             // pictures a later refresh will supply.
             return;

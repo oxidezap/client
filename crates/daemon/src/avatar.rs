@@ -47,12 +47,16 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Turn a resolved picture into cached bytes and a durable descriptor.
 ///
-/// `picture_id` empty means WhatsApp says the chat has no picture: the
-/// descriptor is dropped rather than left pointing at bytes the account no
-/// longer shows, and every front end is told to draw the placeholder.
-/// Otherwise a cache hit is published straight away and the descriptor is
-/// (re)written, which is how a descriptor lost to an earlier failure heals; a
-/// miss fetches, and only writes the descriptor once the bytes are in.
+/// A cache hit is published straight away and the descriptor is (re)written,
+/// which is how a descriptor lost to an earlier failure heals; a miss fetches,
+/// and only writes the descriptor once the bytes are in.
+///
+/// Nothing here removes a picture. The library folds "no picture", "unchanged",
+/// a partial response and *not authorized* into one `Ok(None)`, so a `None`
+/// says nothing definite about removal and acting on it would let a privacy
+/// refusal erase a valid avatar. The session resolves that ambiguity into
+/// [`Lookup::Unknown`](crate) before any of this runs; a picture that is truly
+/// gone keeps showing until its id changes or the cache is cleared.
 pub fn resolved(
     hub: &Arc<StateHub>,
     recorder: &AvatarRecorder,
@@ -61,24 +65,32 @@ pub fn resolved(
     source: Option<&str>,
 ) {
     if picture_id.is_empty() {
-        // WhatsApp says this chat has no picture. Drop the durable pointer so
-        // a restart does not draw one that is gone; the cached bytes are left
-        // for the budget sweep.
-        recorder.clear(jid.to_string());
-        pub_cleared(hub, jid);
+        // No id at all. Not evidence of removal, so nothing is written.
         return;
     }
     let id = picture_id.to_string();
     let selection = record_selection(hub, jid, Some(&id), source);
     let cache_key = oxidezap_core::avatar_cache_key(jid, &id);
     if crate::media::has(&cache_key) {
-        recorder.record(jid.to_string(), id.clone(), cache_key.clone());
         oxidezap_session::spawn({
             let hub = Arc::clone(hub);
             let jid = jid.to_string();
+            let recorder = recorder.clone();
             let selection = selection.clone();
             async move {
-                if is_current(&hub, &jid, &selection) {
+                // The descriptor is rewritten and committed before the
+                // readiness is published, so a front end is never told about
+                // bytes the durable store does not yet name. A write that did
+                // not commit is not announced.
+                //
+                // `selection.token` is the resolution's order, and the store
+                // keeps the highest one: a first picture whose commit lands
+                // after a second picture's must not overwrite it.
+                if recorder
+                    .record(jid.clone(), id, cache_key.clone(), selection.token)
+                    .await
+                    && is_current(&hub, &jid, &selection)
+                {
                     publish_ready(&hub, jid, cache_key);
                 }
             }
@@ -106,10 +118,20 @@ pub fn resolved(
             if !is_current(&hub, &jid, &selection) {
                 return;
             }
-            // Bytes first, then the pointer. A descriptor written before the
-            // cache write could name a key that holds nothing if this died in
-            // between.
-            recorder.record(jid.clone(), id, cache_key.clone());
+            // Cache, then commit, then announce — in that order. The commit
+            // is awaited so "durable before visible" is the sequence the code
+            // runs rather than a sentence beside it, and its `seq` is the
+            // resolution's order so a slower first picture cannot overwrite a
+            // faster second one.
+            if !recorder
+                .record(jid.clone(), id, cache_key.clone(), selection.token)
+                .await
+            {
+                return;
+            }
+            if !is_current(&hub, &jid, &selection) {
+                return;
+            }
             publish_ready(&hub, jid, cache_key);
         }
     });
@@ -122,23 +144,6 @@ fn publish_ready(hub: &StateHub, jid: String, key: String) {
     }) {
         Ok(frame) => hub.publish_session(frame),
         Err(error) => log::error!("could not serialize avatar readiness: {error}"),
-    }
-}
-
-/// Tell every front end this chat no longer has a picture.
-///
-/// A second, equally true kind of readiness: the placeholder is the right
-/// drawing, and a window holding stale bytes has to be told to drop them.
-fn pub_cleared(hub: &StateHub, jid: &str) {
-    let event = oxidezap_core::UiEvent::AvatarReady {
-        jid: jid.to_string(),
-        key: String::new(),
-    };
-    match serde_json::to_string(&DaemonMessage::Session {
-        event: Box::new(event),
-    }) {
-        Ok(frame) => hub.publish_session(frame),
-        Err(error) => log::error!("could not serialize an avatar removal: {error}"),
     }
 }
 

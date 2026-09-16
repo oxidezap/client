@@ -20,7 +20,7 @@ async fn an_avatar_descriptor_survives_reopening_the_store() {
     let (store, chat_store) = test_store().await;
 
     chat_store
-        .record_avatar(&jid(PEER), "picture-1", "a-kept")
+        .record_avatar(&jid(PEER), "picture-1", "a-kept", 1)
         .unwrap();
     chat_store.flush().await.unwrap();
 
@@ -41,10 +41,10 @@ async fn the_newest_picture_replaces_the_previous_descriptor() {
     let (_store, chat_store) = test_store().await;
 
     chat_store
-        .record_avatar(&jid(PEER), "picture-1", "a-one")
+        .record_avatar(&jid(PEER), "picture-1", "a-one", 1)
         .unwrap();
     chat_store
-        .record_avatar(&jid(PEER), "picture-2", "a-two")
+        .record_avatar(&jid(PEER), "picture-2", "a-two", 2)
         .unwrap();
     chat_store.flush().await.unwrap();
 
@@ -54,22 +54,30 @@ async fn the_newest_picture_replaces_the_previous_descriptor() {
     assert_eq!(descriptors[0].cache_key, "a-two");
 }
 
-/// A picture removed server-side must not leave a durable pointer behind: the
-/// next start would draw a picture WhatsApp says is gone.
+/// Two resolutions committed out of order must not store the older one last.
+///
+/// The two pictures come from separate tasks, so their writes can reach the
+/// table in either order; the row keeps the higher `seq` regardless. Without
+/// this a restart would draw the picture that lost the race.
 #[tokio::test]
-async fn a_removed_picture_drops_its_descriptor() {
+async fn an_out_of_order_commit_does_not_store_the_older_picture() {
     let (_store, chat_store) = test_store().await;
+
+    // The newer resolution commits first, the older one second.
     chat_store
-        .record_avatar(&jid(PEER), "picture-1", "a-one")
+        .record_avatar(&jid(PEER), "picture-new", "a-new", 2)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    chat_store
+        .record_avatar(&jid(PEER), "picture-old", "a-old", 1)
         .unwrap();
     chat_store.flush().await.unwrap();
 
-    chat_store.clear_avatar(&jid(PEER)).unwrap();
-    chat_store.flush().await.unwrap();
-
-    assert!(
-        chat_store.avatar_descriptors().await.unwrap().is_empty(),
-        "the pointer outlived the picture it named"
+    let descriptors = chat_store.avatar_descriptors().await.unwrap();
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(
+        descriptors[0].picture_id, "picture-new",
+        "the stale resolution overwrote the newer one"
     );
 }
 
@@ -79,7 +87,7 @@ async fn a_removed_picture_drops_its_descriptor() {
 async fn no_source_url_is_stored() {
     let (_store, chat_store) = test_store().await;
     chat_store
-        .record_avatar(&jid(PEER), "picture-1", "a-one")
+        .record_avatar(&jid(PEER), "picture-1", "a-one", 1)
         .unwrap();
     chat_store.flush().await.unwrap();
 

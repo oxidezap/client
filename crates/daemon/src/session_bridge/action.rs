@@ -106,6 +106,12 @@ impl Action {
                 | Self::MarkStatusWatched(_)
                 | Self::LoadMessages { .. }
                 | Self::LoadChats { .. }
+                // Local, and only local: it forgets what the resolver knows and
+                // asks for a pass. The pass needs the network and tolerates
+                // not having it, so refusing this offline would lose the reset
+                // rather than defer it — the descriptors would keep pointing
+                // at bytes the clear just removed.
+                | Self::RefreshAvatars
                 // A group's members, too: the connection holds that list
                 // because sending needs one, so the common answer is a read
                 // of what is already held. Gating it on the network would

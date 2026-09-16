@@ -403,6 +403,29 @@ fn a_resolved_picture_is_the_only_thing_that_starts_a_fetch() {
     );
 }
 
+/// An empty picture id is not evidence of removal.
+///
+/// The library folds "no picture", "unchanged", a partial response and *not
+/// authorized* into one `Ok(None)`, so a session that sent an empty id is
+/// saying "nothing definite", not "gone". Treating it as removal would let a
+/// privacy refusal erase a valid avatar, so the daemon must not act on it.
+#[test]
+fn an_ambiguous_picture_answer_starts_nothing() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::AvatarsResolved {
+        resolutions: vec![oxidezap_core::AvatarResolution {
+            jid: "1@s.whatsapp.net".into(),
+            picture_id: String::new(),
+            source: None,
+        }],
+    });
+
+    assert!(
+        !crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
+        "an answer that says nothing definite must not change what the chat shows"
+    );
+}
+
 /// A front end reacts to what it is told the instant it is told, and the
 /// runtime is multithreaded. Publishing before applying lets a `MarkRead`
 /// racing a message find a hub that has not seen it — refused as stale,

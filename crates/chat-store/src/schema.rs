@@ -108,6 +108,7 @@ diesel::table! {
         picture_id -> Text,
         cache_key -> Text,
         updated_at_ms -> BigInt,
+        seq -> BigInt,
     }
 }
 

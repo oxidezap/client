@@ -56,6 +56,7 @@ use std::sync::Arc;
 
 use log::{debug, error, info, warn};
 use oxidezap_chat_store::ChatStore;
+use portable_atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
@@ -227,48 +228,48 @@ impl AvatarRecorder {
 
     /// Point `jid` at `picture_id`, whose bytes are cached under `cache_key`.
     ///
-    /// Called only once the bytes have landed. The order is the whole point:
-    /// a descriptor naming a cache key that holds nothing is the restart
-    /// failure the table exists to prevent.
-    pub fn record(&self, jid: String, picture_id: String, cache_key: String) {
-        let session = self.session.clone();
-        crate::exec::spawn(async move {
-            let Some(live) = session.lock().await.clone() else {
-                // No session to record into: an account change or a teardown
-                // raced the fetch. The bytes stay cached and the next connect
-                // rediscovers them; writing nothing is the honest answer.
-                return;
-            };
-            let Ok(jid) = jid.parse::<Jid>() else {
-                warn!("cannot record an avatar against an unparseable address");
-                return;
-            };
-            let store = &live.chat_store;
-            if let Err(e) = store.record_avatar(&jid, picture_id, cache_key) {
-                warn!("could not publish the avatar descriptor: {e}");
-            } else if let Err(e) = store.flush().await {
+    /// Called only once the bytes have landed, and awaited: the descriptor
+    /// must be committed before the picture is published, or a reader can be
+    /// told about bytes the durable store does not yet point at. The writer
+    /// queue orders the write, and `flush` is what turns "queued" into
+    /// "committed".
+    ///
+    /// `seq` is the resolution's order, not the write's. It is what keeps two
+    /// rapid pictures from being stored backwards when their commits arrive
+    /// out of order; the store keeps the higher one.
+    ///
+    /// Answers whether the row committed. A caller publishes on `true` and
+    /// stays quiet on `false`, so a failed write is not announced as a
+    /// picture that will survive a restart.
+    pub async fn record(
+        &self,
+        jid: String,
+        picture_id: String,
+        cache_key: String,
+        seq: u64,
+    ) -> bool {
+        let Some(live) = self.session.lock().await.clone() else {
+            // No session to record into: an account change or a teardown
+            // raced the fetch. The bytes stay cached and the next connect
+            // rediscovers them; writing nothing is the honest answer.
+            return false;
+        };
+        let Ok(jid) = jid.parse::<Jid>() else {
+            warn!("cannot record an avatar against an unparseable address");
+            return false;
+        };
+        let store = &live.chat_store;
+        if let Err(e) = store.record_avatar(&jid, picture_id, cache_key, seq) {
+            warn!("could not publish the avatar descriptor: {e}");
+            return false;
+        }
+        match store.flush().await {
+            Ok(()) => true,
+            Err(e) => {
                 warn!("the avatar descriptor did not commit: {e}");
+                false
             }
-        });
-    }
-
-    /// Drop `jid`'s descriptor, because WhatsApp says it has no picture.
-    pub fn clear(&self, jid: String) {
-        let session = self.session.clone();
-        crate::exec::spawn(async move {
-            let Some(live) = session.lock().await.clone() else {
-                return;
-            };
-            let Ok(jid) = jid.parse::<Jid>() else {
-                return;
-            };
-            let store = &live.chat_store;
-            if let Err(e) = store.clear_avatar(&jid) {
-                warn!("could not drop the avatar descriptor: {e}");
-            } else if let Err(e) = store.flush().await {
-                warn!("the avatar removal did not commit: {e}");
-            }
-        });
+        }
     }
 }
 
@@ -319,21 +320,33 @@ struct Shared {
     history_budget: Arc<ui_queue::HistoryBudget>,
 }
 
-/// Asking the avatar resolver for a pass, and whether it must forget first.
+/// Asking the avatar resolver for a pass.
 ///
-/// The two travel together, so they are one value: a plain pass asks about
-/// chats nothing is known about, and a reset pass throws away what *is* known
-/// because the bytes those keys named are gone (a cleared media cache). Two
-/// separate handles could be observed one without the other.
+/// Explicit state rather than one notification, because the three kinds of ask
+/// mean different things and a bare wake-up cannot carry which one it was. The
+/// flags are what coalesce: ten `request()` calls while a pass runs are one
+/// `full` bit, and ten named chats are one set.
 ///
-/// An explicit ask may also name chats, which is how a page past the store's
-/// read window gets its pictures: the connect pass reads a bounded list, and a
-/// chat that only arrives later is one that list never held.
+/// A new connection is a new generation. Resolution memory is cleared with it,
+/// which is what revalidates pictures that changed while the process was
+/// offline: a chat resolved against the previous socket must be looked at once
+/// more, and the pass that follows `Connected` is that look.
 #[derive(Clone, Default)]
 pub(super) struct AvatarResolveSignal {
     ask: Arc<tokio::sync::Notify>,
-    reset: Arc<portable_atomic::AtomicBool>,
-    named: Arc<std::sync::Mutex<Vec<String>>>,
+    state: Arc<std::sync::Mutex<PendingResolve>>,
+    generation: Arc<AtomicU64>,
+}
+
+/// What asks are outstanding, under one lock so they are taken atomically.
+#[derive(Default)]
+struct PendingResolve {
+    /// A pass over the account's stored chat list.
+    full: bool,
+    /// Forget what earlier passes resolved before the next pass.
+    reset: bool,
+    /// Chats named by a page, whether or not the stored window holds them.
+    named: Vec<String>,
 }
 
 impl AvatarResolveSignal {
@@ -341,41 +354,98 @@ impl AvatarResolveSignal {
         Self::default()
     }
 
+    /// A connection was established: revalidate once, at this new generation.
+    ///
+    /// The generation bump alone is the revalidation: every chat's remembered
+    /// answer is from the previous socket and no longer counts, so the pass
+    /// that follows looks at each one again. This is what catches a picture
+    /// changed while the process was offline.
+    pub(super) fn new_connection(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.set(|pending| pending.full = true);
+    }
+
     /// Ask for a pass over what is not yet known.
+    ///
+    /// Only a test asks directly: production asks through
+    /// [`new_connection`](Self::new_connection), which also advances the
+    /// generation.
+    #[cfg(test)]
     pub(super) fn request(&self) {
-        self.ask.notify_one();
+        self.set(|pending| pending.full = true);
     }
 
     /// Ask for a pass that forgets what is known, because its bytes are gone.
     pub(super) fn reset(&self) {
-        self.reset.store(true, portable_atomic::Ordering::SeqCst);
-        self.ask.notify_one();
+        self.set(|pending| {
+            pending.reset = true;
+            pending.full = true;
+        });
     }
 
-    /// Ask about these chats specifically, whether or not the store's read
-    /// window covers them.
+    /// Ask about these chats specifically.
     pub(super) fn request_named(&self, jids: impl IntoIterator<Item = String>) {
+        self.set(|pending| pending.named.extend(jids));
+    }
+
+    fn set(&self, change: impl FnOnce(&mut PendingResolve)) {
         {
-            let mut named = self.named.lock().unwrap_or_else(|e| e.into_inner());
-            named.extend(jids);
+            let mut pending = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            change(&mut pending);
         }
         self.ask.notify_one();
     }
 
-    /// Take the pending reset and named chats, and wait for the next ask.
+    /// The current connection generation, for a test that checks a bump.
+    #[cfg(test)]
+    pub(super) fn next_generation_for_test(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Wait for an ask, and take what it carried.
     ///
-    /// Answers `(reset, named)`. Waits rather than returning empty when only a
-    /// reset flag was set, so a caller never spins.
-    pub(super) async fn next(&self) -> (bool, Vec<String>) {
+    /// A bare `request()` is the `full` bit, which is the piece the old
+    /// notification lost: answering "wake up" alone left the caller with
+    /// nothing outstanding and it went straight back to waiting.
+    pub(super) async fn next(&self) -> ResolveRequest {
         loop {
-            let reset = self.reset.swap(false, portable_atomic::Ordering::SeqCst);
-            let named = std::mem::take(&mut *self.named.lock().unwrap_or_else(|e| e.into_inner()));
-            if reset || !named.is_empty() {
-                return (reset, named);
+            let taken = {
+                let mut pending = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let taken = ResolveRequest {
+                    full: pending.full,
+                    reset: pending.reset,
+                    named: std::mem::take(&mut pending.named),
+                    generation: self.generation.load(Ordering::SeqCst),
+                };
+                pending.full = false;
+                pending.reset = false;
+                taken
+            };
+            if taken.full || taken.reset || !taken.named.is_empty() {
+                return taken;
             }
             self.ask.notified().await;
         }
     }
+}
+
+/// One pass's worth of asks, taken from the signal together.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ResolveRequest {
+    /// Cover the stored chat list.
+    pub(super) full: bool,
+    /// Forget what earlier passes resolved first.
+    pub(super) reset: bool,
+    /// Chats named by a page.
+    pub(super) named: Vec<String>,
+    /// The connection this ask was made under.
+    pub(super) generation: u64,
 }
 
 /// WhatsApp client wrapper that manages the connection and provides
@@ -1175,9 +1245,11 @@ impl WhatsAppClient {
                 // fresh connection is exactly when a metadata refresh is worth
                 // making: the durable descriptors already drew every known
                 // avatar from the cache, and this picks up whatever changed
-                // while the process was away.
+                // while the process was away. It also advances the resolution
+                // generation, so the previous socket's answers do not stand
+                // in for this one's.
                 if let Some(resolve) = resolve_avatars {
-                    resolve.request();
+                    resolve.new_connection();
                 }
                 let _ = ui_tx.send(UiEvent::Connected);
                 // Who this device is linked as. Read from the device store

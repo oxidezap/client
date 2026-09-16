@@ -1133,6 +1133,59 @@ impl ChatStore {
             .collect())
     }
 
+    /// The durable avatar descriptors for these chats, in one read.
+    ///
+    /// The narrowed sibling of [`avatar_descriptors`](Self::avatar_descriptors),
+    /// for the case that actually happens: a scoped reload is a receipt or an
+    /// ack about one chat, and reading the whole account's descriptors to look
+    /// up one row is a full scan and a hash map per acknowledgement. Batched
+    /// the way every other keyed read here is, so the parameter ceiling is the
+    /// same one.
+    ///
+    /// Keys are compared as stored: `jid.to_string()` on both sides, which is
+    /// what the writer files and what a hydrated chat carries.
+    pub async fn avatar_descriptors_for(&self, jids: &[String]) -> Result<Vec<AvatarDescriptor>> {
+        use schema::avatar_descriptors::dsl;
+        let device_id = self.device_id();
+        let keys = jids.to_vec();
+        let rows: Vec<(String, String, String, i64)> = self
+            .db()
+            .read(move |conn| {
+                let mut rows = Vec::new();
+                for page in keys.chunks(BIND_CHUNK) {
+                    rows.extend(
+                        dsl::avatar_descriptors
+                            .filter(
+                                dsl::device_id
+                                    .eq(device_id)
+                                    .and(dsl::jid.eq_any(page.to_vec())),
+                            )
+                            .select((
+                                dsl::jid,
+                                dsl::picture_id,
+                                dsl::cache_key,
+                                dsl::updated_at_ms,
+                            ))
+                            .load(conn)
+                            .map_err(db_err)?,
+                    );
+                }
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(jid, picture_id, cache_key, updated_at_ms)| AvatarDescriptor {
+                    jid: parse_jid(&jid),
+                    picture_id,
+                    cache_key,
+                    updated_at: ms_to_utc(updated_at_ms).unwrap_or_default(),
+                },
+            )
+            .collect())
+    }
+
     pub async fn contact(&self, jid: &Jid) -> Result<Option<ContactEntry>> {
         use schema::contacts::dsl;
         let device_id = self.device_id();

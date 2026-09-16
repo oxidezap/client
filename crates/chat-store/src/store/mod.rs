@@ -106,14 +106,16 @@ pub(crate) enum WriterMsg {
     /// Written only after the bytes have landed: pointing a durable row at a
     /// cache key that holds nothing is exactly the restart failure this table
     /// exists to prevent.
+    ///
+    /// `seq` is the resolution's order, and it is what keeps two rapid
+    /// pictures from being stored backwards: their commits come from separate
+    /// tasks and can reach here in either order, so the row keeps the newer
+    /// resolution rather than the later write.
     Avatar {
         jid: Jid,
         picture_id: String,
         cache_key: String,
-    },
-    /// Drop a chat's descriptor, because WhatsApp says it has no picture.
-    AvatarCleared {
-        jid: Jid,
+        seq: u64,
     },
     // String, not StoreError: one batch outcome fans out to many waiters and
     // StoreError is not Clone.
@@ -388,6 +390,10 @@ impl ChatStore {
     /// prevent. Never stores the signed source URL, which expires and is a
     /// credential besides; the bytes stay in the media cache.
     ///
+    /// `seq` orders the resolution. Two pictures can be resolved moments
+    /// apart and their commits can arrive out of order, so the row keeps the
+    /// higher `seq` rather than the later write; see `store::avatar::upsert`.
+    ///
     /// Through the writer queue like every other write; use
     /// [`flush`](Self::flush) to await completion.
     pub fn record_avatar(
@@ -395,25 +401,15 @@ impl ChatStore {
         jid: &Jid,
         picture_id: impl Into<String>,
         cache_key: impl Into<String>,
+        seq: u64,
     ) -> Result<()> {
         self.tx
             .send(WriterMsg::Avatar {
                 jid: jid.clone(),
                 picture_id: picture_id.into(),
                 cache_key: cache_key.into(),
+                seq,
             })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
-    }
-
-    /// Record that a chat has no picture, dropping any descriptor it had.
-    ///
-    /// A picture that was removed server-side must not leave a durable row
-    /// pointing at bytes the account no longer shows: the next start would
-    /// draw a picture WhatsApp says is gone. The cached bytes are left for the
-    /// budget sweep; only the pointer goes.
-    pub fn clear_avatar(&self, jid: &Jid) -> Result<()> {
-        self.tx
-            .send(WriterMsg::AvatarCleared { jid: jid.clone() })
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 

@@ -12,11 +12,19 @@
 -- it expires, and persisting it would be storing a credential in the clear.
 -- The bytes never live here either; they stay in the media cache under
 -- `cache_key`.
+--
+-- `seq` orders writes. Two pictures can be resolved in quick succession and
+-- their two commits can reach this table out of order, because they come from
+-- separate tasks; without an order carried in the row, the stale one can land
+-- last and a restart would then draw the picture that lost. The writer only
+-- accepts a `seq` greater than the row's, so the newest resolution is the one
+-- that survives regardless of commit order.
 CREATE TABLE avatar_descriptors (
     device_id       INTEGER NOT NULL,
     jid             TEXT NOT NULL,
     picture_id      TEXT NOT NULL,
     cache_key       TEXT NOT NULL,
     updated_at_ms   BIGINT NOT NULL,
+    seq             BIGINT NOT NULL,
     PRIMARY KEY (device_id, jid)
 );
