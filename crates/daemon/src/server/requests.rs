@@ -189,7 +189,14 @@ pub(super) async fn handle_request(
             )
             .await
         }
-        ClientRequest::ForgetSession => acted(dispatch(hub, commands, Action::ForgetSession).await),
+        ClientRequest::ForgetSession => acted(
+            dispatch(
+                hub,
+                commands,
+                Action::ForgetSession(crate::session_bridge::AccountDisposition::Reset),
+            )
+            .await,
+        ),
         ClientRequest::MarkRead(request) => {
             acted(dispatch(hub, commands, Action::MarkRead(request)).await)
         }

@@ -811,7 +811,9 @@ async fn a_client_that_asked_for_events_receives_them() {
 /// on a connection refuses it exactly when it is wanted.
 #[test]
 fn the_local_actions_do_not_need_a_connection() {
-    assert!(!Action::ForgetSession.needs_network());
+    assert!(
+        !Action::ForgetSession(crate::session_bridge::AccountDisposition::Reset).needs_network()
+    );
     assert!(!Action::ReloadHistory.needs_network());
     // A view is one local row and no stanza, over history a disconnected
     // window can still read — and the ring it watched is already drawn.

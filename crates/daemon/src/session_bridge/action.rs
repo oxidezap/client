@@ -68,9 +68,35 @@ pub enum Action {
         request: oxidezap_ipc::GroupMembers,
         answer_to: Outbox,
     },
-    /// Wipe local state so the user can pair again. The daemon owns the store
-    /// file, so it is the only process that may delete it.
-    ForgetSession,
+    /// Wipe local state so the user can pair again, or retire the account for
+    /// good. The daemon owns the store, so it is the only process that may
+    /// purge it. See [`AccountDisposition`] for what each choice leaves
+    /// behind.
+    ForgetSession(AccountDisposition),
+}
+
+/// What a session's teardown leaves the account in.
+///
+/// The two lifecycle mutations the plan's control plane exposes
+/// (`ResetAccount`/`RemoveAccount`) and a client's own "clear data and pair
+/// again" all end the same run loop the same way — stop, close the session,
+/// join the plugins, stop the publisher, retire the plugin approvals — and
+/// differ only in the one storage call at the end and in whether the account
+/// is worth restarting afterwards. Carrying that choice through
+/// [`Action::ForgetSession`] rather than adding a second, near-identical
+/// action keeps that shared teardown written once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountDisposition {
+    /// Wipe local state, keep the id, and expect to be paired again — a
+    /// client's own "clear data and pair again", and what `ResetAccount`
+    /// asks a running account to do to itself. The daemon respawns a fresh
+    /// runtime under the same id once this one has fully stopped.
+    Reset,
+    /// Wipe local state and retire the id for good — what `RemoveAccount`
+    /// asks a running account to do to itself. The daemon drops the runtime
+    /// from the registry once this one has fully stopped, and the id is
+    /// never reissued (WR-1's `AUTOINCREMENT` allocation).
+    Remove,
 }
 
 impl Action {
@@ -95,7 +121,7 @@ impl Action {
             self,
             Self::ReloadHistory
                 | Self::RefreshVideo
-                | Self::ForgetSession
+                | Self::ForgetSession(_)
                 | Self::MarkStatusWatched(_)
                 | Self::LoadMessages { .. }
                 | Self::LoadChats { .. }

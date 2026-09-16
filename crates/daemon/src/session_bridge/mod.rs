@@ -33,7 +33,7 @@ mod translate;
 #[cfg(test)]
 mod tests;
 
-pub use action::{Action, CommandOutcome, Commands, Outbox, SessionCommand};
+pub use action::{AccountDisposition, Action, CommandOutcome, Commands, Outbox, SessionCommand};
 pub(crate) use externalize::externalize_media;
 
 use act::MAX_IN_FLIGHT;
@@ -47,6 +47,12 @@ use translate::Answer;
 #[derive(Clone, Debug)]
 pub struct RuntimeLifecycle {
     stopping: Arc<AtomicBool>,
+    /// Set once, by whichever [`Action::ForgetSession`] stops this runtime.
+    /// Read after `run()` returns by the supervisor that spawned it, which
+    /// decides from this alone whether to respawn the id (`Reset`), drop it
+    /// for good (`Remove`), or do neither — a session that ended on its own,
+    /// or a process-wide shutdown, leaves this `None`.
+    disposition: Arc<Mutex<Option<AccountDisposition>>>,
 }
 
 impl RuntimeLifecycle {
@@ -54,6 +60,7 @@ impl RuntimeLifecycle {
     pub fn new() -> Self {
         Self {
             stopping: Arc::new(AtomicBool::new(false)),
+            disposition: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -64,6 +71,34 @@ impl RuntimeLifecycle {
     #[must_use]
     pub fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst)
+    }
+
+    /// Record why this runtime is stopping, and mark it stopping at the same
+    /// time — the two always go together, so there is nowhere to set one
+    /// without the other.
+    ///
+    /// The first call wins: a runtime already stopping for one reason cannot
+    /// be redirected to a second one by a request that arrives after it.
+    pub fn set_disposition(&self, disposition: AccountDisposition) {
+        let mut slot = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(disposition);
+        }
+        drop(slot);
+        self.mark_stopping();
+    }
+
+    /// What this runtime's teardown should do to storage, if anything was
+    /// asked before it stopped.
+    #[must_use]
+    pub fn disposition(&self) -> Option<AccountDisposition> {
+        *self
+            .disposition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -145,9 +180,10 @@ pub async fn run(
             command = commands.recv(), if !commands_closed => match command {
                 Some(command) => {
                     bridge.execute(&client, command).await;
-                    // Asked to forget: stop here so the teardown below runs
-                    // before anything deletes the file it is closing.
-                    if bridge.forget {
+                    // Asked to stop and be reset or removed: stop here so the
+                    // teardown below runs before anything touches the row
+                    // it is closing.
+                    if bridge.lifecycle.disposition().is_some() {
                         break;
                     }
                 }
@@ -157,12 +193,18 @@ pub async fn run(
         }
     }
 
+    // Read once and carried by value from here on: nothing after this can
+    // change it (the command channel is about to be dropped), and a `Copy`
+    // enum is simpler to match on than a method call at every site that used
+    // to read `bridge.forget`.
+    let disposition = bridge.lifecycle.disposition();
+
     // Reached whether the session ended on its own or a signal arrived.
     //
     // Both of the things that would panic here — a join that blocks and the
     // drop of a tokio runtime inside an async context — belong to the client
     // rather than to this loop, so it does them: see `WhatsAppClient::close`.
-    let grace = if bridge.forget {
+    let grace = if disposition.is_some() {
         FORGET_GRACE
     } else {
         SHUTDOWN_GRACE
@@ -256,13 +298,13 @@ pub async fn run(
     // not the same as being finished, so refusing here leaves the old account
     // intact rather than racing it: intact is a state the user can act on
     // again, and a purge run underneath a live writer is not.
-    if bridge.forget && !closed {
+    if disposition.is_some() && !closed {
         log::error!(
             "local state was NOT reset: the session is still closing, and resetting the \
              account from under it could let it repopulate what the reset just cleared. \
              Start oxidezap again and repeat \"clear data and pair again\"."
         );
-    } else if bridge.forget && !approvals_retired(account_id) {
+    } else if disposition.is_some() && !approvals_retired(account_id) {
         // The same refusal as above and for the same reason. What must not
         // outlive this account is the record of what its owner allowed: reset
         // the credentials first and fail this afterwards, and the next
@@ -277,16 +319,21 @@ pub async fn run(
              cleared, and resetting now would let them outlive the account that granted them. \
              Start oxidezap again and repeat \"clear data and pair again\"."
         );
-    } else if bridge.forget {
+    } else if let Some(disposition) = disposition {
         // Purges this account's rows — upstream's and, through the
-        // `ON DELETE CASCADE` the chat-store migration adds, this crate's own
-        // — and recreates the `device` row under the same id with fresh keys.
+        // `ON DELETE CASCADE` the chat-store migration adds, this crate's own.
         // Never the whole-file wipe a single-account daemon used: the shared
         // database holds every other local account too, and deleting it would
         // take them down with this one.
-        match stores_for_reset.reset_account(account_id).await {
-            Ok(()) => log::info!("account {} reset; pair again", account_id.get()),
-            Err(e) => log::error!("could not reset account {}: {e}", account_id.get()),
+        match disposition {
+            AccountDisposition::Reset => match stores_for_reset.reset_account(account_id).await {
+                Ok(()) => log::info!("account {} reset; pair again", account_id.get()),
+                Err(e) => log::error!("could not reset account {}: {e}", account_id.get()),
+            },
+            AccountDisposition::Remove => match stores_for_reset.remove_account(account_id).await {
+                Ok(()) => log::info!("account {} removed", account_id.get()),
+                Err(e) => log::error!("could not remove account {}: {e}", account_id.get()),
+            },
         }
         // A plugin's own settings are this account's data too — an
         // autoreply's "already answered these people" is a list of people —
@@ -361,9 +408,6 @@ struct Bridge {
     publisher: Option<crate::publisher::Handle>,
     reads: Arc<Mutex<ReadTracker>>,
     in_flight: Arc<Semaphore>,
-    /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
-    /// and wipes once the session has let go of the store.
-    forget: bool,
 }
 
 impl Bridge {
@@ -392,7 +436,6 @@ impl Bridge {
             publisher: Some(publisher),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
-            forget: false,
         }
     }
 

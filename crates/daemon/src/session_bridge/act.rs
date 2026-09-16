@@ -617,16 +617,19 @@ impl Bridge {
                 client.request_video_keyframe();
                 CommandOutcome::Accepted
             }
-            // Deferred rather than done here, because the file to delete is
+            // Deferred rather than done here, because the file to purge is
             // the one the session still has open. The event loop already ends
-            // by disconnecting and closing SQLite; the wipe belongs after
-            // that, and reusing that path is what makes the ordering hold.
-            Action::ForgetSession => {
-                self.forget = true;
+            // by disconnecting and closing SQLite; the storage call belongs
+            // after that, and reusing that path is what makes the ordering
+            // hold for both a reset and a removal.
+            Action::ForgetSession(disposition) => {
                 // Said out loud, because somebody else has to hear it: on a
                 // page a front end reconnects the instant it sends this, and
                 // whatever answers must not be the session that is leaving.
-                self.lifecycle.mark_stopping();
+                // `set_disposition` marks stopping itself, and the first call
+                // wins — a runtime already stopping keeps the reason it was
+                // first asked to stop for.
+                self.lifecycle.set_disposition(disposition);
                 CommandOutcome::Accepted
             }
         }
