@@ -49,6 +49,11 @@ whether it reads or writes, so a variant cannot be born permissive by
 accident. Mutations need a connected account; reads work offline against
 the local store.
 
+`accounts add` and `accounts remove` run locally, before any handshake, so
+the daemon never sees them; `--read-only` refuses both in the client with
+`read_only_violation`. Without that the flag would still permit the one
+command that deletes a profile's store.
+
 ## Accounts
 
 One account is one daemon over one store: separate socket, lock, database
@@ -87,10 +92,11 @@ the forward page.
 
 ## Events
 
-`sync` prints the current status and exits. `sync --follow` follows the
-event stream as NDJSON. Receipts, reactions and call stages have no event
-spelling — poll or re-list for those. The follower skips lines it cannot
-parse; only EOF ends it.
+`sync` prints the current status and exits. `sync --follow` asks the daemon
+for session events in its handshake and follows the stream as NDJSON.
+Receipts, reactions and call stages have no event spelling — poll or re-list
+for those. The follower skips lines it cannot parse; EOF ends it cleanly and
+a transport error is reported with a nonzero exit.
 
 ## Examples
 

@@ -469,11 +469,30 @@ pub fn endpoint_path_for_account(id: &str) -> Option<PathBuf> {
     {
         Some(state_dir()?.join(format!("daemon-{clean}.sock")))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // The id the caller named, never the one in the environment: a caller
+        // that says `work` must get `work`'s pipe whatever profile the shell
+        // had selected. Delegating to `endpoint_path` would read
+        // `OXIDEZAP_ACCOUNT`, so `accounts remove work` could resolve the pipe
+        // of whoever was selected instead.
+        Some(account_pipe_name(&clean, &user_suffix()?))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = clean;
-        endpoint_path()
+        None
     }
+}
+
+/// A named pipe's name for one account, given the user's SID suffix.
+///
+/// Split out so the id's part in the name is testable on every platform: the
+/// bug this replaced ignored the id outright and read the profile from the
+/// environment. Windows-only in effect, but pure and platform-free in shape.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn account_pipe_name(clean: &str, user: &str) -> PathBuf {
+    PathBuf::from(format!(r"\\.\pipe\{DIR_NAME}-{user}-{clean}"))
 }
 
 /// Only a Unix endpoint is a file with a name: Windows listens on a named
@@ -634,6 +653,26 @@ mod tests {
         assert_eq!(
             path.file_name().and_then(|n| n.to_str()),
             Some("daemon-work.sock")
+        );
+    }
+
+    /// The pipe name carries the id the caller asked for, not whichever
+    /// profile is selected in the environment.
+    ///
+    /// The Windows branch used to fall back to `endpoint_path()`, which reads
+    /// `OXIDEZAP_ACCOUNT`: `accounts remove work` could resolve the pipe of
+    /// the currently selected account and wipe the wrong store.
+    #[test]
+    fn an_account_pipe_name_carries_the_id_it_was_given() {
+        let work = account_pipe_name("work", "S-1-5-21");
+        let other = account_pipe_name("other", "S-1-5-21");
+        assert_ne!(work, other, "two ids must not share one pipe");
+        let name = work.to_string_lossy();
+        assert!(name.starts_with(r"\\.\pipe\"), "not a pipe name: {name}");
+        assert!(name.ends_with("-work"), "the id is not in the name: {name}");
+        assert!(
+            name.contains("S-1-5-21"),
+            "the name is machine-wide, so it has to say whose it is: {name}"
         );
     }
 

@@ -144,6 +144,30 @@ fn main() -> ExitCode {
 
     // Local-only account management, which owns its own connection semantics.
     if let Commands::Accounts(accounts) = &command {
+        // Refused here, before anything is spawned or wiped. These run their
+        // own local operations and never reach a daemon, so neither
+        // `ClientRequest::access` nor the daemon-side gate can see them:
+        // `accounts remove` would otherwise delete a store under a read-only
+        // connection. A mutation the client performs itself is a mutation the
+        // client has to refuse itself.
+        if cli.read_only
+            && matches!(
+                accounts.command,
+                Some(args::AccountsSubcommand::Add(_) | args::AccountsSubcommand::Remove(_))
+            )
+        {
+            let what = if matches!(accounts.command, Some(args::AccountsSubcommand::Remove(_))) {
+                "accounts remove"
+            } else {
+                "accounts add"
+            };
+            print_error(
+                output_mode,
+                "read_only_violation",
+                &format!("{what} mutates local state and is refused by --read-only"),
+            );
+            return ExitCode::from(1);
+        }
         match &accounts.command {
             Some(args::AccountsSubcommand::Add(add)) => {
                 return match account_add(&add.id, output_mode) {
@@ -197,12 +221,19 @@ fn main() -> ExitCode {
     };
     let mut client = client;
 
+    // The session stream is opt-in and must be asked for in the handshake, so
+    // `sync --follow` has to say so here rather than when it starts reading:
+    // `--events` is the flag that names it, but a follower that did not also
+    // pass it would otherwise subscribe to summaries and wait forever for
+    // events the daemon was never asked to publish.
+    let session_events = cli.events || matches!(&command, Commands::Sync(sync) if sync.follow);
+
     // Perform handshake
     let handshake_req = ClientRequest::Hello {
         protocol: CURRENT_PROTOCOL_VERSION,
         client_name: "oxidezap-cli".into(),
         read_only: cli.read_only,
-        session_events: cli.events,
+        session_events,
     };
 
     if let Err(err) = client.request(handshake_req) {
@@ -799,17 +830,27 @@ fn execute_command(
                         before: before.clone(),
                         after: None,
                     })?;
-                    let DaemonResponse::Messages { messages, .. } = resp else {
+                    let DaemonResponse::Messages {
+                        messages,
+                        next_cursor,
+                    } = resp
+                    else {
                         break;
                     };
                     if messages.is_empty() {
                         break;
                     }
-                    before = messages.first().map(|m| m.id.clone());
-                    let reached_start = messages.len() < want;
                     exported.extend(messages);
-                    if reached_start {
-                        break;
+                    // The cursor the daemon wrote, never a message id: the two
+                    // are different strings, and the id does not parse back
+                    // into the position a page was read from. `None` is the
+                    // start of the conversation, and an export that has what it
+                    // asked for stops regardless.
+                    match next_cursor {
+                        Some(cursor) if exported.len() < e.limit => {
+                            before = Some(cursor.as_str().to_string());
+                        }
+                        _ => break,
                     }
                 }
                 exported.reverse();
@@ -1687,12 +1728,41 @@ fn execute_command(
             Ok(())
         }
         Commands::Sync(sync) => {
-            if sync.follow {
-                if output_mode == OutputMode::Human {
-                    eprintln!("Following events stream (Ctrl+C to stop)...");
+            if !sync.follow {
+                // The documented contract: `sync` reports where the account
+                // stands and exits. It used to print nothing and return
+                // success, which is the one thing a status command must not
+                // do — a script cannot tell "connected" from "did nothing".
+                let resp = client.request(ClientRequest::GetStatus)?;
+                if let DaemonResponse::Status(status) = resp {
+                    print_result(output_mode, &status, |s| {
+                        println!("Connection: {}", s.state);
+                        if let Some(name) = &s.name {
+                            println!("Name:       {name}");
+                        }
+                        if let Some(jid) = &s.jid {
+                            println!("JID:        {jid}");
+                        }
+                    });
                 }
-                while let Ok(Some(event)) = client.next_event() {
-                    print_event(&event);
+                return Ok(());
+            }
+            if output_mode == OutputMode::Human {
+                eprintln!("Following events stream (Ctrl+C to stop)...");
+            }
+            // A transport error is not the end of the stream: EOF ends it, and
+            // a failed read is a failure to report. Collapsing the two into
+            // "stop, exit zero" told a script its follow had finished cleanly
+            // when the daemon had in fact gone away under it.
+            loop {
+                match client.next_event() {
+                    Ok(Some(event)) => print_event(&event),
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(oxidezap_wire::ApiError::not_connected(format!(
+                            "event stream ended: {e}"
+                        )));
+                    }
                 }
             }
             Ok(())

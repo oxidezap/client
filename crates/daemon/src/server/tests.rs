@@ -656,6 +656,77 @@ async fn a_client_that_asked_for_events_receives_them() {
     served.abort();
 }
 
+/// A wire client has no snapshot flow, so a lag is recovered by reconnecting
+/// and not by asking for state. It used to be sent a legacy `Resync` — which
+/// has no wire spelling, so it was dropped — and then gated on a `Snapshot`
+/// request the wire protocol cannot make, stopping its stream for good. The
+/// lag now ends the connection, which is the whole recovery.
+#[tokio::test]
+async fn a_wire_client_that_lags_is_disconnected_rather_than_stalled() {
+    use oxidezap_wire::envelope::RequestEnvelope;
+    use oxidezap_wire::request::ClientRequest as WireRequest;
+
+    let (mut client, server) = tokio::io::duplex(1024);
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let served = tokio::spawn(serve_client(
+        server,
+        Arc::clone(&hub),
+        no_plugins(),
+        commands,
+    ));
+
+    let wire_hello = serde_json::to_string(&RequestEnvelope {
+        id: 1,
+        request: WireRequest::Hello {
+            protocol: oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION,
+            client_name: "test".into(),
+            read_only: false,
+            session_events: false,
+        },
+    })
+    .unwrap();
+    client
+        .write_all(format!("{wire_hello}\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // the hello acknowledgement
+
+    // Overrun the broadcast ring without yielding, so the server's receiver is
+    // behind before it is ever polled.
+    for i in 0..2000 {
+        hub.apply(crate::state::Change::live(
+            oxidezap_ipc::DaemonEvent::ChatRemoved {
+                jid: format!("{i}@s.whatsapp.net"),
+            },
+        ));
+    }
+
+    // Drain to the end, asserting no legacy `Resync` reaches a wire client.
+    // Bounded by the frames the daemon can have written: the broadcast ring
+    // plus this overrun. A connection that stalled instead of closing would
+    // read forever, so the bound turns that into a failure rather than a hang.
+    let mut drained = 0usize;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                assert!(
+                    !line.contains("\"type\":\"resync\""),
+                    "a wire client was sent a legacy Resync: {line}"
+                );
+                drained += 1;
+                assert!(drained <= 2000, "the connection did not end after the lag");
+            }
+        }
+    }
+    served.abort();
+}
+
 /// Forgetting the session is the only way out of dead credentials, and
 /// dead credentials are a state the account is unreachable in. Gating it
 /// on a connection refuses it exactly when it is wanted.

@@ -264,7 +264,18 @@ where
                     // no longer trustworthy. Telling it to resync is the only
                     // correct answer; silently continuing would leave it with a
                     // state that never converges.
-                    log::debug!("client fell {missed} frames behind; asking it to resync");
+                    log::debug!("client fell {missed} frames behind");
+                    if attached.is_wire {
+                        // A wire client has no snapshot flow: `Resync` has no
+                        // wire spelling, `Snapshot` is a legacy request, and
+                        // gating this stream on an answer that can never come
+                        // stops its events for good. Ending the connection is
+                        // the whole recovery — the client reconnects and
+                        // re-reads, which is the only convergence it has.
+                        log::debug!("wire client cannot resync; closing so it reconnects");
+                        return Ok(());
+                    }
+                    log::debug!("asking it to resync");
                     let frame = serde_json::to_string(&DaemonMessage::Resync)?;
                     write_line(&mut writer, &frame).await?;
                     awaiting_resync = true;
@@ -296,6 +307,15 @@ where
                 // reattaches.
                 Err(RecvError::Lagged(missed)) => {
                     log::debug!("front end fell {missed} session events behind");
+                    if attached.is_wire {
+                        // Same answer as the summary stream, and for the same
+                        // reason: a `Resync` frame is a legacy shape with no
+                        // wire spelling, so sending it to a wire client is a
+                        // frame it silently drops and a gap it never learns
+                        // about. Closing makes the reconnect the recovery.
+                        log::debug!("wire client cannot resync; closing so it reconnects");
+                        return Ok(());
+                    }
                     let frame = serde_json::to_string(&DaemonMessage::Resync)?;
                     write_line(&mut writer, &frame).await?;
                 }

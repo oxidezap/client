@@ -293,3 +293,162 @@ fn raw_text_commands_still_run_by_default() {
         "export OXIDEZAP_ACCOUNT=work"
     );
 }
+
+/// `--read-only` refuses the local account mutations too.
+///
+/// `accounts add/remove` run in this process, before any handshake, so the
+/// daemon-side gate never sees them. A read-only pass that could still wipe a
+/// profile would be the promise broken by the one command it matters most for.
+#[test]
+fn read_only_refuses_local_account_mutations() {
+    for args in [
+        vec!["--read-only", "accounts", "add", "probe"],
+        vec!["--read-only", "accounts", "remove", "probe"],
+    ] {
+        let out = cli().args(&args).output().expect("run the cli");
+        assert_ne!(out.status.code(), Some(0), "allowed {args:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "{args:?} wrote to stdout under --read-only"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("read_only_violation"),
+            "expected a read-only refusal, got {stderr}"
+        );
+    }
+}
+
+/// `sync` without `--follow` reports status, which is what the docs promise.
+/// It must not silently succeed against a dead socket.
+#[test]
+fn sync_without_follow_reports_a_dead_daemon() {
+    let out = cli()
+        .args([
+            "--socket",
+            "/tmp/oxidezap-cli-test-nonexistent.sock",
+            "sync",
+        ])
+        .output()
+        .expect("run the cli");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// `messages export` continues from the daemon's `next_cursor`, never from a
+/// message id: the id and the cursor are different strings, and a follow-up
+/// `--before <id>` does not parse back into the position the page was read
+/// from, so a multi-page export skips or repeats rows.
+///
+/// A real daemon is not needed, only the shape of its answers: a socket that
+/// speaks the wire protocol well enough to page twice and records what the
+/// second request asked for.
+#[cfg(unix)]
+#[test]
+fn export_continues_from_the_daemon_cursor() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+
+    let dir = std::env::temp_dir().join(format!("oxidezap-cli-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let socket = dir.join("endpoint.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+
+    let cursor = "m1:1700000000000:3";
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorder = std::sync::Arc::clone(&seen);
+
+    /// One message, with every field `MessageDto` requires.
+    fn message(id: &str, ts: i64) -> String {
+        format!(
+            r#"{{"id":"{id}","chat_jid":"c@s.whatsapp.net","sender_jid":"c@s.whatsapp.net","from_me":false,"timestamp_ms":{ts},"text":null,"kind":"text","status":"sent","is_starred":false,"reply_to_id":null,"media":null,"reactions":[]}}"#
+        )
+    }
+
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        let mut writer = stream;
+        let mut line = String::new();
+
+        // Handshake: any request is answered with an Ack.
+        reader.read_line(&mut line).expect("hello");
+        writer
+            .write_all(b"{\"id\":1,\"status\":\"ok\",\"type\":\"ack\"}\n")
+            .expect("answer hello");
+
+        let mut page = 0;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).expect("request") == 0 {
+                break;
+            }
+            let request: serde_json::Value =
+                serde_json::from_str(&line).expect("a wire request envelope");
+            // Echo the id: a response is matched by the id it answers, and a
+            // fixed one would leave the second request waiting forever.
+            let id = request["id"].as_u64().unwrap_or(0);
+            let before = request["params"]["before"].as_str().map(str::to_string);
+            recorder
+                .lock()
+                .unwrap()
+                .push(before.clone().unwrap_or_default());
+
+            let (messages, next) = if page == 0 {
+                page = 1;
+                (
+                    format!(
+                        "[{}, {}, {}]",
+                        message("m-10", 1000),
+                        message("m-9", 900),
+                        message("m-8", 800)
+                    ),
+                    format!(r#""{cursor}""#),
+                )
+            } else {
+                (format!("[{}]", message("m-7", 700)), "null".to_string())
+            };
+
+            let answer = format!(
+                "{{\"id\":{id},\"status\":\"ok\",\"type\":\"messages\",\"data\":{{\"messages\":{messages},\"next_cursor\":{next}}}}}\n"
+            );
+            writer.write_all(answer.as_bytes()).expect("answer page");
+        }
+    });
+
+    let out = cli()
+        .args([
+            "--json",
+            "--socket",
+            socket.to_str().unwrap(),
+            "messages",
+            "export",
+            "c@s.whatsapp.net",
+            "--limit",
+            "4",
+        ])
+        .output()
+        .expect("run the cli");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server.join().expect("server thread");
+
+    assert!(out.status.success(), "export failed: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
+    assert_eq!(
+        parsed["data"].as_array().map(Vec::len),
+        Some(4),
+        "both pages were exported: {stdout}"
+    );
+
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2, "expected two pages: {requests:?}");
+    assert!(
+        requests[0].is_empty(),
+        "the first page starts at the newest"
+    );
+    assert_eq!(
+        requests[1], cursor,
+        "the second page must continue from the daemon cursor, not a message id"
+    );
+}
