@@ -6,11 +6,18 @@
 //! it publishes only a coalesced control snapshot, while account data remains
 //! on the runtime's own hub.
 //!
-//! This first slice intentionally keeps startup on `AccountId::LEGACY`. It is
-//! still useful now because the runtime boundary makes the next registry step
-//! additive, rather than forcing the single-account bridge to be duplicated.
+//! [`AccountSupervisor`] (native only) is what actually turns an id into a
+//! running [`AccountRuntime`] and back, including while the daemon is already
+//! up: the startup loop, `CreateAccount`'s spawn, and `ResetAccount`/
+//! `RemoveAccount`'s respawn-or-drop all go through it rather than each
+//! reimplementing the same construction `main.rs` used to do once, inline,
+//! for the one account a single-account daemon ever had.
 
 use std::collections::HashMap;
+#[cfg(not(target_family = "wasm"))]
+use std::future::Future;
+#[cfg(not(target_family = "wasm"))]
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -18,7 +25,7 @@ use oxidezap_core::AccountId;
 use oxidezap_ipc::{AccountOverview, AccountStatus, AccountsSnapshot};
 use tokio::sync::{mpsc, watch};
 
-use crate::session_bridge::{self, Commands, RuntimeLifecycle, SessionCommand};
+use crate::session_bridge::{self, AccountDisposition, Commands, RuntimeLifecycle, SessionCommand};
 use crate::state::StateHub;
 use oxidezap_session::StoreRegistry;
 
@@ -118,6 +125,19 @@ impl AccountRuntime {
     #[must_use]
     pub fn is_stopping(&self) -> bool {
         self.lifecycle.is_stopping()
+    }
+
+    /// What this runtime's teardown should do to storage, once it has one.
+    ///
+    /// `None` until an [`session_bridge::Action::ForgetSession`] lands on
+    /// this runtime's own command channel; read by [`AccountSupervisor`]
+    /// after `run()` returns, to decide whether to respawn this id (`Reset`),
+    /// drop it for good (`Remove`), or leave the runtime exactly as `run()`
+    /// left it (still `None` — a process-wide shutdown, or a session that
+    /// ended on its own).
+    #[must_use]
+    pub fn disposition(&self) -> Option<AccountDisposition> {
+        self.lifecycle.disposition()
     }
 
     /// Drive this account until its session ends or the supplied shutdown fires.
@@ -264,6 +284,253 @@ impl AccountRegistry {
         accounts.sort_by_key(|account| account.id.get());
         self.overview
             .send_replace(Arc::new(AccountsSnapshot { accounts }));
+    }
+}
+
+/// Builds, registers and drives account runtimes for as long as the daemon
+/// runs — not just the ones alive at startup.
+///
+/// `main.rs` used to assemble exactly one [`AccountRuntime`] inline and hand
+/// its `run()` future to a `select!` the whole process lived or died by: when
+/// that one account's session ended, so did the daemon. That was never a
+/// multi-account shape to begin with — a second account's crash or reset must
+/// not take the first down with it — so this owns the startup loop,
+/// `CreateAccount`'s spawn, and `ResetAccount`/`RemoveAccount`'s
+/// respawn-or-drop, all through the one `spawn` method below.
+///
+/// Native only: [`tokio::task::JoinSet`] requires every task it holds to be
+/// `Send`, and a page's own plugin host
+/// (`crate::plugins::web::start`) is built from `wasm-bindgen` closures that
+/// are deliberately not — there is exactly one thread in a browser tab, so
+/// nothing there needs to cross one. `embedded.rs` keeps building its one
+/// account inline for exactly that reason; the multi-account *web* registry
+/// the plan's section 8 asks for needs its own, `MaybeSend`-compatible
+/// supervision, not this one taught to tolerate `!Send`.
+#[cfg(not(target_family = "wasm"))]
+pub struct AccountSupervisor {
+    registry: Arc<AccountRegistry>,
+    stores: Arc<StoreRegistry>,
+    /// How many commands one account's channel may queue. Sized like the
+    /// client cap it can never exceed, exactly as `main.rs` sized its single
+    /// channel before this existed: a connection waits for its command's
+    /// answer before reading the next request, so at most one command per
+    /// connection is ever outstanding.
+    command_capacity: usize,
+    /// Every account task this supervisor has ever spawned, live or finished
+    /// but not yet reaped. A respawn (`Reset`) adds its replacement here
+    /// itself, so a caller that only ever enumerated accounts at startup
+    /// still eventually joins every one a reset or a `CreateAccount` added
+    /// later.
+    tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// What every spawned runtime's `run()` loop awaits alongside its own
+    /// command channel and event stream.
+    ///
+    /// Injectable rather than a direct call to `crate::shutdown::requested()`
+    /// inside [`Self::hold`], because that signal is a process-global
+    /// `'static` that only ever goes from unrequested to requested — a test
+    /// that asked for it would leave every later test in the same binary
+    /// unable to run an account to completion at all. Production supplies it
+    /// through [`Self::new`]; tests supply a signal scoped to themselves.
+    shutdown: Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl AccountSupervisor {
+    /// Build a supervisor over the daemon's one account registry and one
+    /// shared store registry, stopping every runtime it spawns on the same
+    /// process-wide signal `crate::shutdown::request` raises.
+    #[must_use]
+    pub fn new(
+        registry: Arc<AccountRegistry>,
+        stores: Arc<StoreRegistry>,
+        command_capacity: usize,
+    ) -> Arc<Self> {
+        Self::with_shutdown(registry, stores, command_capacity, || {
+            Box::pin(crate::shutdown::requested())
+        })
+    }
+
+    /// The same, with an explicit shutdown signal instead of the
+    /// process-global one. See [`Self::shutdown`] for why this exists
+    /// separately from [`Self::new`].
+    #[must_use]
+    pub fn with_shutdown<F, Fut>(
+        registry: Arc<AccountRegistry>,
+        stores: Arc<StoreRegistry>,
+        command_capacity: usize,
+        shutdown: F,
+    ) -> Arc<Self>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        Arc::new(Self {
+            registry,
+            stores,
+            command_capacity,
+            tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            shutdown: Arc::new(move || Box::pin(shutdown())),
+        })
+    }
+
+    /// Build, register and start driving a fresh runtime for `id`.
+    ///
+    /// `id` must not already have a runtime registered — the daemon's own
+    /// startup loop and `CreateAccount`'s handler are the only two callers,
+    /// and both know the id they are about to spawn has no runtime yet: the
+    /// first because it just listed `StoreRegistry::accounts()`, the second
+    /// because `StoreRegistry::create_account()` just allocated the id fresh.
+    /// A reset's respawn (in [`Self::hold`] below) removes the old runtime
+    /// from the registry immediately before calling back in here, so it never
+    /// finds one already registered either.
+    ///
+    /// Returns once the runtime is registered and its task has been handed to
+    /// the scheduler — not once a session has connected, which can take
+    /// seconds and is observed through the hub's own state instead.
+    ///
+    /// Returns an explicitly boxed, `dyn`-erased future rather than an
+    /// ordinary `async fn`: a reset's respawn (see [`Self::hold`]) calls this
+    /// from inside the future this same function returns, and an ordinary
+    /// `async fn` embeds its callees' concrete future types in its own —
+    /// which for a function that calls itself is a type with itself as a
+    /// field, infinite by construction. Boxing behind `dyn Future + Send`
+    /// gives the recursive call a fixed-size, already-known-`Send` type to
+    /// hold instead, which is what a recursive `async fn` needs and plain
+    /// `Box::pin` alone does not supply: `Box::pin(x)` still carries `x`'s
+    /// own (self-referential) concrete type as its type parameter.
+    pub fn spawn(
+        self: &Arc<Self>,
+        id: AccountId,
+    ) -> Pin<Box<dyn Future<Output = Arc<AccountRuntime>> + Send + '_>> {
+        self.spawn_inner(id, StateHub::for_account(id))
+    }
+
+    /// The same, using an already-built hub instead of building one
+    /// internally.
+    ///
+    /// The one caller this exists for is the daemon's own bootstrap: on
+    /// macOS the tray is built on the main thread, from a `StateHub` that has
+    /// to exist before the async runtime starts spawning anything at all
+    /// (see `macos_main`), so `main` builds it first and hands it in here
+    /// rather than [`Self::spawn`] building a second, disconnected one that
+    /// nobody would ever publish to.
+    ///
+    /// # Panics
+    ///
+    /// If `hub` was not built for `id` — every other caller is expected to
+    /// use [`Self::spawn`], which cannot make this mistake.
+    pub fn spawn_with_hub(
+        self: &Arc<Self>,
+        id: AccountId,
+        hub: Arc<StateHub>,
+    ) -> Pin<Box<dyn Future<Output = Arc<AccountRuntime>> + Send + '_>> {
+        debug_assert_eq!(hub.account_id(), id);
+        self.spawn_inner(id, hub)
+    }
+
+    fn spawn_inner(
+        self: &Arc<Self>,
+        id: AccountId,
+        hub: Arc<StateHub>,
+    ) -> Pin<Box<dyn Future<Output = Arc<AccountRuntime>> + Send + '_>> {
+        Box::pin(async move {
+            let (commands, command_rx) = mpsc::channel(self.command_capacity);
+            // After the command channel, because a plugin acts through it,
+            // and before the session, because a plugin subscribed to
+            // messages must not miss the ones that arrive while it is still
+            // loading — the same order `main.rs`/`embedded.rs` used to keep
+            // by hand for the one account each assembled inline.
+            let plugins = crate::plugins::start(&hub, commands.clone()).await;
+            let runtime = Arc::new(AccountRuntime::new_with_registry(
+                id,
+                hub,
+                plugins,
+                commands,
+                Arc::clone(&self.stores),
+            ));
+            assert!(
+                self.registry.insert(Arc::clone(&runtime)),
+                "account {} already has a runtime registered",
+                id.get()
+            );
+            self.hold(Arc::clone(&runtime), command_rx).await;
+            runtime
+        })
+    }
+
+    /// Spawn `runtime`'s `run()` loop, tracked so [`Self::join_all`] can wait
+    /// for it, and supervise what happens once it returns.
+    ///
+    /// `async` and awaited by [`Self::spawn`] itself, rather than a plain
+    /// `tokio::spawn` fire-and-forget: inserting into the `JoinSet` needs the
+    /// task lock, and taking it here — before this returns, not from inside
+    /// a second detached task — is what makes [`Self::join_all`] able to see
+    /// every task it should wait for. A version that spawned a task just to
+    /// take the lock would let `join_all` run, find the set still empty, and
+    /// return before that task ever got scheduled.
+    async fn hold(
+        self: &Arc<Self>,
+        runtime: Arc<AccountRuntime>,
+        command_rx: mpsc::Receiver<SessionCommand>,
+    ) {
+        let supervisor = Arc::clone(self);
+        let task = async move {
+            let id = runtime.id();
+            let shutdown = (supervisor.shutdown)();
+            if let Err(e) = supervisor
+                .registry
+                .run(Arc::clone(&runtime), command_rx, shutdown)
+                .await
+            {
+                log::error!("account {} ended with an error: {e:#}", id.get());
+            }
+            match runtime.disposition() {
+                Some(AccountDisposition::Reset) => {
+                    log::info!(
+                        "account {} finished resetting; starting a fresh session under the same id",
+                        id.get()
+                    );
+                    supervisor.registry.remove(id);
+                    supervisor.spawn(id).await;
+                }
+                Some(AccountDisposition::Remove) => {
+                    log::info!("account {} finished being removed", id.get());
+                    supervisor.registry.remove(id);
+                }
+                None => {
+                    // A process-wide shutdown, or a session that ended on its
+                    // own (dead credentials, an unrecoverable I/O error the
+                    // client already logged). Left registered with whatever
+                    // terminal status `AccountRegistry::run` just published,
+                    // exactly as a single-account daemon left it: a control
+                    // connection can still see the id and its last status
+                    // rather than watch it silently vanish.
+                }
+            }
+        };
+        self.tasks.lock().await.spawn(task);
+    }
+
+    /// Wait for every account task this supervisor has ever spawned to
+    /// finish, including ones a reset spawned after startup.
+    ///
+    /// Meant for the process's own shutdown path, after
+    /// `crate::shutdown::request` has been made and every live runtime has
+    /// therefore been asked to stop: once this resolves, nothing is left
+    /// running that still holds the store or a session, and the process may
+    /// exit. Holds the task lock for as long as it runs, so a `CreateAccount`
+    /// or a reset's respawn racing this blocks rather than starting a fresh
+    /// account the process is already on its way out from under — which is
+    /// the outcome wanted once shutdown has actually been asked for.
+    pub async fn join_all(&self) {
+        let mut tasks = self.tasks.lock().await;
+        loop {
+            match tasks.join_next().await {
+                Some(Ok(())) => {}
+                Some(Err(e)) => log::error!("an account task panicked: {e}"),
+                None => return,
+            }
+        }
     }
 }
 
