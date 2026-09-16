@@ -174,6 +174,20 @@ impl AccountRuntime {
 pub struct AccountRegistry {
     accounts: RwLock<HashMap<AccountId, Arc<AccountRuntime>>>,
     overview: watch::Sender<Arc<AccountsSnapshot>>,
+    /// The supervisor spawning and respawning runtimes into this registry,
+    /// if one exists. `Weak`, not `Arc`: `AccountSupervisor` already holds an
+    /// `Arc<AccountRegistry>`, so a strong pointer back would be a reference
+    /// cycle neither side ever drops. Set once, by
+    /// [`AccountSupervisor::with_shutdown`], and read by
+    /// `server::serve_control_client` so `CreateAccount`/`ResetAccount`/
+    /// `RemoveAccount` can reach it without every listener between `main.rs`
+    /// and that function threading a second `Arc` alongside this one. `None`
+    /// on a registry nothing has attached a supervisor to (a focused test
+    /// exercising `AccountRuntime`/`AccountRegistry` directly, or
+    /// `embedded.rs`, which builds its one runtime by hand) and on wasm,
+    /// where `AccountSupervisor` does not exist at all.
+    #[cfg(not(target_family = "wasm"))]
+    supervisor: std::sync::OnceLock<std::sync::Weak<AccountSupervisor>>,
 }
 
 impl AccountRegistry {
@@ -186,7 +200,18 @@ impl AccountRegistry {
         Arc::new(Self {
             accounts: RwLock::new(HashMap::new()),
             overview,
+            #[cfg(not(target_family = "wasm"))]
+            supervisor: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The supervisor spawning and respawning runtimes into this registry, if
+    /// [`AccountSupervisor::new`]/[`AccountSupervisor::with_shutdown`] has
+    /// attached one and it is still alive.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn supervisor(&self) -> Option<Arc<AccountSupervisor>> {
+        self.supervisor.get()?.upgrade()
     }
 
     /// Add a runtime, returning `false` when its id is already registered.
@@ -364,13 +389,33 @@ impl AccountSupervisor {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        Arc::new(Self {
+        let supervisor = Arc::new(Self {
             registry,
             stores,
             command_capacity,
             tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
             shutdown: Arc::new(move || Box::pin(shutdown())),
-        })
+        });
+        // So `server::serve_control_client` can reach this supervisor through
+        // the same `Arc<AccountRegistry>` every listener already threads —
+        // see the field doc on `AccountRegistry::supervisor` for why this is
+        // `Weak` rather than a second strong owner.
+        let _ = supervisor
+            .registry
+            .supervisor
+            .set(Arc::downgrade(&supervisor));
+        supervisor
+    }
+
+    /// Allocate a new local account and start its runtime immediately.
+    ///
+    /// The two steps happen together because `ClientRequest::CreateAccount`
+    /// answers in one round trip with `DaemonMessage::AccountCreated`, which
+    /// promises the id it names is already registered and running.
+    pub async fn create_and_spawn(self: &Arc<Self>) -> Result<AccountId> {
+        let id = self.stores.create_account().await?;
+        self.spawn(id).await;
+        Ok(id)
     }
 
     /// Build, register and start driving a fresh runtime for `id`.
@@ -574,6 +619,36 @@ mod tests {
         assert_eq!(
             registry.snapshot().accounts[0].id,
             AccountId::new(2).unwrap()
+        );
+    }
+
+    /// `AccountSupervisor::new`/`with_shutdown` attach themselves to the
+    /// registry they were built over, so `server::serve_control_client` can
+    /// reach one through the same `Arc<AccountRegistry>` every listener
+    /// already threads. The attachment is `Weak`: it must not be what keeps
+    /// the supervisor alive, or the two would leak each other.
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn supervisor_attaches_itself_to_its_registry_and_lets_it_go_when_dropped() {
+        use super::AccountSupervisor;
+        use oxidezap_session::StoreRegistry;
+
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(StoreRegistry::new(format!(
+            "file:memdb_account_supervisor_attach_{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let supervisor = AccountSupervisor::new(Arc::clone(&registry), stores, 4);
+
+        assert!(
+            registry.supervisor().is_some(),
+            "a fresh supervisor is reachable through its own registry"
+        );
+
+        drop(supervisor);
+        assert!(
+            registry.supervisor().is_none(),
+            "a dropped supervisor is not kept alive by the registry's own back-pointer"
         );
     }
 }

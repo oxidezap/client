@@ -504,14 +504,25 @@ where
                                 },
                             )?,
                         }),
-                        ClientRequest::CreateAccount
-                        | ClientRequest::ResetAccount { .. }
-                        | ClientRequest::RemoveAccount { .. } => Some(error_frame(
-                            id,
-                            ProtocolError::Refused {
-                                detail: "account lifecycle is unavailable until whatsapp-rust WR-1 lands".to_string(),
-                            },
-                        )?),
+                        ClientRequest::CreateAccount => Some(create_account(&registry, id).await?),
+                        ClientRequest::ResetAccount { account } => Some(
+                            change_account(
+                                &registry,
+                                id,
+                                account,
+                                crate::session_bridge::AccountDisposition::Reset,
+                            )
+                            .await?,
+                        ),
+                        ClientRequest::RemoveAccount { account } => Some(
+                            change_account(
+                                &registry,
+                                id,
+                                account,
+                                crate::session_bridge::AccountDisposition::Remove,
+                            )
+                            .await?,
+                        ),
                         ClientRequest::Shutdown => {
                             let frame = answer_shutdown(id)?;
                             write_line(&mut writer, &frame).await?;
@@ -548,6 +559,91 @@ where
 
 fn answer_shutdown(id: Option<RequestId>) -> Result<String> {
     Ok(serde_json::to_string(&DaemonMessage::Accepted { id })?)
+}
+
+/// Answer `ClientRequest::CreateAccount`: allocate a new local account and
+/// start its runtime, naming the id in `DaemonMessage::AccountCreated`.
+///
+/// Needs an id to answer under, like `ListAccounts` and every other request
+/// whose answer names something the client cannot already predict.
+async fn create_account(registry: &AccountRegistry, id: Option<RequestId>) -> Result<String> {
+    let Some(id) = id else {
+        return error_frame(
+            None,
+            ProtocolError::Malformed {
+                detail: "creating an account needs an id to answer under".to_string(),
+            },
+        );
+    };
+    #[cfg(not(target_family = "wasm"))]
+    {
+        match registry.supervisor() {
+            Some(supervisor) => match supervisor.create_and_spawn().await {
+                Ok(account) => Ok(serde_json::to_string(&DaemonMessage::AccountCreated {
+                    id,
+                    account,
+                })?),
+                Err(e) => error_frame(
+                    Some(id),
+                    ProtocolError::Failed {
+                        detail: e.to_string(),
+                        retryable: false,
+                    },
+                ),
+            },
+            None => error_frame(
+                Some(id),
+                ProtocolError::Refused {
+                    detail: "account lifecycle is not available on this listener".to_string(),
+                },
+            ),
+        }
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = registry; // no `AccountSupervisor` exists to reach on this target yet.
+        error_frame(
+            Some(id),
+            ProtocolError::Refused {
+                detail: "account lifecycle is not available on web yet".to_string(),
+            },
+        )
+    }
+}
+
+/// Answer `ClientRequest::ResetAccount`/`RemoveAccount`: reuse the exact
+/// self-service `ForgetSession` teardown path (`Action::ForgetSession`)
+/// against the *target* account's own command channel, so no new teardown
+/// logic exists for the control-initiated case.
+///
+/// This only asks and waits for the ask to be accepted. The actual stop, and
+/// (for `Reset`) the respawn under the same id, happen afterward in the
+/// background, in `AccountSupervisor::hold`; a client watches
+/// `DaemonMessage::AccountsChanged` for that.
+async fn change_account(
+    registry: &AccountRegistry,
+    id: Option<RequestId>,
+    account: oxidezap_core::AccountId,
+    disposition: crate::session_bridge::AccountDisposition,
+) -> Result<String> {
+    let Some(runtime) = registry.get(account) else {
+        return error_frame(
+            id,
+            ProtocolError::NoSession {
+                detail: format!("account {} is not available", account.get()),
+            },
+        );
+    };
+    match dispatch(
+        &runtime.hub(),
+        &runtime.commands(),
+        Action::ForgetSession(disposition),
+    )
+    .await
+    {
+        Ok(()) => Ok(serde_json::to_string(&DaemonMessage::Accepted { id })?),
+        Err(error) => error_frame(id, error),
+    }
 }
 
 /// An error frame, naming the request it answers when there is one.

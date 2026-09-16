@@ -198,6 +198,188 @@ async fn an_account_connection_is_bound_to_the_requested_runtime() {
     served.abort();
 }
 
+/// `CreateAccount` needs a supervisor attached to the registry it is served
+/// through; every other control test in this file builds a bare
+/// `AccountRegistry::new()` (no `AccountSupervisor` over it), which is
+/// exactly the shape `embedded.rs` and every focused test here use, so the
+/// refusal has to be graceful rather than a panic.
+#[tokio::test]
+async fn create_account_is_refused_without_a_supervisor_attached() {
+    let registry = AccountRegistry::new();
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, registry));
+
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // ControlHello
+
+    let create = serde_json::to_string(&Request {
+        id: Some(1),
+        request: ClientRequest::CreateAccount,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{create}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                id: Some(1),
+                error: ProtocolError::Refused { .. },
+            }
+        ),
+        "unexpected answer: {line}"
+    );
+    served.abort();
+}
+
+/// `ResetAccount`/`RemoveAccount` reuse the target account's own
+/// `Action::ForgetSession` teardown path, dispatched through *its* command
+/// channel rather than the control connection's (which has none): this pins
+/// that the right runtime hears it, with the right disposition, and that an
+/// unknown id is refused rather than silently accepted.
+#[tokio::test]
+async fn a_control_connection_resets_and_removes_a_named_account() {
+    let registry = AccountRegistry::new();
+    let target_id = oxidezap_core::AccountId::new(2).expect("positive account id");
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        target_id,
+        StateHub::for_account(target_id),
+        no_plugins(),
+        commands,
+    ))));
+    // Registered before the connection opens, along with the reset target
+    // above: registering it *during* the conversation would race this
+    // connection's own `AccountsChanged` push against the next request's
+    // answer, and this test is about the answers, not that push.
+    let other_id = oxidezap_core::AccountId::new(3).expect("positive account id");
+    let (commands, taken_other) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        other_id,
+        StateHub::for_account(other_id),
+        no_plugins(),
+        commands,
+    ))));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, Arc::clone(&registry)));
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // ControlHello
+
+    let reset = serde_json::to_string(&Request {
+        id: Some(5),
+        request: ClientRequest::ResetAccount { account: target_id },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{reset}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(5) }
+        ),
+        "unexpected answer to ResetAccount: {line}"
+    );
+    assert!(matches!(
+        taken.await.unwrap(),
+        Some(Action::ForgetSession(
+            crate::session_bridge::AccountDisposition::Reset
+        ))
+    ));
+
+    // A second target, this time removed rather than reset.
+    let remove = serde_json::to_string(&Request {
+        id: Some(6),
+        request: ClientRequest::RemoveAccount { account: other_id },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{remove}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(6) }
+        ),
+        "unexpected answer to RemoveAccount: {line}"
+    );
+    assert!(matches!(
+        taken_other.await.unwrap(),
+        Some(Action::ForgetSession(
+            crate::session_bridge::AccountDisposition::Remove
+        ))
+    ));
+
+    // An id nothing is registered under is refused rather than silently
+    // accepted.
+    let unknown_id = oxidezap_core::AccountId::new(99).expect("positive account id");
+    let reset_unknown = serde_json::to_string(&Request {
+        id: Some(7),
+        request: ClientRequest::ResetAccount {
+            account: unknown_id,
+        },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{reset_unknown}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                id: Some(7),
+                error: ProtocolError::NoSession { .. },
+            }
+        ),
+        "unexpected answer for an unknown account: {line}"
+    );
+    served.abort();
+}
+
 /// Window ownership and call-video subscription are independent capabilities.
 #[test]
 fn a_client_can_subscribe_to_video_without_owning_a_window() {
