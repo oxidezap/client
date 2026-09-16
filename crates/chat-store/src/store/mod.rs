@@ -8,6 +8,7 @@
 //! does per event, split by the kind of event each one materializes.
 
 mod ack;
+mod avatar;
 mod chat_rows;
 mod contacts;
 mod edit;
@@ -99,6 +100,20 @@ pub(crate) enum WriterMsg {
     StatusWatched {
         chat: Jid,
         msg_ids: Vec<String>,
+    },
+    /// Record which picture a chat is showing, and where its bytes are cached.
+    ///
+    /// Written only after the bytes have landed: pointing a durable row at a
+    /// cache key that holds nothing is exactly the restart failure this table
+    /// exists to prevent.
+    Avatar {
+        jid: Jid,
+        picture_id: String,
+        cache_key: String,
+    },
+    /// Drop a chat's descriptor, because WhatsApp says it has no picture.
+    AvatarCleared {
+        jid: Jid,
     },
     // String, not StoreError: one batch outcome fans out to many waiters and
     // StoreError is not Clone.
@@ -365,6 +380,43 @@ impl ChatStore {
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
+    /// Record which picture a chat is showing, and where its bytes are cached.
+    ///
+    /// The two halves land in one row on purpose, and this is called only
+    /// after the bytes are on disk: a descriptor pointing at a cache key that
+    /// holds nothing is exactly the restart failure the table exists to
+    /// prevent. Never stores the signed source URL, which expires and is a
+    /// credential besides; the bytes stay in the media cache.
+    ///
+    /// Through the writer queue like every other write; use
+    /// [`flush`](Self::flush) to await completion.
+    pub fn record_avatar(
+        &self,
+        jid: &Jid,
+        picture_id: impl Into<String>,
+        cache_key: impl Into<String>,
+    ) -> Result<()> {
+        self.tx
+            .send(WriterMsg::Avatar {
+                jid: jid.clone(),
+                picture_id: picture_id.into(),
+                cache_key: cache_key.into(),
+            })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Record that a chat has no picture, dropping any descriptor it had.
+    ///
+    /// A picture that was removed server-side must not leave a durable row
+    /// pointing at bytes the account no longer shows: the next start would
+    /// draw a picture WhatsApp says is gone. The cached bytes are left for the
+    /// budget sweep; only the pointer goes.
+    pub fn clear_avatar(&self, jid: &Jid) -> Result<()> {
+        self.tx
+            .send(WriterMsg::AvatarCleared { jid: jid.clone() })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
     /// Record a sender revoke this client just sent for one of its own
     /// messages.
     ///
@@ -500,6 +552,20 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
+        // The avatar descriptors are derived state, so reverting them is
+        // cheap and loses nothing durable: the table goes and a later start
+        // refetches. It is the most recent migration, so it reverts first.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("avatar-descriptor downgrade is reversible");
+        assert!(!has_table(&store, "avatar_descriptors").await);
+
         // The stable-id rewrite is reversible: reverting it keeps the table
         // (without the `id`/`proto_codec` columns) rather than failing.
         store
@@ -546,6 +612,29 @@ mod migration_tests {
                 )
                 .get_result::<Count>(conn)
                 .map(|row| row.count)
+                .map_err(crate::error::db_err)
+            })
+            .await
+            .expect("inspect schema")
+    }
+
+    async fn has_table(store: &SqliteStore, table: &str) -> bool {
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+        let table = table.to_owned();
+        store
+            .shared()
+            .read(move |conn| {
+                diesel::sql_query(
+                    "SELECT count(*) AS count FROM sqlite_master \
+                     WHERE type = 'table' AND name = ?",
+                )
+                .bind::<diesel::sql_types::Text, _>(table)
+                .get_result::<Count>(conn)
+                .map(|row| row.count > 0)
                 .map_err(crate::error::db_err)
             })
             .await

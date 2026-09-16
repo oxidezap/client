@@ -436,7 +436,12 @@ fn class_of(event: &UiEvent) -> Class {
         UiEvent::MessageReceived { .. }
         | UiEvent::HistoryLoaded { .. }
         | UiEvent::ReceiptReceived { .. }
-        | UiEvent::ReactionReceived { .. } => Class::Recoverable,
+        | UiEvent::ReactionReceived { .. }
+        // Recoverable in the sense that losing it costs a picture, not the
+        // session: the resolver has already marked the chats asked, and the
+        // next connect resolves them again. It is deliberately *not* in
+        // `needs_recovery` — a batch of pictures is not worth a history reload.
+        | UiEvent::AvatarsResolved { .. } => Class::Recoverable,
         UiEvent::ChatPresence { .. } | UiEvent::PresenceUpdated { .. } => Class::Ephemeral,
         _ => Class::Control,
     }
@@ -455,6 +460,21 @@ fn estimated_bytes(event: &UiEvent) -> usize {
     match event {
         UiEvent::HistoryLoaded { chats, .. } => {
             std::mem::size_of_val(event) + chats.iter().map(chat_bytes).sum::<usize>()
+        }
+        UiEvent::AvatarsResolved { resolutions } => {
+            std::mem::size_of_val(event)
+                + resolutions
+                    .iter()
+                    .map(|resolution| {
+                        string_bytes(&resolution.jid)
+                            + string_bytes(&resolution.picture_id)
+                            + resolution
+                                .source
+                                .as_deref()
+                                .map(string_bytes)
+                                .unwrap_or_default()
+                    })
+                    .sum::<usize>()
         }
         UiEvent::MessageReceived {
             chat_jid,

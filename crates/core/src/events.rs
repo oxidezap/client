@@ -86,6 +86,21 @@ pub enum UiEvent {
         jid: String,
         key: String,
     },
+    /// The session resolved profile-picture metadata for a batch of chats.
+    ///
+    /// Its own event rather than a field on `HistoryLoaded`, which is the
+    /// whole point: a profile picture is relatively stable, and coupling its
+    /// lookup to store reloads meant every receipt and acknowledgement queried
+    /// WhatsApp for metadata that had not moved. The daemon answers this by
+    /// fetching the bytes, committing the durable descriptor only once they
+    /// land, and publishing [`AvatarReady`](Self::AvatarReady).
+    ///
+    /// Batched, and one event per batch, because the queue between the session
+    /// and the daemon is bounded: one event per chat would flood a lane sized
+    /// for a history load and drop most of a large account's pictures.
+    AvatarsResolved {
+        resolutions: Vec<AvatarResolution>,
+    },
     ReactionReceived {
         chat_jid: String,
         message_id: String,
@@ -287,6 +302,18 @@ pub enum UiEvent {
         notice: SystemNotice,
     },
     Error(String),
+}
+
+/// One chat's resolved profile picture, inside [`UiEvent::AvatarsResolved`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvatarResolution {
+    pub jid: String,
+    pub picture_id: String,
+    /// Signed and short-lived. Never persisted, and never serialized: the
+    /// daemon is its only reader, and a credential does not belong in a frame
+    /// any front end could log.
+    #[serde(default, skip_serializing)]
+    pub source: Option<String>,
 }
 
 /// A receipt type as WhatsApp spells it, which is the only spelling that

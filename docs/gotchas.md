@@ -1654,3 +1654,29 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   skewed fixture: protos 944 KiB → 546 KiB (−42%), the ack index 168 KiB →
   12 KiB (−93%), chat/arrival pages single-digit ms, search ~27 ms/page in a
   debug build.
+- **A profile picture has two identities and its own lifecycle.** WhatsApp's
+  picture id is what a metadata refresh compares against; the media cache key
+  is a pure function of `(jid, picture_id)` and is what the bytes on disk are
+  named under. They are `avatar_picture_id` and `avatar_cache_key` rather than
+  one overloaded `avatar_key`, because the same field meaning one thing above
+  the daemon and another below it made persistence and comparison a matter of
+  arrival order. The signed CDN URL is `avatar_source`, transient, never
+  serialized and never stored. `chat-store`'s `avatar_descriptors` table keeps
+  only the two ids and a timestamp, so a restarted process can address bytes
+  it fetched in an earlier run without a network round trip; the write is
+  two-phase — bytes land in the media cache first, the descriptor is committed
+  after — so the pointer never names bytes that are not there, and a transient
+  fetch failure leaves the previous picture intact. The lookup itself runs in
+  `session/whatsapp/avatar.rs`, bounded to eight in flight, deduplicated by
+  JID, triggered by `Connected` and by paging, and deliberately *not* by the
+  history reload path: receipts and acknowledgements used to query WhatsApp
+  for a picture because they reloaded history, and a picture is stable
+  metadata that a receipt says nothing about. `HistoryLoaded` carries whatever
+  the durable descriptors already said and never waits on an IQ. Every kind
+  goes through the generic `ProfilePictureSpec` path: the library already
+  skips the privacy-token dance for anything that is not a plain PN, so a
+  group, a channel and a contact are one call, which is also what removed the
+  group-only batch that read `url` and ignored the `direct_path` it needed as
+  a fallback. The status broadcast, broadcast lists and the system account are
+  never asked about.
+

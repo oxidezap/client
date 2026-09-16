@@ -216,12 +216,6 @@ impl Bridge {
                             // locally, sends no receipt and comes straight
                             // back on the next hydration.
                             for chat in &mut page.items {
-                                crate::avatar::queue(&hub, chat);
-                                if let Some(picture_id) = chat.avatar_key.as_deref() {
-                                    chat.avatar_key =
-                                        Some(crate::avatar::key(&chat.jid, picture_id));
-                                }
-                                chat.avatar_source = None;
                                 externalize_messages(epoch, &mut chat.messages);
                                 let mut reads =
                                     reads.lock().unwrap_or_else(|held| held.into_inner());
@@ -602,6 +596,10 @@ impl Bridge {
             } => self.download(client, id, *media, answer_to),
             Action::ReloadHistory => {
                 client.reload_history();
+                CommandOutcome::Accepted
+            }
+            Action::RefreshAvatars => {
+                client.reset_avatar_cache();
                 CommandOutcome::Accepted
             }
             Action::RefreshVideo => {

@@ -829,6 +829,30 @@ const TEST_GROUP: &str = "120363000000000001@g.us";
 /// A chat store and a client over one in-memory database, with no network:
 /// `Bot::build` only opens the store, and `load_history` needs the client
 /// solely for the PN/LID mapping lookups that resolve chat identity.
+/// A durable descriptor is what a restart draws from before the network is up.
+/// Attaching it is a local read: no lookup happens here, which is the whole
+/// point of keeping the two apart.
+#[tokio::test]
+async fn a_stored_avatar_descriptor_reaches_the_chat_without_a_lookup() {
+    let (chat_store, client) = test_session("avatar-descriptor").await;
+    let jid: Jid = "1@s.whatsapp.net".parse().unwrap();
+    chat_store.record_avatar(&jid, "picture-9", "a-9").unwrap();
+    chat_store.flush().await.unwrap();
+
+    let mut chats = vec![Chat::from_store("1@s.whatsapp.net".into(), "Ana".into(), 0)];
+    WhatsAppClient::attach_avatar_descriptors(&chat_store, &mut chats).await;
+
+    // No network was touched; the client is here only because the hydrate
+    // path that calls this takes one.
+    let _ = &client;
+    assert_eq!(chats[0].avatar_picture_id.as_deref(), Some("picture-9"));
+    assert_eq!(chats[0].avatar_cache_key.as_deref(), Some("a-9"));
+    assert!(
+        chats[0].avatar_loaded,
+        "a known picture is loaded; whether its bytes are still cached is a reader's question"
+    );
+}
+
 async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
     let store = SqliteStore::new(&format!(
         "file:oxidezap-session-{name}?mode=memory&cache=shared"

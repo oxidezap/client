@@ -354,7 +354,6 @@ impl WhatsAppClient {
             names,
             chat_limit,
             message_limit,
-            true,
         )
         .await
     }
@@ -373,7 +372,6 @@ impl WhatsAppClient {
             names,
             chat_limit,
             message_limit,
-            false,
         )
         .await
     }
@@ -385,7 +383,6 @@ impl WhatsAppClient {
         names: &NameBook,
         chat_limit: usize,
         message_limit: usize,
-        hydrate_avatars: bool,
     ) -> Result<LoadedHistory, oxidezap_chat_store::ChatStoreError> {
         // A whole-list load is the pass that re-reads the address book, so it
         // is the one that drops what the book remembers: a contact renamed on
@@ -465,14 +462,49 @@ impl WhatsAppClient {
             Self::attach_page_with_ceiling(entry, message_limit as i64)
         })
         .await?;
-        if hydrate_avatars {
-            Self::hydrate_avatar_sources(client, &mut chats).await;
-        }
+        // Local, and always: a durable descriptor is what lets a restart draw
+        // the picture it had before the network came up. The *network* lookup
+        // is the resolver's job and is never started from here.
+        Self::attach_avatar_descriptors(chat_store, &mut chats).await;
         Ok(LoadedHistory {
             chats,
             complete,
             next,
         })
+    }
+
+    /// Give each chat the picture a durable descriptor says it is showing.
+    ///
+    /// Local and cheap: one query for the whole account, then a cache-key
+    /// derivation per chat. What it buys is the cold start that draws the
+    /// avatar it had before the process restarted, without waiting for the
+    /// network. A chat with no descriptor is left blank rather than cleared,
+    /// because this load is not an answer about pictures.
+    pub(super) async fn attach_avatar_descriptors(
+        chat_store: &Arc<ChatStore>,
+        chats: &mut [oxidezap_core::Chat],
+    ) {
+        let Ok(descriptors) = chat_store.avatar_descriptors().await else {
+            // The read failed; the chats are still drawn, just without the
+            // pictures a later refresh will supply.
+            return;
+        };
+        let by_jid: std::collections::HashMap<String, oxidezap_chat_store::AvatarDescriptor> =
+            descriptors
+                .into_iter()
+                .map(|descriptor| (descriptor.jid.to_string(), descriptor))
+                .collect();
+        for chat in chats.iter_mut() {
+            let Some(descriptor) = by_jid.get(&chat.jid) else {
+                continue;
+            };
+            chat.avatar_picture_id = Some(descriptor.picture_id.clone());
+            chat.avatar_cache_key = Some(descriptor.cache_key.clone());
+            // `loaded` says the picture is *known*, not that its bytes are
+            // still on disk. A reader that misses the cache asks the daemon
+            // to fetch it, which is the refresh the descriptor describes.
+            chat.avatar_loaded = true;
+        }
     }
 
     /// Turn store rows into the chats a front end draws.

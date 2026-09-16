@@ -1,4 +1,10 @@
 //! Profile-picture fetching owned by the daemon.
+//!
+//! The session resolves the *metadata* — which picture a chat has, and the
+//! signed URL that fetches it — and this side turns that into bytes in the
+//! media cache and a durable descriptor once they land. The order is the whole
+//! contract: a descriptor naming a cache key is written only after the bytes
+//! are on disk, so a restart can trust it.
 
 #[cfg(not(target_family = "wasm"))]
 mod native;
@@ -12,14 +18,20 @@ use std::sync::{LazyLock, Mutex};
 use portable_atomic::{AtomicU64, Ordering};
 
 use crate::state::StateHub;
+use oxidezap_session::AvatarRecorder;
 
 struct AvatarResponse {
     status: u16,
     body: Vec<u8>,
 }
-use oxidezap_core::Chat;
 use oxidezap_ipc::DaemonMessage;
 
+/// One fetch in flight, and what makes it current.
+///
+/// A second resolution for the same chat supersedes the first, and the older
+/// one must not overwrite the newer avatar with a late answer. Account and
+/// cache epochs cover the two wipes: an answer for a departed account, or one
+/// whose bytes landed after the cache was cleared, is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Selection {
     account_generation: usize,
@@ -33,42 +45,72 @@ static LATEST: LazyLock<Mutex<HashMap<(usize, String), Selection>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-pub fn key(jid: &str, id: &str) -> String {
-    let jid = safe_component(jid);
-    let id = safe_component(id);
-    format!("a-{}-{jid}-{}-{id}", jid.len(), id.len())
-}
-
-pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
-    if !chat.avatar_loaded {
+/// Turn a resolved picture into cached bytes and a durable descriptor.
+///
+/// `picture_id` empty means WhatsApp says the chat has no picture: the
+/// descriptor is dropped rather than left pointing at bytes the account no
+/// longer shows, and every front end is told to draw the placeholder.
+/// Otherwise a cache hit is published straight away and the descriptor is
+/// (re)written, which is how a descriptor lost to an earlier failure heals; a
+/// miss fetches, and only writes the descriptor once the bytes are in.
+pub fn resolved(
+    hub: &Arc<StateHub>,
+    recorder: &AvatarRecorder,
+    jid: &str,
+    picture_id: &str,
+    source: Option<&str>,
+) {
+    if picture_id.is_empty() {
+        // WhatsApp says this chat has no picture. Drop the durable pointer so
+        // a restart does not draw one that is gone; the cached bytes are left
+        // for the budget sweep.
+        recorder.clear(jid.to_string());
+        pub_cleared(hub, jid);
         return;
     }
-    let jid = chat.jid.clone();
-    let source = chat.avatar_source.clone();
-    let id = chat.avatar_key.clone();
-    let selection = record_selection(hub, &jid, id.as_deref(), source.as_deref());
-    let (Some(source), Some(id)) = (source, id) else {
-        return;
-    };
-    let hub = Arc::clone(hub);
-    let key = key(&jid, &id);
-    if crate::media::has(&key) {
-        oxidezap_session::spawn(async move {
-            if is_current(&hub, &jid, &selection) {
-                publish_ready(&hub, jid, key);
+    let id = picture_id.to_string();
+    let selection = record_selection(hub, jid, Some(&id), source);
+    let cache_key = oxidezap_core::avatar_cache_key(jid, &id);
+    if crate::media::has(&cache_key) {
+        recorder.record(jid.to_string(), id.clone(), cache_key.clone());
+        oxidezap_session::spawn({
+            let hub = Arc::clone(hub);
+            let jid = jid.to_string();
+            let selection = selection.clone();
+            async move {
+                if is_current(&hub, &jid, &selection) {
+                    publish_ready(&hub, jid, cache_key);
+                }
             }
         });
         return;
     }
-    oxidezap_session::spawn(async move {
-        let Ok(response) = fetch(&source).await else {
-            return;
-        };
-        let Ok(bytes) = accept(response) else { return };
-        if crate::media::put_since(selection.cache_epoch, &key, &bytes).is_ok()
-            && is_current(&hub, &jid, &selection)
-        {
-            publish_ready(&hub, jid, key);
+    let Some(source) = source else {
+        return;
+    };
+    let source = source.to_string();
+    oxidezap_session::spawn({
+        let hub = Arc::clone(hub);
+        let jid = jid.to_string();
+        let recorder = recorder.clone();
+        async move {
+            let Ok(response) = fetch(&source).await else {
+                // A transient failure keeps whatever was cached before: the
+                // old avatar is a better answer than initials.
+                return;
+            };
+            let Ok(bytes) = accept(response) else { return };
+            if crate::media::put_since(selection.cache_epoch, &cache_key, &bytes).is_err() {
+                return;
+            }
+            if !is_current(&hub, &jid, &selection) {
+                return;
+            }
+            // Bytes first, then the pointer. A descriptor written before the
+            // cache write could name a key that holds nothing if this died in
+            // between.
+            recorder.record(jid.clone(), id, cache_key.clone());
+            publish_ready(&hub, jid, cache_key);
         }
     });
 }
@@ -83,24 +125,28 @@ fn publish_ready(hub: &StateHub, jid: String, key: String) {
     }
 }
 
+/// Tell every front end this chat no longer has a picture.
+///
+/// A second, equally true kind of readiness: the placeholder is the right
+/// drawing, and a window holding stale bytes has to be told to drop them.
+fn pub_cleared(hub: &StateHub, jid: &str) {
+    let event = oxidezap_core::UiEvent::AvatarReady {
+        jid: jid.to_string(),
+        key: String::new(),
+    };
+    match serde_json::to_string(&DaemonMessage::Session {
+        event: Box::new(event),
+    }) {
+        Ok(frame) => hub.publish_session(frame),
+        Err(error) => log::error!("could not serialize an avatar removal: {error}"),
+    }
+}
+
 pub fn purge(hub: &StateHub) {
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     latest.retain(|(id, _), _| *id != hub_id(hub));
-}
-
-fn safe_component(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
-            result.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(result, ".{byte:02X}");
-        }
-    }
-    result
 }
 
 fn record_selection(
@@ -148,6 +194,18 @@ fn is_current(hub: &StateHub, jid: &str, selection: &Selection) -> bool {
 
 fn hub_id(hub: &StateHub) -> usize {
     std::ptr::from_ref(hub) as usize
+}
+
+/// Whether a chat has an avatar fetch recorded as its current one.
+///
+/// A test-visible answer to "did this path ask about a picture at all",
+/// which is the property the history decoupling is about.
+#[cfg(test)]
+pub(super) fn has_selection(hub: &StateHub, jid: &str) -> bool {
+    LATEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&(hub_id(hub), jid.to_owned()))
 }
 
 async fn fetch(url: &str) -> anyhow::Result<AvatarResponse> {
@@ -206,16 +264,8 @@ fn accept(response: AvatarResponse) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AvatarResponse, accept, is_current, key, purge, record_selection};
+    use super::{AvatarResponse, accept, is_current, purge, record_selection};
     use crate::state::StateHub;
-
-    #[test]
-    fn avatar_keys_are_safe_and_distinct() {
-        assert_eq!(key("jid-1", "picture-1"), "a-5-jid-1-9-picture-1");
-        assert_ne!(key("jid-1", "picture-1"), key("jid-2", "picture-1"));
-        assert_ne!(key("a/b", "picture"), key("a?b", "picture"));
-        assert!(!key("../../avatar", "picture").contains('/'));
-    }
 
     #[test]
     fn superseded_avatar_completion_is_rejected() {

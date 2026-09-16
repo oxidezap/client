@@ -101,6 +101,16 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    avatar_descriptors (device_id, jid) {
+        device_id -> Integer,
+        jid -> Text,
+        picture_id -> Text,
+        cache_key -> Text,
+        updated_at_ms -> BigInt,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     chats,
     messages,

@@ -53,6 +53,7 @@ pub(super) fn bridge() -> Bridge {
         Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
             |_| {},
         ))),
+        oxidezap_session::AvatarRecorder::detached(),
     )
 }
 
@@ -336,6 +337,70 @@ fn a_credential_does_not_survive_leaving_the_pairing_state() {
 #[test]
 fn an_absurd_pairing_lifetime_saturates_rather_than_wrapping() {
     assert_eq!(deadline_ms(u64::MAX), i64::MAX);
+}
+
+/// A history load must not start a profile-picture lookup.
+///
+/// This is the coupling the split removes: receipts, acknowledged messages
+/// and every store invalidation used to reload history, and history used to
+/// query WhatsApp for pictures. A picture is stable metadata; a receipt is
+/// not news about one. Only an explicit `AvatarResolved` from the session's
+/// own resolver may reach [`crate::avatar`].
+#[test]
+fn a_history_load_starts_no_picture_lookup() {
+    let mut bridge = bridge();
+    let chat = stored_chat(
+        "1@s.whatsapp.net",
+        0,
+        vec![message("m1", "1@s.whatsapp.net", 10, false, true)],
+    );
+    bridge.observe(loaded(vec![chat]));
+
+    assert!(
+        !crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
+        "loading history asked about a picture, which is the coupling this removes"
+    );
+}
+
+/// A receipt must not either: it is the same argument, one event over.
+#[test]
+fn a_receipt_starts_no_picture_lookup() {
+    let mut bridge = bridge();
+    bridge.observe(received(
+        "1@s.whatsapp.net",
+        message("m1", "1@s.whatsapp.net", 10, false, false),
+        None,
+    ));
+    bridge.observe(UiEvent::ReceiptReceived {
+        chat_jid: "1@s.whatsapp.net".into(),
+        message_ids: vec!["m1".into()],
+        receipt_type: oxidezap_core::ReceiptType::Read,
+    });
+
+    assert!(
+        !crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
+        "a receipt asked about a picture"
+    );
+}
+
+/// The daemon reads a resolved picture as a fetch it may make, and the session
+/// is the one that decided the metadata moved. Nothing about the front end is
+/// touched by the metadata itself.
+#[test]
+fn a_resolved_picture_is_the_only_thing_that_starts_a_fetch() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::AvatarsResolved {
+        resolutions: vec![oxidezap_core::AvatarResolution {
+            jid: "1@s.whatsapp.net".into(),
+            picture_id: "picture-1".into(),
+            source: None,
+        }],
+    });
+
+    assert!(
+        crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
+        "a resolved picture is what the fetcher waits for"
+    );
 }
 
 /// A front end reacts to what it is told the instant it is told, and the

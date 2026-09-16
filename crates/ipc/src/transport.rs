@@ -5,6 +5,20 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 30: `UiEvent::AvatarsResolved`. Profile-picture metadata moved off the
+/// history reload path — a receipt no longer queries WhatsApp for a picture —
+/// and its answer is now its own session event, carrying the picture id and
+/// the signed source the daemon fetches from. A v29 window receiving one reads
+/// the frame as unparsable and logs it, so a picture that changed server-side
+/// would never redraw; the daemon is the half that deliberately outlives an
+/// upgrade, so this is the same v22 case of a frame an older reader drops.
+///
+/// 29: `UiEvent::AvatarReady` and the avatar fields it describes. A profile
+/// picture is cached by the daemon and named by a key rather than carried as
+/// bytes, exactly as other media is. A v28 window reads the frame as
+/// unparsable and draws the placeholder it already had, which is the honest
+/// answer for a picture it cannot fetch.
+///
 /// 28: `CallAction::RequestVideoKeyframe` names the call and direction whose
 /// compressed reference chain was lost. Older daemons reject the request,
 /// leaving a remote decoder waiting for an IDR the peer may never send.
@@ -215,7 +229,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

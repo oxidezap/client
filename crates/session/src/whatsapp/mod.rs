@@ -1,5 +1,7 @@
 //! WhatsApp client wrapper for UI integration
 
+/// Profile-picture metadata, resolved on its own lifecycle.
+mod avatar;
 /// Voice calls, which are the one part of the session a page cannot run.
 mod calls;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
@@ -16,7 +18,6 @@ mod groups;
 
 /// Store rows read back as the chats a front end draws.
 mod history;
-
 /// Which events wait for which, and which never had to.
 mod lanes;
 
@@ -198,6 +199,79 @@ pub(crate) struct Session {
 /// moment it is let go. Nothing observable sits in between.
 pub(crate) type SessionSlot = Arc<Mutex<Option<Arc<Session>>>>;
 
+/// A handle for recording avatar descriptors from outside the session task.
+///
+/// The daemon fetches the bytes and the session owns the store, so the write
+/// that points a chat at those bytes has to cross that seam. This is the
+/// crossing: a cheap handle that reaches the one session, carries no session
+/// state of its own, and refuses quietly when there is nothing to write to.
+///
+/// Cloneable because the daemon's bridge holds one for the life of the
+/// process.
+#[derive(Clone)]
+pub struct AvatarRecorder {
+    session: SessionSlot,
+}
+
+impl AvatarRecorder {
+    /// A recorder with no session behind it.
+    ///
+    /// Every record is dropped, which is the honest answer when there is no
+    /// store: a test that folds an event without opening one, or a host that
+    /// built the daemon but never a session.
+    pub fn detached() -> Self {
+        Self {
+            session: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Point `jid` at `picture_id`, whose bytes are cached under `cache_key`.
+    ///
+    /// Called only once the bytes have landed. The order is the whole point:
+    /// a descriptor naming a cache key that holds nothing is the restart
+    /// failure the table exists to prevent.
+    pub fn record(&self, jid: String, picture_id: String, cache_key: String) {
+        let session = self.session.clone();
+        crate::exec::spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                // No session to record into: an account change or a teardown
+                // raced the fetch. The bytes stay cached and the next connect
+                // rediscovers them; writing nothing is the honest answer.
+                return;
+            };
+            let Ok(jid) = jid.parse::<Jid>() else {
+                warn!("cannot record an avatar against an unparseable address");
+                return;
+            };
+            let store = &live.chat_store;
+            if let Err(e) = store.record_avatar(&jid, picture_id, cache_key) {
+                warn!("could not publish the avatar descriptor: {e}");
+            } else if let Err(e) = store.flush().await {
+                warn!("the avatar descriptor did not commit: {e}");
+            }
+        });
+    }
+
+    /// Drop `jid`'s descriptor, because WhatsApp says it has no picture.
+    pub fn clear(&self, jid: String) {
+        let session = self.session.clone();
+        crate::exec::spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return;
+            };
+            let Ok(jid) = jid.parse::<Jid>() else {
+                return;
+            };
+            let store = &live.chat_store;
+            if let Err(e) = store.clear_avatar(&jid) {
+                warn!("could not drop the avatar descriptor: {e}");
+            } else if let Err(e) = store.flush().await {
+                warn!("the avatar removal did not commit: {e}");
+            }
+        });
+    }
+}
+
 /// How long each phase of a cold start took, so the one line that reports
 /// it can be written after hydration rather than in the middle of it.
 struct ColdStart {
@@ -237,7 +311,71 @@ struct Shared {
     calls: CallRegistry,
     shutdown: Arc<tokio::sync::Notify>,
     reload: Arc<tokio::sync::Notify>,
+    /// Asks the avatar resolver for a pass. Its own signal rather than the
+    /// history reloader's: the two lifecycles are exactly what the split
+    /// exists to keep apart, and a receipt that asks for history must not
+    /// drag a profile-picture lookup behind it.
+    resolve_avatars: AvatarResolveSignal,
     history_budget: Arc<ui_queue::HistoryBudget>,
+}
+
+/// Asking the avatar resolver for a pass, and whether it must forget first.
+///
+/// The two travel together, so they are one value: a plain pass asks about
+/// chats nothing is known about, and a reset pass throws away what *is* known
+/// because the bytes those keys named are gone (a cleared media cache). Two
+/// separate handles could be observed one without the other.
+///
+/// An explicit ask may also name chats, which is how a page past the store's
+/// read window gets its pictures: the connect pass reads a bounded list, and a
+/// chat that only arrives later is one that list never held.
+#[derive(Clone, Default)]
+pub(super) struct AvatarResolveSignal {
+    ask: Arc<tokio::sync::Notify>,
+    reset: Arc<portable_atomic::AtomicBool>,
+    named: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl AvatarResolveSignal {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask for a pass over what is not yet known.
+    pub(super) fn request(&self) {
+        self.ask.notify_one();
+    }
+
+    /// Ask for a pass that forgets what is known, because its bytes are gone.
+    pub(super) fn reset(&self) {
+        self.reset.store(true, portable_atomic::Ordering::SeqCst);
+        self.ask.notify_one();
+    }
+
+    /// Ask about these chats specifically, whether or not the store's read
+    /// window covers them.
+    pub(super) fn request_named(&self, jids: impl IntoIterator<Item = String>) {
+        {
+            let mut named = self.named.lock().unwrap_or_else(|e| e.into_inner());
+            named.extend(jids);
+        }
+        self.ask.notify_one();
+    }
+
+    /// Take the pending reset and named chats, and wait for the next ask.
+    ///
+    /// Answers `(reset, named)`. Waits rather than returning empty when only a
+    /// reset flag was set, so a caller never spins.
+    pub(super) async fn next(&self) -> (bool, Vec<String>) {
+        loop {
+            let reset = self.reset.swap(false, portable_atomic::Ordering::SeqCst);
+            let named = std::mem::take(&mut *self.named.lock().unwrap_or_else(|e| e.into_inner()));
+            if reset || !named.is_empty() {
+                return (reset, named);
+            }
+            self.ask.notified().await;
+        }
+    }
 }
 
 /// WhatsApp client wrapper that manages the connection and provides
@@ -284,6 +422,14 @@ pub struct WhatsAppClient {
     /// next message did.
     reload: Arc<tokio::sync::Notify>,
     history_budget: Arc<ui_queue::HistoryBudget>,
+    /// Asks the avatar resolver for a pass, and whether it must forget first.
+    ///
+    /// Its own lifecycle, deliberately not the reloader's: a picture is
+    /// stable metadata, and running its lookup behind every store
+    /// invalidation is what made a receipt query WhatsApp for something that
+    /// had not moved. The flag is set by a media-cache clear, where the
+    /// metadata may be unchanged but the bytes it named are gone.
+    resolve_avatars: AvatarResolveSignal,
 }
 
 impl WhatsAppClient {
@@ -293,6 +439,7 @@ impl WhatsAppClient {
     /// the thread that asked.
     pub fn new() -> std::io::Result<Self> {
         let reload = Arc::new(tokio::sync::Notify::new());
+        let resolve_avatars = AvatarResolveSignal::new();
         let history_budget = Arc::new(ui_queue::HistoryBudget::new());
         let (ui_sender, ui_events) = ui_queue::channel(reload.clone(), history_budget.clone());
         Ok(Self {
@@ -308,6 +455,7 @@ impl WhatsAppClient {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             reload,
             history_budget,
+            resolve_avatars,
         })
     }
 
@@ -494,6 +642,7 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let shutdown = self.shutdown.clone();
         let reload = self.reload.clone();
+        let resolve_avatars = self.resolve_avatars.clone();
         let history_budget = self.history_budget.clone();
 
         let started = self.exec.start("oxidezap-session", async move {
@@ -504,6 +653,7 @@ impl WhatsAppClient {
                     calls,
                     shutdown,
                     reload,
+                    resolve_avatars,
                     history_budget,
                 },
             )
@@ -702,6 +852,7 @@ impl WhatsAppClient {
             calls,
             shutdown,
             reload,
+            resolve_avatars,
             history_budget,
         } = shared;
         let cold_start = wacore::time::Instant::now();
@@ -825,6 +976,7 @@ impl WhatsAppClient {
             let names = names.clone();
             let reload = reload.clone();
             let control_fault_ui = ui_tx.clone();
+            let avatar_signal = resolve_avatars.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
                 // The dispatch loop's own handle. The one below is moved into
@@ -839,9 +991,18 @@ impl WhatsAppClient {
                         let calls = calls.clone();
                         let names = names.clone();
                         let reload = reload.clone();
+                        let resolve_avatars = avatar_signal.clone();
                         async move {
-                            Self::handle_event(event, client, ui_tx, calls, names, Some(reload))
-                                .await;
+                            Self::handle_event(
+                                event,
+                                client,
+                                ui_tx,
+                                calls,
+                                names,
+                                Some(reload),
+                                Some(resolve_avatars),
+                            )
+                            .await;
                         }
                     },
                     stopping.clone(),
@@ -920,6 +1081,18 @@ impl WhatsAppClient {
             reload,
             history_budget,
             names.clone(),
+            stopping.clone(),
+        );
+
+        // The picture lifecycle, kept apart from history on purpose. It runs
+        // when the session connects and when the chat list is paged further,
+        // never on a receipt or an acknowledgement, and it reads metadata only
+        // — the bytes are the daemon's.
+        Self::spawn_avatar_resolver(
+            bot.client(),
+            chat_store.clone(),
+            ui_tx.clone(),
+            resolve_avatars,
             stopping,
         );
 
@@ -966,6 +1139,7 @@ impl WhatsAppClient {
         calls: CallRegistry,
         names: Arc<NameBook>,
         reload: Option<Arc<tokio::sync::Notify>>,
+        resolve_avatars: Option<AvatarResolveSignal>,
     ) {
         match &*event {
             Event::RawNode(node) => calls.accept_advertisement(node).await,
@@ -996,6 +1170,14 @@ impl WhatsAppClient {
                 info!("Connected to WhatsApp!");
                 if let Some(reload) = reload {
                     reload.notify_one();
+                }
+                // The pictures, on their own signal and their own pass. A
+                // fresh connection is exactly when a metadata refresh is worth
+                // making: the durable descriptors already drew every known
+                // avatar from the cache, and this picks up whatever changed
+                // while the process was away.
+                if let Some(resolve) = resolve_avatars {
+                    resolve.request();
                 }
                 let _ = ui_tx.send(UiEvent::Connected);
                 // Who this device is linked as. Read from the device store
@@ -2033,6 +2215,35 @@ impl WhatsAppClient {
     /// this the new arrival would sit empty until the next message arrived.
     pub fn reload_history(&self) {
         self.reload.notify_one();
+    }
+
+    /// A handle for recording avatar descriptors from outside the session.
+    ///
+    /// The daemon fetches the bytes; the session owns the store. This is the
+    /// handle that lets the first tell the second, which is what keeps the
+    /// descriptor write behind the byte write.
+    pub fn avatar_recorder(&self) -> AvatarRecorder {
+        AvatarRecorder {
+            session: self.session.clone(),
+        }
+    }
+
+    /// Drop every resolved picture and ask for a fresh pass.
+    ///
+    /// For a cleared media cache: the metadata may not have moved, but the
+    /// bytes it named are gone, so a cache key has to be rediscovered rather
+    /// than trusted.
+    pub fn reset_avatar_cache(&self) {
+        self.resolve_avatars.reset();
+    }
+
+    /// Ask the avatar resolver about these chats specifically.
+    ///
+    /// For a chat list paged further: the rows it just read may name chats the
+    /// connect pass never saw, because that pass reads a bounded window. The
+    /// resolver deduplicates, so a chat it has already resolved costs nothing.
+    pub fn request_avatar_resolve_for(&self, jids: impl IntoIterator<Item = String>) {
+        self.resolve_avatars.request_named(jids);
     }
 
     /// Remember that these status updates have been watched.
