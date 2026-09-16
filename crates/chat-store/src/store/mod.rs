@@ -510,7 +510,7 @@ mod migration_tests {
     use diesel_migrations::MigrationHarness;
 
     #[tokio::test]
-    async fn sender_identity_migration_refuses_downgrade() {
+    async fn stable_id_downgrade_round_trips_then_sender_identity_refuses() {
         let store = SqliteStore::new(&format!(
             "file:memdb_chat_store_downgrade_{}?mode=memory&cache=shared",
             std::process::id()
@@ -519,6 +519,24 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
+        // The stable-id rewrite is reversible: reverting it keeps the table
+        // (without the `id`/`proto_codec` columns) rather than failing.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("stable-id downgrade is reversible");
+        assert_eq!(table_count(&store).await, 1);
+        assert!(!has_column(&store, "messages", "id").await);
+        assert!(!has_column(&store, "messages", "proto_codec").await);
+
+        // The sender-identity migration below it is not: collapsing the
+        // identity key back cannot reunite rows that became distinct, so it
+        // still refuses.
         let error = store
             .shared()
             .run(|conn| {
@@ -529,13 +547,16 @@ mod migration_tests {
             .await
             .expect_err("irreversible migration must reject downgrade");
         assert!(error.to_string().contains("migration"));
+        assert_eq!(table_count(&store).await, 1);
+    }
 
+    async fn table_count(store: &SqliteStore) -> i64 {
         #[derive(QueryableByName)]
         struct Count {
             #[diesel(sql_type = diesel::sql_types::BigInt)]
             count: i64,
         }
-        let exists: i64 = store
+        store
             .shared()
             .read(|conn| {
                 diesel::sql_query(
@@ -547,8 +568,27 @@ mod migration_tests {
                 .map_err(crate::error::db_err)
             })
             .await
-            .expect("inspect schema");
-        assert_eq!(exists, 1);
+            .expect("inspect schema")
+    }
+
+    async fn has_column(store: &SqliteStore, table: &str, column: &str) -> bool {
+        #[derive(QueryableByName)]
+        struct Col {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+        }
+        let table = table.to_owned();
+        let column = column.to_owned();
+        let cols: Vec<Col> = store
+            .shared()
+            .read(move |conn| {
+                diesel::sql_query(format!("SELECT name FROM pragma_table_info('{table}')"))
+                    .load(conn)
+                    .map_err(crate::error::db_err)
+            })
+            .await
+            .expect("inspect columns");
+        cols.iter().any(|col| col.name == column)
     }
 
     #[tokio::test]

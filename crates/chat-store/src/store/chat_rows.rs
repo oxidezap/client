@@ -13,7 +13,7 @@ use crate::store::read_state::{
 /// When `msg_id` is the chat's most recent message, replace the denormalized
 /// chat-list preview (an edit/revoke of an older message leaves it alone).
 /// "Most recent" uses the same total order as `messages()` — `(timestamp_ms,
-/// rowid)` — so a same-second sibling can't hijack the preview.
+/// id)` — so a same-second sibling can't hijack the preview.
 pub(super) fn refresh_preview_if_latest(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -34,7 +34,7 @@ pub(super) fn refresh_preview_if_latest(
                 .eq(device_id)
                 .and(dsl::chat_jid.eq_any(&keys)),
         )
-        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+        .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
         .select(dsl::msg_id)
         .first(conn)
         .optional()?;
@@ -71,7 +71,7 @@ fn newest_chat_head(
                 .eq(device_id)
                 .and(dsl::chat_jid.eq_any(&keys)),
         )
-        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+        .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
         .select((
             dsl::timestamp_ms,
             dsl::text_content,
@@ -186,7 +186,7 @@ pub(super) fn bump_chat(
         .set(dsl::last_message_ts.eq(bump.ts_ms))
         .execute(conn)?;
     // ...but the preview belongs to the newest row by the store's own order,
-    // (timestamp_ms, rowid): a same-millisecond sibling applied later must
+    // (timestamp_ms, id): a same-millisecond sibling applied later must
     // not win. Not msg_id, which is what the `message_arrival_order`
     // migration removed for biasing the tie towards a `3EB0` prefix.
     refresh_preview_if_latest(conn, device_id, chat, bump.msg_id, bump.preview, bump.kind)?;

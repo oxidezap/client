@@ -244,7 +244,7 @@ fn newest_message_ts(
     use schema::messages::dsl;
     dsl::messages
         .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
-        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+        .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
         .select(dsl::timestamp_ms)
         .first(conn)
         .optional()
@@ -388,8 +388,8 @@ pub(crate) fn merge_split_chat(
         .bind::<Text, _>(&dup.id)
         .execute(conn)?;
     }
-    // UPDATE OR IGNORE: PK collisions (the dups above) stay behind and are
-    // dropped after. rowids survive the UPDATE, so the FTS external-content
+    // UPDATE OR IGNORE: identity collisions (the dups above) stay behind and
+    // are dropped after. Ids survive the UPDATE, so the FTS external-content
     // index stays consistent; the leftover DELETE fires its cleanup trigger.
     diesel::sql_query(
         "UPDATE OR IGNORE messages SET chat_jid = ? WHERE device_id = ? AND chat_jid = ?",
@@ -414,7 +414,7 @@ pub(crate) fn merge_split_chat(
     //
     // A heuristic, not a proof, and worth saying so. The live path settles a
     // tie by arrival (`ts_ms <= ts_ms`), and across a split pair there is no
-    // arrival order to consult: a row is updated in place, so its rowid is
+    // arrival order to consult: a row is updated in place, so its id is
     // when the row was created rather than when its value was applied. The
     // case this gets wrong is a same-second add, remove and re-add split
     // across the two identities, where the re-add is dropped. That needs
