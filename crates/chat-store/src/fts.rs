@@ -319,6 +319,18 @@ mod tests {
     #[test]
     fn an_index_whose_triggers_went_out_from_under_it_is_rebuilt() {
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        // This connection's SQLite is built with foreign keys enabled by
+        // default (see the account/device cascade migration), so the account
+        // rows this migration set now writes need a parent `device` row to
+        // reference. The real parent table belongs to `whatsapp-rust`'s own
+        // migrations; this test only exercises chat-store's own set, so a
+        // minimal stand-in with the one row the fixture below uses is enough.
+        diesel::sql_query("CREATE TABLE device (id INTEGER PRIMARY KEY)")
+            .execute(&mut conn)
+            .expect("seed a device parent for the account cascade migration");
+        diesel::sql_query("INSERT INTO device (id) VALUES (1)")
+            .execute(&mut conn)
+            .expect("seed the device row the fixture below references");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
         ensure_fts(&mut conn).expect("create the index");
 

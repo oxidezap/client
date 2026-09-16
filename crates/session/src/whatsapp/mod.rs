@@ -61,7 +61,7 @@ use whatsapp_rust::client::Client;
 // The same type either way; only the road to it differs. On a desktop the
 // library re-exports it, and in a browser that re-export is behind a default
 // feature the wasm build drops — so it is named at its own crate there.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(test, not(target_family = "wasm")))]
 use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
@@ -73,13 +73,13 @@ use whatsapp_rust::wacore::types::presence::{
 };
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 use whatsapp_rust::waproto::whatsapp as wa;
-#[cfg(target_family = "wasm")]
+#[cfg(all(test, target_family = "wasm"))]
 use whatsapp_rust_sqlite_storage::SqliteStore;
 
 use crate::exec::{Executor, Task};
 use oxidezap_core::{
-    Availability, CallVideoFrame, ChatMessage, ComposingKind, DownloadableMedia, IncomingCall,
-    MessageStatus, SystemNotice, UiEvent, VideoStream, fallback_chat_name,
+    AccountId, Availability, CallVideoFrame, ChatMessage, ComposingKind, DownloadableMedia,
+    IncomingCall, MessageStatus, SystemNotice, UiEvent, VideoStream, fallback_chat_name,
 };
 
 use crate::names::NameBook;
@@ -88,7 +88,7 @@ use crate::video::{self, CameraLost, PictureLost, VideoPublisher, VideoSenderSlo
 use whatsapp_rust::voip::KeyframeUrgency;
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
-use crate::store::settings as store_settings;
+use crate::store::StoreRegistry;
 
 struct InterestedEventHandler {
     inner: Arc<ChannelEventHandler>,
@@ -233,6 +233,7 @@ pub(crate) async fn parts_visible(session: &SessionSlot) -> [bool; 3] {
 /// One struct rather than six parameters: every one of these is a handle the
 /// caller keeps a copy of, and a list of six is a list nobody can read.
 struct Shared {
+    stores: Arc<StoreRegistry>,
     session: SessionSlot,
     calls: CallRegistry,
     shutdown: Arc<tokio::sync::Notify>,
@@ -243,6 +244,14 @@ struct Shared {
 /// WhatsApp client wrapper that manages the connection and provides
 /// a clean interface for UI operations.
 pub struct WhatsAppClient {
+    /// The local SQLite device row this session is allowed to use.
+    ///
+    /// It is captured before the executor starts and never changes while the
+    /// session is alive, so an async completion cannot accidentally write to a
+    /// different account after a front-end switch.
+    account_id: AccountId,
+    /// Shared registry for the physical database and one chat migration run.
+    stores: Arc<StoreRegistry>,
     /// Where the session's work runs: a runtime on a thread of its own on a
     /// desktop, the page's event loop in a browser. See [`crate::exec`].
     exec: Executor,
@@ -292,10 +301,26 @@ impl WhatsAppClient {
     /// refuse — so a retry can route to the error screen instead of panicking
     /// the thread that asked.
     pub fn new() -> std::io::Result<Self> {
+        Self::new_for_account(AccountId::LEGACY)
+    }
+
+    /// Create a session bound permanently to one local account slot.
+    pub fn new_for_account(account_id: AccountId) -> std::io::Result<Self> {
+        let stores = Arc::new(StoreRegistry::new(crate::store::database_path()));
+        Self::new_for_account_with_registry(account_id, stores)
+    }
+
+    /// Create a session using the daemon's shared database registry.
+    pub fn new_for_account_with_registry(
+        account_id: AccountId,
+        stores: Arc<StoreRegistry>,
+    ) -> std::io::Result<Self> {
         let reload = Arc::new(tokio::sync::Notify::new());
         let history_budget = Arc::new(ui_queue::HistoryBudget::new());
         let (ui_sender, ui_events) = ui_queue::channel(reload.clone(), history_budget.clone());
         Ok(Self {
+            account_id,
+            stores,
             exec: Executor::new()?,
             ui_sender,
             ui_events: Some(ui_events),
@@ -495,11 +520,15 @@ impl WhatsAppClient {
         let shutdown = self.shutdown.clone();
         let reload = self.reload.clone();
         let history_budget = self.history_budget.clone();
+        let account_id = self.account_id;
+        let stores = Arc::clone(&self.stores);
 
         let started = self.exec.start("oxidezap-session", async move {
             Self::run_client(
+                account_id,
                 ui_tx,
                 Shared {
+                    stores,
                     session,
                     calls,
                     shutdown,
@@ -541,7 +570,8 @@ impl WhatsAppClient {
     /// Returns the bot, which only the caller runs: `bot.run()` is the network
     /// and the one thing a test cannot have.
     async fn open_session(
-        db_path: &str,
+        stores: &StoreRegistry,
+        account_id: AccountId,
         ui_tx: &UiEventSender,
         session: &SessionSlot,
     ) -> Option<(Bot, Arc<Session>, ColdStart)> {
@@ -591,7 +621,7 @@ impl WhatsAppClient {
         crate::exec::breathe().await;
 
         let opening = wacore::time::Instant::now();
-        let backend = match SqliteStore::with_config(db_path, store_settings()).await {
+        let backend = match stores.store(account_id).await {
             Ok(store) => store,
             Err(e) => {
                 // With the chain, not just the head. `StoreError`'s own
@@ -608,7 +638,12 @@ impl WhatsAppClient {
         crate::exec::breathe().await;
 
         let materializing = wacore::time::Instant::now();
-        let chat_store = match ChatStore::new(&backend).await {
+        if let Err(e) = stores.prepare_chat_schema(&backend).await {
+            error!("Failed to prepare chat store schema: {}", because(&e));
+            let _ = ui_tx.send(UiEvent::Error(format!("Database error: {e}")));
+            return None;
+        }
+        let chat_store = match ChatStore::new_prepared(&backend).await {
             Ok(store) => store,
             Err(e) => {
                 error!("Failed to open chat store: {}", because(&e));
@@ -696,8 +731,9 @@ impl WhatsAppClient {
     }
 
     /// Internal async function to run the client
-    async fn run_client(ui_tx: UiEventSender, shared: Shared) {
+    async fn run_client(account_id: AccountId, ui_tx: UiEventSender, shared: Shared) {
         let Shared {
+            stores,
             session,
             calls,
             shutdown,
@@ -706,17 +742,12 @@ impl WhatsAppClient {
         } = shared;
         let cold_start = wacore::time::Instant::now();
         // Device store + durable chat history share one SQLite file (one pool,
-        // one WAL writer).
-        let db_path = match crate::exec::unblock(resolve_database_path).await {
-            Ok(path) => path,
-            Err(e) => {
-                error!("Failed to resolve database path: {e}");
-                let _ = ui_tx.send(UiEvent::Error("Database initialization failed".to_string()));
-                return;
-            }
-        };
+        // one WAL writer). The registry is owned by the daemon and its schema
+        // cell prevents concurrent account runtimes from rerunning migrations.
         let resolving = cold_start.elapsed();
-        let Some((bot, live, cold)) = Self::open_session(&db_path, &ui_tx, &session).await else {
+        let Some((bot, live, cold)) =
+            Self::open_session(&stores, account_id, &ui_tx, &session).await
+        else {
             return;
         };
         let Session {

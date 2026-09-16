@@ -17,9 +17,7 @@ fixtures = []
 
 [dependencies]
 async-trait = { workspace = true }
-# Local account ids are minted from OS randomness; `wasm_js` is the backend
-# the web build needs, additive and harmless on the host.
-getrandom = { workspace = true }
+
 # Only for the call-state transitions, which refuse a second offer and say so.
 log = { workspace = true }
 # `serde` on chrono: message and chat timestamps cross the daemon socket.
@@ -35,7 +33,6 @@ wacore-binary = { workspace = true }
 # enabled for the whole graph. `oxidezap-core` is the crate everything else
 # depends on, which makes it the one place that reaches all of them.
 [target.'cfg(target_family = "wasm")'.dependencies]
-getrandom = { workspace = true }
 getrandom_02 = { workspace = true }
 
 [lints]

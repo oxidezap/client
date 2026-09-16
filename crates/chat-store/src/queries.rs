@@ -1050,6 +1050,13 @@ mod tests {
     /// about hand-written SQL would pin a string this crate never runs.
     fn plan(sql: &str) -> String {
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        // Production opens this parent through whatsapp-rust before the chat
+        // store runs. This planner test uses Diesel directly, so provide the
+        // smallest equivalent parent schema instead of weakening the FK
+        // migration just for a query-plan fixture.
+        diesel::sql_query("CREATE TABLE device (id INTEGER PRIMARY KEY)")
+            .execute(&mut conn)
+            .expect("device parent");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
         let rows: Vec<PlanRow> = diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
             .load(&mut conn)

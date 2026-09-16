@@ -177,12 +177,14 @@ impl EventHandler for ChatStoreHandler {
 }
 
 impl ChatStore {
-    /// Open (running migrations if needed) on the same database file as
-    /// `store`, bound to its device id, and start the writer task.
-    pub async fn new(store: &SqliteStore) -> Result<Arc<Self>> {
+    /// Prepare the shared chat schema once before account runtimes start.
+    ///
+    /// This has no account-local side effects: migrations and the FTS schema
+    /// belong to the physical database, while rows remain scoped by the
+    /// `device_id` carried by each store. Callers starting several runtimes
+    /// should await this once, then use [`Self::new`] for each device.
+    pub async fn prepare(store: &SqliteStore) -> Result<()> {
         let db = store.shared();
-        let device_id = store.device_id();
-
         db.run(|conn| {
             conn.run_pending_migrations(MIGRATIONS)
                 .map(|_| ())
@@ -192,6 +194,17 @@ impl ChatStore {
             Ok(())
         })
         .await?;
+        Ok(())
+    }
+
+    /// Open the already-prepared database on the same file as `store`, bound to
+    /// its device id, and start the writer task.
+    ///
+    /// This is the entry point for a runtime after the registry has called
+    /// [`Self::prepare`]. It does not launch another migration runner.
+    pub async fn new_prepared(store: &SqliteStore) -> Result<Arc<Self>> {
+        let db = store.shared();
+        let device_id = store.device_id();
 
         let (tx, rx) = mpsc::unbounded_channel();
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
@@ -205,6 +218,12 @@ impl ChatStore {
         });
         crate::spawn::spawn(writer_loop(db, device_id, rx, changes));
         Ok(this)
+    }
+
+    /// Open a store and prepare its shared schema when needed.
+    pub async fn new(store: &SqliteStore) -> Result<Arc<Self>> {
+        Self::prepare(store).await?;
+        Self::new_prepared(store).await
     }
 
     /// Declare that this client's inbound durability hook already materializes
@@ -530,5 +549,78 @@ mod migration_tests {
             .await
             .expect("inspect schema");
         assert_eq!(exists, 1);
+    }
+
+    #[tokio::test]
+    async fn account_device_cascade_removes_only_the_target_account() {
+        let database = format!(
+            "file:memdb_chat_store_cascade_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let store_a = SqliteStore::new(&database).await.expect("create store A");
+        let store_b = SqliteStore::new_for_device(&database, 2)
+            .await
+            .expect("create store B");
+        store_a.create_new_device().await.expect("create device A");
+        store_b.create_new_device().await.expect("create device B");
+        ChatStore::new(&store_a).await.expect("run migrations");
+
+        store_a
+            .shared()
+            .run(|conn| {
+                for sql in [
+                    "INSERT INTO chats (device_id, jid) VALUES (1, 'a@s.whatsapp.net'), (2, 'b@s.whatsapp.net')",
+                    "INSERT INTO messages (device_id, chat_jid, msg_id, sender_jid, timestamp_ms, kind) VALUES (1, 'a@s.whatsapp.net', 'a', 'a@s.whatsapp.net', 1, 'text'), (2, 'b@s.whatsapp.net', 'b', 'b@s.whatsapp.net', 1, 'text')",
+                    "INSERT INTO reactions (device_id, chat_jid, msg_id, sender_jid, emoji, ts_ms) VALUES (1, 'a@s.whatsapp.net', 'a', 'a@s.whatsapp.net', '👍', 1), (2, 'b@s.whatsapp.net', 'b', 'b@s.whatsapp.net', '👍', 1)",
+                    "INSERT INTO contacts (device_id, jid) VALUES (1, 'a@s.whatsapp.net'), (2, 'b@s.whatsapp.net')",
+                    "INSERT INTO message_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type, ts_ms) VALUES (1, 'a@s.whatsapp.net', 'a', 'a@s.whatsapp.net', 3, 1), (2, 'b@s.whatsapp.net', 'b', 'b@s.whatsapp.net', 3, 1)",
+                    "INSERT INTO media_refs (device_id, file_sha256, file_path, downloaded_at_ms) VALUES (1, X'01', 'a', 1), (2, X'02', 'b', 1)",
+                ] {
+                    diesel::sql_query(sql)
+                        .execute(conn)
+                        .map_err(crate::error::db_err)?;
+                }
+                diesel::sql_query("DELETE FROM device WHERE id = 1")
+                    .execute(conn)
+                    .map(|_| ())
+                    .map_err(crate::error::db_err)
+            })
+            .await
+            .expect("delete device A with cascading client rows");
+
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+        for table in [
+            "chats",
+            "messages",
+            "reactions",
+            "contacts",
+            "message_receipts",
+            "media_refs",
+        ] {
+            let counts: (i64, i64) = store_a
+                .shared()
+                .read(move |conn| {
+                    let a = diesel::sql_query(format!(
+                        "SELECT count(*) AS count FROM {table} WHERE device_id = 1"
+                    ))
+                    .get_result::<Count>(conn)
+                    .map(|row| row.count)
+                    .map_err(crate::error::db_err)?;
+                    let b = diesel::sql_query(format!(
+                        "SELECT count(*) AS count FROM {table} WHERE device_id = 2"
+                    ))
+                    .get_result::<Count>(conn)
+                    .map(|row| row.count)
+                    .map_err(crate::error::db_err)?;
+                    Ok((a, b))
+                })
+                .await
+                .expect("inspect cascaded rows");
+            assert_eq!(counts, (0, 1), "unexpected rows in {table}");
+        }
     }
 }
