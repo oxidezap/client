@@ -57,7 +57,10 @@ pub use groups::{
     GroupDetails, GroupListEntry, GroupParticipantView, JoinGroupView, JoinRequestView,
     ParticipantChange,
 };
-pub use ops::{ChannelView, ContactCheckView, HistoryCoverage, PollView, ProfileView};
+pub use ops::{
+    BackfillFile, BackfillReport, ChannelView, ContactCheckView, ContactView, HistoryCoverage,
+    PollView, ProfileView,
+};
 pub use outgoing::OutgoingFile;
 pub use paging::ReadBoundary;
 

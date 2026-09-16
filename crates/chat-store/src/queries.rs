@@ -55,15 +55,15 @@ type ContactRow = (
 
 type MediaRefRow = (Vec<u8>, String, Option<String>, Option<i64>, i64);
 
+/// One contact's device-local labels: alias and tags.
+type ContactLabels = (Option<String>, Vec<String>);
+
 /// Labels for these stored contact keys, in one read.
 fn labels_for(
     conn: &mut diesel::SqliteConnection,
     device_id: i32,
     jids: &[String],
-) -> std::result::Result<
-    HashMap<String, (Option<String>, Vec<String>)>,
-    wacore::store::error::StoreError,
-> {
+) -> std::result::Result<HashMap<String, ContactLabels>, wacore::store::error::StoreError> {
     use schema::contact_labels::dsl;
     let mut out = HashMap::new();
     for page in jids.chunks(BIND_CHUNK) {
@@ -84,7 +84,7 @@ fn read_labels(
     conn: &mut diesel::SqliteConnection,
     device_id: i32,
     jid: &str,
-) -> std::result::Result<(Option<String>, Vec<String>), wacore::store::error::StoreError> {
+) -> std::result::Result<ContactLabels, wacore::store::error::StoreError> {
     use schema::contact_labels::dsl;
     let current: Option<(Option<String>, String)> = dsl::contact_labels
         .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid)))
@@ -103,7 +103,7 @@ fn write_labels(
     conn: &mut diesel::SqliteConnection,
     device_id: i32,
     jid: &str,
-    labels: &(Option<String>, Vec<String>),
+    labels: &ContactLabels,
 ) -> std::result::Result<(), wacore::store::error::StoreError> {
     use schema::contact_labels::dsl;
     let tags = serde_json::to_string(&labels.1).unwrap_or_else(|_| "[]".into());
@@ -993,7 +993,7 @@ impl ChatStore {
         // Bare key, matching how the writers file contacts: a caller holding a
         // message's `sender` has the device on it.
         let jid_str = jid.to_non_ad_string();
-        let row: Option<(ContactRow, Option<(Option<String>, Vec<String>)>)> = self
+        let row: Option<(ContactRow, Option<ContactLabels>)> = self
             .db()
             .read(move |conn| {
                 let row: Option<ContactRow> = dsl::contacts
@@ -1010,7 +1010,7 @@ impl ChatStore {
                     .map_err(db_err)?;
                 let labels = match &row {
                     Some((jid, _, _, _, _)) => {
-                        labels_for(conn, device_id, &[jid.clone()])?.remove(jid)
+                        labels_for(conn, device_id, std::slice::from_ref(jid))?.remove(jid)
                     }
                     None => None,
                 };
@@ -1036,10 +1036,7 @@ impl ChatStore {
     pub async fn contacts(&self, query: Option<String>, limit: i64) -> Result<Vec<ContactEntry>> {
         use schema::contacts::dsl;
         let device_id = self.device_id();
-        let rows: (
-            Vec<ContactRow>,
-            HashMap<String, (Option<String>, Vec<String>)>,
-        ) = self
+        let rows: (Vec<ContactRow>, HashMap<String, ContactLabels>) = self
             .db()
             .read(move |conn| {
                 let mut q = dsl::contacts
@@ -1116,7 +1113,6 @@ impl ChatStore {
 
     /// Add a device-local tag to a contact. Idempotent.
     pub async fn tag_contact(&self, jid: &Jid, tag: String) -> Result<()> {
-        use schema::contact_labels::dsl;
         let device_id = self.device_id();
         let jid = jid.to_non_ad_string();
         self.db()
@@ -1133,7 +1129,6 @@ impl ChatStore {
 
     /// Remove a device-local tag from a contact. Idempotent.
     pub async fn untag_contact(&self, jid: &Jid, tag: &str) -> Result<()> {
-        use schema::contact_labels::dsl;
         let device_id = self.device_id();
         let jid = jid.to_non_ad_string();
         let tag = tag.to_string();

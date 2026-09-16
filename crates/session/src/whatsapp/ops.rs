@@ -46,6 +46,34 @@ pub struct ContactCheckView {
     pub jid: Option<String>,
 }
 
+/// One address-book row, labels included.
+#[derive(Debug, Clone)]
+pub struct ContactView {
+    pub jid: String,
+    pub name: Option<String>,
+    pub push_name: Option<String>,
+    pub phone: Option<String>,
+    pub is_business: bool,
+    pub alias: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// An address-book row as the plain view the daemon maps onto its DTO.
+fn contact_view_of(entry: oxidezap_chat_store::ContactEntry) -> ContactView {
+    let jid = entry.jid.to_string();
+    let phone = jid.split('@').next().map(str::to_string);
+    let is_business = entry.business_name.is_some();
+    ContactView {
+        jid,
+        name: entry.full_name.or(entry.first_name).or(entry.business_name),
+        push_name: entry.push_name,
+        phone,
+        is_business,
+        alias: entry.alias,
+        tags: entry.tags,
+    }
+}
+
 /// One subscribed channel.
 #[derive(Debug, Clone)]
 pub struct ChannelView {
@@ -62,6 +90,22 @@ pub struct HistoryCoverage {
     pub stored_count: u64,
     pub oldest_ms: Option<i64>,
     pub newest_ms: Option<i64>,
+}
+
+/// One backfilled media file, with the hash the daemon keys its cache by.
+#[derive(Debug, Clone)]
+pub struct BackfillFile {
+    pub message_id: String,
+    pub chat_jid: String,
+    pub file_enc_sha256: Vec<u8>,
+    pub bytes: Vec<u8>,
+}
+
+/// What a media backfill attempted and fetched.
+#[derive(Debug, Clone)]
+pub struct BackfillReport {
+    pub requested: u64,
+    pub files: Vec<BackfillFile>,
 }
 
 impl WhatsAppClient {
@@ -473,7 +517,7 @@ impl WhatsAppClient {
         &self,
         jid: String,
         alias: Option<String>,
-    ) -> Task<Result<Option<oxidezap_chat_store::ContactEntry>, String>> {
+    ) -> Task<Result<Option<ContactView>, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
             let target: Jid = jid.parse().map_err(|_| "not a user address".to_string())?;
@@ -487,6 +531,7 @@ impl WhatsAppClient {
             live.chat_store
                 .contact(&target)
                 .await
+                .map(|entry| entry.map(contact_view_of))
                 .map_err(|e| format!("database query failed: {e}"))
         })
     }
@@ -496,7 +541,7 @@ impl WhatsAppClient {
         &self,
         jid: String,
         tag: String,
-    ) -> Task<Result<Option<oxidezap_chat_store::ContactEntry>, String>> {
+    ) -> Task<Result<Option<ContactView>, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
             let target: Jid = jid.parse().map_err(|_| "not a user address".to_string())?;
@@ -513,6 +558,7 @@ impl WhatsAppClient {
             live.chat_store
                 .contact(&target)
                 .await
+                .map(|entry| entry.map(contact_view_of))
                 .map_err(|e| format!("database query failed: {e}"))
         })
     }
@@ -522,7 +568,7 @@ impl WhatsAppClient {
         &self,
         jid: String,
         tag: String,
-    ) -> Task<Result<Option<oxidezap_chat_store::ContactEntry>, String>> {
+    ) -> Task<Result<Option<ContactView>, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
             let target: Jid = jid.parse().map_err(|_| "not a user address".to_string())?;
@@ -536,15 +582,104 @@ impl WhatsAppClient {
             live.chat_store
                 .contact(&target)
                 .await
+                .map(|entry| entry.map(contact_view_of))
                 .map_err(|e| format!("database query failed: {e}"))
         })
     }
 
-    /// One contact row by JID.
-    pub fn get_contact(
+    /// Contacts matching a query, labels included.
+    pub fn list_contact_views(
         &self,
-        jid: String,
-    ) -> Task<Result<Option<oxidezap_chat_store::ContactEntry>, String>> {
+        query: Option<String>,
+        limit: i64,
+    ) -> Task<Result<Vec<ContactView>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let entries = live
+                .chat_store
+                .contacts(query, limit.clamp(1, 200))
+                .await
+                .map_err(|e| format!("loading contacts failed: {e}"))?;
+            Ok(entries.into_iter().map(contact_view_of).collect())
+        })
+    }
+
+    /// Refresh contacts from the network, then read back the refreshed rows:
+    /// the one asked about, or the first page of the book.
+    pub fn refresh_contacts_and_read(
+        &self,
+        jid: Option<String>,
+    ) -> Task<Result<Vec<ContactView>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            Self::refresh_into(&session, jid.clone()).await?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            match jid {
+                Some(j) => {
+                    let target: Jid = j.parse().map_err(|_| "not a user address".to_string())?;
+                    let entry = live
+                        .chat_store
+                        .contact(&target)
+                        .await
+                        .map_err(|e| format!("database query failed: {e}"))?;
+                    Ok(entry.into_iter().map(contact_view_of).collect())
+                }
+                None => {
+                    let entries = live
+                        .chat_store
+                        .contacts(None, 200)
+                        .await
+                        .map_err(|e| format!("loading contacts failed: {e}"))?;
+                    Ok(entries.into_iter().map(contact_view_of).collect())
+                }
+            }
+        })
+    }
+
+    /// The network half of a contact refresh, shared by the counter and the
+    /// read-back.
+    async fn refresh_into(
+        session: &super::SessionSlot,
+        jid: Option<String>,
+    ) -> Result<usize, String> {
+        let targets: Vec<Jid> = match jid {
+            Some(j) => vec![j.parse().map_err(|_| "not a user address".to_string())?],
+            None => {
+                let Some(live) = session.lock().await.clone() else {
+                    return Err("no session yet".to_string());
+                };
+                live.chat_store
+                    .contacts(None, 10_000)
+                    .await
+                    .map_err(|e| format!("database query failed: {e}"))?
+                    .into_iter()
+                    .map(|c| c.jid)
+                    .collect()
+            }
+        };
+        let Some(live) = session.lock().await.clone() else {
+            return Err("no session yet".to_string());
+        };
+        let mut refreshed = 0;
+        for chunk in targets.chunks(50) {
+            let info = live
+                .client
+                .contacts()
+                .get_user_info(chunk)
+                .await
+                .map_err(|e| e.to_string())?;
+            refreshed += info.len();
+        }
+        Ok(refreshed)
+    }
+
+    /// One contact row by JID.
+    pub fn get_contact(&self, jid: String) -> Task<Result<Option<ContactView>, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
             let target: Jid = jid.parse().map_err(|_| "not a user address".to_string())?;
@@ -554,6 +689,7 @@ impl WhatsAppClient {
             live.chat_store
                 .contact(&target)
                 .await
+                .map(|entry| entry.map(contact_view_of))
                 .map_err(|e| format!("database query failed: {e}"))
         })
     }
@@ -565,37 +701,8 @@ impl WhatsAppClient {
     /// mappings behind it, so the address book converges as a side effect.
     pub fn refresh_contacts(&self, jid: Option<String>) -> Task<Result<usize, String>> {
         let session = self.session.clone();
-        self.exec.spawn(async move {
-            let targets: Vec<Jid> = match jid {
-                Some(j) => vec![j.parse().map_err(|_| "not a user address".to_string())?],
-                None => {
-                    let Some(live) = session.lock().await.clone() else {
-                        return Err("no session yet".to_string());
-                    };
-                    live.chat_store
-                        .contacts(None, 10_000)
-                        .await
-                        .map_err(|e| format!("database query failed: {e}"))?
-                        .into_iter()
-                        .map(|c| c.jid)
-                        .collect()
-                }
-            };
-            let Some(live) = session.lock().await.clone() else {
-                return Err("no session yet".to_string());
-            };
-            let mut refreshed = 0;
-            for chunk in targets.chunks(50) {
-                let info = live
-                    .client
-                    .contacts()
-                    .get_user_info(chunk)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                refreshed += info.len();
-            }
-            Ok(refreshed)
-        })
+        self.exec
+            .spawn(async move { Self::refresh_into(&session, jid).await })
     }
 
     /// Subscribed channels.
@@ -748,10 +855,13 @@ impl WhatsAppClient {
     }
 
     /// Starred messages, newest first, hydrated like search hits.
+    ///
+    /// Each message rides with its chat: starred spans conversations, and
+    /// the row is where the reader jumps to.
     pub fn list_starred(
         &self,
         limit: i64,
-    ) -> Task<Result<Vec<oxidezap_core::ChatMessage>, String>> {
+    ) -> Task<Result<Vec<(String, oxidezap_core::ChatMessage)>, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
             let Some(live) = session.lock().await.clone() else {
@@ -762,6 +872,7 @@ impl WhatsAppClient {
                 .starred_messages(limit.clamp(1, 200))
                 .await
                 .map_err(|e| format!("database query failed: {e}"))?;
+            let chats: Vec<String> = rows.iter().map(|s| s.chat_jid.to_string()).collect();
             let mut messages: Vec<oxidezap_core::ChatMessage> =
                 rows.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_sender_names(
@@ -772,7 +883,7 @@ impl WhatsAppClient {
                 false,
             )
             .await;
-            Ok(messages)
+            Ok(chats.into_iter().zip(messages).collect())
         })
     }
 
@@ -883,12 +994,18 @@ impl WhatsAppClient {
         })
     }
 
-    /// Messages carrying media, naming a media backfill's candidates.
-    pub fn pending_media(
+    /// Bulk-fetch media for the backfill candidates: every message carrying
+    /// media, with its bytes and the hash the daemon keys its cache by.
+    ///
+    /// Failures are per-message, not fatal: a backfill repairs what it can
+    /// and reports the rest by omission, which is what the daemon counts
+    /// against the candidates. The fetch is bounded by the limit, like
+    /// every other listing here.
+    pub fn backfill_media(
         &self,
         chat_jid: Option<String>,
         limit: i64,
-    ) -> Task<Result<Vec<oxidezap_core::ChatMessage>, String>> {
+    ) -> Task<Result<BackfillReport, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
             let chat = chat_jid
@@ -905,7 +1022,65 @@ impl WhatsAppClient {
                 .pending_media_messages(chat.as_ref(), limit.clamp(1, 200))
                 .await
                 .map_err(|e| format!("database query failed: {e}"))?;
-            Ok(rows.into_iter().map(stored_to_chat_message).collect())
+            let mut report = BackfillReport {
+                requested: 0,
+                files: Vec::new(),
+            };
+            for stored in rows {
+                let chat_jid = stored.chat_jid.to_string();
+                let message_id = stored.id.clone();
+                let Some(downloadable) = stored_to_chat_message(stored)
+                    .media
+                    .and_then(|media| media.downloadable)
+                else {
+                    continue;
+                };
+                report.requested += 1;
+                match live.client.download(&downloadable).await {
+                    Ok(bytes) => report.files.push(BackfillFile {
+                        message_id,
+                        chat_jid,
+                        file_enc_sha256: downloadable.file_enc_sha256.clone(),
+                        bytes,
+                    }),
+                    Err(e) => {
+                        log::warn!("a backfill download failed: {e}");
+                    }
+                }
+            }
+            Ok(report)
+        })
+    }
+
+    /// Messages carrying media, naming a media backfill's candidates.
+    ///
+    /// Each message rides with its chat, like starred: the backfill
+    /// downloads by (chat, id).
+    pub fn pending_media(
+        &self,
+        chat_jid: Option<String>,
+        limit: i64,
+    ) -> Task<Result<Vec<(String, oxidezap_core::ChatMessage)>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat = chat_jid
+                .map(|j| {
+                    j.parse::<Jid>()
+                        .map_err(|_| "not a chat address".to_string())
+                })
+                .transpose()?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let rows = live
+                .chat_store
+                .pending_media_messages(chat.as_ref(), limit.clamp(1, 200))
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?;
+            let chats: Vec<String> = rows.iter().map(|s| s.chat_jid.to_string()).collect();
+            let messages: Vec<oxidezap_core::ChatMessage> =
+                rows.into_iter().map(stored_to_chat_message).collect();
+            Ok(chats.into_iter().zip(messages).collect())
         })
     }
 }

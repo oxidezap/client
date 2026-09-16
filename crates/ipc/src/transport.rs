@@ -259,15 +259,17 @@ const MEDIA_DIR: &str = "media";
 pub fn endpoint_path() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        Some(state_dir()?.join(SOCKET_NAME))
+        Some(state_dir()?.join(socket_file_name()))
     }
     #[cfg(windows)]
     {
         // Named pipes are machine-wide, so the name carries the user: two
         // people signed into one machine must not land on each other's
-        // session. The same reason the Unix fallback carries the uid.
+        // session. The same reason the Unix fallback carries the uid. The
+        // account rides along for the same reason the socket file does.
+        let account = account_id().map(|id| format!("-{id}")).unwrap_or_default();
         Some(PathBuf::from(format!(
-            r"\\.\pipe\{DIR_NAME}-{}",
+            r"\\.\pipe\{DIR_NAME}-{}{account}",
             user_suffix()?
         )))
     }
@@ -319,7 +321,7 @@ pub fn state_dir() -> Option<PathBuf> {
 /// the endpoint is not a file at all.
 #[must_use]
 pub fn lock_path() -> Option<PathBuf> {
-    Some(state_dir()?.join("daemon.lock"))
+    Some(state_dir()?.join(account_lock_file_name()))
 }
 
 /// Where a media payload with this cache key lives.
@@ -399,7 +401,108 @@ pub fn staged_key(name: &str) -> String {
 /// The directory [`media_path`] resolves into.
 #[must_use]
 pub fn media_dir() -> Option<PathBuf> {
-    Some(state_dir()?.join(MEDIA_DIR))
+    Some(state_dir()?.join(media_dir_name()))
+}
+
+/// The account profile in force, from `OXIDEZAP_ACCOUNT`.
+///
+/// Sanitized to file-safe characters; unset or empty means the default
+/// profile. One account is one daemon over one store: the socket, the lock,
+/// the media cache and the database all derive from this, so two profiles
+/// never share state.
+#[must_use]
+pub fn account_id() -> Option<String> {
+    let raw = std::env::var_os("OXIDEZAP_ACCOUNT")?;
+    let id: String = raw
+        .to_string_lossy()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!id.is_empty()).then_some(id)
+}
+
+/// Every account socket the state directory holds: the default
+/// `daemon.sock` plus each `daemon-<id>.sock`, with the default first.
+#[must_use]
+pub fn account_sockets() -> Vec<(String, PathBuf)> {
+    let Some(dir) = state_dir() else {
+        return Vec::new();
+    };
+    let entries = std::fs::read_dir(&dir).map(|read| {
+        read.filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "sock")
+                    && path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| stem == "daemon" || stem.starts_with("daemon-"))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut found: Vec<(String, PathBuf)> = entries
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("daemon");
+            let id = stem
+                .strip_prefix("daemon-")
+                .unwrap_or("default")
+                .to_string();
+            (id, path)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The socket file for one account: the default name, or a suffixed one.
+#[must_use]
+pub fn endpoint_path_for_account(id: &str) -> Option<PathBuf> {
+    let clean: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if clean.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        Some(state_dir()?.join(format!("daemon-{clean}.sock")))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = clean;
+        endpoint_path()
+    }
+}
+
+fn socket_file_name() -> String {
+    match account_id() {
+        None => SOCKET_NAME.to_string(),
+        Some(id) => format!("daemon-{id}.sock"),
+    }
+}
+
+fn lock_file_name() -> &'static str {
+    "daemon.lock"
+}
+
+fn account_lock_file_name() -> String {
+    match account_id() {
+        None => lock_file_name().to_string(),
+        Some(id) => format!("daemon-{id}.lock"),
+    }
+}
+
+fn media_dir_name() -> String {
+    match account_id() {
+        None => MEDIA_DIR.to_string(),
+        Some(id) => format!("{MEDIA_DIR}-{id}"),
+    }
 }
 
 /// What distinguishes one user's daemon from another's on the same machine.

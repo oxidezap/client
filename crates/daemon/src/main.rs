@@ -23,9 +23,31 @@ mod macos_main;
 fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
-            "Usage: oxidezapd [OPTIONS]\n\nOptions:\n      --headless  Run headless without system tray integration\n  -h, --help      Print help"
+            "Usage: oxidezapd [OPTIONS]\n\nOptions:\n      --headless       Run headless without system tray integration\n      --account <id>   Run as a named account profile (own socket, lock,\n                       database and media cache; also OXIDEZAP_ACCOUNT)\n  -h, --help           Print help"
         );
         return Ok(());
+    }
+
+    // A named account profile owns its socket, lock, database and media
+    // cache; without one this is the default profile on the historic paths.
+    // Read here, before the claim, so every path derived below agrees.
+    let mut account_from_flag: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--account"
+            && let Some(id) = args.next()
+        {
+            account_from_flag = Some(id);
+        }
+    }
+    if let Some(id) = account_from_flag
+        && std::env::var_os("OXIDEZAP_ACCOUNT").is_none()
+    {
+        // Single-threaded startup, before the runtime exists: no thread can
+        // observe the environment changing under it.
+        unsafe {
+            std::env::set_var("OXIDEZAP_ACCOUNT", id);
+        }
     }
 
     // The level the last person to change it chose, unless `RUST_LOG` says

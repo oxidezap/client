@@ -776,12 +776,57 @@ pub(super) async fn handle_wire_request(
         | WireRequest::GetMessageContext { .. }
         | WireRequest::SearchMessages { .. }
         | WireRequest::ListContacts { .. }
+        | WireRequest::GetContact { .. }
+        | WireRequest::RefreshContacts { .. }
+        | WireRequest::SetContactAlias { .. }
+        | WireRequest::TagContact { .. }
+        | WireRequest::UntagContact { .. }
         | WireRequest::ListChats { .. }
         | WireRequest::GetChat { .. }
         | WireRequest::SendText { .. }
         | WireRequest::SendMedia { .. }
         | WireRequest::SendAudio { .. }
         | WireRequest::SendReaction { .. }
+        | WireRequest::EditMessage { .. }
+        | WireRequest::RevokeMessage { .. }
+        | WireRequest::ForwardMessage { .. }
+        | WireRequest::SendPoll { .. }
+        | WireRequest::VotePoll { .. }
+        | WireRequest::ListPolls { .. }
+        | WireRequest::GetPoll { .. }
+        | WireRequest::SendLocation { .. }
+        | WireRequest::SendStatus { .. }
+        | WireRequest::SendSticker { .. }
+        | WireRequest::ListStarredMessages { .. }
+        | WireRequest::ListGroups { .. }
+        | WireRequest::GetGroupInfo { .. }
+        | WireRequest::CreateGroup { .. }
+        | WireRequest::SetGroupTopic { .. }
+        | WireRequest::SetGroupDescription { .. }
+        | WireRequest::ManageGroupParticipant { .. }
+        | WireRequest::GetGroupInviteLink { .. }
+        | WireRequest::JoinGroup { .. }
+        | WireRequest::LeaveGroup { .. }
+        | WireRequest::SetGroupPermissions { .. }
+        | WireRequest::ListGroupJoinRequests { .. }
+        | WireRequest::ManageGroupJoinRequest { .. }
+        | WireRequest::ListChannels
+        | WireRequest::GetChannelInfo { .. }
+        | WireRequest::JoinChannel { .. }
+        | WireRequest::LeaveChannel { .. }
+        | WireRequest::GetProfile { .. }
+        | WireRequest::GetBusinessProfile { .. }
+        | WireRequest::SetProfileAbout { .. }
+        | WireRequest::SetProfileName { .. }
+        | WireRequest::SetProfilePicture { .. }
+        | WireRequest::RemoveProfilePicture
+        | WireRequest::CheckContact { .. }
+        | WireRequest::DownloadMedia { .. }
+        | WireRequest::RetryMedia { .. }
+        | WireRequest::HistoryCoverage { .. }
+        | WireRequest::BackfillMedia { .. }
+        | WireRequest::CleanupChats
+        | WireRequest::PurgeMessages { .. }
         | WireRequest::MarkRead { .. }
         | WireRequest::MarkUnread { .. }
         | WireRequest::PinChat { .. }
@@ -791,9 +836,65 @@ pub(super) async fn handle_wire_request(
         | WireRequest::ListCalls { .. } => {
             out_of_band_wire(hub, commands, outbox, id, request).await
         }
-        _ => wire_err(
-            id,
-            oxidezap_wire::error::ApiError::unsupported("action not yet implemented"),
-        ),
+        WireRequest::HistoryBackfill { .. } => {
+            // The reload republish lands where the backfill reads: the lane
+            // re-reads the store, and the backfill warms the page after it.
+            // Best effort — a refused reload still leaves a local backfill.
+            let _ = dispatch(hub, commands, Action::ReloadHistory).await;
+            out_of_band_wire(hub, commands, outbox, id, request).await
+        }
+        WireRequest::ForgetSession => {
+            // The bridge owns the forget flag, so this rides the legacy
+            // action rather than the wire out-of-band path.
+            match dispatch(hub, commands, Action::ForgetSession).await {
+                Ok(()) => wire_ok(id, WireResponse::Ack),
+                Err(ProtocolError::NoSession { detail }) => {
+                    wire_err(id, oxidezap_wire::error::ApiError::not_connected(detail))
+                }
+                Err(ProtocolError::Refused { detail }) => wire_err(
+                    id,
+                    oxidezap_wire::error::ApiError::permission_denied(detail),
+                ),
+                Err(other) => wire_err(
+                    id,
+                    oxidezap_wire::error::ApiError::internal(other.to_string()),
+                ),
+            }
+        }
+        WireRequest::ListAccounts => match oxidezap_session::unblock(list_account_profiles).await {
+            Ok(accounts) => wire_ok(id, WireResponse::Accounts { accounts }),
+            Err(e) => wire_err(id, oxidezap_wire::error::ApiError::internal(e.to_string())),
+        },
+    }
+}
+
+/// Every account socket the state directory holds, with a liveness probe.
+///
+/// Blocking by nature — directory scan plus connects — so it runs on the
+/// blocking pool, like the media reads it joins.
+fn list_account_profiles() -> Vec<oxidezap_wire::dto::AccountDto> {
+    oxidezap_ipc::account_sockets()
+        .into_iter()
+        .map(|(id, path)| {
+            let active = is_daemon_socket_live(&path);
+            oxidezap_wire::dto::AccountDto {
+                id,
+                socket_path: path.to_string_lossy().into_owned(),
+                active,
+            }
+        })
+        .collect()
+}
+
+/// A connect probe: a live daemon accepts, a stale socket file refuses.
+fn is_daemon_socket_live(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }

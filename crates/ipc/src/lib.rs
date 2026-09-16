@@ -59,6 +59,6 @@ pub use protocol::{
 };
 pub use transport::{
     DEFAULT_WEB_PORT, MAX_STAGED_BYTES, PROTOCOL_VERSION, STAGED_PREFIX, WEB_MEDIA_PATH,
-    WEB_SOCKET_PATH, endpoint_path, is_staged_key, lock_path, media_dir, media_path, staged_key,
-    state_dir, web_token_path,
+    WEB_SOCKET_PATH, account_id, account_sockets, endpoint_path, endpoint_path_for_account,
+    is_staged_key, lock_path, media_dir, media_path, staged_key, state_dir, web_token_path,
 };

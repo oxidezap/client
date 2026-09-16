@@ -1288,3 +1288,249 @@ async fn wire_phase4_requests_reach_the_session() {
     )
     .await;
 }
+
+/// The Phase 5/6 surface reaches the session instead of being refused:
+/// edits, polls, groups, channels, profile, contacts, media and history.
+#[tokio::test]
+async fn wire_phase56_requests_reach_the_session() {
+    use oxidezap_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let chat = "559900000001@s.whatsapp.net".to_string();
+    let group = "1234567890@g.us".to_string();
+
+    for request in [
+        WireRequest::EditMessage {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            new_text: "editado".into(),
+        },
+        WireRequest::RevokeMessage {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            for_everyone: true,
+        },
+        WireRequest::ForwardMessage {
+            source_chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            target_chat_jid: chat.clone(),
+        },
+        WireRequest::SendPoll {
+            to: chat.clone(),
+            question: "almoço?".into(),
+            options: vec!["pizza".into(), "sushi".into()],
+            selectable_count: 1,
+        },
+        WireRequest::VotePoll {
+            chat_jid: chat.clone(),
+            poll_id: "3EB0A".into(),
+            selected_option_indices: vec![0],
+        },
+        WireRequest::ListPolls {
+            chat_jid: None,
+            limit: 10,
+        },
+        WireRequest::GetPoll {
+            chat_jid: chat.clone(),
+            poll_id: "3EB0A".into(),
+        },
+        WireRequest::SendLocation {
+            to: chat.clone(),
+            latitude: -23.5,
+            longitude: -46.6,
+            name: None,
+        },
+        WireRequest::SendStatus {
+            text: "bom dia".into(),
+        },
+        WireRequest::SendSticker {
+            to: chat.clone(),
+            file_path: "/tmp/fig.webp".into(),
+        },
+        WireRequest::ListStarredMessages { limit: 10 },
+        WireRequest::ListGroups { refresh: false },
+        WireRequest::GetGroupInfo {
+            group_jid: group.clone(),
+        },
+        WireRequest::CreateGroup {
+            subject: "grupo".into(),
+            participants: vec![],
+        },
+        WireRequest::SetGroupTopic {
+            group_jid: group.clone(),
+            topic: "assunto".into(),
+        },
+        WireRequest::SetGroupDescription {
+            group_jid: group.clone(),
+            description: "descrição".into(),
+        },
+        WireRequest::ManageGroupParticipant {
+            group_jid: group.clone(),
+            participant_jid: chat.clone(),
+            action: oxidezap_wire::dto::GroupParticipantAction::Add,
+        },
+        WireRequest::GetGroupInviteLink {
+            group_jid: group.clone(),
+            reset: false,
+        },
+        WireRequest::JoinGroup {
+            invite_code: "AbCdEf".into(),
+        },
+        WireRequest::LeaveGroup {
+            group_jid: group.clone(),
+        },
+        WireRequest::SetGroupPermissions {
+            group_jid: group.clone(),
+            announce_only: false,
+            locked: false,
+        },
+        WireRequest::ListGroupJoinRequests {
+            group_jid: group.clone(),
+        },
+        WireRequest::ManageGroupJoinRequest {
+            group_jid: group.clone(),
+            participant_jid: chat.clone(),
+            approve: true,
+        },
+        WireRequest::ListChannels,
+        WireRequest::GetChannelInfo {
+            channel_jid: "123@newsletter".into(),
+        },
+        WireRequest::JoinChannel {
+            channel_jid: "123@newsletter".into(),
+        },
+        WireRequest::LeaveChannel {
+            channel_jid: "123@newsletter".into(),
+        },
+        WireRequest::GetProfile { jid: None },
+        WireRequest::GetBusinessProfile { jid: chat.clone() },
+        WireRequest::SetProfileAbout {
+            about: "recado".into(),
+        },
+        WireRequest::SetProfileName {
+            name: "nome".into(),
+        },
+        WireRequest::SetProfilePicture {
+            file_path: "/tmp/foto.jpg".into(),
+        },
+        WireRequest::RemoveProfilePicture,
+        WireRequest::CheckContact {
+            phone: "559900000001".into(),
+        },
+        WireRequest::GetContact { jid: chat.clone() },
+        WireRequest::RefreshContacts { jid: None },
+        WireRequest::SetContactAlias {
+            jid: chat.clone(),
+            alias: Some("apelido".into()),
+        },
+        WireRequest::TagContact {
+            jid: chat.clone(),
+            tag: "trabalho".into(),
+        },
+        WireRequest::UntagContact {
+            jid: chat.clone(),
+            tag: "trabalho".into(),
+        },
+        WireRequest::DownloadMedia {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            destination: None,
+        },
+        WireRequest::RetryMedia {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+        },
+        WireRequest::HistoryCoverage { chat_jid: None },
+        WireRequest::BackfillMedia {
+            chat_jid: None,
+            limit: 10,
+        },
+        WireRequest::CleanupChats,
+        WireRequest::PurgeMessages { chat_jid: None },
+    ] {
+        assert_wire_routed(&hub, &plugins, request).await;
+    }
+}
+
+/// A backfill reloads the history lane first, then dispatches to the
+/// session: two commands, in that order.
+#[tokio::test]
+async fn wire_history_backfill_reloads_then_dispatches() {
+    use oxidezap_wire::envelope::RequestEnvelope;
+    use oxidezap_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let (commands, mut incoming): (Commands, _) = tokio::sync::mpsc::channel(8);
+    // A bridge that takes every command and accepts it, recording the order.
+    let taken = tokio::spawn(async move {
+        let mut actions = Vec::new();
+        while let Some(cmd) = incoming.recv().await {
+            let _ = cmd.reply.send(CommandOutcome::Accepted);
+            actions.push(cmd.action);
+            if actions.len() == 2 {
+                break;
+            }
+        }
+        actions
+    });
+    let env = RequestEnvelope {
+        id: 14,
+        request: WireRequest::HistoryBackfill {
+            chat_jid: "559900000001@s.whatsapp.net".into(),
+            count: 50,
+        },
+    };
+    let ans = handle_wire_request(env, &hub, &plugins, &commands, &outbox()).await;
+    assert!(ans.frame.is_none(), "the session answers out-of-band");
+    let actions = taken.await.expect("the stand-in bridge");
+    assert!(matches!(actions.first(), Some(Action::ReloadHistory)));
+    assert!(matches!(
+        actions.get(1),
+        Some(Action::Wire {
+            request: WireRequest::HistoryBackfill { .. },
+            ..
+        })
+    ));
+}
+
+/// Forgetting the session rides the legacy action and answers a wire Ack,
+/// not an out-of-band dispatch.
+#[tokio::test]
+async fn wire_forget_session_answers_a_wire_ack() {
+    use oxidezap_wire::envelope::{RequestEnvelope, ResponseEnvelope, ResponseResult};
+    use oxidezap_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let env = RequestEnvelope {
+        id: 12,
+        request: WireRequest::ForgetSession,
+    };
+    let ans = handle_wire_request(env, &hub, &plugins, &commands, &outbox()).await;
+    let frame = ans.frame.expect("a direct answer");
+    let parsed: ResponseEnvelope = serde_json::from_str(&frame).expect("a wire envelope");
+    assert!(matches!(parsed.result, ResponseResult::Ok { .. }));
+    assert!(matches!(taken.await.unwrap(), Some(Action::ForgetSession)));
+}
+
+/// Listing accounts answers directly, without touching the session bridge.
+#[tokio::test]
+async fn wire_list_accounts_answers_directly() {
+    use oxidezap_wire::envelope::{RequestEnvelope, ResponseEnvelope, ResponseResult};
+    use oxidezap_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let env = RequestEnvelope {
+        id: 13,
+        request: WireRequest::ListAccounts,
+    };
+    let ans = handle_wire_request(env, &hub, &plugins, &commands, &outbox()).await;
+    let frame = ans.frame.expect("a direct answer");
+    let parsed: ResponseEnvelope = serde_json::from_str(&frame).expect("a wire envelope");
+    assert!(matches!(parsed.result, ResponseResult::Ok { .. }));
+}
