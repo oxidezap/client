@@ -283,9 +283,24 @@ de contas no daemon nativo.** O que falta agora é a camada acima:
 3. **Coordenação global (tray, calls) ainda não existe**: o `hub`
    pré-construído passado a `spawn_with_hub` continua fixo em
    `AccountId::LEGACY`; a tray só observa esse hub. Com múltiplas contas
-   reais, a tray precisa saber agregar mais de uma — item 9 do plano,
-   pendente de decisão de produto sobre o que uma chamada ativa faz quando o
-   usuário troca de conta (seção 20 do plano).
+   reais, a tray precisa saber agregar mais de uma.
+
+**Decisão de produto do item 9/seção 20 (perguntada e respondida): o que
+acontece com uma chamada ativa quando o usuário troca de conta.** Opção
+escolhida: **A — finalizar a chamada.** Trocar de conta encerra qualquer
+chamada ativa na conta que está sendo deixada; a UI deve avisar
+explicitamente antes de agir ("trocar de conta vai encerrar sua chamada
+ atual") e só prosseguir com confirmação do usuário — nunca finalizar a
+chamada silenciosamente. Nenhuma implementação de bloqueio restante: esta
+é a resposta definitiva para quando o switcher (item 6/7) e a coordenação
+global de chamada (item 9) forem implementados. Registrado aqui em vez de
+no código porque não existe hoje nenhuma ação de "trocar de conta" na GUI
+para este aviso ser anexado a — a GUI ainda fala só com a conta legada (ver
+item 1 abaixo). Quando o switcher existir, a confirmação entra no mesmo
+ponto onde `reset_and_pair_again`/`clear data and pair again`
+(`crates/gui/src/app/mod.rs`) já encerra a sessão hoje: checar
+`WhatsAppApp::active_call` antes de agir e, se houver uma, pedir
+confirmação antes de chamar `hang_up` e prosseguir.
 
 ## Sequência de implementação
 
@@ -321,9 +336,10 @@ de contas no daemon nativo.** O que falta agora é a camada acima:
       scopes de tab e restauração do conjunto inteiro, plugin-state por conta.
 - [ ] **9. Global** — tray agregado, `CallCoordinator`, sinais cross-account e
       política determinística para hardware de chamadas. Decisão de produto
-      pendente e explicitamente para perguntar ao usuário antes de
-      implementar: o que acontece com uma chamada ativa quando o usuário
-      troca de conta (seção 20 do plano).
+      **já tomada** (não mais pendente): opção A, finalizar a chamada ativa
+      ao trocar de conta, com aviso explícito antes de agir — ver a nota no
+      "Bloqueio arquitetural atual" acima. Falta só a implementação, que
+      depende do switcher (item 6/7) existir.
 - [ ] **10. Hardening/performance** — matriz de races, testes de isolamento,
        stress de writer, benchmark 1/2/4 contas, web, docs e CI completo.
 
