@@ -52,6 +52,19 @@ fn main() -> ExitCode {
         _ => {}
     }
 
+    // A named account profile owns its socket; without one this is the
+    // default profile on the historic path. An explicit socket always wins.
+    // Set before connecting, so the endpoint derived below agrees.
+    if let Some(account) = cli.account.as_deref()
+        && std::env::var_os("OXIDEZAP_ACCOUNT").is_none()
+    {
+        // Single-threaded startup, before any thread exists: no thread can
+        // observe the environment changing under it.
+        unsafe {
+            std::env::set_var("OXIDEZAP_ACCOUNT", account);
+        }
+    }
+
     // Connect to daemon
     let mut client = match cli.socket.as_deref() {
         Some(socket_path) => match IpcClient::connect_at(&PathBuf::from(socket_path)) {
@@ -240,6 +253,13 @@ fn execute_command(
                 println!("Chat unarchived.");
                 Ok(())
             }
+            Some(args::ChatsSubcommand::Cleanup(_)) => {
+                let resp = client.request(ClientRequest::CleanupChats)?;
+                if let DaemonResponse::ChatsCleaned { removed } = resp {
+                    println!("Cleaned {removed} empty chats.");
+                }
+                Ok(())
+            }
             None => {
                 // Default to list
                 let resp = client.request(ClientRequest::ListChats {
@@ -361,12 +381,67 @@ fn execute_command(
                 Ok(())
             }
             Some(args::MessagesSubcommand::Forward(f)) => {
-                client.request(ClientRequest::ForwardMessage {
+                let resp = client.request(ClientRequest::ForwardMessage {
                     source_chat_jid: f.from,
                     message_id: f.id,
                     target_chat_jid: f.to,
                 })?;
-                println!("Message forwarded.");
+                if let DaemonResponse::MessageSent { id, .. } = resp {
+                    println!("Message forwarded with ID: {id}");
+                }
+                Ok(())
+            }
+            Some(args::MessagesSubcommand::Export(e)) => {
+                let mut exported = Vec::new();
+                let mut before: Option<String> = None;
+                while exported.len() < e.limit {
+                    let want = (e.limit - exported.len()).min(200);
+                    let resp = client.request(ClientRequest::ListMessages {
+                        chat_jid: e.chat.clone(),
+                        limit: want,
+                        before: before.clone(),
+                        after: None,
+                    })?;
+                    let DaemonResponse::Messages { messages, .. } = resp else {
+                        break;
+                    };
+                    if messages.is_empty() {
+                        break;
+                    }
+                    before = messages.first().map(|m| m.id.clone());
+                    let reached_start = messages.len() < want;
+                    exported.extend(messages);
+                    if reached_start {
+                        break;
+                    }
+                }
+                exported.reverse();
+                if let Some(path) = e.output {
+                    let json = serde_json::to_string_pretty(&exported).unwrap_or_default();
+                    if let Err(err) = std::fs::write(&path, json) {
+                        print_error(
+                            output_mode,
+                            "export_write_failed",
+                            &format!("could not write {path}: {err}"),
+                        );
+                        return Ok(());
+                    }
+                    println!("Exported {} messages to {path}.", exported.len());
+                } else {
+                    print_result(output_mode, &exported, |items| {
+                        for m in items {
+                            let text = m.text.as_deref().unwrap_or(&m.kind);
+                            println!("[{}] {text}", m.id);
+                        }
+                    });
+                }
+                Ok(())
+            }
+            Some(args::MessagesSubcommand::Purge(p)) => {
+                let resp = client.request(ClientRequest::PurgeMessages { chat_jid: p.chat })?;
+                if let DaemonResponse::MessagesPurged { purged } = resp {
+                    println!("Purged payload of {purged} revoked messages.");
+                }
                 Ok(())
             }
             None => Ok(()),
@@ -390,57 +465,79 @@ fn execute_command(
                 Ok(())
             }
             Some(args::SendSubcommand::File(f)) => {
-                client.request(ClientRequest::SendMedia {
+                let resp = client.request(ClientRequest::SendMedia {
                     to: f.to,
                     file_path: f.file,
                     caption: f.caption,
                     mime_type: None,
                     as_document: f.as_document,
                 })?;
-                println!("File sent successfully.");
+                if let DaemonResponse::MessageSent { id, .. } = resp {
+                    println!("File sent with ID: {id}");
+                }
                 Ok(())
             }
             Some(args::SendSubcommand::Voice(v)) => {
-                client.request(ClientRequest::SendAudio {
+                let resp = client.request(ClientRequest::SendAudio {
                     to: v.to,
                     file_path: v.file,
                     ptt: true,
                 })?;
-                println!("Voice note sent.");
+                if let DaemonResponse::MessageSent { id, .. } = resp {
+                    println!("Voice note sent with ID: {id}");
+                }
                 Ok(())
             }
             Some(args::SendSubcommand::React(r)) => {
-                client.request(ClientRequest::SendReaction {
+                let resp = client.request(ClientRequest::SendReaction {
                     chat_jid: r.chat,
                     message_id: r.id,
                     emoji: r.emoji,
                 })?;
-                println!("Reaction updated.");
+                if let DaemonResponse::MessageSent { id, .. } = resp {
+                    println!("Reaction sent with ID: {id}");
+                }
                 Ok(())
             }
             Some(args::SendSubcommand::Poll(p)) => {
-                client.request(ClientRequest::SendPoll {
+                let resp = client.request(ClientRequest::SendPoll {
                     to: p.to,
                     question: p.question,
                     options: p.options,
                     selectable_count: p.selectable,
                 })?;
-                println!("Poll sent successfully.");
+                if let DaemonResponse::MessageSent { id, .. } = resp {
+                    println!("Poll sent with ID: {id}");
+                }
                 Ok(())
             }
             Some(args::SendSubcommand::Location(loc)) => {
-                client.request(ClientRequest::SendLocation {
+                let resp = client.request(ClientRequest::SendLocation {
                     to: loc.to,
                     latitude: loc.lat,
                     longitude: loc.lng,
                     name: loc.name,
                 })?;
-                println!("Location sent.");
+                if let DaemonResponse::MessageSent { id, .. } = resp {
+                    println!("Location sent with ID: {id}");
+                }
                 Ok(())
             }
             Some(args::SendSubcommand::Status(st)) => {
-                client.request(ClientRequest::SendStatus { text: st.text })?;
-                println!("Status broadcast sent.");
+                let resp = client.request(ClientRequest::SendStatus { text: st.text })?;
+                if let DaemonResponse::MessageSent { id, .. } = resp {
+                    println!("Status broadcast sent with ID: {id}");
+                }
+                Ok(())
+            }
+            Some(args::SendSubcommand::Sticker(s)) => {
+                let resp = client.request(ClientRequest::SendSticker {
+                    to: s.to,
+                    file_path: s.file,
+                })?;
+                if let DaemonResponse::MessageSent { id, .. } = resp {
+                    println!("Sticker sent with ID: {id}");
+                }
                 Ok(())
             }
             None => Ok(()),
@@ -482,6 +579,62 @@ fn execute_command(
                 }
                 Ok(())
             }
+            Some(args::ContactsSubcommand::Show(s)) => {
+                let resp = client.request(ClientRequest::GetContact { jid: s.jid })?;
+                if let DaemonResponse::Contact(c) = resp {
+                    print_result(output_mode, &c, |contact| {
+                        print_contact(contact);
+                    });
+                }
+                Ok(())
+            }
+            Some(args::ContactsSubcommand::Refresh(r)) => {
+                let resp = client.request(ClientRequest::RefreshContacts { jid: r.jid })?;
+                if let DaemonResponse::Contacts { contacts } = resp {
+                    print_result(output_mode, &contacts, |items| {
+                        for c in items {
+                            print_contact(c);
+                        }
+                    });
+                }
+                Ok(())
+            }
+            Some(args::ContactsSubcommand::Alias(a)) => {
+                let resp = client.request(ClientRequest::SetContactAlias {
+                    jid: a.jid,
+                    alias: a.alias,
+                })?;
+                if let DaemonResponse::Contact(c) = resp {
+                    print_result(output_mode, &c, |contact| {
+                        print_contact(contact);
+                    });
+                }
+                Ok(())
+            }
+            Some(args::ContactsSubcommand::Tag(t)) => {
+                let resp = client.request(ClientRequest::TagContact {
+                    jid: t.jid,
+                    tag: t.tag,
+                })?;
+                if let DaemonResponse::Contact(c) = resp {
+                    print_result(output_mode, &c, |contact| {
+                        print_contact(contact);
+                    });
+                }
+                Ok(())
+            }
+            Some(args::ContactsSubcommand::Untag(u)) => {
+                let resp = client.request(ClientRequest::UntagContact {
+                    jid: u.jid,
+                    tag: u.tag,
+                })?;
+                if let DaemonResponse::Contact(c) = resp {
+                    print_result(output_mode, &c, |contact| {
+                        print_contact(contact);
+                    });
+                }
+                Ok(())
+            }
             None => Ok(()),
         },
         Commands::Groups(groups) => match groups.command {
@@ -514,11 +667,13 @@ fn execute_command(
                 Ok(())
             }
             Some(args::GroupsSubcommand::Create(c)) => {
-                client.request(ClientRequest::CreateGroup {
+                let resp = client.request(ClientRequest::CreateGroup {
                     subject: c.subject,
                     participants: c.participants,
                 })?;
-                println!("Group created successfully.");
+                if let DaemonResponse::GroupCreated { jid } = resp {
+                    println!("Group created: {jid}");
+                }
                 Ok(())
             }
             Some(args::GroupsSubcommand::Rename(r)) => {
@@ -578,9 +733,111 @@ fn execute_command(
                 println!("Left group successfully.");
                 Ok(())
             }
+            Some(args::GroupsSubcommand::Invite(i)) => {
+                let resp = client.request(ClientRequest::GetGroupInviteLink {
+                    group_jid: i.jid,
+                    reset: i.reset,
+                })?;
+                if let DaemonResponse::GroupInviteLink { link } = resp {
+                    println!("{link}");
+                }
+                Ok(())
+            }
+            Some(args::GroupsSubcommand::Join(j)) => {
+                let resp = client.request(ClientRequest::JoinGroup {
+                    invite_code: j.code,
+                })?;
+                if let DaemonResponse::GroupJoined {
+                    jid,
+                    pending_approval,
+                } = resp
+                {
+                    if pending_approval {
+                        println!("Join requested for {jid}, awaiting admin approval.");
+                    } else {
+                        println!("Joined group: {jid}");
+                    }
+                }
+                Ok(())
+            }
+            Some(args::GroupsSubcommand::Permissions(p)) => {
+                client.request(ClientRequest::SetGroupPermissions {
+                    group_jid: p.jid,
+                    announce_only: p.announce_only,
+                    locked: p.locked,
+                })?;
+                println!("Group permissions updated.");
+                Ok(())
+            }
+            Some(args::GroupsSubcommand::Requests(r)) => {
+                let resp =
+                    client.request(ClientRequest::ListGroupJoinRequests { group_jid: r.jid })?;
+                if let DaemonResponse::GroupJoinRequests { requests } = resp {
+                    print_result(output_mode, &requests, |items| {
+                        for req in items {
+                            println!("{}", req.jid);
+                        }
+                    });
+                }
+                Ok(())
+            }
+            Some(args::GroupsSubcommand::Approve(a)) => {
+                client.request(ClientRequest::ManageGroupJoinRequest {
+                    group_jid: a.group,
+                    participant_jid: a.participant,
+                    approve: true,
+                })?;
+                println!("Membership request approved.");
+                Ok(())
+            }
+            Some(args::GroupsSubcommand::Reject(r)) => {
+                client.request(ClientRequest::ManageGroupJoinRequest {
+                    group_jid: r.group,
+                    participant_jid: r.participant,
+                    approve: false,
+                })?;
+                println!("Membership request rejected.");
+                Ok(())
+            }
+            Some(args::GroupsSubcommand::Prune(_)) => {
+                let resp = client.request(ClientRequest::CleanupChats)?;
+                if let DaemonResponse::ChatsCleaned { removed } = resp {
+                    println!("Pruned {removed} empty chats.");
+                }
+                Ok(())
+            }
             None => Ok(()),
         },
         Commands::Poll(poll) => match poll.command {
+            Some(args::PollSubcommand::List(l)) => {
+                let resp = client.request(ClientRequest::ListPolls {
+                    chat_jid: l.chat,
+                    limit: l.limit,
+                })?;
+                if let DaemonResponse::Polls { polls } = resp {
+                    print_result(output_mode, &polls, |items| {
+                        for p in items {
+                            println!("[{}] in {}: {}", p.id, p.chat_jid, p.question);
+                        }
+                    });
+                }
+                Ok(())
+            }
+            Some(args::PollSubcommand::Show(s)) => {
+                let resp = client.request(ClientRequest::GetPoll {
+                    chat_jid: s.chat,
+                    poll_id: s.poll,
+                })?;
+                if let DaemonResponse::Poll(p) = resp {
+                    print_result(output_mode, &p, |poll| {
+                        println!("Question: {}", poll.question);
+                        for opt in &poll.options {
+                            println!("  [{}] {} ({} votes)", opt.index, opt.name, opt.vote_count);
+                        }
+                    });
+                }
+                Ok(())
+            }
             Some(args::PollSubcommand::Vote(v)) => {
                 client.request(ClientRequest::VotePoll {
                     chat_jid: v.chat,
@@ -624,6 +881,29 @@ fn execute_command(
                 println!("Profile picture removed.");
                 Ok(())
             }
+            Some(args::ProfileSubcommand::Business(b)) => {
+                // No JID means this account: resolve it from the status.
+                let jid = match b.jid {
+                    Some(jid) => jid,
+                    None => match client.request(ClientRequest::GetStatus)? {
+                        DaemonResponse::Status(status) => status.jid.unwrap_or_default(),
+                        _ => String::new(),
+                    },
+                };
+                if jid.is_empty() {
+                    print_error(output_mode, "not_connected", "no account JID available");
+                    return Ok(());
+                }
+                let resp = client.request(ClientRequest::GetBusinessProfile { jid })?;
+                if let DaemonResponse::Profile(p) = resp {
+                    print_result(output_mode, &p, |prof| {
+                        println!("Name:  {}", prof.name.as_deref().unwrap_or("none"));
+                        println!("About: {}", prof.about.as_deref().unwrap_or("none"));
+                        println!("Photo: {}", prof.picture_url.as_deref().unwrap_or("none"));
+                    });
+                }
+                Ok(())
+            }
             None => Ok(()),
         },
         Commands::Presence(presence) => match presence.command {
@@ -649,6 +929,135 @@ fn execute_command(
                     state: oxidezap_wire::dto::PresenceState::Recording,
                 })?;
                 println!("Sent recording indicator.");
+                Ok(())
+            }
+            Some(args::PresenceSubcommand::Online(_)) => {
+                client.request(ClientRequest::SetPresence {
+                    chat_jid: None,
+                    state: oxidezap_wire::dto::PresenceState::Available,
+                })?;
+                println!("Appearing online.");
+                Ok(())
+            }
+            Some(args::PresenceSubcommand::Offline(_)) => {
+                client.request(ClientRequest::SetPresence {
+                    chat_jid: None,
+                    state: oxidezap_wire::dto::PresenceState::Unavailable,
+                })?;
+                println!("Appearing offline.");
+                Ok(())
+            }
+            None => Ok(()),
+        },
+        Commands::History(history) => match history.command {
+            Some(args::HistorySubcommand::Coverage(c)) => {
+                let resp = client.request(ClientRequest::HistoryCoverage {
+                    chat_jid: c.chat.clone(),
+                })?;
+                if let DaemonResponse::HistoryCoverage {
+                    stored_count,
+                    oldest_ts,
+                    newest_ts,
+                    ..
+                } = resp
+                {
+                    print_result(
+                        output_mode,
+                        &serde_json::json!({
+                            "stored_count": stored_count,
+                            "oldest_ts": oldest_ts,
+                            "newest_ts": newest_ts,
+                        }),
+                        |_| {
+                            println!("Stored messages: {stored_count}");
+                            println!(
+                                "Oldest: {}",
+                                oldest_ts
+                                    .map(|t| t.to_string())
+                                    .as_deref()
+                                    .unwrap_or("none")
+                            );
+                            println!(
+                                "Newest: {}",
+                                newest_ts
+                                    .map(|t| t.to_string())
+                                    .as_deref()
+                                    .unwrap_or("none")
+                            );
+                        },
+                    );
+                }
+                Ok(())
+            }
+            Some(args::HistorySubcommand::Backfill(b)) => {
+                let resp = client.request(ClientRequest::HistoryBackfill {
+                    chat_jid: b.chat,
+                    count: b.count,
+                })?;
+                if let DaemonResponse::HistoryCoverage { stored_count, .. } = resp {
+                    println!("Backfilled history ({stored_count} messages stored).");
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        },
+        Commands::Channels(channels) => match channels.command {
+            Some(args::ChannelsSubcommand::List(_)) => {
+                let resp = client.request(ClientRequest::ListChannels)?;
+                if let DaemonResponse::Channels { channels } = resp {
+                    print_result(output_mode, &channels, |items| {
+                        for c in items {
+                            println!("{:<32} {} ({})", c.jid, c.name, c.subscriber_count);
+                        }
+                    });
+                }
+                Ok(())
+            }
+            Some(args::ChannelsSubcommand::Show(s)) => {
+                let resp = client.request(ClientRequest::GetChannelInfo { channel_jid: s.jid })?;
+                if let DaemonResponse::Channel(c) = resp {
+                    print_result(output_mode, &c, |channel| {
+                        println!("Name:        {}", channel.name);
+                        println!("JID:         {}", channel.jid);
+                        println!("Subscribers: {}", channel.subscriber_count);
+                        println!(
+                            "Description: {}",
+                            channel.description.as_deref().unwrap_or("")
+                        );
+                    });
+                }
+                Ok(())
+            }
+            Some(args::ChannelsSubcommand::Join(j)) => {
+                let resp = client.request(ClientRequest::JoinChannel { channel_jid: j.jid })?;
+                if let DaemonResponse::Channel(c) = resp {
+                    println!("Following channel: {}", c.name);
+                }
+                Ok(())
+            }
+            Some(args::ChannelsSubcommand::Leave(l)) => {
+                client.request(ClientRequest::LeaveChannel { channel_jid: l.jid })?;
+                println!("Unfollowed channel.");
+                Ok(())
+            }
+            None => Ok(()),
+        },
+        Commands::Accounts(accounts) => match accounts.command {
+            Some(args::AccountsSubcommand::List(_)) => {
+                let resp = client.request(ClientRequest::ListAccounts)?;
+                if let DaemonResponse::Accounts { accounts } = resp {
+                    print_result(output_mode, &accounts, |items| {
+                        println!("{:<16} {:<8} SOCKET", "ID", "ACTIVE");
+                        for a in items {
+                            println!(
+                                "{:<16} {:<8} {}",
+                                a.id,
+                                if a.active { "yes" } else { "no" },
+                                a.socket_path
+                            );
+                        }
+                    });
+                }
                 Ok(())
             }
             None => Ok(()),
@@ -693,6 +1102,20 @@ fn execute_command(
                     message_id: r.id,
                 })?;
                 println!("Requested media re-upload from primary device.");
+                Ok(())
+            }
+            Some(args::MediaSubcommand::Backfill(b)) => {
+                let resp = client.request(ClientRequest::BackfillMedia {
+                    chat_jid: b.chat,
+                    limit: b.limit,
+                })?;
+                if let DaemonResponse::MediaBackfilled {
+                    requested,
+                    downloaded,
+                } = resp
+                {
+                    println!("Backfilled {downloaded} of {requested} media files.");
+                }
                 Ok(())
             }
             None => Ok(()),
@@ -764,4 +1187,20 @@ fn execute_command(
         }
         Commands::Completion(_) | Commands::Mcp(_) => Ok(()),
     }
+}
+
+/// One contact as a human line: name, address, and local labels.
+fn print_contact(contact: &oxidezap_wire::dto::ContactDto) {
+    let name = contact
+        .alias
+        .as_deref()
+        .or(contact.name.as_deref())
+        .or(contact.push_name.as_deref())
+        .unwrap_or("");
+    let tags = if contact.tags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", contact.tags.join(", "))
+    };
+    println!("{:<32} {name}{tags}", contact.jid);
 }

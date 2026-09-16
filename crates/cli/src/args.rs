@@ -54,6 +54,12 @@ pub enum Commands {
     Presence(PresenceArgs),
     /// List call events history
     Calls(CallsArgs),
+    /// Inspect local history coverage or backfill it
+    History(HistoryArgs),
+    /// Follow and manage broadcast channels
+    Channels(ChannelsArgs),
+    /// List daemon account profiles
+    Accounts(AccountsArgs),
     /// Download or manage media attachments
     Media(MediaArgs),
     /// Inspect storage stats or clean cache
@@ -110,7 +116,12 @@ pub enum ChatsSubcommand {
     Archive(ChatJidArg),
     /// Unarchive a conversation
     Unarchive(ChatJidArg),
+    /// Delete empty chat rows left behind
+    Cleanup(ChatsCleanupArgs),
 }
+
+#[derive(Args)]
+pub struct ChatsCleanupArgs {}
 
 #[derive(Args)]
 pub struct ChatsListArgs {
@@ -161,6 +172,29 @@ pub enum MessagesSubcommand {
     Revoke(MessageRevokeArgs),
     /// Forward a message to another chat
     Forward(MessageForwardArgs),
+    /// Export a chat's history as JSON
+    Export(MessagesExportArgs),
+    /// Drop stored payload of revoked messages, keeping tombstones
+    Purge(MessagesPurgeArgs),
+}
+
+#[derive(Args)]
+pub struct MessagesExportArgs {
+    /// Chat JID to export
+    pub chat: String,
+    /// Maximum number of messages to export
+    #[usage(long, default = "1000")]
+    pub limit: usize,
+    /// Output file (default: stdout)
+    #[usage(long)]
+    pub output: Option<String>,
+}
+
+#[derive(Args)]
+pub struct MessagesPurgeArgs {
+    /// Restrict purge to a chat (default: every chat)
+    #[usage(long)]
+    pub chat: Option<String>,
 }
 
 #[derive(Args)]
@@ -280,6 +314,17 @@ pub enum SendSubcommand {
     Location(SendLocationArgs),
     /// Send a status update (broadcast)
     Status(SendStatusArgs),
+    /// Send a WebP sticker
+    Sticker(SendStickerArgs),
+}
+
+#[derive(Args)]
+pub struct SendStickerArgs {
+    /// Recipient phone number or JID
+    #[usage(long)]
+    pub to: String,
+    /// Path to WebP sticker file
+    pub file: String,
 }
 
 #[derive(Args)]
@@ -383,8 +428,49 @@ pub struct ContactsArgs {
 pub enum ContactsSubcommand {
     /// Search contacts in local address book
     Search(ContactsSearchArgs),
+    /// Show one contact by JID
+    Show(ContactShowArgs),
     /// Check live if phone number is registered on WhatsApp
     Check(ContactCheckArgs),
+    /// Refresh contacts from the network
+    Refresh(ContactRefreshArgs),
+    /// Set or clear a contact's local alias
+    Alias(ContactAliasArgs),
+    /// Tag a contact locally
+    Tag(ContactTagArgs),
+    /// Remove a local tag from a contact
+    Untag(ContactTagArgs),
+}
+
+#[derive(Args)]
+pub struct ContactShowArgs {
+    /// Contact JID
+    pub jid: String,
+}
+
+#[derive(Args)]
+pub struct ContactRefreshArgs {
+    /// Refresh a single JID (default: the whole address book)
+    #[usage(long)]
+    pub jid: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ContactAliasArgs {
+    /// Contact JID
+    #[usage(long)]
+    pub jid: String,
+    /// Alias text (omit to clear)
+    pub alias: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ContactTagArgs {
+    /// Contact JID
+    #[usage(long)]
+    pub jid: String,
+    /// Tag text
+    pub tag: String,
 }
 
 #[derive(Args)]
@@ -430,7 +516,52 @@ pub enum GroupsSubcommand {
     Demote(GroupParticipantArgs),
     /// Leave a group
     Leave(GroupJidArg),
+    /// Show or reset the invite link
+    Invite(GroupInviteArgs),
+    /// Join a group through its invite code
+    Join(GroupJoinArgs),
+    /// Set announce-only and locked modes
+    Permissions(GroupPermissionsArgs),
+    /// List pending membership requests
+    Requests(GroupJidArg),
+    /// Approve a membership request
+    Approve(GroupParticipantArgs),
+    /// Reject a membership request
+    Reject(GroupParticipantArgs),
+    /// Remove empty chat rows left behind (left groups included)
+    Prune(GroupsPruneArgs),
 }
+
+#[derive(Args)]
+pub struct GroupInviteArgs {
+    /// Group JID
+    pub jid: String,
+    /// Reset the link instead of showing it
+    #[usage(long)]
+    pub reset: bool,
+}
+
+#[derive(Args)]
+pub struct GroupJoinArgs {
+    /// Invite code (the part after chat.whatsapp.com/)
+    pub code: String,
+}
+
+#[derive(Args)]
+pub struct GroupPermissionsArgs {
+    /// Group JID
+    #[usage(long)]
+    pub jid: String,
+    /// Only admins can send messages
+    #[usage(long)]
+    pub announce_only: bool,
+    /// Only admins can edit group info
+    #[usage(long)]
+    pub locked: bool,
+}
+
+#[derive(Args)]
+pub struct GroupsPruneArgs {}
 
 #[derive(Args)]
 pub struct GroupsListArgs {
@@ -495,8 +626,31 @@ pub struct PollArgs {
 
 #[derive(Subcommands)]
 pub enum PollSubcommand {
+    /// List polls as their creation messages describe them
+    List(PollListArgs),
+    /// Show one poll by message ID
+    Show(PollShowArgs),
     /// Vote on a poll option
     Vote(PollVoteArgs),
+}
+
+#[derive(Args)]
+pub struct PollListArgs {
+    /// Restrict to a chat (default: every chat)
+    #[usage(long)]
+    pub chat: Option<String>,
+    /// Maximum number of polls
+    #[usage(long, default = "50")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct PollShowArgs {
+    /// Chat JID
+    #[usage(long)]
+    pub chat: String,
+    /// Poll message ID
+    pub poll: String,
 }
 
 #[derive(Args)]
@@ -521,6 +675,8 @@ pub struct ProfileArgs {
 pub enum ProfileSubcommand {
     /// Get profile about text or details
     Get(ProfileGetArgs),
+    /// Get a business profile (verified name, about, picture)
+    Business(ProfileGetArgs),
     /// Set profile About status text
     SetAbout(ProfileSetAboutArgs),
     /// Set profile display name
@@ -572,7 +728,14 @@ pub enum PresenceSubcommand {
     Paused(PresenceChatArgs),
     /// Send recording audio indicator
     Recording(PresenceChatArgs),
+    /// Appear online to everyone
+    Online(PresenceGlobalArgs),
+    /// Appear offline to everyone
+    Offline(PresenceGlobalArgs),
 }
+
+#[derive(Args)]
+pub struct PresenceGlobalArgs {}
 
 #[derive(Args)]
 pub struct PresenceChatArgs {
@@ -588,6 +751,78 @@ pub struct CallsArgs {
 }
 
 #[derive(Args)]
+pub struct HistoryArgs {
+    #[usage(subcommand)]
+    pub command: Option<HistorySubcommand>,
+}
+
+#[derive(Subcommands)]
+pub enum HistorySubcommand {
+    /// Show how much history the store holds
+    Coverage(HistoryCoverageArgs),
+    /// Backfill history and report the resulting coverage
+    Backfill(HistoryBackfillArgs),
+}
+
+#[derive(Args)]
+pub struct HistoryCoverageArgs {
+    /// Restrict to a chat (default: the whole account)
+    #[usage(long)]
+    pub chat: Option<String>,
+}
+
+#[derive(Args)]
+pub struct HistoryBackfillArgs {
+    /// Chat JID to backfill
+    pub chat: String,
+    /// How deep the warm reads go
+    #[usage(long, default = "100")]
+    pub count: u32,
+}
+
+#[derive(Args)]
+pub struct ChannelsArgs {
+    #[usage(subcommand)]
+    pub command: Option<ChannelsSubcommand>,
+}
+
+#[derive(Subcommands)]
+pub enum ChannelsSubcommand {
+    /// List subscribed channels
+    List(ChannelsListArgs),
+    /// Show one channel
+    Show(ChannelShowArgs),
+    /// Follow a channel
+    Join(ChannelShowArgs),
+    /// Unfollow a channel
+    Leave(ChannelShowArgs),
+}
+
+#[derive(Args)]
+pub struct ChannelsListArgs {}
+
+#[derive(Args)]
+pub struct ChannelShowArgs {
+    /// Channel JID
+    pub jid: String,
+}
+
+#[derive(Args)]
+pub struct AccountsArgs {
+    #[usage(subcommand)]
+    pub command: Option<AccountsSubcommand>,
+}
+
+#[derive(Subcommands)]
+pub enum AccountsSubcommand {
+    /// List known account profiles and their sockets
+    List(AccountsListArgs),
+}
+
+#[derive(Args)]
+pub struct AccountsListArgs {}
+
+#[derive(Args)]
 pub struct MediaArgs {
     #[usage(subcommand)]
     pub command: Option<MediaSubcommand>,
@@ -599,6 +834,18 @@ pub enum MediaSubcommand {
     Download(MediaDownloadArgs),
     /// Request re-upload from primary phone for expired media
     Retry(MediaRetryArgs),
+    /// Fetch missing media into the cache
+    Backfill(MediaBackfillArgs),
+}
+
+#[derive(Args)]
+pub struct MediaBackfillArgs {
+    /// Restrict to a chat (default: every chat)
+    #[usage(long)]
+    pub chat: Option<String>,
+    /// Maximum number of messages to consider
+    #[usage(long, default = "50")]
+    pub limit: usize,
 }
 
 #[derive(Args)]
