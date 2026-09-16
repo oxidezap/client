@@ -1,5 +1,10 @@
 # Still to do
 
+> The multi-account V2 implementation tracker is in
+> [multi-account-todo.md](multi-account-todo.md). It is kept separate from the
+> older product gaps below so those measurements and their rationale remain
+> reviewable.
+
 > Known gaps and why each is still open. **Confirm a gap is still a gap before
 > acting on it** — some of these describe upstream behaviour that may have been
 > fixed, and any count or file size here is from the commit that wrote the
