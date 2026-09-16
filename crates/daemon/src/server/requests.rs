@@ -671,56 +671,17 @@ pub(super) async fn handle_wire_request(
     commands: &Commands,
     outbox: &Outbox,
 ) -> Answer {
-    use oxidezap_wire::dto::{ConnectionStatusDto, DoctorDto, StorageDto};
+    use oxidezap_wire::dto::{DoctorDto, StorageDto};
     use oxidezap_wire::request::ClientRequest as WireRequest;
     use oxidezap_wire::response::DaemonResponse as WireResponse;
 
     match request {
         WireRequest::Hello { .. } => wire_ok(id, WireResponse::Ack),
         WireRequest::GetStatus => {
+            // One constructor for polls and events, so the two never
+            // disagree about what a state is called.
             let snap = hub.snapshot();
-            let state_str = match &snap.connection {
-                oxidezap_ipc::ConnectionState::Connected => "connected",
-                oxidezap_ipc::ConnectionState::Connecting => "connecting",
-                oxidezap_ipc::ConnectionState::Syncing => "syncing",
-                oxidezap_ipc::ConnectionState::Disconnected { .. } => "disconnected",
-                oxidezap_ipc::ConnectionState::Pairing { .. } => "pairing",
-                oxidezap_ipc::ConnectionState::LoggedOut { .. } => "logged_out",
-            }
-            .to_string();
-            let (phone, name, jid, lid) = match &snap.account {
-                Some(acc) => (
-                    acc.jid
-                        .as_deref()
-                        .and_then(|j| j.split('@').next().map(str::to_string)),
-                    acc.name.clone(),
-                    acc.jid.clone(),
-                    acc.lid.clone(),
-                ),
-                None => (None, None, None, None),
-            };
-            let (qr_ascii, pair_code, pair_expires_at_ms) = match &snap.connection {
-                oxidezap_ipc::ConnectionState::Pairing { qr, pair_code } => {
-                    let qr_ascii = qr.as_ref().map(|q| q.code.clone());
-                    let p_code = pair_code.as_ref().map(|p| p.code.clone());
-                    let expires = pair_code
-                        .as_ref()
-                        .map(|p| p.expires_at_ms)
-                        .or_else(|| qr.as_ref().map(|q| q.expires_at_ms));
-                    (qr_ascii, p_code, expires)
-                }
-                _ => (None, None, None),
-            };
-            let status = ConnectionStatusDto {
-                state: state_str,
-                phone,
-                name,
-                jid,
-                lid,
-                qr_ascii,
-                pair_code,
-                pair_expires_at_ms,
-            };
+            let status = crate::session_bridge::connection_status_of(&snap.connection, hub);
             wire_ok(id, WireResponse::Status(status))
         }
         WireRequest::DoctorCheck => {

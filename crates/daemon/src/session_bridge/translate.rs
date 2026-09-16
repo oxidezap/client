@@ -38,6 +38,10 @@ impl Bridge {
     /// Folding does not touch the client, so this stays testable without a
     /// store: what it cannot do itself it returns, and the run loop performs.
     pub(super) fn observe(&mut self, mut event: UiEvent) -> Answer {
+        // Before the fold below, while the hub still holds the pre-state:
+        // the log records what happened, and folding first would only say
+        // what remains.
+        self.calls.observe(&event, &self.hub);
         prepare_avatars(&self.hub, &mut event);
         let mut answer = Answer::Nothing;
         // Before anything is published, so a `MarkRead` that arrives right

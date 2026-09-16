@@ -245,7 +245,20 @@ where
             biased;
 
             update = updates.recv(), if !awaiting_resync => match update {
-                Ok(frame) => write_line(&mut writer, &frame).await?,
+                Ok(frame) => {
+                    if attached.is_wire {
+                        // Translated, not forwarded: a wire client speaks
+                        // events, and frames without a wire spelling are
+                        // skipped rather than approximated.
+                        if let Some(line) =
+                            crate::session_bridge::translate_wire_frame(&frame, &hub)
+                        {
+                            write_line(&mut writer, &line).await?;
+                        }
+                    } else {
+                        write_line(&mut writer, &frame).await?;
+                    }
+                }
                 Err(RecvError::Lagged(missed)) => {
                     // The stream was truncated, so whatever the client holds is
                     // no longer trustworthy. Telling it to resync is the only
@@ -266,7 +279,17 @@ where
             // it before the future.
             session = async { sessions.as_mut().expect("guarded").recv().await },
                 if sessions.is_some() => match session {
-                Ok(frame) => write_line(&mut writer, &frame).await?,
+                Ok(frame) => {
+                    if attached.is_wire {
+                        if let Some(line) =
+                            crate::session_bridge::translate_wire_frame(&frame, &hub)
+                        {
+                            write_line(&mut writer, &line).await?;
+                        }
+                    } else {
+                        write_line(&mut writer, &frame).await?;
+                    }
+                }
                 // A front end that overruns cannot patch the gap from a
                 // snapshot: it holds messages, not summaries. Telling it to
                 // resync is the only answer, and it reloads history when it

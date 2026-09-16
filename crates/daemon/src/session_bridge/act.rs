@@ -17,12 +17,13 @@ use wacore_binary::jid::observe_str;
 use super::externalize::externalize_messages;
 use super::read_tracker::ReadRecord;
 use super::translate::chat_updated;
+use super::wire_events::{chat_message_to_dto, chat_to_dto};
 use super::{Action, Bridge, CommandOutcome, Outbox, STOPPING, SessionCommand};
 use crate::state::Change;
 use oxidezap_wire::dto::{
     ChannelDto, ChatDto, ContactDto, GroupDto, GroupJoinRequestDto,
-    GroupParticipantAction as WireParticipantAction, GroupParticipantDto, MediaDto, MessageDto,
-    PollDto, PollOptionDto, PresenceState, ReactionDto,
+    GroupParticipantAction as WireParticipantAction, GroupParticipantDto, MessageDto, PollDto,
+    PollOptionDto, PresenceState,
 };
 use oxidezap_wire::envelope::ResponseEnvelope;
 use oxidezap_wire::error::ApiError;
@@ -687,10 +688,11 @@ impl Bridge {
                     });
                 }
             },
-            WireRequest::ListCalls { .. } => {
+            WireRequest::ListCalls { limit } => {
+                let calls = self.calls.list(limit);
                 let answer_to = answer_to.clone();
                 oxidezap_session::spawn(async move {
-                    send_wire_result(&answer_to, id, Ok(DaemonResponse::Calls { calls: vec![] }));
+                    send_wire_result(&answer_to, id, Ok(DaemonResponse::Calls { calls }));
                     let _ = reply.send(CommandOutcome::Accepted);
                     drop(permit);
                 });
@@ -2009,103 +2011,6 @@ fn send_wire_result(answer_to: &Outbox, id: u64, result: Result<DaemonResponse, 
     };
     if let Ok(line) = serde_json::to_string(&envelope) {
         answer_now(answer_to, line);
-    }
-}
-
-fn chat_to_dto(chat: oxidezap_core::Chat) -> ChatDto {
-    ChatDto {
-        jid: chat.jid,
-        name: chat.name,
-        unread_count: chat.unread_count,
-        manually_unread: chat.manually_unread,
-        is_group: chat.is_group,
-        is_pinned: chat.pinned_at.is_some(),
-        is_muted: false,
-        is_archived: false,
-        last_message_ts: chat.last_message_time.map(|t| t.timestamp_millis()),
-        last_message_preview: chat.last_message,
-    }
-}
-
-fn chat_message_to_dto(chat_jid: &str, msg: oxidezap_core::ChatMessage) -> MessageDto {
-    let (kind, media) = if msg.revoked {
-        ("revoked", None)
-    } else if let Some(media) = &msg.media {
-        let kind = match media.media_type {
-            oxidezap_core::MediaType::Image => "image",
-            oxidezap_core::MediaType::Video => "video",
-            oxidezap_core::MediaType::Audio => "audio",
-            oxidezap_core::MediaType::Document => "document",
-            oxidezap_core::MediaType::Sticker => "sticker",
-        };
-        let file_sha256 = media
-            .downloadable
-            .as_ref()
-            .map(|d| {
-                d.file_enc_sha256
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            })
-            .unwrap_or_default();
-        let size_bytes = media
-            .downloadable
-            .as_ref()
-            .map(|d| d.file_length)
-            .unwrap_or(0);
-        let is_downloaded = media.cache_key.is_some();
-        let local_path = media.cache_key.clone();
-        let dto = MediaDto {
-            file_sha256,
-            mime_type: media.mime_type.clone(),
-            filename: media.file_name.clone(),
-            size_bytes,
-            is_downloaded,
-            local_path,
-        };
-        (kind, Some(dto))
-    } else if msg.system.is_some() {
-        ("call", None)
-    } else {
-        ("text", None)
-    };
-
-    let status = match msg.status {
-        oxidezap_core::MessageStatus::Pending => "pending",
-        oxidezap_core::MessageStatus::Sent => "sent",
-        oxidezap_core::MessageStatus::Delivered => "delivered",
-        oxidezap_core::MessageStatus::Read => "read",
-        oxidezap_core::MessageStatus::Failed => "failed",
-    };
-
-    let mut reactions = Vec::new();
-    for (emoji, senders) in msg.reactions {
-        for sender in senders {
-            reactions.push(ReactionDto {
-                sender_jid: sender,
-                emoji: emoji.clone(),
-                timestamp_ms: msg.timestamp.timestamp_millis(),
-            });
-        }
-    }
-
-    MessageDto {
-        id: msg.id,
-        chat_jid: chat_jid.to_string(),
-        sender_jid: msg.sender,
-        from_me: msg.is_from_me,
-        timestamp_ms: msg.timestamp.timestamp_millis(),
-        text: if msg.content.is_empty() {
-            None
-        } else {
-            Some(msg.content)
-        },
-        kind: kind.to_string(),
-        status: status.to_string(),
-        is_starred: false,
-        reply_to_id: msg.quoted.map(|q| q.message_id),
-        media,
-        reactions,
     }
 }
 

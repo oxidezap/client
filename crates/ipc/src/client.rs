@@ -85,16 +85,20 @@ impl IpcClient {
     }
 
     /// Read next unsolicited event, if any.
+    ///
+    /// Lines without an event spelling are skipped, not fatal: the stream
+    /// can carry answers and notices a follower did not ask for, and one
+    /// stray line must not end the follow. Only EOF ends it.
     pub fn next_event(&mut self) -> io::Result<Option<DaemonEvent>> {
-        self.buf.clear();
-        let n = self.reader.read_until(b'\n', &mut self.buf)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        if let Ok(event) = serde_json::from_slice::<DaemonEvent>(&self.buf) {
-            Ok(Some(event))
-        } else {
-            Ok(None)
+        loop {
+            self.buf.clear();
+            let n = self.reader.read_until(b'\n', &mut self.buf)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            if let Ok(event) = serde_json::from_slice::<DaemonEvent>(&self.buf) {
+                return Ok(Some(event));
+            }
         }
     }
 
