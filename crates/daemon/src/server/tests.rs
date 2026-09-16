@@ -1104,4 +1104,43 @@ async fn wire_hello_and_diagnostics_flow() {
     assert!(!WireRequest::DoctorCheck.is_mutation());
     assert!(!WireRequest::GetStatus.is_mutation());
     assert!(!WireRequest::GetStorageUsage.is_mutation());
+    assert!(
+        !WireRequest::ListChats {
+            limit: 10,
+            offset: None,
+            query: None,
+            archived: false
+        }
+        .is_mutation()
+    );
+    assert!(
+        !WireRequest::ListContacts {
+            query: None,
+            limit: 10
+        }
+        .is_mutation()
+    );
+    assert!(
+        !WireRequest::SearchMessages {
+            query: "hello".into(),
+            chat_jid: None,
+            has_media: false,
+            limit: 10
+        }
+        .is_mutation()
+    );
+
+    // Query requests are dispatched out-of-band to the session bridge
+    let list_chats_req = RequestEnvelope {
+        id: 4,
+        request: WireRequest::ListChats {
+            limit: 10,
+            offset: None,
+            query: None,
+            archived: false,
+        },
+    };
+    let ans = handle_wire_request(list_chats_req, &hub, &plugins, &commands, &outbox).await;
+    // out_of_band returns None for frame because the bridge responds directly via outbox
+    assert!(ans.frame.is_none());
 }

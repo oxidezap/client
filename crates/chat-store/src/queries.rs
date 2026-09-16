@@ -942,6 +942,51 @@ impl ChatStore {
         ))
     }
 
+    pub async fn contacts(&self, query: Option<String>, limit: i64) -> Result<Vec<ContactEntry>> {
+        use schema::contacts::dsl;
+        let device_id = self.device_id();
+        let rows: Vec<ContactRow> = self
+            .db()
+            .read(move |conn| {
+                let mut q = dsl::contacts
+                    .filter(dsl::device_id.eq(device_id))
+                    .into_boxed();
+                if let Some(search) = query {
+                    let pattern = format!("%{search}%");
+                    q = q.filter(
+                        dsl::jid
+                            .like(pattern.clone())
+                            .or(dsl::full_name.like(pattern.clone()))
+                            .or(dsl::push_name.like(pattern.clone()))
+                            .or(dsl::business_name.like(pattern)),
+                    );
+                }
+                q.select((
+                    dsl::jid,
+                    dsl::push_name,
+                    dsl::full_name,
+                    dsl::first_name,
+                    dsl::business_name,
+                ))
+                .limit(limit)
+                .load(conn)
+                .map_err(db_err)
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(jid, push_name, full_name, first_name, business_name)| ContactEntry {
+                    jid: parse_jid(&jid),
+                    push_name,
+                    full_name,
+                    first_name,
+                    business_name,
+                },
+            )
+            .collect())
+    }
+
     /// Sum of positive unread counters (ignores "marked unread" sentinels).
     pub async fn unread_total(&self) -> Result<i64> {
         use schema::chats::dsl;

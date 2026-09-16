@@ -131,6 +131,151 @@ impl WhatsAppClient {
         })
     }
 
+    /// Full-text search over message history with optional chat filter.
+    pub fn search_messages(
+        &self,
+        query: String,
+        chat_jid: Option<String>,
+        limit: i64,
+    ) -> Task<Result<Vec<ChatMessage>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let parsed_chat = if let Some(j) = chat_jid {
+                Some(
+                    j.parse::<Jid>()
+                        .map_err(|_| "invalid chat jid".to_string())?,
+                )
+            } else {
+                None
+            };
+            let hits = if let Some(ref chat) = parsed_chat {
+                live.chat_store
+                    .search_messages_in_chat(chat, &query, limit.clamp(1, 100))
+                    .await
+                    .map_err(|e| format!("search failed: {e}"))?
+            } else {
+                live.chat_store
+                    .search_messages(&query, limit.clamp(1, 100))
+                    .await
+                    .map_err(|e| format!("search failed: {e}"))?
+            };
+            let mut messages: Vec<ChatMessage> =
+                hits.into_iter().map(stored_to_chat_message).collect();
+            Self::hydrate_sender_names(
+                &live.chat_store,
+                &live.client,
+                &mut messages,
+                &live.names,
+                false,
+            )
+            .await;
+            Ok(messages)
+        })
+    }
+
+    /// Fetch a single message by ID.
+    pub fn get_message(
+        &self,
+        chat_jid: String,
+        message_id: String,
+    ) -> Task<Result<Option<ChatMessage>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let chat = chat_jid
+                .parse::<Jid>()
+                .map_err(|_| "invalid chat jid".to_string())?;
+            let stored = live
+                .chat_store
+                .message(&chat, &message_id)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?;
+            if let Some(s) = stored {
+                let mut msgs = vec![stored_to_chat_message(s)];
+                Self::hydrate_sender_names(
+                    &live.chat_store,
+                    &live.client,
+                    &mut msgs,
+                    &live.names,
+                    false,
+                )
+                .await;
+                Ok(msgs.pop())
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// Fetch context messages around a target message ID.
+    pub fn get_message_context(
+        &self,
+        chat_jid: String,
+        message_id: String,
+        limit: usize,
+    ) -> Task<Result<Vec<ChatMessage>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let chat = chat_jid
+                .parse::<Jid>()
+                .map_err(|_| "invalid chat jid".to_string())?;
+            let target = live
+                .chat_store
+                .message(&chat, &message_id)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?;
+            let Some(target) = target else {
+                return Err("message not found".to_string());
+            };
+            let before_cursor = oxidezap_chat_store::MessageCursor::from(&target);
+            let before_messages = live
+                .chat_store
+                .messages(&chat, Some(before_cursor), (limit / 2).max(1) as i64)
+                .await
+                .map_err(|e| format!("query failed: {e}"))?;
+            let mut result = Vec::with_capacity(before_messages.len() + 1);
+            for m in before_messages.into_iter().rev() {
+                result.push(stored_to_chat_message(m));
+            }
+            result.push(stored_to_chat_message(target));
+            Self::hydrate_sender_names(
+                &live.chat_store,
+                &live.client,
+                &mut result,
+                &live.names,
+                false,
+            )
+            .await;
+            Ok(result)
+        })
+    }
+
+    /// Fetch contacts from the local contact store.
+    pub fn load_contacts(
+        &self,
+        query: Option<String>,
+        limit: i64,
+    ) -> Task<Result<Vec<oxidezap_chat_store::ContactEntry>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            live.chat_store
+                .contacts(query, limit.clamp(1, 200))
+                .await
+                .map_err(|e| format!("loading contacts failed: {e}"))
+        })
+    }
+
     pub(super) async fn message_page(
         store: &Arc<ChatStore>,
         client: &Arc<Client>,

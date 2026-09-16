@@ -71,6 +71,12 @@ pub enum Action {
     /// Wipe local state so the user can pair again. The daemon owns the store
     /// file, so it is the only process that may delete it.
     ForgetSession,
+    /// Asynchronous request from the new wire protocol.
+    Wire {
+        id: u64,
+        request: oxidezap_wire::request::ClientRequest,
+        answer_to: Outbox,
+    },
 }
 
 impl Action {
@@ -87,27 +93,19 @@ impl Action {
     /// exactly the views taken while offline, and there is no retry — the
     /// window has already drawn the ring as watched.
     pub fn needs_network(&self) -> bool {
-        // Reading a page is the same kind of thing as reloading history: it
-        // is a query against the local store, and a window scrolling back
-        // through a conversation it already has is not something to refuse
-        // because the network is down.
-        !matches!(
-            self,
-            Self::ReloadHistory
-                | Self::RefreshVideo
-                | Self::ForgetSession
-                | Self::MarkStatusWatched(_)
-                | Self::LoadMessages { .. }
-                | Self::LoadChats { .. }
-                // A group's members, too: the connection holds that list
-                // because sending needs one, so the common answer is a read
-                // of what is already held. Gating it on the network would
-                // empty the header's line for the length of a blip and put it
-                // back only when the conversation was opened again; a query
-                // that does have to go to the wire fails on its own and says
-                // asking again may work.
-                | Self::GroupMembers { .. }
-        )
+        match self {
+            Self::Wire { request, .. } => request.is_mutation(),
+            _ => !matches!(
+                self,
+                Self::ReloadHistory
+                    | Self::RefreshVideo
+                    | Self::ForgetSession
+                    | Self::MarkStatusWatched(_)
+                    | Self::LoadMessages { .. }
+                    | Self::LoadChats { .. }
+                    | Self::GroupMembers { .. }
+            ),
+        }
     }
 }
 

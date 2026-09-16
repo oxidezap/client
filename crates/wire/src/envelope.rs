@@ -54,6 +54,24 @@ pub struct ResponseEnvelope {
     pub result: ResponseResult,
 }
 
+impl ResponseEnvelope {
+    pub fn success(id: RequestId, response: DaemonResponse) -> Self {
+        Self {
+            id: Some(id),
+            result: ResponseResult::Ok {
+                payload: Box::new(response),
+            },
+        }
+    }
+
+    pub fn error(id: Option<RequestId>, error: ApiError) -> Self {
+        Self {
+            id,
+            result: ResponseResult::Error { error },
+        }
+    }
+}
+
 /// Successful payload or structured failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]

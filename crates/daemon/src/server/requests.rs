@@ -635,12 +635,41 @@ fn wire_err(id: u64, error: oxidezap_wire::error::ApiError) -> Answer {
     Answer::frame(serde_json::to_string(&env).ok())
 }
 
+async fn out_of_band_wire(
+    hub: &StateHub,
+    commands: &Commands,
+    outbox: &Outbox,
+    id: u64,
+    request: oxidezap_wire::request::ClientRequest,
+) -> Answer {
+    let action = Action::Wire {
+        id,
+        request,
+        answer_to: outbox.clone(),
+    };
+    match dispatch(hub, commands, action).await {
+        Ok(()) => Answer::frame(None),
+        Err(err) => {
+            let api_err = match err {
+                ProtocolError::NoSession { detail } => {
+                    oxidezap_wire::error::ApiError::not_connected(detail)
+                }
+                ProtocolError::Refused { detail } => {
+                    oxidezap_wire::error::ApiError::permission_denied(detail)
+                }
+                other => oxidezap_wire::error::ApiError::internal(other.to_string()),
+            };
+            wire_err(id, api_err)
+        }
+    }
+}
+
 pub(super) async fn handle_wire_request(
     oxidezap_wire::envelope::RequestEnvelope { id, request }: oxidezap_wire::envelope::RequestEnvelope,
     hub: &StateHub,
     _plugins: &Arc<oxidezap_plugin_host::Plugins>,
-    _commands: &Commands,
-    _outbox: &Outbox,
+    commands: &Commands,
+    outbox: &Outbox,
 ) -> Answer {
     use oxidezap_wire::dto::{ConnectionStatusDto, DoctorDto, StorageDto};
     use oxidezap_wire::request::ClientRequest as WireRequest;
@@ -742,6 +771,15 @@ pub(super) async fn handle_wire_request(
             .ok(),
             shutdown: true,
         },
+        WireRequest::ListMessages { .. }
+        | WireRequest::GetMessage { .. }
+        | WireRequest::GetMessageContext { .. }
+        | WireRequest::SearchMessages { .. }
+        | WireRequest::ListContacts { .. }
+        | WireRequest::ListChats { .. }
+        | WireRequest::ListCalls { .. } => {
+            out_of_band_wire(hub, commands, outbox, id, request).await
+        }
         _ => wire_err(
             id,
             oxidezap_wire::error::ApiError::unsupported("action not yet implemented"),

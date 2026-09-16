@@ -59,6 +59,10 @@ impl ApiError {
         Self::new("permission_denied", message)
     }
 
+    pub fn too_busy() -> Self {
+        Self::new("too_busy", "daemon is currently busy processing requests")
+    }
+
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new("unsupported", message)
     }
