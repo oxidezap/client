@@ -17,7 +17,7 @@ use wacore_binary::jid::observe_str;
 use super::externalize::externalize_messages;
 use super::read_tracker::ReadRecord;
 use super::translate::chat_updated;
-use super::{Action, Bridge, CommandOutcome, Outbox, STOPPING, SessionCommand};
+use super::{Action, Bridge, CommandOutcome, Outbox, SessionCommand};
 use crate::state::Change;
 
 /// How many commands may still be working inside the session at once.
@@ -118,6 +118,7 @@ impl Bridge {
                 // the departed account's thumbnails back into a directory the
                 // wipe has already emptied.
                 let epoch = crate::media::epoch();
+                let account_media = crate::media::AccountMedia::new(self.hub.account_id());
                 // Which account asked. A page of the old one's history
                 // landing after it left would be folded into a tracker that
                 // had just forgotten it, and the next account would carry the
@@ -130,7 +131,7 @@ impl Bridge {
                             // The bytes travel the way they do everywhere
                             // else: written to the media directory, named by
                             // a key.
-                            externalize_messages(epoch, &mut page.items);
+                            externalize_messages(&account_media, epoch, &mut page.items);
                             // What this side served, it now knows. A read is
                             // bounded by the messages the daemon has observed,
                             // and the page a front end asked for is the
@@ -199,6 +200,7 @@ impl Bridge {
                 // As above: taken now, so a wipe between the ask and the
                 // answer refuses the write rather than repopulating the cache.
                 let epoch = crate::media::epoch();
+                let account_media = crate::media::AccountMedia::new(hub.account_id());
                 // As above: a page of the departed account's chats must not
                 // be put back into a hub that has just been emptied of it.
                 let asked_as = hub.account_generation();
@@ -218,11 +220,14 @@ impl Bridge {
                             for chat in &mut page.items {
                                 crate::avatar::queue(&hub, chat);
                                 if let Some(picture_id) = chat.avatar_key.as_deref() {
-                                    chat.avatar_key =
-                                        Some(crate::avatar::key(&chat.jid, picture_id));
+                                    chat.avatar_key = Some(crate::avatar::key_for(
+                                        hub.account_id(),
+                                        &chat.jid,
+                                        picture_id,
+                                    ));
                                 }
                                 chat.avatar_source = None;
-                                externalize_messages(epoch, &mut chat.messages);
+                                externalize_messages(&account_media, epoch, &mut chat.messages);
                                 let mut reads =
                                     reads.lock().unwrap_or_else(|held| held.into_inner());
                                 for message in &chat.messages {
@@ -621,7 +626,7 @@ impl Bridge {
                 // Said out loud, because somebody else has to hear it: on a
                 // page a front end reconnects the instant it sends this, and
                 // whatever answers must not be the session that is leaving.
-                STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.lifecycle.mark_stopping();
                 CommandOutcome::Accepted
             }
         }
@@ -642,7 +647,8 @@ impl Bridge {
         // No content to address by. Refused rather than filed under a key
         // every such request would share, which answered one message's
         // download with another's bytes.
-        let Some(key) = crate::media::download_key(&media.file_enc_sha256) else {
+        let account_media = crate::media::AccountMedia::new(self.hub.account_id());
+        let Some(local_key) = crate::media::download_key(&media.file_enc_sha256) else {
             answer_now(
                 &answer_to,
                 downloaded(
@@ -664,7 +670,8 @@ impl Bridge {
         // Claimed rather than asked about, because the next line promises it:
         // an entry nothing is holding can be swept between this answer and
         // the front end reading it. See `media::claim`.
-        if crate::media::claim(&key) {
+        let key = account_media.key(&local_key);
+        if account_media.claim(&key) {
             answer_now(&answer_to, downloaded(id, Ok(key)));
             return CommandOutcome::Accepted;
         }
@@ -674,7 +681,9 @@ impl Bridge {
         };
         let bytes = client.download_downloadable_media(media);
         oxidezap_session::spawn(async move {
-            let result = finish_download(bytes.await, |bytes| crate::media::put_owned(&key, bytes));
+            let result = finish_download(bytes.await, |bytes| {
+                account_media.put_owned(&local_key, bytes)
+            });
             // The same rule as a page: an answer nobody delivered leaves the
             // asker waiting on it forever. See `answer_now`.
             answer_now(&answer_to, downloaded(id, result));

@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use oxidezap_core::AccountId;
 use oxidezap_plugin_host::{Commands, Outcome, Plugins, Reloaded, Sink};
 
 #[cfg(not(target_family = "wasm"))]
@@ -55,6 +56,26 @@ pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugin
     platform::start(hub, commands).await
 }
 
+/// This account's slice of the plugin state root.
+///
+/// `None` wherever [`oxidezap_plugin_host::default_state_dir`] is: there is
+/// no per-user directory to scope. Every plugin's recorded approval and every
+/// plugin's settings file are this account's data, never the daemon's as a
+/// whole — a `.wasm` module is shared (the plan calls it a global catalog),
+/// but what it may do and what it remembers are not, so a second account on
+/// the same machine must never inherit or overwrite the first's. Every path
+/// this module hands to a `Plugins` host, or to [`oxidezap_plugin_host::forget_approvals`],
+/// goes through here rather than through `default_state_dir` directly.
+///
+/// Native only: a page's plugin state lives in `localStorage` behind
+/// [`oxidezap_plugin_host::Origin`], which is not yet keyed by account (see
+/// the multi-account plan, section 13.3) and has no path to scope.
+#[cfg(not(target_family = "wasm"))]
+#[must_use]
+pub fn account_state_dir(account_id: AccountId) -> Option<std::path::PathBuf> {
+    oxidezap_plugin_host::default_state_dir().map(|root| root.join(account_id.get().to_string()))
+}
+
 /// Read the plugin folder again and replace what is running with what is in
 /// it now, without stopping the daemon or the session.
 ///
@@ -66,8 +87,8 @@ pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugin
 /// Answers what the reload did, rather than a count: three of the four
 /// outcomes are zero plugins installed and mean different things, and the
 /// count is what gets written to the log.
-pub async fn reload(plugins: &Arc<Plugins>) -> Reloaded {
-    platform::reload(plugins).await
+pub async fn reload(plugins: &Arc<Plugins>, account_id: AccountId) -> Reloaded {
+    platform::reload(plugins, account_id).await
 }
 
 /// The same, off the caller's own task.
@@ -82,14 +103,14 @@ pub async fn reload(plugins: &Arc<Plugins>) -> Reloaded {
 /// Where the work goes is the platform's, for the reason every split in this
 /// module exists: a page's tasks are not `Send` and there is no runtime to
 /// hand one to, so it goes on the loop it is already running on.
-pub fn reload_in_background(plugins: &Arc<Plugins>) {
+pub fn reload_in_background(plugins: &Arc<Plugins>, account_id: AccountId) {
     let plugins = Arc::clone(plugins);
     platform::detach(async move {
         // Said as what it was. A deferred pass and a loader that fell over
         // both installed nothing, and both used to be reported as a reload
         // that finished with none running — over a folder of five healthy
         // plugins, in the first case, all of them still going.
-        match reload(&plugins).await {
+        match reload(&plugins, account_id).await {
             Reloaded::Ran(running) => log::info!("plugins reloaded: {running} running"),
             Reloaded::Deferred => {
                 log::info!("a plugin reload is already running; it will cover this one");

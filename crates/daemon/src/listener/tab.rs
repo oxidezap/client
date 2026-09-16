@@ -45,9 +45,8 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 use web_sys::{BroadcastChannel, MessageEvent};
 
+use crate::account::AccountRegistry;
 use crate::server::MAX_CLIENTS;
-use crate::session_bridge::Commands;
-use crate::state::StateHub;
 
 /// How much of a frame may sit in one connection's pipe before the writer
 /// waits.
@@ -95,11 +94,7 @@ impl Drop for Serving {
 /// The browser would not open the channel. Not fatal to the account — this
 /// tab holds the session either way — so the caller logs it and goes on
 /// serving its own window.
-pub(crate) fn serve(
-    hub: &Arc<StateHub>,
-    plugins: &Arc<oxidezap_plugin_host::Plugins>,
-    commands: &Commands,
-) -> Result<Serving, String> {
+pub(crate) fn serve(registry: &Arc<AccountRegistry>) -> Result<Serving, String> {
     let channel = BroadcastChannel::new(tabs::RENDEZVOUS)
         .map_err(|e| format!("this browser would not open a channel between tabs: {e:?}"))?;
 
@@ -126,9 +121,7 @@ pub(crate) fn serve(
     // is a connection's name, so the name is what is remembered.
     let serving: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
 
-    let hub = Arc::clone(hub);
-    let plugins = Arc::clone(plugins);
-    let commands = commands.clone();
+    let registry = Arc::clone(registry);
     let rendezvous = channel.clone();
     let answering = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         let Some(line) = event.data().as_string() else {
@@ -154,9 +147,7 @@ pub(crate) fn serve(
         accept(
             &rendezvous,
             &ask,
-            Arc::clone(&hub),
-            Arc::clone(&plugins),
-            commands.clone(),
+            Arc::clone(&registry),
             Rc::clone(&served),
             Rc::clone(&serving),
         );
@@ -183,9 +174,7 @@ pub(crate) fn serve(
 fn accept(
     rendezvous: &BroadcastChannel,
     ask: &str,
-    hub: Arc<StateHub>,
-    plugins: Arc<oxidezap_plugin_host::Plugins>,
-    commands: Commands,
+    registry: Arc<AccountRegistry>,
     served: Rc<std::cell::Cell<usize>>,
     serving: Rc<RefCell<HashSet<String>>>,
 ) {
@@ -212,7 +201,7 @@ fn accept(
 
     let (client, server) = tokio::io::duplex(PIPE);
     oxidezap_session::spawn(async move {
-        if let Err(e) = crate::server::serve_client(server, hub, plugins, commands).await {
+        if let Err(e) = crate::server::serve_client_with_registry(server, registry).await {
             log::debug!("a tab disconnected: {e}");
         }
     });
@@ -542,7 +531,7 @@ mod tests {
     use std::sync::Arc;
 
     use oxidezap_ipc::tab::FromTab;
-    use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION, Request};
+    use oxidezap_ipc::{ClientRequest, ClientScope, DaemonMessage, PROTOCOL_VERSION, Request};
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     use super::serve;
@@ -611,8 +600,12 @@ mod tests {
 
         let hello = serde_json::to_vec(&Request::bare(ClientRequest::Hello {
             protocol: PROTOCOL_VERSION,
+            scope: ClientScope::Account {
+                account: oxidezap_core::AccountId::LEGACY,
+            },
             session_events: true,
-            has_window: true,
+            owns_window: true,
+            call_video: true,
         }))
         .expect("a hello serializes");
         tab.link.send_line(&hello).expect("and goes out");

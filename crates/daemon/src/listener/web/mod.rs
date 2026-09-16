@@ -65,8 +65,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 
 use self::http::{HEAD_TIMEOUT, Request, preflight, read_head, respond};
+use crate::account::AccountRegistry;
+#[cfg(test)]
+use crate::account::AccountRuntime;
 use crate::server::{self, ClientSlots};
-use crate::session_bridge::Commands;
+#[cfg(test)]
 use crate::state::StateHub;
 
 /// The bridge's shared secret, drawn once and kept in the per-user directory.
@@ -114,13 +117,7 @@ const MAX_PENDING: usize = 128;
 ///
 /// The port could not be bound. Per-connection failures are logged and
 /// dropped, exactly as the IPC listener treats them.
-pub async fn run(
-    config: Config,
-    hub: Arc<StateHub>,
-    plugins: Arc<oxidezap_plugin_host::Plugins>,
-    commands: Commands,
-    slots: ClientSlots,
-) -> Result<()> {
+pub async fn run(config: Config, registry: Arc<AccountRegistry>, slots: ClientSlots) -> Result<()> {
     // Loopback only, and refused rather than warned about.
     //
     // Off this machine the `Origin` header is not a check at all — it is a
@@ -193,12 +190,10 @@ pub async fn run(
             continue;
         };
         let config = config.clone();
-        let hub = Arc::clone(&hub);
-        let plugins = Arc::clone(&plugins);
-        let commands = commands.clone();
+        let registry = Arc::clone(&registry);
         let slots = Arc::clone(&slots);
         tokio::spawn(async move {
-            if let Err(e) = serve(stream, &config, hub, plugins, commands, slots).await {
+            if let Err(e) = serve(stream, &config, registry, slots).await {
                 log::debug!("web client {peer} disconnected: {e}");
             }
             drop(permit);
@@ -210,9 +205,7 @@ pub async fn run(
 async fn serve(
     stream: TcpStream,
     config: &Config,
-    hub: Arc<StateHub>,
-    plugins: Arc<oxidezap_plugin_host::Plugins>,
-    commands: Commands,
+    registry: Arc<AccountRegistry>,
     slots: ClientSlots,
 ) -> Result<()> {
     let mut stream = BufReader::new(stream);
@@ -292,7 +285,7 @@ async fn serve(
         let Ok(slot) = slots.try_acquire_owned() else {
             return refuse_full(stream, &key).await;
         };
-        let served = attach(stream, &key, hub, plugins, commands).await;
+        let served = attach(stream, &key, registry).await;
         drop(slot);
         return served;
     }
@@ -412,9 +405,7 @@ async fn refuse_full(stream: BufReader<TcpStream>, key: &str) -> Result<()> {
 async fn attach(
     stream: BufReader<TcpStream>,
     key: &str,
-    hub: Arc<StateHub>,
-    plugins: Arc<oxidezap_plugin_host::Plugins>,
-    commands: Commands,
+    registry: Arc<AccountRegistry>,
 ) -> Result<()> {
     let socket = upgrade(stream, key).await?;
     let (mut outbound, mut inbound) = socket.split();
@@ -424,7 +415,7 @@ async fn attach(
     // Sized for one frame of a history load rather than one message.
     let (server_side, bridge_side) = tokio::io::duplex(256 * 1024);
     let serving = tokio::spawn(async move {
-        if let Err(e) = crate::server::serve_client(server_side, hub, plugins, commands).await {
+        if let Err(e) = crate::server::serve_client_with_registry(server_side, registry).await {
             log::debug!("web client disconnected: {e}");
         }
     });
@@ -523,7 +514,14 @@ mod tests {
         let plugins = Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
             |_| {},
         )));
-        let refused = run(exposed, hub, plugins, commands, server::client_slots()).await;
+        let registry = AccountRegistry::new();
+        assert!(registry.insert(Arc::new(AccountRuntime::new(
+            oxidezap_core::AccountId::LEGACY,
+            hub,
+            plugins,
+            commands,
+        ))));
+        let refused = run(exposed, registry, server::client_slots()).await;
         let message = refused
             .expect_err("a non-loopback bind is refused")
             .to_string();

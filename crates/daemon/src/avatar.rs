@@ -39,6 +39,12 @@ pub fn key(jid: &str, id: &str) -> String {
     format!("a-{}-{jid}-{}-{id}", jid.len(), id.len())
 }
 
+/// Account-scoped avatar cache key in the shared media directory.
+#[must_use]
+pub fn key_for(account: oxidezap_core::AccountId, jid: &str, id: &str) -> String {
+    crate::media::AccountMedia::new(account).key(&key(jid, id))
+}
+
 pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
     if !chat.avatar_loaded {
         return;
@@ -51,8 +57,10 @@ pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
         return;
     };
     let hub = Arc::clone(hub);
-    let key = key(&jid, &id);
-    if crate::media::has(&key) {
+    let account_media = crate::media::AccountMedia::new(hub.account_id());
+    let local_key = key(&jid, &id);
+    let key = account_media.key(&local_key);
+    if account_media.has(&key) {
         oxidezap_session::spawn(async move {
             if is_current(&hub, &jid, &selection) {
                 publish_ready(&hub, jid, key);
@@ -65,7 +73,9 @@ pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
             return;
         };
         let Ok(bytes) = accept(response) else { return };
-        if crate::media::put_since(selection.cache_epoch, &key, &bytes).is_ok()
+        if account_media
+            .put_since(selection.cache_epoch, &local_key, &bytes)
+            .is_ok()
             && is_current(&hub, &jid, &selection)
         {
             publish_ready(&hub, jid, key);

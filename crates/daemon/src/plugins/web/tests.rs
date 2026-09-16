@@ -223,7 +223,7 @@ async fn a_page_reloads_its_plugins_from_its_own_folder() {
         std::sync::Arc::new(|_| {}),
     ));
     assert_eq!(
-        super::super::reload(&host).await,
+        super::super::reload(&host, oxidezap_core::AccountId::LEGACY).await,
         oxidezap_plugin_host::Reloaded::Ran(0),
         "an empty folder runs nothing, and that is a reload that happened"
     );
@@ -237,7 +237,7 @@ async fn a_page_reloads_its_plugins_from_its_own_folder() {
         .await
         .expect("a module is installed");
     assert_eq!(
-        super::super::reload(&host).await,
+        super::super::reload(&host, oxidezap_core::AccountId::LEGACY).await,
         oxidezap_plugin_host::Reloaded::Ran(0)
     );
     empty_the_folder().await;

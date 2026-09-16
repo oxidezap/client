@@ -43,6 +43,8 @@ pub use platform::{deliver, read};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use oxidezap_core::AccountId;
+
 use anyhow::Result;
 
 /// The key under which a message's own media is cached.
@@ -162,6 +164,71 @@ impl Wipe {
                     && !is_in_progress(name)
             }
         }
+    }
+}
+
+/// Account-bound view over the shared media cache.
+///
+/// The physical directory remains shared, but every durable cache key created
+/// through this handle carries its `AccountId`. This prevents a completed
+/// download, avatar or history externalization from being served to another
+/// runtime and lets reset/remove delete only this account's entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountMedia {
+    account: AccountId,
+}
+
+impl AccountMedia {
+    #[must_use]
+    pub fn new(account: AccountId) -> Self {
+        Self { account }
+    }
+
+    #[must_use]
+    pub fn account(self) -> AccountId {
+        self.account
+    }
+
+    #[must_use]
+    pub fn prefix(self) -> String {
+        format!("a{}-", self.account)
+    }
+
+    #[must_use]
+    pub fn key(self, key: &str) -> String {
+        format!("{}{}", self.prefix(), key)
+    }
+
+    #[must_use]
+    pub fn message_key(self, message_id: &str) -> String {
+        self.key(&message_key(message_id))
+    }
+
+    #[must_use]
+    pub fn download_key(self, hash: &[u8]) -> Option<String> {
+        download_key(hash).map(|key| self.key(&key))
+    }
+
+    #[must_use]
+    pub fn has(self, key: &str) -> bool {
+        key.starts_with(&self.prefix()) && crate::media::has(key)
+    }
+
+    #[must_use]
+    pub fn claim(self, key: &str) -> bool {
+        key.starts_with(&self.prefix()) && crate::media::claim(key)
+    }
+
+    pub fn put_since(self, epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
+        crate::media::put_since(epoch, &self.key(key), bytes)
+    }
+
+    pub fn put_owned(self, key: &str, bytes: Vec<u8>) -> Result<String> {
+        crate::media::put_owned(&self.key(key), bytes)
+    }
+
+    pub fn wipe(self, scope: Wipe) -> Result<()> {
+        wipe_for(self.account, scope)
     }
 }
 
@@ -304,6 +371,16 @@ pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
 ///
 /// Whatever the platform's deletion answers.
 pub fn wipe(scope: Wipe) -> Result<()> {
+    wipe_with_prefix("", scope)
+}
+
+/// Delete only one account's namespace from the shared physical cache.
+pub fn wipe_for(account: AccountId, scope: Wipe) -> Result<()> {
+    let prefix = format!("a{}-", account);
+    wipe_with_prefix(&prefix, scope)
+}
+
+fn wipe_with_prefix(prefix: &str, scope: Wipe) -> Result<()> {
     // For the whole wipe, so an epoch-checked write is either wholly before
     // it — and deleted by it — or wholly after, and kept.
     let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -311,7 +388,11 @@ pub fn wipe(scope: Wipe) -> Result<()> {
     // the two would otherwise believe its file survived the wipe that is
     // about to remove it.
     invalidate();
-    platform::delete(scope)
+    if prefix.is_empty() {
+        platform::delete(scope)
+    } else {
+        platform::delete_for(prefix, scope)
+    }
 }
 
 /// Retire the epoch every writer in flight is holding.
@@ -553,6 +634,36 @@ mod tests {
             download_key(&sha).expect("a hash").len() < 40,
             "a key is a file name a person may have to read"
         );
+    }
+
+    #[test]
+    fn account_media_namespaces_are_distinct() {
+        let one = AccountMedia::new(AccountId::LEGACY);
+        let two = AccountMedia::new(AccountId::new(2).expect("positive account id"));
+        assert_ne!(one.message_key("message"), two.message_key("message"));
+        assert!(one.message_key("message").starts_with(&one.prefix()));
+        assert!(two.message_key("message").starts_with(&two.prefix()));
+        assert!(!one.has(&two.message_key("message")));
+        assert!(!two.claim(&one.message_key("message")));
+    }
+
+    /// Wiping one account's durable cache must not remove another account's
+    /// copy in the same physical media directory.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn account_media_wipe_does_not_cross_account_boundaries() {
+        let _alone = alone();
+        let one = AccountMedia::new(AccountId::LEGACY);
+        let two = AccountMedia::new(AccountId::new(2).expect("positive account id"));
+        let one_key = one.put_owned("f-isolated-one", b"one".to_vec()).unwrap();
+        let two_key = two.put_owned("f-isolated-two", b"two".to_vec()).unwrap();
+        assert!(one.has(&one_key));
+        assert!(two.has(&two_key));
+
+        one.wipe(Wipe::Everything).unwrap();
+        assert!(!one.has(&one_key));
+        assert!(two.has(&two_key));
+        two.wipe(Wipe::Everything).unwrap();
     }
 
     /// Message keys and download keys share a directory and must not collide:

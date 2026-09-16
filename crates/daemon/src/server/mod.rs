@@ -45,11 +45,19 @@ mod tests;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use oxidezap_ipc::{ClientRequest, DaemonMessage, ProtocolError, Request, RequestId};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use oxidezap_ipc::{
+    ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, Request, RequestId,
+};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::session_bridge::{Action, Commands};
+use crate::account::AccountRegistry;
+#[cfg(test)]
+use crate::account::AccountRuntime;
+use crate::session_bridge::Action;
+#[cfg(test)]
+use crate::session_bridge::Commands;
+#[cfg(test)]
 use crate::state::StateHub;
 
 use handshake::{handshake, read_frame};
@@ -110,6 +118,7 @@ const OUTBOX_CAPACITY: usize = 64;
 /// # Errors
 ///
 /// The connection ended, or the peer said something unrecoverable.
+#[cfg(test)]
 pub(crate) async fn serve_client<S>(
     stream: S,
     hub: Arc<StateHub>,
@@ -117,7 +126,33 @@ pub(crate) async fn serve_client<S>(
     commands: Commands,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    // Kept for the focused server tests and small embedded callers that build
+    // a single service by hand. Production listeners use the registry-aware
+    // entry point below so an account hello is resolved by its immutable id.
+    let registry = AccountRegistry::new();
+    let runtime = Arc::new(AccountRuntime::new(
+        hub.account_id(),
+        hub,
+        plugins,
+        commands,
+    ));
+    assert!(registry.insert(runtime));
+    serve_client_with_registry(stream, registry).await
+}
+
+/// Serve a connection against the daemon's account registry.
+///
+/// The registry lookup happens after the handshake and before subscribing to
+/// any account channels. A stale or forged account id therefore cannot attach
+/// to another account's hub by accident.
+pub(crate) async fn serve_client_with_registry<S>(
+    stream: S,
+    registry: Arc<AccountRegistry>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -150,6 +185,25 @@ where
         }
     };
 
+    let (hub, plugins, commands) = match attached.scope {
+        oxidezap_ipc::ClientScope::Control => {
+            return serve_control_client(reader, writer, registry).await;
+        }
+        oxidezap_ipc::ClientScope::Account { account } => {
+            let Some(runtime) = registry.get(account) else {
+                let frame = error_frame(
+                    None,
+                    ProtocolError::NoSession {
+                        detail: format!("account {} is not available", account.get()),
+                    },
+                )?;
+                write_line(&mut writer, &frame).await?;
+                return Ok(());
+            };
+            (runtime.hub(), runtime.plugins(), runtime.commands())
+        }
+    };
+
     // Subscribe BEFORE snapshotting. Anything published in the window between
     // the two arrives on `updates` and is also in the snapshot; the version on
     // each frame lets the client drop the overlap. Snapshotting first would
@@ -177,7 +231,7 @@ where
     // throws away — while delaying the events it did ask for. The count of
     // these receivers is also what tells the session whether to publish at
     // all, so a client that draws nothing must not hold one.
-    let mut video = attached.has_window.then(|| hub.subscribe_video());
+    let mut video = attached.call_video.then(|| hub.subscribe_video());
     if video.is_some() {
         // A subscriber that arrives mid-call starts wherever the stream is,
         // which is a P-frame referencing units published before it was
@@ -194,7 +248,7 @@ where
     // Held for the connection's whole life, so the count falls again however
     // this task ends. What it answers is "is there a window to raise": see
     // `crate::window::show`.
-    let _window = attached.has_window.then(|| hub.attach_window());
+    let _window = attached.owns_window.then(|| hub.attach_window());
 
     // Frames addressed to this connection alone: a download's answer belongs
     // to whoever asked, and the ids are client-chosen.
@@ -340,6 +394,19 @@ where
                         }
                     };
 
+                    if request.request.is_control_request()
+                        || !request.request.is_account_request()
+                    {
+                        let frame = error_frame(
+                            request.id,
+                            ProtocolError::Refused {
+                                detail: "this request belongs to the control plane".to_string(),
+                            },
+                        )?;
+                        write_line(&mut writer, &frame).await?;
+                        continue;
+                    }
+
                     if matches!(request.request, ClientRequest::Snapshot) {
                         // Resubscribe BEFORE snapshotting, the same ordering
                         // the connection opened with. Reusing the old receiver
@@ -381,6 +448,106 @@ where
             },
         }
     }
+}
+
+/// Serve the control plane without subscribing to any account state.
+///
+/// The control plane can already list the registry and expose the lifecycle
+/// requests on the wire. Mutating lifecycle requests remain refused until WR-1
+/// supplies the upstream device-row API; refusing them here is safer than
+/// opening the wrong store or deleting the shared database.
+async fn serve_control_client<S>(
+    mut reader: BufReader<ReadHalf<S>>,
+    mut writer: WriteHalf<S>,
+    registry: Arc<AccountRegistry>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut accounts = registry.subscribe();
+    let hello = serde_json::to_string(&DaemonMessage::ControlHello {
+        protocol: PROTOCOL_VERSION,
+        accounts: (*registry.snapshot()).clone(),
+    })?;
+    write_line(&mut writer, &hello).await?;
+    let mut buf = Vec::with_capacity(1024);
+
+    loop {
+        tokio::select! {
+            changed = accounts.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                let frame = serde_json::to_string(&DaemonMessage::AccountsChanged((**accounts.borrow_and_update()).clone()))?;
+                write_line(&mut writer, &frame).await?;
+            }
+            frame = read_frame(&mut reader, &mut buf) => match frame? {
+                Some(oxidezap_ipc::FrameRead::Line(line)) => {
+                    let request: Request = match serde_json::from_str(&line) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            write_line(&mut writer, &malformed(&error.to_string())?).await?;
+                            continue;
+                        }
+                    };
+                    let id = request.id;
+                    let response = match request.request {
+                        ClientRequest::ListAccounts => Some(match id {
+                            Some(id) => serde_json::to_string(&DaemonMessage::Accounts {
+                                id,
+                                snapshot: (*registry.snapshot()).clone(),
+                            })?,
+                            None => error_frame(
+                                None,
+                                ProtocolError::Malformed {
+                                    detail: "an account listing needs an id to answer under".to_string(),
+                                },
+                            )?,
+                        }),
+                        ClientRequest::CreateAccount
+                        | ClientRequest::ResetAccount { .. }
+                        | ClientRequest::RemoveAccount { .. } => Some(error_frame(
+                            id,
+                            ProtocolError::Refused {
+                                detail: "account lifecycle is unavailable until whatsapp-rust WR-1 lands".to_string(),
+                            },
+                        )?),
+                        ClientRequest::Shutdown => {
+                            let frame = answer_shutdown(id)?;
+                            write_line(&mut writer, &frame).await?;
+                            crate::shutdown::request("ipc client");
+                            return Ok(());
+                        }
+                        other if other.is_control_request() => Some(error_frame(
+                            id,
+                            ProtocolError::Refused {
+                                detail: "this control request is not yet wired to the global daemon plane".to_string(),
+                            },
+                        )?),
+                        _ => Some(error_frame(
+                            id,
+                            ProtocolError::Refused {
+                                detail: "account requests require an account-scoped connection".to_string(),
+                            },
+                        )?),
+                    };
+                    if let Some(response) = response {
+                        write_line(&mut writer, &response).await?;
+                    }
+                }
+                Some(oxidezap_ipc::FrameRead::NotUtf8) => write_line(&mut writer, &not_utf8()?).await?,
+                Some(oxidezap_ipc::FrameRead::TooLong) => {
+                    write_line(&mut writer, &malformed(&format!("frame exceeded {} bytes", oxidezap_ipc::MAX_REQUEST_BYTES))?).await?;
+                    return Ok(());
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+}
+
+fn answer_shutdown(id: Option<RequestId>) -> Result<String> {
+    Ok(serde_json::to_string(&DaemonMessage::Accepted { id })?)
 }
 
 /// An error frame, naming the request it answers when there is one.

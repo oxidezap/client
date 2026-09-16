@@ -24,6 +24,7 @@ mod store;
 
 use std::sync::Arc;
 
+use oxidezap_core::AccountId;
 use oxidezap_ipc::{ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, PROTOCOL_VERSION};
 use oxidezap_ipc::{StateSnapshot, StateVersion};
 use tokio::sync::{broadcast, watch};
@@ -36,6 +37,7 @@ use store::Published;
 
 /// What the daemon knows, and everyone it tells.
 pub struct StateHub {
+    account_id: AccountId,
     state: StateStore,
     out: Fanout,
 }
@@ -53,11 +55,25 @@ impl Drop for WindowGuard {
 }
 
 impl StateHub {
-    pub fn new() -> Arc<Self> {
+    /// Construct the state and fanout for one immutable account scope.
+    pub fn for_account(account_id: AccountId) -> Arc<Self> {
         Arc::new(Self {
+            account_id,
             state: StateStore::new(),
             out: Fanout::new(),
         })
+    }
+
+    /// The legacy constructor remains for account-local unit tests and callers
+    /// that have not yet been moved to the runtime registry.
+    pub fn new() -> Arc<Self> {
+        Self::for_account(AccountId::LEGACY)
+    }
+
+    /// The account this hub can ever publish state for.
+    #[must_use]
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
     }
 
     /// Subscribe before snapshotting.

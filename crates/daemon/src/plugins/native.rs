@@ -14,9 +14,10 @@
 
 use std::sync::Arc;
 
+use oxidezap_core::AccountId;
 use oxidezap_plugin_host::{Outcome, Plugins, Reloaded, Sink};
 
-use super::{Bridge, publishing_to};
+use super::{Bridge, account_state_dir, publishing_to};
 use crate::session_bridge::{Action, CommandOutcome, Commands as SessionCommands, SessionCommand};
 use crate::state::StateHub;
 
@@ -29,8 +30,9 @@ use crate::state::StateHub;
 /// to receive them.
 pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
     let sink = publishing_to(hub);
+    let account_id = hub.account_id();
     let fallback = (publishing_to(hub), commands.clone());
-    tokio::task::spawn_blocking(move || load(sink, commands))
+    tokio::task::spawn_blocking(move || load(sink, commands, account_id))
         .await
         .unwrap_or_else(|e| {
             // With the daemon's own sink and bridge, not a discarding pair.
@@ -47,15 +49,16 @@ pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc
 }
 
 /// The scan itself, on the blocking thread [`start`] put it on.
-fn load(sink: Sink, commands: SessionCommands) -> Arc<Plugins> {
+fn load(sink: Sink, commands: SessionCommands, account_id: AccountId) -> Arc<Plugins> {
     let Some(dir) = oxidezap_plugin_host::default_dir() else {
         log::debug!("no per-user data directory, so no plugins");
         return Arc::new(Plugins::none(sink, Arc::new(Bridge { commands })));
     };
     // Not the daemon's `state_dir`: that one prefers XDG_RUNTIME_DIR, which
     // is cleared on logout, and a permission answer that does not survive a
-    // logout is a prompt asked forever.
-    let state_dir = oxidezap_plugin_host::default_state_dir();
+    // logout is a prompt asked forever. Scoped to this account: see
+    // `account_state_dir`.
+    let state_dir = account_state_dir(account_id);
     Arc::new(Plugins::load(
         &dir,
         state_dir.as_deref(),
@@ -69,12 +72,12 @@ fn load(sink: Sink, commands: SessionCommands) -> Arc<Plugins> {
 /// The mirror of [`start`], down to where the work happens: the scan reads
 /// files and runs each `oxi_init`, all of it synchronous, so it goes to a
 /// blocking thread as well.
-pub(super) async fn reload(plugins: &Arc<Plugins>) -> Reloaded {
+pub(super) async fn reload(plugins: &Arc<Plugins>, account_id: AccountId) -> Reloaded {
     let Some(dir) = oxidezap_plugin_host::default_dir() else {
         log::debug!("no per-user data directory, so nothing to reload");
         return Reloaded::Kept(0);
     };
-    let state_dir = oxidezap_plugin_host::default_state_dir();
+    let state_dir = account_state_dir(account_id);
     let plugins = Arc::clone(plugins);
     tokio::task::spawn_blocking(move || plugins.reload_from_dir(&dir, state_dir.as_deref()))
         .await

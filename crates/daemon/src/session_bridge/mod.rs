@@ -14,11 +14,12 @@
 //! model those two share, and [`externalize`] is where a frame's media bytes
 //! go. The `Bridge` itself stays here, with the loop that drives it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use oxidezap_core::UiEvent;
-use oxidezap_session::WhatsAppClient;
+use oxidezap_session::{StoreRegistry, WhatsAppClient};
 use tokio::sync::Semaphore;
 
 use crate::state::StateHub;
@@ -39,23 +40,37 @@ use act::MAX_IN_FLIGHT;
 use read_tracker::ReadTracker;
 use translate::Answer;
 
-/// Whether the session is on its way out and must not be handed to anybody
-/// new.
+/// Lifecycle bits owned by one account runtime.
 ///
-/// `ForgetSession` is deferred rather than done where it is accepted — the
-/// file to delete is the one the session still has open — so between the
-/// command being taken and the loop ending, this bridge is alive, reading
-/// commands, and about to wipe the store. A caller that measured "alive" by
-/// the command channel being open would attach to it and be served the
-/// account it just asked to have deleted.
-///
-/// Process-global because a process has one session; the one reader is
-/// [`crate::embedded`], which cannot see this bridge's own state.
-static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// This deliberately is not process-global: resetting account A must not make
+/// account B refuse a new connection or appear to be stopping.
+#[derive(Clone, Debug)]
+pub struct RuntimeLifecycle {
+    stopping: Arc<AtomicBool>,
+}
 
-/// Whether the running session has begun going away.
-pub fn stopping() -> bool {
-    STOPPING.load(std::sync::atomic::Ordering::SeqCst)
+impl RuntimeLifecycle {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stopping: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn mark_stopping(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for RuntimeLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Run the session until it ends or `shutdown` resolves.
@@ -66,14 +81,21 @@ pub fn stopping() -> bool {
 /// disconnect and close SQLite. Owning the signal is what makes the teardown
 /// below reachable on every exit path.
 pub async fn run(
+    account_id: oxidezap_core::AccountId,
+    stores: Arc<StoreRegistry>,
     hub: Arc<StateHub>,
     plugins: Arc<oxidezap_plugin_host::Plugins>,
     mut commands: tokio::sync::mpsc::Receiver<SessionCommand>,
+    lifecycle: RuntimeLifecycle,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    // This session is new, whatever the last one was doing.
-    STOPPING.store(false, std::sync::atomic::Ordering::SeqCst);
-    let mut client = WhatsAppClient::new().context("opening the local store")?;
+    debug_assert_eq!(hub.account_id(), account_id);
+    // Kept alive past the client's own close: the teardown below calls back
+    // into the registry to reset this account's rows, which needs a handle
+    // of its own rather than the one the client just gave up.
+    let stores_for_reset = Arc::clone(&stores);
+    let mut client = WhatsAppClient::new_for_account_with_registry(account_id, stores)
+        .context("opening the local store")?;
     let mut events = client
         .start()
         .map_err(|e| anyhow::anyhow!("starting the session: {e}"))?;
@@ -81,7 +103,7 @@ pub async fn run(
     // camera and one call, and what decides whether a frame is *serialized*
     // is whether anybody is subscribed to the hub's video channel.
     let mut video = client.video_events();
-    let mut bridge = Bridge::new(hub, plugins);
+    let mut bridge = Bridge::with_lifecycle(hub, plugins, lifecycle);
 
     // Set when every sender is gone. A closed channel yields `None`
     // immediately and forever, so leaving the branch enabled would spin the
@@ -195,19 +217,24 @@ pub async fn run(
     ///
     /// `true` when there was nothing to remove, which is the ordinary case: an
     /// account with no plugins has no permissions to retire.
-    fn approvals_retired() -> bool {
+    #[cfg_attr(target_family = "wasm", allow(unused_variables))]
+    fn approvals_retired(account_id: oxidezap_core::AccountId) -> bool {
         // A page keeps them in its origin's storage rather than in a
         // directory, and clears the plugins' settings in the same sweep:
         // there is no directory below to remove afterwards, so the two halves
         // that are separate on a desktop are one call here. What survives is
         // what survives there — the modules themselves.
+        //
+        // Not yet account-scoped there (the multi-account plan's section
+        // 13.3 names this as pending), so this account's id goes unused on
+        // that half of the split.
         #[cfg(target_family = "wasm")]
         {
             oxidezap_plugin_host::Origin::forget_all()
         }
         #[cfg(not(target_family = "wasm"))]
         {
-            let Some(dir) = oxidezap_plugin_host::default_state_dir() else {
+            let Some(dir) = crate::plugins::account_state_dir(account_id) else {
                 return true;
             };
             match oxidezap_plugin_host::forget_approvals(&dir) {
@@ -221,24 +248,23 @@ pub async fn run(
         }
     }
 
-    // After the teardown, never before: the store is one file and the session
-    // was holding it open. Unlinking it first leaves the closing session free
-    // to write a fresh WAL beside a database that is already gone.
-    // And only once it *has* torn down. Giving up waiting is not the same as
-    // being finished: a session still closing can write a fresh WAL beside a
-    // database that has just been unlinked, and the store is one file — a
-    // partial wipe orphans everything behind the new device. Refusing to
-    // delete leaves the old account intact, which is a state the user can act
-    // on again; racing leaves one nobody can.
+    // After the teardown, never before: `reset_account` purges this account's
+    // rows in the *shared* database, and WR-1's own caller obligation is that
+    // nothing still holding a handle bound to this account's id may be live
+    // when that runs — a session still writing through the old handle could
+    // repopulate exactly what the purge just cleared. Giving up waiting is
+    // not the same as being finished, so refusing here leaves the old account
+    // intact rather than racing it: intact is a state the user can act on
+    // again, and a purge run underneath a live writer is not.
     if bridge.forget && !closed {
         log::error!(
-            "local state was NOT wiped: the session is still closing, and deleting the store \
-             from under it would leave a partial wipe. Start oxidezap again and repeat \
-             \"clear data and pair again\"."
+            "local state was NOT reset: the session is still closing, and resetting the \
+             account from under it could let it repopulate what the reset just cleared. \
+             Start oxidezap again and repeat \"clear data and pair again\"."
         );
-    } else if bridge.forget && !approvals_retired() {
+    } else if bridge.forget && !approvals_retired(account_id) {
         // The same refusal as above and for the same reason. What must not
-        // outlive this account is the record of what its owner allowed: wipe
+        // outlive this account is the record of what its owner allowed: reset
         // the credentials first and fail this afterwards, and the next
         // pairing inherits an `approvals.json` in which a plugin with the
         // same id and mask is already allowed to act — consent given for an
@@ -247,14 +273,20 @@ pub async fn run(
         // permissions is not. Its *settings* are cleared below with the rest
         // of the directory: those are data, and this is authority.
         log::error!(
-            "local state was NOT wiped: the plugins' recorded permissions could not be \
-             cleared, and wiping now would let them outlive the account that granted them. \
+            "local state was NOT reset: the plugins' recorded permissions could not be \
+             cleared, and resetting now would let them outlive the account that granted them. \
              Start oxidezap again and repeat \"clear data and pair again\"."
         );
     } else if bridge.forget {
-        match oxidezap_session::wipe_local_state().await {
-            Ok(()) => log::info!("local state wiped; pair again on the next start"),
-            Err(e) => log::error!("could not wipe local state: {e}"),
+        // Purges this account's rows — upstream's and, through the
+        // `ON DELETE CASCADE` the chat-store migration adds, this crate's own
+        // — and recreates the `device` row under the same id with fresh keys.
+        // Never the whole-file wipe a single-account daemon used: the shared
+        // database holds every other local account too, and deleting it would
+        // take them down with this one.
+        match stores_for_reset.reset_account(account_id).await {
+            Ok(()) => log::info!("account {} reset; pair again", account_id.get()),
+            Err(e) => log::error!("could not reset account {}: {e}", account_id.get()),
         }
         // A plugin's own settings are this account's data too — an
         // autoreply's "already answered these people" is a list of people —
@@ -262,7 +294,7 @@ pub async fn run(
         // inside the store. Nothing is writing them any more: the threads
         // were joined above.
         #[cfg(not(target_family = "wasm"))]
-        if let Some(dir) = oxidezap_plugin_host::default_state_dir()
+        if let Some(dir) = crate::plugins::account_state_dir(account_id)
             && let Err(e) = std::fs::remove_dir_all(&dir)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -275,7 +307,9 @@ pub async fn run(
         // is just as much this account's data.
         // Everything, staged uploads included: the account is going, and so
         // is anything that was going to be sent under it.
-        if let Err(e) = crate::media::wipe(crate::media::Wipe::Everything) {
+        if let Err(e) = crate::media::AccountMedia::new(bridge.hub.account_id())
+            .wipe(crate::media::Wipe::Everything)
+        {
             log::error!("could not clear the media cache: {e}");
         }
     }
@@ -301,6 +335,7 @@ const FORGET_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Everything the event loop carries between one event and the next.
 struct Bridge {
     hub: Arc<StateHub>,
+    lifecycle: RuntimeLifecycle,
     /// The plugins, fed the same events the front ends get.
     ///
     /// Held rather than reached for, because the bridge is also what tears
@@ -332,7 +367,16 @@ struct Bridge {
 }
 
 impl Bridge {
+    #[cfg(test)]
     fn new(hub: Arc<StateHub>, plugins: Arc<oxidezap_plugin_host::Plugins>) -> Self {
+        Self::with_lifecycle(hub, plugins, RuntimeLifecycle::new())
+    }
+
+    fn with_lifecycle(
+        hub: Arc<StateHub>,
+        plugins: Arc<oxidezap_plugin_host::Plugins>,
+        lifecycle: RuntimeLifecycle,
+    ) -> Self {
         // Unbounded, and the bound that matters is upstream: the only producer
         // is the event loop draining the session's own unbounded channel, so a
         // limit here could only stall the loop this exists to unblock or drop
@@ -342,6 +386,7 @@ impl Bridge {
 
         Self {
             hub,
+            lifecycle,
             plugins,
             publish: Some(publish),
             publisher: Some(publisher),

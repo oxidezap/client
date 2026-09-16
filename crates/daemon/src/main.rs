@@ -9,13 +9,18 @@
 // Debug keeps its console so `cargo run --bin oxidezapd` still shows logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use oxidezap_daemon::{listener, media, plugins, server, session_bridge, shutdown, state, tray};
+use oxidezap_daemon::{
+    account::{AccountRegistry, AccountRuntime},
+    listener, media, plugins, server, shutdown, state, tray,
+};
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
 use crate::state::StateHub;
+use oxidezap_core::AccountId;
+use oxidezap_session::StoreRegistry;
 
 #[cfg(target_os = "macos")]
 mod macos_main;
@@ -39,7 +44,7 @@ fn main() -> Result<()> {
 
     // The hub is cheap and needs no runtime, so it is made here: on macOS
     // the tray is built from it on this thread before anything blocks.
-    let hub = StateHub::new();
+    let hub = StateHub::for_account(AccountId::LEGACY);
 
     // AppKit pins the menu-bar icon to the main thread (see `macos_main`):
     // there the daemon runs one thread over and this thread pumps the
@@ -117,18 +122,24 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     // ones that arrive while it is still loading.
     let plugins = plugins::start(&hub, commands.clone()).await;
 
+    let registry = AccountRegistry::new();
+    let stores = Arc::new(StoreRegistry::new(oxidezap_session::resolve_database_path()));
+    let runtime = Arc::new(AccountRuntime::new_with_registry(
+        AccountId::LEGACY,
+        Arc::clone(&hub),
+        Arc::clone(&plugins),
+        commands.clone(),
+        stores,
+    ));
+    assert!(registry.insert(Arc::clone(&runtime)));
     let mut session = {
-        let hub = Arc::clone(&hub);
-        let plugins = Arc::clone(&plugins);
+        let registry = Arc::clone(&registry);
+        let runtime = Arc::clone(&runtime);
         let stop = Arc::clone(&stop);
         tokio::spawn(async move {
-            session_bridge::run(
-                hub,
-                plugins,
-                command_rx,
-                async move { stop.notified().await },
-            )
-            .await
+            registry
+                .run(runtime, command_rx, async move { stop.notified().await })
+                .await
         })
     };
 
@@ -158,21 +169,13 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
         None => None,
     };
     let mut bridge = web.map(|config| {
-        let hub = Arc::clone(&hub);
-        let plugins = Arc::clone(&plugins);
-        let commands = commands.clone();
+        let registry = Arc::clone(&registry);
         let slots = Arc::clone(&slots);
-        tokio::spawn(async move { listener::web::run(config, hub, plugins, commands, slots).await })
+        tokio::spawn(async move { listener::web::run(config, registry, slots).await })
     });
 
     let server_outcome = tokio::select! {
-        result = server::run(
-            &claim,
-            Arc::clone(&hub),
-            Arc::clone(&plugins),
-            commands,
-            Arc::clone(&slots),
-        ) => {
+        result = server::run(&claim, Arc::clone(&registry), Arc::clone(&slots)) => {
             // Fatal, and it has to reach the exit code: a supervisor that sees
             // status zero treats a daemon nobody can connect to as a clean
             // stop and never restarts it.

@@ -6,7 +6,7 @@
 //! filesystem for. The web half of this crate has tests of its own that run in
 //! a browser; see `plugins/web/tests.rs`.
 
-use oxidezap_ipc::PROTOCOL_VERSION;
+use oxidezap_ipc::{ClientScope, PROTOCOL_VERSION};
 use tokio::io::AsyncBufReadExt as _;
 
 use super::accept::{acquire_startup_lock, prepare_state_dir, reject};
@@ -34,47 +34,184 @@ fn an_answer_that_cannot_be_encoded_is_still_an_answer() {
 fn hello(protocol: u32, session_events: bool) -> String {
     serde_json::to_string(&ClientRequest::Hello {
         protocol,
+        scope: ClientScope::Account {
+            account: oxidezap_core::AccountId::LEGACY,
+        },
         session_events,
-        has_window: true,
+        owns_window: true,
+        call_video: true,
     })
     .unwrap()
+}
+
+fn attached(session_events: bool, owns_window: bool, call_video: bool) -> Attached {
+    Attached {
+        session_events,
+        scope: ClientScope::Account {
+            account: oxidezap_core::AccountId::LEGACY,
+        },
+        owns_window,
+        call_video,
+    }
 }
 
 #[test]
 fn a_matching_hello_is_accepted() {
     assert_eq!(
         check_hello(&hello(PROTOCOL_VERSION, false)),
-        Ok(Attached {
-            session_events: false,
-            has_window: true
-        })
+        Ok(attached(false, true, true))
     );
 }
 
-/// Whether there is a window to raise is the client's to say, and a
-/// client that says nothing is one: every client today is a front end,
-/// and a build predating the field is likelier than a headless tool. See
-/// [`ClientRequest::Hello`].
-#[test]
-fn a_client_is_a_window_unless_it_says_otherwise() {
-    let silent = format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION}}}"#);
-    assert_eq!(
-        check_hello(&silent),
-        Ok(Attached {
-            session_events: false,
-            has_window: true
-        })
+#[tokio::test]
+async fn a_control_connection_lists_accounts_and_rejects_account_requests() {
+    let registry = AccountRegistry::new();
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        oxidezap_core::AccountId::LEGACY,
+        hub,
+        no_plugins(),
+        commands,
+    ))));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    let first: DaemonMessage = serde_json::from_str(&line).unwrap();
+    assert!(
+        matches!(
+            first,
+            DaemonMessage::ControlHello { accounts, .. } if accounts.accounts.len() == 1
+        ),
+        "unexpected control greeting: {line}"
     );
 
-    let watcher =
-        format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION},"has_window":false}}"#);
-    assert_eq!(
-        check_hello(&watcher),
-        Ok(Attached {
-            session_events: false,
-            has_window: false
-        })
-    );
+    let list = serde_json::to_string(&Request {
+        id: Some(9),
+        request: ClientRequest::ListAccounts,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{list}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Accounts { id: 9, snapshot } if snapshot.accounts.len() == 1
+    ));
+
+    let account_request = serde_json::to_string(&Request {
+        id: Some(10),
+        request: ClientRequest::Snapshot,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{account_request}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Error {
+            id: Some(10),
+            error: ProtocolError::Refused { .. },
+        }
+    ));
+    served.abort();
+}
+
+#[tokio::test]
+async fn an_account_connection_is_bound_to_the_requested_runtime() {
+    let registry = AccountRegistry::new();
+    let account_a = StateHub::for_account(oxidezap_core::AccountId::LEGACY);
+    let account_b_id = oxidezap_core::AccountId::new(2).expect("positive account id");
+    let account_b = StateHub::for_account(account_b_id);
+    account_b.apply(crate::state::Change::live(
+        oxidezap_ipc::DaemonEvent::ConnectionChanged(oxidezap_ipc::ConnectionState::Disconnected {
+            reason: "account b".to_string(),
+        }),
+    ));
+    let (commands_a, _taken_a) = bridge(CommandOutcome::Accepted);
+    let (commands_b, _taken_b) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        oxidezap_core::AccountId::LEGACY,
+        account_a,
+        no_plugins(),
+        commands_a,
+    ))));
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        account_b_id,
+        account_b,
+        no_plugins(),
+        commands_b,
+    ))));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let hello = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account {
+            account: account_b_id,
+        },
+        session_events: false,
+        owns_window: false,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Hello { snapshot, .. }
+            if matches!(
+                snapshot.connection,
+                oxidezap_ipc::ConnectionState::Disconnected { ref reason }
+                    if reason == "account b"
+            )
+    ));
+    served.abort();
+}
+
+/// Window ownership and call-video subscription are independent capabilities.
+#[test]
+fn a_client_can_subscribe_to_video_without_owning_a_window() {
+    let account = serde_json::to_string(&ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account {
+            account: oxidezap_core::AccountId::LEGACY,
+        },
+        session_events: true,
+        owns_window: false,
+        call_video: true,
+    })
+    .unwrap();
+    assert_eq!(check_hello(&account), Ok(attached(true, false, true)));
 }
 
 /// The session stream is opt-in: a tray that never asked must not be sent
@@ -83,21 +220,10 @@ fn a_client_is_a_window_unless_it_says_otherwise() {
 fn the_session_stream_is_only_served_when_asked_for() {
     assert_eq!(
         check_hello(&hello(PROTOCOL_VERSION, true)),
-        Ok(Attached {
-            session_events: true,
-            has_window: true
-        })
+        Ok(attached(true, true, true))
     );
-    // An older client that does not know the field at all still connects,
-    // and gets summaries.
-    let line = format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION}}}"#);
-    assert_eq!(
-        check_hello(&line),
-        Ok(Attached {
-            session_events: false,
-            has_window: true
-        })
-    );
+    let line = hello(PROTOCOL_VERSION, false);
+    assert_eq!(check_hello(&line), Ok(attached(false, true, true)));
 }
 
 /// A client speaking another version must be turned away before it is

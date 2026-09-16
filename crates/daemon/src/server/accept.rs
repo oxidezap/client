@@ -17,10 +17,9 @@ use anyhow::{Context, Result};
 use oxidezap_ipc::{ProtocolError, endpoint_path, lock_path, media_dir, state_dir};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use super::{ClientSlots, MAX_CLIENTS, error_frame, serve_client, write_line};
+use super::{ClientSlots, MAX_CLIENTS, error_frame, serve_client_with_registry, write_line};
+use crate::account::AccountRegistry;
 use crate::listener::Listener;
-use crate::session_bridge::Commands;
-use crate::state::StateHub;
 
 /// This process's claim on being *the* daemon for this user.
 ///
@@ -66,13 +65,7 @@ pub fn claim() -> Result<Claim> {
 /// and can be dropped while the session is still disconnecting, and the lock
 /// has to outlive that. Handing it over here would release it mid-teardown,
 /// which is exactly the window a second daemon must not find open.
-pub async fn run(
-    claim: &Claim,
-    hub: Arc<StateHub>,
-    plugins: Arc<oxidezap_plugin_host::Plugins>,
-    commands: Commands,
-    slots: ClientSlots,
-) -> Result<()> {
+pub async fn run(claim: &Claim, registry: Arc<AccountRegistry>, slots: ClientSlots) -> Result<()> {
     let path = claim.path.clone();
     let mut listener = Listener::bind(&path)?;
     log::info!("listening on {}", path.display());
@@ -101,13 +94,11 @@ pub async fn run(
             continue;
         };
 
-        let hub = Arc::clone(&hub);
-        let plugins = Arc::clone(&plugins);
-        let commands = commands.clone();
+        let registry = Arc::clone(&registry);
         // Per-connection task: one slow or malformed client cannot hold up
         // the accept loop or any other client.
         tokio::spawn(async move {
-            if let Err(e) = serve_client(stream, hub, plugins, commands).await {
+            if let Err(e) = serve_client_with_registry(stream, registry).await {
                 log::debug!("client disconnected: {e}");
             }
             drop(slot);

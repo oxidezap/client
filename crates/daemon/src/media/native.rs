@@ -449,6 +449,11 @@ pub fn cache_usage() -> (u64, u64) {
 ///
 /// The lock and the epoch belong to [`super::wipe`], which is the only caller.
 pub(super) fn delete(scope: Wipe) -> Result<()> {
+    delete_for("", scope)
+}
+
+/// Delete only files in one account namespace when `prefix` is non-empty.
+pub(super) fn delete_for(prefix: &str, scope: Wipe) -> Result<()> {
     let Some(dir) = oxidezap_ipc::media_dir() else {
         return Ok(());
     };
@@ -464,7 +469,12 @@ pub(super) fn delete(scope: Wipe) -> Result<()> {
         if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
             continue;
         }
-        if !scope.takes(&entry.file_name().to_string_lossy()) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(local_name) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        if !scope.takes(local_name) {
             continue;
         }
         if std::fs::remove_file(entry.path()).is_ok() {

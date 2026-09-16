@@ -224,8 +224,16 @@ pub fn cache_usage() -> (u64, u64) {
 ///
 /// Never, for the same reason [`put`] does not.
 pub(super) fn delete(scope: Wipe) -> Result<()> {
+    delete_for("", scope)
+}
+
+/// Delete only entries in one account namespace when `prefix` is non-empty.
+pub(super) fn delete_for(prefix: &str, scope: Wipe) -> Result<()> {
     with(|cache| {
         cache.entries.retain(|name, entry| {
+            let Some(local_name) = name.strip_prefix(prefix) else {
+                return true;
+            };
             // A claimed entry survives a *cache* clear, for the same reason it
             // survives the sweep: somebody asked for these bytes, the request
             // has already been answered `Ok`, and the reader is on its way.
@@ -236,7 +244,7 @@ pub(super) fn delete(scope: Wipe) -> Result<()> {
             // `Wipe::Everything` takes it regardless: there the account
             // itself is going, and nothing that was going to be shown to it
             // has any business outliving it.
-            let taken = scope.takes(name) && !(entry.claims > 0 && scope == Wipe::Cache);
+            let taken = scope.takes(local_name) && !(entry.claims > 0 && scope == Wipe::Cache);
             if taken {
                 cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
             }

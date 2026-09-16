@@ -6,7 +6,7 @@
 //! has not said hello has no business reaching any.
 
 use anyhow::Result;
-use oxidezap_ipc::{ClientRequest, PROTOCOL_VERSION, ProtocolError, Request};
+use oxidezap_ipc::{ClientRequest, ClientScope, PROTOCOL_VERSION, ProtocolError, Request};
 use tokio::io::{
     AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, BufReader, ReadHalf, WriteHalf,
 };
@@ -131,8 +131,12 @@ pub(super) struct Attached {
     /// Whether this client wants the session's own events as well as
     /// summaries. See [`ClientRequest::Hello`].
     pub(super) session_events: bool,
+    /// The control/account plane this connection is bound to.
+    pub(super) scope: ClientScope,
     /// Whether this client owns a window. See [`ClientRequest::Hello`].
-    pub(super) has_window: bool,
+    pub(super) owns_window: bool,
+    /// Whether this connection receives live call video.
+    pub(super) call_video: bool,
 }
 
 /// Validate the client's opening frame.
@@ -148,11 +152,15 @@ pub(super) fn check_hello(line: &str) -> Result<Attached, Option<String>> {
     match request {
         ClientRequest::Hello {
             protocol,
+            scope,
             session_events,
-            has_window,
+            owns_window,
+            call_video,
         } if protocol == PROTOCOL_VERSION => Ok(Attached {
             session_events,
-            has_window,
+            scope,
+            owns_window,
+            call_video,
         }),
         ClientRequest::Hello { protocol, .. } => Err(always(
             id,

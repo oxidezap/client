@@ -358,7 +358,7 @@ pub(super) async fn handle_request(
         // of it in the same frame, because a plugin's interface was always
         // the daemon's rather than the asking window's.
         ClientRequest::ReloadPlugins => {
-            crate::plugins::reload_in_background(plugins);
+            crate::plugins::reload_in_background(plugins, hub.account_id());
             acted(Ok(()))
         }
         // The module travels through the media cache, exactly as a file being
@@ -442,6 +442,12 @@ pub(super) async fn handle_request(
             Answer::frame(None)
         }
         // The acknowledgement goes out first; see the caller.
+        ClientRequest::ListAccounts
+        | ClientRequest::CreateAccount
+        | ClientRequest::ResetAccount { .. }
+        | ClientRequest::RemoveAccount { .. } => acted(Err(ProtocolError::Refused {
+            detail: "control requests require a control-scoped connection".to_string(),
+        })),
         ClientRequest::Shutdown => Answer {
             frame: answer(id, Ok(())),
             shutdown: true,

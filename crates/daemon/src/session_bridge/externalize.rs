@@ -6,6 +6,9 @@
 
 use oxidezap_core::{ChatMessage, MediaContent, UiEvent};
 
+use crate::media::AccountMedia;
+use crate::state::StateHub;
+
 /// Move an event's media bytes into the cache and leave a key behind.
 ///
 /// The bytes stay where they were in this process — `data` is skipped by
@@ -15,18 +18,19 @@ use oxidezap_core::{ChatMessage, MediaContent, UiEvent};
 /// Writing is skipped for anything already cached, which is most of it after
 /// the first attach: a message's media is addressed by its message id, and a
 /// message's media does not change.
-pub(crate) fn externalize_media(event: &mut UiEvent) {
+pub(crate) fn externalize_media(hub: &StateHub, event: &mut UiEvent) {
     // Read once for the whole event: this runs on the publish thread behind
     // an unbounded queue, so a clear can land between being handed the event
     // and writing its media. See `media::put_since`.
     let epoch = crate::media::epoch();
+    let media = AccountMedia::new(hub.account_id());
     match event {
         UiEvent::MessageReceived { message, .. } => {
-            cache_media(epoch, &message.id, &mut message.media)
+            cache_media(&media, epoch, &message.id, &mut message.media)
         }
         UiEvent::HistoryLoaded { chats, .. } => {
             for chat in chats {
-                externalize_messages(epoch, &mut chat.messages);
+                externalize_messages(&media, epoch, &mut chat.messages);
             }
         }
         _ => {}
@@ -41,16 +45,26 @@ pub(crate) fn externalize_media(event: &mut UiEvent) {
 /// nor a key to find them by, and older photos draw as download-only next to
 /// the identical rows the attach load externalized. Every frame that carries
 /// a `ChatMessage` goes through here.
-pub(super) fn externalize_messages(epoch: usize, messages: &mut [ChatMessage]) {
+pub(super) fn externalize_messages(
+    media: &AccountMedia,
+    epoch: usize,
+    messages: &mut [ChatMessage],
+) {
     for message in messages {
         let id = message.id.clone();
-        cache_media(epoch, &id, &mut message.media);
+        cache_media(media, epoch, &id, &mut message.media);
     }
 }
 
-fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaContent>) {
+fn cache_media(
+    account_media: &AccountMedia,
+    cache_epoch: usize,
+    message_id: &str,
+    media: &mut Option<MediaContent>,
+) {
     let Some(media) = media else { return };
-    let key = crate::media::message_key(message_id);
+    let local_key = crate::media::message_key(message_id);
+    let key = account_media.key(&local_key);
 
     // Only the real thing is cached. A fallback thumbnail written under the
     // message's key would take the place of the full image already there —
@@ -61,7 +75,7 @@ fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaCon
         // Nothing to write, but the bytes may already be here: the store
         // never holds media, so this is what makes a photo survive a restart
         // instead of being downloaded again.
-        if crate::media::has(&key) {
+        if account_media.has(&key) {
             media.cache_key = Some(key);
             return;
         }
@@ -71,8 +85,8 @@ fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaCon
         // fetched on demand later is on this disk under a name a hydrated row
         // never looks for. It was downloaded again on every restart.
         if let Some(downloadable) = &media.downloadable
-            && let Some(by_content) = crate::media::download_key(&downloadable.file_enc_sha256)
-            && crate::media::has(&by_content)
+            && let Some(by_content) = account_media.download_key(&downloadable.file_enc_sha256)
+            && account_media.has(&by_content)
         {
             media.cache_key = Some(by_content);
         }
@@ -83,7 +97,7 @@ fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaCon
     // with a message, and the front end can fetch it on demand if it is not
     // here. So a clear that lands while it is queued wins, and the directory
     // the user just emptied stays empty.
-    match crate::media::put_since(cache_epoch, &key, &media.data) {
+    match account_media.put_since(cache_epoch, &local_key, &media.data) {
         Ok(key) => media.cache_key = Some(key),
         // The front end still gets the message; the media renders as the
         // download it also is. A cache that cannot be written is not a reason

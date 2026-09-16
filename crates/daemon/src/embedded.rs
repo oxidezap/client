@@ -20,9 +20,12 @@ use std::sync::Arc;
 
 use tokio::io::DuplexStream;
 
+use crate::account::{AccountRegistry, AccountRuntime};
 use crate::server;
 use crate::session_bridge;
 use crate::state::StateHub;
+use oxidezap_core::AccountId;
+use oxidezap_session::StoreRegistry;
 
 /// How much of a frame may sit in the pipe before the writer waits.
 ///
@@ -49,11 +52,11 @@ const PIPE: usize = 1 << 18;
 /// because on the side this exists for there is no process to end that is
 /// not the tab itself.
 pub async fn start() -> Result<DuplexStream, StartFailed> {
-    let (hub, plugins, commands) = service().await?;
+    let (_, _, _, registry) = service().await?;
 
     let (client, server) = tokio::io::duplex(PIPE);
     oxidezap_session::spawn(async move {
-        if let Err(e) = server::serve_client(server, hub, plugins, commands).await {
+        if let Err(e) = server::serve_client_with_registry(server, registry).await {
             log::error!("the in-process client ended badly: {e}");
         }
         // Nothing is released here, and that is the fix rather than an
@@ -111,6 +114,11 @@ struct Service {
     /// a real host is the same answer a desktop daemon with an empty folder
     /// gives. See [`crate::plugins::start`] for why it is empty here.
     plugins: Arc<oxidezap_plugin_host::Plugins>,
+    /// The account-local runtime, including its lifecycle state.
+    runtime: Arc<AccountRuntime>,
+    /// The registry shared by every embedded control/account connection.
+    registry: Arc<AccountRegistry>,
+
     /// The other tabs of this origin, served.
     ///
     /// This tab won the account's lock, which makes it the daemon; the tabs
@@ -130,6 +138,7 @@ async fn service() -> Result<
         Arc<StateHub>,
         Arc<oxidezap_plugin_host::Plugins>,
         session_bridge::Commands,
+        Arc<AccountRegistry>,
     ),
     StartFailed,
 > {
@@ -153,7 +162,7 @@ async fn service() -> Result<
         return Ok(running);
     }
 
-    let hub = StateHub::new();
+    let hub = StateHub::for_account(AccountId::LEGACY);
 
     // The bridge must never be cancelled: it owns the session, and a future
     // dropped mid-await cannot wait for anything. So it watches for a stop
@@ -177,11 +186,21 @@ async fn service() -> Result<
     // which is a longer span than the command channel measures — see
     // [`tearing_down`].
     RUNNING.with(|running| running.set(true));
+    let registry = AccountRegistry::new();
+    let stores = Arc::new(StoreRegistry::new(oxidezap_session::resolve_database_path()));
+    let runtime = Arc::new(AccountRuntime::new_with_registry(
+        AccountId::LEGACY,
+        Arc::clone(&hub),
+        Arc::clone(&plugins),
+        commands.clone(),
+        stores,
+    ));
+    assert!(registry.insert(Arc::clone(&runtime)));
     oxidezap_session::spawn({
-        let hub = Arc::clone(&hub);
-        let plugins = Arc::clone(&plugins);
+        let registry = Arc::clone(&registry);
+        let runtime = Arc::clone(&runtime);
         async move {
-            let outcome = session_bridge::run(hub, plugins, command_rx, stopped).await;
+            let outcome = registry.run(runtime, command_rx, stopped).await;
             // After `run`, not inside it: what this says is "the teardown is
             // over", and the teardown is the last thing `run` does.
             RUNNING.with(|running| running.set(false));
@@ -194,7 +213,7 @@ async fn service() -> Result<
     // this origin — and announcing it before the bridge existed would invite
     // a front end onto a hub with nothing behind it.
     #[cfg(target_family = "wasm")]
-    let tabs = match crate::listener::tab::serve(&hub, &plugins, &commands) {
+    let tabs = match crate::listener::tab::serve(&registry) {
         Ok(serving) => Some(serving),
         Err(e) => {
             // Not fatal, and deliberately not an error the window sees: this
@@ -211,11 +230,13 @@ async fn service() -> Result<
             commands: commands.clone(),
             _claim: claim,
             plugins: Arc::clone(&plugins),
+            runtime: Arc::clone(&runtime),
+            registry: Arc::clone(&registry),
             #[cfg(target_family = "wasm")]
             _tabs: tabs,
         });
     });
-    Ok((hub, plugins, commands))
+    Ok((hub, plugins, commands, registry))
 }
 
 /// This page's session, if it has one that is still listening.
@@ -230,6 +251,7 @@ type Running = (
     Arc<StateHub>,
     Arc<oxidezap_plugin_host::Plugins>,
     session_bridge::Commands,
+    Arc<AccountRegistry>,
 );
 
 fn running() -> Result<Option<Running>, StartFailed> {
@@ -268,7 +290,10 @@ fn running() -> Result<Option<Running>, StartFailed> {
         // first has not let go of. So the honest answer is neither the old
         // service nor a new one, but "ask again in a moment" — which is what
         // the front end's ordinary reconnect already does.
-        if slot.is_some() && session_bridge::stopping() {
+        if slot
+            .as_ref()
+            .is_some_and(|service| service.runtime.is_stopping())
+        {
             return Err(StartFailed::Stopping);
         }
 
@@ -277,6 +302,7 @@ fn running() -> Result<Option<Running>, StartFailed> {
                 Arc::clone(&running.hub),
                 Arc::clone(&running.plugins),
                 running.commands.clone(),
+                Arc::clone(&running.registry),
             )
         }))
     })

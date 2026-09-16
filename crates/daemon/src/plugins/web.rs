@@ -67,7 +67,16 @@ pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc
 }
 
 /// See [`super::reload`].
-pub(super) async fn reload(plugins: &Arc<Plugins>) -> Reloaded {
+///
+/// `account_id` is unused here: a page's plugin state lives in `localStorage`
+/// behind [`Origin`], which is not yet keyed by account (the multi-account
+/// plan's section 13.3 names this as pending). The parameter exists so the
+/// platform split stays one function the caller names rather than a `cfg` at
+/// every call — see `crates/daemon/src/plugins/mod.rs`'s header.
+pub(super) async fn reload(
+    plugins: &Arc<Plugins>,
+    _account_id: oxidezap_core::AccountId,
+) -> Reloaded {
     // Handed over as a future rather than as values, and that is not style:
     // `Origin::storage()` *stamps* the origin's storage, retiring every
     // handle taken before it. `Plugins::reload` refuses a second reload while
