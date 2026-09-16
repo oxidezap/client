@@ -591,7 +591,6 @@ impl ChatStore {
         after: MessageCursor,
         limit: i64,
     ) -> Result<Vec<StoredMessage>> {
-        use schema::messages::dsl;
         let limit = limit.max(0);
         if limit == 0 {
             return Ok(Vec::new());
@@ -603,23 +602,7 @@ impl ChatStore {
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                let rows: Vec<MessageRow> = dsl::messages
-                    .filter(
-                        dsl::device_id
-                            .eq(device_id)
-                            .and(dsl::chat_jid.eq_any(keys))
-                            .and(
-                                dsl::timestamp_ms
-                                    .gt(after.timestamp_ms)
-                                    .or(dsl::timestamp_ms
-                                        .eq(after.timestamp_ms)
-                                        .and(dsl::id.gt(after.seq))),
-                            ),
-                    )
-                    .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
-                    .limit(limit)
-                    .load(conn)
-                    .map_err(db_err)?;
+                let rows = fill_unique_after(conn, device_id, &keys, after, limit)?;
                 finalize_messages(conn, device_id, rows)
             })
             .await?;
@@ -678,6 +661,74 @@ fn fill_unique(
                 kept.push(row);
             }
         }
+        if exhausted {
+            break;
+        }
+    }
+    Ok(kept)
+}
+
+/// [`fill_unique`], walking forward instead of back.
+///
+/// A forward page is read as oldest-first, so the cursor advances upward and
+/// the query is the ascending twin of [`page_query`]. The dedup is the same
+/// one, for the same reason: a 1:1 chat's PN and LID rows are one logical
+/// message, and returning both would spend two slots on one bubble — which
+/// for a caller paging forward is a page that ends early and a cursor that
+/// re-reads what it already had.
+fn fill_unique_after(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    keys: &[String],
+    after: MessageCursor,
+    limit: i64,
+) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
+    use schema::messages::dsl;
+    let mut kept: Vec<MessageRow> = Vec::new();
+    // The same read identity [`fill_unique`] uses: alias candidates are one
+    // thread, so the id alone is the duplicate; a single chat may hold the
+    // same id from two group participants and keeps the sender in the key.
+    let dedupe_by_sender = keys.len() == 1;
+    let mut ids = std::collections::HashSet::new();
+    let mut after = after;
+    while (kept.len() as i64) < limit {
+        let wanted = limit - kept.len() as i64;
+        let rows: Vec<MessageRow> = dsl::messages
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::chat_jid.eq_any(keys.to_vec()))
+                    .and(
+                        dsl::timestamp_ms
+                            .gt(after.timestamp_ms)
+                            .or(dsl::timestamp_ms
+                                .eq(after.timestamp_ms)
+                                .and(dsl::id.gt(after.seq))),
+                    ),
+            )
+            .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
+            .limit(wanted)
+            .load(conn)
+            .map_err(db_err)?;
+        let exhausted = (rows.len() as i64) < wanted;
+        if let Some(last) = rows.last() {
+            after = MessageCursor {
+                timestamp_ms: last.timestamp_ms,
+                seq: last.id,
+            };
+        }
+        for row in rows {
+            let identity = if dedupe_by_sender {
+                (row.msg_id.clone(), row.sender_jid.clone())
+            } else {
+                (row.msg_id.clone(), String::new())
+            };
+            if ids.insert(identity) {
+                kept.push(row);
+            }
+        }
+        // `rows` was empty: the store is exhausted and the cursor did not
+        // move, so another pass would ask the same question forever.
         if exhausted {
             break;
         }

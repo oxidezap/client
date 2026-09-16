@@ -82,18 +82,6 @@ pub(super) fn participant_keyed_chat(jid: &Jid) -> bool {
     jid.is_group() || jid.is_broadcast_list() || jid.is_status_broadcast()
 }
 
-/// Whether a stored message's class carries an attachment.
-///
-/// The search filter `has_media` reads, kept here beside the message class so
-/// the two move together.
-fn carries_media(kind: &oxidezap_chat_store::MessageKind) -> bool {
-    use oxidezap_chat_store::MessageKind as K;
-    matches!(
-        kind,
-        K::Image | K::Video | K::VideoNote | K::Audio | K::VoiceNote | K::Sticker | K::Document
-    )
-}
-
 impl WhatsAppClient {
     /// One page of a conversation, for a front end that asked for one.
     ///
@@ -196,7 +184,12 @@ impl WhatsAppClient {
             } else {
                 None
             };
-            let hits = if let Some(ref chat) = parsed_chat {
+            let hits = if has_media {
+                live.chat_store
+                    .search_media_messages(&query, parsed_chat.clone(), limit.clamp(1, 100))
+                    .await
+                    .map_err(|e| format!("search failed: {e}"))?
+            } else if let Some(ref chat) = parsed_chat {
                 live.chat_store
                     .search_messages_in_chat(chat, &query, limit.clamp(1, 100))
                     .await
@@ -206,13 +199,6 @@ impl WhatsAppClient {
                     .search_messages(&query, limit.clamp(1, 100))
                     .await
                     .map_err(|e| format!("search failed: {e}"))?
-            };
-            let hits = if has_media {
-                hits.into_iter()
-                    .filter(|m| carries_media(&m.kind))
-                    .collect()
-            } else {
-                hits
             };
             let mut messages: Vec<ChatMessage> =
                 hits.into_iter().map(stored_to_chat_message).collect();

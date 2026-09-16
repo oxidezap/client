@@ -130,19 +130,56 @@ fn an_invalid_account_flag_is_refused() {
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
 }
 
-/// `--account` overrides the environment, which is what makes the flag
-/// usable in a script that inherited a different profile.
+/// `--account` overrides the environment when the connection is resolved,
+/// which is what makes the flag usable in a shell that already exports a
+/// default profile. The error names the endpoint for `work`, not `other`.
+///
+/// Run from a private directory holding a copy of the binary and nothing
+/// else, with a private runtime directory: no `oxidezapd` sits beside it to
+/// start and no daemon can already be listening, so the CLI reports the
+/// endpoint it looked for. A workspace `cargo test` leaves a real
+/// `oxidezapd` in `target/debug/`, which is what a test run from there would
+/// otherwise start and connect to.
 #[test]
 fn the_account_flag_beats_the_environment() {
-    let out = cli()
-        .args(["--account", "work", "accounts", "use", "work"])
+    let dir = std::env::temp_dir().join(format!("oxidezap-cli-flag-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let binary = dir.join(if cfg!(windows) {
+        "oxidezap-cli.exe"
+    } else {
+        "oxidezap-cli"
+    });
+    std::fs::copy(env!("CARGO_BIN_EXE_oxidezap-cli"), &binary).expect("a copy of the cli");
+
+    let out = Command::new(&binary)
+        .args(["--json", "--account", "work", "status"])
         .env("OXIDEZAP_ACCOUNT", "other")
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("TMPDIR", &dir)
         .output()
         .expect("run the cli");
-    assert!(out.status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stderr).expect("structured json error on stderr");
+    assert_eq!(parsed["ok"], serde_json::json!(false));
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "export OXIDEZAP_ACCOUNT=work"
+        parsed["error"]["code"],
+        serde_json::json!("daemon_not_running")
+    );
+    let message = parsed["error"]["message"].as_str().unwrap_or_default();
+    // The profile is suffixed onto the endpoint name on every platform: a
+    // Unix socket is `daemon-work.sock` and a Windows pipe ends `...-work`.
+    assert!(
+        message.contains("-work"),
+        "the flag did not select its profile: {message}"
+    );
+    assert!(
+        !message.contains("-other"),
+        "the environment profile was selected over the flag: {message}"
     );
 }
 

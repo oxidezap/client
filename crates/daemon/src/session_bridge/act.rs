@@ -563,27 +563,36 @@ impl Bridge {
                                 }
                             }
                             _ => {
-                                // The id is announced before the send touches
-                                // the network, so a channel that closed
-                                // without one means the send refused before
-                                // it started — a bad JID, empty text. Await
-                                // the task to report that rather than
-                                // inventing a session failure; it has
-                                // already resolved in that case.
-                                let detail = match oxidezap_session::with_timeout(
+                                // No id arrived. A send that refuses before
+                                // it starts — a bad JID, empty text — reports
+                                // a request error; a session that stopped, a
+                                // task that died before announcing, or a wait
+                                // that expired did not, and folding the two
+                                // together told a client its request was
+                                // wrong when the session was gone.
+                                let settled = oxidezap_session::with_timeout(
                                     pending,
                                     std::time::Duration::from_secs(5),
                                 )
-                                .await
-                                {
-                                    Some(Ok(Err(e))) => e,
-                                    _ => "the session stopped before the send started".to_string(),
+                                .await;
+                                let result = match settled {
+                                    Some(Ok(Err(e))) => Err(ApiError::invalid_argument(e)),
+                                    // The send finished in the gap between
+                                    // the announcement's deadline and this
+                                    // await: it succeeded, so answer with
+                                    // what it produced rather than an error.
+                                    Some(Ok(Ok((sent_id, ts)))) => {
+                                        Ok(DaemonResponse::MessageSent {
+                                            id: sent_id,
+                                            timestamp_ms: ts,
+                                            enqueued: true,
+                                        })
+                                    }
+                                    _ => Err(ApiError::not_connected(
+                                        "the session stopped before the send started",
+                                    )),
                                 };
-                                send_wire_result(
-                                    &answer_to,
-                                    id,
-                                    Err(ApiError::invalid_argument(detail)),
-                                );
+                                send_wire_result(&answer_to, id, result);
                                 let _ = reply.send(CommandOutcome::Accepted);
                             }
                         }

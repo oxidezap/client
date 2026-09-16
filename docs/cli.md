@@ -22,10 +22,10 @@ Human tables by default. `--json` prints one envelope to stdout:
 { "ok": true, "data": { } }
 ```
 
-and errors to stderr as `{"ok": false, "error": {"code", "message"}}` with a
-nonzero exit. Every command, read or write, returns a DTO in `data`; no
-command prints a human sentence in `--json`, and none exits zero after a
-failure.
+and errors to stderr as
+`{"ok": false, "error": {"code": "...", "message": "..."}}` with a nonzero
+exit. Every command, read or write, returns a DTO in `data`; no command
+prints a human sentence in `--json`, and none exits zero after a failure.
 
 `--events` subscribes the connection to lifecycle events. `sync --follow`
 prints one `DaemonEvent` per line as NDJSON and nothing else, so a follower

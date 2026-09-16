@@ -94,6 +94,14 @@ impl Action {
     /// window has already drawn the ring as watched.
     pub fn needs_network(&self) -> bool {
         match self {
+            // Pairing is the connection attempt itself: the account is in
+            // `Pairing`, never `Connected`, for the whole of it, so gating it
+            // on a live connection refuses it exactly when it is wanted. The
+            // request reaches a client that exists, which is all it needs.
+            Self::Wire {
+                request: oxidezap_wire::request::ClientRequest::RequestPairCode { .. },
+                ..
+            } => false,
             Self::Wire { request, .. } => request.is_mutation(),
             _ => !matches!(
                 self,

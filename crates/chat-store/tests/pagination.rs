@@ -866,3 +866,50 @@ async fn a_new_message_can_land_at_a_previously_used_seq() {
         watermark
     );
 }
+
+/// The forward walk collapses the PN/LID pair the same way the backward one
+/// does, and tops the page up from behind the duplicates.
+///
+/// Without it a page of two could return one logical message twice: two slots
+/// spent on one bubble, and a cursor parked on the second copy that then
+/// re-reads what the caller already had.
+#[tokio::test]
+async fn a_forward_page_collapses_the_identity_pair() {
+    let (store, chat_store) = test_store().await;
+    // No mapping yet, so the two identities file their own copy.
+    let mut events = Vec::new();
+    events.push(message_event(
+        wa::Message::text("anchor"),
+        incoming_info(PEER, PEER, "ANCHOR", 1_699_999_000),
+    ));
+    for (n, id) in ["DUP-A", "DUP-B"].iter().enumerate() {
+        let at = 1_700_000_000 + n as i64;
+        events.push(message_event(
+            wa::Message::text("under the number"),
+            incoming_info(PEER, PEER, id, at),
+        ));
+        events.push(message_event(
+            wa::Message::text("under the lid"),
+            incoming_info(PEER_LID, PEER_LID, id, at),
+        ));
+    }
+    events.push(message_event(
+        wa::Message::text("newest, only under the number"),
+        incoming_info(PEER, PEER, "NEWER", 1_700_000_100),
+    ));
+    feed(&chat_store, events).await;
+
+    add_lid_mapping(&store).await;
+    let anchor = chat_store
+        .oldest_message(&jid(PEER))
+        .await
+        .unwrap()
+        .expect("anchor row");
+    let page = chat_store
+        .messages_after(&jid(PEER), (&anchor).into(), 3)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 3, "two duplicates must not spend two slots");
+    let ids: Vec<&str> = page.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["DUP-A", "DUP-B", "NEWER"]);
+}

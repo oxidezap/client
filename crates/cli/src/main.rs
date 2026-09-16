@@ -101,11 +101,16 @@ fn main() -> ExitCode {
         },
         None => None,
     };
-    if account.is_some() && std::env::var_os("OXIDEZAP_ACCOUNT").is_none() {
+    if let Some(id) = account.as_deref() {
+        // Unconditionally, so the flag is a stronger word than the
+        // environment it was inherited alongside — a script that exports a
+        // default profile and passes `--account` for one command must get the
+        // one it named.
+        //
         // Single-threaded startup, before any thread exists: no thread can
         // observe the environment changing under it.
         unsafe {
-            std::env::set_var("OXIDEZAP_ACCOUNT", account.as_deref().unwrap());
+            std::env::set_var("OXIDEZAP_ACCOUNT", id);
         }
     }
     if let Some(raw) = std::env::var_os("OXIDEZAP_ACCOUNT")
@@ -236,8 +241,17 @@ fn connect_or_start() -> std::io::Result<IpcClient> {
         Some(program) => program,
         None => {
             // No daemon to start, but one may still be running: try to connect
-            // and report the connect error if there is not.
-            return IpcClient::connect();
+            // and report the endpoint the profile resolved to if there is not.
+            // The path is the point of the message: with `--account work` it
+            // says which socket was looked for, so a script can tell which
+            // profile it reached.
+            return match IpcClient::connect() {
+                Ok(client) => Ok(client),
+                Err(e) => Err(std::io::Error::other(format!(
+                    "no daemon listening on {}: {e}",
+                    path.display()
+                ))),
+            };
         }
     };
     let deadline = std::time::Instant::now() + START_TIMEOUT;

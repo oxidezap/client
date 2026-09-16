@@ -43,15 +43,21 @@ fn main() -> Result<()> {
             account_from_flag = Some(id);
         }
     }
+    // A supplied `--account` is validated whether or not it wins, so a typo
+    // is refused instead of being silently overruled by the environment. The
+    // precedence itself is unchanged: the flag only sets the variable when
+    // the environment does not already hold one.
+    if let Some(id) = &account_from_flag
+        && oxidezap_wire::validate_account_id(id).is_none()
+    {
+        eprintln!(
+            "error [invalid_account_id]: --account must match [A-Za-z0-9][A-Za-z0-9_-]*, got {id:?}"
+        );
+        std::process::exit(2);
+    }
     if let Some(id) = account_from_flag
         && std::env::var_os("OXIDEZAP_ACCOUNT").is_none()
     {
-        if oxidezap_wire::validate_account_id(&id).is_none() {
-            eprintln!(
-                "error [invalid_account_id]: --account must match [A-Za-z0-9][A-Za-z0-9_-]*, got {id:?}"
-            );
-            std::process::exit(2);
-        }
         // Single-threaded startup, before the runtime exists: no thread can
         // observe the environment changing under it.
         unsafe {
@@ -128,7 +134,9 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     // The tray is optional by design: no StatusNotifierItem host (a bare WM, a
     // headless session) is a reason to run without an icon, not to refuse to
     // start. On macOS the icon lives on the main thread instead (see
-    // `macos_main`), so there is nothing to spawn here.
+    // `macos_main`), so there is nothing to spawn here — and nothing to ask:
+    // the binding exists only where the non-macOS branch below reads it.
+    #[cfg(not(target_os = "macos"))]
     let headless = std::env::args().any(|a| a == "--headless")
         || std::env::var_os("OXIDEZAPD_HEADLESS").is_some();
     #[cfg(not(target_os = "macos"))]

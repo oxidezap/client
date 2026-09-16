@@ -144,7 +144,7 @@ impl ChatStore {
     /// by relevance: ranking has to score every row such a prefix matches
     /// before `limit` can discard any, which on a real store means most of it.
     pub async fn search_messages(&self, query: &str, limit: i64) -> Result<Vec<StoredMessage>> {
-        self.search(query, None, limit).await
+        self.search(query, None, false, limit).await
     }
 
     /// The same search restricted to one chat.
@@ -161,13 +161,31 @@ impl ChatStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<StoredMessage>> {
-        self.search(query, Some(chat.to_string()), limit).await
+        self.search(query, Some(chat.to_string()), false, limit)
+            .await
+    }
+
+    /// The same search, keeping only rows carrying an attachment.
+    ///
+    /// `has_media` filters in the query rather than over the page: a caller
+    /// that asked for ten media hits wants ten, and filtering a page of ten
+    /// already-chosen rows would return however few of them happened to be
+    /// media — a limit applied in the wrong direction.
+    pub async fn search_media_messages(
+        &self,
+        query: &str,
+        chat: Option<Jid>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        self.search(query, chat.map(|c| c.to_string()), true, limit)
+            .await
     }
 
     async fn search(
         &self,
         query: &str,
         chat: Option<String>,
+        has_media: bool,
         limit: i64,
     ) -> Result<Vec<StoredMessage>> {
         let Some(match_query) = build_match_query(query) else {
@@ -190,7 +208,15 @@ impl ChatStore {
                             .map_err(db_err)?,
                         None => Vec::new(),
                     };
-                    let hits = fts_hits(conn, device_id, &match_query, &keys, ranked, limit)?;
+                    let hits = fts_hits(
+                        conn,
+                        device_id,
+                        &match_query,
+                        &keys,
+                        ranked,
+                        has_media,
+                        limit,
+                    )?;
                     if hits.is_empty() {
                         return Ok(Vec::new());
                     }
@@ -225,12 +251,18 @@ impl ChatStore {
 
 /// Matching message ids, best first. `keys` scopes the search to one chat's
 /// storage identities; empty searches every chat.
+///
+/// When `has_media` is set the content class is filtered *in the statement*,
+/// before `limit` is applied: filtering a page of already-chosen rows would
+/// return however few of them happened to be media, so a caller asking for
+/// ten media hits could get one.
 fn fts_hits(
     conn: &mut SqliteConnection,
     device_id: i32,
     match_query: &str,
     keys: &[String],
     ranked: bool,
+    has_media: bool,
     limit: i64,
 ) -> wacore::store::error::Result<Vec<FtsHit>> {
     use diesel::sql_types::{BigInt, Integer, Text};
@@ -244,11 +276,22 @@ fn fts_hits(
     // keeps that name; `content_rowid='id'` only says which content column it
     // maps to), so the join crosses `m.id = f.rowid`.
     let order = if ranked { "f.rank" } else { "f.rowid DESC" };
+    // Built from the class's own label list, so the filter and `as_str` move
+    // together. Every label is a fixed identifier, so the literal is safe.
+    let media_filter = if has_media {
+        let labels: Vec<String> = crate::types::MessageKind::MEDIA_LABELS
+            .iter()
+            .map(|label| format!("'{label}'"))
+            .collect();
+        format!(" AND m.kind IN ({})", labels.join(", "))
+    } else {
+        String::new()
+    };
     let Some(first_key) = keys.first() else {
         return diesel::sql_query(format!(
             "SELECT f.rowid AS id
              FROM messages_fts f JOIN messages m ON m.id = f.rowid
-             WHERE messages_fts MATCH ? AND m.device_id = ?
+             WHERE messages_fts MATCH ? AND m.device_id = ?{media_filter}
              ORDER BY {order} LIMIT ?"
         ))
         .bind::<Text, _>(match_query)
@@ -264,7 +307,7 @@ fn fts_hits(
     diesel::sql_query(format!(
         "SELECT f.rowid AS id
          FROM messages_fts f JOIN messages m ON m.id = f.rowid
-         WHERE messages_fts MATCH ? AND m.device_id = ? AND m.chat_jid IN (?, ?)
+         WHERE messages_fts MATCH ? AND m.device_id = ? AND m.chat_jid IN (?, ?){media_filter}
          ORDER BY {order} LIMIT ?"
     ))
     .bind::<Text, _>(match_query)

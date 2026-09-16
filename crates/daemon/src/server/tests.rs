@@ -682,6 +682,27 @@ fn the_local_actions_do_not_need_a_connection() {
     );
 }
 
+/// Pairing is the connection attempt itself: the account is in `Pairing`,
+/// never `Connected`, for the whole of it, so a live-connection gate would
+/// refuse the one request that is trying to establish one.
+#[test]
+fn requesting_a_pair_code_does_not_need_a_live_connection() {
+    let action = Action::Wire {
+        id: 1,
+        request: oxidezap_wire::request::ClientRequest::RequestPairCode {
+            phone: "5511999999999".into(),
+        },
+        answer_to: outbox(),
+    };
+    assert!(!action.needs_network());
+    // Still a write: it mints credentials on the server, so a read-only
+    // connection must not be able to ask for one.
+    let Action::Wire { request, .. } = &action else {
+        unreachable!("built as a wire action");
+    };
+    assert!(request.is_mutation());
+}
+
 /// A connection's own answer channel, with the end that reads it.
 ///
 /// Everything about a plugin folder is answered *later*, on this channel,

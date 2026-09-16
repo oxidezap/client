@@ -89,6 +89,17 @@ impl MessageKind {
         }
     }
 
+    /// The database labels whose content carries an attachment.
+    ///
+    /// A SQL fragment's worth of vocabulary, written beside [`Self::as_str`]
+    /// so the two cannot drift: `has_media` filtering happens in the FTS
+    /// query, where the rows the caller asked for are chosen before the limit
+    /// applies, and a label added here without a matching `as_str` arm would
+    /// be a filter that silently misses.
+    pub(crate) const MEDIA_LABELS: &'static [&'static str] = &[
+        "image", "video", "ptv", "audio", "ptt", "sticker", "document",
+    ];
+
     pub(crate) fn from_db(label: String) -> Self {
         match label.as_str() {
             "text" => Self::Text,
