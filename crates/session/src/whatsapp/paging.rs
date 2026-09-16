@@ -258,6 +258,37 @@ impl WhatsAppClient {
         })
     }
 
+    /// Fetch one chat by JID, hydrated like a chat-list row.
+    pub fn get_chat(&self, jid: String) -> Task<Result<Option<Chat>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let chat: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
+            let entry = live
+                .chat_store
+                .chat(&chat)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?;
+            match entry {
+                None => Ok(None),
+                Some(entry) => {
+                    let mut chats = Self::hydrate_entries(
+                        &live.chat_store,
+                        &live.client,
+                        &live.names,
+                        vec![entry],
+                        Self::attach_page,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    Ok(chats.pop())
+                }
+            }
+        })
+    }
+
     /// Fetch contacts from the local contact store.
     pub fn load_contacts(
         &self,
@@ -342,6 +373,7 @@ impl WhatsAppClient {
         &self,
         after: Option<String>,
         limit: i64,
+        include_archived: bool,
     ) -> Task<Result<Page<oxidezap_core::Chat>, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
@@ -355,7 +387,7 @@ impl WhatsAppClient {
 
             let limit = limit.clamp(1, Self::CHAT_PAGE);
             let entries = store
-                .chats_page(false, after, limit)
+                .chats_page(include_archived, after, limit)
                 .await
                 .map_err(|e| e.to_string())?;
             // Off the page as it was read, before the aliases below join it:

@@ -13,6 +13,10 @@ mod durability;
 
 /// Who is in a group, for the surfaces that name them.
 mod groups;
+/// Mutations a front end asks the account to perform.
+mod mutations;
+/// Sends a scriptable front end asks for, read from daemon-local paths.
+mod sends;
 
 /// Store rows read back as the chats a front end draws.
 mod history;

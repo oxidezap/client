@@ -1144,3 +1144,147 @@ async fn wire_hello_and_diagnostics_flow() {
     // out_of_band returns None for frame because the bridge responds directly via outbox
     assert!(ans.frame.is_none());
 }
+
+/// One wire request reaches the session bridge as an [`Action::Wire`].
+async fn assert_wire_routed(
+    hub: &Arc<StateHub>,
+    plugins: &Arc<oxidezap_plugin_host::Plugins>,
+    request: oxidezap_wire::request::ClientRequest,
+) {
+    use oxidezap_wire::envelope::RequestEnvelope;
+
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let env = RequestEnvelope {
+        id: 11,
+        request: request.clone(),
+    };
+    let ans = handle_wire_request(env, hub, plugins, &commands, &outbox()).await;
+    assert!(
+        ans.frame.is_none(),
+        "expected out-of-band dispatch for {request:?}"
+    );
+    match taken.await.unwrap() {
+        Some(Action::Wire { request: got, .. }) => assert_eq!(got, request),
+        other => panic!("expected an Action::Wire, got {other:?}"),
+    }
+}
+
+/// The Phase 4 surface reaches the session instead of being refused as
+/// unsupported: sends, chat mutations, presence and single-chat reads.
+#[tokio::test]
+async fn wire_phase4_requests_reach_the_session() {
+    use oxidezap_wire::dto::PresenceState;
+    use oxidezap_wire::request::ClientRequest as WireRequest;
+
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    let chat = "559900000001@s.whatsapp.net".to_string();
+
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SendText {
+            to: chat.clone(),
+            message: "oi".into(),
+            reply_to: None,
+            mentions: vec![],
+            enqueue_only: false,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SendReaction {
+            chat_jid: chat.clone(),
+            message_id: "3EB0A".into(),
+            emoji: "👍".into(),
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SendMedia {
+            to: chat.clone(),
+            file_path: "/tmp/foto.jpg".into(),
+            caption: None,
+            mime_type: None,
+            as_document: false,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SendAudio {
+            to: chat.clone(),
+            file_path: "/tmp/audio.ogg".into(),
+            ptt: true,
+        },
+    )
+    .await;
+    assert_wire_routed(&hub, &plugins, WireRequest::GetChat { jid: chat.clone() }).await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::MarkRead {
+            chat_jid: chat.clone(),
+            through_message_id: None,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::MarkUnread {
+            chat_jid: chat.clone(),
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::PinChat {
+            chat_jid: chat.clone(),
+            pin: true,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::MuteChat {
+            chat_jid: chat.clone(),
+            mute_duration_seconds: None,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::ArchiveChat {
+            chat_jid: chat.clone(),
+            archive: true,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SetPresence {
+            chat_jid: Some(chat.clone()),
+            state: PresenceState::Recording,
+        },
+    )
+    .await;
+    assert_wire_routed(
+        &hub,
+        &plugins,
+        WireRequest::SetPresence {
+            chat_jid: None,
+            state: PresenceState::Available,
+        },
+    )
+    .await;
+}

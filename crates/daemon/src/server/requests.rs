@@ -777,6 +777,17 @@ pub(super) async fn handle_wire_request(
         | WireRequest::SearchMessages { .. }
         | WireRequest::ListContacts { .. }
         | WireRequest::ListChats { .. }
+        | WireRequest::GetChat { .. }
+        | WireRequest::SendText { .. }
+        | WireRequest::SendMedia { .. }
+        | WireRequest::SendAudio { .. }
+        | WireRequest::SendReaction { .. }
+        | WireRequest::MarkRead { .. }
+        | WireRequest::MarkUnread { .. }
+        | WireRequest::PinChat { .. }
+        | WireRequest::MuteChat { .. }
+        | WireRequest::ArchiveChat { .. }
+        | WireRequest::SetPresence { .. }
         | WireRequest::ListCalls { .. } => {
             out_of_band_wire(hub, commands, outbox, id, request).await
         }
