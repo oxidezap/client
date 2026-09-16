@@ -17,6 +17,9 @@ fixtures = []
 
 [dependencies]
 async-trait = { workspace = true }
+# Local account ids are minted from OS randomness; `wasm_js` is the backend
+# the web build needs, additive and harmless on the host.
+getrandom = { workspace = true }
 # Only for the call-state transitions, which refuse a second offer and say so.
 log = { workspace = true }
 # `serde` on chrono: message and chat timestamps cross the daemon socket.
