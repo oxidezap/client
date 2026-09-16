@@ -15,6 +15,8 @@ mod durability;
 mod groups;
 /// Mutations a front end asks the account to perform.
 mod mutations;
+/// Polls, profiles, contacts, channels, media fetch and history coverage.
+mod ops;
 /// Sends a scriptable front end asks for, read from daemon-local paths.
 mod sends;
 
@@ -51,6 +53,11 @@ pub use ui_queue::{Receiver as UiEventReceiver, TryRecvError as UiEventTryRecvEr
 
 /// How far back a read receipt reaches: the last row a front end was shown,
 /// and the ids it is bounded by. Written in `paging`, beside the cursors.
+pub use groups::{
+    GroupDetails, GroupListEntry, GroupParticipantView, JoinGroupView, JoinRequestView,
+    ParticipantChange,
+};
+pub use ops::{ChannelView, ContactCheckView, HistoryCoverage, PollView, ProfileView};
 pub use outgoing::OutgoingFile;
 pub use paging::ReadBoundary;
 

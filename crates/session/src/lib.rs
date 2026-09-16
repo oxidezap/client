@@ -19,6 +19,8 @@ pub use whatsapp::{OutgoingAcceptCase, outgoing_accept_events};
 
 pub use exec::{Cancelled, Task, sleep, spawn, unblock, with_timeout};
 pub use whatsapp::{
-    OutgoingFile, ReadBoundary, UiEventReceiver, UiEventTryRecvError, WhatsAppClient,
-    prepare_store, resolve_database_path, wipe_local_state,
+    ChannelView, ContactCheckView, GroupDetails, GroupListEntry, GroupParticipantView,
+    HistoryCoverage, JoinGroupView, JoinRequestView, OutgoingFile, ParticipantChange, PollView,
+    ProfileView, ReadBoundary, UiEventReceiver, UiEventTryRecvError, WhatsAppClient, prepare_store,
+    resolve_database_path, wipe_local_state,
 };

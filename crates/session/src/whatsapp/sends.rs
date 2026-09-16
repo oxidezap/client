@@ -234,6 +234,69 @@ impl WhatsAppClient {
             }
         })
     }
+
+    /// Send a WebP sticker read from a daemon-local path.
+    pub fn send_sticker_from_path(
+        &self,
+        to: String,
+        file_path: String,
+    ) -> Task<Result<SentReceipt, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let chat: Jid = to.parse().map_err(|_| "not a chat address".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let path = std::path::PathBuf::from(&file_path);
+            let data = crate::exec::unblock(move || std::fs::read(&path))
+                .await
+                .map_err(|e| format!("the send could not start: {e}"))?
+                .map_err(|e| format!("could not read {file_path}: {e}"))?;
+            if data.is_empty() {
+                return Err(format!("{file_path} is empty"));
+            }
+            let client = &live.client;
+            let upload = match client
+                .upload(
+                    data,
+                    whatsapp_rust::wacore::download::MediaType::Sticker,
+                    Default::default(),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(e) => return Err(e.to_string()),
+            };
+            let message = wa::Message {
+                sticker_message: whatsapp_rust::buffa::MessageField::some(
+                    wa::message::StickerMessage {
+                        url: Some(upload.url),
+                        direct_path: Some(upload.direct_path),
+                        media_key: Some(upload.media_key.to_vec()),
+                        file_sha256: Some(upload.file_sha256.to_vec()),
+                        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                        file_length: Some(upload.file_length),
+                        mimetype: Some("image/webp".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            };
+            let msg_id = client.generate_message_id();
+            super::record_outgoing(&live.chat_store, &chat, &msg_id, &message);
+            let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
+            match client
+                .send_message_with_options(chat.clone(), message, options)
+                .await
+            {
+                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Err(e) => {
+                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    Err(e.to_string())
+                }
+            }
+        })
+    }
 }
 
 /// The quote behind a reply id, read from the store.

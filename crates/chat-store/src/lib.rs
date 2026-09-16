@@ -43,6 +43,6 @@ pub use error::{ChatStoreError, Result, db_err};
 pub use materialize::is_control_only;
 pub use store::ChatStore;
 pub use types::{
-    ArrivalCursor, ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind,
-    MessageStatus, ReactionEntry, ReceiptEntry, StoreChange, StoredMessage,
+    ArrivalCursor, ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCoverage, MessageCursor,
+    MessageKind, MessageStatus, ReactionEntry, ReceiptEntry, StoreChange, StoredMessage,
 };

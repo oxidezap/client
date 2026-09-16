@@ -14,8 +14,8 @@ use crate::error::{ChatStoreError, Result, db_err};
 use crate::schema;
 use crate::store::ChatStore;
 use crate::types::{
-    ArrivalCursor, ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind,
-    MessageStatus, ReactionEntry, ReceiptEntry, StoredMessage,
+    ArrivalCursor, ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCoverage, MessageCursor,
+    MessageKind, MessageStatus, ReactionEntry, ReceiptEntry, StoredMessage,
 };
 
 /// How many keys one batched lookup may bind at a time.
@@ -54,6 +54,85 @@ type ContactRow = (
 );
 
 type MediaRefRow = (Vec<u8>, String, Option<String>, Option<i64>, i64);
+
+/// Labels for these stored contact keys, in one read.
+fn labels_for(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    jids: &[String],
+) -> std::result::Result<
+    HashMap<String, (Option<String>, Vec<String>)>,
+    wacore::store::error::StoreError,
+> {
+    use schema::contact_labels::dsl;
+    let mut out = HashMap::new();
+    for page in jids.chunks(BIND_CHUNK) {
+        let rows: Vec<(String, Option<String>, String)> = dsl::contact_labels
+            .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq_any(page)))
+            .select((dsl::jid, dsl::alias, dsl::tags))
+            .load(conn)
+            .map_err(db_err)?;
+        for (jid, alias, tags) in rows {
+            out.insert(jid, (alias, decode_tags(&tags)));
+        }
+    }
+    Ok(out)
+}
+
+/// One contact's labels inside a transaction: the stored row, or blank.
+fn read_labels(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    jid: &str,
+) -> std::result::Result<(Option<String>, Vec<String>), wacore::store::error::StoreError> {
+    use schema::contact_labels::dsl;
+    let current: Option<(Option<String>, String)> = dsl::contact_labels
+        .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid)))
+        .select((dsl::alias, dsl::tags))
+        .first(conn)
+        .optional()
+        .map_err(db_err)?;
+    Ok(match current {
+        Some((alias, tags)) => (alias, decode_tags(&tags)),
+        None => (None, Vec::new()),
+    })
+}
+
+/// Upsert one contact's labels inside a transaction.
+fn write_labels(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    jid: &str,
+    labels: &(Option<String>, Vec<String>),
+) -> std::result::Result<(), wacore::store::error::StoreError> {
+    use schema::contact_labels::dsl;
+    let tags = serde_json::to_string(&labels.1).unwrap_or_else(|_| "[]".into());
+    diesel::insert_into(dsl::contact_labels)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::jid.eq(jid),
+            dsl::alias.eq(&labels.0),
+            dsl::tags.eq(&tags),
+        ))
+        .on_conflict((dsl::device_id, dsl::jid))
+        .do_update()
+        .set((dsl::alias.eq(&labels.0), dsl::tags.eq(&tags)))
+        .execute(conn)
+        .map(|_| ())
+        .map_err(db_err)
+}
+
+/// Tags as stored: a JSON array, with a lenient fallback for rows written by
+/// anything else.
+fn decode_tags(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_else(|_| {
+        if raw.is_empty() {
+            Vec::new()
+        } else {
+            vec![raw.to_string()]
+        }
+    })
+}
 
 /// Parse a stored JID column; empty (own history messages with no participant)
 /// maps to the default JID rather than an error.
@@ -914,10 +993,10 @@ impl ChatStore {
         // Bare key, matching how the writers file contacts: a caller holding a
         // message's `sender` has the device on it.
         let jid_str = jid.to_non_ad_string();
-        let row: Option<ContactRow> = self
+        let row: Option<(ContactRow, Option<(Option<String>, Vec<String>)>)> = self
             .db()
             .read(move |conn| {
-                dsl::contacts
+                let row: Option<ContactRow> = dsl::contacts
                     .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(&jid_str)))
                     .select((
                         dsl::jid,
@@ -928,16 +1007,28 @@ impl ChatStore {
                     ))
                     .first(conn)
                     .optional()
-                    .map_err(db_err)
+                    .map_err(db_err)?;
+                let labels = match &row {
+                    Some((jid, _, _, _, _)) => {
+                        labels_for(conn, device_id, &[jid.clone()])?.remove(jid)
+                    }
+                    None => None,
+                };
+                Ok(row.map(|row| (row, labels)))
             })
             .await?;
         Ok(row.map(
-            |(jid, push_name, full_name, first_name, business_name)| ContactEntry {
-                jid: parse_jid(&jid),
-                push_name,
-                full_name,
-                first_name,
-                business_name,
+            |((jid, push_name, full_name, first_name, business_name), labels)| {
+                let (alias, tags) = labels.unwrap_or((None, Vec::new()));
+                ContactEntry {
+                    jid: parse_jid(&jid),
+                    push_name,
+                    full_name,
+                    first_name,
+                    business_name,
+                    alias,
+                    tags,
+                }
             },
         ))
     }
@@ -945,7 +1036,10 @@ impl ChatStore {
     pub async fn contacts(&self, query: Option<String>, limit: i64) -> Result<Vec<ContactEntry>> {
         use schema::contacts::dsl;
         let device_id = self.device_id();
-        let rows: Vec<ContactRow> = self
+        let rows: (
+            Vec<ContactRow>,
+            HashMap<String, (Option<String>, Vec<String>)>,
+        ) = self
             .db()
             .read(move |conn| {
                 let mut q = dsl::contacts
@@ -961,30 +1055,96 @@ impl ChatStore {
                             .or(dsl::business_name.like(pattern)),
                     );
                 }
-                q.select((
-                    dsl::jid,
-                    dsl::push_name,
-                    dsl::full_name,
-                    dsl::first_name,
-                    dsl::business_name,
-                ))
-                .limit(limit)
-                .load(conn)
-                .map_err(db_err)
+                let rows: Vec<ContactRow> = q
+                    .select((
+                        dsl::jid,
+                        dsl::push_name,
+                        dsl::full_name,
+                        dsl::first_name,
+                        dsl::business_name,
+                    ))
+                    .limit(limit)
+                    .load(conn)
+                    .map_err(db_err)?;
+                let keys: Vec<String> = rows.iter().map(|(jid, _, _, _, _)| jid.clone()).collect();
+                let labels = labels_for(conn, device_id, &keys)?;
+                Ok((rows, labels))
             })
             .await?;
+        let (rows, labels) = rows;
         Ok(rows
             .into_iter()
-            .map(
-                |(jid, push_name, full_name, first_name, business_name)| ContactEntry {
+            .map(|(jid, push_name, full_name, first_name, business_name)| {
+                let (alias, tags) = labels.get(&jid).cloned().unwrap_or((None, Vec::new()));
+                ContactEntry {
                     jid: parse_jid(&jid),
                     push_name,
                     full_name,
                     first_name,
                     business_name,
-                },
-            )
+                    alias,
+                    tags,
+                }
+            })
             .collect())
+    }
+
+    /// Set (or clear, with `None`) a contact's device-local alias.
+    pub async fn set_contact_alias(&self, jid: &Jid, alias: Option<String>) -> Result<()> {
+        use schema::contact_labels::dsl;
+        let device_id = self.device_id();
+        let jid = jid.to_non_ad_string();
+        self.db()
+            .run(move |conn| {
+                diesel::insert_into(dsl::contact_labels)
+                    .values((
+                        dsl::device_id.eq(device_id),
+                        dsl::jid.eq(&jid),
+                        dsl::alias.eq(&alias),
+                        dsl::tags.eq("[]"),
+                    ))
+                    .on_conflict((dsl::device_id, dsl::jid))
+                    .do_update()
+                    .set(dsl::alias.eq(&alias))
+                    .execute(conn)
+                    .map(|_| ())
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Add a device-local tag to a contact. Idempotent.
+    pub async fn tag_contact(&self, jid: &Jid, tag: String) -> Result<()> {
+        use schema::contact_labels::dsl;
+        let device_id = self.device_id();
+        let jid = jid.to_non_ad_string();
+        self.db()
+            .run(move |conn| {
+                let mut labels = read_labels(conn, device_id, &jid)?;
+                if !labels.1.contains(&tag) {
+                    labels.1.push(tag);
+                }
+                write_labels(conn, device_id, &jid, &labels)
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Remove a device-local tag from a contact. Idempotent.
+    pub async fn untag_contact(&self, jid: &Jid, tag: &str) -> Result<()> {
+        use schema::contact_labels::dsl;
+        let device_id = self.device_id();
+        let jid = jid.to_non_ad_string();
+        let tag = tag.to_string();
+        self.db()
+            .run(move |conn| {
+                let mut labels = read_labels(conn, device_id, &jid)?;
+                labels.1.retain(|t| *t != tag);
+                write_labels(conn, device_id, &jid, &labels)
+            })
+            .await?;
+        Ok(())
     }
 
     /// Sum of positive unread counters (ignores "marked unread" sentinels).
@@ -1073,6 +1233,207 @@ impl ChatStore {
                 downloaded_at: ms_to_utc(downloaded_at_ms).unwrap_or_default(),
             },
         ))
+    }
+
+    /// Starred messages across every chat, newest first.
+    pub async fn starred_messages(&self, limit: i64) -> Result<Vec<StoredMessage>> {
+        use schema::messages::dsl;
+        let device_id = self.device_id();
+        let rows: Vec<MessageRow> = self
+            .db()
+            .read(move |conn| {
+                dsl::messages
+                    .filter(dsl::device_id.eq(device_id).and(dsl::starred.eq(true)))
+                    .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+                    .limit(limit.max(0))
+                    .load(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Poll creation messages, optionally scoped to one chat, newest first.
+    ///
+    /// The rows carry the creation proto votes were cast against; tallies
+    /// live in the vote messages, not here.
+    pub async fn poll_messages(
+        &self,
+        chat: Option<&Jid>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        use schema::messages::dsl;
+        let device_id = self.device_id();
+        let chat = chat.map(ToString::to_string);
+        let rows: Vec<MessageRow> = self
+            .db()
+            .read(move |conn| {
+                let mut query = dsl::messages
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::kind.eq(MessageKind::Poll.as_str())),
+                    )
+                    .into_boxed();
+                if let Some(chat) = &chat {
+                    let keys =
+                        crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
+                    query = query.filter(dsl::chat_jid.eq_any(keys));
+                }
+                query
+                    .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+                    .limit(limit.max(0))
+                    .load(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// How much history the store holds, per chat or account-wide.
+    pub async fn message_coverage(&self, chat: Option<&Jid>) -> Result<MessageCoverage> {
+        use schema::messages::dsl;
+        let device_id = self.device_id();
+        let chat = chat.map(ToString::to_string);
+        let (count, oldest, newest): (i64, Option<i64>, Option<i64>) = self
+            .db()
+            .read(move |conn| {
+                let mut query = dsl::messages
+                    .filter(dsl::device_id.eq(device_id))
+                    .into_boxed();
+                if let Some(chat) = &chat {
+                    let keys =
+                        crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
+                    query = query.filter(dsl::chat_jid.eq_any(keys));
+                }
+                query
+                    .select((
+                        diesel::dsl::count_star(),
+                        diesel::dsl::min(dsl::timestamp_ms),
+                        diesel::dsl::max(dsl::timestamp_ms),
+                    ))
+                    .first(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(MessageCoverage {
+            stored_count: count.max(0) as u64,
+            oldest_ms: oldest,
+            newest_ms: newest,
+        })
+    }
+
+    /// Drop the stored payload of revoked messages, keeping the tombstone row.
+    ///
+    /// The row stays so the timeline keeps its "message deleted" marker; only
+    /// the proto blob — the bytes nobody can render anymore — is released.
+    /// Returns how many rows were emptied.
+    pub async fn purge_revoked_payload(&self, chat: Option<&Jid>) -> Result<u64> {
+        use schema::messages::dsl;
+        let device_id = self.device_id();
+        let chat = chat.map(ToString::to_string);
+        let purged = self
+            .db()
+            .run(move |conn| {
+                let mut query = diesel::update(
+                    dsl::messages.filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::revoked.eq(true))
+                            .and(dsl::proto.is_not_null()),
+                    ),
+                )
+                .into_boxed();
+                if let Some(chat) = &chat {
+                    let keys =
+                        crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
+                    query = query.filter(dsl::chat_jid.eq_any(keys));
+                }
+                let purged = query
+                    .set(dsl::proto.eq(None::<Vec<u8>>))
+                    .execute(conn)
+                    .map(|n| n as u64)
+                    .map_err(db_err)?;
+                Ok(purged)
+            })
+            .await?;
+        Ok(purged)
+    }
+
+    /// Messages carrying media, optionally scoped to one chat, newest first.
+    ///
+    /// Whether the bytes are already on disk is the media cache's to say, not
+    /// the row's: this names the candidates a backfill downloads.
+    pub async fn pending_media_messages(
+        &self,
+        chat: Option<&Jid>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        use schema::messages::dsl;
+        let device_id = self.device_id();
+        let chat = chat.map(ToString::to_string);
+        let kinds = [
+            MessageKind::Image.as_str(),
+            MessageKind::Video.as_str(),
+            MessageKind::VideoNote.as_str(),
+            MessageKind::Audio.as_str(),
+            MessageKind::VoiceNote.as_str(),
+            MessageKind::Document.as_str(),
+            MessageKind::Sticker.as_str(),
+        ];
+        let rows: Vec<MessageRow> = self
+            .db()
+            .read(move |conn| {
+                let mut query = dsl::messages
+                    .filter(dsl::device_id.eq(device_id).and(dsl::kind.eq_any(kinds)))
+                    .into_boxed();
+                if let Some(chat) = &chat {
+                    let keys =
+                        crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
+                    query = query.filter(dsl::chat_jid.eq_any(keys));
+                }
+                query
+                    .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+                    .limit(limit.max(0))
+                    .load(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Delete chat rows that hold no messages. Returns how many were removed.
+    ///
+    /// Empty rows accumulate from notifications about chats whose history
+    /// never materialized; dropping them is what `chats cleanup` and group
+    /// pruning both mean on this side.
+    pub async fn cleanup_empty_chats(&self) -> Result<u64> {
+        use schema::chats::dsl as chats;
+        use schema::messages::dsl as messages;
+        let device_id = self.device_id();
+        let removed = self
+            .db()
+            .run(move |conn| {
+                let removed = diesel::delete(
+                    chats::chats.filter(
+                        chats::device_id
+                            .eq(device_id)
+                            .and(diesel::dsl::not(diesel::dsl::exists(
+                                messages::messages.filter(
+                                    messages::device_id
+                                        .eq(device_id)
+                                        .and(messages::chat_jid.eq(chats::jid)),
+                                ),
+                            ))),
+                    ),
+                )
+                .execute(conn)
+                .map(|n| n as u64)
+                .map_err(db_err)?;
+                Ok(removed)
+            })
+            .await?;
+        Ok(removed)
     }
 }
 
