@@ -500,6 +500,20 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
+        // Later migrations stay reversible: the labels table holds
+        // device-local metadata with no source to re-read it from, and its
+        // down migration says exactly that. Revert it first, so what is
+        // tested below is the sender-identity migration itself.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("revert the reversible labels migration");
+
         let error = store
             .shared()
             .run(|conn| {
