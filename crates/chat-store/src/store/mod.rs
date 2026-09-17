@@ -288,7 +288,9 @@ impl ChatStore {
     /// This has no account-local side effects: migrations and the FTS schema
     /// belong to the physical database, while rows remain scoped by the
     /// `device_id` carried by each store. Callers starting several runtimes
-    /// should await this once, then use [`Self::new`] for each device.
+    /// should await this once, then use [`Self::new_prepared`] for each device:
+    /// [`Self::new`] calls this again, so using it per device would re-enter
+    /// the migration runner once per account.
     pub async fn prepare(store: &SqliteStore) -> Result<()> {
         let db = store.shared();
         db.run(|conn| {

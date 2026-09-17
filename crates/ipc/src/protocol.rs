@@ -387,7 +387,13 @@ pub enum DaemonMessage {
     /// [`ClientRequest::StorageUsage`].
     Storage {
         id: RequestId,
-        /// The store: the database and its journal files.
+        /// The shared store: the database and its journal files.
+        ///
+        /// Every local account shares one file keyed by `device_id`, and
+        /// SQLite exposes no per-account size without the `dbstat` module this
+        /// build trims, so this is the whole store rather than one account's
+        /// share of it. A front end must not label it as this account's alone;
+        /// the media numbers below *are* account-scoped.
         database_bytes: u64,
         /// The media cache: photos, video, audio and documents.
         media_bytes: u64,

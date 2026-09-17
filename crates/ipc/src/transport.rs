@@ -429,7 +429,7 @@ pub const ACCOUNT_STAGED_INFIX: &str = "-u-";
 /// either the global namespace or an account's.
 #[must_use]
 pub fn is_staged_key(key: &str) -> bool {
-    key.starts_with(STAGED_PREFIX) || account_staged_prefix_of(key).is_some()
+    key.starts_with(STAGED_PREFIX) || is_account_staged_key(key)
 }
 
 /// Whether this key names a *daemon-global* staged payload, as opposed to one
@@ -441,7 +441,34 @@ pub fn is_staged_key(key: &str) -> bool {
 /// catalog.
 #[must_use]
 pub fn is_global_staged_key(key: &str) -> bool {
-    key.starts_with(STAGED_PREFIX) && account_staged_prefix_of(key).is_none()
+    key.starts_with(STAGED_PREFIX) && !is_account_staged_key(key)
+}
+
+/// Whether this key is an account's staged payload (`a<id>-u-...`).
+///
+/// The account id itself is not returned here, and this deliberately does not
+/// need [`oxidezap_core::AccountId`]: the predicates above are used by every
+/// consumer of this crate, including the CLI, which must not pull the domain
+/// crate in. The typed form is [`account_staged_prefix_of`].
+#[must_use]
+pub fn is_account_staged_key(key: &str) -> bool {
+    account_staged_local(key).is_some()
+}
+
+/// The local name of an account-staged key, `u-<name>` from `a<id>-u-<name>`.
+///
+/// The account part is the one `a<digits>-` namespace every account key shares,
+/// and this is one only when the local name right after it starts with the
+/// staged `u-`. That distinction keeps a durable `a1-f-...` key whose message
+/// id happens to contain `-u-` — the alphabet is not restricted — from reading
+/// as a staged payload.
+fn account_staged_local(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix('a')?;
+    let (digits, local) = rest.split_once('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    local.starts_with(STAGED_PREFIX).then_some(local)
 }
 
 /// The key a global staged payload is filed under.
@@ -456,12 +483,14 @@ pub fn staged_key(name: &str) -> String {
 /// The key an account's staged payload is filed under: `a<id>-u-<name>`.
 ///
 /// See [`STAGED_PREFIX`] for why an account's send payload is not global.
+#[cfg(feature = "legacy-protocol")]
 #[must_use]
 pub fn account_staged_key(account: oxidezap_core::AccountId, name: &str) -> String {
     format!("{}{name}", account_staged_prefix(account))
 }
 
 /// The prefix every one of `account`'s staged payloads carries.
+#[cfg(feature = "legacy-protocol")]
 #[must_use]
 pub fn account_staged_prefix(account: oxidezap_core::AccountId) -> String {
     format!("a{}{ACCOUNT_STAGED_INFIX}", account.get())
@@ -500,21 +529,14 @@ pub fn key_local_name(key: &str) -> &str {
 ///
 /// Parsed rather than trusted: the key is a name a peer chose, and the send
 /// path is what has to decide whether it belongs to the account being asked
-/// to send.
-///
-/// The account part is the one `a<digits>-` namespace every account key
-/// shares, and this is one only when the local name right after it is the
-/// staged `u-`. That distinction is what keeps a durable `a1-f-...` key whose
-/// message id happens to contain `-u-` — the alphabet is not restricted —
-/// from being read as a staged payload.
+/// to send. The shape rule lives in [`account_staged_local`]; this only wraps
+/// the parsed id, and is gated on `legacy-protocol` because
+/// [`oxidezap_core::AccountId`] is.
+#[cfg(feature = "legacy-protocol")]
 #[must_use]
 pub fn account_staged_prefix_of(key: &str) -> Option<oxidezap_core::AccountId> {
-    let rest = key.strip_prefix('a')?;
-    let (digits, local) = rest.split_once('-')?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    local.starts_with(STAGED_PREFIX).then_some(())?;
+    account_staged_local(key)?;
+    let digits = key.strip_prefix('a')?.split_once('-')?.0;
     digits
         .parse::<i32>()
         .ok()

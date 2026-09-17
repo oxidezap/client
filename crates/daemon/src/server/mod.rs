@@ -505,6 +505,21 @@ where
                         }
                     };
 
+                    // A hello is the opening frame and only that. Told apart
+                    // from the plane fallback below so a client that sends a
+                    // second one is answered about the mistake it made rather
+                    // than handed a plane it never asked for.
+                    if matches!(request.request, ClientRequest::Hello { .. }) {
+                        let frame = error_frame(
+                            request.id,
+                            ProtocolError::Refused {
+                                detail: "a hello is only valid as the first frame".to_string(),
+                            },
+                        )?;
+                        write_line(&mut writer, &frame).await?;
+                        continue;
+                    }
+
                     if request.request.is_control_request()
                         || !request.request.is_account_request()
                     {
@@ -563,10 +578,13 @@ where
 
 /// Serve the control plane without subscribing to any account state.
 ///
-/// The control plane can already list the registry and expose the lifecycle
-/// requests on the wire. Mutating lifecycle requests remain refused until WR-1
-/// supplies the upstream device-row API; refusing them here is safer than
-/// opening the wrong store or deleting the shared database.
+/// The control plane lists the registry and carries the account lifecycle:
+/// `CreateAccount` allocates and spawns through the supervisor, and
+/// `ResetAccount`/`RemoveAccount` dispatch the same teardown self-service uses
+/// to the named account's command channel. A lifecycle request is only refused
+/// when the registry has no supervisor attached — `embedded.rs` and the web
+/// host, which build their one runtime by hand — and a request that is control
+/// but not one of these is refused with its own message rather than acted on.
 async fn serve_control_client<S>(
     mut reader: BufReader<ReadHalf<S>>,
     mut writer: WriteHalf<S>,
@@ -602,7 +620,17 @@ where
                         }
                     };
                     let id = request.id;
+                    // A hello opened this connection; a second one is not a
+                    // request this plane can answer as if it were ordinary
+                    // control traffic, so it is refused for what it is before
+                    // the plane match below.
                     let response = match request.request {
+                        ClientRequest::Hello { .. } => Some(error_frame(
+                            id,
+                            ProtocolError::Refused {
+                                detail: "a hello is only valid as the first frame".to_string(),
+                            },
+                        )?),
                         ClientRequest::ListAccounts => Some(match id {
                             Some(id) => serde_json::to_string(&DaemonMessage::Accounts {
                                 id,

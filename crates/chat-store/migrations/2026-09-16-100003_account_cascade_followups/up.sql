@@ -10,6 +10,11 @@
 -- SQLite cannot add a constraint to an existing table, so both are rebuilt the
 -- way the older cascade migration rebuilt its six. `device_id` is already the
 -- account key, so no data changes; the constraint is what changes.
+--
+-- Only rows whose `device_id` still names a `device` are copied. The new
+-- constraint is enforced inside this migration's own transaction, so an
+-- orphaned row would abort the upgrade; and an orphan is unreadable anyway,
+-- since every query joins the account it belongs to.
 CREATE TABLE avatar_descriptors_new (
     device_id       INTEGER NOT NULL,
     jid             TEXT NOT NULL,
@@ -22,8 +27,9 @@ CREATE TABLE avatar_descriptors_new (
 );
 INSERT INTO avatar_descriptors_new
     (device_id, jid, picture_id, cache_key, updated_at_ms, seq)
-SELECT device_id, jid, picture_id, cache_key, updated_at_ms, seq
-FROM avatar_descriptors;
+SELECT a.device_id, a.jid, a.picture_id, a.cache_key, a.updated_at_ms, a.seq
+FROM avatar_descriptors a
+WHERE EXISTS (SELECT 1 FROM device d WHERE d.id = a.device_id);
 DROP TABLE avatar_descriptors;
 ALTER TABLE avatar_descriptors_new RENAME TO avatar_descriptors;
 
@@ -36,7 +42,8 @@ CREATE TABLE contact_labels_new (
     FOREIGN KEY (device_id) REFERENCES device(id) ON DELETE CASCADE
 );
 INSERT INTO contact_labels_new (device_id, jid, alias, tags)
-SELECT device_id, jid, alias, tags
-FROM contact_labels;
+SELECT c.device_id, c.jid, c.alias, c.tags
+FROM contact_labels c
+WHERE EXISTS (SELECT 1 FROM device d WHERE d.id = c.device_id);
 DROP TABLE contact_labels;
 ALTER TABLE contact_labels_new RENAME TO contact_labels;

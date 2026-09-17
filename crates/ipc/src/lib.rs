@@ -60,8 +60,10 @@ pub use protocol::{
 };
 pub use transport::{
     ACCOUNT_STAGED_INFIX, DEFAULT_WEB_PORT, MAX_STAGED_BYTES, PROTOCOL_VERSION, STAGED_PREFIX,
-    WEB_MEDIA_PATH, WEB_SOCKET_PATH, account_id, account_prefix_of, account_sockets,
-    account_staged_key, account_staged_prefix, account_staged_prefix_of, endpoint_path,
-    endpoint_path_for_account, is_global_staged_key, is_staged_key, key_local_name, lock_path,
-    media_dir, media_path, staged_key, state_dir, web_token_path,
+    WEB_MEDIA_PATH, WEB_SOCKET_PATH, account_id, account_prefix_of, account_sockets, endpoint_path,
+    endpoint_path_for_account, is_account_staged_key, is_global_staged_key, is_staged_key,
+    key_local_name, lock_path, media_dir, media_path, staged_key, state_dir, web_token_path,
 };
+// The `AccountId`-shaped helpers, gated with the domain crate they name.
+#[cfg(feature = "legacy-protocol")]
+pub use transport::{account_staged_key, account_staged_prefix, account_staged_prefix_of};

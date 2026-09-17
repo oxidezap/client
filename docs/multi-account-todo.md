@@ -1,7 +1,8 @@
 # Multi-account V2 — TODO
 
-Fonte de requisitos: `multi-account-plan-v2.md` (handoff em `/home/jlucaso/Downloads`,
-mantido em paralelo a este arquivo — atualizar os dois a cada marco).
+Fonte de requisitos: `multi-account-plan-v2.md`, o documento de handoff mantido
+em paralelo a este arquivo — atualizar os dois a cada marco. Ele não vive neste
+repositório; este arquivo é o resumo canônico do estado da implementação.
 A implementação usa **um `whatsapp.db` compartilhado**; `AccountId` é o `device.id`
 positivo desse banco. Não reintroduzir `accounts.json`, UUIDs, um DB por conta ou
 migração de arquivo.
@@ -74,12 +75,13 @@ abaixo para o diagnóstico completo.
 - [x] Servidor resolve `Account { account }` no `AccountRegistry`, recusa
       account id desconhecido e impede requests de control em conexões de conta
       e requests de conta em conexões de control.
-- [~] `CreateAccount`/`ResetAccount`/`RemoveAccount` estão presentes no wire
-      (`ClientRequest`) e a *storage* por trás deles já existe e está testada
-      (`StoreRegistry::create_account/reset_account/remove_account`), mas
-      `serve_control_client` ainda responde `Refused` para as três — falta o
-      "spawn/stop de runtime em tempo de execução" no daemon. Ver bloqueio
-      arquitetural atual, abaixo.
+- [x] `CreateAccount`/`ResetAccount`/`RemoveAccount` respondem de verdade em
+      `serve_control_client`: a primeira passa pelo `AccountSupervisor`
+      (`create_and_spawn`, resposta `AccountCreated`) e as outras duas
+      despacham `Action::ForgetSession(disposition)` para o `Commands` da conta
+      alvo (resposta `Accepted`; id desconhecido responde `NoSession`). A
+      *storage* por trás (`StoreRegistry::create_account/reset_account/
+      remove_account`) já existia e está testada.
 - [x] Preparação única do schema do `chat-store`: `StoreRegistry` guarda um
       `OnceCell` compartilhado, `AccountRuntime`/`WhatsAppClient` recebem o
       mesmo `StoreRegistry` e cada runtime abre apenas seu próprio writer com
@@ -121,27 +123,24 @@ abaixo para o diagnóstico completo.
       antes só a forma `Reset` existia. Os dois call sites atuais
       (self-service "clear data and pair again" e seu teste) continuam
       passando `Reset`, comportamento idêntico ao anterior.
-- [x] **`AccountSupervisor` (nativo) implementado** em
+- [x] **`AccountSupervisor` (nativo) implementado e ligado** em
       `crates/daemon/src/account/mod.rs`: `spawn(id)` monta hub/plugins/
-      commands, registra e dá spawn no `run()` de uma conta — recursivo (um
-      respawn de `Reset` chama `spawn` de novo de dentro da tarefa que
-      `hold()` guarda), por isso retorna um `Pin<Box<dyn Future<...> +
-      Send>>` explícito em vez de um `async fn` comum, que não compila
-      recursivo (tamanho infinito). `spawn_with_hub(id, hub)` é a mesma
-      coisa para o bootstrap do `main.rs`, que no macOS precisa construir o
-      `StateHub` na thread principal antes do runtime assíncrono (a tray).
-      `hold()` drena o `run()` de uma conta e decide pelo `disposition()`:
-      `Reset` remove+respawna o mesmo id, `Remove` só remove,
-      nenhuma disposição (shutdown ou sessão que terminou sozinha) deixa a
-      runtime como o `run()` a deixou. `join_all()` drena todas as tarefas já
-      dadas spawn, incluindo as que um `Reset` adicionou depois do startup.
+      commands, registra e entrega a runtime ao reaper, que é o dono único do
+      `JoinSet` — a tarefa de cada conta só roda a sessão e devolve um
+      `AccountExit`, nunca chama `spawn` por dentro, o que elimina o deadlock
+      entre `join_all()` e um respawn de `Reset` e o stall que um `spawn` de
+      segunda conta sofria atrás de uma sessão longa. `spawn_with_hub(id, hub)`
+      serve o bootstrap do `main.rs`, que no macOS constrói o `StateHub` na
+      thread principal antes do runtime assíncrono (a tray). O reaper decide
+      pelo `AccountExit`, não pelo pedido: `ResetCompleted` remove+respawna o
+      mesmo id, `RemoveCompleted` só remove, `ResetIncomplete`/
+      `RemoveIncomplete` deixam a runtime intacta, `SessionEnded` recupera com
+      backoff e `SessionLoggedOut` deixa a conta para o usuário parear de novo.
       Gated `#[cfg(not(target_family = "wasm"))]`: `tokio::task::JoinSet`
       exige futures `Send`, e o host de plugin web é construído com closures
       `wasm-bindgen` deliberadamente `!Send` — `embedded.rs` continua com sua
       construção manual de uma conta só por esse motivo (item 8 do plano,
       supervisor `MaybeSend` próprio para web, ainda não feito).
-      **Ainda não conectado a `main.rs`/`serve_control_client`** — ver
-      "Bloqueio arquitetural atual" abaixo, que passa a ser só isso agora.
 - [x] **`DaemonMessage::AccountCreated { id, account }`** responde
       `ClientRequest::CreateAccount` no wire, nomeando o id que o daemon
       alocou — um cliente pode abrir uma conexão `Account`-scoped a ele

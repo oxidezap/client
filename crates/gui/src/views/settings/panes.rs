@@ -539,7 +539,11 @@ fn storage(
             card(
                 vec![
                     (
-                        "Messages and keys".to_string(),
+                        // The shared store: every local account lives in one
+                        // database file, and SQLite cannot report one account's
+                        // share of it. Said as the file it is rather than as
+                        // this account's private usage.
+                        "Message store (shared)".to_string(),
                         // Until the first answer arrives. The daemon measures,
                         // and it is another process: there is a frame or two
                         // where the honest thing to show is that nobody has

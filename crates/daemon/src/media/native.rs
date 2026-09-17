@@ -493,6 +493,15 @@ pub(super) fn delete_unscoped(scope: Wipe) -> Result<()> {
         if oxidezap_ipc::account_prefix_of(&name).is_some() {
             continue;
         }
+        // A bare staged key is the daemon's now, not this account's: plugin
+        // installation is global and reads `u-<name>` from whichever front end
+        // asked, so a legacy-account wipe must not take a payload another
+        // account's install is still going to consume. A pre-multi-account
+        // *send* payload shares the spelling and cannot be told apart, so it is
+        // left too and collected by age in `reclaim_abandoned_writes_in`.
+        if oxidezap_ipc::is_global_staged_key(&name) {
+            continue;
+        }
         if !scope.takes(&name) {
             continue;
         }

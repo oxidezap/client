@@ -5,6 +5,17 @@
 -- to an existing table with ALTER TABLE. The FTS virtual table is recreated by
 -- ChatStore::new after migrations, so remove its triggers before replacing
 -- messages.
+--
+-- Only rows whose `device_id` still names a `device` are carried across. The
+-- constraint is enforced inside the migration's own transaction, so an
+-- orphaned row -- a client table written for a device that was removed before
+-- this migration existed -- would abort the whole upgrade rather than being
+-- discarded. An orphan is unusable either way: nothing can read it without its
+-- device, and the cascade this migration adds would delete it on the first
+-- removal. Every `SELECT` below therefore joins the parent table.
+--
+-- The upstream device tables (`app_state_keys`, `identities`, ...) are purged
+-- by `remove_device` itself, so only these client-owned tables can be orphaned.
 
 DROP TRIGGER IF EXISTS messages_fts_ai;
 DROP TRIGGER IF EXISTS messages_fts_ad;
@@ -32,10 +43,11 @@ INSERT INTO chats_new
     (device_id, jid, name, last_message_ts, last_message_preview,
      last_message_kind, unread_count, pinned_at, muted_until, archived,
      ephemeral_expiration, read_boundary_ms, read_boundary_ids)
-SELECT device_id, jid, name, last_message_ts, last_message_preview,
-       last_message_kind, unread_count, pinned_at, muted_until, archived,
-       ephemeral_expiration, read_boundary_ms, read_boundary_ids
-FROM chats;
+SELECT c.device_id, c.jid, c.name, c.last_message_ts, c.last_message_preview,
+       c.last_message_kind, c.unread_count, c.pinned_at, c.muted_until, c.archived,
+       c.ephemeral_expiration, c.read_boundary_ms, c.read_boundary_ids
+FROM chats c
+WHERE EXISTS (SELECT 1 FROM device d WHERE d.id = c.device_id);
 DROP TABLE chats;
 ALTER TABLE chats_new RENAME TO chats;
 CREATE INDEX idx_chats_order ON chats (device_id, last_message_ts DESC, jid DESC);
@@ -62,9 +74,10 @@ CREATE TABLE messages_new (
 INSERT INTO messages_new
     (device_id, chat_jid, msg_id, sender_jid, from_me, timestamp_ms, kind,
      text_content, proto, status, starred, edited_at_ms, revoked)
-SELECT device_id, chat_jid, msg_id, sender_jid, from_me, timestamp_ms, kind,
-       text_content, proto, status, starred, edited_at_ms, revoked
-FROM messages;
+SELECT m.device_id, m.chat_jid, m.msg_id, m.sender_jid, m.from_me, m.timestamp_ms, m.kind,
+       m.text_content, m.proto, m.status, m.starred, m.edited_at_ms, m.revoked
+FROM messages m
+WHERE EXISTS (SELECT 1 FROM device d WHERE d.id = m.device_id);
 DROP TABLE messages;
 ALTER TABLE messages_new RENAME TO messages;
 CREATE INDEX idx_messages_chat_time
@@ -83,8 +96,9 @@ CREATE TABLE reactions_new (
 );
 INSERT INTO reactions_new
     (device_id, chat_jid, msg_id, sender_jid, emoji, ts_ms)
-SELECT device_id, chat_jid, msg_id, sender_jid, emoji, ts_ms
-FROM reactions;
+SELECT r.device_id, r.chat_jid, r.msg_id, r.sender_jid, r.emoji, r.ts_ms
+FROM reactions r
+WHERE EXISTS (SELECT 1 FROM device d WHERE d.id = r.device_id);
 DROP TABLE reactions;
 ALTER TABLE reactions_new RENAME TO reactions;
 
@@ -100,8 +114,9 @@ CREATE TABLE contacts_new (
 );
 INSERT INTO contacts_new
     (device_id, jid, push_name, full_name, first_name, business_name)
-SELECT device_id, jid, push_name, full_name, first_name, business_name
-FROM contacts;
+SELECT c.device_id, c.jid, c.push_name, c.full_name, c.first_name, c.business_name
+FROM contacts c
+WHERE EXISTS (SELECT 1 FROM device d WHERE d.id = c.device_id);
 DROP TABLE contacts;
 ALTER TABLE contacts_new RENAME TO contacts;
 
@@ -117,8 +132,9 @@ CREATE TABLE message_receipts_new (
 );
 INSERT INTO message_receipts_new
     (device_id, chat_jid, msg_id, user_jid, receipt_type, ts_ms)
-SELECT device_id, chat_jid, msg_id, user_jid, receipt_type, ts_ms
-FROM message_receipts;
+SELECT r.device_id, r.chat_jid, r.msg_id, r.user_jid, r.receipt_type, r.ts_ms
+FROM message_receipts r
+WHERE EXISTS (SELECT 1 FROM device d WHERE d.id = r.device_id);
 DROP TABLE message_receipts;
 ALTER TABLE message_receipts_new RENAME TO message_receipts;
 
@@ -134,7 +150,8 @@ CREATE TABLE media_refs_new (
 );
 INSERT INTO media_refs_new
     (device_id, file_sha256, file_path, mime_type, size_bytes, downloaded_at_ms)
-SELECT device_id, file_sha256, file_path, mime_type, size_bytes, downloaded_at_ms
-FROM media_refs;
+SELECT m.device_id, m.file_sha256, m.file_path, m.mime_type, m.size_bytes, m.downloaded_at_ms
+FROM media_refs m
+WHERE EXISTS (SELECT 1 FROM device d WHERE d.id = m.device_id);
 DROP TABLE media_refs;
 ALTER TABLE media_refs_new RENAME TO media_refs;

@@ -741,7 +741,12 @@ pub(super) async fn handle_wire_request(
             wire_ok(id, WireResponse::Doctor(doctor))
         }
         WireRequest::GetStorageUsage => {
-            let (media_bytes, media_files) = crate::media::cache_usage();
+            // Account-scoped, like the legacy storage query: the media cache is
+            // one shared directory, so the whole walk would bill this account
+            // for every other local account's downloads. The database is the
+            // one shared store, which is what `database_bytes` reports.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            let (media_bytes, media_files) = account_media.usage();
             let db_bytes = database_bytes();
             let storage = StorageDto {
                 database_bytes: db_bytes,
@@ -755,8 +760,14 @@ pub(super) async fn handle_wire_request(
             // replying `Ack` unconditionally told a script the cache was clean
             // when the filesystem had refused, which is exactly the failure
             // the structured-error contract exists to surface.
-            match oxidezap_session::unblock(|| {
-                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| e.to_string())
+            //
+            // Account-scoped: a global wipe both deleted other accounts' cached
+            // downloads and failed to match this account's own namespaced keys.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            match oxidezap_session::unblock(move || {
+                account_media
+                    .wipe(crate::media::Wipe::Cache)
+                    .map_err(|e| e.to_string())
             })
             .await
             {
