@@ -716,11 +716,22 @@ pub(super) async fn handle_wire_request(
             wire_ok(id, WireResponse::Storage(storage))
         }
         WireRequest::ClearMediaCache => {
-            let _ = oxidezap_session::unblock(|| {
+            // The wipe's own answer is the client's answer. Discarding it and
+            // replying `Ack` unconditionally told a script the cache was clean
+            // when the filesystem had refused, which is exactly the failure
+            // the structured-error contract exists to surface.
+            match oxidezap_session::unblock(|| {
                 crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| e.to_string())
             })
-            .await;
-            wire_ok(id, WireResponse::Ack)
+            .await
+            {
+                Ok(Ok(())) => wire_ok(id, WireResponse::Ack),
+                Ok(Err(e)) => wire_err(id, oxidezap_wire::error::ApiError::internal(e)),
+                Err(_) => wire_err(
+                    id,
+                    oxidezap_wire::error::ApiError::internal("the cache wipe did not finish"),
+                ),
+            }
         }
         WireRequest::Shutdown => Answer {
             frame: serde_json::to_string(&oxidezap_wire::envelope::ResponseEnvelope {

@@ -706,13 +706,20 @@ async fn a_wire_client_that_lags_is_disconnected_rather_than_stalled() {
     }
 
     // Drain to the end, asserting no legacy `Resync` reaches a wire client.
-    // Bounded by the frames the daemon can have written: the broadcast ring
-    // plus this overrun. A connection that stalled instead of closing would
-    // read forever, so the bound turns that into a failure rather than a hang.
+    // Each read is bounded: a server that stalled instead of closing leaves
+    // this parked in a read with nothing to end it, and a hung test reports
+    // nothing. The frames are already in the socket, so the timeout only ever
+    // fires on the stall it is there to catch.
     let mut drained = 0usize;
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("the connection stalled instead of closing after the lag");
+        match read {
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 assert!(

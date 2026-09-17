@@ -240,6 +240,12 @@ impl WhatsAppClient {
     /// Returns how many of the server's per-participant answers succeeded:
     /// membership changes are partial by nature, and a bare unit would hide
     /// the half that did not apply.
+    ///
+    /// One participant per call, so no success at all is a failure, not an
+    /// empty success: the server accepted the stanza and refused the change,
+    /// and the refusal reason is what the caller needs. The daemon's answer
+    /// used to discard the count and reply `Ack`, which told the CLI that
+    /// adding somebody worked when the group had refused them.
     pub fn manage_group_participant(
         &self,
         group_jid: String,
@@ -274,7 +280,32 @@ impl WhatsAppClient {
                     .await
                     .map_err(|e| e.to_string())?,
             };
-            Ok(answers.iter().filter(|a| a.is_ok()).count())
+            let applied = answers.iter().filter(|a| a.is_ok()).count();
+            if applied == 0 {
+                // Each field is the server's own word for why, and any of them
+                // is more useful than the bare "did not work". `add_request`
+                // is a V4 invite the phone has to approve, which is a refusal
+                // with a next step rather than a dead end.
+                let reason = answers
+                    .first()
+                    .map(|a| {
+                        let code = a
+                            .error
+                            .as_deref()
+                            .or(a.status.as_deref())
+                            .unwrap_or("refused");
+                        match &a.add_request {
+                            Some(request) => format!(
+                                "the group refused the change ({code}); it needs an invite approval ({})",
+                                request.code
+                            ),
+                            None => format!("the group refused the change ({code})"),
+                        }
+                    })
+                    .unwrap_or_else(|| "the group refused the change".to_string());
+                return Err(reason);
+            }
+            Ok(applied)
         })
     }
 
@@ -487,14 +518,77 @@ pub struct JoinGroupView {
     pub pending_approval: bool,
 }
 
-/// A JID or a bare phone number, the way a script passes people.
+/// A JID or a phone number, the way a script passes people.
+///
+/// The phone branch accepts only phone punctuation, not any string that
+/// happens to contain enough digits. Stripping to digits from arbitrary text
+/// made `user5511999999999` and `contato:5511999999999` resolve to a real
+/// number, and a group mutation aimed at a typo would then act on whichever
+/// person that number belongs to. What is allowed is a valid JID, or a string
+/// built from `+`, digits, spaces, `-`, `(` and `)` with at least eight
+/// digits, which is what a phone number looks like however it is written.
 fn parse_participant(raw: &str) -> Result<Jid, String> {
     if let Ok(jid) = raw.parse::<Jid>() {
         return Ok(jid);
     }
-    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.len() >= 8 {
-        return Ok(Jid::pn(&digits));
+    let looks_like_a_phone_number = raw
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')'));
+    if looks_like_a_phone_number {
+        let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() >= 8 {
+            return Ok(Jid::pn(&digits));
+        }
     }
     Err(format!("not a JID or phone number: {raw}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_jid_is_read_as_itself() {
+        let jid = parse_participant("559900000001@s.whatsapp.net").expect("a JID");
+        assert_eq!(jid.user, "559900000001");
+    }
+
+    /// Every way a phone number is written, with the punctuation dropped.
+    #[test]
+    fn a_phone_number_is_read_from_its_punctuation() {
+        for raw in [
+            "559900000001",
+            "+55 99 0000-0001",
+            "(55) 990000-0001",
+            "+559900000001",
+        ] {
+            let jid = parse_participant(raw).expect(raw);
+            assert_eq!(jid.user, "559900000001", "{raw}");
+        }
+    }
+
+    /// Text is not a phone number: without this, a label with enough digits
+    /// in it resolved to whoever that number belongs to, and a group change
+    /// aimed at a typo landed on a stranger.
+    #[test]
+    fn text_with_digits_in_it_is_not_a_phone_number() {
+        for raw in [
+            "user5511999999999",
+            "contato:5511999999999",
+            "5511999999999x",
+            "abc12345678",
+            "5511999999999@s.whatsapp.net extra",
+        ] {
+            assert!(parse_participant(raw).is_err(), "{raw} was accepted");
+        }
+    }
+
+    /// A number too short to be one is refused rather than sent to the
+    /// server, which would answer a change for nobody.
+    #[test]
+    fn too_few_digits_is_not_a_phone_number() {
+        for raw in ["", "123", "+1 (99) 9"] {
+            assert!(parse_participant(raw).is_err(), "{raw} was accepted");
+        }
+    }
 }

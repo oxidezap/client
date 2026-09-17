@@ -264,7 +264,7 @@ fn json_is_refused_for_raw_text_commands() {
         vec!["--json", "accounts", "use", "work"],
     ] {
         let out = cli().args(&args).output().expect("run the cli");
-        assert_ne!(out.status.code(), Some(0), "accepted {args:?}");
+        assert_eq!(out.status.code(), Some(1), "accepted {args:?}");
         assert!(
             out.stdout.is_empty(),
             "{args:?} wrote raw text to stdout under --json"
@@ -306,7 +306,7 @@ fn read_only_refuses_local_account_mutations() {
         vec!["--read-only", "accounts", "remove", "probe"],
     ] {
         let out = cli().args(&args).output().expect("run the cli");
-        assert_ne!(out.status.code(), Some(0), "allowed {args:?}");
+        assert_eq!(out.status.code(), Some(1), "allowed {args:?}");
         assert!(
             out.stdout.is_empty(),
             "{args:?} wrote to stdout under --read-only"

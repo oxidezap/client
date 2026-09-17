@@ -34,9 +34,11 @@ exit instead of putting non-JSON on stdout.
 
 `--events` subscribes the connection to lifecycle events. `sync --follow`
 prints one `DaemonEvent` per line as NDJSON and nothing else, so a follower
-can parse every line it reads. Exit codes: `0` ok, `1` daemon refused, `2`
-invalid input or no daemon (and it could not be started), `3` handshake
-rejected.
+can parse every line it reads. Exit codes: `0` ok, `1` the command or the
+API call failed, `2` invalid input or no daemon (and it could not be
+started), `3` handshake rejected. Code `1` is the general failure: a daemon
+refusal, an unsupported output mode, a local read-only violation, and
+anything else the command could not carry out.
 
 ## Safety
 
@@ -84,11 +86,15 @@ the account can pair again.
 
 ## Pagination
 
-`messages list --chat <jid>` walks back from the newest message; pass
-`--before <id>` to continue that walk. `--after <id>` walks *forward* from
-a message you already hold, oldest first, which is the direction a sync
-loop needs. The two are exclusive; a request carrying both is answered as
-the forward page.
+`messages list --chat <jid>` walks back from the newest message. Pass
+`--before <cursor>` to continue that walk: the cursor is the opaque
+`next_cursor` the previous answer returned, not a message id. A message id
+is a different string and does not parse back into the position the page
+was read from, so replacing the cursor with one skips or repeats rows.
+`--after <cursor>` walks *forward* from a position you already hold, oldest
+first, which is the direction a sync loop needs, and takes the same opaque
+cursor. The two are exclusive; a request carrying both is answered as the
+forward page.
 
 ## Events
 

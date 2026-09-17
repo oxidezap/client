@@ -204,10 +204,10 @@ pub struct MessagesListArgs {
     /// Maximum number of messages to return
     #[usage(long, default = "50")]
     pub limit: usize,
-    /// Pagination cursor (before message ID)
+    /// Pagination cursor (next_cursor from the previous page)
     #[usage(long)]
     pub before: Option<String>,
-    /// Pagination cursor (after message ID)
+    /// Pagination cursor (next_cursor from the previous page)
     #[usage(long)]
     pub after: Option<String>,
 }

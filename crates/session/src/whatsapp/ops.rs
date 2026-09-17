@@ -974,12 +974,33 @@ impl WhatsAppClient {
                     // straight away would report what was here before the ask.
                     // Bounded, so a phone that never answers costs a wait and
                     // not a hang.
-                    let before = oldest.timestamp.timestamp_millis();
+                    //
+                    // Two ways the wait ends early, because either alone can
+                    // miss an answer. An older row means the sync reached past
+                    // the anchor. A higher count means rows arrived without
+                    // moving it, which is what an out-of-order or
+                    // same-timestamp batch does, and waiting the whole budget
+                    // for a second signal that already arrived would spend
+                    // fifteen seconds on a reply the store had taken.
+                    let before_oldest = oldest.timestamp.timestamp_millis();
+                    let before_count = live
+                        .chat_store
+                        .message_coverage(Some(&chat))
+                        .await
+                        .map(|coverage| coverage.stored_count)
+                        .unwrap_or(0);
                     let deadline = wacore::time::Instant::now() + HISTORY_SYNC_WAIT;
                     loop {
-                        match live.chat_store.oldest_message(&chat).await {
-                            Ok(Some(now)) if now.timestamp.timestamp_millis() < before => break,
-                            Ok(_) => {}
+                        match live.chat_store.message_coverage(Some(&chat)).await {
+                            Ok(coverage) => {
+                                let went_back = coverage
+                                    .oldest_ms
+                                    .is_some_and(|oldest| oldest < before_oldest);
+                                let grew = coverage.stored_count > before_count;
+                                if went_back || grew {
+                                    break;
+                                }
+                            }
                             Err(e) => {
                                 log::warn!("could not read the chat while waiting on history: {e}");
                                 break;
