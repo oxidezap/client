@@ -15,7 +15,7 @@ use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 use whatsapp_rust::waproto::whatsapp as wa;
 
-use oxidezap_core::ChatMessage;
+use oxidezap_core::{Chat, ChatMessage};
 
 use super::WhatsAppClient;
 use super::convert::{mark_unread_tail, stored_to_chat_message};
@@ -131,6 +131,220 @@ impl WhatsAppClient {
         })
     }
 
+    /// One page of a chat's messages *after* a cursor, oldest first.
+    ///
+    /// The forward twin of [`Self::load_messages`], for a caller that holds a
+    /// row and wants what came later. A page shorter than it asked for is the
+    /// end of what the store holds.
+    pub fn load_messages_after(
+        &self,
+        jid: String,
+        after: String,
+        limit: i64,
+    ) -> Task<Result<Page<ChatMessage>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            Self::message_page_after(
+                &live.chat_store,
+                &live.client,
+                &live.names,
+                jid,
+                after,
+                limit,
+            )
+            .await
+        })
+    }
+
+    /// Full-text search over message history with optional chat filter.
+    ///
+    /// `has_media` keeps only rows whose content class carries an attachment,
+    /// which is the one filter the CLI promises and the store can answer
+    /// without a second query: the row's `kind` is already materialized.
+    pub fn search_messages(
+        &self,
+        query: String,
+        chat_jid: Option<String>,
+        has_media: bool,
+        limit: i64,
+    ) -> Task<Result<Vec<ChatMessage>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let parsed_chat = if let Some(j) = chat_jid {
+                Some(
+                    j.parse::<Jid>()
+                        .map_err(|_| "invalid chat jid".to_string())?,
+                )
+            } else {
+                None
+            };
+            let hits = if has_media {
+                live.chat_store
+                    .search_media_messages(&query, parsed_chat.clone(), limit.clamp(1, 100))
+                    .await
+                    .map_err(|e| format!("search failed: {e}"))?
+            } else if let Some(ref chat) = parsed_chat {
+                live.chat_store
+                    .search_messages_in_chat(chat, &query, limit.clamp(1, 100))
+                    .await
+                    .map_err(|e| format!("search failed: {e}"))?
+            } else {
+                live.chat_store
+                    .search_messages(&query, limit.clamp(1, 100))
+                    .await
+                    .map_err(|e| format!("search failed: {e}"))?
+            };
+            let mut messages: Vec<ChatMessage> =
+                hits.into_iter().map(stored_to_chat_message).collect();
+            Self::hydrate_sender_names(
+                &live.chat_store,
+                &live.client,
+                &mut messages,
+                &live.names,
+                false,
+            )
+            .await;
+            Ok(messages)
+        })
+    }
+
+    /// Fetch a single message by ID.
+    pub fn get_message(
+        &self,
+        chat_jid: String,
+        message_id: String,
+    ) -> Task<Result<Option<ChatMessage>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let chat = chat_jid
+                .parse::<Jid>()
+                .map_err(|_| "invalid chat jid".to_string())?;
+            let stored = live
+                .chat_store
+                .message(&chat, &message_id)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?;
+            if let Some(s) = stored {
+                let mut msgs = vec![stored_to_chat_message(s)];
+                Self::hydrate_sender_names(
+                    &live.chat_store,
+                    &live.client,
+                    &mut msgs,
+                    &live.names,
+                    false,
+                )
+                .await;
+                Ok(msgs.pop())
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// Fetch context messages around a target message ID.
+    pub fn get_message_context(
+        &self,
+        chat_jid: String,
+        message_id: String,
+        limit: usize,
+    ) -> Task<Result<Vec<ChatMessage>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let chat = chat_jid
+                .parse::<Jid>()
+                .map_err(|_| "invalid chat jid".to_string())?;
+            let target = live
+                .chat_store
+                .message(&chat, &message_id)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?;
+            let Some(target) = target else {
+                return Err("message not found".to_string());
+            };
+            let before_cursor = oxidezap_chat_store::MessageCursor::from(&target);
+            let before_messages = live
+                .chat_store
+                .messages(&chat, Some(before_cursor), (limit / 2).max(1) as i64)
+                .await
+                .map_err(|e| format!("query failed: {e}"))?;
+            let mut result = Vec::with_capacity(before_messages.len() + 1);
+            for m in before_messages.into_iter().rev() {
+                result.push(stored_to_chat_message(m));
+            }
+            result.push(stored_to_chat_message(target));
+            Self::hydrate_sender_names(
+                &live.chat_store,
+                &live.client,
+                &mut result,
+                &live.names,
+                false,
+            )
+            .await;
+            Ok(result)
+        })
+    }
+
+    /// Fetch one chat by JID, hydrated like a chat-list row.
+    pub fn get_chat(&self, jid: String) -> Task<Result<Option<Chat>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let chat: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
+            let entry = live
+                .chat_store
+                .chat(&chat)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?;
+            match entry {
+                None => Ok(None),
+                Some(entry) => {
+                    let mut chats = Self::hydrate_entries(
+                        &live.chat_store,
+                        &live.client,
+                        &live.names,
+                        vec![entry],
+                        Self::attach_page,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    Ok(chats.pop())
+                }
+            }
+        })
+    }
+
+    /// Fetch contacts from the local contact store.
+    pub fn load_contacts(
+        &self,
+        query: Option<String>,
+        limit: i64,
+    ) -> Task<Result<Vec<oxidezap_chat_store::ContactEntry>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            live.chat_store
+                .contacts(query, limit.clamp(1, 200))
+                .await
+                .map_err(|e| format!("loading contacts failed: {e}"))
+        })
+    }
+
     pub(super) async fn message_page(
         store: &Arc<ChatStore>,
         client: &Arc<Client>,
@@ -160,13 +374,69 @@ impl WhatsAppClient {
             .then(|| page.last().map(message_cursor))
             .flatten();
         page.reverse(); // the store returns newest-first; a timeline is drawn the other way
+        let messages = Self::hydrate_message_page(store, client, names, &chat, page, unread).await;
+        Ok(Page {
+            items: messages,
+            next,
+        })
+    }
+
+    /// One page of a chat's messages *after* a cursor, oldest first.
+    ///
+    /// The forward twin of [`Self::message_page`], hydrated through the same
+    /// function so a bubble read forwards and the same bubble read backwards
+    /// say the same thing. `next` is the last row's cursor, or `None` when the
+    /// store had nothing left to hand over.
+    pub(super) async fn message_page_after(
+        store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
+        jid: String,
+        after: String,
+        limit: i64,
+    ) -> Result<Page<ChatMessage>, String> {
+        let chat: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
+        let after = parse_message_cursor(&after).ok_or_else(|| "unreadable cursor".to_string())?;
+
+        let limit = limit.clamp(1, Self::MESSAGE_PAGE);
+        let page = store
+            .messages_after(&chat, after, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        let next = ((page.len() as i64) == limit)
+            .then(|| page.last().map(message_cursor))
+            .flatten();
+        // A forward page carries no unread tail: those rows are older than the
+        // cursor the caller already holds, and a receipt for them was sent
+        // when they were shown.
+        let messages = Self::hydrate_message_page(store, client, names, &chat, page, 0).await;
+        Ok(Page {
+            items: messages,
+            next,
+        })
+    }
+
+    /// Hydrate stored rows into the messages a front end draws.
+    ///
+    /// One path for both directions: reactions, mentions, quoted authors and
+    /// sender names, exactly as the attach load does them, so a page read
+    /// forwards and a page read backwards are the same rows with the same
+    /// names, and neither leaves an unread tail nobody sends a receipt for.
+    async fn hydrate_message_page(
+        store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
+        chat: &Jid,
+        page: Vec<oxidezap_chat_store::StoredMessage>,
+        unread: i64,
+    ) -> Vec<ChatMessage> {
         let mention_lists = crate::mentions::mention_lists_of(&page);
         let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
         let mut messages: Vec<ChatMessage> = page.into_iter().map(stored_to_chat_message).collect();
         crate::mentions::hydrate_mention_lists(client, names, &mention_lists, &mut messages).await;
         crate::mentions::hydrate_quoted_mention_lists(client, names, &quoted_lists, &mut messages)
             .await;
-        Self::hydrate_reactions(store, client, names, &chat, &mut messages).await;
+        Self::hydrate_reactions(store, client, names, chat, &mut messages).await;
         Self::hydrate_quoted_authors(client, names, &mut messages).await;
         if chat.is_group() || chat.is_status_broadcast() {
             Self::hydrate_sender_names(
@@ -182,10 +452,7 @@ impl WhatsAppClient {
         // paragraph above promises: a page hydrated any other way is one whose
         // unread tail nobody ever sends a receipt for.
         mark_unread_tail(&mut messages, unread.clamp(0, u32::MAX as i64) as u32);
-        Ok(Page {
-            items: messages,
-            next,
-        })
+        messages
     }
 
     /// One page of the chat list, after `after`.
@@ -197,6 +464,7 @@ impl WhatsAppClient {
         &self,
         after: Option<String>,
         limit: i64,
+        include_archived: bool,
     ) -> Task<Result<Page<oxidezap_core::Chat>, String>> {
         let session = self.session.clone();
         let avatars = self.resolve_avatars.clone();
@@ -211,7 +479,7 @@ impl WhatsAppClient {
 
             let limit = limit.clamp(1, Self::CHAT_PAGE);
             let entries = store
-                .chats_page(false, after, limit)
+                .chats_page(include_archived, after, limit)
                 .await
                 .map_err(|e| e.to_string())?;
             // Off the page as it was read, before the aliases below join it:

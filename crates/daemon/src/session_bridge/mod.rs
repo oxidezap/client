@@ -26,9 +26,11 @@ use crate::state::StateHub;
 
 mod act;
 mod action;
+mod call_log;
 mod externalize;
 mod read_tracker;
 mod translate;
+mod wire_events;
 
 #[cfg(test)]
 mod tests;
@@ -37,6 +39,7 @@ pub use action::{
     AccountDisposition, AccountExit, Action, CommandOutcome, Commands, Outbox, SessionCommand,
 };
 pub(crate) use externalize::externalize_media;
+pub(crate) use wire_events::{connection_status_of, translate_wire_frame};
 
 use act::MAX_IN_FLIGHT;
 use read_tracker::ReadTracker;
@@ -505,6 +508,9 @@ struct Bridge {
     publisher: Option<crate::publisher::Handle>,
     reads: Arc<Mutex<ReadTracker>>,
     in_flight: Arc<Semaphore>,
+    /// The call history the wire reports: finalized calls with their
+    /// outcome, fed by the same events the hub folds.
+    calls: call_log::CallLog,
     /// Points the session's durable store at cached avatar bytes.
     ///
     /// The bridge does the byte write through [`crate::avatar`]; the store
@@ -548,6 +554,7 @@ impl Bridge {
             publisher: Some(publisher),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            calls: call_log::CallLog::new(),
             avatar_recorder,
         }
     }

@@ -10,11 +10,20 @@ pub use calls::{OutgoingAcceptCase, outgoing_accept_events};
 /// A stored row and a composed quote, read as the other side's shape.
 mod convert;
 
+/// Pairing a companion device by phone-number code.
+mod auth;
+
 /// The inbound commit hook that makes the chat store the ack durability point.
 mod durability;
 
 /// Who is in a group, for the surfaces that name them.
 mod groups;
+/// Mutations a front end asks the account to perform.
+mod mutations;
+/// Polls, profiles, contacts, channels, media fetch and history coverage.
+mod ops;
+/// Sends a scriptable front end asks for, read from daemon-local paths.
+mod sends;
 
 /// Store rows read back as the chats a front end draws.
 mod history;
@@ -48,6 +57,14 @@ pub use ui_queue::{Receiver as UiEventReceiver, TryRecvError as UiEventTryRecvEr
 
 /// How far back a read receipt reaches: the last row a front end was shown,
 /// and the ids it is bounded by. Written in `paging`, beside the cursors.
+pub use groups::{
+    GroupDetails, GroupListEntry, GroupParticipantView, JoinGroupView, JoinRequestView,
+    ParticipantChange,
+};
+pub use ops::{
+    BackfillFile, BackfillReport, ChannelView, ContactCheckView, ContactView, HistoryCoverage,
+    PollView, ProfileView,
+};
 pub use outgoing::OutgoingFile;
 pub use paging::ReadBoundary;
 

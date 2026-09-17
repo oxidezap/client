@@ -1,0 +1,17 @@
+[package]
+name = "oxidezap-wire"
+description = "Lightweight, decoupled wire protocol DTOs for OxideZap IPC and CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -19,7 +19,9 @@ cargo clippy --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path xtask/Cargo.toml
 cargo xtask help    # what there is to run; from the repository root
 
-# Running it: two binaries, and the window looks for the daemon beside itself.
+# Running it: the window and the daemon, and the window looks for the daemon
+# beside itself. `--bin oxidezap-cli` is the scriptable front end onto the same
+# daemon; see docs/cli.md.
 cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxidezap
 
 # A plugin. Its own workspace, its own target, and the file's name is its id.

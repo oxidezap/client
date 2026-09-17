@@ -89,6 +89,17 @@ impl MessageKind {
         }
     }
 
+    /// The database labels whose content carries an attachment.
+    ///
+    /// A SQL fragment's worth of vocabulary, written beside [`Self::as_str`]
+    /// so the two cannot drift: `has_media` filtering happens in the FTS
+    /// query, where the rows the caller asked for are chosen before the limit
+    /// applies, and a label added here without a matching `as_str` arm would
+    /// be a filter that silently misses.
+    pub(crate) const MEDIA_LABELS: &'static [&'static str] = &[
+        "image", "video", "ptv", "audio", "ptt", "sticker", "document",
+    ];
+
     pub(crate) fn from_db(label: String) -> Self {
         match label.as_str() {
             "text" => Self::Text,
@@ -399,6 +410,10 @@ pub struct ContactEntry {
     pub full_name: Option<String>,
     pub first_name: Option<String>,
     pub business_name: Option<String>,
+    /// Device-local alias; never synced.
+    pub alias: Option<String>,
+    /// Device-local tags; never synced.
+    pub tags: Vec<String>,
 }
 
 impl ContactEntry {
@@ -420,6 +435,15 @@ pub struct MediaRef {
     pub mime_type: Option<String>,
     pub size_bytes: Option<i64>,
     pub downloaded_at: DateTime<Utc>,
+}
+
+/// How much history the store holds: row count and time span, per chat or
+/// account-wide. `None` bounds mean no rows at all, not an empty span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageCoverage {
+    pub stored_count: u64,
+    pub oldest_ms: Option<i64>,
+    pub newest_ms: Option<i64>,
 }
 
 /// The durable pointer from a chat to the profile picture it is showing.

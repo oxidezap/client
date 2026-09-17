@@ -17,8 +17,18 @@ use wacore_binary::jid::observe_str;
 use super::externalize::externalize_messages;
 use super::read_tracker::ReadRecord;
 use super::translate::chat_updated;
+use super::wire_events::{chat_message_to_dto, chat_to_dto};
 use super::{Action, Bridge, CommandOutcome, Outbox, SessionCommand};
 use crate::state::Change;
+use oxidezap_wire::dto::{
+    ChannelDto, ChatDto, ContactDto, GroupDto, GroupJoinRequestDto,
+    GroupParticipantAction as WireParticipantAction, GroupParticipantDto, MessageDto, PollDto,
+    PollOptionDto, PresenceState,
+};
+use oxidezap_wire::envelope::ResponseEnvelope;
+use oxidezap_wire::error::ApiError;
+use oxidezap_wire::request::ClientRequest as WireRequest;
+use oxidezap_wire::response::DaemonResponse;
 
 /// How many commands may still be working inside the session at once.
 ///
@@ -194,6 +204,7 @@ impl Bridge {
                 let page = client.load_chats(
                     after.map(|cursor| cursor.as_str().to_string()),
                     limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
+                    false,
                 );
                 let reads = Arc::clone(&self.reads);
                 let hub = Arc::clone(&self.hub);
@@ -293,7 +304,1006 @@ impl Bridge {
                 });
                 None
             }
+            Action::Wire {
+                id,
+                request,
+                answer_to,
+            } => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                self.begin_slow_wire(client, id, request, answer_to, reply, permit);
+                None
+            }
             action => Some((action, reply)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_slow_wire(
+        &mut self,
+        client: &WhatsAppClient,
+        id: u64,
+        request: oxidezap_wire::request::ClientRequest,
+        answer_to: Outbox,
+        reply: tokio::sync::oneshot::Sender<CommandOutcome>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        match request {
+            WireRequest::ListMessages {
+                chat_jid,
+                limit,
+                before,
+                after,
+            } => {
+                // One cursor or the other, never both: `after` walks forward
+                // from a row the caller holds, `before` walks back from the
+                // newest. A request carrying both is answered as the forward
+                // page, because that is the one whose position the caller
+                // cannot infer.
+                let page = match after {
+                    Some(after) => {
+                        client.load_messages_after(chat_jid.clone(), after, limit as i64)
+                    }
+                    None => client.load_messages(chat_jid.clone(), before, limit as i64),
+                };
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match page.await {
+                        Ok(Ok(page)) => {
+                            let messages: Vec<MessageDto> = page
+                                .items
+                                .into_iter()
+                                .map(|m| chat_message_to_dto(&chat_jid, m))
+                                .collect();
+                            let next_cursor =
+                                page.next.map(oxidezap_wire::envelope::PageCursor::new);
+                            Ok(DaemonResponse::Messages {
+                                messages,
+                                next_cursor,
+                            })
+                        }
+                        Ok(Err(e)) => Err(ApiError::internal(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::GetMessage {
+                chat_jid,
+                message_id,
+            } => {
+                let task = client.get_message(chat_jid.clone(), message_id);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(Some(msg))) => {
+                            Ok(DaemonResponse::Message(chat_message_to_dto(&chat_jid, msg)))
+                        }
+                        Ok(Ok(None)) => Err(ApiError::not_found("message not found")),
+                        Ok(Err(e)) => Err(ApiError::internal(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::GetMessageContext {
+                chat_jid,
+                message_id,
+                limit,
+            } => {
+                let task = client.get_message_context(chat_jid.clone(), message_id, limit);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(msgs)) => {
+                            let messages: Vec<MessageDto> = msgs
+                                .into_iter()
+                                .map(|m| chat_message_to_dto(&chat_jid, m))
+                                .collect();
+                            Ok(DaemonResponse::Messages {
+                                messages,
+                                next_cursor: None,
+                            })
+                        }
+                        Ok(Err(e)) => Err(ApiError::internal(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::SearchMessages {
+                query,
+                chat_jid,
+                has_media,
+                limit,
+            } => {
+                let task = client.search_messages(query, chat_jid.clone(), has_media, limit as i64);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(msgs)) => {
+                            let messages: Vec<MessageDto> = msgs
+                                .into_iter()
+                                .map(|m| {
+                                    let c_jid =
+                                        chat_jid.as_deref().unwrap_or(&m.sender).to_string();
+                                    chat_message_to_dto(&c_jid, m)
+                                })
+                                .collect();
+                            Ok(DaemonResponse::Messages {
+                                messages,
+                                next_cursor: None,
+                            })
+                        }
+                        Ok(Err(e)) => Err(ApiError::internal(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::ListContacts { query, limit } => {
+                let task = client.list_contact_views(query, limit as i64);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(contacts)) => {
+                            let contacts: Vec<ContactDto> =
+                                contacts.into_iter().map(contact_to_dto).collect();
+                            Ok(DaemonResponse::Contacts { contacts })
+                        }
+                        Ok(Err(e)) => Err(ApiError::internal(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::ListChats {
+                limit,
+                offset,
+                query,
+                archived,
+            } => {
+                let task = client.load_chats(offset, limit as i64, archived);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(page)) => {
+                            let chats: Vec<ChatDto> = page
+                                .items
+                                .into_iter()
+                                .filter(|chat| match &query {
+                                    None => true,
+                                    Some(q) => {
+                                        chat.jid.contains(q.as_str())
+                                            || chat.name.to_lowercase().contains(&q.to_lowercase())
+                                    }
+                                })
+                                .map(chat_to_dto)
+                                .collect();
+                            let next_cursor =
+                                page.next.map(oxidezap_wire::envelope::PageCursor::new);
+                            Ok(DaemonResponse::Chats { chats, next_cursor })
+                        }
+                        Ok(Err(e)) => Err(ApiError::internal(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::GetChat { jid } => {
+                let task = client.get_chat(jid);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(Some(chat))) => Ok(DaemonResponse::Chat(chat_to_dto(chat))),
+                        Ok(Ok(None)) => Err(ApiError::not_found("no such chat")),
+                        Ok(Err(e)) => Err(ApiError::internal(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::SendText {
+                to,
+                message,
+                reply_to,
+                mentions,
+                enqueue_only,
+            } => {
+                if enqueue_only {
+                    // Dispatched, not awaited: the GUI's own acknowledgement
+                    // semantics. The id is announced by the send itself, so
+                    // the id the client is answered with is the same one the
+                    // store records and WhatsApp is told. Waited for through a
+                    // timeout: a session that dies before it picks the id must
+                    // answer, not hang. The task is created here, so what the
+                    // spawned future owns is the `Task` rather than the
+                    // borrowed client.
+                    let (announce, announced) = tokio::sync::oneshot::channel();
+                    let pending =
+                        client.send_text_wire(to, message, reply_to, mentions, Some(announce));
+                    let answer_to = answer_to.clone();
+                    oxidezap_session::spawn(async move {
+                        let announced = oxidezap_session::with_timeout(
+                            announced,
+                            std::time::Duration::from_secs(10),
+                        )
+                        .await;
+                        match announced {
+                            Some(Ok(local_id)) => {
+                                let answer = DaemonResponse::MessageSent {
+                                    id: local_id,
+                                    timestamp_ms: wacore::time::now_millis(),
+                                    enqueued: true,
+                                };
+                                send_wire_result(&answer_to, id, Ok(answer));
+                                let _ = reply.send(CommandOutcome::Accepted);
+                                if let Ok(Err(e)) = pending.await {
+                                    log::warn!("an enqueued send failed after its answer: {e}");
+                                }
+                            }
+                            _ => {
+                                // No id arrived. A send that refuses before
+                                // it starts — a bad JID, empty text — reports
+                                // a request error; a session that stopped, a
+                                // task that died before announcing, or a wait
+                                // that expired did not, and folding the two
+                                // together told a client its request was
+                                // wrong when the session was gone.
+                                let settled = oxidezap_session::with_timeout(
+                                    pending,
+                                    std::time::Duration::from_secs(5),
+                                )
+                                .await;
+                                let result = match settled {
+                                    Some(Ok(Err(e))) => Err(ApiError::invalid_argument(e)),
+                                    // The send finished in the gap between
+                                    // the announcement's deadline and this
+                                    // await: it succeeded, so answer with
+                                    // what it produced rather than an error.
+                                    Some(Ok(Ok((sent_id, ts)))) => {
+                                        Ok(DaemonResponse::MessageSent {
+                                            id: sent_id,
+                                            timestamp_ms: ts,
+                                            enqueued: true,
+                                        })
+                                    }
+                                    _ => Err(ApiError::not_connected(
+                                        "the session stopped before the send started",
+                                    )),
+                                };
+                                send_wire_result(&answer_to, id, result);
+                                let _ = reply.send(CommandOutcome::Accepted);
+                            }
+                        }
+                        drop(permit);
+                    });
+                } else {
+                    let task = client.send_text_wire(to, message, reply_to, mentions, None);
+                    run_wire(
+                        answer_to.clone(),
+                        id,
+                        reply,
+                        permit,
+                        task,
+                        |(sent_id, ts)| DaemonResponse::MessageSent {
+                            id: sent_id,
+                            timestamp_ms: ts,
+                            enqueued: false,
+                        },
+                    );
+                }
+            }
+            WireRequest::SendReaction {
+                chat_jid,
+                message_id,
+                emoji,
+            } => {
+                let task = client.send_reaction(chat_jid, message_id, emoji);
+                run_wire(answer_to.clone(), id, reply, permit, task, |sent_id| {
+                    DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: wacore::time::now_millis(),
+                        enqueued: false,
+                    }
+                });
+            }
+            WireRequest::SendMedia {
+                to,
+                file_path,
+                caption,
+                mime_type,
+                as_document,
+            } => {
+                let task =
+                    client.send_media_from_path(to, file_path, caption, mime_type, as_document);
+                run_wire(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |(sent_id, ts)| DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: ts,
+                        enqueued: false,
+                    },
+                );
+            }
+            WireRequest::SendAudio { to, file_path, ptt } => {
+                let task = client.send_audio_from_path(to, file_path, ptt);
+                run_wire(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |(sent_id, ts)| DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: ts,
+                        enqueued: false,
+                    },
+                );
+            }
+            WireRequest::MarkRead {
+                chat_jid,
+                through_message_id,
+            } => {
+                // Answered here, not from a task: the read is bounded and
+                // applied synchronously, and the receipts leave on their own.
+                let outcome = self.mark_read(client, &chat_jid, through_message_id.as_deref());
+                let result = match outcome {
+                    CommandOutcome::Accepted => Ok(DaemonResponse::Ack),
+                    CommandOutcome::NoSession(detail) => Err(ApiError::not_connected(detail)),
+                    CommandOutcome::Refused(detail) => Err(ApiError::invalid_argument(detail)),
+                    CommandOutcome::Busy(_) => Err(ApiError::too_busy()),
+                };
+                send_wire_result(&answer_to, id, result);
+                let _ = reply.send(CommandOutcome::Accepted);
+                drop(permit);
+            }
+            WireRequest::MarkUnread { chat_jid } => {
+                let task = client.mark_chat_unread(chat_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::PinChat { chat_jid, pin } => {
+                let task = client.pin_chat(chat_jid, pin);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::MuteChat {
+                chat_jid,
+                mute_duration_seconds,
+            } => {
+                let task = client.mute_chat(chat_jid, mute_duration_seconds);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::ArchiveChat { chat_jid, archive } => {
+                let task = client.archive_chat(chat_jid, archive);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::SetPresence { chat_jid, state } => match state {
+                PresenceState::Composing => {
+                    if let Some(chat) = chat_jid {
+                        client.send_composing(&chat);
+                    }
+                    send_wire_result(&answer_to, id, Ok(DaemonResponse::Ack));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                }
+                PresenceState::Paused => {
+                    if let Some(chat) = chat_jid {
+                        client.send_paused(&chat);
+                    }
+                    send_wire_result(&answer_to, id, Ok(DaemonResponse::Ack));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                }
+                PresenceState::Recording => {
+                    if let Some(chat) = chat_jid {
+                        client.send_recording(&chat);
+                    }
+                    send_wire_result(&answer_to, id, Ok(DaemonResponse::Ack));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                }
+                PresenceState::Available => {
+                    let task = client.set_available();
+                    run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                        DaemonResponse::Ack
+                    });
+                }
+                PresenceState::Unavailable => {
+                    let task = client.set_unavailable();
+                    run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                        DaemonResponse::Ack
+                    });
+                }
+            },
+            WireRequest::ListCalls { limit } => {
+                let calls = self.calls.list(limit);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    send_wire_result(&answer_to, id, Ok(DaemonResponse::Calls { calls }));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::EditMessage {
+                chat_jid,
+                message_id,
+                new_text,
+            } => {
+                let task = client.edit_message(chat_jid, message_id, new_text);
+                run_wire(answer_to.clone(), id, reply, permit, task, |sent_id| {
+                    DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: wacore::time::now_millis(),
+                        enqueued: false,
+                    }
+                });
+            }
+            WireRequest::RevokeMessage {
+                chat_jid,
+                message_id,
+                for_everyone,
+            } => {
+                let task = client.revoke_message(chat_jid, message_id, for_everyone);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::ForwardMessage {
+                source_chat_jid,
+                message_id,
+                target_chat_jid,
+            } => {
+                let task = client.forward_message(source_chat_jid, message_id, target_chat_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |sent_id| {
+                    DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: wacore::time::now_millis(),
+                        enqueued: false,
+                    }
+                });
+            }
+            WireRequest::SendPoll {
+                to,
+                question,
+                options,
+                selectable_count,
+            } => {
+                let task = client.create_poll(to, question, options, selectable_count);
+                run_wire(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |(sent_id, ts)| DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: ts,
+                        enqueued: false,
+                    },
+                );
+            }
+            WireRequest::VotePoll {
+                chat_jid,
+                poll_id,
+                selected_option_indices,
+            } => {
+                let task = client.vote_poll(chat_jid, poll_id, selected_option_indices);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::ListPolls { chat_jid, limit } => {
+                let task = client.list_polls(chat_jid, limit as i64);
+                run_wire(answer_to.clone(), id, reply, permit, task, |polls| {
+                    DaemonResponse::Polls {
+                        polls: polls.into_iter().map(poll_view_to_dto).collect(),
+                    }
+                });
+            }
+            WireRequest::GetPoll { chat_jid, poll_id } => {
+                let task = client.get_poll(chat_jid, poll_id);
+                run_wire_opt(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |poll| DaemonResponse::Poll(poll_view_to_dto(poll)),
+                    "no such poll",
+                );
+            }
+            WireRequest::SendLocation {
+                to,
+                latitude,
+                longitude,
+                name,
+            } => {
+                let task = client.send_location(to, latitude, longitude, name);
+                run_wire(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |(sent_id, ts)| DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: ts,
+                        enqueued: false,
+                    },
+                );
+            }
+            WireRequest::SendStatus { text } => {
+                let task = client.send_status(text);
+                run_wire(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |(sent_id, ts)| DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: ts,
+                        enqueued: false,
+                    },
+                );
+            }
+            WireRequest::SendSticker { to, file_path } => {
+                let task = client.send_sticker_from_path(to, file_path);
+                run_wire(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |(sent_id, ts)| DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: ts,
+                        enqueued: false,
+                    },
+                );
+            }
+            WireRequest::SendListResponse {
+                to,
+                title,
+                row_id,
+                reply_to,
+            } => {
+                let task = client.send_list_response(to, title, row_id, reply_to);
+                run_wire(answer_to.clone(), id, reply, permit, task, |sent_id| {
+                    DaemonResponse::MessageSent {
+                        id: sent_id,
+                        timestamp_ms: wacore::time::now_millis(),
+                        enqueued: false,
+                    }
+                });
+            }
+            WireRequest::ListStarredMessages { limit } => {
+                let task = client.list_starred(limit as i64);
+                run_wire(answer_to.clone(), id, reply, permit, task, |starred| {
+                    DaemonResponse::Messages {
+                        messages: starred
+                            .into_iter()
+                            .map(|(chat_jid, message)| chat_message_to_dto(&chat_jid, message))
+                            .collect(),
+                        next_cursor: None,
+                    }
+                });
+            }
+            WireRequest::ListGroups => {
+                let task = client.list_groups();
+                run_wire(answer_to.clone(), id, reply, permit, task, |groups| {
+                    DaemonResponse::Groups {
+                        groups: groups.into_iter().map(group_entry_to_dto).collect(),
+                    }
+                });
+            }
+            WireRequest::GetGroupInfo { group_jid } => {
+                let task = client.get_group_info(group_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |info| {
+                    DaemonResponse::Group(group_details_to_dto(info))
+                });
+            }
+            WireRequest::CreateGroup {
+                subject,
+                participants,
+            } => {
+                let task = client.create_group(subject, participants);
+                run_wire(answer_to.clone(), id, reply, permit, task, |jid| {
+                    DaemonResponse::GroupCreated { jid }
+                });
+            }
+            WireRequest::SetGroupTopic { group_jid, topic } => {
+                let task = client.set_group_topic(group_jid, topic);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::SetGroupDescription {
+                group_jid,
+                description,
+            } => {
+                let task = client.set_group_description(group_jid, description);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::ManageGroupParticipant {
+                group_jid,
+                participant_jid,
+                action,
+            } => {
+                let action = match action {
+                    WireParticipantAction::Add => oxidezap_session::ParticipantChange::Add,
+                    WireParticipantAction::Remove => oxidezap_session::ParticipantChange::Remove,
+                    WireParticipantAction::Promote => oxidezap_session::ParticipantChange::Promote,
+                    WireParticipantAction::Demote => oxidezap_session::ParticipantChange::Demote,
+                };
+                let task = client.manage_group_participant(group_jid, participant_jid, action);
+                run_wire(answer_to.clone(), id, reply, permit, task, |_| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::GetGroupInviteLink { group_jid, reset } => {
+                let task = client.get_group_invite_link(group_jid, reset);
+                run_wire(answer_to.clone(), id, reply, permit, task, |link| {
+                    DaemonResponse::GroupInviteLink { link }
+                });
+            }
+            WireRequest::JoinGroup { invite_code } => {
+                let task = client.join_group(invite_code);
+                run_wire(answer_to.clone(), id, reply, permit, task, |joined| {
+                    DaemonResponse::GroupJoined {
+                        jid: joined.jid,
+                        pending_approval: joined.pending_approval,
+                    }
+                });
+            }
+            WireRequest::LeaveGroup { group_jid } => {
+                let task = client.leave_group(group_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::SetGroupPermissions {
+                group_jid,
+                announce_only,
+                locked,
+            } => {
+                let task = client.set_group_permissions(group_jid, announce_only, locked);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::ListGroupJoinRequests { group_jid } => {
+                let task = client.list_group_join_requests(group_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |requests| {
+                    DaemonResponse::GroupJoinRequests {
+                        requests: requests
+                            .into_iter()
+                            .map(|r| GroupJoinRequestDto {
+                                jid: r.jid,
+                                request_time_secs: r.request_time_secs,
+                            })
+                            .collect(),
+                    }
+                });
+            }
+            WireRequest::ManageGroupJoinRequest {
+                group_jid,
+                participant_jid,
+                approve,
+            } => {
+                let task = client.manage_group_join_request(group_jid, participant_jid, approve);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::ListChannels => {
+                let task = client.list_channels();
+                run_wire(answer_to.clone(), id, reply, permit, task, |channels| {
+                    DaemonResponse::Channels {
+                        channels: channels.into_iter().map(channel_view_to_dto).collect(),
+                    }
+                });
+            }
+            WireRequest::GetChannelInfo { channel_jid } => {
+                let task = client.get_channel(channel_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |channel| {
+                    DaemonResponse::Channel(channel_view_to_dto(channel))
+                });
+            }
+            WireRequest::JoinChannel { channel_jid } => {
+                let task = client.join_channel(channel_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |channel| {
+                    DaemonResponse::Channel(channel_view_to_dto(channel))
+                });
+            }
+            WireRequest::LeaveChannel { channel_jid } => {
+                let task = client.leave_channel(channel_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::GetProfile { jid } => {
+                let task = client.get_profile(jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |profile| {
+                    DaemonResponse::Profile(profile_view_to_dto(profile))
+                });
+            }
+            WireRequest::GetBusinessProfile { jid } => {
+                let task = client.get_business_profile(jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |profile| {
+                    DaemonResponse::Profile(profile_view_to_dto(profile))
+                });
+            }
+            WireRequest::SetProfileAbout { about } => {
+                let task = client.set_profile_about(about);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::SetProfileName { name } => {
+                let task = client.set_profile_name(name);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::SetProfilePicture { file_path } => {
+                let task = client.set_profile_picture_from_path(file_path);
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::RemoveProfilePicture => {
+                let task = client.remove_profile_picture();
+                run_wire(answer_to.clone(), id, reply, permit, task, |()| {
+                    DaemonResponse::Ack
+                });
+            }
+            WireRequest::CheckContact { phone } => {
+                let task = client.check_contact(phone);
+                run_wire(answer_to.clone(), id, reply, permit, task, |checked| {
+                    DaemonResponse::ContactCheck {
+                        phone: checked.phone,
+                        is_registered: checked.is_registered,
+                        jid: checked.jid,
+                    }
+                });
+            }
+            WireRequest::GetContact { jid } => {
+                let task = client.get_contact(jid);
+                run_wire_opt(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |contact| DaemonResponse::Contact(contact_to_dto(contact)),
+                    "no such contact",
+                );
+            }
+            WireRequest::RefreshContacts { jid } => {
+                let task = client.refresh_contacts_and_read(jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |contacts| {
+                    DaemonResponse::Contacts {
+                        contacts: contacts.into_iter().map(contact_to_dto).collect(),
+                    }
+                });
+            }
+            WireRequest::SetContactAlias { jid, alias } => {
+                let task = client.set_contact_alias(jid, alias);
+                run_wire_opt(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |contact| DaemonResponse::Contact(contact_to_dto(contact)),
+                    "no such contact",
+                );
+            }
+            WireRequest::TagContact { jid, tag } => {
+                let task = client.tag_contact(jid, tag);
+                run_wire_opt(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |contact| DaemonResponse::Contact(contact_to_dto(contact)),
+                    "no such contact",
+                );
+            }
+            WireRequest::UntagContact { jid, tag } => {
+                let task = client.untag_contact(jid, tag);
+                run_wire_opt(
+                    answer_to.clone(),
+                    id,
+                    reply,
+                    permit,
+                    task,
+                    |contact| DaemonResponse::Contact(contact_to_dto(contact)),
+                    "no such contact",
+                );
+            }
+            WireRequest::DownloadMedia {
+                chat_jid,
+                message_id,
+                destination,
+            } => {
+                let task = client.download_media_by_id(chat_jid, message_id.clone());
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(bytes)) => {
+                            let path =
+                                destination
+                                    .map(std::path::PathBuf::from)
+                                    .unwrap_or_else(|| {
+                                        std::env::temp_dir().join(format!("oxidezap-{message_id}"))
+                                    });
+                            let size = bytes.len() as u64;
+                            match oxidezap_session::unblock(move || {
+                                std::fs::write(&path, &bytes).map(|()| path)
+                            })
+                            .await
+                            {
+                                Ok(Ok(path)) => Ok(DaemonResponse::MediaDownloaded {
+                                    message_id,
+                                    local_path: path.to_string_lossy().into_owned(),
+                                    size_bytes: size,
+                                }),
+                                Ok(Err(e)) => {
+                                    Err(ApiError::internal(format!("could not write file: {e}")))
+                                }
+                                Err(e) => Err(ApiError::internal(e.to_string())),
+                            }
+                        }
+                        Ok(Err(e)) => Err(ApiError::internal(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::RetryMedia {
+                chat_jid,
+                message_id,
+            } => {
+                let task = client.retry_media(chat_jid, message_id.clone());
+                run_wire(answer_to.clone(), id, reply, permit, task, |_| {
+                    DaemonResponse::MediaRetryRequested { message_id }
+                });
+            }
+            WireRequest::HistoryCoverage { chat_jid } => {
+                let resume = chat_jid.clone().unwrap_or_default();
+                let task = client.history_coverage(chat_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |coverage| {
+                    DaemonResponse::HistoryCoverage {
+                        chat_jid: resume,
+                        oldest_ts: coverage.oldest_ms,
+                        newest_ts: coverage.newest_ms,
+                        stored_count: coverage.stored_count,
+                    }
+                });
+            }
+            WireRequest::HistoryBackfill { chat_jid, count } => {
+                let resume = chat_jid.clone();
+                let task = client.history_backfill(chat_jid, i64::from(count));
+                run_wire(answer_to.clone(), id, reply, permit, task, |coverage| {
+                    DaemonResponse::HistoryCoverage {
+                        chat_jid: resume,
+                        oldest_ts: coverage.oldest_ms,
+                        newest_ts: coverage.newest_ms,
+                        stored_count: coverage.stored_count,
+                    }
+                });
+            }
+            WireRequest::RequestPairCode { phone } => {
+                // The session publishes the `PairCode` event and hands the
+                // code back here, so a script that asked synchronously gets
+                // the code rather than having to subscribe for it.
+                let task = client.request_pair_code(phone);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(pair)) => Ok(DaemonResponse::PairCode {
+                            code: pair.code,
+                            expires_at_ms: pair.expires_at_ms,
+                        }),
+                        Ok(Err(e)) => Err(ApiError::invalid_argument(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::BackfillMedia { chat_jid, limit } => {
+                let task = client.backfill_media(chat_jid, limit.clamp(1, 200) as i64);
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(report)) => {
+                            let mut downloaded = 0u64;
+                            for file in &report.files {
+                                let Some(key) = crate::media::download_key(&file.file_enc_sha256)
+                                else {
+                                    continue;
+                                };
+                                if crate::media::has(&key) {
+                                    continue;
+                                }
+                                if crate::media::put_owned(&key, file.bytes.clone()).is_ok() {
+                                    downloaded += 1;
+                                }
+                            }
+                            Ok(DaemonResponse::MediaBackfilled {
+                                requested: report.requested,
+                                downloaded,
+                            })
+                        }
+                        Ok(Err(e)) => Err(ApiError::internal(e)),
+                        Err(e) => Err(ApiError::not_connected(e.to_string())),
+                    };
+                    send_wire_result(&answer_to, id, result);
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
+            WireRequest::CleanupChats => {
+                let task = client.cleanup_chats();
+                run_wire(answer_to.clone(), id, reply, permit, task, |removed| {
+                    DaemonResponse::ChatsCleaned { removed }
+                });
+            }
+            WireRequest::PurgeMessages { chat_jid } => {
+                let task = client.purge_messages(chat_jid);
+                run_wire(answer_to.clone(), id, reply, permit, task, |purged| {
+                    DaemonResponse::MessagesPurged { purged }
+                });
+            }
+            _ => {
+                let answer_to = answer_to.clone();
+                oxidezap_session::spawn(async move {
+                    send_wire_result(
+                        &answer_to,
+                        id,
+                        Err(ApiError::unsupported("wire action not supported in bridge")),
+                    );
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+            }
         }
     }
 
@@ -318,6 +1328,7 @@ impl Bridge {
         }
 
         match action {
+            Action::Wire { .. } => unreachable!("Wire actions are handled in begin_slow"),
             Action::SendText(oxidezap_ipc::SendText {
                 jid,
                 text,
@@ -958,6 +1969,163 @@ fn next_local_id() -> String {
         wacore::time::now_millis(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// Answer a wire request from the session task that ran it.
+///
+/// One shape for every awaited mutation: the session's string failure becomes
+/// an internal error, a dead executor a dropped connection, and the value the
+/// response the caller maps it to. The permit is held until the work it paid
+/// for is over, like every other slow action.
+fn run_wire<T>(
+    answer_to: Outbox,
+    id: u64,
+    reply: tokio::sync::oneshot::Sender<CommandOutcome>,
+    permit: OwnedSemaphorePermit,
+    task: impl std::future::Future<Output = Result<Result<T, String>, impl std::fmt::Display>>
+    + Send
+    + 'static,
+    ok: impl FnOnce(T) -> DaemonResponse + Send + 'static,
+) {
+    oxidezap_session::spawn(async move {
+        let result = match task.await {
+            Ok(Ok(value)) => Ok(ok(value)),
+            Ok(Err(e)) => Err(ApiError::internal(e)),
+            Err(e) => Err(ApiError::not_connected(e.to_string())),
+        };
+        send_wire_result(&answer_to, id, result);
+        let _ = reply.send(CommandOutcome::Accepted);
+        drop(permit);
+    });
+}
+
+/// [`run_wire`], for lookups that can miss: `None` is a not-found error,
+// not an empty answer.
+#[allow(clippy::too_many_arguments)]
+fn run_wire_opt<T>(
+    answer_to: Outbox,
+    id: u64,
+    reply: tokio::sync::oneshot::Sender<CommandOutcome>,
+    permit: OwnedSemaphorePermit,
+    task: impl std::future::Future<Output = Result<Result<Option<T>, String>, impl std::fmt::Display>>
+    + Send
+    + 'static,
+    ok: impl FnOnce(T) -> DaemonResponse + Send + 'static,
+    missing: &'static str,
+) {
+    oxidezap_session::spawn(async move {
+        let result = match task.await {
+            Ok(Ok(Some(value))) => Ok(ok(value)),
+            Ok(Ok(None)) => Err(ApiError::not_found(missing)),
+            Ok(Err(e)) => Err(ApiError::internal(e)),
+            Err(e) => Err(ApiError::not_connected(e.to_string())),
+        };
+        send_wire_result(&answer_to, id, result);
+        let _ = reply.send(CommandOutcome::Accepted);
+        drop(permit);
+    });
+}
+
+/// A session contact view as the protocol's contact.
+fn contact_to_dto(contact: oxidezap_session::ContactView) -> ContactDto {
+    ContactDto {
+        jid: contact.jid,
+        name: contact.name,
+        push_name: contact.push_name,
+        phone: contact.phone,
+        is_business: contact.is_business,
+        alias: contact.alias,
+        tags: contact.tags,
+    }
+}
+
+/// A group-list row as the protocol's group.
+fn group_entry_to_dto(group: oxidezap_session::GroupListEntry) -> GroupDto {
+    GroupDto {
+        jid: group.jid,
+        subject: group.subject,
+        description: None,
+        owner_jid: None,
+        participant_count: group.participant_count,
+        announce_only: false,
+        locked: false,
+        participants: Vec::new(),
+    }
+}
+
+/// Full group metadata as the protocol's group.
+fn group_details_to_dto(group: oxidezap_session::GroupDetails) -> GroupDto {
+    GroupDto {
+        jid: group.jid,
+        subject: group.subject,
+        description: group.description,
+        owner_jid: group.owner_jid,
+        participant_count: group.participant_count,
+        announce_only: group.announce_only,
+        locked: group.locked,
+        participants: group
+            .participants
+            .into_iter()
+            .map(|p| GroupParticipantDto {
+                jid: p.jid,
+                is_admin: p.is_admin,
+                is_superadmin: p.is_superadmin,
+            })
+            .collect(),
+    }
+}
+
+/// A stored poll as the protocol's poll. Tallies are not decrypted here —
+/// see the session's note — so every option starts at zero.
+fn poll_view_to_dto(poll: oxidezap_session::PollView) -> PollDto {
+    PollDto {
+        id: poll.id,
+        chat_jid: poll.chat_jid,
+        question: poll.question,
+        options: poll
+            .options
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| PollOptionDto {
+                index: index as u32,
+                name,
+                vote_count: 0,
+                voters: Vec::new(),
+            })
+            .collect(),
+        selectable_count: poll.selectable_count,
+    }
+}
+
+/// A subscribed channel as the protocol's channel.
+fn channel_view_to_dto(channel: oxidezap_session::ChannelView) -> ChannelDto {
+    ChannelDto {
+        jid: channel.jid,
+        name: channel.name,
+        description: channel.description,
+        subscriber_count: channel.subscriber_count,
+        picture_url: channel.picture_url,
+    }
+}
+
+/// A profile as the protocol's profile.
+fn profile_view_to_dto(profile: oxidezap_session::ProfileView) -> oxidezap_wire::dto::ProfileDto {
+    oxidezap_wire::dto::ProfileDto {
+        jid: profile.jid,
+        name: profile.name,
+        about: profile.about,
+        picture_url: profile.picture_url,
+    }
+}
+
+fn send_wire_result(answer_to: &Outbox, id: u64, result: Result<DaemonResponse, ApiError>) {
+    let envelope = match result {
+        Ok(data) => ResponseEnvelope::success(id, data),
+        Err(err) => ResponseEnvelope::error(Some(id), err),
+    };
+    if let Ok(line) = serde_json::to_string(&envelope) {
+        answer_now(answer_to, line);
+    }
 }
 
 #[cfg(test)]

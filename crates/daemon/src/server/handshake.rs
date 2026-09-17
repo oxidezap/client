@@ -126,7 +126,7 @@ pub(super) async fn handshake<S: AsyncRead + AsyncWrite>(
 }
 
 /// What an accepted hello asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Attached {
     /// Whether this client wants the session's own events as well as
     /// summaries. See [`ClientRequest::Hello`].
@@ -137,6 +137,35 @@ pub(super) struct Attached {
     pub(super) owns_window: bool,
     /// Whether this connection receives live call video.
     pub(super) call_video: bool,
+    /// Whether this client requested read-only safety mode.
+    pub(super) read_only: bool,
+    /// Whether this client speaks the wire protocol.
+    pub(super) is_wire: bool,
+    /// Wire hello request ID.
+    pub(super) wire_hello_id: Option<u64>,
+}
+
+impl Attached {
+    /// A wire-protocol client, bound to the daemon's default account.
+    ///
+    /// The wire hello predates account scoping and carries no account: the CLI
+    /// reaches whichever daemon owns the socket it connected to. On a
+    /// multi-account daemon that is the legacy slot, which every install has
+    /// and which a fresh one allocates first; a wire client that wants another
+    /// local account is a follow-up, not a wire field yet.
+    pub(super) fn wire(session_events: bool, read_only: bool, wire_hello_id: Option<u64>) -> Self {
+        Self {
+            session_events,
+            scope: ClientScope::Account {
+                account: oxidezap_core::AccountId::LEGACY,
+            },
+            owns_window: false,
+            call_video: false,
+            read_only,
+            is_wire: true,
+            wire_hello_id,
+        }
+    }
 }
 
 /// Validate the client's opening frame.
@@ -144,6 +173,45 @@ pub(super) struct Attached {
 /// `Err` carries the rejection to send; `Ok` carries what the client asked to
 /// be served.
 pub(super) fn check_hello(line: &str) -> Result<Attached, Option<String>> {
+    // 1. Try parsing as a wire protocol RequestEnvelope
+    if let Ok(env) = serde_json::from_str::<oxidezap_wire::envelope::RequestEnvelope>(line) {
+        return match env.request {
+            oxidezap_wire::request::ClientRequest::Hello {
+                protocol,
+                client_name: _,
+                read_only,
+                session_events,
+            } => {
+                if protocol == oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION {
+                    Ok(Attached::wire(session_events, read_only, Some(env.id)))
+                } else {
+                    let err = oxidezap_wire::envelope::ResponseEnvelope {
+                        id: Some(env.id),
+                        result: oxidezap_wire::envelope::ResponseResult::Error {
+                            error: oxidezap_wire::error::ApiError::invalid_request(format!(
+                                "protocol version mismatch: client {protocol}, daemon {}",
+                                oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION
+                            )),
+                        },
+                    };
+                    Err(serde_json::to_string(&err).ok())
+                }
+            }
+            _ => {
+                let err = oxidezap_wire::envelope::ResponseEnvelope {
+                    id: Some(env.id),
+                    result: oxidezap_wire::envelope::ResponseResult::Error {
+                        error: oxidezap_wire::error::ApiError::invalid_request(
+                            "first frame must be a hello action",
+                        ),
+                    },
+                };
+                Err(serde_json::to_string(&err).ok())
+            }
+        };
+    }
+
+    // 2. Fall back to legacy Request
     let Request { id, request } = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => return Err(always(None, malformed(&e.to_string()))),
@@ -161,6 +229,9 @@ pub(super) fn check_hello(line: &str) -> Result<Attached, Option<String>> {
             scope,
             owns_window,
             call_video,
+            read_only: false,
+            is_wire: false,
+            wire_hello_id: None,
         }),
         ClientRequest::Hello { protocol, .. } => Err(always(
             id,

@@ -1,0 +1,32 @@
+[package]
+name = "oxidezap-cli"
+description = "Lightweight, scriptable WhatsApp CLI for OxideZap powered by usage-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxidezap-cli"
+path = "src/main.rs"
+
+[dependencies]
+oxidezap-ipc = { workspace = true }
+oxidezap-wire = { workspace = true }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true, features = ["std"] }
+usage = { workspace = true }
+
+# `CREATE_NO_WINDOW`, so a daemon the CLI starts does not pop a console window
+# of its own. The same flag the window's own launch passes.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+# The surface tests parse the JSON contract the binary prints.
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

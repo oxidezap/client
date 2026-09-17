@@ -52,15 +52,20 @@ jobs:
           cat > notes.md <<'NOTES'
           Unsigned development build of `main`. Expect breakage.
 
-          Download the archive for your platform and unpack it. It holds two
-          binaries that belong together: `oxidezap` is the window, `oxidezapd`
-          holds the WhatsApp session, and the first starts the second when
-          nothing is already running. Keep them in the same directory.
+          Download the archive for your platform and unpack it. It holds three
+          binaries that belong together, and they must stay in the same
+          directory:
+
+          - `oxidezap` is the window.
+          - `oxidezapd` holds the WhatsApp session. The window starts it when
+            nothing is already running.
+          - `oxidezap-cli` is the scriptable front end onto that same daemon,
+            for use from a terminal or a script.
 
           The tarballs carry the execute bit. On macOS, clear the quarantine
           flag before the first run:
 
-              xattr -dr com.apple.quarantine oxidezap oxidezapd
+              xattr -dr com.apple.quarantine oxidezap oxidezapd oxidezap-cli
 
           On Windows, SmartScreen will object. All of this follows from the
           binaries being unsigned.

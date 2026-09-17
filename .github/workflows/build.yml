@@ -125,12 +125,14 @@ jobs:
           key: ${{ matrix.target }}
           cache-targets: "false"
 
-      # Both binaries, because they are one product now: the front end owns no
-      # WhatsApp session and starts `oxidezapd` beside itself when none is
-      # running. Shipping the UI alone would ship something that cannot
-      # connect to anything.
+      # Three binaries, because they are one product now: the front end owns
+      # no WhatsApp session and starts `oxidezapd` beside itself when none is
+      # running, and `oxidezap-cli` is the scriptable front end onto that same
+      # daemon. Shipping the UI alone would ship something that cannot connect
+      # to anything, and shipping without the CLI would leave the feature
+      # undiscoverable from the releases page.
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin oxidezap --bin oxidezapd
+        run: cargo build --release --target ${{ matrix.target }} --bin oxidezap --bin oxidezapd --bin oxidezap-cli
 
       - name: Package the binaries for their platform
         shell: bash
@@ -162,14 +164,16 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             mv "target/$TARGET/release/oxidezap.exe" "$out/"
             mv "target/$TARGET/release/oxidezapd.exe" "$out/"
+            mv "target/$TARGET/release/oxidezap-cli.exe" "$out/"
             7z a -tzip "$out.zip" "$out" > /dev/null
             echo "ASSET=$out.zip" >> "$GITHUB_ENV"
           else
             mv "target/$TARGET/release/oxidezap" "$out/"
             mv "target/$TARGET/release/oxidezapd" "$out/"
+            mv "target/$TARGET/release/oxidezap-cli" "$out/"
             # Preserving the execute bit, which the bare binaries never had:
             # an archive can carry it where a raw asset download cannot.
-            chmod +x "$out/oxidezap" "$out/oxidezapd"
+            chmod +x "$out/oxidezap" "$out/oxidezapd" "$out/oxidezap-cli"
             tar -czf "$out.tar.gz" "$out"
             echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
           fi

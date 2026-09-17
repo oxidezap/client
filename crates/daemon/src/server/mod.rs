@@ -61,7 +61,7 @@ use crate::session_bridge::Commands;
 use crate::state::StateHub;
 
 use handshake::{handshake, read_frame};
-use requests::{dispatch, handle_request};
+use requests::{dispatch, handle_request, handle_wire_request};
 
 /// How long a client has to send its hello.
 ///
@@ -273,8 +273,18 @@ where
     // to whoever asked, and the ids are client-chosen.
     let (outbox, mut inbox) = tokio::sync::mpsc::channel::<String>(OUTBOX_CAPACITY);
 
-    let hello = hub.hello_frame().context("serializing the snapshot")?;
-    write_line(&mut writer, &hello).await?;
+    if attached.is_wire {
+        let resp = oxidezap_wire::envelope::ResponseEnvelope {
+            id: attached.wire_hello_id,
+            result: oxidezap_wire::envelope::ResponseResult::Ok {
+                payload: Box::new(oxidezap_wire::response::DaemonResponse::Ack),
+            },
+        };
+        write_line(&mut writer, &serde_json::to_string(&resp)?).await?;
+    } else {
+        let hello = hub.hello_frame().context("serializing the snapshot")?;
+        write_line(&mut writer, &hello).await?;
+    }
 
     if attached.session_events {
         // Nothing in the store has changed, so the session's invalidation
@@ -308,13 +318,37 @@ where
             biased;
 
             update = updates.recv(), if !awaiting_resync => match update {
-                Ok(frame) => write_line(&mut writer, &frame).await?,
+                Ok(frame) => {
+                    if attached.is_wire {
+                        // Translated, not forwarded: a wire client speaks
+                        // events, and frames without a wire spelling are
+                        // skipped rather than approximated.
+                        if let Some(line) =
+                            crate::session_bridge::translate_wire_frame(&frame, &hub)
+                        {
+                            write_line(&mut writer, &line).await?;
+                        }
+                    } else {
+                        write_line(&mut writer, &frame).await?;
+                    }
+                }
                 Err(RecvError::Lagged(missed)) => {
                     // The stream was truncated, so whatever the client holds is
                     // no longer trustworthy. Telling it to resync is the only
                     // correct answer; silently continuing would leave it with a
                     // state that never converges.
-                    log::debug!("client fell {missed} frames behind; asking it to resync");
+                    log::debug!("client fell {missed} frames behind");
+                    if attached.is_wire {
+                        // A wire client has no snapshot flow: `Resync` has no
+                        // wire spelling, `Snapshot` is a legacy request, and
+                        // gating this stream on an answer that can never come
+                        // stops its events for good. Ending the connection is
+                        // the whole recovery — the client reconnects and
+                        // re-reads, which is the only convergence it has.
+                        log::debug!("wire client cannot resync; closing so it reconnects");
+                        return Ok(());
+                    }
+                    log::debug!("asking it to resync");
                     let frame = serde_json::to_string(&DaemonMessage::Resync)?;
                     write_line(&mut writer, &frame).await?;
                     awaiting_resync = true;
@@ -329,13 +363,32 @@ where
             // it before the future.
             session = async { sessions.as_mut().expect("guarded").recv().await },
                 if sessions.is_some() => match session {
-                Ok(frame) => write_line(&mut writer, &frame).await?,
+                Ok(frame) => {
+                    if attached.is_wire {
+                        if let Some(line) =
+                            crate::session_bridge::translate_wire_frame(&frame, &hub)
+                        {
+                            write_line(&mut writer, &line).await?;
+                        }
+                    } else {
+                        write_line(&mut writer, &frame).await?;
+                    }
+                }
                 // A front end that overruns cannot patch the gap from a
                 // snapshot: it holds messages, not summaries. Telling it to
                 // resync is the only answer, and it reloads history when it
                 // reattaches.
                 Err(RecvError::Lagged(missed)) => {
                     log::debug!("front end fell {missed} session events behind");
+                    if attached.is_wire {
+                        // Same answer as the summary stream, and for the same
+                        // reason: a `Resync` frame is a legacy shape with no
+                        // wire spelling, so sending it to a wire client is a
+                        // frame it silently drops and a gap it never learns
+                        // about. Closing makes the reconnect the recovery.
+                        log::debug!("wire client cannot resync; closing so it reconnects");
+                        return Ok(());
+                    }
                     let frame = serde_json::to_string(&DaemonMessage::Resync)?;
                     write_line(&mut writer, &frame).await?;
                 }
@@ -397,6 +450,45 @@ where
             // `buf` across losing this race. See its documentation.
             frame = read_frame(&mut reader, &mut buf) => match frame? {
                 Some(oxidezap_ipc::FrameRead::Line(line)) => {
+                    if attached.is_wire {
+                        let env: oxidezap_wire::envelope::RequestEnvelope = match serde_json::from_str(&line) {
+                            Ok(env) => env,
+                            Err(e) => {
+                                let err_resp = oxidezap_wire::envelope::ResponseEnvelope {
+                                    id: None,
+                                    result: oxidezap_wire::envelope::ResponseResult::Error {
+                                        error: oxidezap_wire::error::ApiError::invalid_request(e.to_string()),
+                                    },
+                                };
+                                write_line(&mut writer, &serde_json::to_string(&err_resp)?).await?;
+                                continue;
+                            }
+                        };
+
+                        if attached.read_only && env.request.is_mutation() {
+                            let err_resp = oxidezap_wire::envelope::ResponseEnvelope {
+                                id: Some(env.id),
+                                result: oxidezap_wire::envelope::ResponseResult::Error {
+                                    error: oxidezap_wire::error::ApiError::permission_denied(
+                                        "read-only connection cannot mutate state",
+                                    ),
+                                },
+                            };
+                            write_line(&mut writer, &serde_json::to_string(&err_resp)?).await?;
+                            continue;
+                        }
+
+                        let answer = handle_wire_request(env, &hub, &plugins, &commands, &outbox).await;
+                        if let Some(frame) = answer.frame {
+                            write_line(&mut writer, &frame).await?;
+                        }
+                        if answer.shutdown {
+                            crate::shutdown::request("ipc client");
+                            return Ok(());
+                        }
+                        continue;
+                    }
+
                     // Parsed once, here: gating update delivery and answering
                     // are two decisions about one frame, and reading it twice
                     // is how they drift apart.

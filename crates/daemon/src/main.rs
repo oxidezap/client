@@ -6,8 +6,10 @@
 
 // A background service, not a console program: on Windows release builds no
 // terminal comes with it, whether it was started from the GUI or by hand.
-// Debug keeps its console so `cargo run --bin oxidezapd` still shows logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// A rejected `--account` is reported before the logging subsystem exists, so
+// this binary's own stderr is the only stream there is at that point.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use oxidezap_daemon::{
     account::{AccountRegistry, AccountSupervisor},
@@ -26,6 +28,57 @@ use oxidezap_session::StoreRegistry;
 mod macos_main;
 
 fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "Usage: oxidezapd [OPTIONS]\n\nOptions:\n      --headless       Run headless without system tray integration\n      --account <id>   Run as a named account profile (own socket, lock,\n                       database and media cache; also OXIDEZAP_ACCOUNT)\n  -h, --help           Print help"
+        );
+        return Ok(());
+    }
+
+    // A named account profile owns its socket, lock, database and media
+    // cache; without one this is the default profile on the historic paths.
+    // Read here, before the claim, so every path derived below agrees.
+    // Validated, never sanitized: `wo/rk` must not converge onto `work`.
+    let mut account_from_flag: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--account"
+            && let Some(id) = args.next()
+        {
+            account_from_flag = Some(id);
+        }
+    }
+    // A supplied `--account` is validated whether or not it wins, so a typo
+    // is refused instead of being silently overruled by the environment. The
+    // precedence itself is unchanged: the flag only sets the variable when
+    // the environment does not already hold one.
+    if let Some(id) = &account_from_flag
+        && oxidezap_wire::validate_account_id(id).is_none()
+    {
+        eprintln!(
+            "error [invalid_account_id]: --account must match [A-Za-z0-9][A-Za-z0-9_-]*, got {id:?}"
+        );
+        std::process::exit(2);
+    }
+    if let Some(id) = account_from_flag
+        && std::env::var_os("OXIDEZAP_ACCOUNT").is_none()
+    {
+        // Single-threaded startup, before the runtime exists: no thread can
+        // observe the environment changing under it.
+        unsafe {
+            std::env::set_var("OXIDEZAP_ACCOUNT", id);
+        }
+    }
+    if let Some(raw) = std::env::var_os("OXIDEZAP_ACCOUNT")
+        && oxidezap_wire::validate_account_id(&raw.to_string_lossy()).is_none()
+    {
+        eprintln!(
+            "error [invalid_account_id]: OXIDEZAP_ACCOUNT must match [A-Za-z0-9][A-Za-z0-9_-]*, got {:?}",
+            raw.to_string_lossy()
+        );
+        std::process::exit(2);
+    }
+
     // The level the last person to change it chose, unless `RUST_LOG` says
     // otherwise for this run — and changeable while the daemon runs, which is
     // the point: nearly everything worth reading about a session is written
@@ -86,13 +139,22 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     // The tray is optional by design: no StatusNotifierItem host (a bare WM, a
     // headless session) is a reason to run without an icon, not to refuse to
     // start. On macOS the icon lives on the main thread instead (see
-    // `macos_main`), so there is nothing to spawn here.
+    // `macos_main`), so there is nothing to spawn here — and nothing to ask:
+    // the binding exists only where the non-macOS branch below reads it.
     #[cfg(not(target_os = "macos"))]
-    let tray = match tray::spawn(Arc::clone(&hub)).await {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            log::warn!("no tray presence: {e}");
-            None
+    let headless = std::env::args().any(|a| a == "--headless")
+        || std::env::var_os("OXIDEZAPD_HEADLESS").is_some();
+    #[cfg(not(target_os = "macos"))]
+    let tray = if headless {
+        log::info!("running in headless mode: system tray disabled");
+        None
+    } else {
+        match tray::spawn(Arc::clone(&hub)).await {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::warn!("no tray presence: {e}");
+                None
+            }
         }
     };
     #[cfg(target_os = "macos")]

@@ -285,15 +285,17 @@ const MEDIA_DIR: &str = "media";
 pub fn endpoint_path() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        Some(state_dir()?.join(SOCKET_NAME))
+        Some(state_dir()?.join(socket_file_name()))
     }
     #[cfg(windows)]
     {
         // Named pipes are machine-wide, so the name carries the user: two
         // people signed into one machine must not land on each other's
-        // session. The same reason the Unix fallback carries the uid.
+        // session. The same reason the Unix fallback carries the uid. The
+        // account rides along for the same reason the socket file does.
+        let account = account_id().map(|id| format!("-{id}")).unwrap_or_default();
         Some(PathBuf::from(format!(
-            r"\\.\pipe\{DIR_NAME}-{}",
+            r"\\.\pipe\{DIR_NAME}-{}{account}",
             user_suffix()?
         )))
     }
@@ -345,7 +347,7 @@ pub fn state_dir() -> Option<PathBuf> {
 /// the endpoint is not a file at all.
 #[must_use]
 pub fn lock_path() -> Option<PathBuf> {
-    Some(state_dir()?.join("daemon.lock"))
+    Some(state_dir()?.join(account_lock_file_name()))
 }
 
 /// Where a media payload with this cache key lives.
@@ -522,7 +524,128 @@ pub fn account_staged_prefix_of(key: &str) -> Option<oxidezap_core::AccountId> {
 /// The directory [`media_path`] resolves into.
 #[must_use]
 pub fn media_dir() -> Option<PathBuf> {
-    Some(state_dir()?.join(MEDIA_DIR))
+    Some(state_dir()?.join(media_dir_name()))
+}
+
+/// The account profile in force, from `OXIDEZAP_ACCOUNT`.
+///
+/// Validated, never sanitized: an invalid value falls back to the default
+/// profile rather than converging onto a real one (see
+/// [`oxidezap_wire::validate_account_id`]). Entry points that take an id
+/// from the user — CLI `--account`, `accounts use`, daemon `--account` —
+/// reject invalid ids outright instead of reaching this fallback. Unset or
+/// empty means the default profile. One account is one daemon over one
+/// store: the socket, the lock, the media cache and the database all derive
+/// from this, so two profiles never share state.
+#[must_use]
+pub fn account_id() -> Option<String> {
+    let raw = std::env::var_os("OXIDEZAP_ACCOUNT")?;
+    oxidezap_wire::validate_account_id(&raw.to_string_lossy())
+}
+
+/// Every account socket the state directory holds: the default
+/// `daemon.sock` plus each `daemon-<id>.sock`, with the default first.
+#[must_use]
+pub fn account_sockets() -> Vec<(String, PathBuf)> {
+    let Some(dir) = state_dir() else {
+        return Vec::new();
+    };
+    let entries = std::fs::read_dir(&dir).map(|read| {
+        read.filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "sock")
+                    && path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| stem == "daemon" || stem.starts_with("daemon-"))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut found: Vec<(String, PathBuf)> = entries
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("daemon");
+            let id = stem
+                .strip_prefix("daemon-")
+                .unwrap_or("default")
+                .to_string();
+            (id, path)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The socket file for one account: the default name, or a suffixed one.
+///
+/// `None` for an invalid id: callers already handle `None` as "no endpoint",
+/// so a rejected id never converges onto another profile's socket.
+#[must_use]
+pub fn endpoint_path_for_account(id: &str) -> Option<PathBuf> {
+    let clean = oxidezap_wire::validate_account_id(id)?;
+    #[cfg(unix)]
+    {
+        Some(state_dir()?.join(format!("daemon-{clean}.sock")))
+    }
+    #[cfg(windows)]
+    {
+        // The id the caller named, never the one in the environment: a caller
+        // that says `work` must get `work`'s pipe whatever profile the shell
+        // had selected. Delegating to `endpoint_path` would read
+        // `OXIDEZAP_ACCOUNT`, so `accounts remove work` could resolve the pipe
+        // of whoever was selected instead.
+        Some(account_pipe_name(&clean, &user_suffix()?))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = clean;
+        None
+    }
+}
+
+/// A named pipe's name for one account, given the user's SID suffix.
+///
+/// Split out so the id's part in the name is testable on every platform: the
+/// bug this replaced ignored the id outright and read the profile from the
+/// environment. Windows-only in effect, but pure and platform-free in shape.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn account_pipe_name(clean: &str, user: &str) -> PathBuf {
+    PathBuf::from(format!(r"\\.\pipe\{DIR_NAME}-{user}-{clean}"))
+}
+
+/// Only a Unix endpoint is a file with a name: Windows listens on a named
+/// pipe and a page reaches its daemon over the loopback bridge, so neither
+/// has a socket file to name. Gated like [`SOCKET_NAME`] itself, beside the
+/// one caller that is gated the same way.
+#[cfg(unix)]
+fn socket_file_name() -> String {
+    match account_id() {
+        None => SOCKET_NAME.to_string(),
+        Some(id) => format!("daemon-{id}.sock"),
+    }
+}
+
+fn lock_file_name() -> &'static str {
+    "daemon.lock"
+}
+
+fn account_lock_file_name() -> String {
+    match account_id() {
+        None => lock_file_name().to_string(),
+        Some(id) => format!("daemon-{id}.lock"),
+    }
+}
+
+fn media_dir_name() -> String {
+    match account_id() {
+        None => MEDIA_DIR.to_string(),
+        Some(id) => format!("{MEDIA_DIR}-{id}"),
+    }
 }
 
 /// What distinguishes one user's daemon from another's on the same machine.
@@ -634,6 +757,46 @@ mod tests {
                 "a pipe name is machine-wide, so it has to say whose it is: {name}"
             );
         }
+    }
+
+    /// An invalid account id resolves to no endpoint rather than to
+    /// another profile's socket: `wo/rk` must not converge onto `work`.
+    #[test]
+    fn an_invalid_account_id_resolves_to_no_endpoint() {
+        for id in ["", "-work", "wo/rk", "wo!rk", "wo rk", "../x"] {
+            assert_eq!(endpoint_path_for_account(id), None, "{id}");
+        }
+    }
+
+    /// A valid account id names its own suffixed socket.
+    #[cfg(unix)]
+    #[test]
+    fn a_valid_account_id_names_its_own_socket() {
+        let path = endpoint_path_for_account("work").expect("a valid id");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("daemon-work.sock")
+        );
+    }
+
+    /// The pipe name carries the id the caller asked for, not whichever
+    /// profile is selected in the environment.
+    ///
+    /// The Windows branch used to fall back to `endpoint_path()`, which reads
+    /// `OXIDEZAP_ACCOUNT`: `accounts remove work` could resolve the pipe of
+    /// the currently selected account and wipe the wrong store.
+    #[test]
+    fn an_account_pipe_name_carries_the_id_it_was_given() {
+        let work = account_pipe_name("work", "S-1-5-21");
+        let other = account_pipe_name("other", "S-1-5-21");
+        assert_ne!(work, other, "two ids must not share one pipe");
+        let name = work.to_string_lossy();
+        assert!(name.starts_with(r"\\.\pipe\"), "not a pipe name: {name}");
+        assert!(name.ends_with("-work"), "the id is not in the name: {name}");
+        assert!(
+            name.contains("S-1-5-21"),
+            "the name is machine-wide, so it has to say whose it is: {name}"
+        );
     }
 
     /// Both live under the same per-user directory, so whatever protects one

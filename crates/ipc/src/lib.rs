@@ -21,11 +21,14 @@
 // WebSocket. That is the whole of the platform split on this side (see
 // /AGENTS.md); everything above it gets [`Link`] and never mentions any of
 // them.
+#[cfg(not(target_family = "wasm"))]
+pub mod client;
 mod endpoint;
 /// Where a frame ends, and how long one may be — the framing this crate
 /// exists to put around the domain types.
 pub mod framing;
 mod link;
+#[cfg(feature = "legacy-protocol")]
 mod protocol;
 /// How a tab with no session finds the tab that has one.
 pub mod tabs;
@@ -36,6 +39,8 @@ pub mod web_locks;
 #[cfg(windows)]
 pub mod windows_user;
 
+#[cfg(not(target_family = "wasm"))]
+pub use client::IpcClient;
 #[cfg(target_family = "wasm")]
 pub use endpoint::tab;
 #[cfg(target_family = "wasm")]
@@ -44,6 +49,8 @@ pub use endpoint::web;
 pub use endpoint::{Endpoint, Hangup, Reader, Writer};
 pub use framing::{FrameRead, MAX_DAEMON_FRAME_BYTES, MAX_REQUEST_BYTES, read_frame};
 pub use link::Link;
+pub use oxidezap_wire as wire;
+#[cfg(feature = "legacy-protocol")]
 pub use protocol::{
     AccountIdentity, AccountOverview, AccountStatus, AccountsSnapshot, CallAction, ChatSummary,
     ClientRequest, ClientScope, ConnectionState, DaemonEvent, DaemonMessage, Download,
@@ -53,7 +60,8 @@ pub use protocol::{
 };
 pub use transport::{
     ACCOUNT_STAGED_INFIX, DEFAULT_WEB_PORT, MAX_STAGED_BYTES, PROTOCOL_VERSION, STAGED_PREFIX,
-    WEB_MEDIA_PATH, WEB_SOCKET_PATH, account_prefix_of, account_staged_key, account_staged_prefix,
-    account_staged_prefix_of, endpoint_path, is_global_staged_key, is_staged_key, key_local_name,
-    lock_path, media_dir, media_path, staged_key, state_dir, web_token_path,
+    WEB_MEDIA_PATH, WEB_SOCKET_PATH, account_id, account_prefix_of, account_sockets,
+    account_staged_key, account_staged_prefix, account_staged_prefix_of, endpoint_path,
+    endpoint_path_for_account, is_global_staged_key, is_staged_key, key_local_name, lock_path,
+    media_dir, media_path, staged_key, state_dir, web_token_path,
 };

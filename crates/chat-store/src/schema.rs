@@ -66,6 +66,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    contact_labels (device_id, jid) {
+        device_id -> Integer,
+        jid -> Text,
+        alias -> Nullable<Text>,
+        tags -> Text,
+    }
+}
+
+diesel::table! {
     message_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type) {
         device_id -> Integer,
         chat_jid -> Text,
@@ -117,5 +126,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     messages,
     reactions,
     contacts,
+    contact_labels,
     message_receipts
 );

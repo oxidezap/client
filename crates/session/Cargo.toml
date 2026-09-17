@@ -40,6 +40,9 @@ wacore = { workspace = true }
 oxidezap-audio = { workspace = true }
 oxidezap-chat-store = { workspace = true, features = ["search"] }
 oxidezap-core = { workspace = true }
+# The account-id rule: one shared validator, so a profile name can never mean
+# one thing for the socket and another for the database.
+oxidezap-wire = { workspace = true }
 # Where a task runs and how it waits, for both targets. `exec` is still the
 # module the session asks; what it asks is one crate down, because the plugin
 # host sits beside the session and cannot ask it — which is how the browser

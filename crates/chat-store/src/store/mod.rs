@@ -240,6 +240,12 @@ fn adopt_renumbered(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
             "SELECT count(*) AS count FROM sqlite_master \
              WHERE type = 'table' AND name = 'avatar_descriptors'",
         ),
+        (
+            "20260916000001",
+            "20260916100002",
+            "SELECT count(*) AS count FROM sqlite_master \
+             WHERE type = 'table' AND name = 'contact_labels'",
+        ),
     ];
     for (old, new, produced) in RENUMBERED {
         let mut recorded = |version: &str| -> diesel::QueryResult<i64> {
@@ -707,9 +713,10 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // The most recent migration only adds the `device` foreign key to the
-        // avatar descriptors; reverting it leaves the table in place without
-        // the constraint, which is reversible and loses nothing durable.
+        // Reverted in reverse application order. On top is the account-cascade
+        // follow-up: it only adds the `device` foreign key to the descriptors
+        // and the labels table, so reverting it leaves both in place without
+        // the constraint, which loses nothing durable.
         store
             .shared()
             .run(|conn| {
@@ -718,15 +725,30 @@ mod migration_tests {
                     .map_err(StoreError::Migration)
             })
             .await
-            .expect("avatar-descriptor cascade downgrade is reversible");
+            .expect("account-cascade follow-up downgrade is reversible");
         assert!(
-            has_table(&store, "avatar_descriptors").await,
-            "reverting only the constraint must leave the descriptor table"
+            has_table(&store, "avatar_descriptors").await
+                && has_table(&store, "contact_labels").await,
+            "reverting only the constraint must leave both tables"
         );
 
-        // The descriptors themselves are derived state, so reverting their
-        // migration is cheap and loses nothing durable: the table goes and a
-        // later start refetches.
+        // The labels migration holds device-local metadata with no source to
+        // re-read it from, so its down migration drops the table, which is the
+        // honest answer rather than a failed revert.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("revert the reversible labels migration");
+        assert!(!has_table(&store, "contact_labels").await);
+
+        // The descriptors are derived state, so reverting their migration is
+        // cheap and loses nothing durable: the table goes and a later start
+        // refetches.
         store
             .shared()
             .run(|conn| {
@@ -753,7 +775,7 @@ mod migration_tests {
         assert!(!has_column(&store, "messages", "id").await);
         assert!(!has_column(&store, "messages", "proto_codec").await);
 
-        // The sender-identity migration below it is not: collapsing the
+        // The sender-identity migration below those is not: collapsing the
         // identity key back cannot reunite rows that became distinct, so it
         // still refuses.
         let error = store

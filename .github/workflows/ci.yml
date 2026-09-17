@@ -117,6 +117,17 @@ jobs:
       # none, so they need their own libtest step.
       - name: Run doctests
         run: cargo test --workspace --all-features --doc
+      # The CLI is the scriptable surface, and its size is the contract: it
+      # must stay dependency-light (blocking I/O, no runtime, no GUI
+      # crates). Release, because debug sizes are allocator noise; 2 MiB
+      # leaves headroom over the ~1.5 MiB it ships today while catching a
+      # heavy dependency the moment it lands.
+      - name: Check the CLI binary budget
+        run: |
+          cargo build -p oxidezap-cli --release
+          size=$(stat -c%s target/release/oxidezap-cli)
+          echo "oxidezap-cli release size: $size bytes"
+          test "$size" -lt 2097152
       # The example plugins, which the workspace steps above compile no line
       # of: `examples/` is excluded from the root workspace so that a host
       # build does not fail at every `oxi_*` import. Nothing checked them, and

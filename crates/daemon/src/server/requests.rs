@@ -651,3 +651,267 @@ fn no_session(detail: impl Into<String>) -> ProtocolError {
         detail: detail.into(),
     }
 }
+
+fn wire_ok(id: u64, payload: oxidezap_wire::response::DaemonResponse) -> Answer {
+    let env = oxidezap_wire::envelope::ResponseEnvelope {
+        id: Some(id),
+        result: oxidezap_wire::envelope::ResponseResult::Ok {
+            payload: Box::new(payload),
+        },
+    };
+    Answer::frame(serde_json::to_string(&env).ok())
+}
+
+fn wire_err(id: u64, error: oxidezap_wire::error::ApiError) -> Answer {
+    let env = oxidezap_wire::envelope::ResponseEnvelope {
+        id: Some(id),
+        result: oxidezap_wire::envelope::ResponseResult::Error { error },
+    };
+    Answer::frame(serde_json::to_string(&env).ok())
+}
+
+async fn out_of_band_wire(
+    hub: &StateHub,
+    commands: &Commands,
+    outbox: &Outbox,
+    id: u64,
+    request: oxidezap_wire::request::ClientRequest,
+) -> Answer {
+    let action = Action::Wire {
+        id,
+        request,
+        answer_to: outbox.clone(),
+    };
+    match dispatch(hub, commands, action).await {
+        Ok(()) => Answer::frame(None),
+        Err(err) => {
+            let api_err = match err {
+                ProtocolError::NoSession { detail } => {
+                    oxidezap_wire::error::ApiError::not_connected(detail)
+                }
+                ProtocolError::Refused { detail } => {
+                    oxidezap_wire::error::ApiError::permission_denied(detail)
+                }
+                other => oxidezap_wire::error::ApiError::internal(other.to_string()),
+            };
+            wire_err(id, api_err)
+        }
+    }
+}
+
+pub(super) async fn handle_wire_request(
+    oxidezap_wire::envelope::RequestEnvelope { id, request }: oxidezap_wire::envelope::RequestEnvelope,
+    hub: &StateHub,
+    _plugins: &Arc<oxidezap_plugin_host::Plugins>,
+    commands: &Commands,
+    outbox: &Outbox,
+) -> Answer {
+    use oxidezap_wire::dto::{DoctorDto, StorageDto};
+    use oxidezap_wire::request::ClientRequest as WireRequest;
+    use oxidezap_wire::response::DaemonResponse as WireResponse;
+
+    match request {
+        WireRequest::Hello { .. } => wire_ok(id, WireResponse::Ack),
+        WireRequest::GetStatus => {
+            // One constructor for polls and events, so the two never
+            // disagree about what a state is called.
+            let snap = hub.snapshot();
+            let status = crate::session_bridge::connection_status_of(&snap.connection, hub);
+            wire_ok(id, WireResponse::Status(status))
+        }
+        WireRequest::DoctorCheck => {
+            let endpoint_path = oxidezap_ipc::endpoint_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let db_bytes = database_bytes();
+            let (media_bytes, _) = crate::media::cache_usage();
+            let media_dir_str = oxidezap_ipc::media_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let snap = hub.snapshot();
+            let doctor = DoctorDto {
+                daemon_running: true,
+                socket_path: endpoint_path,
+                connection_state: format!("{:?}", snap.connection),
+                database_ok: true,
+                database_bytes: db_bytes,
+                media_cache_dir: media_dir_str,
+                media_cache_bytes: media_bytes,
+            };
+            wire_ok(id, WireResponse::Doctor(doctor))
+        }
+        WireRequest::GetStorageUsage => {
+            let (media_bytes, media_files) = crate::media::cache_usage();
+            let db_bytes = database_bytes();
+            let storage = StorageDto {
+                database_bytes: db_bytes,
+                media_bytes,
+                media_files,
+            };
+            wire_ok(id, WireResponse::Storage(storage))
+        }
+        WireRequest::ClearMediaCache => {
+            // The wipe's own answer is the client's answer. Discarding it and
+            // replying `Ack` unconditionally told a script the cache was clean
+            // when the filesystem had refused, which is exactly the failure
+            // the structured-error contract exists to surface.
+            match oxidezap_session::unblock(|| {
+                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| e.to_string())
+            })
+            .await
+            {
+                Ok(Ok(())) => wire_ok(id, WireResponse::Ack),
+                Ok(Err(e)) => wire_err(id, oxidezap_wire::error::ApiError::internal(e)),
+                Err(_) => wire_err(
+                    id,
+                    oxidezap_wire::error::ApiError::internal("the cache wipe did not finish"),
+                ),
+            }
+        }
+        WireRequest::Shutdown => Answer {
+            frame: serde_json::to_string(&oxidezap_wire::envelope::ResponseEnvelope {
+                id: Some(id),
+                result: oxidezap_wire::envelope::ResponseResult::Ok {
+                    payload: Box::new(WireResponse::Ack),
+                },
+            })
+            .ok(),
+            shutdown: true,
+        },
+        WireRequest::ListMessages { .. }
+        | WireRequest::GetMessage { .. }
+        | WireRequest::GetMessageContext { .. }
+        | WireRequest::SearchMessages { .. }
+        | WireRequest::ListContacts { .. }
+        | WireRequest::GetContact { .. }
+        | WireRequest::RefreshContacts { .. }
+        | WireRequest::SetContactAlias { .. }
+        | WireRequest::TagContact { .. }
+        | WireRequest::UntagContact { .. }
+        | WireRequest::ListChats { .. }
+        | WireRequest::GetChat { .. }
+        | WireRequest::SendText { .. }
+        | WireRequest::SendMedia { .. }
+        | WireRequest::SendAudio { .. }
+        | WireRequest::SendReaction { .. }
+        | WireRequest::EditMessage { .. }
+        | WireRequest::RevokeMessage { .. }
+        | WireRequest::ForwardMessage { .. }
+        | WireRequest::SendPoll { .. }
+        | WireRequest::VotePoll { .. }
+        | WireRequest::ListPolls { .. }
+        | WireRequest::GetPoll { .. }
+        | WireRequest::SendLocation { .. }
+        | WireRequest::SendStatus { .. }
+        | WireRequest::SendSticker { .. }
+        | WireRequest::SendListResponse { .. }
+        | WireRequest::ListStarredMessages { .. }
+        | WireRequest::ListGroups
+        | WireRequest::GetGroupInfo { .. }
+        | WireRequest::CreateGroup { .. }
+        | WireRequest::SetGroupTopic { .. }
+        | WireRequest::SetGroupDescription { .. }
+        | WireRequest::ManageGroupParticipant { .. }
+        | WireRequest::GetGroupInviteLink { .. }
+        | WireRequest::JoinGroup { .. }
+        | WireRequest::LeaveGroup { .. }
+        | WireRequest::SetGroupPermissions { .. }
+        | WireRequest::ListGroupJoinRequests { .. }
+        | WireRequest::ManageGroupJoinRequest { .. }
+        | WireRequest::ListChannels
+        | WireRequest::GetChannelInfo { .. }
+        | WireRequest::JoinChannel { .. }
+        | WireRequest::LeaveChannel { .. }
+        | WireRequest::GetProfile { .. }
+        | WireRequest::GetBusinessProfile { .. }
+        | WireRequest::SetProfileAbout { .. }
+        | WireRequest::SetProfileName { .. }
+        | WireRequest::SetProfilePicture { .. }
+        | WireRequest::RemoveProfilePicture
+        | WireRequest::CheckContact { .. }
+        | WireRequest::DownloadMedia { .. }
+        | WireRequest::RetryMedia { .. }
+        | WireRequest::HistoryCoverage { .. }
+        | WireRequest::BackfillMedia { .. }
+        | WireRequest::CleanupChats
+        | WireRequest::PurgeMessages { .. }
+        | WireRequest::MarkRead { .. }
+        | WireRequest::MarkUnread { .. }
+        | WireRequest::PinChat { .. }
+        | WireRequest::MuteChat { .. }
+        | WireRequest::ArchiveChat { .. }
+        | WireRequest::SetPresence { .. }
+        | WireRequest::RequestPairCode { .. }
+        | WireRequest::ListCalls { .. } => {
+            out_of_band_wire(hub, commands, outbox, id, request).await
+        }
+        WireRequest::HistoryBackfill { .. } => {
+            // The reload republish lands where the backfill reads: the lane
+            // re-reads the store, and the backfill warms the page after it.
+            // Best effort — a refused reload still leaves a local backfill.
+            let _ = dispatch(hub, commands, Action::ReloadHistory).await;
+            out_of_band_wire(hub, commands, outbox, id, request).await
+        }
+        WireRequest::ForgetSession => {
+            // The bridge owns the forget flag, so this rides the legacy
+            // action rather than the wire out-of-band path. The wire's own
+            // `ForgetSession` is the self-service "clear data and pair again":
+            // it keeps the account id and expects a re-pair.
+            match dispatch(
+                hub,
+                commands,
+                Action::ForgetSession(crate::session_bridge::AccountDisposition::Reset),
+            )
+            .await
+            {
+                Ok(()) => wire_ok(id, WireResponse::Ack),
+                Err(ProtocolError::NoSession { detail }) => {
+                    wire_err(id, oxidezap_wire::error::ApiError::not_connected(detail))
+                }
+                Err(ProtocolError::Refused { detail }) => wire_err(
+                    id,
+                    oxidezap_wire::error::ApiError::permission_denied(detail),
+                ),
+                Err(other) => wire_err(
+                    id,
+                    oxidezap_wire::error::ApiError::internal(other.to_string()),
+                ),
+            }
+        }
+        WireRequest::ListAccounts => match oxidezap_session::unblock(list_account_profiles).await {
+            Ok(accounts) => wire_ok(id, WireResponse::Accounts { accounts }),
+            Err(e) => wire_err(id, oxidezap_wire::error::ApiError::internal(e.to_string())),
+        },
+    }
+}
+
+/// Every account socket the state directory holds, with a liveness probe.
+///
+/// Blocking by nature — directory scan plus connects — so it runs on the
+/// blocking pool, like the media reads it joins.
+fn list_account_profiles() -> Vec<oxidezap_wire::dto::AccountDto> {
+    oxidezap_ipc::account_sockets()
+        .into_iter()
+        .map(|(id, path)| {
+            let active = is_daemon_socket_live(&path);
+            oxidezap_wire::dto::AccountDto {
+                id,
+                socket_path: path.to_string_lossy().into_owned(),
+                active,
+            }
+        })
+        .collect()
+}
+
+/// A connect probe: a live daemon accepts, a stale socket file refuses.
+fn is_daemon_socket_live(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}

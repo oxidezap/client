@@ -79,7 +79,17 @@ fn database_dir() -> Option<std::path::PathBuf> {
             })
     };
 
-    let dir = data_root.map(|root| root.join(DATA_DIR))?;
+    // One database per account profile: a second daemon over the same file
+    // would lose the startup race by design, so each profile gets its own
+    // directory. Unset means the default profile and the historic path.
+    // Validated with the one shared rule, so the database can never read a
+    // profile name differently from the socket beside it.
+    let dir = match std::env::var_os("OXIDEZAP_ACCOUNT")
+        .and_then(|v| oxidezap_wire::validate_account_id(&v.to_string_lossy()))
+    {
+        None => data_root.map(|root| root.join(DATA_DIR))?,
+        Some(id) => data_root.map(|root| root.join(format!("{DATA_DIR}-{id}")))?,
+    };
     // SQLite won't create missing parent directories itself.
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!("Failed to create data dir: {e}; using CWD-relative {DB_FILE}");

@@ -43,6 +43,86 @@ async fn keyset_pagination_covers_all_pages_in_order() {
     assert_eq!(seen, ["m4", "m3", "m2", "m1", "m0"]);
 }
 
+/// The forward twin: walking *after* a cursor yields what came later, oldest
+/// first, with the same rows the backward walk sees.
+#[tokio::test]
+async fn forward_pages_continue_from_a_row_in_arrival_order() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    let events: Vec<Event> = (0..5)
+        .map(|i| {
+            message_event(
+                wa::Message::text(format!("m{i}")),
+                incoming_info(PEER, PEER, &format!("MSG-{i}"), 1_700_000_000 + i),
+            )
+        })
+        .collect();
+    feed(&chat_store, events).await;
+
+    // The oldest row is where a caller that does not yet hold anything starts.
+    let oldest = chat_store
+        .oldest_message(&chat)
+        .await
+        .unwrap()
+        .expect("the chat has rows");
+    assert_eq!(oldest.text.as_deref(), Some("m0"));
+
+    let mut seen = Vec::new();
+    let mut cursor = oldest;
+    loop {
+        let page = chat_store
+            .messages_after(&chat, (&cursor).into(), 2)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().unwrap().clone();
+        seen.extend(page.into_iter().map(|m| m.text.unwrap()));
+    }
+    // Oldest first, from the row after the anchor, no duplicates, no gaps.
+    assert_eq!(seen, ["m1", "m2", "m3", "m4"]);
+}
+
+/// A forward page from the newest row is empty: there is nothing after it.
+#[tokio::test]
+async fn a_forward_page_past_the_end_is_empty() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("only"),
+            incoming_info(PEER, PEER, "MSG-ONLY", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let newest = chat_store.messages(&chat, None, 1).await.unwrap();
+    let newest = newest.first().expect("one row");
+    let page = chat_store
+        .messages_after(&chat, newest.into(), 5)
+        .await
+        .unwrap();
+    assert!(page.is_empty(), "nothing follows the newest row");
+}
+
+/// The oldest-row anchor a phone request needs: absent on an empty chat.
+#[tokio::test]
+async fn an_empty_chat_has_no_oldest_message() {
+    let (_store, chat_store) = test_store().await;
+    assert!(
+        chat_store
+            .oldest_message(&jid(PEER))
+            .await
+            .unwrap()
+            .is_none(),
+        "an empty chat has nothing to anchor a history request on"
+    );
+}
+
 /// A conversation timestamp far outside anything a clock produces used to
 /// stop the chat list paginating for good: it sorts to the top, so it is very
 /// likely the row a page ends on, and the instant it reads back as is `None`
@@ -798,4 +878,51 @@ async fn a_new_message_can_land_at_a_previously_used_seq() {
         page[0].seq,
         watermark
     );
+}
+
+/// The forward walk collapses the PN/LID pair the same way the backward one
+/// does, and tops the page up from behind the duplicates.
+///
+/// Without it a page of two could return one logical message twice: two slots
+/// spent on one bubble, and a cursor parked on the second copy that then
+/// re-reads what the caller already had.
+#[tokio::test]
+async fn a_forward_page_collapses_the_identity_pair() {
+    let (store, chat_store) = test_store().await;
+    // No mapping yet, so the two identities file their own copy.
+    let mut events = Vec::new();
+    events.push(message_event(
+        wa::Message::text("anchor"),
+        incoming_info(PEER, PEER, "ANCHOR", 1_699_999_000),
+    ));
+    for (n, id) in ["DUP-A", "DUP-B"].iter().enumerate() {
+        let at = 1_700_000_000 + n as i64;
+        events.push(message_event(
+            wa::Message::text("under the number"),
+            incoming_info(PEER, PEER, id, at),
+        ));
+        events.push(message_event(
+            wa::Message::text("under the lid"),
+            incoming_info(PEER_LID, PEER_LID, id, at),
+        ));
+    }
+    events.push(message_event(
+        wa::Message::text("newest, only under the number"),
+        incoming_info(PEER, PEER, "NEWER", 1_700_000_100),
+    ));
+    feed(&chat_store, events).await;
+
+    add_lid_mapping(&store).await;
+    let anchor = chat_store
+        .oldest_message(&jid(PEER))
+        .await
+        .unwrap()
+        .expect("anchor row");
+    let page = chat_store
+        .messages_after(&jid(PEER), (&anchor).into(), 3)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 3, "two duplicates must not spend two slots");
+    let ids: Vec<&str> = page.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["DUP-A", "DUP-B", "NEWER"]);
 }
