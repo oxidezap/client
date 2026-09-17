@@ -1063,6 +1063,22 @@ fn the_local_actions_do_not_need_a_connection() {
     );
 }
 
+/// A clear-cache reset must survive being offline.
+///
+/// The reset itself is local — it forgets what the resolver knows — while the
+/// pass it schedules needs the network and tolerates its absence. Refusing the
+/// action offline would lose the reset rather than defer it, leaving the
+/// descriptors pointing at bytes the clear just deleted until the next
+/// connection revalidates on its own. So it is admitted disconnected, the same
+/// as a history reload.
+#[test]
+fn a_clear_cache_avatar_reset_is_admitted_while_disconnected() {
+    assert!(
+        !Action::RefreshAvatars.needs_network(),
+        "the reset is local; the pass it schedules waits for the network on its own"
+    );
+}
+
 /// A connection's own answer channel, with the end that reads it.
 ///
 /// Everything about a plugin folder is answered *later*, on this channel,

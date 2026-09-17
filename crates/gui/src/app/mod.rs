@@ -939,7 +939,8 @@ impl WhatsAppApp {
                     }),
                     FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
                         if let Some(chat) = app.find_chat_mut(&jid) {
-                            chat.avatar_key = Some(key);
+                            chat.avatar_cache_key = Some(key);
+                            chat.avatar_loaded = true;
                             app.invalidate_chat_cache();
                             cx.notify();
                         }

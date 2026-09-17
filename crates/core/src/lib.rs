@@ -21,6 +21,7 @@ pub mod fixtures;
 
 mod account;
 mod app_state;
+mod avatar;
 mod call;
 mod calls;
 mod chat;
@@ -41,6 +42,7 @@ mod video;
 
 pub use account::{AccountId, InvalidAccountId};
 pub use app_state::{AppState, CachedQrCode, Fault, Issued, Lifetime, Recovery};
+pub use avatar::cache_key as avatar_cache_key;
 pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
 pub use calls::{ActiveCall, Admission, CallState, Ending, Stage, WaitingCall};
 pub use chat::STATUS_BROADCAST_JID;
@@ -49,7 +51,7 @@ pub use chat::{
     Resend,
 };
 pub use chat::{fallback_chat_name, fallback_sender_name};
-pub use events::{ReceiptType, UiEvent};
+pub use events::{AvatarOutcome, AvatarResolution, ReceiptType, UiEvent};
 pub use group::{GroupMember, GroupRoster};
 pub use links::{LinkSpan, find_links as find_message_links, find_links_in};
 pub use log_level::{LogLevel, UnknownLogLevel};

@@ -112,10 +112,34 @@ impl WhatsAppApp {
                 self.install_chats(chats, &agreed, cx);
                 cx.notify();
             }
+            // Metadata, not bytes: the daemon turns this into fetches and
+            // publishes `AvatarReady` when a picture is cached. A front end
+            // that receives it directly only learns which picture is now
+            // current; the source travels nowhere and must not be acted on
+            // here.
+            UiEvent::AvatarsResolved { resolutions } => {
+                for resolution in resolutions {
+                    if let Some(chat) = self.find_chat_mut(&resolution.jid) {
+                        match resolution.outcome {
+                            oxidezap_core::AvatarOutcome::Found { picture_id, .. } => {
+                                chat.avatar_picture_id = Some(picture_id);
+                            }
+                            // The chat has no picture: drop what was held so
+                            // the next state carries the placeholder.
+                            oxidezap_core::AvatarOutcome::NotFound => {
+                                chat.avatar_picture_id = None;
+                            }
+                        }
+                    }
+                }
+            }
             UiEvent::AvatarReady { jid, key } => {
-                if let Some(chat) = self.find_chat_mut(&jid)
-                    && chat.avatar_key.as_deref() == Some(key.as_str())
-                {
+                if let Some(chat) = self.find_chat_mut(&jid) {
+                    // An empty key is WhatsApp saying this chat has no
+                    // picture: the placeholder is the right drawing, and any
+                    // cached bytes have to stop being pointed at.
+                    chat.avatar_cache_key = (!key.is_empty()).then_some(key);
+                    chat.avatar_loaded = chat.avatar_cache_key.is_some();
                     self.invalidate_chat_cache();
                     cx.notify();
                 }

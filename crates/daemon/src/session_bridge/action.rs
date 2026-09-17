@@ -40,6 +40,13 @@ pub enum Action {
     /// Reload the whole history, for a front end that has just attached and
     /// holds nothing.
     ReloadHistory,
+    /// Forget every resolved picture and resolve them again.
+    ///
+    /// For a cleared media cache: the metadata may be unchanged, but the bytes
+    /// it named are gone, so the cache keys have to be rediscovered. Its own
+    /// action rather than a history reload, which is exactly the coupling this
+    /// repays.
+    RefreshAvatars,
     /// A front end that draws video has attached: let the session publish
     /// again, and ask the cameras for a point its decoders can start from.
     /// See [`oxidezap_session::WhatsAppClient::set_video_publishing`].
@@ -197,6 +204,12 @@ impl Action {
                 | Self::MarkStatusWatched(_)
                 | Self::LoadMessages { .. }
                 | Self::LoadChats { .. }
+                // Local, and only local: it forgets what the resolver knows and
+                // asks for a pass. The pass needs the network and tolerates
+                // not having it, so refusing this offline would lose the reset
+                // rather than defer it — the descriptors would keep pointing
+                // at bytes the clear just removed.
+                | Self::RefreshAvatars
                 // A group's members, too: the connection holds that list
                 // because sending needs one, so the common answer is a read
                 // of what is already held. Gating it on the network would

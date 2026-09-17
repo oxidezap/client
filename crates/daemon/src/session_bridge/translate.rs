@@ -38,7 +38,7 @@ impl Bridge {
     /// Folding does not touch the client, so this stays testable without a
     /// store: what it cannot do itself it returns, and the run loop performs.
     pub(super) fn observe(&mut self, mut event: UiEvent) -> Answer {
-        prepare_avatars(&self.hub, &mut event);
+        prepare_avatars(&self.hub, &self.avatar_recorder, &mut event);
         let mut answer = Answer::Nothing;
         // Before anything is published, so a `MarkRead` that arrives right
         // behind a message already covers it. What it answers is whether the
@@ -380,16 +380,22 @@ impl Bridge {
     }
 }
 
-fn prepare_avatars(hub: &std::sync::Arc<StateHub>, event: &mut UiEvent) {
-    let UiEvent::HistoryLoaded { chats, .. } = event else {
-        return;
-    };
-    for chat in chats {
-        crate::avatar::queue(hub, chat);
-        if let Some(picture_id) = chat.avatar_key.as_deref() {
-            chat.avatar_key = Some(crate::avatar::key(&chat.jid, picture_id));
+/// Answer a resolved picture, by outcome.
+///
+/// The one thing the daemon does with an avatar event, and deliberately the
+/// only place it touches the network for a picture. A history load is *not*
+/// this: it carries whatever the durable descriptors already said, and the
+/// session resolves the network lookup on its own lifecycle. That split is
+/// what a receipt no longer pays for.
+fn prepare_avatars(
+    hub: &std::sync::Arc<StateHub>,
+    recorder: &oxidezap_session::AvatarRecorder,
+    event: &mut UiEvent,
+) {
+    if let UiEvent::AvatarsResolved { resolutions } = event {
+        for resolution in resolutions.iter() {
+            crate::avatar::resolve(hub, recorder, &resolution.jid, &resolution.outcome);
         }
-        chat.avatar_source = None;
     }
 }
 

@@ -545,7 +545,7 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
     }
 
     fn avatar_key_of(chat: &Chat, into: &mut Vec<String>) {
-        if let Some(key) = &chat.avatar_key {
+        if let Some(key) = &chat.avatar_cache_key {
             into.push(key.clone());
         }
     }
@@ -562,7 +562,9 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
                     }
                 }
             }
-            UiEvent::AvatarReady { key, .. } => keys.push(key.clone()),
+            // An empty key is the daemon saying this chat has no picture, not
+            // a key to fetch: it would ask the media cache for nothing.
+            UiEvent::AvatarReady { key, .. } if !key.is_empty() => keys.push(key.clone()),
             _ => {}
         },
         // A page is media-bearing exactly like a load is, and is answered on

@@ -78,9 +78,14 @@ impl Chat {
         // store owns it from here on.
         self.from_store |= hydrated.from_store;
         self.set_name_if_not_worse(hydrated.name, hydrated.name_priority);
+        // A hydrated avatar is the one identity a restart can restore without
+        // the network: a durable descriptor read back from the store says which
+        // picture belongs here and under which cache key. A load that carries
+        // none says nothing, so it must not clear what a live refresh already
+        // resolved.
         if hydrated.avatar_loaded {
-            self.avatar_source = hydrated.avatar_source;
-            self.avatar_key = hydrated.avatar_key;
+            self.avatar_picture_id = hydrated.avatar_picture_id;
+            self.avatar_cache_key = hydrated.avatar_cache_key;
             self.avatar_loaded = true;
         }
         // Read before the messages are moved out: it decides what an absent
@@ -321,6 +326,33 @@ mod tests {
 
         assert!(chat.mark_send_failed("m1"));
         assert_eq!(chat.messages[0].status, MessageStatus::Failed);
+    }
+
+    /// A restart restores the avatar from a durable descriptor. The identity
+    /// (picture id + cache key) has to survive the merge, and a load that
+    /// carries no avatar must not clear one a live refresh already resolved.
+    #[test]
+    fn a_hydrated_avatar_identity_survives_the_merge() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        chat.avatar_picture_id = Some("live".into());
+        chat.avatar_cache_key = Some("a-live".into());
+        chat.avatar_loaded = true;
+
+        // A load with no descriptor says nothing and must not clear it.
+        let mut bare = Chat::new(jid.clone());
+        bare.from_store = true;
+        chat.merge_history(bare);
+        assert_eq!(chat.avatar_cache_key.as_deref(), Some("a-live"));
+
+        let mut hydrated = Chat::from_store(jid, "Ana".into(), 0);
+        hydrated.avatar_picture_id = Some("stored".into());
+        hydrated.avatar_cache_key = Some("a-stored".into());
+        hydrated.avatar_loaded = true;
+        chat.merge_history(hydrated);
+        assert_eq!(chat.avatar_picture_id.as_deref(), Some("stored"));
+        assert_eq!(chat.avatar_cache_key.as_deref(), Some("a-stored"));
+        assert!(chat.avatar_loaded);
     }
 
     #[test]

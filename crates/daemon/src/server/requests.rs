@@ -263,8 +263,12 @@ pub(super) async fn handle_request(
             .await;
             acted(match cleared {
                 Ok(Ok(())) => {
+                    // The bytes are gone, so every cache key a descriptor
+                    // named is now a miss. Ask the session to forget what it
+                    // resolved and fetch the metadata again; the bytes are
+                    // refetched only for the pictures that still exist.
                     if hub.connection().is_connected()
-                        && let Err(error) = dispatch(hub, commands, Action::ReloadHistory).await
+                        && let Err(error) = dispatch(hub, commands, Action::RefreshAvatars).await
                     {
                         log::warn!(
                             "media cache cleared but avatar refresh was not queued: {error}"

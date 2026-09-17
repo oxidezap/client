@@ -170,6 +170,7 @@ pub async fn run(
     let stores_for_reset = Arc::clone(&stores);
     let mut client = WhatsAppClient::new_for_account_with_registry(account_id, stores)
         .context("opening the local store")?;
+    let avatar_recorder = client.avatar_recorder();
     let mut events = client
         .start()
         .map_err(|e| anyhow::anyhow!("starting the session: {e}"))?;
@@ -177,7 +178,7 @@ pub async fn run(
     // camera and one call, and what decides whether a frame is *serialized*
     // is whether anybody is subscribed to the hub's video channel.
     let mut video = client.video_events();
-    let mut bridge = Bridge::with_lifecycle(hub, plugins, lifecycle);
+    let mut bridge = Bridge::with_lifecycle(hub, plugins, lifecycle, avatar_recorder);
 
     // Set when every sender is gone. A closed channel yields `None`
     // immediately and forever, so leaving the branch enabled would spin the
@@ -504,18 +505,33 @@ struct Bridge {
     publisher: Option<crate::publisher::Handle>,
     reads: Arc<Mutex<ReadTracker>>,
     in_flight: Arc<Semaphore>,
+    /// Points the session's durable store at cached avatar bytes.
+    ///
+    /// The bridge does the byte write through [`crate::avatar`]; the store
+    /// lives in the session. This is the seam, and it is what keeps the
+    /// descriptor write behind the byte write.
+    avatar_recorder: oxidezap_session::AvatarRecorder,
 }
 
 impl Bridge {
     #[cfg(test)]
     fn new(hub: Arc<StateHub>, plugins: Arc<oxidezap_plugin_host::Plugins>) -> Self {
-        Self::with_lifecycle(hub, plugins, RuntimeLifecycle::new())
+        // No session behind it: these tests fold events without opening a
+        // store, so every avatar descriptor write is dropped, which is the
+        // honest answer for a bridge with no store to point at one.
+        Self::with_lifecycle(
+            hub,
+            plugins,
+            RuntimeLifecycle::new(),
+            oxidezap_session::AvatarRecorder::detached(),
+        )
     }
 
     fn with_lifecycle(
         hub: Arc<StateHub>,
         plugins: Arc<oxidezap_plugin_host::Plugins>,
         lifecycle: RuntimeLifecycle,
+        avatar_recorder: oxidezap_session::AvatarRecorder,
     ) -> Self {
         // Unbounded, and the bound that matters is upstream: the only producer
         // is the event loop draining the session's own unbounded channel, so a
@@ -532,6 +548,7 @@ impl Bridge {
             publisher: Some(publisher),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            avatar_recorder,
         }
     }
 

@@ -376,6 +376,15 @@ fn apply_writer_msg(
             }
             Ok(())
         }
+        WriterMsg::Avatar {
+            jid,
+            picture_id,
+            cache_key,
+            seq,
+        } => crate::store::avatar::upsert(conn, device_id, jid, picture_id, cache_key, *seq),
+        WriterMsg::AvatarCleared { jid, seq } => {
+            crate::store::avatar::delete(conn, device_id, jid, *seq)
+        }
         WriterMsg::StatusWatched { chat, msg_ids } => {
             // Routed like every other write that targets a row. The broadcast
             // this is called with today routes to itself, but the method is
