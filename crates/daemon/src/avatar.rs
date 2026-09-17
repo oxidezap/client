@@ -34,6 +34,7 @@ use oxidezap_ipc::DaemonMessage;
 /// whose bytes landed after the cache was cleared, is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Selection {
+    account: oxidezap_core::AccountId,
     account_generation: usize,
     cache_epoch: usize,
     picture_id: Option<String>,
@@ -131,7 +132,11 @@ pub fn resolve(
                 return;
             };
             let Ok(bytes) = accept(response) else { return };
-            if crate::media::put_since(selection.cache_epoch, &cache_key, &bytes).is_err() {
+            // This account's epoch and this account's key: a clear of another
+            // account must not refuse this fetch.
+            if crate::media::put_since(selection.account, selection.cache_epoch, &cache_key, &bytes)
+                .is_err()
+            {
                 return;
             }
             if !is_current(&hub, &jid, &selection) {
@@ -220,8 +225,9 @@ fn record_selection(
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let account = hub.account_id();
     let account_generation = hub.account_generation();
-    let cache_epoch = crate::media::epoch();
+    let cache_epoch = crate::media::epoch(account);
     let key = (hub.id(), jid.to_owned());
     if let Some(selection) = latest.get(&key)
         && selection.account_generation == account_generation
@@ -232,6 +238,7 @@ fn record_selection(
         return selection.clone();
     }
     let selection = Selection {
+        account,
         account_generation,
         cache_epoch,
         picture_id: picture_id.map(str::to_owned),
@@ -244,7 +251,7 @@ fn record_selection(
 
 fn is_current(hub: &StateHub, jid: &str, selection: &Selection) -> bool {
     if selection.account_generation != hub.account_generation()
-        || selection.cache_epoch != crate::media::epoch()
+        || selection.cache_epoch != crate::media::epoch(hub.account_id())
     {
         return false;
     }

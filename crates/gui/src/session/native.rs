@@ -41,6 +41,37 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     connect_over(connect_or_start()?)
 }
 
+/// The control plane, over the same socket the account connection uses.
+///
+/// A second connection to the same daemon, not a second daemon: the control
+/// plane is what owns the log level, a window and the shared plugin
+/// catalogue, and it is a different scope on the same endpoint. Used by the
+/// window beside its account connection so those global actions have a plane
+/// to reach; see `attach::begin_control`.
+pub(super) fn connect_control() -> std::io::Result<(Session, Events)> {
+    let endpoint = connect_or_start()?;
+    let (reader, writer) = endpoint.split()?;
+    let hangup = reader.hangup()?;
+    let attach::Attached {
+        mut session,
+        events,
+        sink,
+        pending,
+        pictures,
+        recover,
+    } = attach::begin_control(Link::over_stream(writer), Arc::new(Directory))?;
+    start_reader(
+        reader,
+        sink,
+        pending,
+        pictures,
+        recover,
+        hangup,
+        &mut session,
+    );
+    Ok((session, events))
+}
+
 /// Everything after the connection: split it, say hello, and start a reader.
 ///
 /// Taken apart from [`connect`] so an endpoint can come from somewhere other
@@ -70,16 +101,49 @@ fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
         true,
     )?;
 
-    // Dropped when the thread ends, whichever way it ends, so the wait below
-    // is over the thread's whole life rather than over a message it might
-    // not reach.
+    start_reader(
+        reader,
+        sink,
+        pending,
+        pictures,
+        recover,
+        hangup,
+        &mut session,
+    );
+
+    Ok((session, events))
+}
+
+/// Park a thread in the connection's read and hang the teardown on the
+/// session.
+///
+/// Shared by the account connection and the control one: both are the same
+/// socket, the same framing and the same [`Frames`], and the only difference
+/// is the hello that went out before this. The thread is dropped when it ends,
+/// whichever way it ends, so the wait is over the thread's whole life rather
+/// than over a message it might not reach.
+///
+/// The sink, the request table and the video slots move rather than being
+/// borrowed: the reader owns them for its whole life, and `ReaderSink` is
+/// deliberately not `Clone` so there is exactly one holder of the end that
+/// may wait for room.
+#[allow(clippy::too_many_arguments)]
+fn start_reader(
+    reader: oxidezap_ipc::Reader,
+    sink: ReaderSink,
+    pending: Pending,
+    pictures: crate::video::LatestFrames,
+    recover: crate::video::RecoverySink,
+    hangup: oxidezap_ipc::Hangup,
+    session: &mut Session,
+) {
     let (alive, until_gone) = std::sync::mpsc::channel::<()>();
-    std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("oxidezap-ipc".to_string())
         .spawn(move || {
             let _alive = alive;
             read_frames(reader, &sink, &pending, &pictures, recover);
-        })?;
+        });
 
     session.ends_with(Teardown::new(move || {
         hangup.hang_up();
@@ -95,8 +159,6 @@ fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
                 let _ = until_gone.recv_timeout(READER_PATIENCE);
             });
     }));
-
-    Ok((session, events))
 }
 
 /// Read frames until the daemon goes away.

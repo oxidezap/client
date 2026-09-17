@@ -306,41 +306,6 @@ pub async fn run(
         publisher.join().await;
     }
 
-    /// Whether the record of what the user allowed each plugin is gone.
-    ///
-    /// `true` when there was nothing to remove, which is the ordinary case: an
-    /// account with no plugins has no permissions to retire.
-    #[cfg_attr(target_family = "wasm", allow(unused_variables))]
-    fn approvals_retired(account_id: oxidezap_core::AccountId) -> bool {
-        // A page keeps them in its origin's storage rather than in a
-        // directory, and clears the plugins' settings in the same sweep:
-        // there is no directory below to remove afterwards, so the two halves
-        // that are separate on a desktop are one call here. What survives is
-        // what survives there — the modules themselves.
-        //
-        // Not yet account-scoped there (the multi-account plan's section
-        // 13.3 names this as pending), so this account's id goes unused on
-        // that half of the split.
-        #[cfg(target_family = "wasm")]
-        {
-            oxidezap_plugin_host::Origin::forget_all()
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let Some(dir) = crate::plugins::account_state_dir(account_id) else {
-                return true;
-            };
-            match oxidezap_plugin_host::forget_approvals(&dir) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                Err(e) => {
-                    log::error!("cannot remove the plugins' recorded permissions: {e}");
-                    false
-                }
-            }
-        }
-    }
-
     // After the teardown, never before: `reset_account` purges this account's
     // rows in the *shared* database, and WR-1's own caller obligation is that
     // nothing still holding a handle bound to this account's id may be live
@@ -370,85 +335,8 @@ pub async fn run(
                  Start oxidezap again and repeat \"clear data and pair again\"."
             );
             disposition.incomplete()
-        } else if !approvals_retired(account_id) {
-            // The same refusal as above and for the same reason. What must not
-            // outlive this account is the record of what its owner allowed: reset
-            // the credentials first and fail this afterwards, and the next
-            // pairing inherits an `approvals.json` in which a plugin with the
-            // same id and mask is already allowed to act — consent given for an
-            // account that no longer exists. Leaving the old account intact is a
-            // state the user can act on again; a new account under the old one's
-            // permissions is not. Its *settings* are cleared below with the rest
-            // of the directory: those are data, and this is authority.
-            log::error!(
-                "local state was NOT reset: the plugins' recorded permissions could not be \
-                 cleared, and resetting now would let them outlive the account that granted them. \
-                 Start oxidezap again and repeat \"clear data and pair again\"."
-            );
-            disposition.incomplete()
         } else {
-            // Purges this account's rows — upstream's and, through the
-            // `ON DELETE CASCADE` the chat-store migration adds, this crate's
-            // own. Never the whole-file wipe a single-account daemon used:
-            // the shared database holds every other local account too, and
-            // deleting it would take them down with this one.
-            let completed = match disposition {
-                AccountDisposition::Reset => {
-                    match stores_for_reset.reset_account(account_id).await {
-                        Ok(()) => {
-                            log::info!("account {} reset; pair again", account_id.get());
-                            true
-                        }
-                        Err(e) => {
-                            log::error!("could not reset account {}: {e}", account_id.get());
-                            false
-                        }
-                    }
-                }
-                AccountDisposition::Remove => {
-                    match stores_for_reset.remove_account(account_id).await {
-                        Ok(()) => {
-                            log::info!("account {} removed", account_id.get());
-                            true
-                        }
-                        Err(e) => {
-                            log::error!("could not remove account {}: {e}", account_id.get());
-                            false
-                        }
-                    }
-                }
-            };
-            if !completed {
-                disposition.incomplete()
-            } else {
-                // A plugin's own settings are this account's data too — an
-                // autoreply's "already answered these people" is a list of
-                // people — and they sit in their own directory beside the
-                // plugins rather than inside the store. Nothing is writing
-                // them any more: the threads were joined above.
-                #[cfg(not(target_family = "wasm"))]
-                if let Some(dir) = crate::plugins::account_state_dir(account_id)
-                    && let Err(e) = std::fs::remove_dir_all(&dir)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    // Only the settings are at stake here: the permissions
-                    // were retired before the credentials went, so nothing
-                    // that survives this can let a plugin act on whoever
-                    // pairs next.
-                    log::error!("could not clear the plugins' stored settings: {e}");
-                }
-                // The store is one file; the media is a directory beside
-                // it, and it is just as much this account's data.
-                // Everything, staged uploads included: the account is
-                // going, and so is anything that was going to be sent
-                // under it.
-                if let Err(e) = crate::media::AccountMedia::new(bridge.hub.account_id())
-                    .wipe(crate::media::Wipe::Everything)
-                {
-                    log::error!("could not clear the media cache: {e}");
-                }
-                disposition.completed()
-            }
+            finish_forget(account_id, &stores_for_reset, &bridge.hub, disposition).await
         }
     } else if stopping || commands_closed {
         // The daemon is stopping, or nothing on this side can ever ask the
@@ -462,6 +350,133 @@ pub async fn run(
     };
     crate::avatar::purge(&bridge.hub);
     Ok(exit)
+}
+
+/// Everything a reset or a remove does to storage, and nothing that needs a
+/// live session.
+///
+/// Shared by the two ways the operation can run: the normal one, where the run
+/// loop has finished its own teardown and calls this last, and the supervisor's
+/// direct path for an account whose session already ended — a logout, an
+/// exhausted recovery, or a task whose command receiver is gone. Before this
+/// was extracted, that second case could only be reached through the command
+/// channel, and a runtime with no live session owned no receiver to reach: the
+/// account sat `Error` with no way for the user to pair again.
+///
+/// The caller is responsible for everything that a *closed session* implies —
+/// this assumes nothing is writing to the store any more. That is exactly the
+/// caller obligation [`StoreRegistry::reset_account`] documents.
+pub async fn finish_forget(
+    account_id: oxidezap_core::AccountId,
+    stores: &Arc<StoreRegistry>,
+    hub: &Arc<StateHub>,
+    disposition: AccountDisposition,
+) -> AccountExit {
+    if !approvals_retired(account_id) {
+        // What must not outlive this account is the record of what its owner
+        // allowed: reset the credentials first and fail this afterwards, and
+        // the next pairing inherits an `approvals.json` in which a plugin with
+        // the same id and mask is already allowed to act — consent given for an
+        // account that no longer exists. Leaving the old account intact is a
+        // state the user can act on again; a new account under the old one's
+        // permissions is not. Its *settings* are cleared below with the rest
+        // of the directory: those are data, and this is authority.
+        log::error!(
+            "local state was NOT reset: the plugins' recorded permissions could not be \
+             cleared, and resetting now would let them outlive the account that granted them. \
+             Start oxidezap again and repeat \"clear data and pair again\"."
+        );
+        return disposition.incomplete();
+    }
+    // Purges this account's rows — upstream's and, through the `ON DELETE
+    // CASCADE` the chat-store migration adds, this crate's own. Never the
+    // whole-file wipe a single-account daemon used: the shared database holds
+    // every other local account too, and deleting it would take them down with
+    // this one.
+    let completed = match disposition {
+        AccountDisposition::Reset => match stores.reset_account(account_id).await {
+            Ok(()) => {
+                log::info!("account {} reset; pair again", account_id.get());
+                true
+            }
+            Err(e) => {
+                log::error!("could not reset account {}: {e}", account_id.get());
+                false
+            }
+        },
+        AccountDisposition::Remove => match stores.remove_account(account_id).await {
+            Ok(()) => {
+                log::info!("account {} removed", account_id.get());
+                true
+            }
+            Err(e) => {
+                log::error!("could not remove account {}: {e}", account_id.get());
+                false
+            }
+        },
+    };
+    if !completed {
+        return disposition.incomplete();
+    }
+    // A plugin's own settings are this account's data too — an autoreply's
+    // "already answered these people" is a list of people — and they sit in
+    // their own directory beside the plugins rather than inside the store.
+    // Nothing is writing them any more: the caller stopped the session.
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(dir) = crate::plugins::account_state_dir(account_id)
+        && let Err(e) = std::fs::remove_dir_all(&dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        // Only the settings are at stake here: the permissions were retired
+        // before the credentials went, so nothing that survives this can let a
+        // plugin act on whoever pairs next.
+        log::error!("could not clear the plugins' stored settings: {e}");
+    }
+    // The store is one file; the media is a directory beside it, and it is
+    // just as much this account's data. Everything, staged uploads included:
+    // the account is going, and so is anything that was going to be sent under
+    // it.
+    if let Err(e) =
+        crate::media::AccountMedia::new(hub.account_id()).wipe(crate::media::Wipe::Everything)
+    {
+        log::error!("could not clear the media cache: {e}");
+    }
+    disposition.completed()
+}
+
+/// Whether the record of what the user allowed each plugin is gone.
+///
+/// `true` when there was nothing to remove, which is the ordinary case: an
+/// account with no plugins has no permissions to retire.
+#[cfg_attr(target_family = "wasm", allow(unused_variables))]
+fn approvals_retired(account_id: oxidezap_core::AccountId) -> bool {
+    // A page keeps them in its origin's storage rather than in a directory,
+    // and clears the plugins' settings in the same sweep: there is no
+    // directory below to remove afterwards, so the two halves that are
+    // separate on a desktop are one call here. What survives is what survives
+    // there — the modules themselves.
+    //
+    // Not yet account-scoped there (the multi-account plan's section 13.3
+    // names this as pending), so this account's id goes unused on that half of
+    // the split.
+    #[cfg(target_family = "wasm")]
+    {
+        oxidezap_plugin_host::Origin::forget_all()
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let Some(dir) = crate::plugins::account_state_dir(account_id) else {
+            return true;
+        };
+        match oxidezap_plugin_host::forget_approvals(&dir) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                log::error!("cannot remove the plugins' recorded permissions: {e}");
+                false
+            }
+        }
+    }
 }
 
 /// How long to wait for the session to finish closing.

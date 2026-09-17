@@ -126,9 +126,9 @@ impl Bridge {
                 // page lands. A `ForgetSession` in between retires this one,
                 // and `put_since` then refuses the write rather than putting
                 // the departed account's thumbnails back into a directory the
-                // wipe has already emptied.
-                let epoch = crate::media::epoch();
+                // wipe has already emptied. This account's own epoch.
                 let account_media = crate::media::AccountMedia::new(self.hub.account_id());
+                let epoch = account_media.epoch();
                 // Which account asked. A page of the old one's history
                 // landing after it left would be folded into a tracker that
                 // had just forgotten it, and the next account would carry the
@@ -210,8 +210,8 @@ impl Bridge {
                 let hub = Arc::clone(&self.hub);
                 // As above: taken now, so a wipe between the ask and the
                 // answer refuses the write rather than repopulating the cache.
-                let epoch = crate::media::epoch();
                 let account_media = crate::media::AccountMedia::new(hub.account_id());
+                let epoch = account_media.epoch();
                 // As above: a page of the departed account's chats must not
                 // be put back into a hub that has just been emptied of it.
                 let asked_as = hub.account_generation();

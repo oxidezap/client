@@ -41,6 +41,19 @@ use super::sink::Events;
 /// tab that would have answered has closed, and the caller's next move is to
 /// take the account itself.
 pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
+    connect_scoped(false).await
+}
+
+/// The control plane, onto the tab holding the account.
+///
+/// A second connection on the same rendezvous, with a control hello: the tab
+/// that runs the session is the daemon, so it is the peer that answers the
+/// process-wide requests.
+pub(super) async fn connect_control() -> std::io::Result<(Session, Events)> {
+    connect_scoped(true).await
+}
+
+async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
     log::info!("another tab holds this account; attaching to it");
 
     let connection = tab::connect().await.map_err(|e| {
@@ -69,6 +82,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
 
     let fetched = Arc::new(Fetched::new(media.clone()));
 
+    let media = Arc::clone(&fetched) as Arc<dyn MediaCache>;
     let attach::Attached {
         session,
         events,
@@ -76,19 +90,18 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         pending,
         pictures,
         recover,
-    } = attach::begin(
-        link,
-        Arc::clone(&fetched) as Arc<dyn MediaCache>,
-        // Yes: this is a window, and the question `has_window` asks is
-        // whether there is one for the daemon's Open to bring forward. A tab
-        // cannot raise itself from an unsolicited frame — which is why the
-        // *socket* front end says no — but the daemon here is another tab in
-        // the same browser, with no tray and nothing to relay. What the
-        // answer decides that matters is the video path: a call's frames are
-        // published to front ends that have somewhere to draw them, and this
-        // one does.
-        true,
-    )?;
+    } = if control {
+        attach::begin_control(link, media)?
+    } else {
+        // Yes, this is a window, and the question `has_window` asks is whether
+        // there is one for the daemon's Open to bring forward. A tab cannot
+        // raise itself from an unsolicited frame — which is why the *socket*
+        // front end says no — but the daemon here is another tab in the same
+        // browser, with no tray and nothing to relay. What the answer decides
+        // that matters is the video path: a call's frames are published to
+        // front ends that have somewhere to draw them, and this one does.
+        attach::begin_for_account(link, media, oxidezap_core::AccountId::LEGACY, true, true)?
+    };
 
     // The account, when it becomes this tab's.
     //

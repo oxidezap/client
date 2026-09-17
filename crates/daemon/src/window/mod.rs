@@ -31,6 +31,31 @@ use crate::state::StateHub;
 
 pub use platform::show;
 
+/// Ask every account's front ends to raise a window, launching one if none of
+/// them has one attached.
+///
+/// The control plane reaches the daemon rather than one account, and a window
+/// is global even though the hub that counts ownership is per account. This
+/// signals all of them — every attached front end reads the signal channel —
+/// and only launches when *no* account has a window, which is the same
+/// decision [`platform::show`] makes for one hub without starting a second
+/// window beside an existing one.
+pub fn show_every(hubs: impl IntoIterator<Item = std::sync::Arc<StateHub>>) {
+    let hubs: Vec<_> = hubs.into_iter().collect();
+    for hub in &hubs {
+        hub.signal(&DaemonMessage::ShowWindow);
+    }
+    if hubs.iter().any(|hub| hub.windows_attached()) {
+        return;
+    }
+    // Nobody owns a window: the same launch path the tray's Open and a single
+    // account's `ShowWindow` use, through whichever hub is first. Starting one
+    // front end is global work, so `show` is asked for exactly one hub.
+    if let Some(hub) = hubs.first() {
+        show(hub);
+    }
+}
+
 /// Ask whoever owns a window to put it away.
 ///
 /// A request and nothing more: the daemon has no window to close, and what

@@ -21,9 +21,10 @@ use crate::state::StateHub;
 pub(crate) fn externalize_media(hub: &StateHub, event: &mut UiEvent) {
     // Read once for the whole event: this runs on the publish thread behind
     // an unbounded queue, so a clear can land between being handed the event
-    // and writing its media. See `media::put_since`.
-    let epoch = crate::media::epoch();
+    // and writing its media. See `media::put_since`. This account's own epoch,
+    // so another account's clear does not refuse this write.
     let media = AccountMedia::new(hub.account_id());
+    let epoch = media.epoch();
     match event {
         UiEvent::MessageReceived { message, .. } => {
             cache_media(&media, epoch, &message.id, &mut message.media)

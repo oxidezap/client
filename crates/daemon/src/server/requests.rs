@@ -482,7 +482,7 @@ pub(super) async fn handle_request(
 /// exactly what the session's own out-of-band answers do, and for the same
 /// reason — the caller is not the connection, so it must not park on a client
 /// that is not reading.
-fn answer_later(answer_to: &Outbox, frame: Option<String>) {
+pub(super) fn answer_later(answer_to: &Outbox, frame: Option<String>) {
     use tokio::sync::mpsc::error::TrySendError;
 
     let Some(frame) = frame else {
@@ -509,7 +509,9 @@ fn answer_later(answer_to: &Outbox, frame: Option<String>) {
 /// this is the only copy of the payload, nothing else is ever going to read
 /// it, and a refusal that left it staged would keep a module in the cache
 /// until the account was wiped.
-async fn install(request: &oxidezap_ipc::InstallPlugin) -> Result<String, ProtocolError> {
+pub(super) async fn install(
+    request: &oxidezap_ipc::InstallPlugin,
+) -> Result<String, ProtocolError> {
     // Global staged payloads only. A plugin module is the daemon's and lives
     // in the shared catalog, read by every account; a payload staged under an
     // account's own send namespace (`a<id>-u-...`) is that account's data, and
@@ -612,7 +614,7 @@ pub(super) async fn dispatch(
 /// One place, because with an id on every answer there is nothing left to
 /// special-case: a refusal is an error naming its request, exactly like a
 /// refused download or a malformed frame.
-fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<String> {
+pub(super) fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<String> {
     match result {
         Ok(()) => always(
             id,

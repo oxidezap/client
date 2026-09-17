@@ -54,14 +54,14 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::account::AccountRegistry;
 #[cfg(test)]
 use crate::account::AccountRuntime;
-use crate::session_bridge::Action;
 #[cfg(test)]
 use crate::session_bridge::Commands;
+use crate::session_bridge::{Action, Outbox};
 #[cfg(test)]
 use crate::state::StateHub;
 
 use handshake::{handshake, read_frame};
-use requests::{dispatch, handle_request, handle_wire_request};
+use requests::{answer, answer_later, dispatch, handle_request, handle_wire_request, install};
 
 /// How long a client has to send its hello.
 ///
@@ -600,9 +600,17 @@ where
     })?;
     write_line(&mut writer, &hello).await?;
     let mut buf = Vec::with_capacity(1024);
+    // The control plane's own out-of-band answers — a plugin install, listing
+    // or removal is disk work, and a control connection still pushes
+    // `AccountsChanged`, so parking this loop on a slow disk would delay a
+    // lifecycle update the user is watching for.
+    let (outbox, mut inbox) = tokio::sync::mpsc::channel::<String>(OUTBOX_CAPACITY);
 
     loop {
         tokio::select! {
+            // Out-of-band answers first, so a plugin install/removal/listing
+            // lands as soon as it is ready rather than behind a state push.
+            Some(frame) = inbox.recv() => write_line(&mut writer, &frame).await?,
             changed = accounts.changed() => {
                 if changed.is_err() {
                     return Ok(());
@@ -668,10 +676,57 @@ where
                             crate::shutdown::request("ipc client");
                             return Ok(());
                         }
+                        // The log level is the process's, not an account's:
+                        // one daemon logs once, so a control connection is
+                        // where the request belongs.
+                        ClientRequest::SetLogLevel { level } => {
+                            Some(set_log_level(id, level).await)
+                        }
+                        // A window is global even though ownership is counted
+                        // per account: ask every account's front ends, launch
+                        // only when none has one.
+                        ClientRequest::ShowWindow => {
+                            crate::window::show_every(
+                                registry.runtimes().into_iter().map(|runtime| runtime.hub()),
+                            );
+                            Some(answer_acted(id))
+                        }
+                        // Reload is per account: the catalogue is global, but
+                        // what runs and what state it keeps are the account's,
+                        // so each runtime reloads its own.
+                        ClientRequest::ReloadPlugins => {
+                            for runtime in registry.runtimes() {
+                                crate::plugins::reload_in_background(
+                                    &runtime.plugins(),
+                                    runtime.id(),
+                                );
+                            }
+                            Some(answer_acted(id))
+                        }
+                        // Installing, removing and listing touch the shared
+                        // `.wasm` catalogue, which is the daemon's rather than
+                        // any account's — see `plugins::account_state_dir` for
+                        // what *is* per account. Each answers on the outbox,
+                        // so this loop is not parked on a disk.
+                        ClientRequest::InstallPlugin(request) => {
+                            install_plugin(id, request, &outbox);
+                            None
+                        }
+                        ClientRequest::RemovePlugin { plugin } => {
+                            remove_plugin(id, plugin, &outbox);
+                            None
+                        }
+                        ClientRequest::ListInstalledPlugins => {
+                            list_plugins(id, &outbox);
+                            None
+                        }
                         other if other.is_control_request() => Some(error_frame(
                             id,
                             ProtocolError::Refused {
-                                detail: "this control request is not yet wired to the global daemon plane".to_string(),
+                                detail: format!(
+                                    "this control request is not available on the control plane yet ({})",
+                                    request_name(&other)
+                                ),
                             },
                         )?),
                         _ => Some(error_frame(
@@ -698,6 +753,111 @@ where
 
 fn answer_shutdown(id: Option<RequestId>) -> Result<String> {
     Ok(serde_json::to_string(&DaemonMessage::Accepted { id })?)
+}
+
+/// An immediate `Accepted`, for a control request that hands work off.
+fn answer_acted(id: Option<RequestId>) -> String {
+    serde_json::to_string(&DaemonMessage::Accepted { id })
+        .unwrap_or_else(|_| unanswerable(id, "the acknowledgement could not be encoded"))
+}
+
+/// Apply a log level, and remember it for the next start.
+///
+/// At `error` when the remembering fails, deliberately: the level has already
+/// taken effect, so a person quieting the daemon to `error` should still see
+/// the one line that says the choice was not stored.
+async fn set_log_level(id: Option<RequestId>, level: oxidezap_logging::LogLevel) -> String {
+    oxidezap_logging::apply(level);
+    log::info!("logging at {level}, asked for by a control client");
+    match oxidezap_session::unblock(oxidezap_logging::remember).await {
+        Ok(Ok(())) => answer_acted(id),
+        Ok(Err(e)) => {
+            log::error!("the log level was changed but not stored: {e}");
+            answer_acted(id)
+        }
+        Err(_) => {
+            log::error!("the log level was changed but the store was not reached");
+            answer_acted(id)
+        }
+    }
+}
+
+/// Install a module from a staged payload, answering on the outbox.
+///
+/// Off the connection's loop: this is a thirty-two megabyte read, a listing, a
+/// write and two flushes, and the control loop also pushes `AccountsChanged`.
+fn install_plugin(id: Option<RequestId>, request: oxidezap_ipc::InstallPlugin, outbox: &Outbox) {
+    let Some(id) = id else {
+        answer_later(
+            outbox,
+            always(None, malformed("an install needs an id to answer under")),
+        );
+        return;
+    };
+    let answer_to = outbox.clone();
+    oxidezap_session::spawn(async move {
+        let frame = match install(&request).await {
+            Ok(plugin) => always(
+                Some(id),
+                serde_json::to_string(&DaemonMessage::PluginInstalled { id, plugin })
+                    .map_err(anyhow::Error::from),
+            ),
+            Err(error) => always(Some(id), error_frame(Some(id), error)),
+        };
+        answer_later(&answer_to, frame);
+    });
+}
+
+/// Remove a module from the shared catalogue, answering on the outbox.
+fn remove_plugin(id: Option<RequestId>, plugin: String, outbox: &Outbox) {
+    let answer_to = outbox.clone();
+    oxidezap_session::spawn(async move {
+        let removed = crate::plugins::uninstall(&plugin).await;
+        let frame = match removed {
+            Ok(()) => answer(id, Ok(())),
+            Err(detail) => answer(id, Err(ProtocolError::Refused { detail })),
+        };
+        answer_later(&answer_to, frame);
+    });
+}
+
+/// List the shared catalogue, answering on the outbox.
+fn list_plugins(id: Option<RequestId>, outbox: &Outbox) {
+    let Some(id) = id else {
+        answer_later(
+            outbox,
+            always(
+                None,
+                malformed("a plugin listing needs an id to answer under"),
+            ),
+        );
+        return;
+    };
+    let answer_to = outbox.clone();
+    oxidezap_session::spawn(async move {
+        let frame = match crate::plugins::names().await {
+            Ok(plugins) => always(
+                Some(id),
+                serde_json::to_string(&DaemonMessage::InstalledPlugins { id, plugins })
+                    .map_err(anyhow::Error::from),
+            ),
+            Err(detail) => always(
+                Some(id),
+                error_frame(Some(id), ProtocolError::Refused { detail }),
+            ),
+        };
+        answer_later(&answer_to, frame);
+    });
+}
+
+/// A frame that arrived on the plane but has no handler, named for the log.
+fn request_name(request: &ClientRequest) -> &'static str {
+    match request {
+        ClientRequest::PluginAction { .. } => "plugin_action",
+        ClientRequest::PluginApproval { .. } => "plugin_approval",
+        ClientRequest::Snapshot => "snapshot",
+        _ => "request",
+    }
 }
 
 /// Answer `ClientRequest::CreateAccount`: allocate a new local account and
@@ -750,38 +910,76 @@ async fn create_account(registry: &AccountRegistry, id: Option<RequestId>) -> Re
     }
 }
 
-/// Answer `ClientRequest::ResetAccount`/`RemoveAccount`: reuse the exact
-/// self-service `ForgetSession` teardown path (`Action::ForgetSession`)
-/// against the *target* account's own command channel, so no new teardown
-/// logic exists for the control-initiated case.
+/// Answer `ClientRequest::ResetAccount`/`RemoveAccount` by asking the
+/// supervisor, which owns the account lifecycle.
 ///
-/// This only asks and waits for the ask to be accepted. The actual stop, and
-/// (for `Reset`) the respawn under the same id, happen afterward in the
-/// background, in `AccountSupervisor::hold`; a client watches
-/// `DaemonMessage::AccountsChanged` for that.
+/// Not a command blindly forwarded to the target runtime's command channel: an
+/// account whose session logged out, whose recovery attempts are spent, or
+/// which is between a failure and a scheduled restart has no live receiver, so
+/// a forwarded command answered `NoSession` and left the account terminal with
+/// no way out. The supervisor knows which accounts still have a task and can
+/// finish a storage mutation directly when none does.
+///
+/// A live account answers `Accepted` and completes in the background; the
+/// client watches `DaemonMessage::AccountsChanged` for that, as it always has.
 async fn change_account(
     registry: &AccountRegistry,
     id: Option<RequestId>,
     account: oxidezap_core::AccountId,
     disposition: crate::session_bridge::AccountDisposition,
 ) -> Result<String> {
-    let Some(runtime) = registry.get(account) else {
-        return error_frame(
-            id,
-            ProtocolError::NoSession {
-                detail: format!("account {} is not available", account.get()),
-            },
-        );
-    };
-    match dispatch(
-        &runtime.hub(),
-        &runtime.commands(),
-        Action::ForgetSession(disposition),
-    )
-    .await
+    #[cfg(not(target_family = "wasm"))]
     {
-        Ok(()) => Ok(serde_json::to_string(&DaemonMessage::Accepted { id })?),
-        Err(error) => error_frame(id, error),
+        let Some(supervisor) = registry.supervisor() else {
+            return error_frame(
+                id,
+                ProtocolError::Refused {
+                    detail: "account lifecycle is not available on this listener".to_string(),
+                },
+            );
+        };
+        match disposition {
+            crate::session_bridge::AccountDisposition::Reset => {
+                supervisor.reset_account(account).await
+            }
+            crate::session_bridge::AccountDisposition::Remove => {
+                supervisor.remove_account(account).await
+            }
+        }
+        .into_answer(id)
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (registry, account, disposition);
+        error_frame(
+            id,
+            ProtocolError::Refused {
+                detail: "account lifecycle is not available on web yet".to_string(),
+            },
+        )
+    }
+}
+
+/// The wire answer for a [`LifecycleOutcome`].
+#[cfg(not(target_family = "wasm"))]
+impl crate::account::LifecycleOutcome {
+    fn into_answer(self, id: Option<RequestId>) -> Result<String> {
+        match self {
+            Self::Accepted => Ok(serde_json::to_string(&DaemonMessage::Accepted { id })?),
+            Self::NoAccount => error_frame(
+                id,
+                ProtocolError::NoSession {
+                    detail: "that account is not available".to_string(),
+                },
+            ),
+            Self::Incomplete => error_frame(
+                id,
+                ProtocolError::Failed {
+                    detail: "the account operation did not finish; try again".to_string(),
+                    retryable: true,
+                },
+            ),
+        }
     }
 }
 

@@ -462,17 +462,12 @@ pub fn usage_for(prefix: &str) -> (u64, u64) {
         })
 }
 
-/// Best-effort per entry: one unreadable file must not abandon the rest.
-///
-/// The lock and the epoch belong to [`super::wipe`], which is the only caller.
-pub(super) fn delete(scope: Wipe) -> Result<()> {
-    delete_for("", scope)
-}
-
 /// Delete the files belonging to no account: the pre-multi-account names.
 ///
-/// See [`super::wipe_unscoped`]. `scope.takes` is applied to the whole name,
-/// which is the local name here because there is no prefix to strip.
+/// `scope.takes` is applied to the whole name, which is the local name here
+/// because there is no prefix to strip. Best-effort per entry: one unreadable
+/// file must not abandon the rest. The lock and the epoch belong to
+/// [`super::wipe_for`], which is the only caller.
 pub(super) fn delete_unscoped(scope: Wipe) -> Result<()> {
     let Some(dir) = oxidezap_ipc::media_dir() else {
         return Ok(());

@@ -85,12 +85,67 @@ pub(super) fn begin_for_account(
     owns_window: bool,
     call_video: bool,
 ) -> std::io::Result<Attached> {
+    begin_scoped(
+        link,
+        media,
+        account,
+        ClientScope::Account { account },
+        true,
+        owns_window,
+        call_video,
+    )
+}
+
+/// Attach a frontend to the daemon's control plane.
+///
+/// A second, account-less connection beside the account one, carrying the
+/// requests that belong to the process rather than to an account: the log
+/// level, a window, the shared plugin catalogue, and the account lifecycle.
+/// It has no session events, no window and no call video — none of those mean
+/// anything without an account — so the reader it starts answers requests and
+/// the control frames, and nothing else.
+///
+/// The bundle is the same [`Attached`], because everything downstream of the
+/// hello is the same machinery: the request table, the outbox and the frame
+/// decoder do not care which plane the connection is on.
+pub(super) fn begin_control(link: Link, media: Arc<dyn MediaCache>) -> std::io::Result<Attached> {
+    // The `account` the connection carries is the legacy slot only because the
+    // type requires one; a control connection never composes an account-staged
+    // key, so it is never read. The hello's scope is what binds the plane.
+    begin_scoped(
+        link,
+        media,
+        AccountId::LEGACY,
+        ClientScope::Control,
+        false,
+        false,
+        false,
+    )
+}
+
+/// Assemble a connection around one scope's hello.
+///
+/// The one place the four transports' account and control halves meet: the
+/// hello differs, and everything after it — the request table, the outbox, the
+/// reader — is the same bundle. `session_events` off and both capabilities off
+/// is what a control connection is; the caller that wants an account passes
+/// its own values.
+#[allow(clippy::too_many_arguments)]
+fn begin_scoped(
+    link: Link,
+    media: Arc<dyn MediaCache>,
+    account: AccountId,
+    scope: ClientScope,
+    session_events: bool,
+    owns_window: bool,
+    call_video: bool,
+) -> std::io::Result<Attached> {
     let (sink, events) = sink::channel();
     let session = Session::new(link, sink.ui(), media, account);
     session.send(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
-        scope: ClientScope::Account { account },
-        session_events: true,
+        scope,
+        session_events,
         owns_window,
         call_video,
     })?;

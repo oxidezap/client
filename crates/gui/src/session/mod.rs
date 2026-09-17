@@ -820,6 +820,47 @@ impl Session {
         }
     }
 
+    /// Attach to the daemon's control plane.
+    ///
+    /// A second connection beside [`Self::connect`], bound to the plane that
+    /// owns the process-wide requests: the log level, a window, the shared
+    /// plugin catalogue and the account lifecycle. A window that kept sending
+    /// those on its account connection was answered "this request belongs to
+    /// the control plane", so they have a connection of their own here.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect`].
+    pub async fn connect_control() -> std::io::Result<(Self, Events)> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            native::connect_control()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            web::connect_control().await
+        }
+    }
+
+    /// [`Self::connect_control`], on whichever thread can carry it. See
+    /// [`Self::attach`] for why the two platforms differ.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect_control`].
+    pub async fn attach_control(cx: &mut gpui::AsyncApp) -> std::io::Result<(Self, Events)> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            use gpui::AppContext as _;
+            cx.background_spawn(Self::connect_control()).await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = cx;
+            Self::connect_control().await
+        }
+    }
+
     /// [`Self::connect`], on whichever thread can carry it.
     ///
     /// Off the UI thread on a desktop: connecting there can mean starting a

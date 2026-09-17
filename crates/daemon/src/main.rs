@@ -178,24 +178,30 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     // `AccountId::LEGACY`: on macOS the tray already attached to it before
     // this function ever ran, so that account's runtime is spawned through
     // it rather than through a second, disconnected hub `spawn` would build.
+    // It is used only when a spawned account really is that id.
     //
-    // Which ids actually get spawned depends on what the shared database
-    // already lists, and deliberately does *not* default to "always start
-    // the legacy id": `RemoveAccount` can retire it like any other, and a
-    // startup that spawned it anyway would silently reopen a removed
-    // account's slot every time the daemon restarted — the exact
-    // "aposentar" guarantee `StoreRegistry::remove_account`'s own
-    // `AUTOINCREMENT`-backed id allocation exists to make.
+    // Which ids get spawned is exactly what the shared database lists. An
+    // empty listing is *not* treated as "the legacy slot": `RemoveAccount` can
+    // retire the legacy id like any other, and a startup that recreated it
+    // would (a) silently reopen a removed account's slot and (b) resurrect the
+    // id, which upstream's `AUTOINCREMENT` allocation exists to prevent — its
+    // `PersistenceManager::new` recreates the bound `device` row whenever it
+    // is missing. So an empty database allocates its next account the same way
+    // `CreateAccount` does, which yields 1 on a genuinely fresh install and the
+    // next free id after every account has been removed.
     match stores.accounts().await {
-        Ok(existing) if existing.is_empty() => {
-            // First launch: nothing in the database yet, so there is no
-            // account here for a prior removal to have made permanent —
-            // there is no account here at all. Spawn the legacy slot
-            // through the hub already built for it.
-            supervisor
-                .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
-                .await;
-        }
+        Ok(existing) if existing.is_empty() => match stores.create_account().await {
+            Ok(id) => {
+                if id == AccountId::LEGACY {
+                    supervisor
+                        .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
+                        .await;
+                } else {
+                    supervisor.spawn(id).await;
+                }
+            }
+            Err(e) => log::error!("could not allocate the first account: {e:#}"),
+        },
         Ok(existing) => {
             for account in existing {
                 if account.id == AccountId::LEGACY {
@@ -219,14 +225,11 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
             // this loop quietly recreating its slot.
         }
         Err(e) => {
-            log::error!("could not list existing accounts at startup: {e:#}");
-            // The same fallback a single-account daemon always had: a
-            // listing error is not a reason to refuse to start, so assume
-            // the legacy slot and let whatever is actually wrong surface
-            // once a session tries to open its store.
-            supervisor
-                .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
-                .await;
+            log::error!("could not list existing accounts at startup: {e:#}; starting with none");
+            // Deliberately no fallback that spawns an id: a listing error is
+            // not a reason to refuse to start, but guessing an account is what
+            // resurrects a removed one. The daemon starts with no runtime and
+            // `CreateAccount` can still make one.
         }
     }
 

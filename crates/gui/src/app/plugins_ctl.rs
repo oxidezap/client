@@ -513,11 +513,9 @@ impl WhatsAppApp {
     /// starts on "reading…" every time is worse than one that is already
     /// right.
     pub fn refresh_installed_plugins(&mut self, cx: &mut Context<Self>) {
-        let Some(asked) = self
-            .client
-            .as_ref()
-            .map(|client| client.installed_plugins())
-        else {
+        // The shared plugin catalogue is the daemon's, not the account's, so
+        // it is asked for on the control connection.
+        let Some(asked) = self.control().map(|client| client.installed_plugins()) else {
             return;
         };
         let plugins = self.plugins.clone();
@@ -573,7 +571,9 @@ impl WhatsAppApp {
                 }
             };
             let asked = entity.update(cx, |app, cx| {
-                let Some(client) = app.client.as_ref() else {
+                // The catalogue is the daemon's, so the install rides the
+                // control connection.
+                let Some(client) = app.control() else {
                     // Between connections, and the button is drawn anyway
                     // because the folder is not this window's to know about.
                     // Said rather than dropped: somebody chose a file and
@@ -630,8 +630,7 @@ impl WhatsAppApp {
     /// was given against the id and its mask rather than against the bytes.
     pub fn remove_plugin(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(asked) = self
-            .client
-            .as_ref()
+            .control()
             .map(|client| client.remove_plugin(id.clone()))
         else {
             // As the install: the folder is the daemon's, so with no
@@ -684,7 +683,10 @@ impl WhatsAppApp {
     /// it arrives in a frame like any other and every window sees the same
     /// thing at the same time — including the windows that did not ask.
     pub fn reload_plugins(&mut self, cx: &mut Context<Self>) {
-        if let Some(client) = self.client.as_ref() {
+        // Reloading is per account — each runtime runs its own plugin set —
+        // but the request is control-plane, so it rides the control
+        // connection and the daemon reloads every account.
+        if let Some(client) = self.control() {
             client.reload_plugins();
         }
         cx.notify();

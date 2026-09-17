@@ -232,20 +232,10 @@ pub fn usage_for(prefix: &str) -> (u64, u64) {
     })
 }
 
-/// Delete the cached entries this wipe is entitled to.
-///
-/// The lock and the epoch belong to [`super::wipe`], which is the only caller.
-///
-/// # Errors
-///
-/// Never, for the same reason [`put`] does not.
-pub(super) fn delete(scope: Wipe) -> Result<()> {
-    delete_for("", scope)
-}
-
 /// Delete the entries belonging to no account: the pre-multi-account names.
 ///
-/// See [`super::wipe_unscoped`].
+/// The lock and the epoch belong to [`super::wipe_for`], which is the only
+/// caller.
 pub(super) fn delete_unscoped(scope: Wipe) -> Result<()> {
     with(|cache| {
         let mut removed = 0u64;

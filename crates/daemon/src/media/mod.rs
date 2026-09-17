@@ -40,8 +40,8 @@ pub use platform::{cache_usage, claim, has, take, usage_for};
 #[cfg(target_family = "wasm")]
 pub use platform::{deliver, read};
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use oxidezap_core::AccountId;
 
@@ -226,8 +226,17 @@ impl AccountMedia {
         key.starts_with(&self.prefix()) && crate::media::claim(key)
     }
 
+    /// This account's cache epoch right now.
+    ///
+    /// Handed to [`Self::put_since`] later, and compared against this same
+    /// account's epoch then: a clear for another account does not move it.
+    #[must_use]
+    pub fn epoch(self) -> usize {
+        epoch(self.account)
+    }
+
     pub fn put_since(self, epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
-        crate::media::put_since(epoch, &self.key(key), bytes)
+        crate::media::put_since(self.account, epoch, &self.key(key), bytes)
     }
 
     pub fn put_owned(self, key: &str, bytes: Vec<u8>) -> Result<String> {
@@ -348,13 +357,23 @@ pub(super) const IN_PROGRESS_PREFIX: &str = "w-";
 pub(super) fn is_in_progress(name: &str) -> bool {
     name.starts_with(IN_PROGRESS_PREFIX)
 }
-/// Which cache the writers still in flight think they are writing into.
+/// Which cache the writers still in flight think they are writing into, per
+/// account.
 ///
 /// A download dispatched before a wipe finishes after it, and the eager cache
 /// of an inbound message can be queued across one. Neither can be cancelled,
 /// so the answer is the same as everywhere else in this codebase: bump a
 /// number and let the writer notice.
-pub(super) static CACHE_EPOCH: AtomicUsize = AtomicUsize::new(0);
+///
+/// Per account, not process-global: the physical directory is shared, but a
+/// `ClearMediaCache` for A must not refuse an avatar or a download B had
+/// already started. A single counter made every account's wipe invalidate
+/// every other account's in-flight writes.
+///
+/// A key this map has never seen reads as zero, which is what a writer that
+/// has not been started yet sees, so no account needs an explicit entry.
+pub(super) static CACHE_EPOCH: LazyLock<Mutex<HashMap<AccountId, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Held across a wipe, and across an epoch-checked write.
 ///
@@ -363,11 +382,20 @@ pub(super) static CACHE_EPOCH: AtomicUsize = AtomicUsize::new(0);
 /// writer's rename could land afterwards — repopulating a directory the user
 /// had just been told was empty. Nothing else in this module needs the lock,
 /// because nothing else claims to be ordered against a wipe.
+///
+/// Still one lock for the shared directory: the files live under one roof, so
+/// the rename a write performs and the deletion a wipe performs are ordered by
+/// the same mutex however many accounts they belong to. What is per account is
+/// the *validity* a writer checks, above.
 pub(super) static WIPE_LOCK: Mutex<()> = Mutex::new(());
 
-/// What to hand back to [`put_since`] later.
-pub fn epoch() -> usize {
-    CACHE_EPOCH.load(Ordering::SeqCst)
+/// What to hand back to [`put_since`] later, for one account.
+pub fn epoch(account: AccountId) -> usize {
+    *CACHE_EPOCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&account)
+        .unwrap_or(&0)
 }
 
 /// Cache `bytes` unless the cache has been cleared since `epoch`.
@@ -397,34 +425,27 @@ pub fn put_owned(key: &str, bytes: Vec<u8>) -> Result<String> {
     platform::put_owned(key, bytes)
 }
 
-pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
+pub fn put_since(account: AccountId, epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
     // Held across the check *and* the write, so a wipe cannot land between
     // them. See `WIPE_LOCK`.
     let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if CACHE_EPOCH.load(Ordering::SeqCst) != epoch {
+    if current_epoch(account) != epoch {
         anyhow::bail!("the media cache was cleared while this was being prepared");
     }
     platform::put_evictable(key, bytes)
 }
 
-/// Delete the cached files this wipe is entitled to.
+/// The epoch in force for `account`, under the wipe lock.
 ///
-/// Part of "clear data and pair again", and not optional there: the store is
-/// one file, but the media beside it is a directory that can hold half a
-/// gigabyte of the *previous* account's photos, videos and documents. Leaving
-/// it in place means pairing a different account onto a cache of someone
-/// else's pictures, with no control anywhere that clears them.
-///
-/// The lock and the epoch are taken here rather than by each platform, so a
-/// backend cannot forget them. One did: the page's wipe emptied its map
-/// without moving the epoch, so a publisher still draining its queue found
-/// the epoch it was handed still current and put the bytes straight back.
-///
-/// # Errors
-///
-/// Whatever the platform's deletion answers.
-pub fn wipe(scope: Wipe) -> Result<()> {
-    wipe_with_prefix("", scope)
+/// The lock is already held by every caller, so this does not take it again:
+/// the inner map lock is separate and short, and taking the file lock twice on
+/// the same thread is what a recursive call would do.
+fn current_epoch(account: AccountId) -> usize {
+    *CACHE_EPOCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&account)
+        .unwrap_or(&0)
 }
 
 /// Delete only one account's namespace from the shared physical cache.
@@ -438,46 +459,33 @@ pub fn wipe(scope: Wipe) -> Result<()> {
 /// none may claim them: only the legacy slot is allowed to clean them up.
 pub fn wipe_for(account: AccountId, scope: Wipe) -> Result<()> {
     let prefix = format!("a{}-", account);
-    let legacy = (account == AccountId::LEGACY).then(|| wipe_unscoped(scope));
-    let wiped = wipe_with_prefix(&prefix, scope);
-    if let Some(legacy) = legacy {
-        legacy?;
-    }
-    wiped
-}
-
-/// Delete the entries that carry no account prefix.
-///
-/// The pre-multi-account layout. Deliberately separate from a global
-/// [`wipe`], which under `Everything` would take every account's files: this
-/// takes only names belonging to no account at all.
-fn wipe_unscoped(scope: Wipe) -> Result<()> {
-    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    invalidate();
-    platform::delete_unscoped(scope)
-}
-
-fn wipe_with_prefix(prefix: &str, scope: Wipe) -> Result<()> {
-    // For the whole wipe, so an epoch-checked write is either wholly before
-    // it — and deleted by it — or wholly after, and kept.
+    // One lock for the whole operation, so the unscoped sweep and the account
+    // sweep cannot interleave with another account's write.
     let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Before the deletions, not after: a writer that reads the epoch between
     // the two would otherwise believe its file survived the wipe that is
-    // about to remove it.
-    invalidate();
-    if prefix.is_empty() {
-        platform::delete(scope)
+    // about to remove it. Only *this* account's epoch moves, so a clear for A
+    // does not refuse B's in-flight avatar or download.
+    invalidate(account);
+    let legacy = if account == AccountId::LEGACY {
+        platform::delete_unscoped(scope)
     } else {
-        platform::delete_for(prefix, scope)
-    }
+        Ok(())
+    };
+    let wiped = platform::delete_for(&prefix, scope);
+    legacy?;
+    wiped
 }
 
-/// Retire the epoch every writer in flight is holding.
+/// Retire the epoch every writer in flight for `account` is holding.
 ///
 /// Split out so the property can be asserted without deleting anybody's
-/// cache. [`wipe`] is its only caller.
-fn invalidate() {
-    CACHE_EPOCH.fetch_add(1, Ordering::SeqCst);
+/// cache.
+fn invalidate(account: AccountId) {
+    let mut epochs = CACHE_EPOCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *epochs.entry(account).or_insert(0) += 1;
 }
 
 /// What both backends have to answer the same way.
@@ -491,16 +499,14 @@ fn invalidate() {
 mod tests {
     use super::*;
 
-    /// The epoch is one static, and the test runner is many threads.
+    /// The cache epoch is one map, and the test runner is many threads.
     ///
-    /// The three tests below read it, bump it and compare against it, and
-    /// cargo runs them at once: a clear bumped by one test between another's
-    /// `epoch()` and its `put_since` refused a write that had checked the
-    /// epoch a moment earlier — which is exactly what that write is *meant*
-    /// to do, and so read as the lock test failing. Seen once on the Windows
-    /// runner, where the thread that holds the write is scheduled later than
-    /// on Linux. Not `WIPE_LOCK`: `put_since` takes that itself, so a test
-    /// holding it across the call would deadlock the thing it is timing.
+    /// The tests below read it, bump it and compare against it, and cargo runs
+    /// them at once. Each gives itself an account id no other test uses, so a
+    /// clear in one cannot move the epoch another is timing — which is exactly
+    /// the property the per-account map exists for. Not `WIPE_LOCK`:
+    /// `put_since` takes that itself, so a test holding it across the call
+    /// would deadlock the thing it is timing.
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     fn alone() -> std::sync::MutexGuard<'static, ()> {
@@ -524,12 +530,34 @@ mod tests {
     #[test]
     fn a_write_prepared_before_a_clear_is_refused() {
         let _alone = alone();
-        let before = epoch();
-        invalidate();
+        let account = test_account(40);
+        let before = epoch(account);
+        invalidate(account);
         assert!(
-            put_since(before, "f-3EB0ABC", b"the bytes of a photo").is_err(),
+            put_since(account, before, "f-3EB0ABC", b"the bytes of a photo").is_err(),
             "the cache was cleared after this write was prepared"
         );
+    }
+
+    /// Clearing one account's cache must not refuse a write another account
+    /// prepared: the files share a directory, but validity is per account.
+    #[test]
+    fn a_clear_for_one_account_does_not_refuse_another_accounts_write() {
+        let _alone = alone();
+        let a = test_account(41);
+        let b = test_account(42);
+        let b_epoch = epoch(b);
+
+        invalidate(a);
+
+        assert_eq!(epoch(b), b_epoch, "B's epoch must not move for A's clear");
+        assert!(
+            put_since(b, b_epoch, "f-3EB0OTHERACCT", b"a photo of B's").is_ok(),
+            "A's clear refused a write B had already prepared"
+        );
+        if let Some(path) = oxidezap_ipc::media_path("f-3EB0OTHERACCT") {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// The lock belongs to the entry point, and only to it.
@@ -547,9 +575,15 @@ mod tests {
         };
         let _ = std::fs::create_dir_all(&dir);
 
+        let account = test_account(43);
         let (done, answered) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = done.send(put_since(epoch(), "f-3EB0LOCKCHECK", b"a photo"));
+            let _ = done.send(put_since(
+                account,
+                epoch(account),
+                "f-3EB0LOCKCHECK",
+                b"a photo",
+            ));
         });
         let landed = answered
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -566,9 +600,10 @@ mod tests {
     #[test]
     fn clearing_the_cache_retires_the_epoch_every_writer_is_holding() {
         let _alone = alone();
-        let before = epoch();
-        invalidate();
-        assert_ne!(epoch(), before);
+        let account = test_account(44);
+        let before = epoch(account);
+        invalidate(account);
+        assert_ne!(epoch(account), before);
     }
 
     /// A "clear cached media" that takes a staged upload with it turns an

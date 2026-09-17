@@ -27,7 +27,9 @@ use oxidezap_core::AccountId;
 use oxidezap_ipc::{AccountOverview, AccountStatus, AccountsSnapshot};
 use tokio::sync::{mpsc, watch};
 
-use crate::session_bridge::{self, Commands, RuntimeLifecycle, SessionCommand};
+use crate::session_bridge::{
+    self, AccountDisposition, Action, CommandOutcome, Commands, RuntimeLifecycle, SessionCommand,
+};
 use crate::state::StateHub;
 use oxidezap_session::StoreRegistry;
 
@@ -285,6 +287,25 @@ impl AccountRegistry {
         self.overview.borrow().clone()
     }
 
+    /// Every registered runtime, in id order.
+    ///
+    /// For the control plane's global requests — a window belongs to whoever
+    /// has one, so raising it means reaching every account's front ends, and a
+    /// plugin reload is per account. Ordered so a caller that acts on all of
+    /// them does so deterministically.
+    #[must_use]
+    pub fn runtimes(&self) -> Vec<Arc<AccountRuntime>> {
+        let mut runtimes: Vec<_> = self
+            .accounts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        runtimes.sort_by_key(|runtime| runtime.id().get());
+        runtimes
+    }
+
     /// Drive one registered runtime while publishing lifecycle transitions.
     pub async fn run(
         &self,
@@ -366,8 +387,9 @@ pub struct AccountSupervisor {
     /// answer before reading the next request, so at most one command per
     /// connection is ever outstanding.
     command_capacity: usize,
-    /// Handed each freshly built runtime and its command receiver to the
-    /// reaper, which is the sole owner of the `JoinSet` those tasks live in.
+    /// Handed every lifecycle decision to the reaper, which is the sole owner
+    /// of the `JoinSet` the run tasks live in and the only place that reads or
+    /// writes a generation.
     ///
     /// A channel, and no shared lock at all, because a shared
     /// `Mutex<JoinSet>` could not both satisfy [`Self::join_all`] and stay
@@ -378,7 +400,12 @@ pub struct AccountSupervisor {
     /// long-lived session's completion held the lock that `spawn` for a
     /// second account needed. Sending here never waits, and the reaper drains
     /// this to learn about every runtime exactly when it can act on it.
-    spawns: mpsc::UnboundedSender<(Arc<AccountRuntime>, mpsc::Receiver<SessionCommand>)>,
+    ///
+    /// The same channel carries the restart timers and the lifecycle
+    /// requests, so a reset or a removal is serialized against a completion
+    /// and cannot interleave with the reaper's own view of which accounts are
+    /// live — see [`SupervisorCommand`].
+    commands: mpsc::UnboundedSender<SupervisorCommand>,
     /// Set once by [`Self::join_all`], read by [`Self::handle_exit`] (a
     /// completed reset must not respawn into a daemon that is leaving) and by
     /// [`Self::create_and_spawn`] (refuse a `CreateAccount` that arrives
@@ -392,8 +419,17 @@ pub struct AccountSupervisor {
     /// is not lost.
     wake: tokio::sync::Notify,
     /// Consecutive session-ended failures per account, driving the restart
-    /// backoff. See [`Self::recover`].
+    /// backoff. Read and written only by the reaper.
     failures: FailureCounts,
+    /// A per-account counter the reaper bumps whenever a lifecycle decision
+    /// invalidates a restart already scheduled for that account.
+    ///
+    /// A scheduled restart is a timer that fires later and cannot be
+    /// cancelled; the generation is the cancellation. Every decision that
+    /// makes an outstanding timer wrong — a reset, a removal, another
+    /// scheduled restart, the account coming back — bumps the counter, and
+    /// the timer fires into a generation that no longer matches.
+    generations: RwLock<HashMap<AccountId, u64>>,
     /// The reaper task's own handle, awaited by [`Self::join_all`]. `None`
     /// only after [`Self::join_all`] has taken it.
     reaper: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -474,6 +510,44 @@ struct AccountRun {
     ran_for: std::time::Duration,
 }
 
+/// Everything the reaper has to act on, over one channel.
+///
+/// One channel rather than several, because they all have to be serialized
+/// against each other: a lifecycle request must not run its storage mutation
+/// while the completion it is racing is still being handled, and a restart
+/// timer must see the account set a request just changed. The reaper is the
+/// only owner of that set, so it is the only place they can meet.
+#[cfg(not(target_family = "wasm"))]
+enum SupervisorCommand {
+    /// A freshly built runtime and its command receiver, ready to be driven.
+    Spawn {
+        runtime: Arc<AccountRuntime>,
+        command_rx: mpsc::Receiver<SessionCommand>,
+    },
+    /// A backoff timer fired. Carries the generation it was armed under, so it
+    /// is a no-op when a reset, removal or newer timer has overtaken it.
+    RestartDue { id: AccountId, generation: u64 },
+    /// Reset or remove one account, answering how it ended up.
+    Lifecycle {
+        id: AccountId,
+        disposition: AccountDisposition,
+        reply: tokio::sync::oneshot::Sender<LifecycleOutcome>,
+    },
+}
+
+/// How a control-plane lifecycle request ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleOutcome {
+    /// The request was taken and either completed directly or will complete in
+    /// the background; the account set reports the result either way.
+    Accepted,
+    /// The operation did not finish. Storage is untouched and the account is
+    /// still there, so the user can try again.
+    Incomplete,
+    /// No runtime is registered under that id.
+    NoAccount,
+}
+
 #[cfg(not(target_family = "wasm"))]
 impl AccountSupervisor {
     /// Build a supervisor over the daemon's one account registry and one
@@ -510,16 +584,17 @@ impl AccountSupervisor {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let (spawns, spawning) = mpsc::unbounded_channel();
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let supervisor = Arc::new(Self {
             registry,
             stores,
             restart,
             command_capacity,
-            spawns,
+            commands,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             failures: FailureCounts::default(),
+            generations: RwLock::new(HashMap::new()),
             reaper: tokio::sync::Mutex::new(None),
             shutdown: Arc::new(move || Box::pin(shutdown())),
         });
@@ -536,7 +611,7 @@ impl AccountSupervisor {
         // `spawns`, and a supervisor nobody has spawned the reaper for yet
         // would let a respawn or a `join_all` wait on a set nothing ever
         // drains.
-        let handle = tokio::spawn(Arc::clone(&supervisor).run_reaper(spawning));
+        let handle = tokio::spawn(Arc::clone(&supervisor).run_reaper(command_rx));
         *supervisor
             .reaper
             .try_lock()
@@ -567,6 +642,52 @@ impl AccountSupervisor {
         let id = self.stores.create_account().await?;
         self.spawn(id).await;
         Ok(id)
+    }
+
+    /// Reset one account, keeping its id, however it is currently running.
+    ///
+    /// The operation the control plane exposes. It is a supervisor decision,
+    /// not a command blindly forwarded to the account, because a runtime can
+    /// be in a state with no live session behind it: a session that logged
+    /// out, one whose recovery attempts are spent, or one between a failure
+    /// and its scheduled restart. In all of those the command channel's
+    /// receiver is gone, so the old "dispatch `ForgetSession` and hope"
+    /// answered `NoSession` — a terminal state the lifecycle API could not
+    /// rescue, which is exactly the account a user most needs to reset.
+    ///
+    /// The supervisor knows which accounts have a live task. A live one gets
+    /// the request through its command channel and completes in the
+    /// background, as before; a terminal one is finished directly, because
+    /// nothing is writing to its store any more.
+    pub async fn reset_account(self: &Arc<Self>, id: AccountId) -> LifecycleOutcome {
+        self.request_lifecycle(id, AccountDisposition::Reset).await
+    }
+
+    /// Retire one account for good, however it is currently running. See
+    /// [`Self::reset_account`] for why this is the supervisor's decision.
+    pub async fn remove_account(self: &Arc<Self>, id: AccountId) -> LifecycleOutcome {
+        self.request_lifecycle(id, AccountDisposition::Remove).await
+    }
+
+    async fn request_lifecycle(
+        self: &Arc<Self>,
+        id: AccountId,
+        disposition: AccountDisposition,
+    ) -> LifecycleOutcome {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        if self
+            .commands
+            .send(SupervisorCommand::Lifecycle {
+                id,
+                disposition,
+                reply,
+            })
+            .is_err()
+        {
+            // The reaper is gone: the daemon is on its way down.
+            return LifecycleOutcome::NoAccount;
+        }
+        answer.await.unwrap_or(LifecycleOutcome::NoAccount)
     }
 
     /// Build, register and start driving a fresh runtime for `id`.
@@ -662,7 +783,56 @@ impl AccountSupervisor {
     ) {
         // The channel cannot be closed: `self` holds the sender for as long as
         // this supervisor lives, and the reaper owns the receiver.
-        let _ = self.spawns.send((runtime, command_rx));
+        let _ = self.commands.send(SupervisorCommand::Spawn {
+            runtime,
+            command_rx,
+        });
+    }
+
+    /// The generation a restart timer for `id` must still match to be valid.
+    ///
+    /// Bumped by every decision that makes an outstanding timer wrong: a
+    /// reset, a removal, a new scheduled restart, and an account that came
+    /// back. Read by [`Self::schedule_restart`] when it arms a timer and by
+    /// the reaper when one fires.
+    fn generation(&self, id: AccountId) -> u64 {
+        *self
+            .generations
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&id)
+            .unwrap_or(&0)
+    }
+
+    /// Invalidate any restart already scheduled for `id`, returning the new
+    /// generation.
+    fn bump_generation(&self, id: AccountId) -> u64 {
+        let mut generations = self
+            .generations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = generations.entry(id).or_insert(0);
+        *entry = entry.wrapping_add(1);
+        *entry
+    }
+
+    /// Arm a restart for `id` without blocking the reaper.
+    ///
+    /// The old shape slept inside the reaper, which serialized the whole
+    /// daemon behind one account's backoff: a `CreateAccount` was answered
+    /// before its task had even entered the `JoinSet`, and every other
+    /// account's completion waited out the sleep. A timer task sends the wake
+    /// back after the delay, so the reaper keeps reaping; the generation it
+    /// carries is what makes a reset or a removal land before it fires.
+    fn schedule_restart(self: &Arc<Self>, id: AccountId, delay: std::time::Duration) {
+        let generation = self.bump_generation(id);
+        let supervisor = Arc::clone(self);
+        tokio::spawn(async move {
+            oxidezap_session::sleep(delay).await;
+            let _ = supervisor
+                .commands
+                .send(SupervisorCommand::RestartDue { id, generation });
+        });
     }
 
     /// React to one account task's outcome: respawn a completed reset under
@@ -685,6 +855,9 @@ impl AccountSupervisor {
         }
         match exit {
             AccountExit::ResetCompleted => {
+                // A fresh runtime replaces this one, so any timer armed for
+                // the old session is void.
+                self.bump_generation(id);
                 self.registry.remove(id);
                 if self.shutting_down.load(Ordering::SeqCst) {
                     log::info!(
@@ -701,6 +874,7 @@ impl AccountSupervisor {
             }
             AccountExit::RemoveCompleted => {
                 log::info!("account {} finished being removed", id.get());
+                self.bump_generation(id);
                 self.registry.remove(id);
             }
             AccountExit::ResetIncomplete | AccountExit::RemoveIncomplete => {
@@ -715,13 +889,15 @@ impl AccountSupervisor {
                 // server refused loops forever, so the account is left
                 // registered and observable, `Error` in the control snapshot,
                 // which is what a front end draws a re-pair affordance from.
+                // Its command receiver is gone, so a reset/remove takes the
+                // supervisor's direct path rather than this channel.
                 log::warn!(
                     "account {} was logged out; leaving it for the user to pair again rather than restarting it",
                     id.get()
                 );
                 self.registry.set_status(id, AccountStatus::Error);
             }
-            AccountExit::SessionEnded => self.recover(id).await,
+            AccountExit::SessionEnded => self.recover(id),
             AccountExit::Stopped => {
                 // A process-wide shutdown, or a command channel nothing can
                 // send on again. Left registered with whatever terminal status
@@ -733,8 +909,8 @@ impl AccountSupervisor {
         }
     }
 
-    /// Restart a runtime whose session ended on its own, with a bounded
-    /// backoff, or leave it `Error` once the attempts are spent.
+    /// Schedule a restart for a runtime whose session ended on its own, with a
+    /// bounded backoff, or leave it `Error` once the attempts are spent.
     ///
     /// The multi-account daemon gained fault isolation — one account's failure
     /// no longer takes the process down — and with it lost the restart the
@@ -742,14 +918,24 @@ impl AccountSupervisor {
     /// I/O error the client logged) is something to ride out, not something to
     /// leave dead forever. Bounded, so a genuinely broken account stops
     /// spinning and stays visible as `Error` for a user to act on.
-    async fn recover(self: &Arc<Self>, id: AccountId) {
+    ///
+    /// Does not await the delay: see [`Self::schedule_restart`]. While a
+    /// restart is pending the runtime is left registered and its session
+    /// command receiver is gone, so a reset or a removal arriving in the
+    /// meantime is answered by [`Self::request_lifecycle`]'s direct path.
+    fn recover(self: &Arc<Self>, id: AccountId) {
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        let attempt = self.failures.bump(id);
+        let failures = self.failures.bump(id);
+        // `bump` counts failures (1 for the first), and `max_attempts` is how
+        // many *retries* follow it, so the delay index starts at zero and the
+        // bound is on the failures that already happened rather than on the
+        // retry about to be scheduled.
+        let attempt = failures.saturating_sub(1);
         if attempt >= self.restart.max_attempts {
             log::warn!(
-                "account {} ended on its own {attempt} times in a row; leaving it in error for a user to act on",
+                "account {} ended on its own {failures} times in a row; leaving it in error for a user to act on",
                 id.get()
             );
             self.registry.set_status(id, AccountStatus::Error);
@@ -757,21 +943,79 @@ impl AccountSupervisor {
         }
         let delay = self.restart.delay(attempt);
         log::info!(
-            "account {} ended on its own; restarting in {delay:?} (attempt {}/{})",
+            "account {} ended on its own; restarting in {delay:?} (retry {}/{})",
             id.get(),
             attempt + 1,
             self.restart.max_attempts
         );
         self.registry.set_status(id, AccountStatus::Starting);
-        oxidezap_session::sleep(delay).await;
-        // Re-checked after the wait: shutdown may have been asked for while
-        // this slept, and a restart into a departing daemon is the one thing
-        // this must not do.
+        self.schedule_restart(id, delay);
+    }
+
+    /// Spawn the replacement a restart was scheduled for, if the schedule is
+    /// still valid.
+    ///
+    /// A no-op when the account was reset, removed, or restarted by something
+    /// else in the meantime: the generation no longer matches. That is the
+    /// whole reason the generation exists — a timer cannot be cancelled once
+    /// armed, so the account it was armed for is what has to say whether it
+    /// still wants it.
+    async fn restart_due(self: &Arc<Self>, id: AccountId, generation: u64) {
+        if self.generation(id) != generation {
+            return;
+        }
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
+        if self.registry.get(id).is_none() {
+            return;
+        }
+        // Bumped here too: this restart is the generation a later timer would
+        // have to match, and the account is now a fresh session.
+        self.bump_generation(id);
         self.registry.remove(id);
         self.spawn(id).await;
+    }
+
+    /// Finish a lifecycle request that reached an account with no live
+    /// session.
+    ///
+    /// The account is registered but its command receiver is gone, so there is
+    /// nothing writing to the store and nothing to ask: the storage mutation
+    /// runs here, and the outcome is applied immediately. Returns whether the
+    /// operation completed, so the control answer reflects the truth.
+    async fn finish_terminal(
+        self: &Arc<Self>,
+        id: AccountId,
+        disposition: AccountDisposition,
+    ) -> LifecycleOutcome {
+        let Some(runtime) = self.registry.get(id) else {
+            return LifecycleOutcome::NoAccount;
+        };
+        // Invalidate any restart timer before touching storage: it must not
+        // resurrect an account this request is retiring or resetting.
+        self.bump_generation(id);
+        let exit =
+            session_bridge::finish_forget(id, &self.stores, &runtime.hub(), disposition).await;
+        use session_bridge::AccountExit;
+        match exit {
+            AccountExit::ResetCompleted => {
+                self.registry.remove(id);
+                if self.shutting_down.load(Ordering::SeqCst) {
+                    return LifecycleOutcome::Accepted;
+                }
+                self.failures.forget(id);
+                self.spawn(id).await;
+                LifecycleOutcome::Accepted
+            }
+            AccountExit::RemoveCompleted => {
+                self.registry.remove(id);
+                LifecycleOutcome::Accepted
+            }
+            // The teardown's own logs say why; the row is untouched, which is
+            // a state the user can act on again.
+            _ => LifecycleOutcome::Incomplete,
+        }
     }
 
     /// Continuously reap finished account tasks and act on what they
@@ -786,21 +1030,28 @@ impl AccountSupervisor {
     /// [`Self::join_all`] has been called — an empty set before that is
     /// ordinary quiet, not completion, because a `CreateAccount`, a respawn or
     /// a recovery can still add to it.
-    async fn run_reaper(
-        self: Arc<Self>,
-        mut spawning: mpsc::UnboundedReceiver<(
-            Arc<AccountRuntime>,
-            mpsc::Receiver<SessionCommand>,
-        )>,
-    ) {
+    async fn run_reaper(self: Arc<Self>, mut commands: mpsc::UnboundedReceiver<SupervisorCommand>) {
         let mut tasks: tokio::task::JoinSet<AccountRun> = tokio::task::JoinSet::new();
+        // Closed only when the supervisor is dropped, which cannot happen while
+        // this task holds an `Arc` to it — so `false` here is the drop signal,
+        // and it must persist across outer iterations rather than reset.
+        let mut commands_open = true;
         loop {
-            // Drained before anything else, so a runtime handed over while the
-            // loop was awaiting a completion is picked up in this pass. The
-            // channel only closes when the supervisor is dropped, which cannot
-            // happen while this task holds an `Arc` to it.
-            while let Ok((runtime, command_rx)) = spawning.try_recv() {
-                tasks.spawn(Self::run_task(Arc::clone(&self), runtime, command_rx));
+            // Drained before anything else, so a command that arrived while the
+            // loop was awaiting a completion is acted on in this pass.
+            if commands_open {
+                loop {
+                    match commands.try_recv() {
+                        Ok(command) => {
+                            Self::apply_command(&self, &mut tasks, command).await;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            commands_open = false;
+                            break;
+                        }
+                    }
+                }
             }
 
             // Reaped without awaiting: a finished task is already here, and
@@ -824,12 +1075,16 @@ impl AccountSupervisor {
             if self.shutting_down.load(Ordering::SeqCst) && tasks.is_empty() {
                 return;
             }
+            if !commands_open && tasks.is_empty() {
+                // The supervisor is being dropped; nothing can arrive again.
+                return;
+            }
 
-            // Nothing to reap right now. Wait for any of: a task finishing, a
-            // runtime being handed over, or shutdown. `select!` is over the
-            // receiver and the join set, so a completion or a spawn wakes this
-            // at once; `biased` puts the receiver first so a burst of spawns is
-            // never starved by a stream of completions.
+            // Nothing to reap right now. Wait for any of: a command, a task
+            // finishing, or shutdown. `select!` is over these, so a completion
+            // or a command wakes this at once; `biased` puts the command first
+            // so a burst of lifecycle requests is never starved by a stream of
+            // completions.
             //
             // The wake branch is guarded rather than resolved-and-returned:
             // an unguarded future that is ready once `shutting_down` is set
@@ -840,9 +1095,10 @@ impl AccountSupervisor {
             // it here.
             tokio::select! {
                 biased;
-                arrived = spawning.recv() => {
-                    if let Some((runtime, command_rx)) = arrived {
-                        tasks.spawn(Self::run_task(Arc::clone(&self), runtime, command_rx));
+                command = commands.recv(), if commands_open => {
+                    match command {
+                        Some(command) => Self::apply_command(&self, &mut tasks, command).await,
+                        None => commands_open = false,
                     }
                 }
                 joined = tasks.join_next(), if !tasks.is_empty() => match joined {
@@ -851,6 +1107,73 @@ impl AccountSupervisor {
                     None => {}
                 },
                 () = self.wake.notified(), if !self.shutting_down.load(Ordering::SeqCst) => {}
+            }
+        }
+    }
+
+    /// Act on one thing that reached the reaper's own channel.
+    ///
+    /// All of it runs on the reaper's thread, so a lifecycle decision cannot
+    /// interleave with a completion: the account set this sees is the account
+    /// set a command acts on.
+    async fn apply_command(
+        self: &Arc<Self>,
+        tasks: &mut tokio::task::JoinSet<AccountRun>,
+        command: SupervisorCommand,
+    ) {
+        match command {
+            SupervisorCommand::Spawn {
+                runtime,
+                command_rx,
+            } => {
+                tasks.spawn(Self::run_task(Arc::clone(self), runtime, command_rx));
+            }
+            SupervisorCommand::RestartDue { id, generation } => {
+                self.restart_due(id, generation).await;
+            }
+            SupervisorCommand::Lifecycle {
+                id,
+                disposition,
+                reply,
+            } => {
+                let Some(runtime) = self.registry.get(id) else {
+                    let _ = reply.send(LifecycleOutcome::NoAccount);
+                    return;
+                };
+                // A runtime already stopping has a task that will finish the
+                // teardown and be reaped, so the operation is in flight: do
+                // not run a second storage mutation underneath it. `Accepted`
+                // is the truth — the request was taken and the outcome is
+                // observed through the account set, exactly as the
+                // command-channel path answers.
+                if runtime.is_stopping() {
+                    let _ = reply.send(LifecycleOutcome::Accepted);
+                    return;
+                }
+                // A live session owns the command channel; ask it to stop and
+                // let the teardown run in its own task. The answer is the
+                // acceptance, not the completion, exactly as before. No
+                // `needs_network` gate: forgetting a session is a local
+                // mutation and is wanted precisely when the account is
+                // unreachable.
+                let (answered, accepted) = tokio::sync::oneshot::channel();
+                let sent = runtime
+                    .commands()
+                    .send(SessionCommand {
+                        action: Action::ForgetSession(disposition),
+                        reply: answered,
+                    })
+                    .await;
+                if sent.is_ok() && matches!(accepted.await, Ok(CommandOutcome::Accepted)) {
+                    let _ = reply.send(LifecycleOutcome::Accepted);
+                    return;
+                }
+                // No live session to ask — a logout, an exhausted recovery, or
+                // a pending restart whose runtime has no task yet. Finish the
+                // storage mutation here, where the supervisor is the authority
+                // on whether anything is still writing.
+                let outcome = self.finish_terminal(id, disposition).await;
+                let _ = reply.send(outcome);
             }
         }
     }
@@ -1282,6 +1605,133 @@ mod tests {
         assert!(
             registry.get(AccountId::LEGACY).is_none(),
             "a removed legacy account is gone, and a restart must not recreate it"
+        );
+
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.join_all()).await;
+    }
+
+    /// The first retry waits `initial_delay`, not twice it. `bump` counts the
+    /// failure that already happened, so the delay index is one behind it.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_first_retry_waits_the_initial_delay() {
+        let policy = super::RestartPolicy {
+            initial_delay: std::time::Duration::from_secs(2),
+            max_delay: std::time::Duration::from_secs(60),
+            max_attempts: 8,
+            healthy_after: std::time::Duration::from_secs(120),
+        };
+        assert_eq!(policy.delay(0), std::time::Duration::from_secs(2));
+        assert_eq!(policy.delay(1), std::time::Duration::from_secs(4));
+        assert_eq!(
+            policy.delay(20),
+            std::time::Duration::from_secs(60),
+            "the wait is capped"
+        );
+    }
+
+    /// An account that left a session with no live command receiver — a logout,
+    /// an exhausted recovery, a pending restart — must still be resettable and
+    /// removable. The control path used to dispatch to the dead channel and
+    /// answer `NoSession`, leaving the account terminal for good.
+    ///
+    /// Driven through the real reaper channel and a real `StoreRegistry`, so
+    /// the storage mutation actually runs: the fake runtime's command receiver
+    /// is dropped by `runtime()`, which is exactly the terminal shape.
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn a_terminal_account_can_still_be_removed() {
+        use super::{AccountSupervisor, LifecycleOutcome, RestartPolicy};
+        use oxidezap_session::StoreRegistry;
+
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(StoreRegistry::new(format!(
+            "file:memdb_account_supervisor_terminal_{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        // The account row the removal purges. `runtime()` binds a hub but no
+        // store, so the row is seeded through the registry's public API.
+        //
+        // The second allocation, not the first: the physical media directory
+        // is shared by every test in this binary, and a removal wipes the
+        // account's `a<id>-*` files. Account 1's are the ones the
+        // session-bridge tests stage under, so this uses the next id and
+        // leaves those alone.
+        let _first = stores
+            .create_account()
+            .await
+            .expect("create a first account");
+        let id = stores.create_account().await.expect("create the account");
+        let supervisor = AccountSupervisor::with_shutdown(
+            Arc::clone(&registry),
+            Arc::clone(&stores) as Arc<StoreRegistry>,
+            4,
+            RestartPolicy::production(),
+            || Box::pin(std::future::ready(())),
+        );
+
+        // Registered with its command receiver already gone: the terminal
+        // state a timed-out logout leaves.
+        assert!(registry.insert(runtime(id.get())));
+
+        let outcome = supervisor.remove_account(id).await;
+        assert_eq!(
+            outcome,
+            LifecycleOutcome::Accepted,
+            "a terminal account's removal must run directly, not fail on a dead channel"
+        );
+        assert!(
+            registry.get(id).is_none(),
+            "the completed removal drops the runtime"
+        );
+        assert!(
+            !stores
+                .accounts()
+                .await
+                .expect("list")
+                .iter()
+                .any(|account| account.id == id),
+            "and the device row is really gone"
+        );
+
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.join_all()).await;
+    }
+
+    /// A restart that fires after the account was removed is a no-op: the
+    /// generation the timer carried no longer matches.
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn a_stale_restart_timer_does_not_resurrect_a_removed_account() {
+        use super::{AccountSupervisor, RestartPolicy};
+        use oxidezap_session::StoreRegistry;
+
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(StoreRegistry::new(format!(
+            "file:memdb_account_supervisor_stale_timer_{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let supervisor = AccountSupervisor::with_shutdown(
+            Arc::clone(&registry),
+            stores,
+            4,
+            RestartPolicy::production(),
+            || Box::pin(std::future::ready(())),
+        );
+
+        let id = AccountId::new(7).unwrap();
+        assert!(registry.insert(runtime(7)));
+        let generation = supervisor.generation(id);
+        // The account leaves, invalidating the timer that would have matched
+        // this generation.
+        supervisor.bump_generation(id);
+        registry.remove(id);
+
+        supervisor.restart_due(id, generation).await;
+        assert!(
+            registry.get(id).is_none(),
+            "a restart armed before a removal must not bring the account back"
         );
 
         let _ =

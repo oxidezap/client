@@ -301,13 +301,25 @@ async fn create_account_is_refused_without_a_supervisor_attached() {
 }
 
 /// `ResetAccount`/`RemoveAccount` reuse the target account's own
-/// `Action::ForgetSession` teardown path, dispatched through *its* command
-/// channel rather than the control connection's (which has none): this pins
-/// that the right runtime hears it, with the right disposition, and that an
-/// unknown id is refused rather than silently accepted.
+/// `Action::ForgetSession` teardown path, dispatched by the supervisor through
+/// *its* command channel rather than the control connection's (which has
+/// none): this pins that the right runtime hears it, with the right
+/// disposition, and that an unknown id is refused rather than silently
+/// accepted.
 #[tokio::test]
 async fn a_control_connection_resets_and_removes_a_named_account() {
+    use super::*;
+
     let registry = AccountRegistry::new();
+    // The lifecycle is the supervisor's to run, so the registry needs one.
+    let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+        "file:memdb_control_lifecycle_{}?mode=memory&cache=shared",
+        std::process::id()
+    )));
+    // Held for the test's lifetime: the registry's back-pointer is `Weak`, so
+    // a dropped supervisor would leave `change_account` with nowhere to go.
+    let _supervisor = crate::account::AccountSupervisor::new(Arc::clone(&registry), stores, 4);
+
     let target_id = oxidezap_core::AccountId::new(2).expect("positive account id");
     let (commands, taken) = bridge(CommandOutcome::Accepted);
     assert!(registry.insert(Arc::new(AccountRuntime::new(
@@ -427,6 +439,107 @@ async fn a_control_connection_resets_and_removes_a_named_account() {
         ),
         "unexpected answer for an unknown account: {line}"
     );
+    served.abort();
+}
+
+/// The control plane answers the process-wide requests the GUI's account
+/// connection used to send and be refused for.
+///
+/// `SetLogLevel`, `ShowWindow`, `ReloadPlugins` and `ListInstalledPlugins`
+/// are all control requests, so an account connection refuses them with "this
+/// request belongs to the control plane" — which is only a working answer if
+/// there *is* a control plane that serves them. This pins that there is: each
+/// is answered rather than refused as unwired.
+#[tokio::test]
+async fn the_control_plane_answers_the_process_wide_requests() {
+    use super::*;
+
+    let registry = AccountRegistry::new();
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, Arc::clone(&registry)));
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // ControlHello
+
+    // An acknowledgement, not a refusal: `SetLogLevel` is the process's.
+    let level = serde_json::to_string(&Request {
+        id: Some(3),
+        request: ClientRequest::SetLogLevel {
+            level: oxidezap_core::LogLevel::Info,
+        },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{level}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(3) }
+        ),
+        "unexpected answer to SetLogLevel: {line}"
+    );
+
+    // `ShowWindow` relays and acknowledges: nobody is attached to raise, so
+    // the launch path runs and the answer is still an acknowledgement.
+    let show = serde_json::to_string(&Request {
+        id: Some(4),
+        request: ClientRequest::ShowWindow,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{show}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(4) }
+        ),
+        "unexpected answer to ShowWindow: {line}"
+    );
+
+    // `ListInstalledPlugins` answers out of band, on the connection's outbox,
+    // because it is a directory read.
+    let list = serde_json::to_string(&Request {
+        id: Some(5),
+        request: ClientRequest::ListInstalledPlugins,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{list}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::InstalledPlugins { id: 5, .. }
+        ),
+        "unexpected answer to ListInstalledPlugins: {line}"
+    );
+
     served.abort();
 }
 
