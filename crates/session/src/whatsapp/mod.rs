@@ -368,12 +368,12 @@ struct Shared {
 /// Explicit state rather than one notification, because the three kinds of ask
 /// mean different things and a bare wake-up cannot carry which one it was. The
 /// flags are what coalesce: ten `request()` calls while a pass runs are one
-/// `full` bit, and ten named chats are one set.
+/// `full` bit, and demands are deduplicated by JID.
 ///
 /// A new connection is a new generation. Resolution memory is cleared with it,
 /// which is what revalidates pictures that changed while the process was
 /// offline: a chat resolved against the previous socket must be looked at once
-/// more, and the pass that follows `Connected` is that look.
+/// more when demanded by the viewport.
 #[derive(Clone, Default)]
 pub(super) struct AvatarResolveSignal {
     ask: Arc<tokio::sync::Notify>,
@@ -384,12 +384,12 @@ pub(super) struct AvatarResolveSignal {
 /// What asks are outstanding, under one lock so they are taken atomically.
 #[derive(Default)]
 struct PendingResolve {
-    /// A pass over the account's stored chat list.
+    /// A pass over the account's stored chat list (used in tests or manual full refreshes).
     full: bool,
     /// Forget what earlier passes resolved before the next pass.
     reset: bool,
-    /// Chats named by a page, whether or not the stored window holds them.
-    named: Vec<String>,
+    /// Demands requested by the viewport, header, or overscan.
+    demands: HashMap<String, oxidezap_core::AvatarDemand>,
 }
 
 impl AvatarResolveSignal {
@@ -397,22 +397,18 @@ impl AvatarResolveSignal {
         Self::default()
     }
 
-    /// A connection was established: revalidate once, at this new generation.
+    /// A connection was established: advance the generation counter.
     ///
     /// The generation bump alone is the revalidation: every chat's remembered
-    /// answer is from the previous socket and no longer counts, so the pass
-    /// that follows looks at each one again. This is what catches a picture
-    /// changed while the process was offline.
+    /// answer is from the previous socket and no longer counts, so future
+    /// demands will revalidate against the new connection.
     pub(super) fn new_connection(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        self.set(|pending| pending.full = true);
     }
 
     /// Ask for a pass over what is not yet known.
     ///
-    /// Only a test asks directly: production asks through
-    /// [`new_connection`](Self::new_connection), which also advances the
-    /// generation.
+    /// Only a test asks directly.
     #[cfg(test)]
     pub(super) fn request(&self) {
         self.set(|pending| pending.full = true);
@@ -422,13 +418,44 @@ impl AvatarResolveSignal {
     pub(super) fn reset(&self) {
         self.set(|pending| {
             pending.reset = true;
-            pending.full = true;
         });
     }
 
     /// Ask about these chats specifically.
     pub(super) fn request_named(&self, jids: impl IntoIterator<Item = String>) {
-        self.set(|pending| pending.named.extend(jids));
+        self.ensure(jids.into_iter().map(|jid| oxidezap_core::AvatarDemand {
+            jid,
+            known_picture_id: None,
+            cache_key: None,
+            need_bytes: true,
+        }));
+    }
+
+    /// Queue avatar demands from viewport or header.
+    pub(super) fn ensure(&self, items: impl IntoIterator<Item = oxidezap_core::AvatarDemand>) {
+        self.set(|pending| {
+            for item in items {
+                pending
+                    .demands
+                    .entry(item.jid.clone())
+                    .and_modify(|existing| {
+                        if item.need_bytes {
+                            existing.need_bytes = true;
+                            existing.known_picture_id = None;
+                        } else {
+                            if item.known_picture_id.is_some()
+                                && existing.known_picture_id.is_none()
+                            {
+                                existing.known_picture_id = item.known_picture_id.clone();
+                            }
+                            if item.cache_key.is_some() && existing.cache_key.is_none() {
+                                existing.cache_key = item.cache_key.clone();
+                            }
+                        }
+                    })
+                    .or_insert(item);
+            }
+        });
     }
 
     fn set(&self, change: impl FnOnce(&mut PendingResolve)) {
@@ -449,10 +476,6 @@ impl AvatarResolveSignal {
     }
 
     /// Wait for an ask, and take what it carried.
-    ///
-    /// A bare `request()` is the `full` bit, which is the piece the old
-    /// notification lost: answering "wake up" alone left the caller with
-    /// nothing outstanding and it went straight back to waiting.
     pub(super) async fn next(&self) -> ResolveRequest {
         loop {
             let taken = {
@@ -460,17 +483,18 @@ impl AvatarResolveSignal {
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let demands = pending.demands.drain().map(|(_, d)| d).collect();
                 let taken = ResolveRequest {
                     full: pending.full,
                     reset: pending.reset,
-                    named: std::mem::take(&mut pending.named),
+                    demands,
                     generation: self.generation.load(Ordering::SeqCst),
                 };
                 pending.full = false;
                 pending.reset = false;
                 taken
             };
-            if taken.full || taken.reset || !taken.named.is_empty() {
+            if taken.full || taken.reset || !taken.demands.is_empty() {
                 return taken;
             }
             self.ask.notified().await;
@@ -485,8 +509,8 @@ pub(super) struct ResolveRequest {
     pub(super) full: bool,
     /// Forget what earlier passes resolved first.
     pub(super) reset: bool,
-    /// Chats named by a page.
-    pub(super) named: Vec<String>,
+    /// Demands requested by viewport or explicit requests.
+    pub(super) demands: Vec<oxidezap_core::AvatarDemand>,
     /// The connection this ask was made under.
     pub(super) generation: u64,
 }
@@ -2352,11 +2376,14 @@ impl WhatsAppClient {
         self.resolve_avatars.reset();
     }
 
+    /// Ensure profile pictures for avatar demands.
+    pub fn ensure_avatars(&self, items: Vec<oxidezap_core::AvatarDemand>) {
+        self.resolve_avatars.ensure(items);
+    }
+
     /// Ask the avatar resolver about these chats specifically.
     ///
-    /// For a chat list paged further: the rows it just read may name chats the
-    /// connect pass never saw, because that pass reads a bounded window. The
-    /// resolver deduplicates, so a chat it has already resolved costs nothing.
+    /// The resolver deduplicates, so a chat it has already resolved costs nothing.
     pub fn request_avatar_resolve_for(&self, jids: impl IntoIterator<Item = String>) {
         self.resolve_avatars.request_named(jids);
     }

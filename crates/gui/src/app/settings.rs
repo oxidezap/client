@@ -577,6 +577,10 @@ impl WhatsAppApp {
                 return;
             }
             let _ = entity.update(cx, |app, cx| {
+                app.avatar_manager.clear();
+                crate::session::avatar::spawn_task(async {
+                    crate::session::avatar::clear_cache_storage().await;
+                });
                 crate::session::clear_image_sources();
                 app.refresh_storage_usage(cx);
             });

@@ -1613,6 +1613,10 @@ impl Bridge {
                 client.reset_avatar_cache();
                 CommandOutcome::Accepted
             }
+            Action::EnsureAvatars(items) => {
+                client.ensure_avatars(items);
+                CommandOutcome::Accepted
+            }
             Action::RefreshVideo => {
                 // A window is drawing again — or for the first time. The gate
                 // opens before the keyframe is asked for, so the frame that

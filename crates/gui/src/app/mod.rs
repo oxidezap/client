@@ -884,11 +884,60 @@ pub struct WhatsAppApp {
     /// Both are things that change with no event to carry them.
     #[allow(dead_code)]
     heartbeat: Option<Task<()>>,
+    /// Demand-driven avatar pipeline and cache coordinator.
+    pub(crate) avatar_manager: crate::session::avatar::AvatarManager,
 }
 
 impl WhatsAppApp {
     pub fn media_cache(&self) -> Option<std::sync::Arc<dyn crate::session::MediaCache>> {
         self.client.as_ref().map(Session::media_cache)
+    }
+
+    /// Demand avatar images for visible rows and overscan (+/- 10 rows).
+    pub fn demand_avatars_for_visible_range(
+        &mut self,
+        rows: &[ChatRow],
+        visible_range: std::ops::Range<usize>,
+        _cx: &mut App,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let start = visible_range.start.saturating_sub(10);
+        let end = (visible_range.end + 10).min(rows.len());
+        if start >= end || start >= rows.len() {
+            return;
+        }
+        let demands: Vec<crate::session::avatar::ChatDemand> = rows[start..end]
+            .iter()
+            .map(|row| {
+                let picture_id = self
+                    .find_chat(&row.jid)
+                    .and_then(|c| c.avatar_picture_id.clone());
+                crate::session::avatar::ChatDemand {
+                    jid: row.jid.clone(),
+                    picture_id,
+                    cache_key: row.avatar_key.clone(),
+                }
+            })
+            .collect();
+        self.avatar_manager.demand_chats(&demands);
+        if let Some(session) = &self.client {
+            self.avatar_manager.flush_demands(session);
+        }
+    }
+
+    /// Demand avatar image for an individual open chat (e.g. from the header).
+    pub fn demand_avatar_for_chat(&mut self, chat: &Chat) {
+        self.avatar_manager
+            .demand_chat(&crate::session::avatar::ChatDemand {
+                jid: chat.jid.clone(),
+                picture_id: chat.avatar_picture_id.clone(),
+                cache_key: chat.avatar_cache_key.clone(),
+            });
+        if let Some(session) = &self.client {
+            self.avatar_manager.flush_demands(session);
+        }
     }
     /// Spawn the event handling task that processes UI events from the WhatsApp client
     fn spawn_event_task(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
@@ -938,9 +987,10 @@ impl WhatsAppApp {
                         cx.notify();
                     }),
                     FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
+                        app.avatar_manager.on_avatar_ready(&jid, &key);
                         if let Some(chat) = app.find_chat_mut(&jid) {
-                            chat.avatar_cache_key = Some(key);
-                            chat.avatar_loaded = true;
+                            chat.avatar_cache_key = (!key.is_empty()).then_some(key);
+                            chat.avatar_loaded = chat.avatar_cache_key.is_some();
                             app.invalidate_chat_cache();
                             cx.notify();
                         }
@@ -1109,6 +1159,7 @@ impl WhatsAppApp {
             settings: cx.new(|_| settings::Settings::new()),
             status_tick: None,
             heartbeat: None,
+            avatar_manager: crate::session::avatar::AvatarManager::new(),
         }
     }
 
@@ -1701,8 +1752,12 @@ impl WhatsAppApp {
         self.destination = Destination::default();
         self.message_list_cache.borrow_mut().clear();
         self.chat_list_cache.borrow_mut().take();
-        *self.status_feed_cache.borrow_mut() = None;
+        self.status_feed_cache.borrow_mut().take();
         self.decoded_images.borrow_mut().clear();
+        self.avatar_manager.clear();
+        crate::session::avatar::spawn_task(async {
+            crate::session::avatar::delete_account_storage().await;
+        });
         self.sticker_validation.borrow_mut().clear();
         self.timeline_anchor = None;
         // Composed text, and the reply bar it may be answering.
@@ -2258,6 +2313,9 @@ impl WhatsAppApp {
             self.cancel_reply(cx);
         }
         self.selected_chat = Some(jid.clone());
+        if let Some(chat) = self.find_chat(&jid).cloned() {
+            self.demand_avatar_for_chat(&chat);
+        }
         self.navigate_to_chat();
 
         self.keyboard_intent = open;

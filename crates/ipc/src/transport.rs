@@ -228,8 +228,11 @@ use std::path::PathBuf;
 /// request the protocol defines became one the daemon acts on. A v1 peer
 /// would misparse the first three and not recognise the rest.
 ///
+/// 31: `EnsureAvatars` was added to [`ClientRequest`] to support viewport-driven
+/// avatar demand and conditional profile picture metadata freshness checks.
+///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

@@ -992,6 +992,42 @@ async fn removing_a_plugin_is_answered_without_the_session() {
     );
 }
 
+#[tokio::test]
+async fn an_ensure_avatars_request_dispatches_to_session_bridge() {
+    let hub = StateHub::new();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    let request = Request {
+        id: Some(99),
+        request: ClientRequest::EnsureAvatars(oxidezap_ipc::EnsureAvatars {
+            items: vec![oxidezap_core::AvatarDemand {
+                jid: "123@s.whatsapp.net".into(),
+                known_picture_id: Some("pic_1".into()),
+                cache_key: Some("a-123".into()),
+                need_bytes: false,
+            }],
+        }),
+    };
+
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox).await;
+    assert!(matches!(
+        answered(answer, &mut answers).await,
+        DaemonMessage::Accepted { id: Some(99) }
+    ));
+    drop(commands);
+    let command = taken.await.unwrap().expect("a command was dispatched");
+    match command {
+        Action::EnsureAvatars(items) => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].jid, "123@s.whatsapp.net");
+            assert_eq!(items[0].known_picture_id.as_deref(), Some("pic_1"));
+            assert!(!items[0].need_bytes);
+        }
+        other => panic!("expected Action::EnsureAvatars, got {other:?}"),
+    }
+}
+
 /// A refused command names the request it refused. Before ids, the only
 /// way to report a refused send was to invent a failure against the
 /// message the client happened to have drawn.

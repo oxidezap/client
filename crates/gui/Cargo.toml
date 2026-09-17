@@ -148,6 +148,12 @@ web-sys = { version = "0.3", features = [
     "Url",
     "Performance",
     "Window",
+    # Cache Storage API for persistent avatar caching across F5 reloads
+    "CacheStorage",
+    "Cache",
+    "ResponseInit",
+    "Headers",
+    "Request",
     # WebCodecs: the browser's own H.264 decoder, which is what stands in for
     # openh264 where there is no C toolchain. See `video/webcodecs.rs`.
     "VideoDecoder",

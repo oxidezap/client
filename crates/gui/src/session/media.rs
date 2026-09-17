@@ -118,13 +118,12 @@ fn cached_image_source(
         }
         let bytes = read().ok()?;
         let (source, decoded_size) = decode_avatar(&bytes)?;
-        let size = (bytes.len() as u64).saturating_add(decoded_size);
-        images.put(key.to_string(), source.clone(), size);
+        images.put(key.to_string(), source.clone(), decoded_size);
         Some(source)
     })
 }
 
-fn decode_avatar(bytes: &[u8]) -> Option<(ImageSource, u64)> {
+pub(crate) fn decode_avatar(bytes: &[u8]) -> Option<(ImageSource, u64)> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -153,6 +152,14 @@ fn decode_avatar(bytes: &[u8]) -> Option<(ImageSource, u64)> {
         ]))),
         decoded_size,
     ))
+}
+
+pub(crate) fn get_avatar_image(key: &str) -> Option<ImageSource> {
+    AVATAR_IMAGES.with(|images| images.borrow_mut().get(key))
+}
+
+pub(crate) fn put_avatar_image(key: String, source: ImageSource, decoded_size: u64) {
+    AVATAR_IMAGES.with(|images| images.borrow_mut().put(key, source, decoded_size));
 }
 
 pub(crate) fn clear_image_sources() {
@@ -248,8 +255,7 @@ impl MediaCache for Directory {
             let path = oxidezap_ipc::media_path(key)?;
             let bytes = std::fs::read(path).ok()?;
             let (source, decoded_size) = decode_avatar(&bytes)?;
-            let size = (bytes.len() as u64).saturating_add(decoded_size);
-            images.put(key.to_string(), source.clone(), size);
+            images.put(key.to_string(), source.clone(), decoded_size);
             Some(source)
         })
     }

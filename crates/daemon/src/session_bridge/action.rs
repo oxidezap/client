@@ -78,6 +78,8 @@ pub enum Action {
     /// Wipe local state so the user can pair again. The daemon owns the store
     /// file, so it is the only process that may delete it.
     ForgetSession,
+    /// Demand profile pictures for visible rows or overscan.
+    EnsureAvatars(Vec<oxidezap_core::AvatarDemand>),
     /// Asynchronous request from the new wire protocol.
     Wire {
         id: u64,
@@ -116,6 +118,7 @@ impl Action {
                     // lose the reset rather than defer it — the descriptors
                     // would keep pointing at bytes the clear just removed.
                     | Self::RefreshAvatars
+                    | Self::EnsureAvatars(_)
                     // A group's members, too: the connection holds that list
                     // because sending needs one, so the common answer is a read
                     // of what is already held. Gating it on the network would

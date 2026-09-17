@@ -467,7 +467,6 @@ impl WhatsAppClient {
         include_archived: bool,
     ) -> Task<Result<Page<oxidezap_core::Chat>, String>> {
         let session = self.session.clone();
-        let avatars = self.resolve_avatars.clone();
         self.exec.spawn(async move {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
@@ -498,12 +497,9 @@ impl WhatsAppClient {
             let mut chats = Self::hydrate_entries(store, client, names, entries, Self::attach_page)
                 .await
                 .map_err(|e| e.to_string())?;
-            // The durable pictures, locally, and an ask that picks up any this
-            // page named for the first time. Both belong here: a chat paged in
-            // after the connect pass is one the resolver has never seen, and
-            // the connect pass reads a bounded window that may not hold it.
+            // The durable pictures, locally: attach what sqlite already knows.
+            // Network lookups are demand-driven as rows become visible in the UI.
             Self::attach_avatar_descriptors(store, &mut chats).await;
-            avatars.request_named(chats.iter().map(|chat| chat.jid.clone()));
             Ok(Page { items: chats, next })
         })
     }

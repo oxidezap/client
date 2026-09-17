@@ -733,6 +733,14 @@ pub struct GroupMembers {
     pub jid: String,
 }
 
+pub use oxidezap_core::AvatarDemand;
+
+/// Ask the daemon/session to ensure profile pictures for the given chats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnsureAvatars {
+    pub items: Vec<AvatarDemand>,
+}
+
 /// What a client asks the daemon to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -1010,6 +1018,8 @@ pub enum ClientRequest {
     ListInstalledPlugins,
     /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,
+    /// Demand avatar profile pictures for visible rows and overscan.
+    EnsureAvatars(EnsureAvatars),
 }
 
 /// Correlates a request with the answer it gets back.

@@ -134,6 +134,7 @@ impl WhatsAppApp {
                 }
             }
             UiEvent::AvatarReady { jid, key } => {
+                self.avatar_manager.on_avatar_ready(&jid, &key);
                 if let Some(chat) = self.find_chat_mut(&jid) {
                     // An empty key is WhatsApp saying this chat has no
                     // picture: the placeholder is the right drawing, and any

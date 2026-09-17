@@ -308,7 +308,12 @@ mod page {
                     Ok(bytes) => {
                         so_far = so_far.saturating_add(bytes.len() as u64);
                         if key.starts_with("a-") {
-                            into.put_avatar(key, bytes);
+                            if let Some((source, decoded_size)) =
+                                crate::session::decode_avatar(&bytes)
+                            {
+                                crate::session::put_avatar_image(key.clone(), source, decoded_size);
+                            }
+                            crate::session::avatar::save_avatar(&key, &bytes);
                         } else {
                             into.put(key, bytes);
                         }

@@ -127,9 +127,11 @@ impl Lookup {
 /// The generation is the connection it was resolved under. A new connection
 /// makes every entry stale, because a picture can change while the process is
 /// offline and the previous socket's answer says nothing about this one.
+/// The boolean tracks whether bytes were requested (`had_bytes = true`) or only
+/// metadata freshness checked (`had_bytes = false`).
 #[derive(Default)]
 pub(super) struct Resolver {
-    asked: HashMap<String, u64>,
+    asked: HashMap<String, (u64, bool)>,
 }
 
 impl Resolver {
@@ -137,13 +139,33 @@ impl Resolver {
         Self::default()
     }
 
-    /// Whether `jid` still needs a metadata lookup in this generation.
-    fn needs(&self, jid: &str, generation: u64) -> bool {
-        self.asked.get(jid) != Some(&generation)
+    /// Whether `jid` still needs a lookup in this generation.
+    fn needs(&self, jid: &str, generation: u64, need_bytes: bool) -> bool {
+        match self.asked.get(jid) {
+            None => true,
+            Some(&(recorded_gen, had_bytes)) => {
+                if recorded_gen != generation {
+                    true
+                } else if need_bytes && !had_bytes {
+                    // Previous ask was freshness-only, but caller needs bytes.
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
-    fn mark_asked(&mut self, jid: &str, generation: u64) {
-        self.asked.insert(jid.to_string(), generation);
+    fn mark_asked(&mut self, jid: &str, generation: u64, had_bytes: bool) {
+        let entry = self
+            .asked
+            .entry(jid.to_string())
+            .or_insert((generation, had_bytes));
+        if entry.0 != generation {
+            *entry = (generation, had_bytes);
+        } else if had_bytes {
+            entry.1 = true;
+        }
     }
 
     /// Forget every chat, so the next pass re-queries.
@@ -170,11 +192,21 @@ fn lookup_is_useless(jid: &Jid) -> bool {
 ///
 /// The group branch carries the community fallback; see [`Lookup::or_community`]
 /// for why only a `Found` is taken from it.
-async fn lookup(client: &Arc<Client>, jid: &Jid) -> Lookup {
+///
+/// When `need_bytes` is true, `existing_id` is passed as `None` to avoid the
+/// "unchanged trap": an `Unchanged` response carries no download URL, so if
+/// cached bytes are missing, an unconditional lookup is required.
+async fn lookup(
+    client: &Arc<Client>,
+    jid: &Jid,
+    known_id: Option<&str>,
+    need_bytes: bool,
+) -> Lookup {
+    let existing_id = if need_bytes { None } else { known_id };
     if jid.is_group() {
         let asked = match client
             .groups()
-            .lookup_profile_picture(jid, true, None)
+            .lookup_profile_picture(jid, true, existing_id)
             .await
         {
             Ok(outcome) => Lookup::of(outcome),
@@ -193,7 +225,7 @@ async fn lookup(client: &Arc<Client>, jid: &Jid) -> Lookup {
         // `w:profile:picture` answers. Ask the `w:g2` query before giving up.
         match client
             .groups()
-            .lookup_community_profile_picture(jid, true, None)
+            .lookup_community_profile_picture(jid, true, existing_id)
             .await
         {
             Ok(outcome) => asked.or_community(outcome),
@@ -204,7 +236,7 @@ async fn lookup(client: &Arc<Client>, jid: &Jid) -> Lookup {
     } else {
         match client
             .contacts()
-            .lookup_profile_picture(jid, true, None)
+            .lookup_profile_picture(jid, true, existing_id)
             .await
         {
             Ok(outcome) => Lookup::of(outcome),
@@ -220,42 +252,58 @@ async fn lookup(client: &Arc<Client>, jid: &Jid) -> Lookup {
     }
 }
 
-/// Resolve a page of chats and publish what was learned, a chunk at a time.
+/// Resolve avatar demands and publish what was learned, a chunk at a time.
 ///
-/// Bounded and deduplicated. The caller is the connect path or a chat-list
-/// page; a receipt is never one.
-///
-/// Published per chunk rather than once at the end: the first eight pictures
-/// are worth drawing while the next eight are in flight, and holding a whole
-/// five-hundred-chat pass behind its slowest request would leave the visible
-/// list on placeholders for no reason.
+/// Bounded and deduplicated. The caller is viewport demand or an explicit ask.
 pub(super) async fn resolve(
     client: &Arc<Client>,
     ui_tx: &UiEventSender,
     resolver: &mut Resolver,
-    jids: Vec<Jid>,
+    demands: Vec<oxidezap_core::AvatarDemand>,
     generation: u64,
 ) {
-    let pending: Vec<Jid> = jids
-        .into_iter()
-        .filter(|jid| !lookup_is_useless(jid))
-        .filter(|jid| resolver.needs(&jid.to_string(), generation))
-        .collect();
+    let mut filtered: HashMap<String, (Jid, Option<String>, bool)> = HashMap::new();
+    for demand in demands {
+        let Ok(jid) = demand.jid.parse::<Jid>() else {
+            continue;
+        };
+        if lookup_is_useless(&jid) {
+            continue;
+        }
+        if !resolver.needs(&demand.jid, generation, demand.need_bytes) {
+            continue;
+        }
+        let entry = filtered
+            .entry(demand.jid.clone())
+            .or_insert_with(|| (jid, demand.known_picture_id.clone(), demand.need_bytes));
+        if demand.need_bytes {
+            entry.2 = true;
+        }
+    }
+
+    let pending: Vec<(Jid, Option<String>, bool)> = filtered.into_values().collect();
     if pending.is_empty() {
         return;
     }
     let total = pending.len();
     let mut published = 0usize;
     for chunk in pending.chunks(AVATAR_CONCURRENCY) {
-        let answered = whatsapp_rust::futures::future::join_all(
-            chunk
-                .iter()
-                .map(|jid| async move { (jid.clone(), lookup(client, jid).await) }),
-        )
+        let answered = whatsapp_rust::futures::future::join_all(chunk.iter().map(
+            |(jid, known_id, need_bytes)| {
+                let jid = jid.clone();
+                let known_id = known_id.clone();
+                let need_bytes = *need_bytes;
+                async move {
+                    let answer = lookup(client, &jid, known_id.as_deref(), need_bytes).await;
+                    (jid, need_bytes, answer)
+                }
+            },
+        ))
         .await;
 
         let mut resolutions = Vec::with_capacity(answered.len());
-        for (jid, answer) in answered {
+        for (jid, need_bytes, answer) in answered {
+            let jid_str = jid.to_string();
             let outcome = match answer {
                 Lookup::Found { picture_id, source } => oxidezap_core::AvatarOutcome::Found {
                     picture_id,
@@ -267,28 +315,21 @@ pub(super) async fn resolve(
                 // next page does not repeat the request, and not published,
                 // because nothing on the other side would do anything with it.
                 Lookup::Unchanged | Lookup::Unknown => {
-                    resolver.mark_asked(&jid.to_string(), generation);
+                    resolver.mark_asked(&jid_str, generation, !need_bytes);
                     continue;
                 }
                 // A failure is deliberately not remembered, so a transient one
-                // is retried the next time a page names the chat.
+                // is retried the next time a demand names the chat.
                 Lookup::Failed => continue,
             };
             resolutions.push(oxidezap_core::AvatarResolution {
-                jid: jid.to_string(),
+                jid: jid_str,
                 outcome,
             });
         }
         if resolutions.is_empty() {
             continue;
         }
-        // One event for the chunk, not one per chat: the queue between here
-        // and the daemon is bounded, and a first connect resolving a large
-        // account would otherwise drop most of its own answers as overflow.
-        //
-        // The send is the line between "asked" and "answered": a chunk the
-        // queue refused is left unmarked, so the next pass asks again rather
-        // than believing a lookup that never reached the daemon.
         let chats: Vec<String> = resolutions
             .iter()
             .map(|resolution| resolution.jid.clone())
@@ -296,7 +337,7 @@ pub(super) async fn resolve(
         match ui_tx.send(UiEvent::AvatarsResolved { resolutions }) {
             Ok(()) => {
                 for jid in &chats {
-                    resolver.mark_asked(jid, generation);
+                    resolver.mark_asked(jid, generation, true);
                 }
                 published += chats.len();
             }
@@ -350,22 +391,28 @@ impl WhatsAppClient {
                 if request.reset {
                     resolver.forget_all();
                 }
-                if !request.named.is_empty() {
-                    // The named chats are what somebody just looked at, so
-                    // they are resolved first and on their own: the store
-                    // window a full pass reads may not even hold them.
-                    let named: Vec<Jid> = request
-                        .named
-                        .iter()
-                        .filter_map(|jid| jid.parse().ok())
-                        .collect();
-                    resolve(&client, &ui_tx, &mut resolver, named, request.generation).await;
+                if !request.demands.is_empty() {
+                    resolve(
+                        &client,
+                        &ui_tx,
+                        &mut resolver,
+                        request.demands,
+                        request.generation,
+                    )
+                    .await;
                 }
-                // A full ask covers the store's window; a named-only ask has
-                // already been answered above.
                 if request.full {
                     let jids = stored_jids(&chat_store).await;
-                    resolve(&client, &ui_tx, &mut resolver, jids, request.generation).await;
+                    let demands = jids
+                        .into_iter()
+                        .map(|jid| oxidezap_core::AvatarDemand {
+                            jid: jid.to_string(),
+                            known_picture_id: None,
+                            cache_key: None,
+                            need_bytes: true,
+                        })
+                        .collect();
+                    resolve(&client, &ui_tx, &mut resolver, demands, request.generation).await;
                 }
             }
         });
@@ -400,13 +447,16 @@ mod tests {
     #[test]
     fn an_asked_chat_is_not_asked_again() {
         let mut resolver = Resolver::new();
-        assert!(resolver.needs("a@s.whatsapp.net", 1));
-        resolver.mark_asked("a@s.whatsapp.net", 1);
-        assert!(!resolver.needs("a@s.whatsapp.net", 1));
-        assert!(resolver.needs("b@s.whatsapp.net", 1));
+        assert!(resolver.needs("a@s.whatsapp.net", 1, true));
+        resolver.mark_asked("a@s.whatsapp.net", 1, true);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
+        assert!(resolver.needs("b@s.whatsapp.net", 1, true));
 
         resolver.forget_all();
-        assert!(resolver.needs("a@s.whatsapp.net", 1), "a clear re-queries");
+        assert!(
+            resolver.needs("a@s.whatsapp.net", 1, true),
+            "a clear re-queries"
+        );
     }
 
     /// A reconnect is a new generation, and every previous answer is stale:
@@ -414,11 +464,20 @@ mod tests {
     #[test]
     fn a_new_connection_revalidates_what_the_last_one_resolved() {
         let mut resolver = Resolver::new();
-        resolver.mark_asked("a@s.whatsapp.net", 1);
-        assert!(!resolver.needs("a@s.whatsapp.net", 1));
+        resolver.mark_asked("a@s.whatsapp.net", 1, true);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
         assert!(
-            resolver.needs("a@s.whatsapp.net", 2),
+            resolver.needs("a@s.whatsapp.net", 2, true),
             "the answer belongs to the socket that gave it"
         );
+    }
+
+    /// Needing bytes supersedes a previous freshness-only ask.
+    #[test]
+    fn needing_bytes_supersedes_a_metadata_only_ask() {
+        let mut resolver = Resolver::new();
+        resolver.mark_asked("a@s.whatsapp.net", 1, false);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
+        assert!(resolver.needs("a@s.whatsapp.net", 1, true));
     }
 }

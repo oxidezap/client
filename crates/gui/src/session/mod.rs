@@ -24,12 +24,13 @@
 //! which side it is on.
 
 mod attach;
+pub mod avatar;
 #[cfg(target_family = "wasm")]
 mod embedded;
 mod frames;
 mod media;
 pub use media::MediaCache;
-pub(crate) use media::clear_image_sources;
+pub(crate) use media::{clear_image_sources, get_avatar_image};
 #[cfg(not(target_family = "wasm"))]
 mod native;
 mod recovery;
@@ -1561,6 +1562,16 @@ impl SessionHandle {
         let (tx, rx) = oneshot::channel();
         self.ask(ClientRequest::ClearMediaCache, Awaiting::Acted(tx));
         rx
+    }
+
+    /// Demand profile pictures for visible rows or overscan.
+    pub fn ensure_avatars(&self, items: Vec<oxidezap_core::AvatarDemand>) {
+        if items.is_empty() {
+            return;
+        }
+        self.tell(ClientRequest::EnsureAvatars(oxidezap_ipc::EnsureAvatars {
+            items,
+        }));
     }
 
     /// Fetch media, answered when the bytes are available.

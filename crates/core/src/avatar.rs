@@ -39,6 +39,20 @@ pub fn cache_key(jid: &str, picture_id: &str) -> String {
     format!("a-{}-{jid}-{}-{id}", jid.len(), id.len())
 }
 
+use serde::{Deserialize, Serialize};
+
+/// One avatar demand requested by the UI viewport, header, or overscan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvatarDemand {
+    pub jid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_picture_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    #[serde(default)]
+    pub need_bytes: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::cache_key;

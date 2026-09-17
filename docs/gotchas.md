@@ -1689,13 +1689,29 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   older one cannot land last (`store::avatar::upsert`). The lookup itself runs
   in `session/whatsapp/avatar.rs`, bounded to eight in flight, deduplicated by
   JID within a connection generation, published a chunk at a time so the first
-  eight pictures are drawn while the next eight are in flight, triggered by
-  `Connected` and by paging, and deliberately *not* by the history reload path:
-  receipts and acknowledgements used to query WhatsApp for a picture because
-  they reloaded history, and a picture is stable metadata that a receipt says
-  nothing about. A new connection advances the generation, so every chat is
-  revalidated once per connect — a picture can change while the process is
-  offline. `HistoryLoaded` carries whatever the durable descriptors already
+  eight pictures are drawn while the next eight are in flight, driven by
+  front-end demand (`ClientRequest::EnsureAvatars`) from the visible viewport
+  (+/- 10 rows overscan) and active chat header, and deliberately *not* by eager
+  full passes on `Connected`, paging, or history reload: loading 500 chats while
+  15 are visible must not decode or query 500 avatars offscreen. A new connection
+  advances the generation so visible chats are revalidated once per connect, but
+  does not trigger an eager full pass.
+
+  Avatars use a multi-tier cache:
+  1. Memory tier: Decoded GPUI `ImageSource` in `AVATAR_IMAGES` LRU cache,
+     bounded by `DECODED_IMAGE_BUDGET_BYTES` (accounting only for decoded bytes).
+  2. Persistent tier: Browser Cache Storage API (`window.caches`) on web,
+     surviving F5 page reloads, and the daemon media cache directory on native
+     (read off the UI thread via `smol::unblock`).
+  3. Network tier: Demand requests specify `need_bytes`. When a persistent blob
+     is missing or corrupt, demand forces unconditional fetch (`need_bytes = true`,
+     `known_picture_id = None`) to avoid the "Unchanged" trap where the server
+     omits the download URL because it believes the client already has the bytes.
+  4. Cache eviction & logout: Logging out wipes account cache storage and
+     rotates the account scope (128-bit hex); clearing media cache evicts blobs
+     without destroying durable descriptors.
+
+  `HistoryLoaded` carries whatever the durable descriptors already
   said and never waits on an IQ. Ordinary contacts, groups and channels go
   through the generic `ProfilePictureSpec` path: the library already skips the
   privacy-token dance for anything that is not a plain PN, so they are one

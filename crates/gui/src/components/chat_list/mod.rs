@@ -262,6 +262,7 @@ fn render_rows(
                         if crate::app::nearing_end(visible_range.end, rows.len()) {
                             view.want_more_chats(cx);
                         }
+                        view.demand_avatars_for_visible_range(&rows, visible_range.clone(), cx);
                         visible_range
                             .map(|ix| {
                                 let row = rows[ix].clone();

@@ -52,10 +52,11 @@ pub use link::Link;
 pub use oxidezap_wire as wire;
 #[cfg(feature = "legacy-protocol")]
 pub use protocol::{
-    AccountIdentity, CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent,
-    DaemonMessage, Download, GroupMembers, InstallPlugin, LoadChats, LoadMessages, MarkRead,
-    MarkStatusWatched, MessagePreview, PageCursor, PairingCode, ProtocolError, Request, RequestId,
-    SendAudio, SendMedia, SendText, StateSnapshot, StateVersion, Typing,
+    AccountIdentity, AvatarDemand, CallAction, ChatSummary, ClientRequest, ConnectionState,
+    DaemonEvent, DaemonMessage, Download, EnsureAvatars, GroupMembers, InstallPlugin, LoadChats,
+    LoadMessages, MarkRead, MarkStatusWatched, MessagePreview, PageCursor, PairingCode,
+    ProtocolError, Request, RequestId, SendAudio, SendMedia, SendText, StateSnapshot, StateVersion,
+    Typing,
 };
 pub use transport::{
     DEFAULT_WEB_PORT, MAX_STAGED_BYTES, PROTOCOL_VERSION, STAGED_PREFIX, WEB_MEDIA_PATH,

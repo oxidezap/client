@@ -450,6 +450,9 @@ pub(super) async fn handle_request(
             frame: answer(id, Ok(())),
             shutdown: true,
         },
+        ClientRequest::EnsureAvatars(request) => {
+            acted(dispatch(hub, commands, Action::EnsureAvatars(request.items)).await)
+        }
     }
 }
 

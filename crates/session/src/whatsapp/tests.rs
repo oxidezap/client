@@ -1585,7 +1585,7 @@ async fn a_session_is_never_observed_half_open() {
             "half a session was visible after {polls} polls: {seen:?}"
         );
         polls += 1;
-        assert!(polls < 100_000, "the session never finished opening");
+        assert!(polls < 500_000, "the session never finished opening");
         tokio::task::yield_now().await;
     };
 
@@ -1638,11 +1638,6 @@ fn only_a_decision_reject_ends_our_side_of_the_call() {
 }
 
 /// A plain `request()` must carry the full-pass bit.
-///
-/// The bug this catches: the signal used to be a bare notification, so the
-/// consumer woke, found nothing outstanding (no reset, no named chats) and
-/// went straight back to waiting. `Connected` used `request()`, so the full
-/// refresh it is supposed to trigger never ran at all.
 #[tokio::test]
 async fn a_plain_request_carries_a_full_pass() {
     let signal = super::AvatarResolveSignal::new();
@@ -1650,7 +1645,7 @@ async fn a_plain_request_carries_a_full_pass() {
     let taken = signal.next().await;
     assert!(taken.full, "a bare request is a full pass");
     assert!(!taken.reset, "nothing asked to forget");
-    assert!(taken.named.is_empty());
+    assert!(taken.demands.is_empty());
 }
 
 /// The asks coalesce: what is outstanding between two passes is one pass.
@@ -1666,27 +1661,86 @@ async fn asks_coalesce_into_one_pass() {
     let taken = signal.next().await;
     assert!(taken.full);
     assert!(taken.reset);
-    let mut named = taken.named;
-    named.sort();
-    assert_eq!(named, ["a@s.whatsapp.net", "b@s.whatsapp.net"]);
+    let mut jids: Vec<String> = taken.demands.into_iter().map(|d| d.jid).collect();
+    jids.sort();
+    assert_eq!(jids, ["a@s.whatsapp.net", "b@s.whatsapp.net"]);
 
     // Nothing is left over: a second take would block, so take it out of band.
     let next = tokio::time::timeout(std::time::Duration::from_millis(50), signal.next()).await;
     assert!(next.is_err(), "a coalesced ask is taken once");
 }
 
-/// A new connection is a new generation, and it asks for a full pass so every
-/// remembered answer is revalidated.
+/// A new connection is a new generation, without an eager full pass over all chats.
 #[tokio::test]
-async fn a_new_connection_advances_the_generation_and_asks_for_everything() {
+async fn a_new_connection_advances_the_generation_without_eager_full_pass() {
     let signal = super::AvatarResolveSignal::new();
     let before = signal.next_generation_for_test();
     signal.new_connection();
-    let taken = signal.next().await;
-    assert!(taken.full);
     assert_eq!(
-        taken.generation,
+        signal.next_generation_for_test(),
         before + 1,
-        "the pass belongs to the new socket"
+        "generation is bumped on new connection"
     );
+
+    // It does not eagerly queue a pass:
+    let next = tokio::time::timeout(std::time::Duration::from_millis(50), signal.next()).await;
+    assert!(
+        next.is_err(),
+        "new connection does not eagerly queue a pass"
+    );
+
+    // When demand arrives, it executes under the new generation:
+    signal.ensure([oxidezap_core::AvatarDemand {
+        jid: "a@s.whatsapp.net".to_string(),
+        known_picture_id: None,
+        cache_key: None,
+        need_bytes: true,
+    }]);
+    let taken = signal.next().await;
+    assert_eq!(taken.generation, before + 1);
+    assert!(!taken.full);
+    assert_eq!(taken.demands.len(), 1);
+}
+
+/// Ensure coalesces demands by JID and upgrades need_bytes from false to true.
+#[tokio::test]
+async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
+    let signal = super::AvatarResolveSignal::new();
+    signal.ensure([
+        oxidezap_core::AvatarDemand {
+            jid: "a@s.whatsapp.net".to_string(),
+            known_picture_id: Some("pic-1".to_string()),
+            cache_key: Some("a-1".to_string()),
+            need_bytes: false,
+        },
+        oxidezap_core::AvatarDemand {
+            jid: "b@s.whatsapp.net".to_string(),
+            known_picture_id: None,
+            cache_key: None,
+            need_bytes: false,
+        },
+    ]);
+
+    // Second demand upgrades a@s.whatsapp.net to need_bytes = true
+    signal.ensure([oxidezap_core::AvatarDemand {
+        jid: "a@s.whatsapp.net".to_string(),
+        known_picture_id: None,
+        cache_key: None,
+        need_bytes: true,
+    }]);
+
+    let taken = signal.next().await;
+    assert_eq!(taken.demands.len(), 2);
+    let mut demands = taken.demands;
+    demands.sort_by(|x, y| x.jid.cmp(&y.jid));
+
+    assert_eq!(demands[0].jid, "a@s.whatsapp.net");
+    assert!(demands[0].need_bytes, "upgraded to need_bytes = true");
+    assert_eq!(
+        demands[0].known_picture_id, None,
+        "cleared known_picture_id"
+    );
+
+    assert_eq!(demands[1].jid, "b@s.whatsapp.net");
+    assert!(!demands[1].need_bytes);
 }

@@ -544,19 +544,12 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
         into.push(key);
     }
 
-    fn avatar_key_of(chat: &Chat, into: &mut Vec<String>) {
-        if let Some(key) = &chat.avatar_cache_key {
-            into.push(key.clone());
-        }
-    }
-
     let mut keys = Vec::new();
     match message {
         DaemonMessage::Session { event } => match event.as_ref() {
             UiEvent::MessageReceived { message, .. } => key_of(&message.media, &mut keys),
             UiEvent::HistoryLoaded { chats, .. } => {
                 for chat in chats {
-                    avatar_key_of(chat, &mut keys);
                     for message in &chat.messages {
                         key_of(&message.media, &mut keys);
                     }
@@ -577,7 +570,6 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
         }
         DaemonMessage::Chats { chats, .. } => {
             for chat in chats {
-                avatar_key_of(chat, &mut keys);
                 for message in &chat.messages {
                     key_of(&message.media, &mut keys);
                 }
