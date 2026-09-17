@@ -302,7 +302,7 @@ pub(super) async fn resolve(
         .await;
 
         let mut resolutions = Vec::with_capacity(answered.len());
-        for (jid, need_bytes, answer) in answered {
+        for (jid, _need_bytes, answer) in answered {
             let jid_str = jid.to_string();
             let outcome = match answer {
                 Lookup::Found { picture_id, source } => oxidezap_core::AvatarOutcome::Found {
@@ -315,7 +315,7 @@ pub(super) async fn resolve(
                 // next page does not repeat the request, and not published,
                 // because nothing on the other side would do anything with it.
                 Lookup::Unchanged | Lookup::Unknown => {
-                    resolver.mark_asked(&jid_str, generation, !need_bytes);
+                    resolver.mark_asked(&jid_str, generation, false);
                     continue;
                 }
                 // A failure is deliberately not remembered, so a transient one
@@ -479,5 +479,18 @@ mod tests {
         resolver.mark_asked("a@s.whatsapp.net", 1, false);
         assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
         assert!(resolver.needs("a@s.whatsapp.net", 1, true));
+    }
+
+    /// A metadata-only Unchanged lookup records had_bytes: false, so a subsequent byte demand proceeds.
+    #[test]
+    fn metadata_only_unchanged_lookup_permits_subsequent_byte_demand() {
+        let mut resolver = Resolver::new();
+        // Unchanged on metadata-only ask records had_bytes = false:
+        resolver.mark_asked("a@s.whatsapp.net", 1, false);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
+        assert!(
+            resolver.needs("a@s.whatsapp.net", 1, true),
+            "byte demand must proceed even after metadata Unchanged"
+        );
     }
 }

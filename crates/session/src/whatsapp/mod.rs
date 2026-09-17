@@ -1221,10 +1221,11 @@ impl WhatsAppClient {
             stopping.clone(),
         );
 
-        // The picture lifecycle, kept apart from history on purpose. It runs
-        // when the session connects and when the chat list is paged further,
-        // never on a receipt or an acknowledgement, and it reads metadata only
-        // — the bytes are the daemon's.
+        // The picture lifecycle, kept apart from history on purpose. It handles
+        // explicit demands from the viewport, overscan, active chat header, and
+        // named requests; Connected only advances its generation; chat-list paging
+        // does not enqueue resolution; and the resolver reads metadata while the
+        // daemon fetches avatar bytes.
         Self::spawn_avatar_resolver(
             bot.client(),
             chat_store.clone(),

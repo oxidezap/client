@@ -28,7 +28,8 @@ use crate::session::media::{
 };
 
 pub use imp::{
-    clear_cache_storage, delete_account_storage, read_persistent, spawn_task, write_persistent,
+    account_scope, clear_cache_storage, delete_account_storage, read_persistent,
+    rotate_account_scope, spawn_task, write_persistent,
 };
 
 /// Persist an avatar payload to the platform's storage tier.
@@ -36,8 +37,9 @@ pub use imp::{
 pub fn save_avatar(key: &str, bytes: &[u8]) {
     let key = key.to_string();
     let bytes = bytes.to_vec();
+    let scope = account_scope();
     spawn_task(async move {
-        let _ = write_persistent(&key, &bytes).await;
+        let _ = write_persistent(&key, &bytes, &scope).await;
     });
 }
 
@@ -66,6 +68,12 @@ impl AvatarManager {
     /// Reset in-memory cache and tracking (e.g. on cache clear or account change).
     pub fn clear(&self) {
         clear_image_sources();
+        self.reset_connection();
+    }
+
+    /// Clear in-flight and revalidated tracking on connection restart while preserving
+    /// decoded images in memory.
+    pub fn reset_connection(&self) {
         self.in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -350,6 +358,33 @@ mod tests {
 
         assert!(!manager.is_in_flight("user3@s.whatsapp.net"));
         assert!(!manager.is_revalidated("user3@s.whatsapp.net"));
+        assert!(manager.take_demands().is_empty());
+    }
+
+    #[test]
+    fn reset_connection_clears_in_flight_and_revalidated() {
+        let manager = AvatarManager::new();
+        manager.enqueue_demand(AvatarDemand {
+            jid: "user4@s.whatsapp.net".to_string(),
+            known_picture_id: None,
+            cache_key: None,
+            need_bytes: true,
+        });
+        manager
+            .in_flight
+            .lock()
+            .unwrap()
+            .insert("user4@s.whatsapp.net".to_string());
+        manager
+            .revalidated
+            .lock()
+            .unwrap()
+            .insert("user4@s.whatsapp.net".to_string());
+
+        manager.reset_connection();
+
+        assert!(!manager.is_in_flight("user4@s.whatsapp.net"));
+        assert!(!manager.is_revalidated("user4@s.whatsapp.net"));
         assert!(manager.take_demands().is_empty());
     }
 

@@ -4,13 +4,25 @@
 //! media cache directory (`oxidezap_ipc::media_path`). Reads run off the UI
 //! thread via `smol::unblock`.
 
+pub fn account_scope() -> String {
+    String::new()
+}
+
+pub fn rotate_account_scope() -> String {
+    String::new()
+}
+
 pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {
     let path = oxidezap_ipc::media_path(key)?;
     smol::unblock(move || std::fs::read(path).ok()).await
 }
 
 #[allow(dead_code)]
-pub async fn write_persistent(key: &str, bytes: &[u8]) -> Result<(), String> {
+pub async fn write_persistent(
+    key: &str,
+    bytes: &[u8],
+    _expected_scope: &str,
+) -> Result<(), String> {
     let path =
         oxidezap_ipc::media_path(key).ok_or_else(|| "no media cache path available".to_string())?;
     let bytes = bytes.to_vec();
@@ -23,7 +35,7 @@ pub async fn write_persistent(key: &str, bytes: &[u8]) -> Result<(), String> {
     .await
 }
 
-pub async fn delete_account_storage() {
+pub async fn delete_account_storage(_scope: &str) {
     // Daemon manages file deletion on account wipe
 }
 

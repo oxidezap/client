@@ -26,7 +26,7 @@ pub fn account_scope() -> String {
         }
     }
     let mut bytes = [0u8; 16];
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         return "default".to_string();
     }
     let mut hex = String::with_capacity(32);
@@ -38,10 +38,12 @@ pub fn account_scope() -> String {
     hex
 }
 
-pub fn rotate_account_scope() {
+/// Rotates the account scope synchronously and returns the old scope.
+pub fn rotate_account_scope() -> String {
+    let old_scope = account_scope();
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let mut bytes = [0u8; 16];
-        if getrandom::getrandom(&mut bytes).is_ok() {
+        if getrandom::fill(&mut bytes).is_ok() {
             let mut hex = String::with_capacity(32);
             for b in bytes {
                 use std::fmt::Write;
@@ -50,10 +52,15 @@ pub fn rotate_account_scope() {
             let _ = storage.set_item(SCOPE_STORAGE_KEY, &hex);
         }
     }
+    old_scope
+}
+
+pub fn cache_name_for_scope(scope: &str) -> String {
+    format!("oxidezap-avatar-v1-{scope}")
 }
 
 pub fn cache_name() -> String {
-    format!("oxidezap-avatar-v1-{}", account_scope())
+    cache_name_for_scope(&account_scope())
 }
 
 pub fn cache_url(key: &str) -> String {
@@ -85,20 +92,27 @@ pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {
     Some(array.to_vec())
 }
 
-pub async fn write_persistent(key: &str, bytes: &[u8]) -> Result<(), String> {
+pub async fn write_persistent(key: &str, bytes: &[u8], expected_scope: &str) -> Result<(), String> {
+    if account_scope() != expected_scope {
+        // Discard writes if the account scope rotated while the task was in flight
+        return Ok(());
+    }
     let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
     let caches = window.caches().map_err(|e| format!("{e:?}"))?;
-    let cache_promise = caches.open(&cache_name());
+    let cache_promise = caches.open(&cache_name_for_scope(expected_scope));
     let cache_val = wasm_bindgen_futures::JsFuture::from(cache_promise)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let cache: web_sys::Cache = cache_val.dyn_into().map_err(|e| format!("{e:?}"))?;
     let url = cache_url(key);
 
-    // Copy bytes into a JS-owned Uint8Array before passing across the wasm boundary
+    // Copy bytes into a JS-owned Uint8Array buffer and construct a Blob
     let js_array = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::new();
+    parts.push(&js_array.buffer());
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts).map_err(|e| format!("{e:?}"))?;
     let response =
-        web_sys::Response::new_with_opt_u8_array(Some(&js_array)).map_err(|e| format!("{e:?}"))?;
+        web_sys::Response::new_with_opt_blob(Some(&blob)).map_err(|e| format!("{e:?}"))?;
     let put_promise = cache.put_with_str(&url, &response);
     wasm_bindgen_futures::JsFuture::from(put_promise)
         .await
@@ -106,14 +120,13 @@ pub async fn write_persistent(key: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn delete_account_storage() {
-    let name = cache_name();
+pub async fn delete_account_storage(scope: &str) {
+    let name = cache_name_for_scope(scope);
     if let Some(window) = web_sys::window() {
         if let Ok(caches) = window.caches() {
             let _ = wasm_bindgen_futures::JsFuture::from(caches.delete(&name)).await;
         }
     }
-    rotate_account_scope();
 }
 
 pub async fn clear_cache_storage() {

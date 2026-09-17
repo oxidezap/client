@@ -1755,8 +1755,9 @@ impl WhatsAppApp {
         self.status_feed_cache.borrow_mut().take();
         self.decoded_images.borrow_mut().clear();
         self.avatar_manager.clear();
-        crate::session::avatar::spawn_task(async {
-            crate::session::avatar::delete_account_storage().await;
+        let old_scope = crate::session::avatar::rotate_account_scope();
+        crate::session::avatar::spawn_task(async move {
+            crate::session::avatar::delete_account_storage(&old_scope).await;
         });
         self.sticker_validation.borrow_mut().clear();
         self.timeline_anchor = None;
@@ -2427,6 +2428,7 @@ impl WhatsAppApp {
     }
 
     pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
+        self.avatar_manager.reset_connection();
         self.app_state = AppState::Loading;
 
         // Drop the old connection first: a second one alongside it would be
