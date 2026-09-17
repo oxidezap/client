@@ -415,7 +415,9 @@ async fn attach(
     // Sized for one frame of a history load rather than one message.
     let (server_side, bridge_side) = tokio::io::duplex(256 * 1024);
     let serving = tokio::spawn(async move {
-        if let Err(e) = crate::server::serve_client_with_registry(server_side, registry).await {
+        if let Err(e) =
+            crate::server::serve_client_with_registry(Box::new(server_side), registry).await
+        {
             log::debug!("web client disconnected: {e}");
         }
     });

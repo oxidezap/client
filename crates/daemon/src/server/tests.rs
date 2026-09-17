@@ -79,7 +79,7 @@ async fn a_control_connection_lists_accounts_and_rejects_account_requests() {
     ))));
 
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
     let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
         scope: ClientScope::Control,
@@ -171,7 +171,7 @@ async fn an_account_connection_is_bound_to_the_requested_runtime() {
     ))));
 
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
     let hello = serde_json::to_string(&Request::bare(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
         scope: ClientScope::Account {
@@ -219,7 +219,7 @@ async fn a_stopping_account_refuses_a_new_connection() {
     assert!(registry.insert(runtime));
 
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
     let hello = serde_json::to_string(&Request::bare(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
         scope: ClientScope::Account { account },
@@ -257,7 +257,7 @@ async fn a_stopping_account_refuses_a_new_connection() {
 async fn create_account_is_refused_without_a_supervisor_attached() {
     let registry = AccountRegistry::new();
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
 
     let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
@@ -342,7 +342,10 @@ async fn a_control_connection_resets_and_removes_a_named_account() {
     ))));
 
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let served = tokio::spawn(serve_client_with_registry(server, Arc::clone(&registry)));
+    let served = tokio::spawn(serve_client_with_registry(
+        Box::new(server),
+        Arc::clone(&registry),
+    ));
     let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
         scope: ClientScope::Control,
@@ -456,7 +459,10 @@ async fn the_control_plane_answers_the_process_wide_requests() {
 
     let registry = AccountRegistry::new();
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let served = tokio::spawn(serve_client_with_registry(server, Arc::clone(&registry)));
+    let served = tokio::spawn(serve_client_with_registry(
+        Box::new(server),
+        Arc::clone(&registry),
+    ));
     let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
         scope: ClientScope::Control,
@@ -671,12 +677,12 @@ async fn a_command_reaches_the_session_rather_than_being_refused() {
     let hub = connected_hub();
     let (commands, taken) = bridge(CommandOutcome::Accepted);
 
-    let request = bare(ClientRequest::SendText(oxidezap_ipc::SendText {
+    let request = bare(ClientRequest::SendText(Box::new(oxidezap_ipc::SendText {
         jid: "a@s.whatsapp.net".into(),
         text: "hi".into(),
         local_id: None,
         quoted: None,
-    }));
+    })));
     let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
     assert!(matches!(
         parse(answer.frame),
@@ -718,7 +724,7 @@ async fn a_picked_file_reaches_the_session_as_it_was_described() {
         }),
     };
     let answer = handle_request(
-        bare(ClientRequest::SendMedia(sent.clone())),
+        bare(ClientRequest::SendMedia(Box::new(sent.clone()))),
         &hub,
         &no_plugins(),
         &commands,
@@ -777,12 +783,12 @@ async fn a_session_lost_mid_command_is_reported_as_such() {
     let hub = connected_hub();
     let (commands, _taken) = bridge(CommandOutcome::NoSession("not connected".into()));
 
-    let request = bare(ClientRequest::SendText(oxidezap_ipc::SendText {
+    let request = bare(ClientRequest::SendText(Box::new(oxidezap_ipc::SendText {
         jid: "a@s.whatsapp.net".into(),
         text: "hi".into(),
         local_id: None,
         quoted: None,
-    }));
+    })));
     let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
     assert!(matches!(
         parse(answer.frame),
@@ -802,12 +808,12 @@ async fn a_command_is_refused_while_there_is_no_session_to_carry_it() {
     let hub = StateHub::new();
     let (commands, taken) = bridge(CommandOutcome::Accepted);
 
-    let request = bare(ClientRequest::SendText(oxidezap_ipc::SendText {
+    let request = bare(ClientRequest::SendText(Box::new(oxidezap_ipc::SendText {
         jid: "a@s.whatsapp.net".into(),
         text: "hi".into(),
         local_id: None,
         quoted: None,
-    }));
+    })));
     let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
     assert!(matches!(
         parse(answer.frame),
@@ -1552,12 +1558,12 @@ async fn a_refusal_names_the_request_it_refused() {
 
     let request = Request {
         id: Some(42),
-        request: ClientRequest::SendText(oxidezap_ipc::SendText {
+        request: ClientRequest::SendText(Box::new(oxidezap_ipc::SendText {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: Some("local_1".into()),
             quoted: None,
-        }),
+        })),
     };
     let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
     assert!(matches!(

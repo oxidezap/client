@@ -201,7 +201,8 @@ fn accept(
 
     let (client, server) = tokio::io::duplex(PIPE);
     oxidezap_session::spawn(async move {
-        if let Err(e) = crate::server::serve_client_with_registry(server, registry).await {
+        if let Err(e) = crate::server::serve_client_with_registry(Box::new(server), registry).await
+        {
             log::debug!("a tab disconnected: {e}");
         }
     });

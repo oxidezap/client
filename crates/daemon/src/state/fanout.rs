@@ -295,7 +295,10 @@ impl Claim<'_> {
     pub(super) fn publish(self, version: StateVersion, event: DaemonEvent, tray: TrayState) {
         // Serialized once, and only when someone is listening.
         if self.fanout.updates_wanted() {
-            match serde_json::to_string(&DaemonMessage::Update { version, event }) {
+            match serde_json::to_string(&DaemonMessage::Update {
+                version,
+                event: Box::new(event),
+            }) {
                 Ok(line) => {
                     // Err means every receiver dropped between the count above
                     // and here. Nothing to do: the state is already recorded.

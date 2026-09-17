@@ -22,7 +22,7 @@ use crate::state::StateHub;
 pub(crate) fn translate_wire_frame(frame: &str, hub: &StateHub) -> Option<String> {
     let message: DaemonMessage = serde_json::from_str(frame).ok()?;
     let event = match message {
-        DaemonMessage::Update { event, .. } => translate_state_event(event, hub)?,
+        DaemonMessage::Update { event, .. } => translate_state_event(*event, hub)?,
         DaemonMessage::Session { event, .. } => translate_session_event(*event, hub)?,
         _ => return None,
     };
@@ -309,14 +309,14 @@ mod tests {
         let hub = StateHub::new();
         let frame = serde_json::to_string(&DaemonMessage::Update {
             version: oxidezap_ipc::StateVersion::INITIAL,
-            event: LegacyEvent::ChatUpdated(ChatSummary {
+            event: Box::new(LegacyEvent::ChatUpdated(ChatSummary {
                 jid: "559900000001@s.whatsapp.net".into(),
                 name: "Maria".into(),
                 unread: 2,
                 manually_unread: false,
                 last_message: None,
                 pinned_at_ms: None,
-            }),
+            })),
         })
         .unwrap();
         let line = translate_wire_frame(&frame, &hub).expect("a wire event");

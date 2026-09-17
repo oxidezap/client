@@ -139,7 +139,7 @@ where
         commands,
     ));
     assert!(registry.insert(runtime));
-    serve_client_with_registry(stream, registry).await
+    serve_client_with_registry(Box::new(stream), registry).await
 }
 
 /// Serve a connection against the daemon's account registry.
@@ -147,13 +147,24 @@ where
 /// The registry lookup happens after the handshake and before subscribing to
 /// any account channels. A stale or forged account id therefore cannot attach
 /// to another account's hub by accident.
-pub(crate) async fn serve_client_with_registry<S>(
-    stream: S,
+///
+/// The stream arrives boxed rather than generic: Unix sockets, in-process
+/// duplex pairs and the web bridge's channels would otherwise monomorphize
+/// everything below — the handshake, every write, the control plane — once
+/// per transport. One allocation per connection, which lives as long as the
+/// connection does; the per-read cost is a vtable hop the socket dwarfs.
+///
+/// A trait rather than `Box<dyn AsyncRead + AsyncWrite + ...>` inline, which
+/// the language refuses — one non-auto trait per object, so the conjunction
+/// gets a name and the name gets the blanket impl below.
+pub(crate) trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
+pub(crate) type ClientStream = Box<dyn AsyncStream>;
+
+pub(crate) async fn serve_client_with_registry(
+    stream: ClientStream,
     registry: Arc<AccountRegistry>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
+) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::with_capacity(1024);

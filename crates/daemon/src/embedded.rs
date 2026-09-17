@@ -56,7 +56,7 @@ pub async fn start() -> Result<DuplexStream, StartFailed> {
 
     let (client, server) = tokio::io::duplex(PIPE);
     oxidezap_session::spawn(async move {
-        if let Err(e) = server::serve_client_with_registry(server, registry).await {
+        if let Err(e) = server::serve_client_with_registry(Box::new(server), registry).await {
             log::error!("the in-process client ended badly: {e}");
         }
         // Nothing is released here, and that is the fix rather than an

@@ -1061,12 +1061,12 @@ impl SessionHandle {
         quoted: Option<QuotedMessage>,
     ) {
         self.ask(
-            ClientRequest::SendText(SendText {
+            ClientRequest::SendText(Box::new(SendText {
                 jid: jid.to_string(),
                 text: text.to_string(),
                 local_id: Some(local_id.clone()),
                 quoted,
-            }),
+            })),
             Awaiting::Send {
                 chat_jid: jid.to_string(),
                 local_id,
@@ -1085,14 +1085,14 @@ impl SessionHandle {
         quoted: Option<QuotedMessage>,
     ) {
         self.send_staged(jid, local_id, audio, "the recording", |upload, local_id| {
-            ClientRequest::SendAudio(SendAudio {
+            ClientRequest::SendAudio(Box::new(SendAudio {
                 jid: jid.to_string(),
                 upload,
                 duration_secs,
                 waveform,
                 local_id: Some(local_id),
                 quoted,
-            })
+            }))
         });
     }
 
@@ -1118,7 +1118,7 @@ impl SessionHandle {
             caption,
         } = file;
         self.send_staged(jid, local_id, bytes, "that file", |upload, local_id| {
-            ClientRequest::SendMedia(SendMedia {
+            ClientRequest::SendMedia(Box::new(SendMedia {
                 jid: jid.to_string(),
                 upload,
                 kind,
@@ -1127,7 +1127,7 @@ impl SessionHandle {
                 caption,
                 local_id: Some(local_id),
                 quoted,
-            })
+            }))
         });
     }
 
@@ -1445,14 +1445,14 @@ impl SessionHandle {
         widget: oxidezap_core::PluginWidget,
     ) {
         self.tell(ClientRequest::PluginAction {
-            action: oxidezap_core::PluginAction {
+            action: Box::new(oxidezap_core::PluginAction {
                 plugin: plugin.to_string(),
                 action: action.to_string(),
                 value,
                 chat_jid,
                 slot,
                 widget,
-            },
+            }),
         });
     }
 

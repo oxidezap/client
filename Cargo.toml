@@ -362,6 +362,13 @@ opt-level = "z"
 # connection state changes. 263 KiB of the daemon before this.
 [profile.release.package.ksni]
 opt-level = "z"
+# The same tray on the other two platforms, where `ksni` has nothing to talk
+# to. Same shape of work — clicks and a menu nobody opens in a loop — so the
+# same level, keeping the Linux-only halves this crate leaves out.
+[profile.release.package.tray-icon]
+opt-level = "z"
+[profile.release.package.muda]
+opt-level = "z"
 
 # The pattern parser under the regex engine the sweep already names. `regex`
 # and `regex-automata` have been at "z" here from the start, and this runs
@@ -390,10 +397,18 @@ opt-level = "z"
 [profile.release.package.num-bigint-dig]
 opt-level = "z"
 
-# A plugin's module is *validated* once, at load, and then interpreted. Only
-# the validator is here: `wasmi` itself runs a plugin's instructions and stays
-# where it is.
+# A plugin's module is *validated* once, at load, and then interpreted, one
+# instruction at a time, at whatever pace the plugin sets. Neither half is a
+# loop the process drives, so both go here rather than only the validator.
 [profile.release.package.wasmparser]
+opt-level = "z"
+[profile.release.package.wasmi]
+opt-level = "z"
+[profile.release.package.wasmi_collections]
+opt-level = "z"
+[profile.release.package.wasmi_core]
+opt-level = "z"
+[profile.release.package.wasmi_ir]
 opt-level = "z"
 
 # The certificate work at connect: parsing a chain, checking a name, and the
@@ -412,6 +427,16 @@ opt-level = "z"
 [profile.release.package.rtc-dtls]
 opt-level = "z"
 [profile.release.package.rtc-sctp]
+opt-level = "z"
+# The Noise handshake the connection opens with: once per connect, against a
+# record path (`rustls`, `ring`) that stays untouched, like the DTLS entry
+# above it.
+[profile.release.package.wacore-noise]
+opt-level = "z"
+# Decompression behind a network wait: history-sync blobs and HTTP gzip.
+# The bytes arrive at wire speed either way, so nothing here can cost a user
+# anything measurable.
+[profile.release.package.zlib-rs]
 opt-level = "z"
 
 # The wire format, which the web profile below has always had at "z" and the
@@ -485,7 +510,20 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.wacore-appstate]
 opt-level = "s"
+# The Signal session and the binary framing under it: per message like the
+# appstate entry above, and control-plane work rather than a loop — the
+# arithmetic underneath (`curve25519-dalek`, `aes`, `sha2`) stays where it is.
+[profile.release.package.wacore-libsignal]
+opt-level = "s"
+[profile.release.package.wacore-binary]
+opt-level = "s"
 [profile.release.package.chrono]
+opt-level = "s"
+# The IPC and protocol serialization beside `serde_json`: per request rather
+# than per frame, on paths a user waits on but never in a loop.
+[profile.release.package.serde]
+opt-level = "s"
+[profile.release.package.serde_core]
 opt-level = "s"
 [profile.release.package.serde_json]
 opt-level = "s"

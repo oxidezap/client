@@ -261,21 +261,28 @@ fn only_the_type(format: Option<image::ImageFormat>) -> Option<Photo> {
 /// The re-encode is free of any decode this was not going to pay anyway: a
 /// thumbnail needs the pixels, so the picture is decoded once and used twice.
 fn still(data: &[u8]) -> (Shape, Option<Photo>) {
-    let reader = match image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format() {
-        Ok(reader) => reader,
-        Err(e) => {
-            warn!("could not read that image's header: {e}");
+    // Named, not sniffed: `named_image_format` reads only magic bytes, so
+    // naming a format links no decoder — only the four in
+    // `allowed_image_format` ever reach one, whatever feature set the binary
+    // linking this crate was built with.
+    let named = crate::media::named_image_format(data);
+    let Some(format) = crate::media::allowed_image_format(data) else {
+        // A format nothing here decodes goes out as it came, still saying
+        // what it is; what cannot be named at all keeps the picker's claim.
+        if named.is_none() {
+            warn!("could not read that image's header; sending it as it came");
             return (Shape::default(), None);
         }
+        return (Shape::default(), only_the_type(named));
     };
-    // Kept, because `into_dimensions` consumes the reader and guessing the
-    // format again would mean sniffing the same bytes a second time.
-    let format = reader.format();
-    let (width, height) = match reader.into_dimensions() {
+    // No limits to enforce here beyond the decoder's own defaults — the
+    // ceiling this module answers to is `MAX_THUMBNAIL_SOURCE_PIXELS`,
+    // measured below from what this returns.
+    let (width, height) = match crate::media::dimensions(data, format, image::Limits::default()) {
         Ok(dimensions) => dimensions,
         Err(e) => {
             warn!("could not measure that image: {e}");
-            return (Shape::default(), only_the_type(format));
+            return (Shape::default(), only_the_type(Some(format)));
         }
     };
 
@@ -290,25 +297,17 @@ fn still(data: &[u8]) -> (Shape, Option<Photo>) {
         // however the recipient's client manages with them, which is the
         // better of the two failures available here.
         warn!("{width}x{height} is too large to decode; sending it as it came");
-        return (shape, only_the_type(format));
+        return (shape, only_the_type(Some(format)));
     }
 
-    let Some(format) = format else {
-        warn!("that image is in a format this build cannot read");
-        return (shape, None);
-    };
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(data));
-    reader.set_format(format);
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_THUMBNAIL_DECODE_BYTES);
-    reader.limits(limits);
-    let decoded = match reader.decode() {
+    let decoded = match crate::media::decode(data, format, limits) {
         Ok(decoded) => decoded,
         Err(e) => {
-            // A format named in the header and refused by the decoder — a
-            // HEIC, an AVIF, anything this build was not given a decoder for.
-            // It goes out as it came, which is the only thing left to do with
-            // bytes nothing here can read.
+            // Pixels this build will not allocate: truncated or corrupt in a
+            // format it does read. It goes out as it came, which is the only
+            // thing left to do with bytes nothing here can read.
             warn!("could not decode that image: {e}");
             return (shape, only_the_type(Some(format)));
         }
@@ -801,6 +800,20 @@ mod tests {
 
         assert_eq!(sent.data, bmp, "the bytes are the ones that came in");
         assert_eq!(sent.mime_type, "image/bmp");
+        assert_eq!(shape, Shape::default(), "and nothing was measured");
+    }
+
+    /// A format WhatsApp's own clients do not accept as a picture is named
+    /// but never decoded here, whatever the binary's feature set: it goes
+    /// out as it came, saying what it is. A TIFF signature — recognised by
+    /// its magic bytes, with no TIFF decoder linked into this process.
+    #[test]
+    fn a_format_outside_the_allowlist_is_named_but_never_decoded() {
+        let tiff = b"II*\x00\x08\x00\x00\x00".to_vec();
+        let (shape, sent) = prepared("image/png", tiff.clone());
+
+        assert_eq!(sent.data, tiff, "the bytes are the ones that came in");
+        assert_eq!(sent.mime_type, "image/tiff");
         assert_eq!(shape, Shape::default(), "and nothing was measured");
     }
 

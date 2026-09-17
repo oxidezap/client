@@ -98,7 +98,7 @@ pub async fn run(claim: &Claim, registry: Arc<AccountRegistry>, slots: ClientSlo
         // Per-connection task: one slow or malformed client cannot hold up
         // the accept loop or any other client.
         tokio::spawn(async move {
-            if let Err(e) = serve_client_with_registry(stream, registry).await {
+            if let Err(e) = serve_client_with_registry(Box::new(stream), registry).await {
                 log::debug!("client disconnected: {e}");
             }
             drop(slot);

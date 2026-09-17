@@ -294,17 +294,15 @@ fn accept(response: AvatarResponse) -> anyhow::Result<Vec<u8>> {
     if response.body.is_empty() {
         anyhow::bail!("avatar response was empty");
     }
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(&response.body));
-    reader = reader
-        .with_guessed_format()
-        .map_err(|e| anyhow::anyhow!("invalid avatar format: {e}"))?;
+    // Named, not sniffed: only WhatsApp's four picture formats decode here,
+    // whatever the binary's `image` feature set — see `oxidezap_session::media`.
+    let format = oxidezap_session::media::allowed_image_format(&response.body)
+        .ok_or_else(|| anyhow::anyhow!("avatar is in a format this build does not read"))?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
     limits.max_image_height = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
     limits.max_alloc = Some(oxidezap_core::MAX_AVATAR_PIXELS * 4);
-    reader.limits(limits);
-    let (width, height) = reader
-        .into_dimensions()
+    let (width, height) = oxidezap_session::media::dimensions(&response.body, format, limits)
         .map_err(|e| anyhow::anyhow!("invalid avatar image: {e}"))?;
     let pixels = u64::from(width)
         .checked_mul(u64::from(height))
@@ -312,17 +310,11 @@ fn accept(response: AvatarResponse) -> anyhow::Result<Vec<u8>> {
     if pixels > oxidezap_core::MAX_AVATAR_PIXELS {
         anyhow::bail!("avatar has too many pixels");
     }
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(&response.body));
-    reader = reader
-        .with_guessed_format()
-        .map_err(|e| anyhow::anyhow!("invalid avatar format: {e}"))?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
-    limits.max_image_height = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
-    limits.max_alloc = Some(oxidezap_core::MAX_AVATAR_PIXELS * 4);
-    reader.limits(limits);
-    reader
-        .decode()
+    let mut decode_limits = image::Limits::default();
+    decode_limits.max_image_width = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    decode_limits.max_image_height = Some(oxidezap_core::MAX_AVATAR_DIMENSION);
+    decode_limits.max_alloc = Some(oxidezap_core::MAX_AVATAR_PIXELS * 4);
+    oxidezap_session::media::decode(&response.body, format, decode_limits)
         .map_err(|e| anyhow::anyhow!("invalid avatar image: {e}"))?;
     Ok(response.body)
 }
@@ -404,6 +396,23 @@ mod tests {
             accept(AvatarResponse {
                 status: 200,
                 body: bytes
+            })
+            .is_err()
+        );
+    }
+
+    /// A picture in a format nothing here decodes is not an avatar, even
+    /// where the bytes name a real format: the servers send JPEG, and
+    /// decoding anything else would link a decoder for bytes that never
+    /// arrive.
+    #[test]
+    fn an_avatar_in_a_format_nothing_decodes_is_rejected() {
+        // A BMP signature: named, never decoded here.
+        let bmp = b"BM\x00\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00".to_vec();
+        assert!(
+            accept(AvatarResponse {
+                status: 200,
+                body: bmp
             })
             .is_err()
         );

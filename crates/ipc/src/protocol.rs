@@ -385,9 +385,13 @@ pub enum DaemonMessage {
     },
     /// First frame on every account connection. Establishes the protocol version and
     /// the state to apply events onto.
+    ///
+    /// Boxed: the snapshot carries every chat, which would otherwise set the
+    /// size of every frame in this enum — the same reason
+    /// [`DaemonMessage::Session`] boxes its event.
     Hello {
         protocol: u32,
-        snapshot: StateSnapshot,
+        snapshot: Box<StateSnapshot>,
     },
     /// What this account occupies on disk, answering
     /// [`ClientRequest::StorageUsage`].
@@ -406,9 +410,12 @@ pub enum DaemonMessage {
         media_files: u64,
     },
     /// A change, tagged with the version it produced.
+    ///
+    /// Boxed with the snapshot above: at 248 bytes the event prices every
+    /// frame in this enum.
     Update {
         version: StateVersion,
-        event: DaemonEvent,
+        event: Box<DaemonEvent>,
     },
     /// One event straight from the session, for a client that asked for them.
     ///
@@ -905,13 +912,17 @@ pub enum ClientRequest {
     /// Ask for a fresh snapshot, after a [`DaemonMessage::Resync`] or on
     /// reconnect.
     Snapshot,
-    SendText(SendText),
+    /// Boxed, like the two below it: the three send payloads are the largest
+    /// frames on this half of the protocol, and an unboxed one sets the size
+    /// — and the serde working set — of every request. The wire is unchanged:
+    /// `Box` is transparent to serde, and the round-trip test pins the bytes.
+    SendText(Box<SendText>),
     /// Send a recorded voice note.
     ///
     /// The audio arrives through the media cache rather than the socket: it
     /// is the one client-to-daemon payload big enough to matter, and the cache
     /// is a per-user directory both processes can already reach.
-    SendAudio(SendAudio),
+    SendAudio(Box<SendAudio>),
     /// Send a file somebody picked: a photo, a video, a document.
     ///
     /// Through the media cache for the reason [`SendAudio`](Self::SendAudio)
@@ -919,7 +930,7 @@ pub enum ClientRequest {
     /// and separate from it because the two carry different facts: a
     /// recording knows its length and its shape, and a file knows its name
     /// and its type.
-    SendMedia(SendMedia),
+    SendMedia(Box<SendMedia>),
     /// Tell the peer whether we are typing. One request rather than two,
     /// because it is one piece of state with two values.
     Typing(Typing),
@@ -1056,7 +1067,9 @@ pub enum ClientRequest {
     /// tagged, and a newtype's fields would be flattened into the same map as
     /// `request`.
     PluginAction {
-        action: PluginAction,
+        /// Boxed with the send payloads above: at 104 bytes this is the
+        /// largest small frame, and unboxed it prices every request.
+        action: Box<PluginAction>,
     },
     /// Allow, or stop allowing, what a plugin asked to be able to do.
     ///
@@ -1241,6 +1254,39 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The large frames stay heap-backed: every frame deserializes through
+    /// serde's buffered `Content`, so the largest variant sets the working
+    /// set — and the derived `Clone`/`Debug`/`PartialEq` code — of every
+    /// request and every message. `Box` is transparent on the wire, and the
+    /// round-trip test pins the bytes; this pins the sizes.
+    #[test]
+    fn probe2() {
+        eprintln!(
+            "DaemonEvent={} ChatMessage={} Chat={} GroupRoster={} PageCursor={} CallVideoFrame={} PluginSurface={}",
+            size_of::<DaemonEvent>(),
+            size_of::<oxidezap_core::ChatMessage>(),
+            size_of::<oxidezap_core::Chat>(),
+            size_of::<oxidezap_core::GroupRoster>(),
+            size_of::<PageCursor>(),
+            size_of::<oxidezap_core::CallVideoFrame>(),
+            size_of::<oxidezap_core::PluginSurface>(),
+        );
+    }
+
+    #[test]
+    fn large_frames_stay_boxed() {
+        assert!(
+            size_of::<ClientRequest>() <= 96,
+            "ClientRequest is {} bytes: box the payload that grew it",
+            size_of::<ClientRequest>()
+        );
+        assert!(
+            size_of::<DaemonMessage>() <= 128,
+            "DaemonMessage is {} bytes: box the payload that grew it",
+            size_of::<DaemonMessage>()
+        );
+    }
 
     #[test]
     fn control_messages_and_lifecycle_requests_round_trip() {
@@ -1451,7 +1497,7 @@ mod tests {
             // of refusal lives.
             let frame = DaemonMessage::Update {
                 version: StateVersion::INITIAL,
-                event: event.clone(),
+                event: Box::new(event.clone()),
             };
             let line = serde_json::to_string(&frame)
                 .unwrap_or_else(|e| panic!("{event:?} cannot be written: {e}"));
@@ -1678,7 +1724,7 @@ mod tests {
     fn frames_round_trip_through_json() {
         let msg = DaemonMessage::Update {
             version: StateVersion::INITIAL.next(),
-            event: DaemonEvent::ChatUpdated(ChatSummary {
+            event: Box::new(DaemonEvent::ChatUpdated(ChatSummary {
                 jid: "12025550143@s.whatsapp.net".into(),
                 name: "Alice".into(),
                 unread: 2,
@@ -1690,7 +1736,7 @@ mod tests {
                     from_me: false,
                     timestamp_ms: 1_700_000_000_000,
                 }),
-            }),
+            })),
         };
         let line = serde_json::to_string(&msg).unwrap();
         assert!(!line.contains('\n'), "frames are newline-delimited");
@@ -1731,36 +1777,36 @@ mod tests {
 
         let cases: Vec<(ClientRequest, String)> = vec![
             (
-                ClientRequest::SendText(SendText {
+                ClientRequest::SendText(Box::new(SendText {
                     jid: "559900000001@s.whatsapp.net".into(),
                     text: "oi".into(),
                     local_id: Some("local-1".into()),
                     quoted: Some(quoted.clone()),
-                }),
+                })),
                 r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi","local_id":"local-1","quoted":{"message_id":"3EB0A","sender":"559900000001@s.whatsapp.net","sender_name":"quem quer que seja","preview":"a linha citada","kind":null}}"#.to_string(),
             ),
             (
-                ClientRequest::SendText(SendText {
+                ClientRequest::SendText(Box::new(SendText {
                     jid: "559900000001@s.whatsapp.net".into(),
                     text: "oi".into(),
                     local_id: None,
                     quoted: None,
-                }),
+                })),
                 r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi","local_id":null}"#.to_string(),
             ),
             (
-                ClientRequest::SendAudio(SendAudio {
+                ClientRequest::SendAudio(Box::new(SendAudio {
                     jid: "559900000001@s.whatsapp.net".into(),
                     upload: "staged-local-1".into(),
                     duration_secs: 3,
                     waveform: vec![7, 8],
                     local_id: Some("local-1".into()),
                     quoted: Some(quoted),
-                }),
+                })),
                 r#"{"request":"send_audio","jid":"559900000001@s.whatsapp.net","upload":"staged-local-1","duration_secs":3,"waveform":[7,8],"local_id":"local-1","quoted":{"message_id":"3EB0A","sender":"559900000001@s.whatsapp.net","sender_name":"quem quer que seja","preview":"a linha citada","kind":null}}"#.to_string(),
             ),
             (
-                ClientRequest::SendMedia(SendMedia {
+                ClientRequest::SendMedia(Box::new(SendMedia {
                     jid: "559900000001@s.whatsapp.net".into(),
                     upload: "u-local-1".into(),
                     kind: OutgoingMedia::Image,
@@ -1769,11 +1815,11 @@ mod tests {
                     caption: Some("olha isso".into()),
                     local_id: Some("local-1".into()),
                     quoted: None,
-                }),
+                })),
                 r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-1","kind":"image","mime_type":"image/jpeg","file_name":"praia.jpg","caption":"olha isso","local_id":"local-1"}"#.to_string(),
             ),
             (
-                ClientRequest::SendMedia(SendMedia {
+                ClientRequest::SendMedia(Box::new(SendMedia {
                     jid: "559900000001@s.whatsapp.net".into(),
                     upload: "u-local-2".into(),
                     kind: OutgoingMedia::Document,
@@ -1782,7 +1828,7 @@ mod tests {
                     caption: None,
                     local_id: None,
                     quoted: None,
-                }),
+                })),
                 r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-2","kind":"document","mime_type":"application/pdf","file_name":"nota.pdf","local_id":null}"#.to_string(),
             ),
             (

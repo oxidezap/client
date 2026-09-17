@@ -365,38 +365,38 @@ impl<'a> Frames<'a> {
             // daemon publishes the overlap rather than risking a gap; dropping
             // it is this side's half of that bargain.
             DaemonMessage::Update { version, .. } if version.is_covered_by(self.applied) => {}
-            // The account, once the daemon knows it. A window attached
-            // during pairing had nothing in its snapshot to know it from.
-            DaemonMessage::Update {
-                version,
-                event: DaemonEvent::AccountChanged(account),
-            } => {
-                self.applied = version;
-                self.publish(FromDaemon::Account(Some(account)))?;
-            }
-            // Whole every time, because a plugin's interface is published
-            // once when it starts and nothing replays it: a window that
-            // merged deltas would be a second implementation of a set the
-            // daemon already holds whole.
-            DaemonMessage::Update {
-                version,
-                event: DaemonEvent::PluginsChanged { plugins },
-            } => {
-                self.applied = version;
-                self.publish(FromDaemon::Plugins(plugins))?;
-            }
-            // The one state update this front end does not derive for
-            // itself. Everything else in a snapshot is rebuilt from the
-            // session stream; a call the *daemon* answered is not in that
-            // stream at all, so without this a second window keeps ringing.
-            DaemonMessage::Update {
-                version,
-                event: DaemonEvent::CallsChanged(calls),
-            } => {
-                self.applied = version;
-                self.follow_calls(&calls);
-                self.publish(FromDaemon::Calls(Box::new(calls)))?;
-            }
+            // Matched unboxed: the event rides behind a `Box` so the frame
+            // stays small, and a pattern cannot see through one — so the
+            // three events this front end acts on share one arm and split
+            // inside it.
+            DaemonMessage::Update { version, event } => match *event {
+                // The account, once the daemon knows it. A window attached
+                // during pairing had nothing in its snapshot to know it from.
+                DaemonEvent::AccountChanged(account) => {
+                    self.applied = version;
+                    self.publish(FromDaemon::Account(Some(account)))?;
+                }
+                // Whole every time, because a plugin's interface is published
+                // once when it starts and nothing replays it: a window that
+                // merged deltas would be a second implementation of a set the
+                // daemon already holds whole.
+                DaemonEvent::PluginsChanged { plugins } => {
+                    self.applied = version;
+                    self.publish(FromDaemon::Plugins(plugins))?;
+                }
+                // The one state update this front end does not derive for
+                // itself. Everything else in a snapshot is rebuilt from the
+                // session stream; a call the *daemon* answered is not in that
+                // stream at all, so without this a second window keeps ringing.
+                DaemonEvent::CallsChanged(calls) => {
+                    self.applied = version;
+                    self.follow_calls(&calls);
+                    self.publish(FromDaemon::Calls(Box::new(calls)))?;
+                }
+                _ => {
+                    self.applied = version;
+                }
+            },
             // A stream rather than an event: fed to the decoder that owns its
             // direction, which drops it if it is still busy with the one
             // before. Nothing here waits, and nothing recovers a frame.
@@ -432,8 +432,8 @@ impl<'a> Frames<'a> {
             // Chat summaries, which this front end derives from the session
             // stream instead. The version still advances: it describes how far
             // the *state* has been carried, not how much of it this client
-            // happens to use.
-            DaemonMessage::Update { version, .. } => self.applied = version,
+            // happens to use. (Covered by the `_` arm of the `Update` match
+            // above, which advances the version for every other event.)
             // Summaries: the daemon serves other front ends too, and this one
             // derives its own state from the session stream.
             _ => {}
@@ -904,7 +904,7 @@ mod tests {
                 frames
                     .apply(DaemonMessage::Update {
                         version: StateVersion::INITIAL.next(),
-                        event: DaemonEvent::CallsChanged(states[0].clone()),
+                        event: Box::new(DaemonEvent::CallsChanged(states[0].clone())),
                     })
                     .is_continue()
             );
@@ -916,7 +916,7 @@ mod tests {
                 version = version.next();
                 let message = DaemonMessage::Update {
                     version,
-                    event: DaemonEvent::CallsChanged(calls),
+                    event: Box::new(DaemonEvent::CallsChanged(calls)),
                 };
                 assert!(frames.apply(message).is_continue());
             }
@@ -1063,7 +1063,7 @@ mod tests {
                 frames
                     .apply(DaemonMessage::Update {
                         version: StateVersion::INITIAL.next(),
-                        event: DaemonEvent::CallsChanged(calls),
+                        event: Box::new(DaemonEvent::CallsChanged(calls)),
                     })
                     .is_continue()
             );
@@ -1133,7 +1133,7 @@ mod tests {
                 frames
                     .apply(DaemonMessage::Update {
                         version: StateVersion::INITIAL.next(),
-                        event: DaemonEvent::CallsChanged(enabled),
+                        event: Box::new(DaemonEvent::CallsChanged(enabled)),
                     })
                     .is_continue()
             );
@@ -1147,7 +1147,7 @@ mod tests {
                         frames
                             .apply(DaemonMessage::Update {
                                 version: StateVersion::INITIAL.next().next(),
-                                event: DaemonEvent::CallsChanged(next.clone()),
+                                event: Box::new(DaemonEvent::CallsChanged(next.clone())),
                             })
                             .is_continue()
                     );
@@ -1263,7 +1263,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Hello {
                     protocol: PROTOCOL_VERSION,
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                 })
                 .is_continue()
         );
@@ -1272,7 +1272,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Update {
                     version: StateVersion::INITIAL.next(),
-                    event: DaemonEvent::CallsChanged(CallState::default()),
+                    event: Box::new(DaemonEvent::CallsChanged(CallState::default())),
                 })
                 .is_continue()
         );
@@ -1295,7 +1295,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Hello {
                     protocol: PROTOCOL_VERSION,
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                 })
                 .is_continue()
         );
@@ -1306,7 +1306,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Update {
                     version,
-                    event: DaemonEvent::CallsChanged(CallState::default()),
+                    event: Box::new(DaemonEvent::CallsChanged(CallState::default())),
                 })
                 .is_continue()
         );
@@ -1335,7 +1335,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Hello {
                     protocol: PROTOCOL_VERSION,
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                 })
                 .is_continue()
         );
@@ -1369,7 +1369,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Hello {
                     protocol: PROTOCOL_VERSION,
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                 })
                 .is_continue()
         );
@@ -1382,7 +1382,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Update {
                     version,
-                    event: DaemonEvent::CallsChanged(calls.clone()),
+                    event: Box::new(DaemonEvent::CallsChanged(calls.clone())),
                 })
                 .is_continue()
         );
@@ -1400,7 +1400,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Update {
                     version: version.next(),
-                    event: DaemonEvent::CallsChanged(calls),
+                    event: Box::new(DaemonEvent::CallsChanged(calls)),
                 })
                 .is_continue()
         );
@@ -1434,7 +1434,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Hello {
                     protocol: PROTOCOL_VERSION,
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                 })
                 .is_continue()
         );
@@ -1442,7 +1442,7 @@ mod tests {
             frames
                 .apply(DaemonMessage::Update {
                     version,
-                    event: DaemonEvent::CallsChanged(CallState::default()),
+                    event: Box::new(DaemonEvent::CallsChanged(CallState::default())),
                 })
                 .is_continue()
         );

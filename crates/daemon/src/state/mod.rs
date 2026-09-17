@@ -162,7 +162,7 @@ impl StateHub {
         let snapshot = self.snapshot();
         serde_json::to_string(&DaemonMessage::Hello {
             protocol: PROTOCOL_VERSION,
-            snapshot,
+            snapshot: Box::new(snapshot),
         })
     }
 
@@ -450,10 +450,8 @@ mod tests {
         let frame: DaemonMessage = serde_json::from_str(&window.recv().await.unwrap()).unwrap();
         assert!(matches!(
             &frame,
-            DaemonMessage::Update {
-                event: DaemonEvent::AccountChanged(sent),
-                ..
-            } if *sent == account
+            DaemonMessage::Update { event, .. }
+                if matches!(event.as_ref(), DaemonEvent::AccountChanged(sent) if *sent == account)
         ));
         assert!(
             window.try_recv().is_err(),
@@ -542,16 +540,13 @@ mod tests {
         let answered: DaemonMessage = serde_json::from_str(&other.recv().await.unwrap()).unwrap();
         assert!(matches!(
             &ringing,
-            DaemonMessage::Update {
-                event: DaemonEvent::CallsChanged(calls),
-                ..
-            } if calls.incoming().is_some()
+            DaemonMessage::Update { event, .. }
+                if matches!(event.as_ref(), DaemonEvent::CallsChanged(calls) if calls.incoming().is_some())
         ));
-        let DaemonMessage::Update {
-            event: DaemonEvent::CallsChanged(calls),
-            version,
-        } = answered
-        else {
+        let DaemonMessage::Update { event, version } = answered else {
+            panic!("the answer is a versioned state update");
+        };
+        let DaemonEvent::CallsChanged(calls) = *event else {
             panic!("the answer is a versioned state update");
         };
         assert!(

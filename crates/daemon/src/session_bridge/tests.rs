@@ -94,9 +94,12 @@ async fn outgoing_accept_handler_reaches_daemon_wire() {
             while let Ok(line) = updates.try_recv() {
                 let DaemonMessage::Update {
                     version: next,
-                    event: DaemonEvent::CallsChanged(calls),
+                    event,
                 } = serde_json::from_str(&line).unwrap()
                 else {
+                    panic!("{case:?}: unexpected wire update");
+                };
+                let DaemonEvent::CallsChanged(calls) = *event else {
                     panic!("{case:?}: unexpected wire update");
                 };
                 assert_eq!(next, version.next(), "{case:?}");

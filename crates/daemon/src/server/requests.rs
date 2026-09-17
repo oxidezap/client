@@ -101,13 +101,13 @@ pub(super) async fn handle_request(
         // request and the action carry the same struct, so there is nothing
         // here for a field to be dropped from.
         ClientRequest::SendText(request) => {
-            acted(dispatch(hub, commands, Action::SendText(request)).await)
+            acted(dispatch(hub, commands, Action::SendText(*request)).await)
         }
         ClientRequest::SendAudio(request) => {
-            acted(dispatch(hub, commands, Action::SendAudio(request)).await)
+            acted(dispatch(hub, commands, Action::SendAudio(*request)).await)
         }
         ClientRequest::SendMedia(request) => {
-            acted(dispatch(hub, commands, Action::SendMedia(request)).await)
+            acted(dispatch(hub, commands, Action::SendMedia(*request)).await)
         }
         ClientRequest::Typing(request) => {
             acted(dispatch(hub, commands, Action::Typing(request)).await)
