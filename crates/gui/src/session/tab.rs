@@ -82,7 +82,10 @@ async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
 
     let fetched = Arc::new(Fetched::new(media.clone()));
 
-    let media = Arc::clone(&fetched) as Arc<dyn MediaCache>;
+    // Named apart from `media`, which is the other tab's sideband and is what
+    // the media pass below reads through; the cache handed to the connection
+    // is this side's own decoded map.
+    let cache = Arc::clone(&fetched) as Arc<dyn MediaCache>;
     let attach::Attached {
         session,
         events,
@@ -91,7 +94,7 @@ async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
         pictures,
         recover,
     } = if control {
-        attach::begin_control(link, media)?
+        attach::begin_control(link, cache)?
     } else {
         // Yes, this is a window, and the question `has_window` asks is whether
         // there is one for the daemon's Open to bring forward. A tab cannot
@@ -100,7 +103,7 @@ async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
         // browser, with no tray and nothing to relay. What the answer decides
         // that matters is the video path: a call's frames are published to
         // front ends that have somewhere to draw them, and this one does.
-        attach::begin_for_account(link, media, oxidezap_core::AccountId::LEGACY, true, true)?
+        attach::begin_for_account(link, cache, oxidezap_core::AccountId::LEGACY, true, true)?
     };
 
     // The account, when it becomes this tab's.
