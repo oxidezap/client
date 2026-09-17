@@ -6,7 +6,7 @@
 //! filesystem for. The web half of this crate has tests of its own that run in
 //! a browser; see `plugins/web/tests.rs`.
 
-use oxidezap_ipc::PROTOCOL_VERSION;
+use oxidezap_ipc::{ClientScope, PROTOCOL_VERSION};
 use tokio::io::AsyncBufReadExt as _;
 
 use super::accept::{acquire_startup_lock, prepare_state_dir, reject};
@@ -34,32 +34,545 @@ fn an_answer_that_cannot_be_encoded_is_still_an_answer() {
 fn hello(protocol: u32, session_events: bool) -> String {
     serde_json::to_string(&ClientRequest::Hello {
         protocol,
+        scope: ClientScope::Account {
+            account: oxidezap_core::AccountId::LEGACY,
+        },
         session_events,
-        has_window: true,
+        owns_window: true,
+        call_video: true,
     })
     .unwrap()
+}
+
+fn attached(session_events: bool, owns_window: bool, call_video: bool) -> Attached {
+    Attached {
+        session_events,
+        scope: ClientScope::Account {
+            account: oxidezap_core::AccountId::LEGACY,
+        },
+        owns_window,
+        call_video,
+        read_only: false,
+        is_wire: false,
+        wire_hello_id: None,
+    }
 }
 
 #[test]
 fn a_matching_hello_is_accepted() {
     assert_eq!(
         check_hello(&hello(PROTOCOL_VERSION, false)),
-        Ok(Attached::legacy(false, true))
+        Ok(attached(false, true, true))
     );
 }
 
-/// Whether there is a window to raise is the client's to say, and a
-/// client that says nothing is one: every client today is a front end,
-/// and a build predating the field is likelier than a headless tool. See
+#[tokio::test]
+async fn a_control_connection_lists_accounts_and_rejects_account_requests() {
+    let registry = AccountRegistry::new();
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        oxidezap_core::AccountId::LEGACY,
+        hub,
+        no_plugins(),
+        commands,
+    ))));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    let first: DaemonMessage = serde_json::from_str(&line).unwrap();
+    assert!(
+        matches!(
+            first,
+            DaemonMessage::ControlHello { accounts, .. } if accounts.accounts.len() == 1
+        ),
+        "unexpected control greeting: {line}"
+    );
+
+    let list = serde_json::to_string(&Request {
+        id: Some(9),
+        request: ClientRequest::ListAccounts,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{list}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Accounts { id: 9, snapshot } if snapshot.accounts.len() == 1
+    ));
+
+    let account_request = serde_json::to_string(&Request {
+        id: Some(10),
+        request: ClientRequest::Snapshot,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{account_request}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Error {
+            id: Some(10),
+            error: ProtocolError::Refused { .. },
+        }
+    ));
+    served.abort();
+}
+
+#[tokio::test]
+async fn an_account_connection_is_bound_to_the_requested_runtime() {
+    let registry = AccountRegistry::new();
+    let account_a = StateHub::for_account(oxidezap_core::AccountId::LEGACY);
+    let account_b_id = oxidezap_core::AccountId::new(2).expect("positive account id");
+    let account_b = StateHub::for_account(account_b_id);
+    account_b.apply(crate::state::Change::live(
+        oxidezap_ipc::DaemonEvent::ConnectionChanged(oxidezap_ipc::ConnectionState::Disconnected {
+            reason: "account b".to_string(),
+        }),
+    ));
+    let (commands_a, _taken_a) = bridge(CommandOutcome::Accepted);
+    let (commands_b, _taken_b) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        oxidezap_core::AccountId::LEGACY,
+        account_a,
+        no_plugins(),
+        commands_a,
+    ))));
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        account_b_id,
+        account_b,
+        no_plugins(),
+        commands_b,
+    ))));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let hello = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account {
+            account: account_b_id,
+        },
+        session_events: false,
+        owns_window: false,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+        DaemonMessage::Hello { snapshot, .. }
+            if matches!(
+                snapshot.connection,
+                oxidezap_ipc::ConnectionState::Disconnected { ref reason }
+                    if reason == "account b"
+            )
+    ));
+    served.abort();
+}
+
+/// A runtime that has accepted a stop/reset/remove cannot take a new front
+/// end: between that acceptance and its removal from the registry there is a
+/// window in which the session, plugins and command channel are all coming
+/// down, and a connection attached there would watch a hub nothing answers
+/// on. Refused rather than bound.
+#[tokio::test]
+async fn a_stopping_account_refuses_a_new_connection() {
+    let registry = AccountRegistry::new();
+    let account = oxidezap_core::AccountId::LEGACY;
+    let hub = StateHub::for_account(account);
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let runtime = Arc::new(AccountRuntime::new(account, hub, no_plugins(), commands));
+    let _ = runtime
+        .lifecycle()
+        .set_disposition(crate::session_bridge::AccountDisposition::Reset);
+    assert!(registry.insert(runtime));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let hello = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account { account },
+        session_events: false,
+        owns_window: false,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                error: ProtocolError::NoSession { .. },
+                ..
+            }
+        ),
+        "a runtime the user is resetting must not accept a connection"
+    );
+    served.abort();
+}
+
+/// `CreateAccount` needs a supervisor attached to the registry it is served
+/// through; every other control test in this file builds a bare
+/// `AccountRegistry::new()` (no `AccountSupervisor` over it), which is
+/// exactly the shape `embedded.rs` and every focused test here use, so the
+/// refusal has to be graceful rather than a panic.
+#[tokio::test]
+async fn create_account_is_refused_without_a_supervisor_attached() {
+    let registry = AccountRegistry::new();
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, registry));
+
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // ControlHello
+
+    let create = serde_json::to_string(&Request {
+        id: Some(1),
+        request: ClientRequest::CreateAccount,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{create}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                id: Some(1),
+                error: ProtocolError::Refused { .. },
+            }
+        ),
+        "unexpected answer: {line}"
+    );
+    served.abort();
+}
+
+/// `ResetAccount`/`RemoveAccount` reuse the target account's own
+/// `Action::ForgetSession` teardown path, dispatched by the supervisor through
+/// *its* command channel rather than the control connection's (which has
+/// none): this pins that the right runtime hears it, with the right
+/// disposition, and that an unknown id is refused rather than silently
+/// accepted.
+#[tokio::test]
+async fn a_control_connection_resets_and_removes_a_named_account() {
+    use super::*;
+
+    let registry = AccountRegistry::new();
+    // The lifecycle is the supervisor's to run, so the registry needs one.
+    let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+        "file:memdb_control_lifecycle_{}?mode=memory&cache=shared",
+        std::process::id()
+    )));
+    // Held for the test's lifetime: the registry's back-pointer is `Weak`, so
+    // a dropped supervisor would leave `change_account` with nowhere to go.
+    let _supervisor = crate::account::AccountSupervisor::new(Arc::clone(&registry), stores, 4);
+
+    let target_id = oxidezap_core::AccountId::new(2).expect("positive account id");
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        target_id,
+        StateHub::for_account(target_id),
+        no_plugins(),
+        commands,
+    ))));
+    // Registered before the connection opens, along with the reset target
+    // above: registering it *during* the conversation would race this
+    // connection's own `AccountsChanged` push against the next request's
+    // answer, and this test is about the answers, not that push.
+    let other_id = oxidezap_core::AccountId::new(3).expect("positive account id");
+    let (commands, taken_other) = bridge(CommandOutcome::Accepted);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        other_id,
+        StateHub::for_account(other_id),
+        no_plugins(),
+        commands,
+    ))));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, Arc::clone(&registry)));
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // ControlHello
+
+    let reset = serde_json::to_string(&Request {
+        id: Some(5),
+        request: ClientRequest::ResetAccount { account: target_id },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{reset}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(5) }
+        ),
+        "unexpected answer to ResetAccount: {line}"
+    );
+    assert!(matches!(
+        taken.await.unwrap(),
+        Some(Action::ForgetSession(
+            crate::session_bridge::AccountDisposition::Reset
+        ))
+    ));
+
+    // A second target, this time removed rather than reset.
+    let remove = serde_json::to_string(&Request {
+        id: Some(6),
+        request: ClientRequest::RemoveAccount { account: other_id },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{remove}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(6) }
+        ),
+        "unexpected answer to RemoveAccount: {line}"
+    );
+    assert!(matches!(
+        taken_other.await.unwrap(),
+        Some(Action::ForgetSession(
+            crate::session_bridge::AccountDisposition::Remove
+        ))
+    ));
+
+    // An id nothing is registered under is refused rather than silently
+    // accepted.
+    let unknown_id = oxidezap_core::AccountId::new(99).expect("positive account id");
+    let reset_unknown = serde_json::to_string(&Request {
+        id: Some(7),
+        request: ClientRequest::ResetAccount {
+            account: unknown_id,
+        },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{reset_unknown}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                id: Some(7),
+                error: ProtocolError::NoSession { .. },
+            }
+        ),
+        "unexpected answer for an unknown account: {line}"
+    );
+    served.abort();
+}
+
+/// The control plane answers the process-wide requests the GUI's account
+/// connection used to send and be refused for.
+///
+/// `SetLogLevel`, `ShowWindow`, `ReloadPlugins` and `ListInstalledPlugins`
+/// are all control requests, so an account connection refuses them with "this
+/// request belongs to the control plane" — which is only a working answer if
+/// there *is* a control plane that serves them. This pins that there is: each
+/// is answered rather than refused as unwired.
+#[tokio::test]
+async fn the_control_plane_answers_the_process_wide_requests() {
+    use super::*;
+
+    let registry = AccountRegistry::new();
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, Arc::clone(&registry)));
+    let control = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Control,
+        session_events: false,
+        owns_window: true,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{control}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // ControlHello
+
+    // An acknowledgement, not a refusal: `SetLogLevel` is the process's.
+    let level = serde_json::to_string(&Request {
+        id: Some(3),
+        request: ClientRequest::SetLogLevel {
+            level: oxidezap_core::LogLevel::Info,
+        },
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{level}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(3) }
+        ),
+        "unexpected answer to SetLogLevel: {line}"
+    );
+
+    // `ShowWindow` relays and acknowledges: nobody is attached to raise, so
+    // the launch path runs and the answer is still an acknowledgement.
+    let show = serde_json::to_string(&Request {
+        id: Some(4),
+        request: ClientRequest::ShowWindow,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{show}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Accepted { id: Some(4) }
+        ),
+        "unexpected answer to ShowWindow: {line}"
+    );
+
+    // `ListInstalledPlugins` answers out of band, on the connection's outbox,
+    // because it is a directory read.
+    let list = serde_json::to_string(&Request {
+        id: Some(5),
+        request: ClientRequest::ListInstalledPlugins,
+    })
+    .unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("{list}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::InstalledPlugins { id: 5, .. }
+        ),
+        "unexpected answer to ListInstalledPlugins: {line}"
+    );
+
+    served.abort();
+}
+
+/// Window ownership and call-video subscription are independent capabilities.
+#[test]
+fn a_client_can_subscribe_to_video_without_owning_a_window() {
+    let account = serde_json::to_string(&ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account {
+            account: oxidezap_core::AccountId::LEGACY,
+        },
+        session_events: true,
+        owns_window: false,
+        call_video: true,
+    })
+    .unwrap();
+    assert_eq!(check_hello(&account), Ok(attached(true, false, true)));
+}
+
+/// Window ownership defaults on a scoped hello, so a client that omits the
+/// field gets the documented answer: it owns a window. See
 /// [`ClientRequest::Hello`].
 #[test]
-fn a_client_is_a_window_unless_it_says_otherwise() {
-    let silent = format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION}}}"#);
-    assert_eq!(check_hello(&silent), Ok(Attached::legacy(false, true)));
+fn a_client_owns_a_window_unless_it_says_otherwise() {
+    let silent = format!(
+        r#"{{"request":"hello","protocol":{PROTOCOL_VERSION},"scope":{{"scope":"account","account":1}}}}"#
+    );
+    assert_eq!(check_hello(&silent), Ok(attached(false, true, false)));
 
-    let watcher =
-        format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION},"has_window":false}}"#);
-    assert_eq!(check_hello(&watcher), Ok(Attached::legacy(false, false)));
+    let watcher = format!(
+        r#"{{"request":"hello","protocol":{PROTOCOL_VERSION},"scope":{{"scope":"account","account":1}},"owns_window":false}}"#
+    );
+    assert_eq!(check_hello(&watcher), Ok(attached(false, false, false)));
 }
 
 /// The session stream is opt-in: a tray that never asked must not be sent
@@ -68,12 +581,10 @@ fn a_client_is_a_window_unless_it_says_otherwise() {
 fn the_session_stream_is_only_served_when_asked_for() {
     assert_eq!(
         check_hello(&hello(PROTOCOL_VERSION, true)),
-        Ok(Attached::legacy(true, true))
+        Ok(attached(true, true, true))
     );
-    // An older client that does not know the field at all still connects,
-    // and gets summaries.
-    let line = format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION}}}"#);
-    assert_eq!(check_hello(&line), Ok(Attached::legacy(false, true)));
+    let line = hello(PROTOCOL_VERSION, false);
+    assert_eq!(check_hello(&line), Ok(attached(false, true, true)));
 }
 
 /// A client speaking another version must be turned away before it is
@@ -739,7 +1250,9 @@ async fn a_wire_client_that_lags_is_disconnected_rather_than_stalled() {
 /// on a connection refuses it exactly when it is wanted.
 #[test]
 fn the_local_actions_do_not_need_a_connection() {
-    assert!(!Action::ForgetSession.needs_network());
+    assert!(
+        !Action::ForgetSession(crate::session_bridge::AccountDisposition::Reset).needs_network()
+    );
     assert!(!Action::ReloadHistory.needs_network());
     // A view is one local row and no stanza, over history a disconnected
     // window can still read — and the ring it watched is already drawn.
@@ -1708,7 +2221,12 @@ async fn wire_forget_session_answers_a_wire_ack() {
     let frame = ans.frame.expect("a direct answer");
     let parsed: ResponseEnvelope = serde_json::from_str(&frame).expect("a wire envelope");
     assert!(matches!(parsed.result, ResponseResult::Ok { .. }));
-    assert!(matches!(taken.await.unwrap(), Some(Action::ForgetSession)));
+    assert!(matches!(
+        taken.await.unwrap(),
+        Some(Action::ForgetSession(
+            crate::session_bridge::AccountDisposition::Reset
+        ))
+    ));
 }
 
 /// Listing accounts answers directly, without touching the session bridge.

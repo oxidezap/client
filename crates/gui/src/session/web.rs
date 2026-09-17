@@ -42,6 +42,18 @@ use super::sink::Events;
 /// arrives as a close on the event stream, which the front end already
 /// handles as a lost connection and retries.
 pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
+    connect_scoped(false).await
+}
+
+/// The control plane, over the same daemon this page already reaches.
+///
+/// No account, no session events, no call video: the requests it carries are
+/// the process-wide ones. See `attach::begin_control`.
+pub(super) async fn connect_control() -> std::io::Result<(Session, Events)> {
+    connect_scoped(true).await
+}
+
+async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
     // Nobody named a daemon, so there is nothing to attach to and no reason
     // to look: this page runs its own. Naming one is how somebody chooses the
     // other arrangement — a desktop daemon holds calls, survives the tab, and
@@ -74,7 +86,14 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
                  — the same origin the deployment uses.",
                 ));
             }
-            return super::embedded::connect().await;
+            // The page's own daemon, on the plane that was asked for: a
+            // control connection that fell back to an account one would be
+            // refused for every request it exists to carry.
+            return if control {
+                super::embedded::connect_control().await
+            } else {
+                super::embedded::connect().await
+            };
         }
     };
     let media_base = web::media_base_url();
@@ -87,6 +106,19 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     let (link, mut socket) = web::connect(&url).map_err(std::io::Error::other)?;
     let fetched = Arc::new(Fetched::default());
 
+    let media = Arc::clone(&fetched) as Arc<dyn super::media::MediaCache>;
+    // A control connection has no account and asks for no window; an account
+    // one is still not a window, whatever it looks like to the person reading
+    // it. `has_window` answers one question — is there something the tray's
+    // Open can bring forward — and a browser tab is not. `ShowWindow` arrives
+    // here on an unsolicited socket callback, and a page cannot raise itself
+    // from one: browsers grant that only under a transient user activation,
+    // which a daemon-initiated frame is the opposite of. Claiming it would
+    // leave Open doing nothing at all, which is exactly what the rule in
+    // docs/gotchas.md exists to prevent — a client that is a window standing in
+    // for one that is not there. Saying no means Open launches the desktop
+    // window instead: a second front end beside the tab, rather than a tray
+    // menu item that silently fails.
     let attach::Attached {
         session,
         events,
@@ -94,25 +126,11 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         pending,
         pictures,
         recover,
-    } = attach::begin(
-        link,
-        Arc::clone(&fetched) as Arc<dyn super::media::MediaCache>,
-        // Not a window, whatever it looks like to the person reading it.
-        //
-        // `has_window` answers one question — is there something the tray's
-        // Open can bring forward — and a browser tab is not. `ShowWindow`
-        // arrives here on an unsolicited socket callback, and a page cannot
-        // raise itself from one: browsers grant that only under a transient
-        // user activation, which a daemon-initiated frame is the opposite of.
-        // Claiming it would leave Open doing nothing at all, which is exactly
-        // what the rule in docs/gotchas.md exists to prevent — a client that is
-        // a window standing in for one that is not there.
-        //
-        // Saying no means Open launches the desktop window instead. That is
-        // the honest outcome: a second front end beside the tab, rather than
-        // a tray menu item that silently fails.
-        false,
-    )?;
+    } = if control {
+        attach::begin_control(link, media)?
+    } else {
+        attach::begin_for_account(link, media, oxidezap_core::AccountId::LEGACY, false, false)?
+    };
 
     spawn_local(async move {
         let frames = Frames::new(&sink, &pending, fetched.as_ref(), &pictures, recover);

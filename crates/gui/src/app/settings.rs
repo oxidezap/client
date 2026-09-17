@@ -489,10 +489,9 @@ impl WhatsAppApp {
         // unreachable, or chosen at all, is one the daemon never heard.
         self.settings
             .update(cx, |settings, _| settings.remember_log_level(level));
-        let told_the_daemon = self
-            .client
-            .as_ref()
-            .map(|client| client.set_log_level(level));
+        // The log level is the process's, not an account's, so it is asked
+        // for on the control connection.
+        let told_the_daemon = self.control().map(|client| client.set_log_level(level));
 
         // And written down by whoever keeps a store of their own. See
         // `platform::log_store`, which answers both halves of that: which
@@ -548,7 +547,8 @@ impl WhatsAppApp {
     /// the daemon that restarted, or was never told, under a page whose own
     /// choice lives in a browser store no daemon can read.
     pub fn resend_log_level(&self, cx: &App) {
-        let (Some(level), Some(client)) = (self.settings.read(cx).log_level_asked(), &self.client)
+        let (Some(level), Some(client)) =
+            (self.settings.read(cx).log_level_asked(), self.control())
         else {
             return;
         };

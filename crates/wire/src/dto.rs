@@ -189,6 +189,13 @@ pub struct AccountDto {
 }
 
 /// Local storage usage diagnostics.
+///
+/// `database_bytes` is the *shared* store: every local account lives in one
+/// file keyed by `device_id`, and SQLite has no per-account size without the
+/// `dbstat` module this build trims. It is reported as what it is — the whole
+/// store — rather than as one account's share. `media_bytes`/`media_files` are
+/// account-scoped: the media directory is shared but every key carries its
+/// account's prefix.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageDto {
     pub database_bytes: u64,

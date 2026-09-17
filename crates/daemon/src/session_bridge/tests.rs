@@ -53,7 +53,6 @@ pub(super) fn bridge() -> Bridge {
         Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
             |_| {},
         ))),
-        oxidezap_session::AvatarRecorder::detached(),
     )
 }
 

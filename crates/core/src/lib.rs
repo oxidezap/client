@@ -19,6 +19,7 @@ pub mod base64;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 
+mod account;
 mod app_state;
 mod avatar;
 mod call;
@@ -39,6 +40,7 @@ mod status;
 mod system_notice;
 mod video;
 
+pub use account::{AccountId, InvalidAccountId};
 pub use app_state::{AppState, CachedQrCode, Fault, Issued, Lifetime, Recovery};
 pub use avatar::AvatarDemand;
 pub use avatar::cache_key as avatar_cache_key;

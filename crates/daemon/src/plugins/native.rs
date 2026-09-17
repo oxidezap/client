@@ -14,9 +14,10 @@
 
 use std::sync::Arc;
 
+use oxidezap_core::AccountId;
 use oxidezap_plugin_host::{Outcome, Plugins, Reloaded, Sink};
 
-use super::{Bridge, publishing_to};
+use super::{Bridge, account_state_dir, publishing_to};
 use crate::session_bridge::{Action, CommandOutcome, Commands as SessionCommands, SessionCommand};
 use crate::state::StateHub;
 
@@ -29,8 +30,9 @@ use crate::state::StateHub;
 /// to receive them.
 pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
     let sink = publishing_to(hub);
+    let account_id = hub.account_id();
     let fallback = (publishing_to(hub), commands.clone());
-    tokio::task::spawn_blocking(move || load(sink, commands))
+    tokio::task::spawn_blocking(move || load(sink, commands, account_id))
         .await
         .unwrap_or_else(|e| {
             // With the daemon's own sink and bridge, not a discarding pair.
@@ -47,15 +49,16 @@ pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc
 }
 
 /// The scan itself, on the blocking thread [`start`] put it on.
-fn load(sink: Sink, commands: SessionCommands) -> Arc<Plugins> {
+fn load(sink: Sink, commands: SessionCommands, account_id: AccountId) -> Arc<Plugins> {
     let Some(dir) = oxidezap_plugin_host::default_dir() else {
         log::debug!("no per-user data directory, so no plugins");
         return Arc::new(Plugins::none(sink, Arc::new(Bridge { commands })));
     };
     // Not the daemon's `state_dir`: that one prefers XDG_RUNTIME_DIR, which
     // is cleared on logout, and a permission answer that does not survive a
-    // logout is a prompt asked forever.
-    let state_dir = oxidezap_plugin_host::default_state_dir();
+    // logout is a prompt asked forever. Scoped to this account: see
+    // `account_state_dir`.
+    let state_dir = account_state_dir(account_id);
     Arc::new(Plugins::load(
         &dir,
         state_dir.as_deref(),
@@ -69,12 +72,12 @@ fn load(sink: Sink, commands: SessionCommands) -> Arc<Plugins> {
 /// The mirror of [`start`], down to where the work happens: the scan reads
 /// files and runs each `oxi_init`, all of it synchronous, so it goes to a
 /// blocking thread as well.
-pub(super) async fn reload(plugins: &Arc<Plugins>) -> Reloaded {
+pub(super) async fn reload(plugins: &Arc<Plugins>, account_id: AccountId) -> Reloaded {
     let Some(dir) = oxidezap_plugin_host::default_dir() else {
         log::debug!("no per-user data directory, so nothing to reload");
         return Reloaded::Kept(0);
     };
-    let state_dir = oxidezap_plugin_host::default_state_dir();
+    let state_dir = account_state_dir(account_id);
     let plugins = Arc::clone(plugins);
     tokio::task::spawn_blocking(move || plugins.reload_from_dir(&dir, state_dir.as_deref()))
         .await
@@ -511,6 +514,96 @@ mod tests {
         std::fs::create_dir(dir.join("impostor.wasm")).expect("a directory in the folder");
         assert_eq!(listed(&dir).expect("the folder lists"), vec!["real"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-multi-account `plugin-state/` is moved into the legacy account's
+    /// slot before anything reads it, so an upgrade keeps the approvals and
+    /// settings the single account already had rather than starting it with
+    /// none.
+    #[test]
+    fn legacy_plugin_state_is_migrated_into_the_legacy_account() {
+        let root = scratch("legacy-state");
+        std::fs::create_dir_all(&root).expect("the state root");
+        let approvals = root.join("approvals.json");
+        std::fs::write(&approvals, br#"{"autoreply":true}"#).expect("an approval file");
+        std::fs::create_dir_all(root.join("autoreply")).expect("a settings directory");
+
+        super::super::migrate_legacy_state_in(&root, oxidezap_core::AccountId::LEGACY);
+
+        let account = root.join("1");
+        assert!(
+            account.join("approvals.json").is_file(),
+            "the approvals moved into account 1's directory"
+        );
+        assert!(
+            account.join("autoreply").is_dir(),
+            "and so did the plugin's settings"
+        );
+        assert!(
+            !approvals.exists(),
+            "the pre-migration copy is gone, so nothing reads a stale one"
+        );
+
+        // Idempotent: a second pass finds no unscoped state and changes
+        // nothing, which is what running on every startup requires.
+        super::super::migrate_legacy_state_in(&root, oxidezap_core::AccountId::LEGACY);
+        assert!(account.join("approvals.json").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stale root entry whose name the account already has in its own slot
+    /// is dropped, not left in place: an account reset clears
+    /// `plugin-state/<id>/`, and a root entry still sitting here would be
+    /// re-imported on the next start, restoring the approvals the reset
+    /// removed.
+    #[test]
+    fn legacy_plugin_state_a_reset_removed_is_not_reimported() {
+        let root = scratch("legacy-state-conflict");
+        std::fs::create_dir_all(&root).expect("the state root");
+        // The current copy, as a reset would leave it: the per-account slot
+        // exists and the root still holds the old file.
+        let account = root.join("1");
+        std::fs::create_dir_all(&account).expect("the account slot");
+        std::fs::write(account.join("approvals.json"), br#"{"autoreply":true}"#)
+            .expect("a current approval file");
+        let stale = root.join("approvals.json");
+        std::fs::write(&stale, br#"{"autoreply":true}"#).expect("the stale approval file");
+
+        super::super::migrate_legacy_state_in(&root, oxidezap_core::AccountId::LEGACY);
+
+        assert!(
+            account.join("approvals.json").is_file(),
+            "the current copy is untouched"
+        );
+        assert!(
+            !stale.exists(),
+            "the stale root entry is gone, so a later start cannot import it again"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A non-legacy account never claims the unscoped root: it did not write
+    /// it, and adopting it would hand a second account the first one's
+    /// recorded permissions.
+    #[test]
+    fn legacy_plugin_state_is_not_migrated_into_another_account() {
+        let root = scratch("legacy-state-other");
+        std::fs::create_dir_all(&root).expect("the state root");
+        let approvals = root.join("approvals.json");
+        std::fs::write(&approvals, br#"{"autoreply":true}"#).expect("an approval file");
+
+        let other = oxidezap_core::AccountId::new(2).expect("a positive id");
+        super::super::migrate_legacy_state_in(&root, other);
+
+        assert!(approvals.exists(), "the unscoped state was left alone");
+        assert!(
+            !root.join("2").exists(),
+            "and nothing was written for the account that did not own it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The id rule is the host's, asked before a byte is written: a file

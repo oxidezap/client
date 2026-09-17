@@ -47,6 +47,19 @@ use super::sink::Events;
 /// nor reach — a tab running a build whose rendezvous this one does not speak
 /// is the realistic one — or this tab's own session is still closing.
 pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
+    connect_scoped(false).await
+}
+
+/// The control plane of whichever daemon this page reaches.
+///
+/// The same peer as [`connect`], one connection along: if this tab holds the
+/// account its own service answers, and otherwise the tab that does. Both are
+/// the daemon for the process-wide requests, so both can.
+pub(super) async fn connect_control() -> std::io::Result<(Session, Events)> {
+    connect_scoped(true).await
+}
+
+async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
     log::info!("no daemon named; looking for a session in this origin");
 
     // The kind is the whole message to the layer above: `AlreadyExists` is
@@ -54,7 +67,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     // attempt. `Stopping` is the second kind — this page's own session is
     // closing after being told to forget the account, and asking again is
     // exactly what fixes it. See `Session::is_settled`.
-    let pipe = match take_or_attach().await? {
+    let pipe = match take_or_attach(control).await? {
         Held::Session(pipe) => pipe,
         Held::AnotherTab(attached) => return Ok(attached),
     };
@@ -79,6 +92,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         }
     });
 
+    let media = Arc::new(InProcess) as Arc<dyn MediaCache>;
     let attach::Attached {
         session,
         events,
@@ -86,9 +100,9 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         pending,
         pictures,
         recover,
-    } = attach::begin(
-        Link::over_pipe(outgoing),
-        Arc::new(InProcess) as Arc<dyn MediaCache>,
+    } = if control {
+        attach::begin_control(Link::over_pipe(outgoing), media)?
+    } else {
         // Yes, here. `has_window` answers "is there something the tray's Open
         // can bring forward", and over a socket the answer is no — a tab
         // cannot raise itself from an unsolicited frame. In this arrangement
@@ -97,8 +111,14 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         // have. Saying no would leave the daemon believing it has none and
         // reaching for a front end to start, which is the one thing a page
         // cannot do.
-        true,
-    )?;
+        attach::begin_for_account(
+            Link::over_pipe(outgoing),
+            media,
+            oxidezap_core::AccountId::LEGACY,
+            true,
+            true,
+        )?
+    };
 
     spawn_local(async move {
         let cache = InProcess;
@@ -151,7 +171,11 @@ enum Held {
 }
 
 /// Take the account, or find the tab that has it.
-async fn take_or_attach() -> std::io::Result<Held> {
+///
+/// `control` only changes what the another-tab branch asks for: a control
+/// connection is a second connection on the same rendezvous, and this tab's
+/// own service answers it from the same registry either way.
+async fn take_or_attach(control: bool) -> std::io::Result<Held> {
     let mut refused = String::new();
     for attempt in 0..ATTEMPTS {
         match oxidezap_daemon::embedded::start().await {
@@ -169,8 +193,14 @@ async fn take_or_attach() -> std::io::Result<Held> {
                 // is either a tab that has gone in between — in which case
                 // the next turn of this loop takes the account — or one that
                 // has the lock and is not serving yet, in which case the next
-                // turn asks it again.
-                match super::tab::connect().await {
+                // turn asks it again. The control plane is a connection to
+                // the same holder, so the same loop asks for it.
+                let asked = if control {
+                    super::tab::connect_control().await
+                } else {
+                    super::tab::connect().await
+                };
+                match asked {
                     Ok(attached) => return Ok(Held::AnotherTab(attached)),
                     Err(e) if attempt + 1 < ATTEMPTS => {
                         log::info!("no tab answered for the account yet: {e}");

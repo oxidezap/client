@@ -20,7 +20,8 @@
 
 use std::sync::Arc;
 
-use oxidezap_ipc::{ClientRequest, Link, PROTOCOL_VERSION};
+use oxidezap_core::AccountId;
+use oxidezap_ipc::{ClientRequest, ClientScope, Link, PROTOCOL_VERSION};
 
 use super::media::MediaCache;
 use super::sink::{self, Events, ReaderSink};
@@ -70,12 +71,83 @@ pub(super) fn begin(
     media: Arc<dyn MediaCache>,
     has_window: bool,
 ) -> std::io::Result<Attached> {
+    begin_for_account(link, media, AccountId::LEGACY, has_window, has_window)
+}
+
+/// Attach a frontend to one immutable account scope.
+///
+/// The legacy wrapper above keeps current transports unchanged while the GUI
+/// grows its control connection and account switcher.
+pub(super) fn begin_for_account(
+    link: Link,
+    media: Arc<dyn MediaCache>,
+    account: AccountId,
+    owns_window: bool,
+    call_video: bool,
+) -> std::io::Result<Attached> {
+    begin_scoped(
+        link,
+        media,
+        account,
+        ClientScope::Account { account },
+        true,
+        owns_window,
+        call_video,
+    )
+}
+
+/// Attach a frontend to the daemon's control plane.
+///
+/// A second, account-less connection beside the account one, carrying the
+/// requests that belong to the process rather than to an account: the log
+/// level, a window, the shared plugin catalogue, and the account lifecycle.
+/// It has no session events, no window and no call video — none of those mean
+/// anything without an account — so the reader it starts answers requests and
+/// the control frames, and nothing else.
+///
+/// The bundle is the same [`Attached`], because everything downstream of the
+/// hello is the same machinery: the request table, the outbox and the frame
+/// decoder do not care which plane the connection is on.
+pub(super) fn begin_control(link: Link, media: Arc<dyn MediaCache>) -> std::io::Result<Attached> {
+    // The `account` the connection carries is the legacy slot only because the
+    // type requires one; a control connection never composes an account-staged
+    // key, so it is never read. The hello's scope is what binds the plane.
+    begin_scoped(
+        link,
+        media,
+        AccountId::LEGACY,
+        ClientScope::Control,
+        false,
+        false,
+        false,
+    )
+}
+
+/// Assemble a connection around one scope's hello.
+///
+/// The one place the four transports' account and control halves meet: the
+/// hello differs, and everything after it — the request table, the outbox, the
+/// reader — is the same bundle. `session_events` off and both capabilities off
+/// is what a control connection is; the caller that wants an account passes
+/// its own values.
+#[allow(clippy::too_many_arguments)]
+fn begin_scoped(
+    link: Link,
+    media: Arc<dyn MediaCache>,
+    account: AccountId,
+    scope: ClientScope,
+    session_events: bool,
+    owns_window: bool,
+    call_video: bool,
+) -> std::io::Result<Attached> {
     let (sink, events) = sink::channel();
-    let session = Session::new(link, sink.ui(), media);
+    let session = Session::new(link, sink.ui(), media, account);
     session.send(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
-        session_events: true,
-        has_window,
+        scope,
+        session_events,
+        owns_window,
+        call_video,
     })?;
     let pending = Arc::clone(&session.conn.pending);
     let pictures = session.call_frames().clone();
@@ -307,13 +379,18 @@ mod page {
                 match fetch(&key, ration).await {
                     Ok(bytes) => {
                         so_far = so_far.saturating_add(bytes.len() as u64);
-                        if key.starts_with("a-") {
-                            if let Some((source, decoded_size)) =
+                        // Through the account wrapper: an avatar key is
+                        // account-scoped now (`a<id>-a-...`), so testing the
+                        // whole key against the bare `a-` avatar prefix would
+                        // miss every one of them and draw them in the ordinary
+                        // media map, where the avatar lookup never finds them.
+                        if oxidezap_ipc::key_local_name(&key).starts_with("a-") {
+                            if let Some((image, decoded_size)) =
                                 crate::session::media::decode_avatar(&bytes)
                             {
                                 crate::session::media::put_avatar_image(
                                     key.clone(),
-                                    source,
+                                    image,
                                     decoded_size,
                                 );
                             }

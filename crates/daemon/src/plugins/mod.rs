@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use oxidezap_core::AccountId;
 use oxidezap_plugin_host::{Commands, Outcome, Plugins, Reloaded, Sink};
 
 #[cfg(not(target_family = "wasm"))]
@@ -55,6 +56,123 @@ pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugin
     platform::start(hub, commands).await
 }
 
+/// This account's slice of the plugin state root.
+///
+/// `None` wherever [`oxidezap_plugin_host::default_state_dir`] is: there is
+/// no per-user directory to scope. Every plugin's recorded approval and every
+/// plugin's settings file are this account's data, never the daemon's as a
+/// whole — a `.wasm` module is shared (the plan calls it a global catalog),
+/// but what it may do and what it remembers are not, so a second account on
+/// the same machine must never inherit or overwrite the first's. Every path
+/// this module hands to a `Plugins` host, or to [`oxidezap_plugin_host::forget_approvals`],
+/// goes through here rather than through `default_state_dir` directly.
+///
+/// Native only: a page's plugin state lives in `localStorage` behind
+/// [`oxidezap_plugin_host::Origin`], which is not yet keyed by account (see
+/// the multi-account plan, section 13.3) and has no path to scope.
+#[cfg(not(target_family = "wasm"))]
+#[must_use]
+pub fn account_state_dir(account_id: AccountId) -> Option<std::path::PathBuf> {
+    oxidezap_plugin_host::default_state_dir().map(|root| root.join(account_id.get().to_string()))
+}
+
+/// Move a pre-multi-account `plugin-state/` into the legacy account's slot.
+///
+/// Before multi-account, every plugin's approvals and settings lived directly
+/// under `plugin-state/`; now they live under `plugin-state/<account>/`. The
+/// legacy account is the one the single-account client paired, so its state
+/// was the root's: without this, an upgrade keeps the modules and silently
+/// starts account 1 with no approvals and no settings, which is user data
+/// lost for no reason. Run once, idempotently, before any plugin loads.
+///
+/// Only the *legacy* account may claim the root: a second account is never
+/// the one that wrote it, so migrating on its behalf would hand it the first
+/// account's recorded permissions — consent given for an account that is not
+/// this one.
+#[cfg(not(target_family = "wasm"))]
+pub fn migrate_legacy_state(account_id: AccountId) {
+    let Some(root) = oxidezap_plugin_host::default_state_dir() else {
+        return;
+    };
+    migrate_legacy_state_in(&root, account_id);
+}
+
+/// The migration itself, against a state root the caller supplies.
+///
+/// Split out so it can be tested against a temporary directory rather than the
+/// machine's real per-user one: the property is "the root's unscoped contents
+/// became the legacy account's", and the root is the only thing the test has
+/// to choose.
+#[cfg(not(target_family = "wasm"))]
+fn migrate_legacy_state_in(root: &std::path::Path, account_id: AccountId) {
+    if account_id != AccountId::LEGACY {
+        return;
+    }
+    let target = root.join(account_id.get().to_string());
+    // The root's entries, but only the files and directories that are state:
+    // an account slot is a numeric directory, and anything already under one
+    // has been migrated, so a non-numeric entry is what is left of the old
+    // layout.
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut moved_any = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.parse::<i32>().is_ok() {
+            continue;
+        }
+        // A move onto a name this same account already has would overwrite the
+        // newer file with the older one. The destination is the live copy, so
+        // the stale root entry is dropped rather than left: an account reset
+        // clears `plugin-state/<id>/`, and a root entry still sitting here
+        // would be re-imported on the next start — restoring the approvals the
+        // reset just removed. Said out loud because it is a deletion.
+        let destination = target.join(name);
+        if destination.exists() {
+            log::warn!(
+                "plugin state {} already had a current copy at {}; removing the stale root entry",
+                entry.path().display(),
+                destination.display()
+            );
+            let stale = entry.path();
+            let removed = match entry.file_type() {
+                Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&stale),
+                Ok(_) => std::fs::remove_file(&stale),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = removed {
+                log::error!(
+                    "could not remove the stale plugin state {}: {e}",
+                    stale.display()
+                );
+            }
+            continue;
+        }
+        if let Err(e) = std::fs::create_dir_all(&target) {
+            log::error!(
+                "could not create the plugin state directory for account {}: {e}",
+                account_id.get()
+            );
+            return;
+        }
+        match std::fs::rename(entry.path(), &destination) {
+            Ok(()) => moved_any = true,
+            Err(e) => log::error!(
+                "could not move legacy plugin state {}: {e}",
+                entry.path().display()
+            ),
+        }
+    }
+    if moved_any {
+        log::info!(
+            "moved pre-multi-account plugin state into account {}'s directory",
+            account_id.get()
+        );
+    }
+}
+
 /// Read the plugin folder again and replace what is running with what is in
 /// it now, without stopping the daemon or the session.
 ///
@@ -66,8 +184,8 @@ pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugin
 /// Answers what the reload did, rather than a count: three of the four
 /// outcomes are zero plugins installed and mean different things, and the
 /// count is what gets written to the log.
-pub async fn reload(plugins: &Arc<Plugins>) -> Reloaded {
-    platform::reload(plugins).await
+pub async fn reload(plugins: &Arc<Plugins>, account_id: AccountId) -> Reloaded {
+    platform::reload(plugins, account_id).await
 }
 
 /// The same, off the caller's own task.
@@ -82,14 +200,14 @@ pub async fn reload(plugins: &Arc<Plugins>) -> Reloaded {
 /// Where the work goes is the platform's, for the reason every split in this
 /// module exists: a page's tasks are not `Send` and there is no runtime to
 /// hand one to, so it goes on the loop it is already running on.
-pub fn reload_in_background(plugins: &Arc<Plugins>) {
+pub fn reload_in_background(plugins: &Arc<Plugins>, account_id: AccountId) {
     let plugins = Arc::clone(plugins);
     platform::detach(async move {
         // Said as what it was. A deferred pass and a loader that fell over
         // both installed nothing, and both used to be reported as a reload
         // that finished with none running — over a folder of five healthy
         // plugins, in the first case, all of them still going.
-        match reload(&plugins).await {
+        match reload(&plugins, account_id).await {
             Reloaded::Ran(running) => log::info!("plugins reloaded: {running} running"),
             Reloaded::Deferred => {
                 log::info!("a plugin reload is already running; it will cover this one");

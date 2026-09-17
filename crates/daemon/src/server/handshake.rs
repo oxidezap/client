@@ -6,7 +6,7 @@
 //! has not said hello has no business reaching any.
 
 use anyhow::Result;
-use oxidezap_ipc::{ClientRequest, PROTOCOL_VERSION, ProtocolError, Request};
+use oxidezap_ipc::{ClientRequest, ClientScope, PROTOCOL_VERSION, ProtocolError, Request};
 use tokio::io::{
     AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, BufReader, ReadHalf, WriteHalf,
 };
@@ -131,8 +131,12 @@ pub(super) struct Attached {
     /// Whether this client wants the session's own events as well as
     /// summaries. See [`ClientRequest::Hello`].
     pub(super) session_events: bool,
+    /// The control/account plane this connection is bound to.
+    pub(super) scope: ClientScope,
     /// Whether this client owns a window. See [`ClientRequest::Hello`].
-    pub(super) has_window: bool,
+    pub(super) owns_window: bool,
+    /// Whether this connection receives live call video.
+    pub(super) call_video: bool,
     /// Whether this client requested read-only safety mode.
     pub(super) read_only: bool,
     /// Whether this client speaks the wire protocol.
@@ -142,13 +146,24 @@ pub(super) struct Attached {
 }
 
 impl Attached {
-    pub(super) fn legacy(session_events: bool, has_window: bool) -> Self {
+    /// A wire-protocol client, bound to the daemon's default account.
+    ///
+    /// The wire hello predates account scoping and carries no account: the CLI
+    /// reaches whichever daemon owns the socket it connected to. On a
+    /// multi-account daemon that is the legacy slot, which every install has
+    /// and which a fresh one allocates first; a wire client that wants another
+    /// local account is a follow-up, not a wire field yet.
+    pub(super) fn wire(session_events: bool, read_only: bool, wire_hello_id: Option<u64>) -> Self {
         Self {
             session_events,
-            has_window,
-            read_only: false,
-            is_wire: false,
-            wire_hello_id: None,
+            scope: ClientScope::Account {
+                account: oxidezap_core::AccountId::LEGACY,
+            },
+            owns_window: false,
+            call_video: false,
+            read_only,
+            is_wire: true,
+            wire_hello_id,
         }
     }
 }
@@ -168,13 +183,7 @@ pub(super) fn check_hello(line: &str) -> Result<Attached, Option<String>> {
                 session_events,
             } => {
                 if protocol == oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION {
-                    Ok(Attached {
-                        session_events,
-                        has_window: false,
-                        read_only,
-                        is_wire: true,
-                        wire_hello_id: Some(env.id),
-                    })
+                    Ok(Attached::wire(session_events, read_only, Some(env.id)))
                 } else {
                     let err = oxidezap_wire::envelope::ResponseEnvelope {
                         id: Some(env.id),
@@ -211,9 +220,19 @@ pub(super) fn check_hello(line: &str) -> Result<Attached, Option<String>> {
     match request {
         ClientRequest::Hello {
             protocol,
+            scope,
             session_events,
-            has_window,
-        } if protocol == PROTOCOL_VERSION => Ok(Attached::legacy(session_events, has_window)),
+            owns_window,
+            call_video,
+        } if protocol == PROTOCOL_VERSION => Ok(Attached {
+            session_events,
+            scope,
+            owns_window,
+            call_video,
+            read_only: false,
+            is_wire: false,
+            wire_hello_id: None,
+        }),
         ClientRequest::Hello { protocol, .. } => Err(always(
             id,
             error_frame(

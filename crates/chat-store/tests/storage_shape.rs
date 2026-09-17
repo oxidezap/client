@@ -66,6 +66,39 @@ async fn messages_table_has_stable_id_and_partial_ack_index() {
     );
 }
 
+/// Every table keyed by the account carries the `device` foreign key, so a
+/// reset or a removal purges it in the same transaction as the upstream rows.
+///
+/// This is the invariant the multi-account daemon leans on: it never runs a
+/// second cleanup pass that could forget a table, because the cascade is the
+/// cleanup. A new account-scoped table that skips the constraint is one whose
+/// rows outlive their account and are then read by the next pairing under the
+/// same id.
+#[tokio::test]
+async fn every_account_scoped_table_cascades_with_its_device() {
+    let (store, _chat_store) = test_store().await;
+
+    for table in [
+        "chats",
+        "messages",
+        "reactions",
+        "contacts",
+        "message_receipts",
+        "media_refs",
+        // `lid_pn_mapping` is deliberately absent: it belongs to the upstream
+        // device store rather than to this crate's migrations, so its shape is
+        // not this test's to pin.
+        "avatar_descriptors",
+        "contact_labels",
+    ] {
+        let sql = table_sql(&store, table).await;
+        assert!(
+            sql.contains("device_id") && sql.contains("REFERENCES device(id) ON DELETE CASCADE"),
+            "{table} must cascade with its device, got:\n{sql}"
+        );
+    }
+}
+
 /// The partial index covers exactly the outbound rows: forcing it for an
 /// outbound-only count returns the outbound count, no more. (The trimmed
 /// SQLite build has no `dbstat`, so sizes are compared by page-count delta in
@@ -145,6 +178,10 @@ async fn file_store(tag: &str) -> (SqliteStore, Arc<ChatStore>, String) {
     let path_str = path.to_str().expect("temp path").to_owned();
     let _ = std::fs::remove_file(&path);
     let store = SqliteStore::new(&path_str).await.expect("create store");
+    // Production's BotBuilder creates the device row; open directly here, so
+    // seed the same legacy account before the FK cascade migration accepts
+    // chat rows (see `common::test_store`'s comment).
+    store.create_new_device().await.expect("seed device parent");
     let chat_store = ChatStore::new(&store).await.expect("create chat store");
     (store, chat_store, path_str)
 }

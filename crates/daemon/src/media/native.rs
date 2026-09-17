@@ -430,6 +430,17 @@ fn sweep_occasionally(dir: &std::path::Path, written: u64) {
 /// keep true. The directory holds a few hundred flat files at most, so asking
 /// it is cheap enough to do when a person opens the Storage pane.
 pub fn cache_usage() -> (u64, u64) {
+    usage_for("")
+}
+
+/// What one account's slice of the shared cache occupies.
+///
+/// The physical directory is one, so a storage pane that billed this account
+/// for the whole walk reported every other account's photos as its own. The
+/// account prefix is exactly what `AccountMedia` writes, and stripping it is
+/// the same operation [`delete_for`] does, so a wiped account's usage and a
+/// measured account's usage agree about what is theirs.
+pub fn usage_for(prefix: &str) -> (u64, u64) {
     let Some(dir) = oxidezap_ipc::media_dir() else {
         return (0, 0);
     };
@@ -438,17 +449,70 @@ pub fn cache_usage() -> (u64, u64) {
     };
     entries
         .flatten()
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|meta| meta.is_file())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let local = name.to_string_lossy();
+            if !prefix.is_empty() && !local.starts_with(prefix) {
+                return None;
+            }
+            entry.metadata().ok().filter(|meta| meta.is_file())
+        })
         .fold((0, 0), |(bytes, files), meta| {
             (bytes + meta.len(), files + 1)
         })
 }
 
-/// Best-effort per entry: one unreadable file must not abandon the rest.
+/// Delete the files belonging to no account: the pre-multi-account names.
 ///
-/// The lock and the epoch belong to [`super::wipe`], which is the only caller.
-pub(super) fn delete(scope: Wipe) -> Result<()> {
+/// `scope.takes` is applied to the whole name, which is the local name here
+/// because there is no prefix to strip. Best-effort per entry: one unreadable
+/// file must not abandon the rest. The lock and the epoch belong to
+/// [`super::wipe_for`], which is the only caller.
+pub(super) fn delete_unscoped(scope: Wipe) -> Result<()> {
+    let Some(dir) = oxidezap_ipc::media_dir() else {
+        return Ok(());
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if oxidezap_ipc::account_prefix_of(&name).is_some() {
+            continue;
+        }
+        // A bare staged key is the daemon's now, not this account's: plugin
+        // installation is global and reads `u-<name>` from whichever front end
+        // asked, so a legacy-account wipe must not take a payload another
+        // account's install is still going to consume. A pre-multi-account
+        // *send* payload shares the spelling and cannot be told apart, so it is
+        // left too and collected by age in `reclaim_abandoned_writes_in`.
+        if oxidezap_ipc::is_global_staged_key(&name) {
+            continue;
+        }
+        if !scope.takes(&name) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    log::info!(
+        "cleared {removed} pre-multi-account media files ({scope:?}) from {}",
+        dir.display()
+    );
+    Ok(())
+}
+
+/// Delete only files in one account namespace when `prefix` is non-empty.
+pub(super) fn delete_for(prefix: &str, scope: Wipe) -> Result<()> {
     let Some(dir) = oxidezap_ipc::media_dir() else {
         return Ok(());
     };
@@ -464,7 +528,12 @@ pub(super) fn delete(scope: Wipe) -> Result<()> {
         if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
             continue;
         }
-        if !scope.takes(&entry.file_name().to_string_lossy()) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(local_name) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        if !scope.takes(local_name) {
             continue;
         }
         if std::fs::remove_file(entry.path()).is_ok() {

@@ -18,7 +18,7 @@ use super::externalize::externalize_messages;
 use super::read_tracker::ReadRecord;
 use super::translate::chat_updated;
 use super::wire_events::{chat_message_to_dto, chat_to_dto};
-use super::{Action, Bridge, CommandOutcome, Outbox, STOPPING, SessionCommand};
+use super::{Action, Bridge, CommandOutcome, Outbox, SessionCommand};
 use crate::state::Change;
 use oxidezap_wire::dto::{
     ChannelDto, ChatDto, ContactDto, GroupDto, GroupJoinRequestDto,
@@ -126,8 +126,9 @@ impl Bridge {
                 // page lands. A `ForgetSession` in between retires this one,
                 // and `put_since` then refuses the write rather than putting
                 // the departed account's thumbnails back into a directory the
-                // wipe has already emptied.
-                let epoch = crate::media::epoch();
+                // wipe has already emptied. This account's own epoch.
+                let account_media = crate::media::AccountMedia::new(self.hub.account_id());
+                let epoch = account_media.epoch();
                 // Which account asked. A page of the old one's history
                 // landing after it left would be folded into a tracker that
                 // had just forgotten it, and the next account would carry the
@@ -140,7 +141,7 @@ impl Bridge {
                             // The bytes travel the way they do everywhere
                             // else: written to the media directory, named by
                             // a key.
-                            externalize_messages(epoch, &mut page.items);
+                            externalize_messages(&account_media, epoch, &mut page.items);
                             // What this side served, it now knows. A read is
                             // bounded by the messages the daemon has observed,
                             // and the page a front end asked for is the
@@ -209,7 +210,8 @@ impl Bridge {
                 let hub = Arc::clone(&self.hub);
                 // As above: taken now, so a wipe between the ask and the
                 // answer refuses the write rather than repopulating the cache.
-                let epoch = crate::media::epoch();
+                let account_media = crate::media::AccountMedia::new(hub.account_id());
+                let epoch = account_media.epoch();
                 // As above: a page of the departed account's chats must not
                 // be put back into a hub that has just been emptied of it.
                 let asked_as = hub.account_generation();
@@ -227,7 +229,7 @@ impl Bridge {
                             // locally, sends no receipt and comes straight
                             // back on the next hydration.
                             for chat in &mut page.items {
-                                externalize_messages(epoch, &mut chat.messages);
+                                externalize_messages(&account_media, epoch, &mut chat.messages);
                                 let mut reads =
                                     reads.lock().unwrap_or_else(|held| held.into_inner());
                                 for message in &chat.messages {
@@ -1249,19 +1251,27 @@ impl Bridge {
             WireRequest::BackfillMedia { chat_jid, limit } => {
                 let task = client.backfill_media(chat_jid, limit.clamp(1, 200) as i64);
                 let answer_to = answer_to.clone();
+                // Account-scoped, like every other durable key: an unscoped
+                // write would let this account's backfilled bytes be served as
+                // another's and would survive this account's wipe.
+                let account_media = crate::media::AccountMedia::new(self.hub.account_id());
                 oxidezap_session::spawn(async move {
                     let result = match task.await {
                         Ok(Ok(report)) => {
                             let mut downloaded = 0u64;
                             for file in &report.files {
-                                let Some(key) = crate::media::download_key(&file.file_enc_sha256)
+                                // `download_key` is the local, content-addressed
+                                // name; `AccountMedia` applies the account
+                                // prefix on the way in and expects it stripped
+                                // on the way to `has`.
+                                let Some(local) = crate::media::download_key(&file.file_enc_sha256)
                                 else {
                                     continue;
                                 };
-                                if crate::media::has(&key) {
+                                if account_media.has(&account_media.key(&local)) {
                                     continue;
                                 }
-                                if crate::media::put_owned(&key, file.bytes.clone()).is_ok() {
+                                if account_media.put_owned(&local, file.bytes.clone()).is_ok() {
                                     downloaded += 1;
                                 }
                             }
@@ -1371,10 +1381,13 @@ impl Bridge {
                 // thing a client sends that is too big for a frame. Taken
                 // rather than read: the client wrote it directly, so its bytes
                 // never counted toward the cache's own sweep and nothing else
-                // would ever remove it.
-                let Some(audio) = crate::media::take(&upload) else {
+                // would ever remove it. Account-scoped, so a send can only
+                // ever consume a payload this same account staged.
+                let Some(audio) =
+                    crate::media::AccountMedia::new(self.hub.account_id()).take_staged(&upload)
+                else {
                     return CommandOutcome::Refused(format!(
-                        "no audio cached under {upload}; write it before sending"
+                        "no audio cached for this account under {upload}; write it before sending"
                     ));
                 };
                 hold(
@@ -1419,9 +1432,10 @@ impl Bridge {
                 let Some(permit) = self.permit() else {
                     return too_busy();
                 };
+                let account_media = crate::media::AccountMedia::new(self.hub.account_id());
                 let taken = {
                     let upload = upload.clone();
-                    oxidezap_session::unblock(move || crate::media::take(&upload)).await
+                    oxidezap_session::unblock(move || account_media.take_staged(&upload)).await
                 };
                 // Two answers, not one. A read that never ran — the worker
                 // panicked, or the runtime is going down — is not a payload
@@ -1625,17 +1639,29 @@ impl Bridge {
                 client.request_video_keyframe();
                 CommandOutcome::Accepted
             }
-            // Deferred rather than done here, because the file to delete is
+            // Deferred rather than done here, because the file to purge is
             // the one the session still has open. The event loop already ends
-            // by disconnecting and closing SQLite; the wipe belongs after
-            // that, and reusing that path is what makes the ordering hold.
-            Action::ForgetSession => {
-                self.forget = true;
+            // by disconnecting and closing SQLite; the storage call belongs
+            // after that, and reusing that path is what makes the ordering
+            // hold for both a reset and a removal.
+            Action::ForgetSession(disposition) => {
                 // Said out loud, because somebody else has to hear it: on a
                 // page a front end reconnects the instant it sends this, and
                 // whatever answers must not be the session that is leaving.
-                STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
-                CommandOutcome::Accepted
+                // `set_disposition` marks stopping itself; the first call
+                // wins, and its answer is what says whether this one is that
+                // call or one the runtime is already committed against.
+                match self.lifecycle.set_disposition(disposition) {
+                    super::DispositionOutcome::Recorded
+                    | super::DispositionOutcome::AlreadySame => CommandOutcome::Accepted,
+                    // Not `Busy`: nothing about timing will change this, and a
+                    // retry is answered the same way. Refused, with the reason
+                    // the caller needs to understand it lost to a different
+                    // operation that is already under way.
+                    super::DispositionOutcome::Conflict => CommandOutcome::Refused(format!(
+                        "this account is already stopping for a different reason than {disposition:?}"
+                    )),
+                }
             }
         }
     }
@@ -1655,7 +1681,8 @@ impl Bridge {
         // No content to address by. Refused rather than filed under a key
         // every such request would share, which answered one message's
         // download with another's bytes.
-        let Some(key) = crate::media::download_key(&media.file_enc_sha256) else {
+        let account_media = crate::media::AccountMedia::new(self.hub.account_id());
+        let Some(local_key) = crate::media::download_key(&media.file_enc_sha256) else {
             answer_now(
                 &answer_to,
                 downloaded(
@@ -1677,7 +1704,8 @@ impl Bridge {
         // Claimed rather than asked about, because the next line promises it:
         // an entry nothing is holding can be swept between this answer and
         // the front end reading it. See `media::claim`.
-        if crate::media::claim(&key) {
+        let key = account_media.key(&local_key);
+        if account_media.claim(&key) {
             answer_now(&answer_to, downloaded(id, Ok(key)));
             return CommandOutcome::Accepted;
         }
@@ -1687,7 +1715,9 @@ impl Bridge {
         };
         let bytes = client.download_downloadable_media(media);
         oxidezap_session::spawn(async move {
-            let result = finish_download(bytes.await, |bytes| crate::media::put_owned(&key, bytes));
+            let result = finish_download(bytes.await, |bytes| {
+                account_media.put_owned(&local_key, bytes)
+            });
             // The same rule as a page: an answer nobody delivered leaves the
             // asker waiting on it forever. See `answer_now`.
             answer_now(&answer_to, downloaded(id, result));
@@ -2153,11 +2183,16 @@ mod tests {
     fn staged_key(what: &str) -> String {
         use portable_atomic::AtomicU64;
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        oxidezap_ipc::staged_key(&format!(
-            "act-test-{what}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
+        // Under the account the test bridge serves (`StateHub::new` is the
+        // legacy one): a send consumes only a payload its own account staged.
+        oxidezap_ipc::account_staged_key(
+            oxidezap_core::AccountId::LEGACY,
+            &format!(
+                "act-test-{what}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        )
     }
 
     fn send_media(upload: &str) -> Action {

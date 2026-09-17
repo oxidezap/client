@@ -283,12 +283,16 @@ struct MigrationCount {
 }
 
 impl ChatStore {
-    /// Open (running migrations if needed) on the same database file as
-    /// `store`, bound to its device id, and start the writer task.
-    pub async fn new(store: &SqliteStore) -> Result<Arc<Self>> {
+    /// Prepare the shared chat schema once before account runtimes start.
+    ///
+    /// This has no account-local side effects: migrations and the FTS schema
+    /// belong to the physical database, while rows remain scoped by the
+    /// `device_id` carried by each store. Callers starting several runtimes
+    /// should await this once, then use [`Self::new_prepared`] for each device:
+    /// [`Self::new`] calls this again, so using it per device would re-enter
+    /// the migration runner once per account.
+    pub async fn prepare(store: &SqliteStore) -> Result<()> {
         let db = store.shared();
-        let device_id = store.device_id();
-
         db.run(|conn| {
             adopt_renumbered(conn).map_err(crate::error::db_err)?;
             conn.run_pending_migrations(MIGRATIONS)
@@ -299,6 +303,17 @@ impl ChatStore {
             Ok(())
         })
         .await?;
+        Ok(())
+    }
+
+    /// Open the already-prepared database on the same file as `store`, bound to
+    /// its device id, and start the writer task.
+    ///
+    /// This is the entry point for a runtime after the registry has called
+    /// [`Self::prepare`]. It does not launch another migration runner.
+    pub async fn new_prepared(store: &SqliteStore) -> Result<Arc<Self>> {
+        let db = store.shared();
+        let device_id = store.device_id();
 
         let (tx, rx) = mpsc::unbounded_channel();
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
@@ -312,6 +327,12 @@ impl ChatStore {
         });
         crate::spawn::spawn(writer_loop(db, device_id, rx, changes));
         Ok(this)
+    }
+
+    /// Open a store and prepare its shared schema when needed.
+    pub async fn new(store: &SqliteStore) -> Result<Arc<Self>> {
+        Self::prepare(store).await?;
+        Self::new_prepared(store).await
     }
 
     /// Declare that this client's inbound durability hook already materializes
@@ -694,10 +715,28 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // Reverted in reverse application order. The labels migration is on
-        // top: the table holds device-local metadata with no source to re-read
-        // it from, so its down migration drops it, which is the honest answer
-        // rather than a failed revert.
+        // Reverted in reverse application order. On top is the account-cascade
+        // follow-up: it only adds the `device` foreign key to the descriptors
+        // and the labels table, so reverting it leaves both in place without
+        // the constraint, which loses nothing durable.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("account-cascade follow-up downgrade is reversible");
+        assert!(
+            has_table(&store, "avatar_descriptors").await
+                && has_table(&store, "contact_labels").await,
+            "reverting only the constraint must leave both tables"
+        );
+
+        // The labels migration holds device-local metadata with no source to
+        // re-read it from, so its down migration drops the table, which is the
+        // honest answer rather than a failed revert.
         store
             .shared()
             .run(|conn| {
@@ -709,8 +748,8 @@ mod migration_tests {
             .expect("revert the reversible labels migration");
         assert!(!has_table(&store, "contact_labels").await);
 
-        // The avatar descriptors are derived state, so reverting them is cheap
-        // and loses nothing durable: the table goes and a later start
+        // The descriptors are derived state, so reverting their migration is
+        // cheap and loses nothing durable: the table goes and a later start
         // refetches.
         store
             .shared()
@@ -816,5 +855,78 @@ mod migration_tests {
             .await
             .expect("inspect columns");
         cols.iter().any(|col| col.name == column)
+    }
+
+    #[tokio::test]
+    async fn account_device_cascade_removes_only_the_target_account() {
+        let database = format!(
+            "file:memdb_chat_store_cascade_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let store_a = SqliteStore::new(&database).await.expect("create store A");
+        let store_b = SqliteStore::new_for_device(&database, 2)
+            .await
+            .expect("create store B");
+        store_a.create_new_device().await.expect("create device A");
+        store_b.create_new_device().await.expect("create device B");
+        ChatStore::new(&store_a).await.expect("run migrations");
+
+        store_a
+            .shared()
+            .run(|conn| {
+                for sql in [
+                    "INSERT INTO chats (device_id, jid) VALUES (1, 'a@s.whatsapp.net'), (2, 'b@s.whatsapp.net')",
+                    "INSERT INTO messages (device_id, chat_jid, msg_id, sender_jid, timestamp_ms, kind) VALUES (1, 'a@s.whatsapp.net', 'a', 'a@s.whatsapp.net', 1, 'text'), (2, 'b@s.whatsapp.net', 'b', 'b@s.whatsapp.net', 1, 'text')",
+                    "INSERT INTO reactions (device_id, chat_jid, msg_id, sender_jid, emoji, ts_ms) VALUES (1, 'a@s.whatsapp.net', 'a', 'a@s.whatsapp.net', '👍', 1), (2, 'b@s.whatsapp.net', 'b', 'b@s.whatsapp.net', '👍', 1)",
+                    "INSERT INTO contacts (device_id, jid) VALUES (1, 'a@s.whatsapp.net'), (2, 'b@s.whatsapp.net')",
+                    "INSERT INTO message_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type, ts_ms) VALUES (1, 'a@s.whatsapp.net', 'a', 'a@s.whatsapp.net', 3, 1), (2, 'b@s.whatsapp.net', 'b', 'b@s.whatsapp.net', 3, 1)",
+                    "INSERT INTO media_refs (device_id, file_sha256, file_path, downloaded_at_ms) VALUES (1, X'01', 'a', 1), (2, X'02', 'b', 1)",
+                ] {
+                    diesel::sql_query(sql)
+                        .execute(conn)
+                        .map_err(crate::error::db_err)?;
+                }
+                diesel::sql_query("DELETE FROM device WHERE id = 1")
+                    .execute(conn)
+                    .map(|_| ())
+                    .map_err(crate::error::db_err)
+            })
+            .await
+            .expect("delete device A with cascading client rows");
+
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+        for table in [
+            "chats",
+            "messages",
+            "reactions",
+            "contacts",
+            "message_receipts",
+            "media_refs",
+        ] {
+            let counts: (i64, i64) = store_a
+                .shared()
+                .read(move |conn| {
+                    let a = diesel::sql_query(format!(
+                        "SELECT count(*) AS count FROM {table} WHERE device_id = 1"
+                    ))
+                    .get_result::<Count>(conn)
+                    .map(|row| row.count)
+                    .map_err(crate::error::db_err)?;
+                    let b = diesel::sql_query(format!(
+                        "SELECT count(*) AS count FROM {table} WHERE device_id = 2"
+                    ))
+                    .get_result::<Count>(conn)
+                    .map(|row| row.count)
+                    .map_err(crate::error::db_err)?;
+                    Ok((a, b))
+                })
+                .await
+                .expect("inspect cascaded rows");
+            assert_eq!(counts, (0, 1), "unexpected rows in {table}");
+        }
     }
 }

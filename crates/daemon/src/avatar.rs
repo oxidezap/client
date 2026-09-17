@@ -34,6 +34,7 @@ use oxidezap_ipc::DaemonMessage;
 /// whose bytes landed after the cache was cleared, is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Selection {
+    account: oxidezap_core::AccountId,
     account_generation: usize,
     cache_epoch: usize,
     picture_id: Option<String>,
@@ -41,7 +42,14 @@ struct Selection {
     token: u64,
 }
 
-static LATEST: LazyLock<Mutex<HashMap<(usize, String), Selection>>> =
+/// The current selection per `(hub, jid)`.
+///
+/// Keyed by [`StateHub::id`] rather than the hub's address: an address is
+/// reused the moment a hub drops, so an entry left behind by a departed
+/// session was read as the next one's — on a target whose allocator reused
+/// addresses eagerly that surfaced as one conversation's picture lookup
+/// attributed to another. The id has no second life.
+static LATEST: LazyLock<Mutex<HashMap<(u64, String), Selection>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -77,7 +85,12 @@ pub fn resolve(
     }
     let id = picture_id.to_string();
     let selection = record_selection(hub, jid, Some(&id), source);
-    let cache_key = oxidezap_core::avatar_cache_key(jid, &id);
+    // Account-scoped, like every other durable key in the shared media
+    // directory: two local accounts may both know a contact by the same JID
+    // and picture id, and an unscoped key would let one account's cached
+    // picture be served as the other's, and be billed to neither cleanly.
+    let cache_key = crate::media::AccountMedia::new(hub.account_id())
+        .key(&oxidezap_core::avatar_cache_key(jid, &id));
     if crate::media::has(&cache_key) {
         oxidezap_session::spawn({
             let hub = Arc::clone(hub);
@@ -119,7 +132,11 @@ pub fn resolve(
                 return;
             };
             let Ok(bytes) = accept(response) else { return };
-            if crate::media::put_since(selection.cache_epoch, &cache_key, &bytes).is_err() {
+            // This account's epoch and this account's key: a clear of another
+            // account must not refuse this fetch.
+            if crate::media::put_since(selection.account, selection.cache_epoch, &cache_key, &bytes)
+                .is_err()
+            {
                 return;
             }
             if !is_current(&hub, &jid, &selection) {
@@ -196,7 +213,7 @@ pub fn purge(hub: &StateHub) {
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    latest.retain(|(id, _), _| *id != hub_id(hub));
+    latest.retain(|(id, _), _| *id != hub.id());
 }
 
 fn record_selection(
@@ -208,9 +225,10 @@ fn record_selection(
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let account = hub.account_id();
     let account_generation = hub.account_generation();
-    let cache_epoch = crate::media::epoch();
-    let key = (hub_id(hub), jid.to_owned());
+    let cache_epoch = crate::media::epoch(account);
+    let key = (hub.id(), jid.to_owned());
     if let Some(selection) = latest.get(&key)
         && selection.account_generation == account_generation
         && selection.cache_epoch == cache_epoch
@@ -220,6 +238,7 @@ fn record_selection(
         return selection.clone();
     }
     let selection = Selection {
+        account,
         account_generation,
         cache_epoch,
         picture_id: picture_id.map(str::to_owned),
@@ -232,18 +251,14 @@ fn record_selection(
 
 fn is_current(hub: &StateHub, jid: &str, selection: &Selection) -> bool {
     if selection.account_generation != hub.account_generation()
-        || selection.cache_epoch != crate::media::epoch()
+        || selection.cache_epoch != crate::media::epoch(hub.account_id())
     {
         return false;
     }
     let latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    latest.get(&(hub_id(hub), jid.to_owned())) == Some(selection)
-}
-
-fn hub_id(hub: &StateHub) -> usize {
-    std::ptr::from_ref(hub) as usize
+    latest.get(&(hub.id(), jid.to_owned())) == Some(selection)
 }
 
 /// Whether a chat has an avatar fetch recorded as its current one.
@@ -255,7 +270,7 @@ pub(super) fn has_selection(hub: &StateHub, jid: &str) -> bool {
     LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(&(hub_id(hub), jid.to_owned()))
+        .contains_key(&(hub.id(), jid.to_owned()))
 }
 
 async fn fetch(url: &str) -> anyhow::Result<AvatarResponse> {

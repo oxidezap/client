@@ -3,6 +3,8 @@
 use log::{info, warn};
 
 use super::{DATA_DIR, DB_FILE};
+use oxidezap_core::AccountId;
+use wacore::store::error::StoreError;
 
 /// Resolve a stable per-user path for the SQLite database.
 ///
@@ -102,4 +104,17 @@ fn database_dir() -> Option<std::path::PathBuf> {
 /// says.
 pub fn settings() -> whatsapp_rust::store::SqliteStoreConfig {
     whatsapp_rust::store::SqliteStoreConfig::default()
+}
+
+/// Open the one shared database while binding the handle to one local account.
+pub async fn open_for_account(
+    database_path: &str,
+    account_id: AccountId,
+) -> Result<whatsapp_rust::store::SqliteStore, StoreError> {
+    whatsapp_rust::store::SqliteStore::with_config_for_device(
+        database_path,
+        account_id.as_i32(),
+        settings(),
+    )
+    .await
 }

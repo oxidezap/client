@@ -45,9 +45,8 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 use web_sys::{BroadcastChannel, MessageEvent};
 
+use crate::account::AccountRegistry;
 use crate::server::MAX_CLIENTS;
-use crate::session_bridge::Commands;
-use crate::state::StateHub;
 
 /// How much of a frame may sit in one connection's pipe before the writer
 /// waits.
@@ -95,11 +94,7 @@ impl Drop for Serving {
 /// The browser would not open the channel. Not fatal to the account — this
 /// tab holds the session either way — so the caller logs it and goes on
 /// serving its own window.
-pub(crate) fn serve(
-    hub: &Arc<StateHub>,
-    plugins: &Arc<oxidezap_plugin_host::Plugins>,
-    commands: &Commands,
-) -> Result<Serving, String> {
+pub(crate) fn serve(registry: &Arc<AccountRegistry>) -> Result<Serving, String> {
     let channel = BroadcastChannel::new(tabs::RENDEZVOUS)
         .map_err(|e| format!("this browser would not open a channel between tabs: {e:?}"))?;
 
@@ -126,9 +121,7 @@ pub(crate) fn serve(
     // is a connection's name, so the name is what is remembered.
     let serving: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
 
-    let hub = Arc::clone(hub);
-    let plugins = Arc::clone(plugins);
-    let commands = commands.clone();
+    let registry = Arc::clone(registry);
     let rendezvous = channel.clone();
     let answering = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         let Some(line) = event.data().as_string() else {
@@ -154,9 +147,7 @@ pub(crate) fn serve(
         accept(
             &rendezvous,
             &ask,
-            Arc::clone(&hub),
-            Arc::clone(&plugins),
-            commands.clone(),
+            Arc::clone(&registry),
             Rc::clone(&served),
             Rc::clone(&serving),
         );
@@ -183,9 +174,7 @@ pub(crate) fn serve(
 fn accept(
     rendezvous: &BroadcastChannel,
     ask: &str,
-    hub: Arc<StateHub>,
-    plugins: Arc<oxidezap_plugin_host::Plugins>,
-    commands: Commands,
+    registry: Arc<AccountRegistry>,
     served: Rc<std::cell::Cell<usize>>,
     serving: Rc<RefCell<HashSet<String>>>,
 ) {
@@ -212,7 +201,7 @@ fn accept(
 
     let (client, server) = tokio::io::duplex(PIPE);
     oxidezap_session::spawn(async move {
-        if let Err(e) = crate::server::serve_client(server, hub, plugins, commands).await {
+        if let Err(e) = crate::server::serve_client_with_registry(server, registry).await {
             log::debug!("a tab disconnected: {e}");
         }
     });
@@ -542,15 +531,18 @@ mod tests {
     use std::sync::Arc;
 
     use oxidezap_ipc::tab::FromTab;
-    use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION, Request};
+    use oxidezap_ipc::{ClientRequest, ClientScope, DaemonMessage, PROTOCOL_VERSION, Request};
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     use super::serve;
+    use crate::account::{AccountRegistry, AccountRuntime};
     use crate::state::StateHub;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    /// A daemon with nothing in it, and something to answer its commands.
+    /// A daemon with nothing in it beyond one account bound to
+    /// [`oxidezap_core::AccountId::LEGACY`], and something to answer its
+    /// commands.
     ///
     /// The stand-in bridge is not decoration. A front end that says it has a
     /// window is asked for a keyframe the moment its handshake lands, and
@@ -558,11 +550,12 @@ mod tests {
     /// receiver open would hang exactly where a real daemon would have
     /// replied. It answers everything the same way; nothing here asks a
     /// second thing.
-    fn a_daemon() -> (
-        Arc<StateHub>,
-        Arc<oxidezap_plugin_host::Plugins>,
-        crate::session_bridge::Commands,
-    ) {
+    ///
+    /// Returns the registry [`serve`] now takes, rather than the hub/plugins/
+    /// commands triple it used to: a tab's rendezvous routes a hello by
+    /// `AccountId` exactly as every other listener does, so what it needs is
+    /// the same [`AccountRegistry`] a real daemon builds one runtime into.
+    fn a_daemon() -> Arc<AccountRegistry> {
         let (commands, mut asked) = tokio::sync::mpsc::channel::<
             crate::session_bridge::SessionCommand,
         >(crate::server::MAX_CLIENTS);
@@ -573,13 +566,22 @@ mod tests {
                     .send(crate::session_bridge::CommandOutcome::Accepted);
             }
         });
-        (
-            StateHub::new(),
-            Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
-                |_| {},
-            ))),
+        let hub = StateHub::new();
+        let plugins = Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+            |_| {},
+        )));
+        let registry = AccountRegistry::new();
+        let runtime = Arc::new(AccountRuntime::new(
+            hub.account_id(),
+            hub,
+            plugins,
             commands,
-        )
+        ));
+        assert!(
+            registry.insert(runtime),
+            "the legacy account registers once"
+        );
+        registry
     }
 
     /// How long the whole exchange may take before it is a failure.
@@ -602,8 +604,8 @@ mod tests {
     /// read and accepted a hello.
     #[wasm_bindgen_test]
     async fn a_served_tab_is_heard_as_well_as_answered() {
-        let (hub, plugins, commands) = a_daemon();
-        let _serving = serve(&hub, &plugins, &commands).expect("the rendezvous opens");
+        let registry = a_daemon();
+        let _serving = serve(&registry).expect("the rendezvous opens");
 
         let mut tab = oxidezap_ipc::tab::connect()
             .await
@@ -611,8 +613,12 @@ mod tests {
 
         let hello = serde_json::to_vec(&Request::bare(ClientRequest::Hello {
             protocol: PROTOCOL_VERSION,
+            scope: ClientScope::Account {
+                account: oxidezap_core::AccountId::LEGACY,
+            },
             session_events: true,
-            has_window: true,
+            owns_window: true,
+            call_video: true,
         }))
         .expect("a hello serializes");
         tab.link.send_line(&hello).expect("and goes out");

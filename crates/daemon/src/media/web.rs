@@ -213,19 +213,62 @@ pub fn claim(key: &str) -> bool {
 
 /// What the media cache occupies: bytes, and how many entries.
 pub fn cache_usage() -> (u64, u64) {
-    with(|cache| (cache.held, cache.entries.len() as u64))
+    usage_for("")
 }
 
-/// Delete the cached entries this wipe is entitled to.
+/// What one account's slice of the shared map occupies.
 ///
-/// The lock and the epoch belong to [`super::wipe`], which is the only caller.
+/// The named half of [`cache_usage`]: a storage pane for one account must not
+/// bill it for every other account's entries in the same page.
+pub fn usage_for(prefix: &str) -> (u64, u64) {
+    with(|cache| {
+        cache
+            .entries
+            .iter()
+            .filter(|(name, _)| prefix.is_empty() || name.starts_with(prefix))
+            .fold((0u64, 0u64), |(bytes, files), (_, entry)| {
+                (bytes + entry.bytes.len() as u64, files + 1)
+            })
+    })
+}
+
+/// Delete the entries belonging to no account: the pre-multi-account names.
 ///
-/// # Errors
-///
-/// Never, for the same reason [`put`] does not.
-pub(super) fn delete(scope: Wipe) -> Result<()> {
+/// The lock and the epoch belong to [`super::wipe_for`], which is the only
+/// caller.
+pub(super) fn delete_unscoped(scope: Wipe) -> Result<()> {
+    with(|cache| {
+        let mut removed = 0u64;
+        cache.entries.retain(|name, entry| {
+            if oxidezap_ipc::account_prefix_of(name).is_some() {
+                return true;
+            }
+            // A bare staged key is the daemon's now, not this account's: plugin
+            // installation is global and reads `u-<name>` from whichever front
+            // end asked, so a legacy-account wipe must not take a payload
+            // another account's install is still going to consume.
+            if oxidezap_ipc::is_global_staged_key(name) {
+                return true;
+            }
+            let taken = scope.takes(name) && !(entry.claims > 0 && scope == Wipe::Cache);
+            if taken {
+                cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
+                removed += 1;
+            }
+            !taken
+        });
+        log::info!("cleared {removed} pre-multi-account media entries ({scope:?})");
+    });
+    Ok(())
+}
+
+/// Delete only entries in one account namespace when `prefix` is non-empty.
+pub(super) fn delete_for(prefix: &str, scope: Wipe) -> Result<()> {
     with(|cache| {
         cache.entries.retain(|name, entry| {
+            let Some(local_name) = name.strip_prefix(prefix) else {
+                return true;
+            };
             // A claimed entry survives a *cache* clear, for the same reason it
             // survives the sweep: somebody asked for these bytes, the request
             // has already been answered `Ok`, and the reader is on its way.
@@ -236,7 +279,7 @@ pub(super) fn delete(scope: Wipe) -> Result<()> {
             // `Wipe::Everything` takes it regardless: there the account
             // itself is going, and nothing that was going to be shown to it
             // has any business outliving it.
-            let taken = scope.takes(name) && !(entry.claims > 0 && scope == Wipe::Cache);
+            let taken = scope.takes(local_name) && !(entry.claims > 0 && scope == Wipe::Cache);
             if taken {
                 cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
             }

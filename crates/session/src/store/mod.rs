@@ -20,8 +20,10 @@
 #[cfg_attr(target_family = "wasm", path = "web.rs")]
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
+mod registry;
 
-pub use platform::{database_path, prepare, settings, wipe};
+pub use platform::{database_path, open_for_account, prepare, wipe};
+pub use registry::{StoreRegistry, StoredAccount};
 
 /// The database's name, wherever it is kept.
 const DB_FILE: &str = "whatsapp.db";

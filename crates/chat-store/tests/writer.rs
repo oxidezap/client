@@ -41,6 +41,7 @@ async fn barrier_store(
     )
     .await
     .expect("create barrier store");
+    store.create_new_device().await.expect("seed device parent");
     let chat_store = ChatStore::new(&store).await.expect("create chat store");
     (store, chat_store)
 }

@@ -38,9 +38,11 @@
 use std::cell::OnceCell;
 
 use log::info;
+use oxidezap_core::AccountId;
 use sqlite_wasm_rs::WasmOsCallback;
 use sqlite_wasm_vfs::relaxed_idb::{RelaxedIdbCfg, RelaxedIdbUtil, install};
 use sqlite_wasm_vfs::sahpool::{OpfsSAHPoolCfg, OpfsSAHPoolUtil, install as install_sahpool};
+use wacore::store::error::StoreError;
 
 use super::DB_FILE;
 
@@ -295,4 +297,17 @@ pub fn settings() -> whatsapp_rust_sqlite_storage::SqliteStoreConfig {
         synchronous: whatsapp_rust_sqlite_storage::Synchronous::Off,
         ..Default::default()
     }
+}
+
+/// Open the one shared database while binding the handle to one local account.
+pub async fn open_for_account(
+    database_path: &str,
+    account_id: AccountId,
+) -> Result<whatsapp_rust_sqlite_storage::SqliteStore, StoreError> {
+    whatsapp_rust_sqlite_storage::SqliteStore::with_config_for_device(
+        database_path,
+        account_id.as_i32(),
+        settings(),
+    )
+    .await
 }

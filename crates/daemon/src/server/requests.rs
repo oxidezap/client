@@ -189,7 +189,14 @@ pub(super) async fn handle_request(
             )
             .await
         }
-        ClientRequest::ForgetSession => acted(dispatch(hub, commands, Action::ForgetSession).await),
+        ClientRequest::ForgetSession => acted(
+            dispatch(
+                hub,
+                commands,
+                Action::ForgetSession(crate::session_bridge::AccountDisposition::Reset),
+            )
+            .await,
+        ),
         ClientRequest::MarkRead(request) => {
             acted(dispatch(hub, commands, Action::MarkRead(request)).await)
         }
@@ -210,9 +217,12 @@ pub(super) async fn handle_request(
                 Err(refusal) => return refusal,
             };
             // Two directory walks, off the runtime for the same reason the
-            // clear is.
-            let measured = oxidezap_session::unblock(|| {
-                let (media_bytes, media_files) = crate::media::cache_usage();
+            // clear is. Account-scoped: the media directory is shared by every
+            // local account, and billing this one for the whole walk reported
+            // every other account's photos as this account's storage.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            let measured = oxidezap_session::unblock(move || {
+                let (media_bytes, media_files) = account_media.usage();
                 (database_bytes(), media_bytes, media_files)
             })
             .await;
@@ -238,10 +248,17 @@ pub(super) async fn handle_request(
             // delivery for as long as a slow disk took. Awaited rather than
             // spawned loose, so the acknowledgement still means the cache is
             // clear.
-            let cleared = oxidezap_session::unblock(|| {
-                // Cached downloads only: a staged upload belongs to a send
-                // that has not run yet. See `media::Wipe`.
-                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| e.to_string())
+            // This account's cache only: the directory is shared, and a global
+            // clear would delete every other local account's downloads — and,
+            // before the account prefix existed, failed to match this
+            // account's own namespaced keys at all, so "clear" removed neither
+            // correctly nor its own. Cached downloads only: a staged upload
+            // belongs to a send that has not run yet. See `media::Wipe`.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            let cleared = oxidezap_session::unblock(move || {
+                account_media
+                    .wipe(crate::media::Wipe::Cache)
+                    .map_err(|e| e.to_string())
             })
             .await;
             acted(match cleared {
@@ -362,7 +379,7 @@ pub(super) async fn handle_request(
         // of it in the same frame, because a plugin's interface was always
         // the daemon's rather than the asking window's.
         ClientRequest::ReloadPlugins => {
-            crate::plugins::reload_in_background(plugins);
+            crate::plugins::reload_in_background(plugins, hub.account_id());
             acted(Ok(()))
         }
         // The module travels through the media cache, exactly as a file being
@@ -446,6 +463,12 @@ pub(super) async fn handle_request(
             Answer::frame(None)
         }
         // The acknowledgement goes out first; see the caller.
+        ClientRequest::ListAccounts
+        | ClientRequest::CreateAccount
+        | ClientRequest::ResetAccount { .. }
+        | ClientRequest::RemoveAccount { .. } => acted(Err(ProtocolError::Refused {
+            detail: "control requests require a control-scoped connection".to_string(),
+        })),
         ClientRequest::Shutdown => Answer {
             frame: answer(id, Ok(())),
             shutdown: true,
@@ -462,7 +485,7 @@ pub(super) async fn handle_request(
 /// exactly what the session's own out-of-band answers do, and for the same
 /// reason — the caller is not the connection, so it must not park on a client
 /// that is not reading.
-fn answer_later(answer_to: &Outbox, frame: Option<String>) {
+pub(super) fn answer_later(answer_to: &Outbox, frame: Option<String>) {
     use tokio::sync::mpsc::error::TrySendError;
 
     let Some(frame) = frame else {
@@ -489,10 +512,20 @@ fn answer_later(answer_to: &Outbox, frame: Option<String>) {
 /// this is the only copy of the payload, nothing else is ever going to read
 /// it, and a refusal that left it staged would keep a module in the cache
 /// until the account was wiped.
-async fn install(request: &oxidezap_ipc::InstallPlugin) -> Result<String, ProtocolError> {
-    if !oxidezap_ipc::is_staged_key(&request.upload) {
+pub(super) async fn install(
+    request: &oxidezap_ipc::InstallPlugin,
+) -> Result<String, ProtocolError> {
+    // Global staged payloads only. A plugin module is the daemon's and lives
+    // in the shared catalog, read by every account; a payload staged under an
+    // account's own send namespace (`a<id>-u-...`) is that account's data, and
+    // moving it into the catalog would let one account install a module for
+    // all of them from a key it staged to send.
+    if !oxidezap_ipc::is_global_staged_key(&request.upload) {
         return Err(ProtocolError::Refused {
-            detail: format!("{} does not name a staged payload", request.upload),
+            detail: format!(
+                "{} does not name a global staged payload a plugin may be installed from",
+                request.upload
+            ),
         });
     }
     let key = request.upload.clone();
@@ -584,7 +617,7 @@ pub(super) async fn dispatch(
 /// One place, because with an id on every answer there is nothing left to
 /// special-case: a refusal is an error naming its request, exactly like a
 /// refused download or a malformed frame.
-fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<String> {
+pub(super) fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<String> {
     match result {
         Ok(()) => always(
             id,
@@ -713,7 +746,12 @@ pub(super) async fn handle_wire_request(
             wire_ok(id, WireResponse::Doctor(doctor))
         }
         WireRequest::GetStorageUsage => {
-            let (media_bytes, media_files) = crate::media::cache_usage();
+            // Account-scoped, like the legacy storage query: the media cache is
+            // one shared directory, so the whole walk would bill this account
+            // for every other local account's downloads. The database is the
+            // one shared store, which is what `database_bytes` reports.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            let (media_bytes, media_files) = account_media.usage();
             let db_bytes = database_bytes();
             let storage = StorageDto {
                 database_bytes: db_bytes,
@@ -727,8 +765,14 @@ pub(super) async fn handle_wire_request(
             // replying `Ack` unconditionally told a script the cache was clean
             // when the filesystem had refused, which is exactly the failure
             // the structured-error contract exists to surface.
-            match oxidezap_session::unblock(|| {
-                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| e.to_string())
+            //
+            // Account-scoped: a global wipe both deleted other accounts' cached
+            // downloads and failed to match this account's own namespaced keys.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            match oxidezap_session::unblock(move || {
+                account_media
+                    .wipe(crate::media::Wipe::Cache)
+                    .map_err(|e| e.to_string())
             })
             .await
             {
@@ -826,8 +870,16 @@ pub(super) async fn handle_wire_request(
         }
         WireRequest::ForgetSession => {
             // The bridge owns the forget flag, so this rides the legacy
-            // action rather than the wire out-of-band path.
-            match dispatch(hub, commands, Action::ForgetSession).await {
+            // action rather than the wire out-of-band path. The wire's own
+            // `ForgetSession` is the self-service "clear data and pair again":
+            // it keeps the account id and expects a re-pair.
+            match dispatch(
+                hub,
+                commands,
+                Action::ForgetSession(crate::session_bridge::AccountDisposition::Reset),
+            )
+            .await
+            {
                 Ok(()) => wire_ok(id, WireResponse::Ack),
                 Err(ProtocolError::NoSession { detail }) => {
                     wire_err(id, oxidezap_wire::error::ApiError::not_connected(detail))

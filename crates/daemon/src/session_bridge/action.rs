@@ -75,9 +75,11 @@ pub enum Action {
         request: oxidezap_ipc::GroupMembers,
         answer_to: Outbox,
     },
-    /// Wipe local state so the user can pair again. The daemon owns the store
-    /// file, so it is the only process that may delete it.
-    ForgetSession,
+    /// Wipe local state so the user can pair again, or retire the account for
+    /// good. The daemon owns the store, so it is the only process that may
+    /// purge it. See [`AccountDisposition`] for what each choice leaves
+    /// behind.
+    ForgetSession(AccountDisposition),
     /// Demand profile pictures for visible rows or overscan.
     EnsureAvatars(Vec<oxidezap_core::AvatarDemand>),
     /// Asynchronous request from the new wire protocol.
@@ -86,6 +88,102 @@ pub enum Action {
         request: oxidezap_wire::request::ClientRequest,
         answer_to: Outbox,
     },
+}
+
+/// What a session's teardown leaves the account in.
+///
+/// The two lifecycle mutations the plan's control plane exposes
+/// (`ResetAccount`/`RemoveAccount`) and a client's own "clear data and pair
+/// again" all end the same run loop the same way — stop, close the session,
+/// join the plugins, stop the publisher, retire the plugin approvals — and
+/// differ only in the one storage call at the end and in whether the account
+/// is worth restarting afterwards. Carrying that choice through
+/// [`Action::ForgetSession`] rather than adding a second, near-identical
+/// action keeps that shared teardown written once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountDisposition {
+    /// Wipe local state, keep the id, and expect to be paired again — a
+    /// client's own "clear data and pair again", and what `ResetAccount`
+    /// asks a running account to do to itself. The daemon respawns a fresh
+    /// runtime under the same id once this one has fully stopped.
+    Reset,
+    /// Wipe local state and retire the id for good — what `RemoveAccount`
+    /// asks a running account to do to itself. The daemon drops the runtime
+    /// from the registry once this one has fully stopped, and the id is
+    /// never reissued (WR-1's `AUTOINCREMENT` allocation).
+    Remove,
+}
+
+impl AccountDisposition {
+    /// The [`AccountExit`] this disposition became, once the storage mutation
+    /// it names actually ran to completion.
+    #[must_use]
+    pub fn completed(self) -> AccountExit {
+        match self {
+            Self::Reset => AccountExit::ResetCompleted,
+            Self::Remove => AccountExit::RemoveCompleted,
+        }
+    }
+
+    /// The [`AccountExit`] this disposition becomes when the teardown could
+    /// not carry it out — the session did not close in time, the plugin
+    /// approvals could not be cleared, or the storage mutation itself failed.
+    #[must_use]
+    pub fn incomplete(self) -> AccountExit {
+        match self {
+            Self::Reset => AccountExit::ResetIncomplete,
+            Self::Remove => AccountExit::RemoveIncomplete,
+        }
+    }
+}
+
+/// What actually happened to an account's run loop, as opposed to what was
+/// asked of it.
+///
+/// [`AccountDisposition`] is a *request*: `session_bridge::run`'s teardown
+/// can fail to carry it out (the old session took longer than its grace to
+/// close, the plugin approvals could not be cleared, `reset_device`/
+/// `remove_device` itself returned an error against real SQLite) and every
+/// one of those failures is only logged, because refusing to storage-mutate
+/// under a session that might still be writing is the whole point of the
+/// grace period above. A supervisor deciding whether to respawn or drop an
+/// id from *the request alone* would respawn an account that was never
+/// actually reset, or forget one that was never actually removed — both
+/// wrong, and both silent. This is the value `run` actually returns, and the
+/// only thing a supervisor may act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountExit {
+    /// Nothing was asked of the teardown and the run loop ended because the
+    /// daemon itself is stopping, or because every sender of its command
+    /// channel is gone. The runtime stays registered exactly as `run()` left
+    /// its status, and nothing restarts it.
+    Stopped,
+    /// The session ended on its own with no request behind it — a dropped
+    /// socket, an unrecoverable I/O error the client already logged, an
+    /// engine that gave up. Nothing asked for this, and it is the one outcome
+    /// a supervisor may *recover* from: the account is still pair-able, so a
+    /// backoff restart is the reasonable answer where doing nothing was the
+    /// single-account daemon's only option.
+    SessionEnded,
+    /// The session ended on its own and the connection is in a terminal
+    /// credential state: the server rejected the stored credentials. Retrying
+    /// this loops forever — the cure is the user pairing again — so a
+    /// supervisor must leave the account for the user rather than restart it.
+    SessionLoggedOut,
+    /// A reset was asked for and the account's storage was actually reset.
+    /// The supervisor should drop this runtime and spawn a fresh one under
+    /// the same id.
+    ResetCompleted,
+    /// A reset was asked for but did not run to completion. The runtime
+    /// stays registered and its storage is untouched, so the next attempt
+    /// starts from a state the user can still act on.
+    ResetIncomplete,
+    /// A removal was asked for and the account's storage was actually
+    /// removed. The supervisor should drop this runtime for good.
+    RemoveCompleted,
+    /// A removal was asked for but did not run to completion. The runtime
+    /// stays registered and its storage is untouched.
+    RemoveIncomplete,
 }
 
 impl Action {
@@ -102,13 +200,17 @@ impl Action {
     /// exactly the views taken while offline, and there is no retry — the
     /// window has already drawn the ring as watched.
     pub fn needs_network(&self) -> bool {
+        // Reading a page is the same kind of thing as reloading history: it
+        // is a query against the local store, and a window scrolling back
+        // through a conversation it already has is not something to refuse
+        // because the network is down.
         match self {
             Self::Wire { request, .. } => wire_needs_network(request),
             _ => !matches!(
                 self,
                 Self::ReloadHistory
                     | Self::RefreshVideo
-                    | Self::ForgetSession
+                    | Self::ForgetSession(_)
                     | Self::MarkStatusWatched(_)
                     | Self::LoadMessages { .. }
                     | Self::LoadChats { .. }

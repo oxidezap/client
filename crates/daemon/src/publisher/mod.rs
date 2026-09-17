@@ -31,7 +31,7 @@ use crate::state::StateHub;
 
 /// Publish one event, whichever side of the split is draining.
 fn publish_one(hub: &StateHub, mut event: UiEvent) {
-    super::session_bridge::externalize_media(&mut event);
+    super::session_bridge::externalize_media(hub, &mut event);
     match serde_json::to_string(&DaemonMessage::Session {
         event: Box::new(event),
     }) {

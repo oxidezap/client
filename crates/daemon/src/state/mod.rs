@@ -24,6 +24,7 @@ mod store;
 
 use std::sync::Arc;
 
+use oxidezap_core::AccountId;
 use oxidezap_ipc::{ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, PROTOCOL_VERSION};
 use oxidezap_ipc::{StateSnapshot, StateVersion};
 use tokio::sync::{broadcast, watch};
@@ -36,6 +37,18 @@ use store::Published;
 
 /// What the daemon knows, and everyone it tells.
 pub struct StateHub {
+    account_id: AccountId,
+    /// A process-unique identity, stable for this hub's whole life.
+    ///
+    /// What an out-of-band registry keyed by "which hub" must use. The hub's
+    /// address is the obvious key and the wrong one: the allocator reuses it
+    /// as soon as a hub drops, so a stale entry left under an address is read
+    /// as belonging to whichever new hub lands there. [`crate::avatar`] maps
+    /// selections by this, and on a target where the allocator reused
+    /// addresses eagerly that showed up as a picture lookup attributed to the
+    /// wrong hub — a receipt in one test reading another's recorded
+    /// selection. A counter has no second life.
+    id: u64,
     state: StateStore,
     out: Fanout,
 }
@@ -53,11 +66,34 @@ impl Drop for WindowGuard {
 }
 
 impl StateHub {
-    pub fn new() -> Arc<Self> {
+    /// Construct the state and fanout for one immutable account scope.
+    pub fn for_account(account_id: AccountId) -> Arc<Self> {
+        use portable_atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         Arc::new(Self {
+            account_id,
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
             state: StateStore::new(),
             out: Fanout::new(),
         })
+    }
+
+    /// The legacy constructor remains for account-local unit tests and callers
+    /// that have not yet been moved to the runtime registry.
+    pub fn new() -> Arc<Self> {
+        Self::for_account(AccountId::LEGACY)
+    }
+
+    /// The account this hub can ever publish state for.
+    #[must_use]
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    /// This hub's process-unique identity. See [`StateHub::id`].
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Subscribe before snapshotting.
@@ -222,6 +258,15 @@ impl StateHub {
     /// silently.
     pub fn connection(&self) -> ConnectionState {
         self.state.connection()
+    }
+
+    /// Whether the server has rejected this account's stored credentials.
+    ///
+    /// Read by the session teardown, before it clears the account, so the end
+    /// of a run loop can be classified: a logout is terminal until the user
+    /// pairs again, where every other natural end is a fault worth retrying.
+    pub fn is_logged_out(&self) -> bool {
+        self.state.is_logged_out()
     }
 
     /// The summary held for `jid`, if any.

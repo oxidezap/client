@@ -25,6 +25,14 @@
 -- next open (same precedent as the sender-identity migration): a DROP TABLE
 -- fires no trigger and renumbers rowids, so the surviving index would
 -- describe rows that no longer exist under those numbers.
+--
+-- 4. `FOREIGN KEY (device_id) REFERENCES device(id) ON DELETE CASCADE`: this
+--    migration is not the one that introduces the constraint (that is the
+--    multi-account cascade migration, timestamped one second before
+--    midnight the day before so it unambiguously runs first), but it is the
+--    last migration to rebuild this table, so it is the one that has to
+--    carry the constraint forward -- recreating `messages` here without it
+--    would silently drop it.
 DROP TRIGGER IF EXISTS messages_fts_ai;
 DROP TRIGGER IF EXISTS messages_fts_ad;
 DROP TRIGGER IF EXISTS messages_fts_au;
@@ -46,7 +54,8 @@ CREATE TABLE messages_new (
     starred BOOLEAN NOT NULL DEFAULT FALSE,
     edited_at_ms BIGINT,
     revoked BOOLEAN NOT NULL DEFAULT FALSE,
-    UNIQUE(device_id, chat_jid, msg_id, sender_jid)
+    UNIQUE(device_id, chat_jid, msg_id, sender_jid),
+    FOREIGN KEY (device_id) REFERENCES device(id) ON DELETE CASCADE
 );
 
 -- `id` takes over the old rowid values, so arrival order, live cursors, and

@@ -18,6 +18,7 @@ mod whatsapp;
 pub use whatsapp::{OutgoingAcceptCase, outgoing_accept_events};
 
 pub use exec::{Cancelled, Task, sleep, spawn, unblock, with_timeout};
+pub use store::{StoreRegistry, StoredAccount};
 pub use whatsapp::{
     AvatarRecorder, BackfillFile, BackfillReport, ChannelView, ContactCheckView, ContactView,
     GroupDetails, GroupListEntry, GroupParticipantView, HistoryCoverage, JoinGroupView,

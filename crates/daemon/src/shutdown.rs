@@ -17,24 +17,69 @@
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
-/// Raised once, waited on by `main`.
+/// One flag, broadcast to every account runtime rather than to a single
+/// waiter.
 ///
-/// `notify_one` stores a permit, so an ask that arrives before `main` is
-/// watching is not lost — which is the case whenever the daemon fails fast
-/// during startup.
-static STOP: LazyLock<Notify> = LazyLock::new(Notify::new);
+/// A plain [`tokio::sync::Notify`] used to carry this: `notify_one` stores a
+/// permit, so an ask that arrives before anybody is watching is not lost —
+/// which matters whenever the daemon fails fast during startup — but it
+/// wakes exactly one waiter. That was fine while there was one session task
+/// to wake; a multi-account daemon has one per live account, all of which
+/// have to stop on the same ask. `watch` keeps both properties at once: the
+/// value survives with zero receivers (an early `request` is not lost), and
+/// every receiver — however many are subscribed, and however late a new one
+/// subscribes — observes the same `true`.
+struct ShutdownSignal {
+    tx: watch::Sender<bool>,
+}
+
+impl ShutdownSignal {
+    fn new() -> Self {
+        let (tx, _rx) = watch::channel(false);
+        Self { tx }
+    }
+
+    /// Not `send`: that fails with zero receivers, which is exactly the
+    /// startup window this exists to survive. `send_replace` sets the value
+    /// unconditionally and is what `AccountRegistry`'s own snapshot channel
+    /// uses for the same reason.
+    fn request(&self) {
+        self.tx.send_replace(true);
+    }
+
+    /// Resolve immediately if already requested, otherwise wait for it.
+    ///
+    /// Every call subscribes its own receiver, so any number of concurrent
+    /// callers — one per live account runtime, plus `main`'s own signal
+    /// handling — each see the flip independently rather than racing one
+    /// shared waiter for it.
+    async fn requested(&self) {
+        let mut rx = self.tx.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                // The sender is `'static` in production; only reachable if a
+                // test's own signal is dropped mid-wait.
+                return;
+            }
+        }
+    }
+}
+
+/// Raised once, waited on by every account runtime and by `main`'s own
+/// signal handling.
+static STOP: LazyLock<ShutdownSignal> = LazyLock::new(ShutdownSignal::new);
 
 /// Ask this process to shut down.
 pub fn request(reason: &str) {
     log::info!("shutdown requested: {reason}");
-    STOP.notify_one();
+    STOP.request();
 }
 
-/// Resolve once somebody has asked.
+/// Resolve once somebody has asked, for however many callers are waiting.
 pub async fn requested() {
-    STOP.notified().await;
+    STOP.requested().await;
 }
 
 /// The outside signal that asked this process to stop.
@@ -127,6 +172,45 @@ impl SignalGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One request wakes every concurrent waiter, not just one of them —
+    /// the property multiple account runtimes now depend on to all stop on
+    /// the same ask. A local signal, not the process-global one: the real
+    /// `STOP` is `'static` and monotonic, so a test that set it would break
+    /// `requested()` for every other test sharing this binary.
+    #[tokio::test]
+    async fn one_request_wakes_every_waiter() {
+        let signal = std::sync::Arc::new(ShutdownSignal::new());
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let signal = std::sync::Arc::clone(&signal);
+                tokio::spawn(async move { signal.requested().await })
+            })
+            .collect();
+        // Let every spawned task actually reach its `.await` before the
+        // request lands, rather than racing the scheduler.
+        tokio::task::yield_now().await;
+        signal.request();
+
+        // Bounded: with the `Notify::notify_one` semantics this replaced, at
+        // most one of these would ever resolve and the rest would hang
+        // forever rather than fail loudly.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for waiter in waiters {
+                waiter.await.expect("a waiter task panicked");
+            }
+        })
+        .await;
+        assert!(
+            joined.is_ok(),
+            "one request() must resolve every concurrent requested() waiter"
+        );
+
+        // A waiter that subscribes *after* the request still resolves at
+        // once — the value survived, exactly as `Notify::notify_one`'s
+        // stored permit used to for the single waiter it served.
+        signal.requested().await;
+    }
 
     /// The terminal's signal starts the graceful shutdown.
     #[test]

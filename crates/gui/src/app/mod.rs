@@ -628,6 +628,14 @@ pub struct WhatsAppApp {
     selected_chat: Option<String>,
     /// WhatsApp client wrapper
     client: Option<Session>,
+    /// The daemon's control plane, beside the account connection.
+    ///
+    /// A second connection carrying the requests that belong to the process
+    /// rather than to an account: the log level, a window, the shared plugin
+    /// catalogue and the account lifecycle. The account plane refuses those,
+    /// so a window that sent them there was answered "this request belongs to
+    /// the control plane" — see `session::attach::begin_control`.
+    control: Option<Session>,
     /// Destination captured while an asynchronous clipboard read is pending.
     pending_pastes: HashMap<u64, (String, Option<ReplyDraft>)>,
     /// Scroll handle for chat list
@@ -762,6 +770,15 @@ pub struct WhatsAppApp {
     /// cancels it.
     #[allow(dead_code)]
     reconnect_task: Option<Task<()>>,
+    /// The control connection's event reader. Retained for the same reason as
+    /// `event_task`: dropping it ends the reader.
+    ///
+    /// Its frames are answered through the control session's own request
+    /// table, so it needs no separate handling beyond staying alive — the
+    /// `Awaiting` entries the control requests registered are what its reader
+    /// resolves.
+    #[allow(dead_code)]
+    control_event_task: Option<Task<()>>,
     /// The microphone, what it is being held open for, and the timer that
     /// draws the meter. See [`recording`].
     recorder: Entity<recording::Recorder>,
@@ -939,6 +956,31 @@ impl WhatsAppApp {
             self.avatar_manager.flush_demands(session);
         }
     }
+
+    /// Drain the control connection's events.
+    ///
+    /// The control plane carries no account state, so there is nothing to
+    /// apply. What this task is for is the *request table*: the answers to
+    /// `SetLogLevel`, a plugin install, a removal and a listing are resolved
+    /// by the reader as it runs, and the one-shot receivers the callers hold
+    /// only fire while it does. The events themselves are dropped.
+    fn spawn_control_reader(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(
+            async move |_: WeakEntity<Self>, _cx| {
+                while ui_rx.recv().await.is_some() {}
+            },
+        )
+    }
+
+    /// The control plane if this window has one.
+    ///
+    /// `None` between connections, or when the daemon answered the account
+    /// connection but not a second one. Every caller that needs it says what
+    /// it could not do rather than panicking.
+    fn control(&self) -> Option<&Session> {
+        self.control.as_ref()
+    }
+
     /// Spawn the event handling task that processes UI events from the WhatsApp client
     fn spawn_event_task(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -1122,6 +1164,8 @@ impl WhatsAppApp {
             drafts: HashMap::new(),
             event_task: None,
             reconnect_task: None,
+            control: None,
+            control_event_task: None,
             recorder: cx.new(|_| recording::Recorder::new()),
             audio_player: AudioPlayer::new(),
             playback_speed: 1.0,
@@ -2441,12 +2485,20 @@ impl WhatsAppApp {
         // the reader to leave and a reader parked for room in that queue is
         // waiting on this very thread to drain it.
         self.event_task.take();
+        self.control_event_task.take();
         self.client.take();
+        self.control.take();
 
         // A failure routes back to the error screen, where retry stays
         // available.
         self.reconnect_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let connected = Session::attach(cx).await;
+            // The control plane, best effort and alongside: a daemon that
+            // answers the account connection answers this one too, and one
+            // that does not leaves the account plane usable with the global
+            // requests refused, rather than failing the whole attach over a
+            // second socket.
+            let control = Session::attach_control(cx).await;
             let _ = entity.update(cx, |app, cx| {
                 match connected {
                     Ok((client, ui_rx)) => {
@@ -2454,6 +2506,14 @@ impl WhatsAppApp {
                         app.avatar_manager.set_session(Some(client.handle()));
                         app.avatar_manager.flush_demands(&client);
                         app.client = Some(client);
+                        if let Ok((control, control_rx)) = control {
+                            // Its frames answer through the control session's
+                            // own request table; the reader just has to keep
+                            // running so those answers land.
+                            app.control_event_task =
+                                Some(Self::spawn_control_reader(control_rx, cx));
+                            app.control = Some(control);
+                        }
                         // A level chosen while this was unreachable reached
                         // nobody, and the daemon on the other end may be a
                         // new one. Nothing is sent if nobody chose.

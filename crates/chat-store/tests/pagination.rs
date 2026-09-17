@@ -705,6 +705,19 @@ async fn arrival_feed_is_scoped_to_the_session_device() {
     store
         .shared()
         .run(move |conn| {
+            // The sibling row is normally created by the upstream lifecycle
+            // API. This test predates that API, so seed only the parent id and
+            // then insert its account-scoped message.
+            diesel::sql_query(format!(
+                "INSERT INTO device \
+                 (id, lid, pn, registration_id, noise_key, identity_key, \
+                  signed_pre_key, signed_pre_key_id, signed_pre_key_signature, \
+                  adv_secret_key) \
+                 VALUES ({sibling}, '2@lid', '2@s.whatsapp.net', 2, X'', X'', \
+                         X'', 0, X'', X'')"
+            ))
+            .execute(conn)
+            .map_err(db_err)?;
             diesel::sql_query(format!(
                 "INSERT INTO messages (device_id, chat_jid, msg_id, sender_jid, from_me, \
                  timestamp_ms, kind, text_content, status, starred, revoked) \
