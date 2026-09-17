@@ -49,8 +49,11 @@ enum Lookup {
     Unchanged,
     /// WhatsApp says this chat has no picture. The only destructive answer.
     NotFound,
-    /// A refusal, a rate limit, or a partial response: the previous picture
-    /// stays, because neither is evidence the picture is gone.
+    /// Permission refused (privacy restricted or not authorized).
+    NotAuthorized,
+    /// Rate limit reached on WhatsApp server; retryable with backoff.
+    RateOverlimit,
+    /// An unknown outcome or refusal: the previous picture stays.
     Unknown,
     /// The lookup failed. Deliberately not remembered, so a transient failure
     /// is retried the next time a page names the chat.
@@ -83,14 +86,9 @@ impl Lookup {
             // fetch, so this session keeps what it had.
             Outcome::Found(_) | Outcome::Unchanged => Self::Unchanged,
             Outcome::NotFound => Self::NotFound,
-            // Not authorized and rate-limited say nothing about whether the
-            // picture exists, so they must not erase one that does.
-            //
-            // The wildcard is `#[non_exhaustive]`'s: a state this build does
-            // not know about is read as "nothing definite" rather than as the
-            // one destructive answer, because guessing "removed" for an
-            // unknown state is the mistake this type exists to prevent.
-            Outcome::NotAuthorized | Outcome::RateOverlimit | _ => Self::Unknown,
+            Outcome::RateOverlimit => Self::RateOverlimit,
+            Outcome::NotAuthorized => Self::NotAuthorized,
+            _ => Self::Unknown,
         }
     }
 
@@ -101,7 +99,7 @@ impl Lookup {
     /// client's request rate, not about the entity, and asking again would
     /// spend another request against a limit already reached.
     fn wants_community_fallback(&self) -> bool {
-        matches!(self, Self::Unknown)
+        matches!(self, Self::NotAuthorized | Self::Unknown)
     }
 
     /// Read the fallback's answer, keeping only a picture.
@@ -127,11 +125,22 @@ impl Lookup {
 /// The generation is the connection it was resolved under. A new connection
 /// makes every entry stale, because a picture can change while the process is
 /// offline and the previous socket's answer says nothing about this one.
-/// The boolean tracks whether bytes were requested (`had_bytes = true`) or only
-/// metadata freshness checked (`had_bytes = false`).
+/// Resolution state of an avatar lookup within a connection generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AvatarResolutionState {
+    /// Metadata freshness checked (`need_bytes: false`), or degraded from failed fetch.
+    MetadataKnown,
+    /// Picture URL was resolved and delivered to the daemon for download (`need_bytes: true`).
+    SourceDelivered,
+    /// Daemon confirmed bytes are downloaded and written to cache.
+    BytesReady,
+    /// WhatsApp confirmed chat has no picture.
+    NotFound,
+}
+
 #[derive(Default)]
 pub(super) struct Resolver {
-    asked: HashMap<String, (u64, bool)>,
+    asked: HashMap<String, (u64, AvatarResolutionState)>,
 }
 
 impl Resolver {
@@ -143,28 +152,44 @@ impl Resolver {
     fn needs(&self, jid: &str, generation: u64, need_bytes: bool) -> bool {
         match self.asked.get(jid) {
             None => true,
-            Some(&(recorded_gen, had_bytes)) => {
+            Some(&(recorded_gen, state)) => {
                 if recorded_gen != generation {
                     true
-                } else if need_bytes && !had_bytes {
-                    // Previous ask was freshness-only, but caller needs bytes.
-                    true
                 } else {
-                    false
+                    match state {
+                        AvatarResolutionState::NotFound => false,
+                        AvatarResolutionState::BytesReady => false,
+                        AvatarResolutionState::SourceDelivered => false,
+                        AvatarResolutionState::MetadataKnown => need_bytes,
+                    }
                 }
             }
         }
     }
 
-    fn mark_asked(&mut self, jid: &str, generation: u64, had_bytes: bool) {
+    fn mark(&mut self, jid: &str, generation: u64, state: AvatarResolutionState) {
         let entry = self
             .asked
             .entry(jid.to_string())
-            .or_insert((generation, had_bytes));
+            .or_insert((generation, state));
         if entry.0 != generation {
-            *entry = (generation, had_bytes);
-        } else if had_bytes {
-            entry.1 = true;
+            *entry = (generation, state);
+        } else {
+            entry.1 = state;
+        }
+    }
+
+    pub(super) fn mark_ready(&mut self, jid: &str) {
+        if let Some((_, state)) = self.asked.get_mut(jid) {
+            *state = AvatarResolutionState::BytesReady;
+        }
+    }
+
+    pub(super) fn mark_failed(&mut self, jid: &str) {
+        if let Some((_, state)) = self.asked.get_mut(jid)
+            && *state == AvatarResolutionState::SourceDelivered
+        {
+            *state = AvatarResolutionState::MetadataKnown;
         }
     }
 
@@ -304,33 +329,47 @@ pub(super) async fn resolve(
         let mut resolutions = Vec::with_capacity(answered.len());
         for (jid, need_bytes, answer) in answered {
             let jid_str = jid.to_string();
-            let (outcome, had_bytes) = match answer {
-                Lookup::Found { picture_id, source } => (
-                    oxidezap_core::AvatarOutcome::Found {
-                        picture_id,
-                        source: Some(source),
-                    },
-                    need_bytes,
+            let (outcome, state) = match answer {
+                Lookup::Found { picture_id, source } => {
+                    let state = if need_bytes {
+                        AvatarResolutionState::SourceDelivered
+                    } else {
+                        AvatarResolutionState::MetadataKnown
+                    };
+                    (
+                        oxidezap_core::AvatarOutcome::Found {
+                            picture_id,
+                            source: Some(source),
+                        },
+                        state,
+                    )
+                }
+                Lookup::NotFound => (
+                    oxidezap_core::AvatarOutcome::NotFound,
+                    AvatarResolutionState::NotFound,
                 ),
-                Lookup::NotFound => (oxidezap_core::AvatarOutcome::NotFound, true),
                 Lookup::Unchanged => {
-                    resolver.mark_asked(&jid_str, generation, false);
+                    resolver.mark(&jid_str, generation, AvatarResolutionState::MetadataKnown);
                     continue;
                 }
-                // An answer with nothing to act on: a refusal, a rate limit,
-                // or a partial response. Mark asked and notify non-retryable failure.
-                Lookup::Unknown => {
-                    resolver.mark_asked(&jid_str, generation, false);
+                Lookup::RateOverlimit => {
+                    resolver.mark_failed(&jid_str);
+                    let _ = ui_tx.send(UiEvent::AvatarFailed {
+                        jid: jid_str,
+                        retryable: true,
+                    });
+                    continue;
+                }
+                Lookup::NotAuthorized | Lookup::Unknown => {
+                    resolver.mark(&jid_str, generation, AvatarResolutionState::MetadataKnown);
                     let _ = ui_tx.send(UiEvent::AvatarFailed {
                         jid: jid_str,
                         retryable: false,
                     });
                     continue;
                 }
-                // A failure is deliberately not remembered, so a transient one
-                // is retried the next time a demand names the chat, but clear
-                // in_flight in the manager via a retryable failure event.
                 Lookup::Failed => {
+                    resolver.mark_failed(&jid_str);
                     let _ = ui_tx.send(UiEvent::AvatarFailed {
                         jid: jid_str,
                         retryable: true,
@@ -338,7 +377,7 @@ pub(super) async fn resolve(
                     continue;
                 }
             };
-            resolver.mark_asked(&jid_str, generation, had_bytes);
+            resolver.mark(&jid_str, generation, state);
             resolutions.push(oxidezap_core::AvatarResolution {
                 jid: jid_str,
                 outcome,
@@ -402,6 +441,12 @@ impl WhatsAppClient {
                 if request.reset {
                     resolver.forget_all();
                 }
+                for jid in request.ready {
+                    resolver.mark_ready(&jid);
+                }
+                for jid in request.failed {
+                    resolver.mark_failed(&jid);
+                }
                 if !request.demands.is_empty() {
                     resolve(
                         &client,
@@ -459,7 +504,7 @@ mod tests {
     fn an_asked_chat_is_not_asked_again() {
         let mut resolver = Resolver::new();
         assert!(resolver.needs("a@s.whatsapp.net", 1, true));
-        resolver.mark_asked("a@s.whatsapp.net", 1, true);
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::BytesReady);
         assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
         assert!(resolver.needs("b@s.whatsapp.net", 1, true));
 
@@ -475,7 +520,7 @@ mod tests {
     #[test]
     fn a_new_connection_revalidates_what_the_last_one_resolved() {
         let mut resolver = Resolver::new();
-        resolver.mark_asked("a@s.whatsapp.net", 1, true);
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::BytesReady);
         assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
         assert!(
             resolver.needs("a@s.whatsapp.net", 2, true),
@@ -487,17 +532,16 @@ mod tests {
     #[test]
     fn needing_bytes_supersedes_a_metadata_only_ask() {
         let mut resolver = Resolver::new();
-        resolver.mark_asked("a@s.whatsapp.net", 1, false);
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::MetadataKnown);
         assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
         assert!(resolver.needs("a@s.whatsapp.net", 1, true));
     }
 
-    /// A metadata-only Unchanged lookup records had_bytes: false, so a subsequent byte demand proceeds.
+    /// A metadata-only Unchanged lookup records MetadataKnown, so a subsequent byte demand proceeds.
     #[test]
     fn metadata_only_unchanged_lookup_permits_subsequent_byte_demand() {
         let mut resolver = Resolver::new();
-        // Unchanged on metadata-only ask records had_bytes = false:
-        resolver.mark_asked("a@s.whatsapp.net", 1, false);
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::MetadataKnown);
         assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
         assert!(
             resolver.needs("a@s.whatsapp.net", 1, true),
@@ -506,32 +550,42 @@ mod tests {
     }
 
     #[test]
-    fn need_bytes_true_with_found_prevents_subsequent_lookups_in_same_generation() {
+    fn source_delivered_suppresses_while_in_flight_and_failure_downgrades_to_allow_retry() {
         let mut resolver = Resolver::new();
-        // Found with need_bytes = true marks had_bytes = true
-        resolver.mark_asked("a@s.whatsapp.net", 1, true);
+        // Found with need_bytes = true marks SourceDelivered
+        resolver.mark(
+            "a@s.whatsapp.net",
+            1,
+            AvatarResolutionState::SourceDelivered,
+        );
         assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
         assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
 
-        // But next generation needs lookup again
-        assert!(resolver.needs("a@s.whatsapp.net", 2, true));
+        // When CDN download fails, resolver marks failure, downgrading to MetadataKnown:
+        resolver.mark_failed("a@s.whatsapp.net");
+        assert!(
+            resolver.needs("a@s.whatsapp.net", 1, true),
+            "retry must be allowed after failure"
+        );
     }
 
     #[test]
-    fn need_bytes_false_with_found_permits_subsequent_byte_demand() {
+    fn ready_marks_bytes_ready_and_suppresses_subsequent_demands() {
         let mut resolver = Resolver::new();
-        // Found with need_bytes = false (e.g. freshness revalidation) marks had_bytes = false
-        resolver.mark_asked("a@s.whatsapp.net", 1, false);
+        resolver.mark(
+            "a@s.whatsapp.net",
+            1,
+            AvatarResolutionState::SourceDelivered,
+        );
+        resolver.mark_ready("a@s.whatsapp.net");
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
         assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
-        // If local bytes are missing, need_bytes = true must still proceed
-        assert!(resolver.needs("a@s.whatsapp.net", 1, true));
     }
 
     #[test]
     fn not_found_prevents_subsequent_lookups_in_same_generation() {
         let mut resolver = Resolver::new();
-        // NotFound marks had_bytes = true
-        resolver.mark_asked("a@s.whatsapp.net", 1, true);
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::NotFound);
         assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
         assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
     }

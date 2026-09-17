@@ -5,6 +5,11 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 33: `DaemonMessage::AvatarFailed` and `UiEvent::AvatarFailed`. Propagates avatar
+/// resolution, download, and materialization failures with a retryable flag to
+/// coordinate front-end failure cooldowns and retry pacing. A v32 front-end
+/// would treat the frame as unparsable JSON and fail to decode the session event.
+///
 /// 32: `ClientRequest::EnsureAvatars`, which carries the viewport's avatar
 /// demands to the daemon so profile pictures are resolved on demand rather
 /// than for every chat the history load names. A v31 daemon does not know the
@@ -247,7 +252,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///
@@ -551,6 +556,21 @@ pub fn key_local_name(key: &str) -> &str {
 pub fn account_staged_prefix_of(key: &str) -> Option<oxidezap_core::AccountId> {
     account_staged_local(key)?;
     let digits = key.strip_prefix('a')?.split_once('-')?.0;
+    digits
+        .parse::<i32>()
+        .ok()
+        .and_then(|id| oxidezap_core::AccountId::new(id).ok())
+}
+
+/// The account id embedded in any account-scoped key (`a<id>-...`), if this is one.
+#[cfg(feature = "legacy-protocol")]
+#[must_use]
+pub fn account_id_of(key: &str) -> Option<oxidezap_core::AccountId> {
+    let rest = key.strip_prefix('a')?;
+    let (digits, _) = rest.split_once('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     digits
         .parse::<i32>()
         .ok()

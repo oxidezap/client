@@ -2037,4 +2037,19 @@ mod tests {
             other => panic!("not a send_media: {other:?}"),
         }
     }
+
+    #[test]
+    fn avatar_failed_wire_round_trip() {
+        let msg = DaemonMessage::AvatarFailed {
+            jid: "user@s.whatsapp.net".to_string(),
+            retryable: true,
+        };
+        let line = serde_json::to_string(&msg).expect("avatar failed is writable");
+        assert_eq!(
+            line,
+            r#"{"type":"avatar_failed","jid":"user@s.whatsapp.net","retryable":true}"#
+        );
+        let parsed: DaemonMessage = serde_json::from_str(&line).expect("avatar failed is readable");
+        assert_eq!(parsed, msg);
+    }
 }

@@ -39,12 +39,19 @@ pub use imp::{
 /// Persist an avatar payload to the platform's storage tier.
 #[allow(dead_code)]
 pub fn save_avatar(key: &str, bytes: &[u8]) {
-    let key = key.to_string();
-    let bytes = bytes.to_vec();
-    let account = imp::resolve_account(&key);
-    spawn_task(async move {
-        let _ = write_persistent(&key, &bytes, account).await;
-    });
+    #[cfg(target_family = "wasm")]
+    {
+        let key = key.to_string();
+        let bytes = bytes.to_vec();
+        let account = imp::resolve_account(&key);
+        spawn_task(async move {
+            let _ = write_persistent(&key, &bytes, account).await;
+        });
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let _ = (key, bytes);
+    }
 }
 
 /// One avatar demand description passed by the viewport or header.
@@ -63,16 +70,19 @@ pub enum DemandPriority {
     Low,
 }
 
+static NEXT_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 /// Central avatar manager coordinating viewport demands, persistent storage,
 /// and in-memory decoded image caching.
 #[derive(Clone, Default)]
 pub struct AvatarManager {
-    persistent_in_flight: Arc<Mutex<HashSet<String>>>,
+    persistent_in_flight: Arc<Mutex<HashMap<String, u64>>>,
     network_in_flight: Arc<Mutex<HashSet<String>>>,
     revalidated: Arc<Mutex<HashSet<String>>>,
     failed_cooldowns: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
     pending_demands: Arc<Mutex<HashMap<String, (AvatarDemand, DemandPriority)>>>,
     generation: Arc<AtomicU64>,
+    demand_epoch: Arc<AtomicU64>,
     account_id: Arc<Mutex<Option<AccountId>>>,
     session: Arc<Mutex<Option<crate::session::SessionHandle>>>,
 }
@@ -82,12 +92,21 @@ impl AvatarManager {
         Self::default()
     }
 
+    pub fn demand_epoch(&self) -> u64 {
+        self.demand_epoch.load(Ordering::Relaxed)
+    }
+
+    pub fn bump_demand_epoch(&self) -> u64 {
+        self.demand_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     /// Set or clear the active session handle, syncing active account and generation.
     pub fn set_session(&self, session: Option<crate::session::SessionHandle>) {
         let new_account = session.as_ref().map(|s| s.account());
         *self.account_id.lock().unwrap_or_else(|e| e.into_inner()) = new_account;
         set_active_account(new_account);
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.bump_demand_epoch();
         self.reset_connection();
         let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
         *s = session;
@@ -100,6 +119,7 @@ impl AvatarManager {
     pub fn clear(&self) {
         clear_image_sources();
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.bump_demand_epoch();
         self.reset_connection();
     }
 
@@ -212,11 +232,13 @@ impl AvatarManager {
             }
 
             // Miss in RAM: check persistent store if not already in flight
+            let op_token = NEXT_OP_TOKEN.fetch_add(1, Ordering::Relaxed);
             let mut p_flight = self
                 .persistent_in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if p_flight.insert(key.clone()) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = p_flight.entry(key.clone()) {
+                entry.insert(op_token);
                 let key_clone = key.clone();
                 let jid_clone = jid.clone();
                 let pic_id = chat.picture_id.clone();
@@ -237,20 +259,24 @@ impl AvatarManager {
                     if generation.load(Ordering::Relaxed) != born_gen
                         || *account_id.lock().unwrap_or_else(|e| e.into_inner()) != born_account
                     {
-                        persistent_in_flight
+                        let mut p = persistent_in_flight
                             .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&key_clone);
+                            .unwrap_or_else(|e| e.into_inner());
+                        if p.get(&key_clone) == Some(&op_token) {
+                            p.remove(&key_clone);
+                        }
                         return;
                     }
 
                     if let Some(bytes) = persistent_bytes {
                         if let Some((source, decoded_size)) = decode_avatar(&bytes) {
                             put_avatar_image(key_clone.clone(), source, decoded_size);
-                            persistent_in_flight
+                            let mut p = persistent_in_flight
                                 .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .remove(&key_clone);
+                                .unwrap_or_else(|e| e.into_inner());
+                            if p.get(&key_clone) == Some(&op_token) {
+                                p.remove(&key_clone);
+                            }
 
                             // Notify UI that the avatar image is ready in RAM
                             if let Some(session) = session_handle
@@ -286,15 +312,32 @@ impl AvatarManager {
                             return;
                         }
 
-                        // Corrupt persistent blob: delete entry and trigger single remote refill
+                        // Corrupt persistent blob: delete entry
                         let _ = delete_persistent(&key_clone).await;
+
+                        // Re-validate generation/account post-await
+                        if generation.load(Ordering::Relaxed) != born_gen
+                            || *account_id.lock().unwrap_or_else(|e| e.into_inner()) != born_account
+                        {
+                            let mut p = persistent_in_flight
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if p.get(&key_clone) == Some(&op_token) {
+                                p.remove(&key_clone);
+                            }
+                            return;
+                        }
                     }
 
                     // Persistent miss or corrupt blob: unconditionally fetch bytes
-                    persistent_in_flight
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&key_clone);
+                    {
+                        let mut p = persistent_in_flight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if p.get(&key_clone) == Some(&op_token) {
+                            p.remove(&key_clone);
+                        }
+                    }
                     let mut n_flight = network_in_flight.lock().unwrap_or_else(|e| e.into_inner());
                     if n_flight.insert(jid_clone.clone()) {
                         let demand = AvatarDemand {
@@ -406,7 +449,7 @@ impl AvatarManager {
     }
 
     /// Called when an avatar lookup, download, or materialization fails.
-    pub fn on_avatar_failed(&self, jid: &str, retryable: bool) {
+    pub fn on_avatar_failed(&self, jid: &str, retryable: bool) -> Instant {
         self.network_in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -416,13 +459,12 @@ impl AvatarManager {
         } else {
             std::time::Duration::from_secs(300)
         };
+        let until = Instant::now() + cooldown_duration;
         self.failed_cooldowns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                jid.to_string(),
-                (retryable, Instant::now() + cooldown_duration),
-            );
+            .insert(jid.to_string(), (retryable, until));
+        until
     }
 
     #[cfg(test)]
@@ -435,7 +477,7 @@ impl AvatarManager {
                 .persistent_in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains(item)
+                .contains_key(item)
     }
 
     #[cfg(test)]

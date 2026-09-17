@@ -229,6 +229,7 @@ pub(crate) type SessionSlot = Arc<Mutex<Option<Arc<Session>>>>;
 #[derive(Clone)]
 pub struct AvatarRecorder {
     session: SessionSlot,
+    resolve_avatars: AvatarResolveSignal,
 }
 
 impl AvatarRecorder {
@@ -240,7 +241,18 @@ impl AvatarRecorder {
     pub fn detached() -> Self {
         Self {
             session: Arc::new(Mutex::new(None)),
+            resolve_avatars: AvatarResolveSignal::new(),
         }
+    }
+
+    /// Mark that an avatar's bytes have been successfully stored and cached.
+    pub fn on_ready(&self, jid: &str) {
+        self.resolve_avatars.on_ready(jid);
+    }
+
+    /// Mark that an avatar's download failed, allowing retry.
+    pub fn on_failed(&self, jid: &str) {
+        self.resolve_avatars.on_failed(jid);
     }
 
     /// Point `jid` at `picture_id`, whose bytes are cached under `cache_key`.
@@ -391,6 +403,10 @@ struct PendingResolve {
     reset: bool,
     /// Demands requested by the viewport, header, or overscan.
     demands: HashMap<String, oxidezap_core::AvatarDemand>,
+    /// JIDs whose avatar bytes landed in the local cache.
+    ready: Vec<String>,
+    /// JIDs whose avatar download failed.
+    failed: Vec<String>,
 }
 
 impl AvatarResolveSignal {
@@ -419,6 +435,22 @@ impl AvatarResolveSignal {
     pub(super) fn reset(&self) {
         self.set(|pending| {
             pending.reset = true;
+        });
+    }
+
+    /// Notify that an avatar's bytes have been saved.
+    pub(super) fn on_ready(&self, jid: impl Into<String>) {
+        let jid = jid.into();
+        self.set(|pending| {
+            pending.ready.push(jid);
+        });
+    }
+
+    /// Notify that an avatar's download failed.
+    pub(super) fn on_failed(&self, jid: impl Into<String>) {
+        let jid = jid.into();
+        self.set(|pending| {
+            pending.failed.push(jid);
         });
     }
 
@@ -485,17 +517,26 @@ impl AvatarResolveSignal {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let demands = pending.demands.drain().map(|(_, d)| d).collect();
+                let ready = std::mem::take(&mut pending.ready);
+                let failed = std::mem::take(&mut pending.failed);
                 let taken = ResolveRequest {
                     full: pending.full,
                     reset: pending.reset,
                     demands,
+                    ready,
+                    failed,
                     generation: self.generation.load(Ordering::SeqCst),
                 };
                 pending.full = false;
                 pending.reset = false;
                 taken
             };
-            if taken.full || taken.reset || !taken.demands.is_empty() {
+            if taken.full
+                || taken.reset
+                || !taken.demands.is_empty()
+                || !taken.ready.is_empty()
+                || !taken.failed.is_empty()
+            {
                 return taken;
             }
             self.ask.notified().await;
@@ -512,6 +553,10 @@ pub(super) struct ResolveRequest {
     pub(super) reset: bool,
     /// Demands requested by viewport or explicit requests.
     pub(super) demands: Vec<oxidezap_core::AvatarDemand>,
+    /// JIDs whose avatars have landed in cache.
+    pub(super) ready: Vec<String>,
+    /// JIDs whose avatar download failed.
+    pub(super) failed: Vec<String>,
     /// The connection this ask was made under.
     pub(super) generation: u64,
 }
@@ -2404,6 +2449,7 @@ impl WhatsAppClient {
     pub fn avatar_recorder(&self) -> AvatarRecorder {
         AvatarRecorder {
             session: self.session.clone(),
+            resolve_avatars: self.resolve_avatars.clone(),
         }
     }
 

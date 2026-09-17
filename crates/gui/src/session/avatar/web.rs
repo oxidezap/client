@@ -17,10 +17,64 @@
 //! into JS is copied into `js_sys::Uint8Array::from(...)`, and reads copy out
 //! using `array.to_vec()`.
 
-use std::sync::RwLock;
+use std::collections::VecDeque;
+use std::sync::{LazyLock, Mutex as StdMutex, RwLock};
 use wasm_bindgen::JsCast;
 
 const AVATAR_CACHE_BUDGET_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+struct AsyncMutex {
+    state: StdMutex<AsyncMutexState>,
+}
+
+struct AsyncMutexState {
+    locked: bool,
+    waiters: VecDeque<futures_channel::oneshot::Sender<()>>,
+}
+
+impl AsyncMutex {
+    const fn new() -> Self {
+        Self {
+            state: StdMutex::new(AsyncMutexState {
+                locked: false,
+                waiters: VecDeque::new(),
+            }),
+        }
+    }
+
+    async fn lock(&self) -> AsyncMutexGuard<'_> {
+        let rx = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if !state.locked {
+                state.locked = true;
+                return AsyncMutexGuard { mutex: self };
+            }
+            let (tx, rx) = futures_channel::oneshot::channel();
+            state.waiters.push_back(tx);
+            rx
+        };
+        let _ = rx.await;
+        AsyncMutexGuard { mutex: self }
+    }
+}
+
+struct AsyncMutexGuard<'a> {
+    mutex: &'a AsyncMutex,
+}
+
+impl Drop for AsyncMutexGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.mutex.state.lock().unwrap_or_else(|p| p.into_inner());
+        while let Some(waiter) = state.waiters.pop_front() {
+            if waiter.send(()).is_ok() {
+                return;
+            }
+        }
+        state.locked = false;
+    }
+}
+
+static CACHE_LOCK: LazyLock<AsyncMutex> = LazyLock::new(AsyncMutex::new);
 
 static ACTIVE_ACCOUNT: RwLock<Option<oxidezap_core::AccountId>> = RwLock::new(None);
 
@@ -41,7 +95,7 @@ pub fn rotate_account_scope() -> Option<oxidezap_core::AccountId> {
 }
 
 pub fn resolve_account(key: &str) -> Option<oxidezap_core::AccountId> {
-    oxidezap_ipc::account_staged_prefix_of(key).or_else(active_account)
+    oxidezap_ipc::account_id_of(key).or_else(active_account)
 }
 
 pub fn cache_name_for_account(account: oxidezap_core::AccountId) -> String {
@@ -125,33 +179,14 @@ pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {
         .await
         .ok()?;
     let array = js_sys::Uint8Array::new(&buffer);
-    let bytes = array.to_vec();
-
-    // Update last_accessed in metadata
-    let mut meta = load_meta(account);
-    let now = wacore::time::now_millis();
-    let now_u64 = if now >= 0 { now as u64 } else { 0 };
-    if let Some(entry) = meta.entries.get_mut(key) {
-        entry.last_accessed = now_u64;
-    } else {
-        meta.entries.insert(
-            key.to_string(),
-            MetaEntry {
-                size: bytes.len() as u64,
-                last_accessed: now_u64,
-            },
-        );
-        meta.total_bytes = meta.total_bytes.saturating_add(bytes.len() as u64);
-    }
-    save_meta(account, &meta);
-
-    Some(bytes)
+    Some(array.to_vec())
 }
 
 pub async fn delete_persistent(key: &str) -> Result<(), String> {
     let Some(account) = resolve_account(key) else {
         return Ok(());
     };
+    let _guard = CACHE_LOCK.lock().await;
     let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
     let caches = window.caches().map_err(|e| format!("{e:?}"))?;
     let name = cache_name_for_account(account);
@@ -181,12 +216,12 @@ pub async fn write_persistent(
         log::debug!("skipping persistent avatar write: no account scope for key {key}");
         return Ok(());
     };
-    if let Some(active) = active_account() {
-        if active != target_account {
-            log::debug!("skipping persistent avatar write for inactive account");
-            return Ok(());
-        }
+    if active_account() != Some(target_account) {
+        log::debug!("skipping persistent avatar write for inactive account");
+        return Ok(());
     }
+
+    let _guard = CACHE_LOCK.lock().await;
 
     let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
     let caches = window.caches().map_err(|e| format!("{e:?}"))?;
@@ -257,6 +292,7 @@ pub async fn delete_account_storage(account: Option<oxidezap_core::AccountId>) {
     let Some(account) = account else {
         return;
     };
+    let _guard = CACHE_LOCK.lock().await;
     let name = cache_name_for_account(account);
     if let Some(window) = web_sys::window() {
         if let Ok(caches) = window.caches() {

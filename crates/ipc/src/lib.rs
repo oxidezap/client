@@ -66,4 +66,6 @@ pub use transport::{
 };
 // The `AccountId`-shaped helpers, gated with the domain crate they name.
 #[cfg(feature = "legacy-protocol")]
-pub use transport::{account_staged_key, account_staged_prefix, account_staged_prefix_of};
+pub use transport::{
+    account_id_of, account_staged_key, account_staged_prefix, account_staged_prefix_of,
+};

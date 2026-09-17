@@ -146,7 +146,21 @@ impl WhatsAppApp {
                 }
             }
             UiEvent::AvatarFailed { jid, retryable } => {
-                self.avatar_manager.on_avatar_failed(&jid, retryable);
+                let until = self.avatar_manager.on_avatar_failed(&jid, retryable);
+                self.last_avatar_window_fingerprint = None;
+                if retryable {
+                    let duration = until.saturating_duration_since(wacore::time::Instant::now());
+                    let entity = cx.entity().downgrade();
+                    cx.spawn(async move |_, cx| {
+                        crate::platform::sleep(duration).await;
+                        let _ = entity.update(cx, |app, cx| {
+                            app.avatar_manager.bump_demand_epoch();
+                            app.last_avatar_window_fingerprint = None;
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
             }
             UiEvent::QrCode { code, timeout_secs } => {
                 // The phone code keeps the deadline it was issued with. A

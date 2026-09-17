@@ -303,8 +303,12 @@ impl<'a> Frames<'a> {
             DaemonMessage::AvatarReady { jid, key } => {
                 // Avatar keys are also carried by the owning chat frame. The
                 // readiness signal only announces that its cache entry is ready.
-                if !key.is_empty() {
-                    materialize_avatar(&key, self.media);
+                if !key.is_empty() && materialize_avatar(&key, self.media).is_err() {
+                    self.publish(FromDaemon::AvatarFailed {
+                        jid,
+                        retryable: false,
+                    })?;
+                    return ControlFlow::Continue(());
                 }
                 self.publish(FromDaemon::Avatar { jid, key })?;
             }
@@ -804,33 +808,50 @@ fn load_media(event: &mut UiEvent, cache: &dyn MediaCache) {
                 }
             }
         }
-        UiEvent::AvatarReady { key, .. } if !key.is_empty() => {
-            materialize_avatar(key, cache);
+        UiEvent::AvatarReady { jid, key } if !key.is_empty() => {
+            if let Err(_err) = materialize_avatar(key, cache) {
+                *event = UiEvent::AvatarFailed {
+                    jid: std::mem::take(jid),
+                    retryable: false,
+                };
+            }
         }
         _ => {}
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MaterializeError {
+    CacheRead,
+    Decode,
 }
 
 /// Materialize an avatar into the in-memory decoded image cache and persistent storage.
 ///
 /// Shared across all transports: reading bytes from the transport cache, decoding to
 /// GPUI image source, caching in RAM LRU, and saving to persistent storage.
-fn materialize_avatar(key: &str, cache: &dyn MediaCache) {
+fn materialize_avatar(key: &str, cache: &dyn MediaCache) -> Result<(), MaterializeError> {
     if key.is_empty() {
-        return;
+        return Ok(());
     }
     if crate::session::media::get_avatar_image(key).is_some() {
-        return;
+        return Ok(());
     }
     match cache.read(key) {
         Ok(bytes) => {
             if let Some((image, decoded_size)) = crate::session::media::decode_avatar(&bytes) {
                 crate::session::media::put_avatar_image(key.to_string(), image, decoded_size);
+                #[cfg(target_family = "wasm")]
                 crate::session::avatar::save_avatar(key, &bytes);
+                Ok(())
+            } else {
+                warn!("avatar {key} could not be decoded");
+                Err(MaterializeError::Decode)
             }
         }
         Err(e) => {
             debug!("avatar {key} is not available in cache: {e}");
+            Err(MaterializeError::CacheRead)
         }
     }
 }
@@ -1699,7 +1720,7 @@ mod tests {
         };
 
         assert!(crate::session::media::get_avatar_image(key).is_none());
-        materialize_avatar(key, &mock_cache);
+        assert!(materialize_avatar(key, &mock_cache).is_ok());
         assert!(crate::session::media::get_avatar_image(key).is_some());
 
         // Also test through Frames::apply
@@ -1733,6 +1754,20 @@ mod tests {
         assert!(matches!(
             events.try_recv(),
             Ok(FromDaemon::Avatar { jid, key }) if jid == "peer@s.whatsapp.net" && key == key2
+        ));
+
+        // When materialization fails, Frames::apply emits AvatarFailed with retryable: false
+        assert!(
+            frames
+                .apply(DaemonMessage::AvatarReady {
+                    jid: "missing@s.whatsapp.net".into(),
+                    key: "missing-key".into(),
+                })
+                .is_continue()
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(FromDaemon::AvatarFailed { jid, retryable: false }) if jid == "missing@s.whatsapp.net"
         ));
     }
 }

@@ -931,6 +931,7 @@ impl WhatsAppApp {
         // Fast fingerprint check to avoid recalculating or locking on identical renders
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.avatar_manager.demand_epoch().hash(&mut hasher);
         visible_range.hash(&mut hasher);
         for row in &rows[start..end] {
             row.jid.hash(&mut hasher);

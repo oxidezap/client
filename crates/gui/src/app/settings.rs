@@ -578,6 +578,7 @@ impl WhatsAppApp {
         let Some(client) = &self.client else {
             return;
         };
+        let account = client.account();
         let cleared = client.clear_media_cache();
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -586,14 +587,13 @@ impl WhatsAppApp {
             if cleared.await.is_err() {
                 return;
             }
+            crate::session::avatar::clear_cache_storage(Some(account)).await;
             let _ = entity.update(cx, |app, cx| {
                 app.avatar_manager.clear();
-                let account = app.client.as_ref().map(|c| c.account());
-                crate::session::avatar::spawn_task(async move {
-                    crate::session::avatar::clear_cache_storage(account).await;
-                });
+                app.last_avatar_window_fingerprint = None;
                 crate::session::clear_image_sources();
                 app.refresh_storage_usage(cx);
+                cx.notify();
             });
         })
         .detach();

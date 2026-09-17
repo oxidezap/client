@@ -26,11 +26,13 @@ struct AvatarResponse {
 }
 use oxidezap_ipc::DaemonMessage;
 
-/// In-flight CDN fetches per `(hub_id, jid, picture_id)`.
-static IN_FLIGHT: LazyLock<Mutex<HashSet<(u64, String, String)>>> =
+type InFlightKey = (u64, String, String, u64);
+
+/// In-flight CDN fetches per `(hub_id, jid, picture_id, token)`.
+static IN_FLIGHT: LazyLock<Mutex<HashSet<InFlightKey>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-struct InFlightGuard((u64, String, String));
+struct InFlightGuard(InFlightKey);
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
@@ -118,11 +120,18 @@ pub fn resolve(
                 // `selection.token` is the resolution's order, and the store
                 // keeps the highest one: a first picture whose commit lands
                 // after a second picture's must not overwrite it.
-                if recorder
+                if !recorder
                     .record(jid.clone(), id, cache_key.clone(), selection.token)
                     .await
-                    && is_current(&hub, &jid, &selection)
                 {
+                    if is_current(&hub, &jid, &selection) {
+                        recorder.on_failed(&jid);
+                        publish_failed(&hub, &jid, true);
+                    }
+                    return;
+                }
+                recorder.on_ready(&jid);
+                if is_current(&hub, &jid, &selection) {
                     publish_ready(&hub, jid, cache_key);
                 }
             }
@@ -132,7 +141,7 @@ pub fn resolve(
     let Some(source) = source else {
         return;
     };
-    let in_flight_key = (hub.id(), jid.to_string(), id.clone());
+    let in_flight_key = (hub.id(), jid.to_string(), id.clone(), selection.token);
     if !IN_FLIGHT
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -147,22 +156,38 @@ pub fn resolve(
         let recorder = recorder.clone();
         async move {
             let _guard = InFlightGuard(in_flight_key);
-            let Ok(response) = fetch(&source).await else {
-                // A transient failure keeps whatever was cached before: the
-                // old avatar is a better answer than initials.
-                publish_failed(&hub, &jid, true);
-                return;
+            let response = match fetch(&source).await {
+                Ok(response) => response,
+                Err(_) => {
+                    if is_current(&hub, &jid, &selection) {
+                        recorder.on_failed(&jid);
+                        publish_failed(&hub, &jid, true);
+                    }
+                    return;
+                }
             };
-            let Ok(bytes) = accept(response) else {
-                publish_failed(&hub, &jid, false);
-                return;
+            let retryable = response.status == 429 || (500..600).contains(&response.status);
+            let bytes = match accept(response) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    if is_current(&hub, &jid, &selection) {
+                        if retryable {
+                            recorder.on_failed(&jid);
+                        }
+                        publish_failed(&hub, &jid, retryable);
+                    }
+                    return;
+                }
             };
             // This account's epoch and this account's key: a clear of another
             // account must not refuse this fetch.
             if crate::media::put_since(selection.account, selection.cache_epoch, &cache_key, &bytes)
                 .is_err()
             {
-                publish_failed(&hub, &jid, true);
+                if is_current(&hub, &jid, &selection) {
+                    recorder.on_failed(&jid);
+                    publish_failed(&hub, &jid, true);
+                }
                 return;
             }
             if !is_current(&hub, &jid, &selection) {
@@ -177,13 +202,16 @@ pub fn resolve(
                 .record(jid.clone(), id, cache_key.clone(), selection.token)
                 .await
             {
-                publish_failed(&hub, &jid, true);
+                if is_current(&hub, &jid, &selection) {
+                    recorder.on_failed(&jid);
+                    publish_failed(&hub, &jid, true);
+                }
                 return;
             }
-            if !is_current(&hub, &jid, &selection) {
-                return;
+            recorder.on_ready(&jid);
+            if is_current(&hub, &jid, &selection) {
+                publish_ready(&hub, jid, cache_key);
             }
-            publish_ready(&hub, jid, cache_key);
         }
     });
 }
@@ -257,7 +285,7 @@ pub fn purge(hub: &StateHub) {
     let mut in_flight = IN_FLIGHT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    in_flight.retain(|(id, _, _)| *id != hub.id());
+    in_flight.retain(|(id, _, _, _)| *id != hub.id());
 }
 
 fn record_selection(

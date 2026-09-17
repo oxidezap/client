@@ -24,8 +24,9 @@ pub fn rotate_account_scope() -> Option<oxidezap_core::AccountId> {
     old
 }
 
+#[allow(dead_code)]
 pub fn resolve_account(key: &str) -> Option<oxidezap_core::AccountId> {
-    oxidezap_ipc::account_staged_prefix_of(key).or_else(active_account)
+    oxidezap_ipc::account_id_of(key).or_else(active_account)
 }
 
 pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {
@@ -40,21 +41,14 @@ pub async fn delete_persistent(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn write_persistent(
-    key: &str,
-    bytes: &[u8],
+    _key: &str,
+    _bytes: &[u8],
     _account: Option<oxidezap_core::AccountId>,
 ) -> Result<(), String> {
-    let path =
-        oxidezap_ipc::media_path(key).ok_or_else(|| "no media cache path available".to_string())?;
-    let bytes = bytes.to_vec();
-    smol::unblock(move || {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(&path, bytes).map_err(|e| e.to_string())
-    })
-    .await
+    // Daemon already persists media atomically; no redundant write needed on native.
+    Ok(())
 }
 
 pub async fn delete_account_storage(_account: Option<oxidezap_core::AccountId>) {
