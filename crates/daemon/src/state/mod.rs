@@ -38,6 +38,17 @@ use store::Published;
 /// What the daemon knows, and everyone it tells.
 pub struct StateHub {
     account_id: AccountId,
+    /// A process-unique identity, stable for this hub's whole life.
+    ///
+    /// What an out-of-band registry keyed by "which hub" must use. The hub's
+    /// address is the obvious key and the wrong one: the allocator reuses it
+    /// as soon as a hub drops, so a stale entry left under an address is read
+    /// as belonging to whichever new hub lands there. [`crate::avatar`] maps
+    /// selections by this, and on a target where the allocator reused
+    /// addresses eagerly that showed up as a picture lookup attributed to the
+    /// wrong hub — a receipt in one test reading another's recorded
+    /// selection. A counter has no second life.
+    id: u64,
     state: StateStore,
     out: Fanout,
 }
@@ -57,8 +68,11 @@ impl Drop for WindowGuard {
 impl StateHub {
     /// Construct the state and fanout for one immutable account scope.
     pub fn for_account(account_id: AccountId) -> Arc<Self> {
+        use portable_atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         Arc::new(Self {
             account_id,
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
             state: StateStore::new(),
             out: Fanout::new(),
         })
@@ -74,6 +88,12 @@ impl StateHub {
     #[must_use]
     pub fn account_id(&self) -> AccountId {
         self.account_id
+    }
+
+    /// This hub's process-unique identity. See [`StateHub::id`].
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Subscribe before snapshotting.

@@ -41,7 +41,14 @@ struct Selection {
     token: u64,
 }
 
-static LATEST: LazyLock<Mutex<HashMap<(usize, String), Selection>>> =
+/// The current selection per `(hub, jid)`.
+///
+/// Keyed by [`StateHub::id`] rather than the hub's address: an address is
+/// reused the moment a hub drops, so an entry left behind by a departed
+/// session was read as the next one's — on a target whose allocator reused
+/// addresses eagerly that surfaced as one conversation's picture lookup
+/// attributed to another. The id has no second life.
+static LATEST: LazyLock<Mutex<HashMap<(u64, String), Selection>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -201,7 +208,7 @@ pub fn purge(hub: &StateHub) {
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    latest.retain(|(id, _), _| *id != hub_id(hub));
+    latest.retain(|(id, _), _| *id != hub.id());
 }
 
 fn record_selection(
@@ -215,7 +222,7 @@ fn record_selection(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let account_generation = hub.account_generation();
     let cache_epoch = crate::media::epoch();
-    let key = (hub_id(hub), jid.to_owned());
+    let key = (hub.id(), jid.to_owned());
     if let Some(selection) = latest.get(&key)
         && selection.account_generation == account_generation
         && selection.cache_epoch == cache_epoch
@@ -244,11 +251,7 @@ fn is_current(hub: &StateHub, jid: &str, selection: &Selection) -> bool {
     let latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    latest.get(&(hub_id(hub), jid.to_owned())) == Some(selection)
-}
-
-fn hub_id(hub: &StateHub) -> usize {
-    std::ptr::from_ref(hub) as usize
+    latest.get(&(hub.id(), jid.to_owned())) == Some(selection)
 }
 
 /// Whether a chat has an avatar fetch recorded as its current one.
@@ -260,7 +263,7 @@ pub(super) fn has_selection(hub: &StateHub, jid: &str) -> bool {
     LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(&(hub_id(hub), jid.to_owned()))
+        .contains_key(&(hub.id(), jid.to_owned()))
 }
 
 async fn fetch(url: &str) -> anyhow::Result<AvatarResponse> {
