@@ -89,6 +89,7 @@ async fn every_account_scoped_table_cascades_with_its_device() {
         // device store rather than to this crate's migrations, so its shape is
         // not this test's to pin.
         "avatar_descriptors",
+        "contact_labels",
     ] {
         let sql = table_sql(&store, table).await;
         assert!(

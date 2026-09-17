@@ -362,7 +362,13 @@ pub enum DaemonMessage {
         accounts: AccountsSnapshot,
     },
     /// The current account set, published to control connections.
-    AccountsChanged(AccountsSnapshot),
+    ///
+    /// A named field rather than a newtype: the serialized form is
+    /// internally tagged, so a newtype's payload is flattened into the same
+    /// map as `type`, while a named field nests it under `snapshot`. The
+    /// latter is what a reader keying off `snapshot` expects and what the
+    /// round-trip test pins.
+    AccountsChanged { snapshot: AccountsSnapshot },
     /// A point-in-time account listing, answering [`ClientRequest::ListAccounts`].
     Accounts {
         id: RequestId,
@@ -1268,6 +1274,24 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<DaemonMessage>(&line).unwrap(),
             created
+        );
+
+        let changed = DaemonMessage::AccountsChanged {
+            snapshot: AccountsSnapshot {
+                accounts: vec![AccountOverview {
+                    id,
+                    status: AccountStatus::Running,
+                }],
+            },
+        };
+        let line = serde_json::to_string(&changed).expect("accounts_changed serializes");
+        assert!(
+            line.contains("\"snapshot\""),
+            "the payload nests under `snapshot`, got: {line}"
+        );
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            changed
         );
     }
 

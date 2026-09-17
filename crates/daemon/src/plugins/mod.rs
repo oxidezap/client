@@ -124,15 +124,30 @@ fn migrate_legacy_state_in(root: &std::path::Path, account_id: AccountId) {
             continue;
         }
         // A move onto a name this same account already has would overwrite the
-        // newer file with the older one; leave it, and say which, rather than
-        // choosing silently.
+        // newer file with the older one. The destination is the live copy, so
+        // the stale root entry is dropped rather than left: an account reset
+        // clears `plugin-state/<id>/`, and a root entry still sitting here
+        // would be re-imported on the next start — restoring the approvals the
+        // reset just removed. Said out loud because it is a deletion.
         let destination = target.join(name);
         if destination.exists() {
             log::warn!(
-                "plugin state {} was left in place: {} already exists",
+                "plugin state {} already had a current copy at {}; removing the stale root entry",
                 entry.path().display(),
                 destination.display()
             );
+            let stale = entry.path();
+            let removed = match entry.file_type() {
+                Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&stale),
+                Ok(_) => std::fs::remove_file(&stale),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = removed {
+                log::error!(
+                    "could not remove the stale plugin state {}: {e}",
+                    stale.display()
+                );
+            }
             continue;
         }
         if let Err(e) = std::fs::create_dir_all(&target) {

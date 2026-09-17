@@ -468,6 +468,14 @@ fn account_staged_local(key: &str) -> Option<&str> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
+    // A positive `i32`, the only id an account can have. Without this the
+    // predicate would accept `a99999999999-u-x` while
+    // [`account_staged_prefix_of`] rejected it, so a key no account could
+    // ever own would read as a staged payload to every prefix check.
+    let id: i32 = digits.parse().ok()?;
+    if id <= 0 {
+        return None;
+    }
     local.starts_with(STAGED_PREFIX).then_some(local)
 }
 
@@ -828,5 +836,55 @@ mod tests {
         let state = state_dir().expect("a state directory is always derivable");
         assert!(media_dir().is_some_and(|dir| dir.starts_with(&state)));
         assert!(lock_path().is_some_and(|path| path.starts_with(&state)));
+    }
+
+    /// The account-staged predicate accepts exactly `a<positive-i32>-u-...`.
+    ///
+    /// The shapes it rejects matter as much as the one it takes: `a-<jid>` and
+    /// `a-1-u-x` are not ids, `ax-u-x` has no digits, and `a99999999999-u-x`
+    /// overflows the `i32` an account id is — a key no account could own must
+    /// not read as a staged payload.
+    #[test]
+    fn only_a_valid_account_id_marks_a_staged_key() {
+        assert!(is_account_staged_key("a1-u-x"));
+        assert!(is_account_staged_key("a2-u-local_audio-7"));
+        for key in [
+            "a-<jid>",
+            "a-1-u-x",
+            "ax-u-x",
+            "a99999999999-u-x",
+            "a0-u-x",
+            "u-x",
+        ] {
+            assert!(
+                !is_account_staged_key(key),
+                "{key} is not an account-staged key"
+            );
+        }
+    }
+
+    /// A durable key whose message id contains `-u-` is not a staged payload:
+    /// the local name after the account prefix has to *start* with `u-`, and
+    /// an id of the alphabet WhatsApp uses never does.
+    #[test]
+    fn a_durable_key_containing_the_staged_infix_is_not_staged() {
+        assert!(!is_account_staged_key("a1-f-3EB0-u-x"));
+        assert!(!is_staged_key("a1-f-3EB0-u-x"));
+        assert!(!is_global_staged_key("a1-f-3EB0-u-x"));
+        assert!(!is_global_staged_key("a1-u-x"));
+        assert!(is_global_staged_key("u-plugin-1"));
+    }
+
+    /// The typed helpers and the core-free predicate agree: a key built for an
+    /// account parses back to that account, so a send can only ever consume
+    /// what the same account staged.
+    #[cfg(feature = "legacy-protocol")]
+    #[test]
+    fn an_account_staged_key_round_trips_through_its_prefix() {
+        let account = oxidezap_core::AccountId::new(7).expect("a positive id");
+        let key = account_staged_key(account, "voice-note");
+        assert!(is_account_staged_key(&key));
+        assert_eq!(account_staged_prefix_of(&key), Some(account));
+        assert_eq!(account_staged_prefix(account), "a7-u-");
     }
 }

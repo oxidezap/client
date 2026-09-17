@@ -1251,19 +1251,27 @@ impl Bridge {
             WireRequest::BackfillMedia { chat_jid, limit } => {
                 let task = client.backfill_media(chat_jid, limit.clamp(1, 200) as i64);
                 let answer_to = answer_to.clone();
+                // Account-scoped, like every other durable key: an unscoped
+                // write would let this account's backfilled bytes be served as
+                // another's and would survive this account's wipe.
+                let account_media = crate::media::AccountMedia::new(self.hub.account_id());
                 oxidezap_session::spawn(async move {
                     let result = match task.await {
                         Ok(Ok(report)) => {
                             let mut downloaded = 0u64;
                             for file in &report.files {
-                                let Some(key) = crate::media::download_key(&file.file_enc_sha256)
+                                // `download_key` is the local, content-addressed
+                                // name; `AccountMedia` applies the account
+                                // prefix on the way in and expects it stripped
+                                // on the way to `has`.
+                                let Some(local) = crate::media::download_key(&file.file_enc_sha256)
                                 else {
                                     continue;
                                 };
-                                if crate::media::has(&key) {
+                                if account_media.has(&account_media.key(&local)) {
                                     continue;
                                 }
-                                if crate::media::put_owned(&key, file.bytes.clone()).is_ok() {
+                                if account_media.put_owned(&local, file.bytes.clone()).is_ok() {
                                     downloaded += 1;
                                 }
                             }

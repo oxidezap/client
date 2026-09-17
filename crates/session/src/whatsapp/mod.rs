@@ -563,8 +563,16 @@ impl WhatsAppClient {
         Self::new_for_account(AccountId::LEGACY)
     }
 
-    /// Create a session bound permanently to one local account slot.
-    pub fn new_for_account(account_id: AccountId) -> std::io::Result<Self> {
+    /// The one single-account construction, kept for [`Self::new`] and its
+    /// tests.
+    ///
+    /// Private on purpose: a multi-account caller must not reach for this,
+    /// because it would build a *second* `StoreRegistry` over the same file —
+    /// a second pool, a second migration runner and two writers that can
+    /// deadlock on a lock upgrade. Everything with more than one account goes
+    /// through [`Self::new_for_account_with_registry`] with the daemon's one
+    /// shared registry.
+    fn new_for_account(account_id: AccountId) -> std::io::Result<Self> {
         let stores = Arc::new(StoreRegistry::new(crate::store::database_path()));
         Self::new_for_account_with_registry(account_id, stores)
     }

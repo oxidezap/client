@@ -86,7 +86,14 @@ async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
                  — the same origin the deployment uses.",
                 ));
             }
-            return super::embedded::connect().await;
+            // The page's own daemon, on the plane that was asked for: a
+            // control connection that fell back to an account one would be
+            // refused for every request it exists to carry.
+            return if control {
+                super::embedded::connect_control().await
+            } else {
+                super::embedded::connect().await
+            };
         }
     };
     let media_base = web::media_base_url();

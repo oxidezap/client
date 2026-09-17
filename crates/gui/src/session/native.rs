@@ -68,7 +68,7 @@ pub(super) fn connect_control() -> std::io::Result<(Session, Events)> {
         recover,
         hangup,
         &mut session,
-    );
+    )?;
     Ok((session, events))
 }
 
@@ -109,7 +109,7 @@ fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
         recover,
         hangup,
         &mut session,
-    );
+    )?;
 
     Ok((session, events))
 }
@@ -136,14 +136,17 @@ fn start_reader(
     recover: crate::video::RecoverySink,
     hangup: oxidezap_ipc::Hangup,
     session: &mut Session,
-) {
+) -> std::io::Result<()> {
     let (alive, until_gone) = std::sync::mpsc::channel::<()>();
-    let _ = std::thread::Builder::new()
+    // Propagated, not discarded: a thread that could not be created is a
+    // connection with nobody reading it, which the caller must not be handed
+    // as a working session.
+    std::thread::Builder::new()
         .name("oxidezap-ipc".to_string())
         .spawn(move || {
             let _alive = alive;
             read_frames(reader, &sink, &pending, &pictures, recover);
-        });
+        })?;
 
     session.ends_with(Teardown::new(move || {
         hangup.hang_up();
@@ -159,6 +162,8 @@ fn start_reader(
                 let _ = until_gone.recv_timeout(READER_PATIENCE);
             });
     }));
+
+    Ok(())
 }
 
 /// Read frames until the daemon goes away.

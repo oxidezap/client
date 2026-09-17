@@ -615,7 +615,9 @@ where
                 if changed.is_err() {
                     return Ok(());
                 }
-                let frame = serde_json::to_string(&DaemonMessage::AccountsChanged((**accounts.borrow_and_update()).clone()))?;
+                let frame = serde_json::to_string(&DaemonMessage::AccountsChanged {
+                    snapshot: (**accounts.borrow_and_update()).clone(),
+                })?;
                 write_line(&mut writer, &frame).await?;
             }
             frame = read_frame(&mut reader, &mut buf) => match frame? {

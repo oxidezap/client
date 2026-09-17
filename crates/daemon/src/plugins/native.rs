@@ -552,6 +552,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A stale root entry whose name the account already has in its own slot
+    /// is dropped, not left in place: an account reset clears
+    /// `plugin-state/<id>/`, and a root entry still sitting here would be
+    /// re-imported on the next start, restoring the approvals the reset
+    /// removed.
+    #[test]
+    fn legacy_plugin_state_a_reset_removed_is_not_reimported() {
+        let root = scratch("legacy-state-conflict");
+        std::fs::create_dir_all(&root).expect("the state root");
+        // The current copy, as a reset would leave it: the per-account slot
+        // exists and the root still holds the old file.
+        let account = root.join("1");
+        std::fs::create_dir_all(&account).expect("the account slot");
+        std::fs::write(account.join("approvals.json"), br#"{"autoreply":true}"#)
+            .expect("a current approval file");
+        let stale = root.join("approvals.json");
+        std::fs::write(&stale, br#"{"autoreply":true}"#).expect("the stale approval file");
+
+        super::super::migrate_legacy_state_in(&root, oxidezap_core::AccountId::LEGACY);
+
+        assert!(
+            account.join("approvals.json").is_file(),
+            "the current copy is untouched"
+        );
+        assert!(
+            !stale.exists(),
+            "the stale root entry is gone, so a later start cannot import it again"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A non-legacy account never claims the unscoped root: it did not write
     /// it, and adopting it would hand a second account the first one's
     /// recorded permissions.
