@@ -2832,26 +2832,76 @@ const BURNS_ON_A_TIMER: &str = r#"(module
     (i32.const 0))
 )"#;
 
+/// How long one callback of [`BURNS_ON_A_TIMER`] really takes on this machine.
+///
+/// Delivered directly, the way `waiting_on_the_daemon_is_not_charged_to_the
+/// _plugin` does it: the worker charges exactly this, so timing it here is what
+/// turns the share below into a number rather than a guess. The first call
+/// warms the store and the module's own scratch, and the minimum of a few is
+/// taken because a descheduled thread only ever adds.
+fn one_callback(dir: &TempDir) -> Duration {
+    let mut runtime = crate::runtime::Runtime::load(
+        &std::fs::read(dir.0.join("greedy.wasm")).expect("the fixture is there"),
+        "greedy",
+        &(Arc::new(crate::store::Nowhere) as Arc<dyn crate::store::Backing>),
+        Arc::new(Recorder::new(Outcome::Accepted)) as Arc<dyn Commands>,
+        Arc::new(AtomicI64::new(abi::caps::SEND | abi::caps::TIMERS)),
+    )
+    .expect("the fixture loads");
+
+    let event = Arc::new(
+        crate::event::from_session(&message("1@s.whatsapp.net", "hi"))
+            .expect("a message is an event"),
+    );
+    runtime.deliver(Arc::clone(&event), 0).expect("it answers");
+    let mut best = Duration::MAX;
+    for _ in 0..5 {
+        let started = Instant::now();
+        runtime.deliver(Arc::clone(&event), 0).expect("it answers");
+        best = best.min(started.elapsed());
+    }
+    best
+}
+
 #[test]
 fn a_plugin_that_wakes_itself_forever_is_held_to_its_share() {
     let dir = TempDir::new("duty");
     dir.plugin("greedy", &versioned(BURNS_ON_A_TIMER));
     let commands = Recorder::new(Outcome::Accepted);
     let published = Published::default();
+
+    // The bound is derived from the *contract*, not read off the constant and
+    // not written as a count. Ten percent is what the host promises a plugin
+    // may spend, so the callbacks that fit are the window divided by ten times
+    // what one costs — and what one costs is a fact about the machine. A
+    // literal count is the machine that wrote it: a faster one makes each
+    // callback cheaper, more fit in the same window, and the fixed number
+    // fails on work the host is doing exactly right. Spelled `0.10` rather
+    // than `MAX_DUTY` on purpose, so loosening the constant to make this pass
+    // is not a way out: the share is the promise, and a test that read the
+    // constant would move with it and prove nothing.
+    const DOCUMENTED_SHARE: f64 = 0.10;
+    let cost = one_callback(&dir);
+    let window = Duration::from_secs(6);
+    let share = (window.as_secs_f64() * DOCUMENTED_SHARE
+        / cost.as_secs_f64().max(f64::MIN_POSITIVE))
+    .ceil() as usize;
+    let share = share.max(1);
+
     let plugins = host(&dir, Arc::clone(&commands), &published);
     published.settles("the plugin to be listed", |s| !s.is_empty());
 
     // Each callback marks itself before spinning, so this counts how many
-    // actually ran. The bound is measured rather than guessed: over this
-    // window an unthrottled plugin gets through sixteen callbacks and a
-    // throttled one three, so six separates them with room on both sides —
-    // twice what the throttle produced here and under half of what removing
-    // it does, which is the margin a timing test on a loaded runner needs.
-    std::thread::sleep(Duration::from_secs(6));
+    // actually ran. The bound is half again the share the throttle allows
+    // here, which is the margin a timing test on a loaded runner needs, and it
+    // stays far under what the same fixture does with the throttle removed —
+    // roughly ten times as many, since that is what a tenth means.
+    std::thread::sleep(window);
     let ran = commands.sent().len();
     assert!(
-        ran <= 6,
-        "a plugin waking itself forever ran {ran} times in six seconds, which is not a share"
+        ran <= share * 3 / 2 + 2,
+        "a plugin waking itself forever ran {ran} times in {window:?}, past the {share} \
+         its share allows on a machine where one callback costs {cost:?}"
     );
     assert!(
         plugins.surfaces()[0].is_running(),
