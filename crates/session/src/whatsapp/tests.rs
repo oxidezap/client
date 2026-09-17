@@ -829,6 +829,32 @@ const TEST_GROUP: &str = "120363000000000001@g.us";
 /// A chat store and a client over one in-memory database, with no network:
 /// `Bot::build` only opens the store, and `load_history` needs the client
 /// solely for the PN/LID mapping lookups that resolve chat identity.
+/// A durable descriptor is what a restart draws from before the network is up.
+/// Attaching it is a local read: no lookup happens here, which is the whole
+/// point of keeping the two apart.
+#[tokio::test]
+async fn a_stored_avatar_descriptor_reaches_the_chat_without_a_lookup() {
+    let (chat_store, client) = test_session("avatar-descriptor").await;
+    let jid: Jid = "1@s.whatsapp.net".parse().unwrap();
+    chat_store
+        .record_avatar(&jid, "picture-9", "a-9", 1)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let mut chats = vec![Chat::from_store("1@s.whatsapp.net".into(), "Ana".into(), 0)];
+    WhatsAppClient::attach_avatar_descriptors(&chat_store, &mut chats).await;
+
+    // No network was touched; the client is here only because the hydrate
+    // path that calls this takes one.
+    let _ = &client;
+    assert_eq!(chats[0].avatar_picture_id.as_deref(), Some("picture-9"));
+    assert_eq!(chats[0].avatar_cache_key.as_deref(), Some("a-9"));
+    assert!(
+        chats[0].avatar_loaded,
+        "a known picture is loaded; whether its bytes are still cached is a reader's question"
+    );
+}
+
 async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
     let store = SqliteStore::new(&format!(
         "file:oxidezap-session-{name}?mode=memory&cache=shared"
@@ -1609,4 +1635,58 @@ fn only_a_decision_reject_ends_our_side_of_the_call() {
     assert!(!super::WhatsAppClient::reject_ends_call(Some("enc")));
     assert!(super::WhatsAppClient::reject_ends_call(None));
     assert!(super::WhatsAppClient::reject_ends_call(Some("declined")));
+}
+
+/// A plain `request()` must carry the full-pass bit.
+///
+/// The bug this catches: the signal used to be a bare notification, so the
+/// consumer woke, found nothing outstanding (no reset, no named chats) and
+/// went straight back to waiting. `Connected` used `request()`, so the full
+/// refresh it is supposed to trigger never ran at all.
+#[tokio::test]
+async fn a_plain_request_carries_a_full_pass() {
+    let signal = super::AvatarResolveSignal::new();
+    signal.request();
+    let taken = signal.next().await;
+    assert!(taken.full, "a bare request is a full pass");
+    assert!(!taken.reset, "nothing asked to forget");
+    assert!(taken.named.is_empty());
+}
+
+/// The asks coalesce: what is outstanding between two passes is one pass.
+#[tokio::test]
+async fn asks_coalesce_into_one_pass() {
+    let signal = super::AvatarResolveSignal::new();
+    signal.request();
+    signal.request();
+    signal.request_named(["a@s.whatsapp.net".to_string()]);
+    signal.request_named(["b@s.whatsapp.net".to_string()]);
+    signal.reset();
+
+    let taken = signal.next().await;
+    assert!(taken.full);
+    assert!(taken.reset);
+    let mut named = taken.named;
+    named.sort();
+    assert_eq!(named, ["a@s.whatsapp.net", "b@s.whatsapp.net"]);
+
+    // Nothing is left over: a second take would block, so take it out of band.
+    let next = tokio::time::timeout(std::time::Duration::from_millis(50), signal.next()).await;
+    assert!(next.is_err(), "a coalesced ask is taken once");
+}
+
+/// A new connection is a new generation, and it asks for a full pass so every
+/// remembered answer is revalidated.
+#[tokio::test]
+async fn a_new_connection_advances_the_generation_and_asks_for_everything() {
+    let signal = super::AvatarResolveSignal::new();
+    let before = signal.next_generation_for_test();
+    signal.new_connection();
+    let taken = signal.next().await;
+    assert!(taken.full);
+    assert_eq!(
+        taken.generation,
+        before + 1,
+        "the pass belongs to the new socket"
+    );
 }

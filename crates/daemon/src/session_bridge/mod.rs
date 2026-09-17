@@ -77,6 +77,7 @@ pub async fn run(
     // This session is new, whatever the last one was doing.
     STOPPING.store(false, std::sync::atomic::Ordering::SeqCst);
     let mut client = WhatsAppClient::new().context("opening the local store")?;
+    let avatar_recorder = client.avatar_recorder();
     let mut events = client
         .start()
         .map_err(|e| anyhow::anyhow!("starting the session: {e}"))?;
@@ -84,7 +85,7 @@ pub async fn run(
     // camera and one call, and what decides whether a frame is *serialized*
     // is whether anybody is subscribed to the hub's video channel.
     let mut video = client.video_events();
-    let mut bridge = Bridge::new(hub, plugins);
+    let mut bridge = Bridge::new(hub, plugins, avatar_recorder);
 
     // Set when every sender is gone. A closed channel yields `None`
     // immediately and forever, so leaving the branch enabled would spin the
@@ -332,13 +333,23 @@ struct Bridge {
     /// The call history the wire reports: finalized calls with their
     /// outcome, fed by the same events the hub folds.
     calls: call_log::CallLog,
+    /// Points the session's durable store at cached avatar bytes.
+    ///
+    /// The bridge does the byte write through [`crate::avatar`]; the store
+    /// lives in the session. This is the seam, and it is what keeps the
+    /// descriptor write behind the byte write.
+    avatar_recorder: oxidezap_session::AvatarRecorder,
     /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
     /// and wipes once the session has let go of the store.
     forget: bool,
 }
 
 impl Bridge {
-    fn new(hub: Arc<StateHub>, plugins: Arc<oxidezap_plugin_host::Plugins>) -> Self {
+    fn new(
+        hub: Arc<StateHub>,
+        plugins: Arc<oxidezap_plugin_host::Plugins>,
+        avatar_recorder: oxidezap_session::AvatarRecorder,
+    ) -> Self {
         // Unbounded, and the bound that matters is upstream: the only producer
         // is the event loop draining the session's own unbounded channel, so a
         // limit here could only stall the loop this exists to unblock or drop
@@ -354,6 +365,7 @@ impl Bridge {
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             calls: call_log::CallLog::new(),
+            avatar_recorder,
             forget: false,
         }
     }

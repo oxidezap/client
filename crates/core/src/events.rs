@@ -86,6 +86,21 @@ pub enum UiEvent {
         jid: String,
         key: String,
     },
+    /// The session resolved profile-picture metadata for a batch of chats.
+    ///
+    /// Its own event rather than a field on `HistoryLoaded`, which is the
+    /// whole point: a profile picture is relatively stable, and coupling its
+    /// lookup to store reloads meant every receipt and acknowledgement queried
+    /// WhatsApp for metadata that had not moved. The daemon answers this by
+    /// fetching the bytes, committing the durable descriptor only once they
+    /// land, and publishing [`AvatarReady`](Self::AvatarReady).
+    ///
+    /// Batched, and one event per batch, because the queue between the session
+    /// and the daemon is bounded: one event per chat would flood a lane sized
+    /// for a history load and drop most of a large account's pictures.
+    AvatarsResolved {
+        resolutions: Vec<AvatarResolution>,
+    },
     ReactionReceived {
         chat_jid: String,
         message_id: String,
@@ -287,6 +302,43 @@ pub enum UiEvent {
         notice: SystemNotice,
     },
     Error(String),
+}
+
+/// One chat's resolved profile picture, inside [`UiEvent::AvatarsResolved`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvatarResolution {
+    pub jid: String,
+    pub outcome: AvatarOutcome,
+}
+
+/// What a metadata lookup decided that some other part has to act on.
+///
+/// Typed rather than "an id, empty when absent", because the difference
+/// between "no picture" and "could not tell" is the whole of whether a known
+/// avatar may be erased. That is exactly the ambiguity the library used to
+/// have and now does not, so it is carried through rather than flattened again
+/// on this side.
+///
+/// Only the two outcomes with an action are here. `Unchanged`, a refusal and a
+/// rate limit all leave the previous picture standing, so they are not
+/// published: the resolver remembers the chat as asked and nothing downstream
+/// has anything to do. A future outcome the library adds is read as one of
+/// those until this side decides otherwise, and the wildcard in the resolver
+/// is what guarantees it cannot arrive as `NotFound`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarOutcome {
+    /// A picture to fetch and cache.
+    Found {
+        picture_id: String,
+        /// Signed and short-lived. Never persisted, never serialized: the
+        /// daemon is its only reader, and a credential does not belong in a
+        /// frame any front end could log.
+        #[serde(default, skip_serializing)]
+        source: Option<String>,
+    },
+    /// WhatsApp says this chat has no picture. The one destructive answer.
+    NotFound,
 }
 
 /// A receipt type as WhatsApp spells it, which is the only spelling that

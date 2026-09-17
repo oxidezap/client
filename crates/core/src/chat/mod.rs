@@ -110,12 +110,22 @@ pub struct Chat {
     /// talk to.
     #[serde(default)]
     pub is_status: bool,
-    /// The signed source URL used by the daemon to fetch the picture.
-    #[serde(default, skip_serializing)]
-    pub avatar_source: Option<String>,
-    /// The daemon media key for the cached profile picture.
+    /// WhatsApp's own id for the current picture.
+    ///
+    /// This is what a conditional lookup compares against, and what the local
+    /// cache key is derived from. Kept apart from the cache key so neither has
+    /// to be decoded back out of the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub avatar_key: Option<String>,
+    pub avatar_picture_id: Option<String>,
+    /// The daemon media cache key holding the picture's bytes.
+    ///
+    /// Deterministic in `(jid, avatar_picture_id)`. `Some` does not promise
+    /// the bytes are still on disk; a reader asks the cache, and a miss is a
+    /// refresh rather than a broken avatar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_cache_key: Option<String>,
+    /// Whether this chat has a resolved picture, either from a durable
+    /// descriptor or from a metadata refresh.
     #[serde(default, skip_serializing_if = "is_false")]
     pub avatar_loaded: bool,
     /// Participant names in group chats (sender JID -> display name)
@@ -184,8 +194,8 @@ impl Chat {
             pinned_at: None,
             is_group,
             is_status,
-            avatar_source: None,
-            avatar_key: None,
+            avatar_picture_id: None,
+            avatar_cache_key: None,
             avatar_loaded: false,
             participants: HashMap::new(),
             messages: Vec::new(),

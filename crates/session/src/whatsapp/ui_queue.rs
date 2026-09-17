@@ -438,6 +438,14 @@ fn class_of(event: &UiEvent) -> Class {
         | UiEvent::ReceiptReceived { .. }
         | UiEvent::ReactionReceived { .. } => Class::Recoverable,
         UiEvent::ChatPresence { .. } | UiEvent::PresenceUpdated { .. } => Class::Ephemeral,
+        // A batch of resolved pictures is control, not data. It is bounded by
+        // the chunk the resolver publishes (a handful of small strings), and
+        // losing one silently would be worse than dropping a message: the
+        // resolver marks a chat resolved only after the send succeeds, so a
+        // batch that never arrived is asked again, while one evicted after the
+        // send would leave the daemon with no picture and no retry until the
+        // next connection. Control is admitted ahead of data and never
+        // reclaimed for age, which is the guarantee this event needs.
         _ => Class::Control,
     }
 }
@@ -455,6 +463,22 @@ fn estimated_bytes(event: &UiEvent) -> usize {
     match event {
         UiEvent::HistoryLoaded { chats, .. } => {
             std::mem::size_of_val(event) + chats.iter().map(chat_bytes).sum::<usize>()
+        }
+        UiEvent::AvatarsResolved { resolutions } => {
+            std::mem::size_of_val(event)
+                + resolutions
+                    .iter()
+                    .map(|resolution| {
+                        let picture = match &resolution.outcome {
+                            oxidezap_core::AvatarOutcome::Found { picture_id, source } => {
+                                string_bytes(picture_id)
+                                    + source.as_deref().map(string_bytes).unwrap_or_default()
+                            }
+                            _ => 0,
+                        };
+                        string_bytes(&resolution.jid) + picture
+                    })
+                    .sum::<usize>()
         }
         UiEvent::MessageReceived {
             chat_jid,

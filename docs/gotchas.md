@@ -1623,6 +1623,23 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   past PENDING already has a real server answer and must never be regressed.
 - **An invalidation is a claim that something changed.** A subscriber answers
   `StoreChange` by re-querying, so emitting one for a batch that wro
+- **Migration versions are shared with `whatsapp-rust-sqlite-storage`, so name
+  them apart.** `chat-store` and the device store migrate the *same SQLite
+  file*, and diesel keeps one ledger — `__diesel_schema_migrations` — for both.
+  A migration's version is its directory's leading segment with the dashes
+  removed, so `2026-09-16-000000_anything` is `20260916000000` no matter which
+  crate wrote it. Two crates choosing that timestamp is one published row, and
+  whichever migrates first makes the other's migration a silent no-op: upstream
+  added `2026-09-16-000000_drop_msg_secrets_created_at` while this tree had
+  `2026-09-16-000000_message_stable_id`, the device store runs first on every
+  open, and the chat store then failed with `no such column: T.id` because its
+  rewrite never ran at all. This crate's timestamps are now `…-100000` and
+  `…-100001`, clear of upstream's range, and `adopt_renumbered` records the new
+  versions for a database written under the old ones — guarded by a schema
+  probe, so a database whose row is upstream's is left for the normal path.
+  A new migration here has to check upstream's
+  `storages/sqlite-storage/migrations` for a taken timestamp first, and the
+  guard is only needed for a rename that already shipped.
 - **Message storage is compacted on write and rehydrated on read, and the
   `id` is the rowid by a durable name.** `messages.id INTEGER PRIMARY KEY`
   carries the old rowid values across the rewrite, so arrival cursors, the
@@ -1654,3 +1671,44 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   skewed fixture: protos 944 KiB → 546 KiB (−42%), the ack index 168 KiB →
   12 KiB (−93%), chat/arrival pages single-digit ms, search ~27 ms/page in a
   debug build.
+- **A profile picture has two identities and its own lifecycle.** WhatsApp's
+  picture id is what a metadata refresh compares against; the media cache key
+  is a pure function of `(jid, picture_id)` and is what the bytes on disk are
+  named under. They are `avatar_picture_id` and `avatar_cache_key` rather than
+  one overloaded `avatar_key`, because the same field meaning one thing above
+  the daemon and another below it made persistence and comparison a matter of
+  arrival order. The signed CDN URL is `avatar_source`, transient, never
+  serialized and never stored. `chat-store`'s `avatar_descriptors` table keeps
+  only the two ids, a timestamp and a `seq`, so a restarted process can address
+  bytes it fetched in an earlier run without a network round trip; the write is
+  two-phase — bytes land in the media cache first, the descriptor is committed
+  after — so the pointer never names bytes that are not there, and a transient
+  fetch failure leaves the previous picture intact. `seq` is the resolution's
+  order rather than the write's: two pictures resolved moments apart have their
+  commits issued from separate tasks, and the row keeps the higher `seq` so the
+  older one cannot land last (`store::avatar::upsert`). The lookup itself runs
+  in `session/whatsapp/avatar.rs`, bounded to eight in flight, deduplicated by
+  JID within a connection generation, published a chunk at a time so the first
+  eight pictures are drawn while the next eight are in flight, triggered by
+  `Connected` and by paging, and deliberately *not* by the history reload path:
+  receipts and acknowledgements used to query WhatsApp for a picture because
+  they reloaded history, and a picture is stable metadata that a receipt says
+  nothing about. A new connection advances the generation, so every chat is
+  revalidated once per connect — a picture can change while the process is
+  offline. `HistoryLoaded` carries whatever the durable descriptors already
+  said and never waits on an IQ. Ordinary contacts, groups and channels go
+  through the generic `ProfilePictureSpec` path: the library already skips the
+  privacy-token dance for anything that is not a plain PN, so they are one
+  call, which is also what removed the group-only batch that read `url` and
+  ignored the `direct_path` it needed as a fallback. The status broadcast,
+  broadcast lists and the system account are never asked about.
+
+  `NotFound` is the only outcome that destroys: the library now returns a
+  typed `ProfilePictureLookup`, so `NotAuthorized`, `RateOverlimit`,
+  `Unchanged` and a partial response are all told apart from "there is no
+  picture here" and none of them removes a descriptor. A community parent is an
+  ordinary `@g.us` address, so which query it needs is not visible in the JID;
+  the client asks the ordinary one first and falls back to the `w:g2` query
+  only on `NotAuthorized`, keeping just a `Found` from it. docs/roadmap.md
+  carries what that costs.
+

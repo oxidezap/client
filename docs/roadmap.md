@@ -513,6 +513,18 @@
   inbound message would sit between the store and every front end, which the
   whole state model assumes it cannot — plugins observe and act, they do not
   filter.
+- **A community parent's picture goes through a fallback, not a known type.**
+  A community parent is an ordinary `@g.us` address, so nothing about the JID
+  says whether the picture comes from `w:profile:picture` or the `w:g2`
+  `pictures` query with a `parent_group_jid` hint; only the group metadata's
+  `is_parent_group` says, and fetching that would be an extra IQ per group on
+  every connect. So the client asks the ordinary query first and, only when it
+  answers `NotAuthorized`, asks the community one and keeps just a `Found` from
+  it (`session/whatsapp/avatar.rs`). That is correct and non-destructive — a
+  normal group that is merely privacy-restricted refuses both and keeps its
+  picture — but it costs a second IQ for a community parent that has a picture.
+  The alternative is carrying `is_parent_group` into the chat state, which is a
+  protocol field the client does not model today.
 
 Clickable `div`s that remain are deliberate: a chat row and a media thumbnail
 are surfaces, not commands, and have no semantic component to compose from.

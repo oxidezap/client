@@ -446,6 +446,21 @@ pub struct MessageCoverage {
     pub newest_ms: Option<i64>,
 }
 
+/// The durable pointer from a chat to the profile picture it is showing.
+///
+/// Deliberately small, and deliberately not the picture itself. WhatsApp's own
+/// picture id is kept so a conditional refresh can ask "has this changed"; the
+/// cache key is kept so a restarted process can address bytes it fetched in an
+/// earlier run without a metadata round trip. The signed CDN URL is *not* here:
+/// it expires, and a credential does not belong in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvatarDescriptor {
+    pub jid: Jid,
+    pub picture_id: String,
+    pub cache_key: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Invalidation signal emitted after each committed write batch. Consumers
 /// re-run the queries backing their visible state; the store never pushes row
 /// data (query + invalidation, not cache duplication).

@@ -135,7 +135,7 @@ impl ChatRow {
             kind: ChatKind::of(chat),
             disambiguator: None,
             is_group: chat.is_group,
-            avatar_key: chat.avatar_key.clone(),
+            avatar_key: chat.avatar_cache_key.clone(),
             timestamp: chat.last_message_time,
             unread: if chat.unread_count > 0 {
                 Unread::Count(chat.unread_count)
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn an_unchanged_avatar_key_is_preserved_for_the_image_cache() {
         let mut chat = chat(false);
-        chat.avatar_key = Some("a-picture-1".to_string());
+        chat.avatar_cache_key = Some("a-picture-1".to_string());
         let first = ChatRow::new(&chat, None, None, false);
         let second = ChatRow::new(&chat, None, None, false);
         assert_eq!(first.avatar_key, second.avatar_key);
@@ -560,9 +560,9 @@ mod tests {
     #[test]
     fn a_changed_avatar_key_replaces_the_cached_picture() {
         let mut chat = chat(false);
-        chat.avatar_key = Some("a-picture-1".to_string());
+        chat.avatar_cache_key = Some("a-picture-1".to_string());
         let old = ChatRow::new(&chat, None, None, false);
-        chat.avatar_key = Some("a-picture-2".to_string());
+        chat.avatar_cache_key = Some("a-picture-2".to_string());
         let new = ChatRow::new(&chat, None, None, false);
         assert_ne!(old.avatar_key, new.avatar_key);
     }

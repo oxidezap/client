@@ -467,6 +467,7 @@ impl WhatsAppClient {
         include_archived: bool,
     ) -> Task<Result<Page<oxidezap_core::Chat>, String>> {
         let session = self.session.clone();
+        let avatars = self.resolve_avatars.clone();
         self.exec.spawn(async move {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
@@ -497,66 +498,14 @@ impl WhatsAppClient {
             let mut chats = Self::hydrate_entries(store, client, names, entries, Self::attach_page)
                 .await
                 .map_err(|e| e.to_string())?;
-            Self::hydrate_avatar_sources(client, &mut chats).await;
+            // The durable pictures, locally, and an ask that picks up any this
+            // page named for the first time. Both belong here: a chat paged in
+            // after the connect pass is one the resolver has never seen, and
+            // the connect pass reads a bounded window that may not hold it.
+            Self::attach_avatar_descriptors(store, &mut chats).await;
+            avatars.request_named(chats.iter().map(|chat| chat.jid.clone()));
             Ok(Page { items: chats, next })
         })
-    }
-
-    pub(super) async fn hydrate_avatar_sources(client: &Arc<Client>, chats: &mut [Chat]) {
-        for chat in chats.iter_mut() {
-            chat.avatar_source = None;
-            chat.avatar_key = None;
-            chat.avatar_loaded = false;
-        }
-        let groups: Vec<Jid> = chats
-            .iter()
-            .filter(|chat| chat.is_group)
-            .filter_map(|chat| chat.jid.parse().ok())
-            .collect();
-        if !groups.is_empty()
-            && let Ok(pictures) = client
-                .groups()
-                .get_profile_pictures(groups, whatsapp_rust::features::PictureType::Preview)
-                .await
-        {
-            for picture in pictures {
-                if let Some(chat) = chats
-                    .iter_mut()
-                    .find(|chat| chat.jid == picture.group_jid.to_string())
-                {
-                    chat.avatar_source = picture.url;
-                    chat.avatar_key = picture.photo_id;
-                }
-            }
-            for chat in chats.iter_mut().filter(|chat| chat.is_group) {
-                chat.avatar_loaded = true;
-            }
-        }
-
-        let direct: Vec<(usize, Jid)> = chats
-            .iter()
-            .enumerate()
-            .filter(|(_, chat)| !chat.is_group)
-            .filter_map(|(index, chat)| chat.jid.parse().ok().map(|jid| (index, jid)))
-            .collect();
-        let pictures = whatsapp_rust::futures::future::join_all(direct.into_iter().map(
-            |(index, jid)| async move {
-                (
-                    index,
-                    client.contacts().get_profile_picture(&jid, true).await,
-                )
-            },
-        ))
-        .await;
-        for (index, picture) in pictures {
-            if let Ok(picture) = picture {
-                chats[index].avatar_loaded = true;
-                if let Some(picture) = picture {
-                    chats[index].avatar_source = Some(picture.url);
-                    chats[index].avatar_key = Some(picture.id);
-                }
-            }
-        }
     }
 }
 

@@ -1,4 +1,10 @@
 //! Profile-picture fetching owned by the daemon.
+//!
+//! The session resolves the *metadata* — which picture a chat has, and the
+//! signed URL that fetches it — and this side turns that into bytes in the
+//! media cache and a durable descriptor once they land. The order is the whole
+//! contract: a descriptor naming a cache key is written only after the bytes
+//! are on disk, so a restart can trust it.
 
 #[cfg(not(target_family = "wasm"))]
 mod native;
@@ -12,14 +18,20 @@ use std::sync::{LazyLock, Mutex};
 use portable_atomic::{AtomicU64, Ordering};
 
 use crate::state::StateHub;
+use oxidezap_session::AvatarRecorder;
 
 struct AvatarResponse {
     status: u16,
     body: Vec<u8>,
 }
-use oxidezap_core::Chat;
 use oxidezap_ipc::DaemonMessage;
 
+/// One fetch in flight, and what makes it current.
+///
+/// A second resolution for the same chat supersedes the first, and the older
+/// one must not overwrite the newer avatar with a late answer. Account and
+/// cache epochs cover the two wipes: an answer for a departed account, or one
+/// whose bytes landed after the cache was cleared, is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Selection {
     account_generation: usize,
@@ -33,42 +45,131 @@ static LATEST: LazyLock<Mutex<HashMap<(usize, String), Selection>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-pub fn key(jid: &str, id: &str) -> String {
-    let jid = safe_component(jid);
-    let id = safe_component(id);
-    format!("a-{}-{jid}-{}-{id}", jid.len(), id.len())
-}
-
-pub fn queue(hub: &Arc<StateHub>, chat: &Chat) {
-    if !chat.avatar_loaded {
+/// Turn a resolved outcome into cached bytes and a durable descriptor.
+///
+/// `Found` is the only outcome that changes a picture: a cache hit is
+/// published straight away and the descriptor is (re)written, which is how a
+/// descriptor lost to an earlier failure heals; a miss fetches, and only
+/// writes the descriptor once the bytes are in.
+///
+/// `NotFound` is the only outcome that removes one, and it is now a fact the
+/// library tells apart from a refusal: `NotAuthorized`, `RateOverlimit`,
+/// `Unchanged` and a partial response never reach here at all, so a privacy
+/// restriction cannot erase a picture that is there.
+pub fn resolve(
+    hub: &Arc<StateHub>,
+    recorder: &AvatarRecorder,
+    jid: &str,
+    outcome: &oxidezap_core::AvatarOutcome,
+) {
+    use oxidezap_core::AvatarOutcome;
+    let (picture_id, source) = match outcome {
+        AvatarOutcome::Found { picture_id, source } => (picture_id.as_str(), source.as_deref()),
+        AvatarOutcome::NotFound => {
+            remove(hub, recorder, jid);
+            return;
+        }
+    };
+    if picture_id.is_empty() {
+        // A found picture with no id cannot be addressed or cached; there is
+        // nothing to write and nothing to remove.
         return;
     }
-    let jid = chat.jid.clone();
-    let source = chat.avatar_source.clone();
-    let id = chat.avatar_key.clone();
-    let selection = record_selection(hub, &jid, id.as_deref(), source.as_deref());
-    let (Some(source), Some(id)) = (source, id) else {
-        return;
-    };
-    let hub = Arc::clone(hub);
-    let key = key(&jid, &id);
-    if crate::media::has(&key) {
-        oxidezap_session::spawn(async move {
-            if is_current(&hub, &jid, &selection) {
-                publish_ready(&hub, jid, key);
+    let id = picture_id.to_string();
+    let selection = record_selection(hub, jid, Some(&id), source);
+    let cache_key = oxidezap_core::avatar_cache_key(jid, &id);
+    if crate::media::has(&cache_key) {
+        oxidezap_session::spawn({
+            let hub = Arc::clone(hub);
+            let jid = jid.to_string();
+            let recorder = recorder.clone();
+            let selection = selection.clone();
+            async move {
+                // The descriptor is rewritten and committed before the
+                // readiness is published, so a front end is never told about
+                // bytes the durable store does not yet name. A write that did
+                // not commit is not announced.
+                //
+                // `selection.token` is the resolution's order, and the store
+                // keeps the highest one: a first picture whose commit lands
+                // after a second picture's must not overwrite it.
+                if recorder
+                    .record(jid.clone(), id, cache_key.clone(), selection.token)
+                    .await
+                    && is_current(&hub, &jid, &selection)
+                {
+                    publish_ready(&hub, jid, cache_key);
+                }
             }
         });
         return;
     }
-    oxidezap_session::spawn(async move {
-        let Ok(response) = fetch(&source).await else {
-            return;
-        };
-        let Ok(bytes) = accept(response) else { return };
-        if crate::media::put_since(selection.cache_epoch, &key, &bytes).is_ok()
-            && is_current(&hub, &jid, &selection)
-        {
-            publish_ready(&hub, jid, key);
+    let Some(source) = source else {
+        return;
+    };
+    let source = source.to_string();
+    oxidezap_session::spawn({
+        let hub = Arc::clone(hub);
+        let jid = jid.to_string();
+        let recorder = recorder.clone();
+        async move {
+            let Ok(response) = fetch(&source).await else {
+                // A transient failure keeps whatever was cached before: the
+                // old avatar is a better answer than initials.
+                return;
+            };
+            let Ok(bytes) = accept(response) else { return };
+            if crate::media::put_since(selection.cache_epoch, &cache_key, &bytes).is_err() {
+                return;
+            }
+            if !is_current(&hub, &jid, &selection) {
+                return;
+            }
+            // Cache, then commit, then announce — in that order. The commit
+            // is awaited so "durable before visible" is the sequence the code
+            // runs rather than a sentence beside it, and its `seq` is the
+            // resolution's order so a slower first picture cannot overwrite a
+            // faster second one.
+            if !recorder
+                .record(jid.clone(), id, cache_key.clone(), selection.token)
+                .await
+            {
+                return;
+            }
+            if !is_current(&hub, &jid, &selection) {
+                return;
+            }
+            publish_ready(&hub, jid, cache_key);
+        }
+    });
+}
+
+/// Drop a chat's picture, because WhatsApp says there is none.
+///
+/// The descriptor goes first, so a restart cannot draw a picture the account
+/// no longer has; then every front end is told to draw the placeholder. The
+/// cached bytes are left for the budget sweep.
+///
+/// The removal takes a selection like a fetch does, so a picture resolved
+/// *after* this removal is not undone by it: the removal is only applied if
+/// nothing newer has been recorded for the chat.
+fn remove(hub: &Arc<StateHub>, recorder: &AvatarRecorder, jid: &str) {
+    let selection = record_selection(hub, jid, None, None);
+    oxidezap_session::spawn({
+        let hub = Arc::clone(hub);
+        let jid = jid.to_string();
+        let recorder = recorder.clone();
+        async move {
+            if !is_current(&hub, &jid, &selection) {
+                return;
+            }
+            if !recorder.clear(jid.clone(), selection.token).await {
+                return;
+            }
+            if !is_current(&hub, &jid, &selection) {
+                return;
+            }
+            publish_cleared(&hub, &jid);
         }
     });
 }
@@ -83,24 +184,19 @@ fn publish_ready(hub: &StateHub, jid: String, key: String) {
     }
 }
 
+/// Tell every front end this chat no longer has a picture.
+///
+/// An empty key is the placeholder, which is the right drawing for a chat
+/// WhatsApp says has no picture.
+fn publish_cleared(hub: &StateHub, jid: &str) {
+    publish_ready(hub, jid.to_string(), String::new());
+}
+
 pub fn purge(hub: &StateHub) {
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     latest.retain(|(id, _), _| *id != hub_id(hub));
-}
-
-fn safe_component(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
-            result.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(result, ".{byte:02X}");
-        }
-    }
-    result
 }
 
 fn record_selection(
@@ -148,6 +244,18 @@ fn is_current(hub: &StateHub, jid: &str, selection: &Selection) -> bool {
 
 fn hub_id(hub: &StateHub) -> usize {
     std::ptr::from_ref(hub) as usize
+}
+
+/// Whether a chat has an avatar fetch recorded as its current one.
+///
+/// A test-visible answer to "did this path ask about a picture at all",
+/// which is the property the history decoupling is about.
+#[cfg(test)]
+pub(super) fn has_selection(hub: &StateHub, jid: &str) -> bool {
+    LATEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&(hub_id(hub), jid.to_owned()))
 }
 
 async fn fetch(url: &str) -> anyhow::Result<AvatarResponse> {
@@ -206,16 +314,8 @@ fn accept(response: AvatarResponse) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AvatarResponse, accept, is_current, key, purge, record_selection};
+    use super::{AvatarResponse, accept, is_current, purge, record_selection};
     use crate::state::StateHub;
-
-    #[test]
-    fn avatar_keys_are_safe_and_distinct() {
-        assert_eq!(key("jid-1", "picture-1"), "a-5-jid-1-9-picture-1");
-        assert_ne!(key("jid-1", "picture-1"), key("jid-2", "picture-1"));
-        assert_ne!(key("a/b", "picture"), key("a?b", "picture"));
-        assert!(!key("../../avatar", "picture").contains('/'));
-    }
 
     #[test]
     fn superseded_avatar_completion_is_rejected() {

@@ -140,7 +140,13 @@ fn decode_avatar(bytes: &[u8]) -> Option<(ImageSource, u64)> {
         return None;
     }
     let decoded_size = pixels.checked_mul(4)?;
-    let image = image.to_rgba8();
+    // The `image` crate decodes to RGBA; GPUI's `RenderImage` is BGRA, and its
+    // own decoder swaps the same two bytes. Skipping this renders every photo
+    // with red and blue exchanged.
+    let mut image = image.to_rgba8();
+    for pixel in image.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
     Some((
         ImageSource::from(Arc::new(RenderImage::new(smallvec::smallvec![
             image::Frame::new(image),
@@ -845,6 +851,36 @@ mod tests {
             .unwrap();
 
         assert!(decode_avatar(&bytes).is_none());
+    }
+
+    /// GPUI renders `RenderImage` as BGRA, so RGBA handed straight to it drew
+    /// every photo with red and blue exchanged while vectors stayed correct.
+    /// Asymmetric channels on purpose: a grey pixel has R == B and passes both
+    /// ways, which is exactly how this shipped unnoticed.
+    #[test]
+    fn an_avatar_reaches_gpui_in_bgra_not_rgba() {
+        let rgba = image::Rgba([255, 20, 40, 255]);
+        let mut decoded = image::RgbaImage::from_pixel(1, 1, rgba);
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(std::mem::take(&mut decoded))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        let (source, _) = decode_avatar(&bytes).expect("a 1x1 avatar decodes");
+        let ImageSource::Render(image) = source else {
+            panic!("a decoded avatar is a render image");
+        };
+        let pixels = image.as_bytes(0).expect("the one frame");
+
+        assert_eq!(
+            pixels,
+            [40, 20, 255, 255],
+            "red and blue were not swapped, so the renderer reads them backwards"
+        );
+        assert_eq!(pixels[3], 255, "alpha must survive the swap");
     }
 
     /// And the payload does not go through whatever is at the name. A staged
