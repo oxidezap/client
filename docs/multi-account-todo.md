@@ -327,12 +327,19 @@ confirmação antes de chamar `hang_up` e prosseguir.
       de requests, e as três mutações de lifecycle (`CreateAccount` ->
       `AccountCreated`, `ResetAccount`/`RemoveAccount` -> `Accepted`) todas
       respondendo de verdade em `serve_control_client`.
-- [ ] **6. GUI** — `ControlSession` + `AccountWorkspace`, attach/detach e
-      completions assíncronas protegidas contra switch.
+- [~] **6. GUI** — a **`ControlSession` já existe e está ligada**: a GUI abre
+      uma segunda conexão `ClientScope::Control` (`Session::connect_control`,
+      `attach::begin_control`) ao lado da de conta, e as requisições de
+      processo (`SetLogLevel`, `ShowWindow`, `ReloadPlugins`, `InstallPlugin`,
+      `RemovePlugin`, `ListInstalledPlugins`) foram movidas para ela — o plano
+      de conta as recusava. Falta o `AccountWorkspace` propriamente dito: a
+      conexão de conta continua fixa em `AccountId::LEGACY`.
 - [ ] **7. UX** — switcher, Add, Reset, Remove, pairing por runtime e estado
       mínimo da conta ativa.
 - [ ] **8. Web/embedded** — registry singleton, Web Lock no daemon, um DB OPFS,
       scopes de tab e restauração do conjunto inteiro, plugin-state por conta.
+      A `ControlSession` já cobre os quatro transports; o que falta aqui é o
+      registry multi-conta do lado do daemon embutido.
 - [ ] **9. Global** — tray agregado, `CallCoordinator`, sinais cross-account e
       política determinística para hardware de chamadas. Decisão de produto
       **já tomada** (não mais pendente): opção A, finalizar a chamada ativa
@@ -341,6 +348,12 @@ confirmação antes de chamar `hang_up` e prosseguir.
       depende do switcher (item 6/7) existir.
 - [ ] **10. Hardening/performance** — matriz de races, testes de isolamento,
        stress de writer, benchmark 1/2/4 contas, web, docs e CI completo.
+       **Gate de release, não item adiável:** cada `WhatsAppClient` ainda cria
+       um runtime Tokio multi-thread próprio mais uma thread que faz
+       `block_on`, então 4 contas não são 4 sessões e sim possivelmente 4
+       runtimes e seus pools. Medir 1/2/4/8 contas — threads, RSS/PSS, CPU
+       ociosa, FDs, startup a frio, history sync, reconexão e shutdown — antes
+       de liberar multi-account.
 
 ## Definition of done
 
@@ -351,9 +364,15 @@ confirmação antes de chamar `hang_up` e prosseguir.
 - [ ] Eventos, unread, mídia, plugins e permissões permanecem account-scoped.
 - [x] Reset/remove de A não altera state, rows ou runtime de B/C no storage
       (testado); falta provar o mesmo em runtime (spawn dinâmico, item acima).
-      Ids removidos nunca são reutilizados (testado, via `AUTOINCREMENT`).
+      Ids removidos nunca são reutilizados (testado, via `AUTOINCREMENT`), e o
+      startup não recria um id removido: uma listagem vazia aloca pelo
+      `create_account` em vez de fixar `AccountId(1)`.
 - [ ] Operações assíncronas iniciadas em A não publicam em B após switch.
-- [ ] Falha de uma runtime não derruba daemon nem as demais.
+- [x] Falha de uma runtime não derruba daemon nem as demais: o reaper por
+      `AccountExit`, com restart por backoff fora do loop (um timer por conta,
+      guardado por geração), e uma conta que termina sozinha é recuperada sem
+      bloquear as demais. Logout e recovery esgotado ficam observáveis como
+      `Error` e ainda podem ser resetados/removidos pelo supervisor.
 - [ ] Web, chamadas, tray, storage usage, migrations e benchmarks passam os
       gates do plano.
 - [ ] `AGENTS.md`, `docs/architecture.md`, `docs/gotchas.md` e `docs/web.md`
