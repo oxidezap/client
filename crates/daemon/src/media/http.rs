@@ -341,7 +341,11 @@ pub(crate) async fn discard(stream: &mut TcpStream, key: &str, origin: Option<&s
 /// or remove.
 ///
 /// `f-` and `d-` are the daemon's own cache of what it fetched and can fetch
-/// again; those are not a caller's to replace or delete.
+/// again; those are not a caller's to replace or delete. Both staged
+/// namespaces are writable here — the global `u-` a plugin install uses, and
+/// the account-scoped `a<id>-u-` a send uses — because the front end composes
+/// the key it wants and this endpoint cannot know which account a page is
+/// bound to.
 fn is_staged(key: &str) -> bool {
     oxidezap_ipc::is_staged_key(key)
 }

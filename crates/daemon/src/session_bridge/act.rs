@@ -371,10 +371,13 @@ impl Bridge {
                 // thing a client sends that is too big for a frame. Taken
                 // rather than read: the client wrote it directly, so its bytes
                 // never counted toward the cache's own sweep and nothing else
-                // would ever remove it.
-                let Some(audio) = crate::media::take(&upload) else {
+                // would ever remove it. Account-scoped, so a send can only
+                // ever consume a payload this same account staged.
+                let Some(audio) =
+                    crate::media::AccountMedia::new(self.hub.account_id()).take_staged(&upload)
+                else {
                     return CommandOutcome::Refused(format!(
-                        "no audio cached under {upload}; write it before sending"
+                        "no audio cached for this account under {upload}; write it before sending"
                     ));
                 };
                 hold(
@@ -419,9 +422,10 @@ impl Bridge {
                 let Some(permit) = self.permit() else {
                     return too_busy();
                 };
+                let account_media = crate::media::AccountMedia::new(self.hub.account_id());
                 let taken = {
                     let upload = upload.clone();
-                    oxidezap_session::unblock(move || crate::media::take(&upload)).await
+                    oxidezap_session::unblock(move || account_media.take_staged(&upload)).await
                 };
                 // Two answers, not one. A read that never ran — the worker
                 // panicked, or the runtime is going down — is not a payload
@@ -626,11 +630,20 @@ impl Bridge {
                 // Said out loud, because somebody else has to hear it: on a
                 // page a front end reconnects the instant it sends this, and
                 // whatever answers must not be the session that is leaving.
-                // `set_disposition` marks stopping itself, and the first call
-                // wins — a runtime already stopping keeps the reason it was
-                // first asked to stop for.
-                self.lifecycle.set_disposition(disposition);
-                CommandOutcome::Accepted
+                // `set_disposition` marks stopping itself; the first call
+                // wins, and its answer is what says whether this one is that
+                // call or one the runtime is already committed against.
+                match self.lifecycle.set_disposition(disposition) {
+                    super::DispositionOutcome::Recorded
+                    | super::DispositionOutcome::AlreadySame => CommandOutcome::Accepted,
+                    // Not `Busy`: nothing about timing will change this, and a
+                    // retry is answered the same way. Refused, with the reason
+                    // the caller needs to understand it lost to a different
+                    // operation that is already under way.
+                    super::DispositionOutcome::Conflict => CommandOutcome::Refused(format!(
+                        "this account is already stopping for a different reason than {disposition:?}"
+                    )),
+                }
             }
         }
     }
@@ -995,11 +1008,16 @@ mod tests {
     fn staged_key(what: &str) -> String {
         use portable_atomic::AtomicU64;
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        oxidezap_ipc::staged_key(&format!(
-            "act-test-{what}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
+        // Under the account the test bridge serves (`StateHub::new` is the
+        // legacy one): a send consumes only a payload its own account staged.
+        oxidezap_ipc::account_staged_key(
+            oxidezap_core::AccountId::LEGACY,
+            &format!(
+                "act-test-{what}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        )
     }
 
     fn send_media(upload: &str) -> Action {

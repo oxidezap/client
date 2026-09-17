@@ -217,9 +217,12 @@ pub(super) async fn handle_request(
                 Err(refusal) => return refusal,
             };
             // Two directory walks, off the runtime for the same reason the
-            // clear is.
-            let measured = oxidezap_session::unblock(|| {
-                let (media_bytes, media_files) = crate::media::cache_usage();
+            // clear is. Account-scoped: the media directory is shared by every
+            // local account, and billing this one for the whole walk reported
+            // every other account's photos as this account's storage.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            let measured = oxidezap_session::unblock(move || {
+                let (media_bytes, media_files) = account_media.usage();
                 (database_bytes(), media_bytes, media_files)
             })
             .await;
@@ -245,10 +248,17 @@ pub(super) async fn handle_request(
             // delivery for as long as a slow disk took. Awaited rather than
             // spawned loose, so the acknowledgement still means the cache is
             // clear.
-            let cleared = oxidezap_session::unblock(|| {
-                // Cached downloads only: a staged upload belongs to a send
-                // that has not run yet. See `media::Wipe`.
-                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| e.to_string())
+            // This account's cache only: the directory is shared, and a global
+            // clear would delete every other local account's downloads — and,
+            // before the account prefix existed, failed to match this
+            // account's own namespaced keys at all, so "clear" removed neither
+            // correctly nor its own. Cached downloads only: a staged upload
+            // belongs to a send that has not run yet. See `media::Wipe`.
+            let account_media = crate::media::AccountMedia::new(hub.account_id());
+            let cleared = oxidezap_session::unblock(move || {
+                account_media
+                    .wipe(crate::media::Wipe::Cache)
+                    .map_err(|e| e.to_string())
             })
             .await;
             acted(match cleared {
@@ -496,9 +506,17 @@ fn answer_later(answer_to: &Outbox, frame: Option<String>) {
 /// it, and a refusal that left it staged would keep a module in the cache
 /// until the account was wiped.
 async fn install(request: &oxidezap_ipc::InstallPlugin) -> Result<String, ProtocolError> {
-    if !oxidezap_ipc::is_staged_key(&request.upload) {
+    // Global staged payloads only. A plugin module is the daemon's and lives
+    // in the shared catalog, read by every account; a payload staged under an
+    // account's own send namespace (`a<id>-u-...`) is that account's data, and
+    // moving it into the catalog would let one account install a module for
+    // all of them from a key it staged to send.
+    if !oxidezap_ipc::is_global_staged_key(&request.upload) {
         return Err(ProtocolError::Refused {
-            detail: format!("{} does not name a staged payload", request.upload),
+            detail: format!(
+                "{} does not name a global staged payload a plugin may be installed from",
+                request.upload
+            ),
         });
     }
     let key = request.upload.clone();

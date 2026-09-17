@@ -52,7 +52,8 @@ pub use protocol::{
     SendMedia, SendText, StateSnapshot, StateVersion, Typing,
 };
 pub use transport::{
-    DEFAULT_WEB_PORT, MAX_STAGED_BYTES, PROTOCOL_VERSION, STAGED_PREFIX, WEB_MEDIA_PATH,
-    WEB_SOCKET_PATH, endpoint_path, is_staged_key, lock_path, media_dir, media_path, staged_key,
-    state_dir, web_token_path,
+    ACCOUNT_STAGED_INFIX, DEFAULT_WEB_PORT, MAX_STAGED_BYTES, PROTOCOL_VERSION, STAGED_PREFIX,
+    WEB_MEDIA_PATH, WEB_SOCKET_PATH, account_prefix_of, account_staged_key, account_staged_prefix,
+    account_staged_prefix_of, endpoint_path, is_global_staged_key, is_staged_key, key_local_name,
+    lock_path, media_dir, media_path, staged_key, state_dir, web_token_path,
 };

@@ -82,7 +82,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use log::error;
-use oxidezap_core::{CallState, Chat, ChatMessage, DownloadableMedia, QuotedMessage, UiEvent};
+use oxidezap_core::{
+    AccountId, CallState, Chat, ChatMessage, DownloadableMedia, QuotedMessage, UiEvent,
+};
 use oxidezap_ipc::{CallAction, ClientRequest, Link, PageCursor, Request, RequestId};
 // The payload structs the protocol declares, named rather than glob-imported
 // so `Typing` and `Download` read at the call site as what they are: the
@@ -692,6 +694,15 @@ pub struct SessionHandle {
 /// arguments, which is what this reached eight parameters as.
 #[derive(Clone)]
 struct Conn {
+    /// The immutable account this connection is bound to.
+    ///
+    /// Carried so a payload staged for a send can be filed under that
+    /// account's own namespace (`a<id>-u-...`) rather than a shared one: a
+    /// key that names only a local id can be consumed by whichever account
+    /// asks next, and a reset of this account would not sweep it. The same
+    /// id the hello bound the connection to, kept here because the send path
+    /// is where the key is composed and the hello is long gone by then.
+    account: AccountId,
     /// The write half, whichever transport is under it, behind the slot the
     /// owner empties. The reader holds the other half, and the two are used
     /// at the same time.
@@ -866,10 +877,11 @@ impl Session {
     }
 
     /// The parts every transport supplies, assembled.
-    fn new(link: Link, events: UiSink, media: Arc<dyn MediaCache>) -> Self {
+    fn new(link: Link, events: UiSink, media: Arc<dyn MediaCache>, account: AccountId) -> Self {
         Self {
             handle: SessionHandle {
                 conn: Conn {
+                    account,
                     wire: Wire::new(link),
                     pending: Pending::default(),
                     outbox: Sending::default(),
@@ -1095,8 +1107,9 @@ impl SessionHandle {
     ) {
         // Through the media cache: these are the things this side sends that
         // do not belong in a frame. The key is the local id, which is already
-        // unique per send.
-        let upload = oxidezap_ipc::staged_key(&sanitize(&local_id));
+        // unique per send, filed under this connection's account so only the
+        // account that staged it can send it and only its own reset sweeps it.
+        let upload = oxidezap_ipc::account_staged_key(self.conn.account, &sanitize(&local_id));
         let request = request(upload.clone(), local_id.clone());
         // The ceiling, once, where every staged payload passes rather than in
         // each of the four caches. Only one of those enforced it — the web

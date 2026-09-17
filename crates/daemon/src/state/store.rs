@@ -275,6 +275,15 @@ impl StateStore {
         self.lock().connection.clone()
     }
 
+    /// Whether the server has rejected this account's stored credentials.
+    ///
+    /// Read by the teardown, before it clears the account, so the run loop's
+    /// end can be told apart from an ordinary one: a logout is not a fault to
+    /// retry, and the state that says so is exactly what the teardown drops.
+    pub(super) fn is_logged_out(&self) -> bool {
+        matches!(self.lock().connection, ConnectionState::LoggedOut { .. })
+    }
+
     /// The summary held for `jid`, if any.
     pub(super) fn chat(&self, jid: &str) -> Option<ChatSummary> {
         self.lock().chats.get(jid).map(|e| e.summary.clone())

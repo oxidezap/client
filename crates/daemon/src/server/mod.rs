@@ -200,6 +200,25 @@ where
                 write_line(&mut writer, &frame).await?;
                 return Ok(());
             };
+            // A runtime that has accepted a stop/reset/remove is between that
+            // acceptance and its own removal from the registry. Attaching a
+            // front end in that window would bind it to a hub whose session,
+            // plugin host and command channel are all being torn down, and it
+            // would watch a connection that can never answer it. Refused here
+            // rather than allowed and then starved.
+            if runtime.is_stopping() {
+                let frame = error_frame(
+                    None,
+                    ProtocolError::NoSession {
+                        detail: format!(
+                            "account {} is stopping and cannot accept new connections",
+                            account.get()
+                        ),
+                    },
+                )?;
+                write_line(&mut writer, &frame).await?;
+                return Ok(());
+            }
             (runtime.hub(), runtime.plugins(), runtime.commands())
         }
     };

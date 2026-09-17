@@ -240,6 +240,15 @@ impl StateHub {
         self.state.connection()
     }
 
+    /// Whether the server has rejected this account's stored credentials.
+    ///
+    /// Read by the session teardown, before it clears the account, so the end
+    /// of a run loop can be classified: a logout is terminal until the user
+    /// pairs again, where every other natural end is a fault worth retrying.
+    pub fn is_logged_out(&self) -> bool {
+        self.state.is_logged_out()
+    }
+
     /// The summary held for `jid`, if any.
     ///
     /// Lets a caller build the next summary from the current one, which is how

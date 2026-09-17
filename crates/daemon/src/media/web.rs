@@ -213,7 +213,23 @@ pub fn claim(key: &str) -> bool {
 
 /// What the media cache occupies: bytes, and how many entries.
 pub fn cache_usage() -> (u64, u64) {
-    with(|cache| (cache.held, cache.entries.len() as u64))
+    usage_for("")
+}
+
+/// What one account's slice of the shared map occupies.
+///
+/// The named half of [`cache_usage`]: a storage pane for one account must not
+/// bill it for every other account's entries in the same page.
+pub fn usage_for(prefix: &str) -> (u64, u64) {
+    with(|cache| {
+        cache
+            .entries
+            .iter()
+            .filter(|(name, _)| prefix.is_empty() || name.starts_with(prefix))
+            .fold((0u64, 0u64), |(bytes, files), (_, entry)| {
+                (bytes + entry.bytes.len() as u64, files + 1)
+            })
+    })
 }
 
 /// Delete the cached entries this wipe is entitled to.
@@ -225,6 +241,28 @@ pub fn cache_usage() -> (u64, u64) {
 /// Never, for the same reason [`put`] does not.
 pub(super) fn delete(scope: Wipe) -> Result<()> {
     delete_for("", scope)
+}
+
+/// Delete the entries belonging to no account: the pre-multi-account names.
+///
+/// See [`super::wipe_unscoped`].
+pub(super) fn delete_unscoped(scope: Wipe) -> Result<()> {
+    with(|cache| {
+        let mut removed = 0u64;
+        cache.entries.retain(|name, entry| {
+            if oxidezap_ipc::account_prefix_of(name).is_some() {
+                return true;
+            }
+            let taken = scope.takes(name) && !(entry.claims > 0 && scope == Wipe::Cache);
+            if taken {
+                cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
+                removed += 1;
+            }
+            !taken
+        });
+        log::info!("cleared {removed} pre-multi-account media entries ({scope:?})");
+    });
+    Ok(())
 }
 
 /// Delete only entries in one account namespace when `prefix` is non-empty.

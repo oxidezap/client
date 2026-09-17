@@ -86,7 +86,7 @@ pub(super) fn begin_for_account(
     call_video: bool,
 ) -> std::io::Result<Attached> {
     let (sink, events) = sink::channel();
-    let session = Session::new(link, sink.ui(), media);
+    let session = Session::new(link, sink.ui(), media, account);
     session.send(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
         scope: ClientScope::Account { account },
@@ -324,7 +324,12 @@ mod page {
                 match fetch(&key, ration).await {
                     Ok(bytes) => {
                         so_far = so_far.saturating_add(bytes.len() as u64);
-                        if key.starts_with("a-") {
+                        // Through the account wrapper: an avatar key is
+                        // account-scoped now (`a<id>-a-...`), so testing the
+                        // whole key against the bare `a-` avatar prefix would
+                        // miss every one of them and draw them in the ordinary
+                        // media map, where the avatar lookup never finds them.
+                        if oxidezap_ipc::key_local_name(&key).starts_with("a-") {
                             into.put_avatar(key, bytes);
                         } else {
                             into.put(key, bytes);

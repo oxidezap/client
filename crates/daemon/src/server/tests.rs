@@ -198,6 +198,53 @@ async fn an_account_connection_is_bound_to_the_requested_runtime() {
     served.abort();
 }
 
+/// A runtime that has accepted a stop/reset/remove cannot take a new front
+/// end: between that acceptance and its removal from the registry there is a
+/// window in which the session, plugins and command channel are all coming
+/// down, and a connection attached there would watch a hub nothing answers
+/// on. Refused rather than bound.
+#[tokio::test]
+async fn a_stopping_account_refuses_a_new_connection() {
+    let registry = AccountRegistry::new();
+    let account = oxidezap_core::AccountId::LEGACY;
+    let hub = StateHub::for_account(account);
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let runtime = Arc::new(AccountRuntime::new(account, hub, no_plugins(), commands));
+    let _ = runtime
+        .lifecycle()
+        .set_disposition(crate::session_bridge::AccountDisposition::Reset);
+    assert!(registry.insert(runtime));
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(server, registry));
+    let hello = serde_json::to_string(&Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account { account },
+        session_events: false,
+        owns_window: false,
+        call_video: false,
+    }))
+    .unwrap();
+    client
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::Error {
+                error: ProtocolError::NoSession { .. },
+                ..
+            }
+        ),
+        "a runtime the user is resetting must not accept a connection"
+    );
+    served.abort();
+}
+
 /// `CreateAccount` needs a supervisor attached to the registry it is served
 /// through; every other control test in this file builds a bare
 /// `AccountRegistry::new()` (no `AccountSupervisor` over it), which is

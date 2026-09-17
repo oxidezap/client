@@ -516,6 +516,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A pre-multi-account `plugin-state/` is moved into the legacy account's
+    /// slot before anything reads it, so an upgrade keeps the approvals and
+    /// settings the single account already had rather than starting it with
+    /// none.
+    #[test]
+    fn legacy_plugin_state_is_migrated_into_the_legacy_account() {
+        let root = scratch("legacy-state");
+        std::fs::create_dir_all(&root).expect("the state root");
+        let approvals = root.join("approvals.json");
+        std::fs::write(&approvals, br#"{"autoreply":true}"#).expect("an approval file");
+        std::fs::create_dir_all(root.join("autoreply")).expect("a settings directory");
+
+        super::super::migrate_legacy_state_in(&root, oxidezap_core::AccountId::LEGACY);
+
+        let account = root.join("1");
+        assert!(
+            account.join("approvals.json").is_file(),
+            "the approvals moved into account 1's directory"
+        );
+        assert!(
+            account.join("autoreply").is_dir(),
+            "and so did the plugin's settings"
+        );
+        assert!(
+            !approvals.exists(),
+            "the pre-migration copy is gone, so nothing reads a stale one"
+        );
+
+        // Idempotent: a second pass finds no unscoped state and changes
+        // nothing, which is what running on every startup requires.
+        super::super::migrate_legacy_state_in(&root, oxidezap_core::AccountId::LEGACY);
+        assert!(account.join("approvals.json").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A non-legacy account never claims the unscoped root: it did not write
+    /// it, and adopting it would hand a second account the first one's
+    /// recorded permissions.
+    #[test]
+    fn legacy_plugin_state_is_not_migrated_into_another_account() {
+        let root = scratch("legacy-state-other");
+        std::fs::create_dir_all(&root).expect("the state root");
+        let approvals = root.join("approvals.json");
+        std::fs::write(&approvals, br#"{"autoreply":true}"#).expect("an approval file");
+
+        let other = oxidezap_core::AccountId::new(2).expect("a positive id");
+        super::super::migrate_legacy_state_in(&root, other);
+
+        assert!(approvals.exists(), "the unscoped state was left alone");
+        assert!(
+            !root.join("2").exists(),
+            "and nothing was written for the account that did not own it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The id rule is the host's, asked before a byte is written: a file
     /// this daemon cannot name a plugin after is one nothing would ever load.
     #[tokio::test]

@@ -380,12 +380,21 @@ pub fn media_path(key: &str) -> Option<PathBuf> {
 /// otherwise this sentence would be true of one transport and not the others.
 pub const MAX_STAGED_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The prefix a front end's staged payload is filed under.
+/// The prefix a *daemon-global* staged payload is filed under.
 ///
-/// The one key space a front end *writes*. `f-` and `d-` are the daemon's
-/// cache of what it fetched and can fetch again; `u-` is a payload staged for
-/// a send that has not run yet, which is its only copy, so the cache sweep
-/// spares it and the daemon's write endpoint takes nothing else.
+/// The one key space a front end *writes* that belongs to no account. `f-` and
+/// `d-` are the daemon's cache of what it fetched and can fetch again; a
+/// staged key is a payload a front end wrote for the daemon to consume, and
+/// the only copy of it, so the cache sweep spares it and the daemon's write
+/// endpoint takes nothing else.
+///
+/// A send's payload is not under this prefix: it carries the account it
+/// belongs to as `a<id>-u-...` (see [`account_staged_key`]), because a
+/// payload staged to be sent *by* an account must not be consumable by a
+/// different one, and must be swept when that account is reset or removed.
+/// What stays global is what really is the daemon's rather than an account's:
+/// a plugin module being installed, which lives in the shared catalog and is
+/// read by the daemon's own plugin loader.
 ///
 /// Here rather than spelled at each end, because the two ends have to agree:
 /// the daemon answers 403 to any other prefix, and a front end that composed
@@ -393,19 +402,107 @@ pub const MAX_STAGED_BYTES: u64 = 64 * 1024 * 1024;
 /// and leave the payload staged until the account was wiped.
 pub const STAGED_PREFIX: &str = "u-";
 
-/// Whether this key names a payload a front end staged for a send.
+/// The infix an account-scoped staged payload carries: `a<id>-u-<name>`.
+///
+/// Between the account prefix and the staged marker, the same `u-` the global
+/// namespace uses, so a single sweep's staged rule can recognise both without
+/// knowing which kind it is looking at.
+pub const ACCOUNT_STAGED_INFIX: &str = "-u-";
+
+/// Whether this key names a payload a front end staged for the daemon, under
+/// either the global namespace or an account's.
 #[must_use]
 pub fn is_staged_key(key: &str) -> bool {
-    key.starts_with(STAGED_PREFIX)
+    key.starts_with(STAGED_PREFIX) || account_staged_prefix_of(key).is_some()
 }
 
-/// The key a staged payload is filed under.
+/// Whether this key names a *daemon-global* staged payload, as opposed to one
+/// belonging to an account.
+///
+/// The install path is the caller that must draw this line: a plugin module is
+/// the daemon's, and a payload staged under an account's namespace is that
+/// account's data, which install must refuse rather than move into the shared
+/// catalog.
+#[must_use]
+pub fn is_global_staged_key(key: &str) -> bool {
+    key.starts_with(STAGED_PREFIX) && account_staged_prefix_of(key).is_none()
+}
+
+/// The key a global staged payload is filed under.
 ///
 /// `name` is the caller's own, and has to survive [`media_path`]: a local id
 /// is composed by a front end, so it is sanitized before it gets here.
 #[must_use]
 pub fn staged_key(name: &str) -> String {
     format!("{STAGED_PREFIX}{name}")
+}
+
+/// The key an account's staged payload is filed under: `a<id>-u-<name>`.
+///
+/// See [`STAGED_PREFIX`] for why an account's send payload is not global.
+#[must_use]
+pub fn account_staged_key(account: oxidezap_core::AccountId, name: &str) -> String {
+    format!("{}{name}", account_staged_prefix(account))
+}
+
+/// The prefix every one of `account`'s staged payloads carries.
+#[must_use]
+pub fn account_staged_prefix(account: oxidezap_core::AccountId) -> String {
+    format!("a{}{ACCOUNT_STAGED_INFIX}", account.get())
+}
+
+/// The account prefix a key carries, if any: `Some("a<id>-")`.
+///
+/// The one `a<digits>-` shape every account-scoped key shares, which is what
+/// lets a consumer that only knows the local convention — the avatar prefix,
+/// say — see through the account wrapper to the key underneath.
+#[must_use]
+pub fn account_prefix_of(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix('a')?;
+    let (digits, local) = rest.split_once('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Everything up to and including the first `-`, i.e. `a<digits>-`.
+    Some(&key[..key.len() - local.len()])
+}
+
+/// The local name a key carries, with any account prefix stripped.
+///
+/// For a caller that knows the local convention (an avatar is `a-...`) and has
+/// only the account-scoped form in hand. A key under no account is returned
+/// unchanged.
+#[must_use]
+pub fn key_local_name(key: &str) -> &str {
+    match account_prefix_of(key) {
+        Some(prefix) => &key[prefix.len()..],
+        None => key,
+    }
+}
+
+/// The account id embedded in an account-staged key, if this is one.
+///
+/// Parsed rather than trusted: the key is a name a peer chose, and the send
+/// path is what has to decide whether it belongs to the account being asked
+/// to send.
+///
+/// The account part is the one `a<digits>-` namespace every account key
+/// shares, and this is one only when the local name right after it is the
+/// staged `u-`. That distinction is what keeps a durable `a1-f-...` key whose
+/// message id happens to contain `-u-` — the alphabet is not restricted —
+/// from being read as a staged payload.
+#[must_use]
+pub fn account_staged_prefix_of(key: &str) -> Option<oxidezap_core::AccountId> {
+    let rest = key.strip_prefix('a')?;
+    let (digits, local) = rest.split_once('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    local.starts_with(STAGED_PREFIX).then_some(())?;
+    digits
+        .parse::<i32>()
+        .ok()
+        .and_then(|id| oxidezap_core::AccountId::new(id).ok())
 }
 
 /// The directory [`media_path`] resolves into.

@@ -1122,6 +1122,7 @@ mod tests {
                 oxidezap_ipc::Link::over_stream(writer),
                 sink.ui(),
                 Arc::new(NoMedia),
+                oxidezap_core::AccountId::LEGACY,
             );
             let pending = Pending::default();
             let pictures = client.call_frames().clone();

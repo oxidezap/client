@@ -35,7 +35,7 @@ pub use platform::reclaim_abandoned_writes_periodically;
 /// scheduled task now.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use platform::prepare_dir as prepare_cache_dir;
-pub use platform::{cache_usage, claim, has, take};
+pub use platform::{cache_usage, claim, has, take, usage_for};
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]
 pub use platform::{deliver, read};
@@ -156,12 +156,19 @@ pub enum Wipe {
 
 impl Wipe {
     /// Whether a file named `name` is this wipe's to take.
+    ///
+    /// `name` is the *local* name: for an account-scoped wipe the caller has
+    /// already stripped the `a<id>-` prefix, which is why the durable prefixes
+    /// tested here are the bare `f-`/`d-`/`a-`. Staged payloads are neither:
+    /// `Everything` takes them because the account is leaving, and `Cache`
+    /// excludes them because one is the only copy of a send that has not run.
     pub(super) fn takes(self, name: &str) -> bool {
         match self {
             Self::Everything => true,
             Self::Cache => {
                 (name.starts_with("f-") || name.starts_with("d-") || name.starts_with("a-"))
                     && !is_in_progress(name)
+                    && !is_staged_upload(name)
             }
         }
     }
@@ -227,6 +234,45 @@ impl AccountMedia {
         crate::media::put_owned(&self.key(key), bytes)
     }
 
+    /// The full key one of this account's staged sends is filed under.
+    ///
+    /// `a<id>-u-<name>`: an account's send payload belongs to the account that
+    /// staged it, so a second account cannot consume it by naming a key it
+    /// guessed, and a reset/remove of that account sweeps it with the rest of
+    /// the account's media.
+    #[must_use]
+    pub fn staged_key(self, name: &str) -> String {
+        oxidezap_ipc::account_staged_key(self.account, name)
+    }
+
+    /// Whether `key` is one of this account's staged sends.
+    #[must_use]
+    pub fn is_staged(self, key: &str) -> bool {
+        oxidezap_ipc::account_staged_prefix_of(key) == Some(self.account)
+    }
+
+    /// Take one of this account's staged sends, if it is here.
+    ///
+    /// Refuses a key belonging to another account, or a global one: a send
+    /// names a payload it staged itself, and taking another account's would be
+    /// exactly the cross-account consumption this namespace exists to stop.
+    #[must_use]
+    pub fn take_staged(self, key: &str) -> Option<Vec<u8>> {
+        self.is_staged(key)
+            .then(|| crate::media::take(key))
+            .flatten()
+    }
+
+    /// How much of the shared cache belongs to this account: bytes and files.
+    ///
+    /// The number a person is shown for *this* account's storage pane. The
+    /// physical directory is shared, so the walk filters by this account's
+    /// prefix rather than billing one account for every other's download.
+    #[must_use]
+    pub fn usage(self) -> (u64, u64) {
+        crate::media::usage_for(&self.prefix())
+    }
+
     pub fn wipe(self, scope: Wipe) -> Result<()> {
         wipe_for(self.account, scope)
     }
@@ -255,6 +301,13 @@ pub(super) const IN_PROGRESS_GRACE: std::time::Duration = std::time::Duration::f
 /// a "clear cached media" is entitled to, and the budget sweep has to reclaim
 /// more than that.
 pub(super) fn is_staged_upload(name: &str) -> bool {
+    // The bare `u-` form, and the `a<id>-u-` form a send actually stages
+    // under. The local name a `delete_for` passes here has had the account
+    // prefix stripped, so it begins at `u-` for both kinds and the shared
+    // predicate answers both. The full-name callers (the budget sweep, the
+    // orphan reclaim) pass the whole name, where the account form must also
+    // be recognised or a send payload would be evicted as an ordinary cache
+    // entry.
     oxidezap_ipc::is_staged_key(name)
 }
 
@@ -375,9 +428,33 @@ pub fn wipe(scope: Wipe) -> Result<()> {
 }
 
 /// Delete only one account's namespace from the shared physical cache.
+///
+/// The legacy account's wipe also takes the pre-multi-account, unscoped
+/// entries: before this namespace existed, the single account wrote `f-`,
+/// `d-`, `a-` and `u-` directly into the shared directory, so a reset of
+/// account 1 that only matched `a1-` would leave that account's own older
+/// photos, avatars and staged sends on disk — the exact bytes "clear data and
+/// pair again" exists to remove. No other account can have written them, and
+/// none may claim them: only the legacy slot is allowed to clean them up.
 pub fn wipe_for(account: AccountId, scope: Wipe) -> Result<()> {
     let prefix = format!("a{}-", account);
-    wipe_with_prefix(&prefix, scope)
+    let legacy = (account == AccountId::LEGACY).then(|| wipe_unscoped(scope));
+    let wiped = wipe_with_prefix(&prefix, scope);
+    if let Some(legacy) = legacy {
+        legacy?;
+    }
+    wiped
+}
+
+/// Delete the entries that carry no account prefix.
+///
+/// The pre-multi-account layout. Deliberately separate from a global
+/// [`wipe`], which under `Everything` would take every account's files: this
+/// takes only names belonging to no account at all.
+fn wipe_unscoped(scope: Wipe) -> Result<()> {
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    invalidate();
+    platform::delete_unscoped(scope)
 }
 
 fn wipe_with_prefix(prefix: &str, scope: Wipe) -> Result<()> {
@@ -428,6 +505,17 @@ mod tests {
 
     fn alone() -> std::sync::MutexGuard<'static, ()> {
         ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// An account id these tests alone use.
+    ///
+    /// The physical media directory is shared by every process on the
+    /// machine, so a namespace test on `AccountId::LEGACY` would have its
+    /// wipe reach into whatever another test or process staged under ids 1/2.
+    /// A high, offset id keeps these tests' files to themselves; it only has
+    /// to be a positive `i32`.
+    fn test_account(offset: i32) -> AccountId {
+        AccountId::new(900_000 + offset).expect("a positive test account id")
     }
 
     /// A publisher's queue outlives the tap that cleared the cache, so the
@@ -653,8 +741,8 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     fn account_media_wipe_does_not_cross_account_boundaries() {
         let _alone = alone();
-        let one = AccountMedia::new(AccountId::LEGACY);
-        let two = AccountMedia::new(AccountId::new(2).expect("positive account id"));
+        let one = AccountMedia::new(test_account(10));
+        let two = AccountMedia::new(test_account(11));
         let one_key = one.put_owned("f-isolated-one", b"one".to_vec()).unwrap();
         let two_key = two.put_owned("f-isolated-two", b"two".to_vec()).unwrap();
         assert!(one.has(&one_key));
@@ -663,6 +751,130 @@ mod tests {
         one.wipe(Wipe::Everything).unwrap();
         assert!(!one.has(&one_key));
         assert!(two.has(&two_key));
+        two.wipe(Wipe::Everything).unwrap();
+    }
+
+    /// A "clear cached media" issued by one account must empty *its* cache and
+    /// leave every other account's untouched — the A/B the review asked for,
+    /// and what the global write this replaced got wrong twice over: it
+    /// billed the whole directory to one account, and its `Cache` rule
+    /// matched `a-` rather than the `a<n>-` the namespace actually writes, so
+    /// it removed neither correctly.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn clearing_one_accounts_cache_leaves_the_other_intact() {
+        let _alone = alone();
+        let one = AccountMedia::new(test_account(12));
+        let two = AccountMedia::new(test_account(13));
+        let one_key = one.put_owned("f-clear-a", b"a".to_vec()).unwrap();
+        let two_key = two.put_owned("f-clear-b", b"b".to_vec()).unwrap();
+
+        one.wipe(Wipe::Cache).unwrap();
+
+        assert!(!one.has(&one_key), "A's cached download is gone");
+        assert!(two.has(&two_key), "B's cached download is untouched");
+        two.wipe(Wipe::Everything).unwrap();
+    }
+
+    /// A send payload is filed under the account that staged it, so the same
+    /// local name in two accounts is two files and neither can take the
+    /// other's.
+    ///
+    /// Two ids of this test's own rather than 1 and 2: the media directory is
+    /// one, shared by every test in this binary and every other process on the
+    /// machine, so an account id another test also uses would have this test's
+    /// wipe take that test's payload.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn a_staged_send_is_private_to_the_account_that_staged_it() {
+        let _alone = alone();
+        let one = AccountMedia::new(test_account(0));
+        let two = AccountMedia::new(test_account(1));
+        let name = "same-local-name";
+
+        // The full key is what a send names and what the front end writes
+        // under, so the write here is the module-level one that takes a whole
+        // key rather than `AccountMedia::put_owned`, which would prefix a key
+        // that already carries one.
+        let one_key = one.staged_key(name);
+        let two_key = two.staged_key(name);
+        assert_ne!(one_key, two_key);
+        crate::media::put_owned(&one_key, b"one's payload".to_vec()).unwrap();
+        crate::media::put_owned(&two_key, b"two's payload".to_vec()).unwrap();
+
+        // B cannot consume A's payload by naming A's key.
+        assert!(
+            two.take_staged(&one_key).is_none(),
+            "B consumed a payload A staged"
+        );
+        assert!(one.has(&one_key), "and A's payload is still there");
+        assert_eq!(one.take_staged(&one_key).unwrap(), b"one's payload");
+        assert_eq!(two.take_staged(&two_key).unwrap(), b"two's payload");
+    }
+
+    /// A reset of the account takes its staged sends with it — the promise
+    /// the teardown's "staged uploads included" comment makes, which was not
+    /// true while a staged key carried no account prefix.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn forgetting_an_account_takes_its_staged_sends_too() {
+        let _alone = alone();
+        let one = AccountMedia::new(test_account(14));
+        let two = AccountMedia::new(test_account(15));
+        let one_send = one.staged_key("send-a");
+        let two_send = two.staged_key("send-b");
+        crate::media::put_owned(&one_send, b"a".to_vec()).unwrap();
+        crate::media::put_owned(&two_send, b"b".to_vec()).unwrap();
+
+        one.wipe(Wipe::Everything).unwrap();
+
+        assert!(!one.has(&one_send), "A's own staged send is gone");
+        assert!(two.has(&two_send), "B's staged send is untouched");
+        two.wipe(Wipe::Everything).unwrap();
+    }
+
+    /// Usage is per account: a storage pane must not report every other local
+    /// account's photos as this one's.
+    ///
+    /// Measured as a delta, because the physical directory is shared by every
+    /// process on the machine: another test's account-1 entries can already be
+    /// there, and only what this test writes is its to assert about.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn storage_usage_is_scoped_to_one_account() {
+        let _alone = alone();
+        let one = AccountMedia::new(test_account(16));
+        let two = AccountMedia::new(test_account(17));
+        // A leftover from a run that died mid-test would otherwise be billed
+        // to the delta this asserts.
+        one.wipe(Wipe::Everything).unwrap();
+        two.wipe(Wipe::Everything).unwrap();
+        let before_one = one.usage().0;
+        let before_two = two.usage().0;
+
+        one.put_owned("f-usage-a", b"aaaa".to_vec()).unwrap();
+        two.put_owned("f-usage-b", b"bb".to_vec()).unwrap();
+
+        assert!(
+            one.usage().0 >= before_one + 4,
+            "A's own entry was not counted"
+        );
+        assert!(
+            two.usage().0 >= before_two + 2,
+            "B's own entry was not counted"
+        );
+        assert_eq!(
+            two.usage().0,
+            before_two + 2,
+            "A's bytes leaked into B's usage"
+        );
+        assert_eq!(
+            one.usage().0,
+            before_one + 4,
+            "B's bytes leaked into A's usage"
+        );
+
+        one.wipe(Wipe::Everything).unwrap();
         two.wipe(Wipe::Everything).unwrap();
     }
 

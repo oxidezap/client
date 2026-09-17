@@ -116,28 +116,56 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     // `AccountId::LEGACY`: on macOS the tray already attached to it before
     // this function ever ran, so that account's runtime is spawned through
     // it rather than through a second, disconnected hub `spawn` would build.
-    // This covers a fresh install (no rows yet) and an existing single- or
-    // multi-account database that still has this id — which today is every
-    // reachable state, since nothing in this daemon can remove the legacy
-    // slot yet (only reset it, which keeps the id).
-    supervisor
-        .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
-        .await;
-
-    // Every other account this database already knows about, started the
-    // same way `CreateAccount` will start a brand new one — its own hub,
-    // plugin host and command channel, none of it shared with the legacy
-    // slot above.
+    //
+    // Which ids actually get spawned depends on what the shared database
+    // already lists, and deliberately does *not* default to "always start
+    // the legacy id": `RemoveAccount` can retire it like any other, and a
+    // startup that spawned it anyway would silently reopen a removed
+    // account's slot every time the daemon restarted — the exact
+    // "aposentar" guarantee `StoreRegistry::remove_account`'s own
+    // `AUTOINCREMENT`-backed id allocation exists to make.
     match stores.accounts().await {
+        Ok(existing) if existing.is_empty() => {
+            // First launch: nothing in the database yet, so there is no
+            // account here for a prior removal to have made permanent —
+            // there is no account here at all. Spawn the legacy slot
+            // through the hub already built for it.
+            supervisor
+                .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
+                .await;
+        }
         Ok(existing) => {
             for account in existing {
                 if account.id == AccountId::LEGACY {
-                    continue; // already spawned above, through the pre-built hub.
+                    // Still here: spawn it through the pre-built hub rather
+                    // than a second, disconnected one `spawn` would build.
+                    supervisor
+                        .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
+                        .await;
+                } else {
+                    // Every other account this database already knows
+                    // about, started the same way `CreateAccount` will
+                    // start a brand new one — its own hub, plugin host and
+                    // command channel, none of it shared with the legacy
+                    // slot.
+                    supervisor.spawn(account.id).await;
                 }
-                supervisor.spawn(account.id).await;
             }
+            // If `AccountId::LEGACY` was removed, it is simply absent from
+            // `existing` and nothing above spawns it — which is the whole
+            // fix: a removed id stays removed across a restart instead of
+            // this loop quietly recreating its slot.
         }
-        Err(e) => log::error!("could not list existing accounts at startup: {e:#}"),
+        Err(e) => {
+            log::error!("could not list existing accounts at startup: {e:#}");
+            // The same fallback a single-account daemon always had: a
+            // listing error is not a reason to refuse to start, so assume
+            // the legacy slot and let whatever is actually wrong surface
+            // once a session tries to open its store.
+            supervisor
+                .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
+                .await;
+        }
     }
 
     // Off unless asked for. The local endpoint is protected by the

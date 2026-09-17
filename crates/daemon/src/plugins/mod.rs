@@ -76,6 +76,88 @@ pub fn account_state_dir(account_id: AccountId) -> Option<std::path::PathBuf> {
     oxidezap_plugin_host::default_state_dir().map(|root| root.join(account_id.get().to_string()))
 }
 
+/// Move a pre-multi-account `plugin-state/` into the legacy account's slot.
+///
+/// Before multi-account, every plugin's approvals and settings lived directly
+/// under `plugin-state/`; now they live under `plugin-state/<account>/`. The
+/// legacy account is the one the single-account client paired, so its state
+/// was the root's: without this, an upgrade keeps the modules and silently
+/// starts account 1 with no approvals and no settings, which is user data
+/// lost for no reason. Run once, idempotently, before any plugin loads.
+///
+/// Only the *legacy* account may claim the root: a second account is never
+/// the one that wrote it, so migrating on its behalf would hand it the first
+/// account's recorded permissions — consent given for an account that is not
+/// this one.
+#[cfg(not(target_family = "wasm"))]
+pub fn migrate_legacy_state(account_id: AccountId) {
+    let Some(root) = oxidezap_plugin_host::default_state_dir() else {
+        return;
+    };
+    migrate_legacy_state_in(&root, account_id);
+}
+
+/// The migration itself, against a state root the caller supplies.
+///
+/// Split out so it can be tested against a temporary directory rather than the
+/// machine's real per-user one: the property is "the root's unscoped contents
+/// became the legacy account's", and the root is the only thing the test has
+/// to choose.
+#[cfg(not(target_family = "wasm"))]
+fn migrate_legacy_state_in(root: &std::path::Path, account_id: AccountId) {
+    if account_id != AccountId::LEGACY {
+        return;
+    }
+    let target = root.join(account_id.get().to_string());
+    // The root's entries, but only the files and directories that are state:
+    // an account slot is a numeric directory, and anything already under one
+    // has been migrated, so a non-numeric entry is what is left of the old
+    // layout.
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut moved_any = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.parse::<i32>().is_ok() {
+            continue;
+        }
+        // A move onto a name this same account already has would overwrite the
+        // newer file with the older one; leave it, and say which, rather than
+        // choosing silently.
+        let destination = target.join(name);
+        if destination.exists() {
+            log::warn!(
+                "plugin state {} was left in place: {} already exists",
+                entry.path().display(),
+                destination.display()
+            );
+            continue;
+        }
+        if let Err(e) = std::fs::create_dir_all(&target) {
+            log::error!(
+                "could not create the plugin state directory for account {}: {e}",
+                account_id.get()
+            );
+            return;
+        }
+        match std::fs::rename(entry.path(), &destination) {
+            Ok(()) => moved_any = true,
+            Err(e) => log::error!(
+                "could not move legacy plugin state {}: {e}",
+                entry.path().display()
+            ),
+        }
+    }
+    if moved_any {
+        log::info!(
+            "moved pre-multi-account plugin state into account {}'s directory",
+            account_id.get()
+        );
+    }
+}
+
 /// Read the plugin folder again and replace what is running with what is in
 /// it now, without stopping the daemon or the session.
 ///
