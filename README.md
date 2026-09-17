@@ -29,6 +29,8 @@ database, however many windows you like.
 | `oxidezap-session` | Connection, event stream, sends, store hydration. |
 | `oxidezap-ipc` | The protocol between the daemon and its front ends, and the client end of the transport. |
 | `oxidezap-daemon` | `oxidezapd`: the session, the socket and the tray. |
+| `oxidezap-wire` | The DTOs and envelopes a scriptable front end speaks, with no heavy dependencies. |
+| `oxidezap-cli` | `oxidezap-cli`: the scriptable front end onto the daemon. |
 | `oxidezap-gui` | `oxidezap`: GPUI front end, plus video decode. Also builds to WebAssembly. |
 | `oxidezap-plugin-abi` | The wasm ABI: constants and the widget-tree codec. `no_std`, no dependencies. |
 | `oxidezap-plugin-host` | Runs `.wasm` plugins inside the daemon: discovery, the sandbox, approvals. |
@@ -40,9 +42,10 @@ Prebuilt binaries for Linux, macOS and Windows are attached to each
 [release](https://github.com/oxidezap/client/releases). Builds of `main` are
 published continuously under the `nightly` tag.
 
-Each platform archive holds two binaries that belong together: `oxidezap` is
-the window and `oxidezapd` holds the session. Keep them in the same directory
-— the window looks for the daemon beside itself.
+Each platform archive holds three binaries that belong together: `oxidezap` is
+the window, `oxidezapd` holds the session, and `oxidezap-cli` is the scriptable
+front end onto that same daemon. Keep them in the same directory — the window
+and the CLI look for the daemon beside themselves.
 
 ```bash
 tar -xzf oxidezap-nightly-linux-x86_64.tar.gz
@@ -57,7 +60,7 @@ The binaries are unsigned, so macOS Gatekeeper and Windows SmartScreen will
 object. On macOS, clear the quarantine flag before the first run:
 
 ```bash
-xattr -dr com.apple.quarantine oxidezap oxidezapd
+xattr -dr com.apple.quarantine oxidezap oxidezapd oxidezap-cli
 ```
 
 ## Build
@@ -69,8 +72,8 @@ development packages:
 sudo apt install libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev \
   libwayland-dev libxcb1-dev libfontconfig1-dev libfreetype6-dev
 
-# Both, because the window starts the daemon beside itself.
-cargo build --release --bin oxidezap --bin oxidezapd
+# All three, because the window and the CLI start the daemon beside themselves.
+cargo build --release --bin oxidezap --bin oxidezapd --bin oxidezap-cli
 ./target/release/oxidezap
 ```
 

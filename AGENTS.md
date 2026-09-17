@@ -86,10 +86,11 @@ cargo test -p oxidezap-plugin-host --all-features -- --ignored
 ```
 
 `cargo xtask help` lists the repository's own tooling — prefer asking it to
-assuming, since tasks are added there. Running the client is two binaries and
-the window looks for the daemon beside itself; `cargo build --release` then run
-the front-end binary. The web build, plugin builds, the browser test runner and
-the profiling and source-map builds are in
+assuming, since tasks are added there. Running the client is the window and the
+daemon, and the window looks for the daemon beside itself; `cargo build
+--release` then run the front-end binary. `oxidezap-cli` is a third binary, a
+front end onto the same daemon. The web build, plugin builds, the browser test
+runner and the profiling and source-map builds are in
 **[docs/building.md](docs/building.md)**.
 
 ## Rules that are not obvious

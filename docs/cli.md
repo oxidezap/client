@@ -6,6 +6,10 @@ socket. When no daemon is listening the CLI starts one beside itself, the
 same way the window does, so a first `oxidezap-cli status` on a fresh
 machine works without a separate launch.
 
+The binary ships in the same archive as the window and the daemon, in the
+`oxidezap-cli` file beside `oxidezap` and `oxidezapd`, so a release download
+is enough to use it. To build it from source:
+
 ```bash
 cargo build --release -p oxidezap-cli
 ./target/release/oxidezap-cli status

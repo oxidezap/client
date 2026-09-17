@@ -951,6 +951,18 @@ impl WhatsAppClient {
                 .map_err(|e| format!("database query failed: {e}"))?;
             if let Some(oldest) = oldest {
                 let from_me = oldest.from_me;
+                // Read before the request, not after it. The baseline is what
+                // the store held *before* the ask, and a reply fast enough to
+                // land before a post-request read would already be inside the
+                // count, so the wait would never see it grow and would spend
+                // the whole budget on an answer it had.
+                let before_oldest = oldest.timestamp.timestamp_millis();
+                let before_count = live
+                    .chat_store
+                    .message_coverage(Some(&chat))
+                    .await
+                    .map(|coverage| coverage.stored_count)
+                    .unwrap_or(0);
                 if let Err(e) = live
                     .client
                     .fetch_message_history(
@@ -982,13 +994,6 @@ impl WhatsAppClient {
                     // same-timestamp batch does, and waiting the whole budget
                     // for a second signal that already arrived would spend
                     // fifteen seconds on a reply the store had taken.
-                    let before_oldest = oldest.timestamp.timestamp_millis();
-                    let before_count = live
-                        .chat_store
-                        .message_coverage(Some(&chat))
-                        .await
-                        .map(|coverage| coverage.stored_count)
-                        .unwrap_or(0);
                     let deadline = wacore::time::Instant::now() + HISTORY_SYNC_WAIT;
                     loop {
                         match live.chat_store.message_coverage(Some(&chat)).await {
