@@ -81,6 +81,43 @@ async fn an_out_of_order_commit_does_not_store_the_older_picture() {
     );
 }
 
+/// A removal only drops the row it named. A picture resolved after the
+/// removal was decided must not be deleted by the removal's late commit.
+#[tokio::test]
+async fn a_stale_removal_does_not_delete_a_newer_picture() {
+    let (_store, chat_store) = test_store().await;
+
+    // The newer picture commits first, the older removal second.
+    chat_store
+        .record_avatar(&jid(PEER), "picture-new", "a-new", 5)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    chat_store.clear_avatar(&jid(PEER), 3).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let descriptors = chat_store.avatar_descriptors().await.unwrap();
+    assert_eq!(descriptors.len(), 1, "the removal deleted a newer picture");
+    assert_eq!(descriptors[0].picture_id, "picture-new");
+}
+
+/// A removal that is genuinely newer does drop the row.
+#[tokio::test]
+async fn a_newer_removal_drops_the_descriptor() {
+    let (_store, chat_store) = test_store().await;
+    chat_store
+        .record_avatar(&jid(PEER), "picture-1", "a-one", 1)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    chat_store.clear_avatar(&jid(PEER), 2).unwrap();
+    chat_store.flush().await.unwrap();
+
+    assert!(
+        chat_store.avatar_descriptors().await.unwrap().is_empty(),
+        "the pointer outlived the picture it named"
+    );
+}
+
 /// Nothing in the row is a signed URL or a token. The source is the thing that
 /// expires, and a credential in the store is a credential in every backup.
 #[tokio::test]

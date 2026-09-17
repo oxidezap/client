@@ -54,3 +54,26 @@ pub(super) fn upsert(
         .execute(conn)
         .map(|_| ())
 }
+
+/// Drop a chat's descriptor, unless a newer resolution already replaced it.
+///
+/// The `seq` guard is what keeps a removal from deleting a picture that was
+/// resolved after the removal was decided: the row only goes if it is still
+/// the one the removal named.
+pub(super) fn delete(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &Jid,
+    seq: u64,
+) -> QueryResult<()> {
+    let jid = jid.to_string();
+    let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+    let victims = diesel::QueryDsl::filter(
+        schema::avatar_descriptors::table,
+        schema::avatar_descriptors::device_id
+            .eq(device_id)
+            .and(schema::avatar_descriptors::jid.eq(jid))
+            .and(schema::avatar_descriptors::seq.lt(seq)),
+    );
+    diesel::delete(victims).execute(conn).map(|_| ())
+}

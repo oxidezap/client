@@ -49,7 +49,7 @@ pub use chat::{
     Resend,
 };
 pub use chat::{fallback_chat_name, fallback_sender_name};
-pub use events::{AvatarResolution, ReceiptType, UiEvent};
+pub use events::{AvatarOutcome, AvatarResolution, ReceiptType, UiEvent};
 pub use group::{GroupMember, GroupRoster};
 pub use links::{LinkSpan, find_links as find_message_links, find_links_in};
 pub use log_level::{LogLevel, UnknownLogLevel};

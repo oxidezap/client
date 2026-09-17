@@ -392,8 +392,10 @@ fn a_resolved_picture_is_the_only_thing_that_starts_a_fetch() {
     bridge.observe(UiEvent::AvatarsResolved {
         resolutions: vec![oxidezap_core::AvatarResolution {
             jid: "1@s.whatsapp.net".into(),
-            picture_id: "picture-1".into(),
-            source: None,
+            outcome: oxidezap_core::AvatarOutcome::Found {
+                picture_id: "picture-1".into(),
+                source: None,
+            },
         }],
     });
 
@@ -403,26 +405,23 @@ fn a_resolved_picture_is_the_only_thing_that_starts_a_fetch() {
     );
 }
 
-/// An empty picture id is not evidence of removal.
-///
-/// The library folds "no picture", "unchanged", a partial response and *not
-/// authorized* into one `Ok(None)`, so a session that sent an empty id is
-/// saying "nothing definite", not "gone". Treating it as removal would let a
-/// privacy refusal erase a valid avatar, so the daemon must not act on it.
-#[test]
-fn an_ambiguous_picture_answer_starts_nothing() {
+/// `NotFound` is the one outcome that removes, and it is a fact the library
+/// now tells apart from a refusal.
+#[tokio::test]
+async fn a_not_found_answer_removes_the_picture() {
     let mut bridge = bridge();
     bridge.observe(UiEvent::AvatarsResolved {
         resolutions: vec![oxidezap_core::AvatarResolution {
             jid: "1@s.whatsapp.net".into(),
-            picture_id: String::new(),
-            source: None,
+            outcome: oxidezap_core::AvatarOutcome::NotFound,
         }],
     });
 
+    // The removal takes a selection for the same reason a fetch does: so a
+    // picture resolved afterwards is not undone by it.
     assert!(
-        !crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
-        "an answer that says nothing definite must not change what the chat shows"
+        crate::avatar::has_selection(&bridge.hub, "1@s.whatsapp.net"),
+        "a removal is a resolution too, and it is what the chat's picture now is"
     );
 }
 

@@ -271,6 +271,32 @@ impl AvatarRecorder {
             }
         }
     }
+
+    /// Drop `jid`'s descriptor, because WhatsApp says it has no picture.
+    ///
+    /// Awaitable and ordered for the reason [`record`](Self::record) is: the
+    /// row must be gone before the removal is announced, and a removal must
+    /// not undo a picture resolved after it.
+    pub async fn clear(&self, jid: String, seq: u64) -> bool {
+        let Some(live) = self.session.lock().await.clone() else {
+            return false;
+        };
+        let Ok(jid) = jid.parse::<Jid>() else {
+            return false;
+        };
+        let store = &live.chat_store;
+        if let Err(e) = store.clear_avatar(&jid, seq) {
+            warn!("could not drop the avatar descriptor: {e}");
+            return false;
+        }
+        match store.flush().await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("the avatar removal did not commit: {e}");
+                false
+            }
+        }
+    }
 }
 
 /// How long each phase of a cold start took, so the one line that reports

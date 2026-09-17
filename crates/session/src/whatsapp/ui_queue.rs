@@ -469,13 +469,14 @@ fn estimated_bytes(event: &UiEvent) -> usize {
                 + resolutions
                     .iter()
                     .map(|resolution| {
-                        string_bytes(&resolution.jid)
-                            + string_bytes(&resolution.picture_id)
-                            + resolution
-                                .source
-                                .as_deref()
-                                .map(string_bytes)
-                                .unwrap_or_default()
+                        let picture = match &resolution.outcome {
+                            oxidezap_core::AvatarOutcome::Found { picture_id, source } => {
+                                string_bytes(picture_id)
+                                    + source.as_deref().map(string_bytes).unwrap_or_default()
+                            }
+                            _ => 0,
+                        };
+                        string_bytes(&resolution.jid) + picture
                     })
                     .sum::<usize>()
         }

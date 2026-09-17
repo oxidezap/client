@@ -513,30 +513,18 @@
   inbound message would sit between the store and every front end, which the
   whole state model assumes it cannot — plugins observe and act, they do not
   filter.
-- **A removed profile picture keeps showing.** `whatsapp-rust`'s
-  `Contacts::get_profile_picture` folds four different answers into one
-  `Ok(None)`: no picture (`404`), not authorized (`401`), an unchanged picture
-  (`304`), and a partial response with no usable URL. `Oxidezap` cannot tell
-  which one it got, and deleting a known avatar on an ambiguous answer would
-  let a privacy refusal erase a valid picture — the exact bug `community`
-  would produce, since that path can answer `401` for a chat with a picture.
-  So the session treats `Ok(None)` as "nothing definite"
-  (`session/whatsapp/avatar.rs`, `Lookup::Unknown`) and the daemon never
-  removes a descriptor. The fix belongs upstream: a typed result such as
-  `Found` / `NotFound` / `NotAuthorized` / `Unchanged`, at which point only
-  `NotFound` may be destructive. Until then a picture that is genuinely gone
-  stays on screen until its id changes or the media cache is cleared.
-- **Community pictures have no explicit path.** A community parent is a
-  `@g.us` JID, but WhatsApp Web queries its picture through the `w:g2`
-  `pictures` stanza with a `parent_group_jid` hint rather than the
-  `w:profile:picture` spec the client uses for everything, and the server can
-  answer `401` to the generic query. That `401` folds into `Ok(None)` above,
-  so the failure is silent rather than wrong: no picture is drawn, and the
-  previous one is not erased. The upstream library has no primitive that
-  returns a downloadable parent-community picture, and a protocol
-  implementation does not belong in the client, so this waits on
-  `whatsapp-rust` adding one. Ordinary groups and channels do go through the
-  generic spec and are covered by tests.
+- **A community parent's picture goes through a fallback, not a known type.**
+  A community parent is an ordinary `@g.us` address, so nothing about the JID
+  says whether the picture comes from `w:profile:picture` or the `w:g2`
+  `pictures` query with a `parent_group_jid` hint; only the group metadata's
+  `is_parent_group` says, and fetching that would be an extra IQ per group on
+  every connect. So the client asks the ordinary query first and, only when it
+  answers `NotAuthorized`, asks the community one and keeps just a `Found` from
+  it (`session/whatsapp/avatar.rs`). That is correct and non-destructive — a
+  normal group that is merely privacy-restricted refuses both and keeps its
+  picture — but it costs a second IQ for a community parent that has a picture.
+  The alternative is carrying `is_parent_group` into the chat state, which is a
+  protocol field the client does not model today.
 
 Clickable `div`s that remain are deliberate: a chat row and a media thumbnail
 are surfaces, not commands, and have no semantic component to compose from.

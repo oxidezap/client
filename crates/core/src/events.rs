@@ -308,12 +308,37 @@ pub enum UiEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AvatarResolution {
     pub jid: String,
-    pub picture_id: String,
-    /// Signed and short-lived. Never persisted, and never serialized: the
-    /// daemon is its only reader, and a credential does not belong in a frame
-    /// any front end could log.
-    #[serde(default, skip_serializing)]
-    pub source: Option<String>,
+    pub outcome: AvatarOutcome,
+}
+
+/// What a metadata lookup decided that some other part has to act on.
+///
+/// Typed rather than "an id, empty when absent", because the difference
+/// between "no picture" and "could not tell" is the whole of whether a known
+/// avatar may be erased. That is exactly the ambiguity the library used to
+/// have and now does not, so it is carried through rather than flattened again
+/// on this side.
+///
+/// Only the two outcomes with an action are here. `Unchanged`, a refusal and a
+/// rate limit all leave the previous picture standing, so they are not
+/// published: the resolver remembers the chat as asked and nothing downstream
+/// has anything to do. A future outcome the library adds is read as one of
+/// those until this side decides otherwise, and the wildcard in the resolver
+/// is what guarantees it cannot arrive as `NotFound`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarOutcome {
+    /// A picture to fetch and cache.
+    Found {
+        picture_id: String,
+        /// Signed and short-lived. Never persisted, never serialized: the
+        /// daemon is its only reader, and a credential does not belong in a
+        /// frame any front end could log.
+        #[serde(default, skip_serializing)]
+        source: Option<String>,
+    },
+    /// WhatsApp says this chat has no picture. The one destructive answer.
+    NotFound,
 }
 
 /// A receipt type as WhatsApp spells it, which is the only spelling that

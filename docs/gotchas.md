@@ -1623,6 +1623,23 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   past PENDING already has a real server answer and must never be regressed.
 - **An invalidation is a claim that something changed.** A subscriber answers
   `StoreChange` by re-querying, so emitting one for a batch that wro
+- **Migration versions are shared with `whatsapp-rust-sqlite-storage`, so name
+  them apart.** `chat-store` and the device store migrate the *same SQLite
+  file*, and diesel keeps one ledger — `__diesel_schema_migrations` — for both.
+  A migration's version is its directory's leading segment with the dashes
+  removed, so `2026-09-16-000000_anything` is `20260916000000` no matter which
+  crate wrote it. Two crates choosing that timestamp is one published row, and
+  whichever migrates first makes the other's migration a silent no-op: upstream
+  added `2026-09-16-000000_drop_msg_secrets_created_at` while this tree had
+  `2026-09-16-000000_message_stable_id`, the device store runs first on every
+  open, and the chat store then failed with `no such column: T.id` because its
+  rewrite never ran at all. This crate's timestamps are now `…-100000` and
+  `…-100001`, clear of upstream's range, and `adopt_renumbered` records the new
+  versions for a database written under the old ones — guarded by a schema
+  probe, so a database whose row is upstream's is left for the normal path.
+  A new migration here has to check upstream's
+  `storages/sqlite-storage/migrations` for a taken timestamp first, and the
+  guard is only needed for a rename that already shipped.
 - **Message storage is compacted on write and rehydrated on read, and the
   `id` is the rowid by a durable name.** `messages.id INTEGER PRIMARY KEY`
   carries the old rowid values across the rewrite, so arrival cursors, the
@@ -1686,12 +1703,12 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   ignored the `direct_path` it needed as a fallback. The status broadcast,
   broadcast lists and the system account are never asked about.
 
-  Two things are deliberately not claimed here. `Ok(None)` is *not* an answer
-  about removal — the library folds `404`, `401`, `304` and a partial response
-  into it, so the session reads it as `Lookup::Unknown` and the daemon never
-  deletes a descriptor; a privacy refusal must not erase a valid picture.
-  And a community parent has no explicit path: WhatsApp Web queries it through
-  `w:g2` with a `parent_group_jid` hint, which the upstream library does not
-  expose, so it currently fails silently rather than wrongly. Both are in
-  docs/roadmap.md.
+  `NotFound` is the only outcome that destroys: the library now returns a
+  typed `ProfilePictureLookup`, so `NotAuthorized`, `RateOverlimit`,
+  `Unchanged` and a partial response are all told apart from "there is no
+  picture here" and none of them removes a descriptor. A community parent is an
+  ordinary `@g.us` address, so which query it needs is not visible in the JID;
+  the client asks the ordinary one first and falls back to the `w:g2` query
+  only on `NotAuthorized`, keeping just a `Found` from it. docs/roadmap.md
+  carries what that costs.
 

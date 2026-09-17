@@ -380,7 +380,7 @@ impl Bridge {
     }
 }
 
-/// Answer a resolved picture by fetching its bytes.
+/// Answer a resolved picture, by outcome.
 ///
 /// The one thing the daemon does with an avatar event, and deliberately the
 /// only place it touches the network for a picture. A history load is *not*
@@ -394,13 +394,7 @@ fn prepare_avatars(
 ) {
     if let UiEvent::AvatarsResolved { resolutions } = event {
         for resolution in resolutions.iter() {
-            crate::avatar::resolved(
-                hub,
-                recorder,
-                &resolution.jid,
-                &resolution.picture_id,
-                resolution.source.as_deref(),
-            );
+            crate::avatar::resolve(hub, recorder, &resolution.jid, &resolution.outcome);
         }
     }
 }

@@ -45,27 +45,34 @@ static LATEST: LazyLock<Mutex<HashMap<(usize, String), Selection>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Turn a resolved picture into cached bytes and a durable descriptor.
+/// Turn a resolved outcome into cached bytes and a durable descriptor.
 ///
-/// A cache hit is published straight away and the descriptor is (re)written,
-/// which is how a descriptor lost to an earlier failure heals; a miss fetches,
-/// and only writes the descriptor once the bytes are in.
+/// `Found` is the only outcome that changes a picture: a cache hit is
+/// published straight away and the descriptor is (re)written, which is how a
+/// descriptor lost to an earlier failure heals; a miss fetches, and only
+/// writes the descriptor once the bytes are in.
 ///
-/// Nothing here removes a picture. The library folds "no picture", "unchanged",
-/// a partial response and *not authorized* into one `Ok(None)`, so a `None`
-/// says nothing definite about removal and acting on it would let a privacy
-/// refusal erase a valid avatar. The session resolves that ambiguity into
-/// [`Lookup::Unknown`](crate) before any of this runs; a picture that is truly
-/// gone keeps showing until its id changes or the cache is cleared.
-pub fn resolved(
+/// `NotFound` is the only outcome that removes one, and it is now a fact the
+/// library tells apart from a refusal: `NotAuthorized`, `RateOverlimit`,
+/// `Unchanged` and a partial response never reach here at all, so a privacy
+/// restriction cannot erase a picture that is there.
+pub fn resolve(
     hub: &Arc<StateHub>,
     recorder: &AvatarRecorder,
     jid: &str,
-    picture_id: &str,
-    source: Option<&str>,
+    outcome: &oxidezap_core::AvatarOutcome,
 ) {
+    use oxidezap_core::AvatarOutcome;
+    let (picture_id, source) = match outcome {
+        AvatarOutcome::Found { picture_id, source } => (picture_id.as_str(), source.as_deref()),
+        AvatarOutcome::NotFound => {
+            remove(hub, recorder, jid);
+            return;
+        }
+    };
     if picture_id.is_empty() {
-        // No id at all. Not evidence of removal, so nothing is written.
+        // A found picture with no id cannot be addressed or cached; there is
+        // nothing to write and nothing to remove.
         return;
     }
     let id = picture_id.to_string();
@@ -137,6 +144,36 @@ pub fn resolved(
     });
 }
 
+/// Drop a chat's picture, because WhatsApp says there is none.
+///
+/// The descriptor goes first, so a restart cannot draw a picture the account
+/// no longer has; then every front end is told to draw the placeholder. The
+/// cached bytes are left for the budget sweep.
+///
+/// The removal takes a selection like a fetch does, so a picture resolved
+/// *after* this removal is not undone by it: the removal is only applied if
+/// nothing newer has been recorded for the chat.
+fn remove(hub: &Arc<StateHub>, recorder: &AvatarRecorder, jid: &str) {
+    let selection = record_selection(hub, jid, None, None);
+    oxidezap_session::spawn({
+        let hub = Arc::clone(hub);
+        let jid = jid.to_string();
+        let recorder = recorder.clone();
+        async move {
+            if !is_current(&hub, &jid, &selection) {
+                return;
+            }
+            if !recorder.clear(jid.clone(), selection.token).await {
+                return;
+            }
+            if !is_current(&hub, &jid, &selection) {
+                return;
+            }
+            publish_cleared(&hub, &jid);
+        }
+    });
+}
+
 fn publish_ready(hub: &StateHub, jid: String, key: String) {
     let event = oxidezap_core::UiEvent::AvatarReady { jid, key };
     match serde_json::to_string(&DaemonMessage::Session {
@@ -145,6 +182,14 @@ fn publish_ready(hub: &StateHub, jid: String, key: String) {
         Ok(frame) => hub.publish_session(frame),
         Err(error) => log::error!("could not serialize avatar readiness: {error}"),
     }
+}
+
+/// Tell every front end this chat no longer has a picture.
+///
+/// An empty key is the placeholder, which is the right drawing for a chat
+/// WhatsApp says has no picture.
+fn publish_cleared(hub: &StateHub, jid: &str) {
+    publish_ready(hub, jid.to_string(), String::new());
 }
 
 pub fn purge(hub: &StateHub) {

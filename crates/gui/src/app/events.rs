@@ -120,7 +120,16 @@ impl WhatsAppApp {
             UiEvent::AvatarsResolved { resolutions } => {
                 for resolution in resolutions {
                     if let Some(chat) = self.find_chat_mut(&resolution.jid) {
-                        chat.avatar_picture_id = Some(resolution.picture_id);
+                        match resolution.outcome {
+                            oxidezap_core::AvatarOutcome::Found { picture_id, .. } => {
+                                chat.avatar_picture_id = Some(picture_id);
+                            }
+                            // The chat has no picture: drop what was held so
+                            // the next state carries the placeholder.
+                            oxidezap_core::AvatarOutcome::NotFound => {
+                                chat.avatar_picture_id = None;
+                            }
+                        }
                     }
                 }
             }

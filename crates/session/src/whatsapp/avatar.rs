@@ -36,24 +36,86 @@ const AVATAR_CONCURRENCY: usize = 8;
 
 /// What one metadata lookup actually told us.
 ///
-/// The distinction matters because the library folds four different answers
-/// into `Ok(None)`: no picture, an unchanged picture (`304`), a partial
-/// response with no usable URL, and *not authorized* (`401`). Only a positive
-/// answer may change what a chat shows; an ambiguous one must leave a known
-/// avatar alone, or a privacy refusal would erase a valid picture. That is
-/// also why there is no "removed" arm: without a definitive signal from the
-/// library, treating a `None` as removal is the destructive reading this
-/// avoids. A removed picture therefore keeps showing until the picture id
-/// changes or the cache is cleared.
+/// The distinction is why this is not an `Option`: the library used to fold
+/// "no picture" (`404`), "not authorized" (`401`), "unchanged" (`304`) and a
+/// partial response into one `Ok(None)`, and only a positive answer may change
+/// what a chat shows. `NotFound` is the one destructive state, and it is now
+/// told apart from the rest.
 enum Lookup {
     /// A picture with a fetchable source.
     Found { picture_id: String, source: String },
-    /// An answer that says nothing definite. Counted as asked, changes
-    /// nothing.
+    /// The picture did not change, or the answer carried no usable URL.
+    /// Nothing to fetch, nothing to forget.
+    Unchanged,
+    /// WhatsApp says this chat has no picture. The only destructive answer.
+    NotFound,
+    /// A refusal, a rate limit, or a partial response: the previous picture
+    /// stays, because neither is evidence the picture is gone.
     Unknown,
     /// The lookup failed. Deliberately not remembered, so a transient failure
     /// is retried the next time a page names the chat.
     Failed,
+}
+
+impl Lookup {
+    /// The group query's outcome, plus the community fallback.
+    ///
+    /// A community parent is an ordinary `@g.us` address, so the JID cannot
+    /// say which query it needs; only group metadata's `is_parent_group` can,
+    /// and fetching that would be an extra IQ per group on every connect. So
+    /// the community query is a *fallback*, taken when the group query answers
+    /// `NotAuthorized`: a parent refuses `w:profile:picture` and answers the
+    /// `w:g2` query, while a normal group that is merely privacy-restricted
+    /// refuses both.
+    ///
+    /// Only `Found` is taken from the fallback. A non-parent can answer the
+    /// community query with a `404`, and trusting that would erase a picture
+    /// the ordinary query refused to show rather than said was gone — the
+    /// destructive reading this whole type exists to avoid.
+    fn of(outcome: whatsapp_rust::features::ProfilePictureLookup) -> Self {
+        use whatsapp_rust::features::ProfilePictureLookup as Outcome;
+        match outcome {
+            Outcome::Found(picture) if !picture.url.is_empty() => Self::Found {
+                picture_id: picture.id,
+                source: picture.url,
+            },
+            // An id with no URL: the metadata moved but there is nothing to
+            // fetch, so this session keeps what it had.
+            Outcome::Found(_) | Outcome::Unchanged => Self::Unchanged,
+            Outcome::NotFound => Self::NotFound,
+            // Not authorized and rate-limited say nothing about whether the
+            // picture exists, so they must not erase one that does.
+            //
+            // The wildcard is `#[non_exhaustive]`'s: a state this build does
+            // not know about is read as "nothing definite" rather than as the
+            // one destructive answer, because guessing "removed" for an
+            // unknown state is the mistake this type exists to prevent.
+            Outcome::NotAuthorized | Outcome::RateOverlimit | _ => Self::Unknown,
+        }
+    }
+
+    /// Whether the fallback is worth asking, and only it.
+    ///
+    /// The one outcome a community parent is known to produce for the wrong
+    /// query. `RateOverlimit` is deliberately excluded: it is about this
+    /// client's request rate, not about the entity, and asking again would
+    /// spend another request against a limit already reached.
+    fn wants_community_fallback(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    /// Read the fallback's answer, keeping only a picture.
+    ///
+    /// Anything else leaves the original answer standing.
+    fn or_community(self, outcome: whatsapp_rust::features::ProfilePictureLookup) -> Self {
+        match Self::of(outcome) {
+            found @ Self::Found { .. } => found,
+            // Unchanged is not evidence of anything here either: the fallback
+            // never sent an `existing_id`, so there is nothing for it to be
+            // unchanged *against*.
+            _ => self,
+        }
+    }
 }
 
 /// Chats whose metadata this side has already asked about, and when.
@@ -106,32 +168,54 @@ fn lookup_is_useless(jid: &Jid) -> bool {
 
 /// Fetch one chat's picture metadata.
 ///
-/// The generic `ProfilePictureSpec` path handles ordinary contacts, groups,
-/// newsletters and bots alike: the library already skips the privacy-token
-/// dance for everything that is not a plain PN, so this needs no per-kind
-/// branch to be correct.
-///
-/// What this side *does* have to add is the reading of `Ok(None)`, which is
-/// not an answer about removal. See [`Lookup`].
+/// The group branch carries the community fallback; see [`Lookup::or_community`]
+/// for why only a `Found` is taken from it.
 async fn lookup(client: &Arc<Client>, jid: &Jid) -> Lookup {
-    match client.contacts().get_profile_picture(jid, true).await {
-        Ok(Some(picture)) => match picture.url.is_empty() {
-            // A picture id with no URL: the metadata moved but there is
-            // nothing to fetch, so this session keeps what it had.
-            true => Lookup::Unknown,
-            false => Lookup::Found {
-                picture_id: picture.id,
-                source: picture.url,
-            },
-        },
-        Ok(None) => Lookup::Unknown,
-        Err(error) => {
-            // Facts only: never the URL or any token it carries.
-            debug!(
-                "avatar metadata lookup failed for {}: {error}",
-                jid.observe()
-            );
-            Lookup::Failed
+    if jid.is_group() {
+        let asked = match client
+            .groups()
+            .lookup_profile_picture(jid, true, None)
+            .await
+        {
+            Ok(outcome) => Lookup::of(outcome),
+            Err(error) => {
+                debug!(
+                    "avatar metadata lookup failed for {}: {error}",
+                    jid.observe()
+                );
+                return Lookup::Failed;
+            }
+        };
+        if !asked.wants_community_fallback() {
+            return asked;
+        }
+        // Not authorized, which for a community parent is what
+        // `w:profile:picture` answers. Ask the `w:g2` query before giving up.
+        match client
+            .groups()
+            .lookup_community_profile_picture(jid, true, None)
+            .await
+        {
+            Ok(outcome) => asked.or_community(outcome),
+            // A group that is not a parent has no answer here; the original
+            // not-authorized stands, and it was not destructive.
+            Err(_) => asked,
+        }
+    } else {
+        match client
+            .contacts()
+            .lookup_profile_picture(jid, true, None)
+            .await
+        {
+            Ok(outcome) => Lookup::of(outcome),
+            Err(error) => {
+                // Facts only: never the URL or any token it carries.
+                debug!(
+                    "avatar metadata lookup failed for {}: {error}",
+                    jid.observe()
+                );
+                Lookup::Failed
+            }
         }
     }
 }
@@ -172,19 +256,28 @@ pub(super) async fn resolve(
 
         let mut resolutions = Vec::with_capacity(answered.len());
         for (jid, answer) in answered {
-            match answer {
-                Lookup::Found { picture_id, source } => {
-                    resolutions.push(oxidezap_core::AvatarResolution {
-                        jid: jid.to_string(),
-                        picture_id,
-                        source: Some(source),
-                    })
+            let outcome = match answer {
+                Lookup::Found { picture_id, source } => oxidezap_core::AvatarOutcome::Found {
+                    picture_id,
+                    source: Some(source),
+                },
+                Lookup::NotFound => oxidezap_core::AvatarOutcome::NotFound,
+                // An answer with nothing to act on: unchanged, a refusal, a
+                // rate limit, a partial response. Remembered as asked so the
+                // next page does not repeat the request, and not published,
+                // because nothing on the other side would do anything with it.
+                Lookup::Unchanged | Lookup::Unknown => {
+                    resolver.mark_asked(&jid.to_string(), generation);
+                    continue;
                 }
-                // An answer, if not a useful one: remembered so it is not
-                // asked again this connection.
-                Lookup::Unknown => resolver.mark_asked(&jid.to_string(), generation),
-                Lookup::Failed => {}
-            }
+                // A failure is deliberately not remembered, so a transient one
+                // is retried the next time a page names the chat.
+                Lookup::Failed => continue,
+            };
+            resolutions.push(oxidezap_core::AvatarResolution {
+                jid: jid.to_string(),
+                outcome,
+            });
         }
         if resolutions.is_empty() {
             continue;

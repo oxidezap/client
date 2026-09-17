@@ -25,6 +25,7 @@ mod writer;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use wacore::store::error::StoreError;
@@ -117,6 +118,14 @@ pub(crate) enum WriterMsg {
         cache_key: String,
         seq: u64,
     },
+    /// Drop a chat's descriptor, because WhatsApp says it has no picture.
+    ///
+    /// Carries a `seq` like a record does: a removal whose commit lands after
+    /// a newer picture's must not delete it.
+    AvatarCleared {
+        jid: Jid,
+        seq: u64,
+    },
     // String, not StoreError: one batch outcome fans out to many waiters and
     // StoreError is not Clone.
     Flush(oneshot::Sender<std::result::Result<(), String>>),
@@ -193,6 +202,80 @@ impl EventHandler for ChatStoreHandler {
     }
 }
 
+/// Adopt a database whose chat-store migrations were recorded under the
+/// versions they had before they were renumbered.
+///
+/// `chat-store` and `whatsapp-rust-sqlite-storage` migrate the *same file*, and
+/// diesel keeps one ledger (`__diesel_schema_migrations`) for both. A
+/// migration's version is its directory's leading segment with the dashes
+/// removed, so `2026-09-16-000000_...` is `20260916000000` no matter which
+/// crate wrote it. Upstream added its own migrations under that same version,
+/// which means this crate's were recorded as applied without ever having run:
+/// `messages.id` was never created and every open failed with
+/// `no such column: T.id`. They were renumbered to `2026-09-16-100000/100001`
+/// to make the collision impossible.
+///
+/// The renumbering is what this repairs. A database written before it has the
+/// old versions in the ledger and the schema those migrations produce, so this
+/// records the new versions for it without re-running the migrations. Only
+/// runs when the new version is absent *and* the old one present, so a fresh
+/// database (neither) and an already-repaired one (new present) both fall
+/// through to the normal path.
+///
+/// Detection is by schema, not by trusting the ledger alone: the old
+/// `message_stable_id` version is also upstream's `drop_msg_secrets_created_at`
+/// version, so a database that has that row may never have run our migration at
+/// all. `messages.id` is the mark that says it did.
+fn adopt_renumbered(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
+    // (old version, new version, a schema fact only our migration produces).
+    const RENUMBERED: &[(&str, &str, &str)] = &[
+        (
+            "20260916000000",
+            "20260916100000",
+            "SELECT count(*) AS count FROM pragma_table_info('messages') WHERE name = 'id'",
+        ),
+        (
+            "20260916000001",
+            "20260916100001",
+            "SELECT count(*) AS count FROM sqlite_master \
+             WHERE type = 'table' AND name = 'avatar_descriptors'",
+        ),
+    ];
+    for (old, new, produced) in RENUMBERED {
+        let mut recorded = |version: &str| -> diesel::QueryResult<i64> {
+            diesel::sql_query(
+                "SELECT count(*) AS count FROM __diesel_schema_migrations WHERE version = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(version)
+            .get_result::<MigrationCount>(conn)
+            .map(|row| row.count)
+        };
+        if recorded(new)? > 0 {
+            continue;
+        }
+        if recorded(old)? == 0 {
+            continue;
+        }
+        let applied = diesel::sql_query(*produced).get_result::<MigrationCount>(conn)?;
+        if applied.count == 0 {
+            // The old version's row is upstream's, and our migration never ran.
+            // Leave it alone: the normal path will run ours under its new
+            // version, which is exactly what should happen.
+            continue;
+        }
+        diesel::sql_query("INSERT OR IGNORE INTO __diesel_schema_migrations (version) VALUES (?)")
+            .bind::<diesel::sql_types::Text, _>(new)
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
+#[derive(diesel::QueryableByName)]
+struct MigrationCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
 impl ChatStore {
     /// Open (running migrations if needed) on the same database file as
     /// `store`, bound to its device id, and start the writer task.
@@ -201,6 +284,7 @@ impl ChatStore {
         let device_id = store.device_id();
 
         db.run(|conn| {
+            adopt_renumbered(conn).map_err(crate::error::db_err)?;
             conn.run_pending_migrations(MIGRATIONS)
                 .map(|_| ())
                 .map_err(StoreError::Migration)?;
@@ -413,6 +497,19 @@ impl ChatStore {
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
+    /// Drop a chat's descriptor, because WhatsApp says it has no picture.
+    ///
+    /// `seq` orders this against records: a removal from an older resolution
+    /// must not delete a newer picture.
+    pub fn clear_avatar(&self, jid: &Jid, seq: u64) -> Result<()> {
+        self.tx
+            .send(WriterMsg::AvatarCleared {
+                jid: jid.clone(),
+                seq,
+            })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
     /// Record a sender revoke this client just sent for one of its own
     /// messages.
     ///
@@ -535,8 +632,51 @@ impl ChatStore {
 #[cfg(test)]
 mod migration_tests {
     use super::*;
-    use diesel::prelude::*;
     use diesel_migrations::MigrationHarness;
+
+    /// A database written before the renumbering keeps working.
+    ///
+    /// The old ledger carried `20260916000000` for this crate's
+    /// `message_stable_id`, which is also upstream's version. Adoption records
+    /// the new version so the migration is not run a second time over a schema
+    /// that already has its effect.
+    #[tokio::test]
+    async fn a_database_from_before_the_renumbering_is_adopted() {
+        let store = SqliteStore::new(&format!(
+            "file:memdb_chat_store_adopt_{}?mode=memory&cache=shared",
+            std::process::id()
+        ))
+        .await
+        .expect("create store");
+        ChatStore::new(&store).await.expect("run migrations");
+        // The schema the migration produces, which is how adoption tells a
+        // real pre-renumbering database from an upstream-only one.
+        assert!(has_column(&store, "messages", "id").await);
+
+        // Put the ledger back the way the old naming left it.
+        store
+            .shared()
+            .run(|conn| {
+                diesel::sql_query(
+                    "DELETE FROM __diesel_schema_migrations \
+                     WHERE version IN ('20260916100000', '20260916100001');
+                     INSERT OR IGNORE INTO __diesel_schema_migrations (version)
+                     VALUES ('20260916000000'), ('20260916000001')",
+                )
+                .execute(conn)
+                .map(|_| ())
+                .map_err(crate::error::db_err)
+            })
+            .await
+            .expect("rewrite the ledger to the old naming");
+
+        // Reopening adopts rather than re-running, which would fail on the
+        // already-rewritten `messages` table.
+        ChatStore::new(&store)
+            .await
+            .expect("a pre-renumbering database must still open");
+        assert!(has_column(&store, "messages", "id").await);
+    }
 
     #[tokio::test]
     async fn stable_id_downgrade_round_trips_then_sender_identity_refuses() {
