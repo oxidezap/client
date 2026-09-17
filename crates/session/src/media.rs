@@ -54,9 +54,12 @@ pub fn dimensions(
             decoder.set_limits(limits)?;
             Ok(decoder.dimensions())
         }
+        // with_limits, not new plus set_limits: the limits also cap the
+        // png crate's internal buffers while the header parses, and
+        // set_limits alone cannot constrain those after the fact — the
+        // constructor is what the dispatched path used too.
         ImageFormat::Png => {
-            let mut decoder = PngDecoder::new(cursor)?;
-            decoder.set_limits(limits)?;
+            let decoder = PngDecoder::with_limits(cursor, limits)?;
             Ok(decoder.dimensions())
         }
         ImageFormat::Gif => {
@@ -86,7 +89,7 @@ pub fn decode(
     let cursor = std::io::Cursor::new(data);
     match format {
         ImageFormat::Jpeg => decode_with(JpegDecoder::new(cursor)?, limits),
-        ImageFormat::Png => decode_with(PngDecoder::new(cursor)?, limits),
+        ImageFormat::Png => decode_with(PngDecoder::with_limits(cursor, limits.clone())?, limits),
         ImageFormat::Gif => decode_with(GifDecoder::new(cursor)?, limits),
         ImageFormat::WebP => decode_with(WebPDecoder::new(cursor)?, limits),
         _ => Err(unsupported(format)),
