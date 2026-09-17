@@ -18,18 +18,22 @@ use native as imp;
 #[cfg(target_family = "wasm")]
 use web as imp;
 
+use portable_atomic::{AtomicU64, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use oxidezap_core::AvatarDemand;
+use oxidezap_core::{AccountId, AvatarDemand};
+use wacore::time::Instant;
 
 use crate::session::media::{
     clear_image_sources, decode_avatar, get_avatar_image, put_avatar_image,
 };
 
+#[allow(unused_imports)]
 pub use imp::{
-    account_scope, clear_cache_storage, delete_account_storage, read_persistent,
-    rotate_account_scope, spawn_task, write_persistent,
+    active_account, avatar_cache_usage, clear_cache_storage, delete_account_storage,
+    delete_persistent, purge_legacy_caches, read_persistent, rotate_account_scope,
+    set_active_account, spawn_task, write_persistent,
 };
 
 /// Persist an avatar payload to the platform's storage tier.
@@ -37,9 +41,9 @@ pub use imp::{
 pub fn save_avatar(key: &str, bytes: &[u8]) {
     let key = key.to_string();
     let bytes = bytes.to_vec();
-    let scope = account_scope();
+    let account = imp::resolve_account(&key);
     spawn_task(async move {
-        let _ = write_persistent(&key, &bytes, &scope).await;
+        let _ = write_persistent(&key, &bytes, account).await;
     });
 }
 
@@ -51,13 +55,25 @@ pub struct ChatDemand {
     pub cache_key: Option<String>,
 }
 
+/// Priority of an avatar demand: visible rows and active conversation header
+/// take high priority; overscan rows take low priority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DemandPriority {
+    High,
+    Low,
+}
+
 /// Central avatar manager coordinating viewport demands, persistent storage,
 /// and in-memory decoded image caching.
 #[derive(Clone, Default)]
 pub struct AvatarManager {
-    in_flight: Arc<Mutex<HashSet<String>>>,
+    persistent_in_flight: Arc<Mutex<HashSet<String>>>,
+    network_in_flight: Arc<Mutex<HashSet<String>>>,
     revalidated: Arc<Mutex<HashSet<String>>>,
-    pending_demands: Arc<Mutex<HashMap<String, AvatarDemand>>>,
+    failed_cooldowns: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
+    pending_demands: Arc<Mutex<HashMap<String, (AvatarDemand, DemandPriority)>>>,
+    generation: Arc<AtomicU64>,
+    account_id: Arc<Mutex<Option<AccountId>>>,
     session: Arc<Mutex<Option<crate::session::SessionHandle>>>,
 }
 
@@ -66,26 +82,43 @@ impl AvatarManager {
         Self::default()
     }
 
-    /// Set or clear the active session handle.
+    /// Set or clear the active session handle, syncing active account and generation.
     pub fn set_session(&self, session: Option<crate::session::SessionHandle>) {
+        let new_account = session.as_ref().map(|s| s.account());
+        *self.account_id.lock().unwrap_or_else(|e| e.into_inner()) = new_account;
+        set_active_account(new_account);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.reset_connection();
         let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
         *s = session;
+        spawn_task(async {
+            purge_legacy_caches().await;
+        });
     }
 
     /// Reset in-memory cache and tracking (e.g. on cache clear or account change).
     pub fn clear(&self) {
         clear_image_sources();
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.reset_connection();
     }
 
-    /// Clear in-flight and revalidated tracking on connection restart while preserving
-    /// decoded images in memory.
+    /// Clear in-flight, revalidated, and cooldown tracking on connection restart while
+    /// preserving decoded images in memory.
     pub fn reset_connection(&self) {
-        self.in_flight
+        self.persistent_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.network_in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.revalidated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.failed_cooldowns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -95,49 +128,126 @@ impl AvatarManager {
             .clear();
     }
 
-    /// Queue a demand for one chat (e.g. from the chat header or active conversation).
+    /// Queue a demand for one chat (e.g. from the chat header or active conversation)
+    /// with high priority.
     pub fn demand_chat(&self, chat: &ChatDemand) {
-        self.demand_chats(std::slice::from_ref(chat));
+        self.demand_one(chat, DemandPriority::High);
     }
 
-    /// Process viewport demands. Checks RAM first; on miss, checks persistent storage;
-    /// on persistent miss, enqueues demand to the daemon with `need_bytes = true`.
+    /// Process a batch of demands with high priority.
+    #[allow(dead_code)]
     pub fn demand_chats(&self, chats: &[ChatDemand]) {
         for chat in chats {
-            let jid = &chat.jid;
-            if let Some(key) = &chat.cache_key {
-                if get_avatar_image(key).is_some() {
-                    // Cache hit in RAM: check if revalidation is needed for this connection
-                    let mut reval = self.revalidated.lock().unwrap_or_else(|e| e.into_inner());
-                    if reval.insert(jid.clone()) {
-                        self.enqueue_demand(AvatarDemand {
+            self.demand_one(chat, DemandPriority::High);
+        }
+    }
+
+    /// Process viewport demands with visible rows (high priority) and overscan rows
+    /// (low priority), pruning stale overscan demands on fast scroll.
+    pub fn demand_chats_windowed(&self, visible: &[ChatDemand], overscan: &[ChatDemand]) {
+        for chat in visible {
+            self.demand_one(chat, DemandPriority::High);
+        }
+        for chat in overscan {
+            self.demand_one(chat, DemandPriority::Low);
+        }
+
+        // Prune low-priority pending demands that are no longer in the active window
+        let mut active_jids = HashSet::with_capacity(visible.len() + overscan.len());
+        for c in visible.iter().chain(overscan.iter()) {
+            active_jids.insert(&c.jid);
+        }
+        let mut pending = self
+            .pending_demands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.retain(|jid, (_demand, priority)| {
+            *priority == DemandPriority::High || active_jids.contains(jid)
+        });
+    }
+
+    fn demand_one(&self, chat: &ChatDemand, priority: DemandPriority) {
+        let jid = &chat.jid;
+
+        // Check failure cooldown: avoid spinning on recently failed avatars
+        {
+            let mut cooldowns = self
+                .failed_cooldowns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((_retryable, until)) = cooldowns.get(jid) {
+                if Instant::now() < *until {
+                    return;
+                }
+                cooldowns.remove(jid);
+            }
+        }
+
+        // If a network fetch is already active for this JID, avoid redundant checks
+        if self
+            .network_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(jid)
+        {
+            return;
+        }
+
+        if let Some(key) = &chat.cache_key {
+            if get_avatar_image(key).is_some() {
+                // Cache hit in RAM: check if revalidation is needed for this connection
+                let mut reval = self.revalidated.lock().unwrap_or_else(|e| e.into_inner());
+                if reval.insert(jid.clone()) {
+                    self.enqueue_demand(
+                        AvatarDemand {
                             jid: jid.clone(),
                             known_picture_id: chat.picture_id.clone(),
                             cache_key: Some(key.clone()),
                             need_bytes: false,
-                        });
-                    }
-                    continue;
+                        },
+                        priority,
+                    );
                 }
+                return;
+            }
 
-                // Miss in RAM: check persistent store if not already in flight
-                let mut flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-                if flight.insert(key.clone()) {
-                    let key_clone = key.clone();
-                    let jid_clone = jid.clone();
-                    let pic_id = chat.picture_id.clone();
-                    let in_flight = Arc::clone(&self.in_flight);
-                    let revalidated = Arc::clone(&self.revalidated);
-                    let pending_demands = Arc::clone(&self.pending_demands);
-                    let session_handle = Arc::clone(&self.session);
+            // Miss in RAM: check persistent store if not already in flight
+            let mut p_flight = self
+                .persistent_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if p_flight.insert(key.clone()) {
+                let key_clone = key.clone();
+                let jid_clone = jid.clone();
+                let pic_id = chat.picture_id.clone();
+                let persistent_in_flight = Arc::clone(&self.persistent_in_flight);
+                let network_in_flight = Arc::clone(&self.network_in_flight);
+                let revalidated = Arc::clone(&self.revalidated);
+                let pending_demands = Arc::clone(&self.pending_demands);
+                let session_handle = Arc::clone(&self.session);
+                let generation = Arc::clone(&self.generation);
+                let account_id = Arc::clone(&self.account_id);
+                let born_gen = generation.load(Ordering::Relaxed);
+                let born_account = *account_id.lock().unwrap_or_else(|e| e.into_inner());
 
-                    spawn_task(async move {
-                        let persistent_bytes = read_persistent(&key_clone).await;
-                        if let Some(bytes) = persistent_bytes
-                            && let Some((source, decoded_size)) = decode_avatar(&bytes)
-                        {
+                spawn_task(async move {
+                    let persistent_bytes = read_persistent(&key_clone).await;
+
+                    // Generation safety: discard if session/account changed while reading
+                    if generation.load(Ordering::Relaxed) != born_gen
+                        || *account_id.lock().unwrap_or_else(|e| e.into_inner()) != born_account
+                    {
+                        persistent_in_flight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&key_clone);
+                        return;
+                    }
+
+                    if let Some(bytes) = persistent_bytes {
+                        if let Some((source, decoded_size)) = decode_avatar(&bytes) {
                             put_avatar_image(key_clone.clone(), source, decoded_size);
-                            in_flight
+                            persistent_in_flight
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .remove(&key_clone);
@@ -151,8 +261,7 @@ impl AvatarManager {
                                 session.notify_avatar_ready(jid_clone.clone(), key_clone.clone());
                             }
 
-                            // If successfully loaded from persistent cache, queue/dispatch a
-                            // conditional check to verify freshness with the server:
+                            // Conditional freshness revalidation:
                             let mut reval = revalidated.lock().unwrap_or_else(|e| e.into_inner());
                             if reval.insert(jid_clone.clone()) {
                                 let demand = AvatarDemand {
@@ -171,17 +280,23 @@ impl AvatarManager {
                                     pending_demands
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner())
-                                        .insert(demand.jid.clone(), demand);
+                                        .insert(demand.jid.clone(), (demand, priority));
                                 }
                             }
                             return;
                         }
 
-                        // Persistent miss (or corrupted file): must unconditionally fetch bytes
-                        in_flight
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&key_clone);
+                        // Corrupt persistent blob: delete entry and trigger single remote refill
+                        let _ = delete_persistent(&key_clone).await;
+                    }
+
+                    // Persistent miss or corrupt blob: unconditionally fetch bytes
+                    persistent_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key_clone);
+                    let mut n_flight = network_in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                    if n_flight.insert(jid_clone.clone()) {
                         let demand = AvatarDemand {
                             jid: jid_clone,
                             known_picture_id: None,
@@ -198,48 +313,66 @@ impl AvatarManager {
                             pending_demands
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .insert(demand.jid.clone(), demand);
+                                .insert(demand.jid.clone(), (demand, priority));
                         }
-                    });
-                }
-            } else {
-                // No avatar key recorded: query WhatsApp
-                let mut flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-                if flight.insert(jid.clone()) {
-                    self.enqueue_demand(AvatarDemand {
+                    }
+                });
+            }
+        } else {
+            // No avatar key recorded: query WhatsApp
+            let mut n_flight = self
+                .network_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if n_flight.insert(jid.clone()) {
+                self.enqueue_demand(
+                    AvatarDemand {
                         jid: jid.clone(),
                         known_picture_id: None,
                         cache_key: None,
                         need_bytes: true,
-                    });
-                }
+                    },
+                    priority,
+                );
             }
         }
     }
 
-    pub fn enqueue_demand(&self, demand: AvatarDemand) {
+    pub fn enqueue_demand(&self, demand: AvatarDemand, priority: DemandPriority) {
         let mut pending = self
             .pending_demands
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pending
             .entry(demand.jid.clone())
-            .and_modify(|existing| {
+            .and_modify(|(existing_demand, existing_priority)| {
                 if demand.need_bytes {
-                    existing.need_bytes = true;
-                    existing.known_picture_id = None;
+                    existing_demand.need_bytes = true;
+                    existing_demand.known_picture_id = None;
+                }
+                if priority == DemandPriority::High {
+                    *existing_priority = DemandPriority::High;
                 }
             })
-            .or_insert(demand);
+            .or_insert((demand, priority));
     }
 
-    /// Extract all pending demands.
+    /// Extract all pending demands ordered by priority (high priority first).
     pub fn take_demands(&self) -> Vec<AvatarDemand> {
         let mut pending = self
             .pending_demands
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pending.drain().map(|(_, d)| d).collect()
+        let mut high = Vec::new();
+        let mut low = Vec::new();
+        for (_, (demand, priority)) in pending.drain() {
+            match priority {
+                DemandPriority::High => high.push(demand),
+                DemandPriority::Low => low.push(demand),
+            }
+        }
+        high.extend(low);
+        high
     }
 
     /// Flush accumulated demands to the session in chunks of up to 64 items.
@@ -256,24 +389,53 @@ impl AvatarManager {
 
     /// Called when the daemon signals an avatar is ready (or cleared).
     pub fn on_avatar_ready(&self, jid: &str, key: &str) {
-        self.in_flight
+        self.network_in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(jid);
         if !key.is_empty() {
-            self.in_flight
+            self.persistent_in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(key);
         }
+        self.failed_cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(jid);
+    }
+
+    /// Called when an avatar lookup, download, or materialization fails.
+    pub fn on_avatar_failed(&self, jid: &str, retryable: bool) {
+        self.network_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(jid);
+        let cooldown_duration = if retryable {
+            std::time::Duration::from_secs(15)
+        } else {
+            std::time::Duration::from_secs(300)
+        };
+        self.failed_cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                jid.to_string(),
+                (retryable, Instant::now() + cooldown_duration),
+            );
     }
 
     #[cfg(test)]
     pub fn is_in_flight(&self, item: &str) -> bool {
-        self.in_flight
+        self.network_in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(item)
+            || self
+                .persistent_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(item)
     }
 
     #[cfg(test)]
@@ -317,20 +479,26 @@ mod tests {
     fn upgrading_demand_to_need_bytes_clears_known_picture_id() {
         let manager = AvatarManager::new();
 
-        manager.enqueue_demand(AvatarDemand {
-            jid: "user2@s.whatsapp.net".to_string(),
-            known_picture_id: Some("pic-12345".to_string()),
-            cache_key: Some("a-oldkey".to_string()),
-            need_bytes: false,
-        });
+        manager.enqueue_demand(
+            AvatarDemand {
+                jid: "user2@s.whatsapp.net".to_string(),
+                known_picture_id: Some("pic-12345".to_string()),
+                cache_key: Some("a-oldkey".to_string()),
+                need_bytes: false,
+            },
+            DemandPriority::Low,
+        );
 
         // Upgrade demand because persistent blob is missing or corrupt
-        manager.enqueue_demand(AvatarDemand {
-            jid: "user2@s.whatsapp.net".to_string(),
-            known_picture_id: None,
-            cache_key: None,
-            need_bytes: true,
-        });
+        manager.enqueue_demand(
+            AvatarDemand {
+                jid: "user2@s.whatsapp.net".to_string(),
+                known_picture_id: None,
+                cache_key: None,
+                need_bytes: true,
+            },
+            DemandPriority::High,
+        );
 
         let demands = manager.take_demands();
         assert_eq!(demands.len(), 1);
@@ -343,15 +511,75 @@ mod tests {
     }
 
     #[test]
-    fn chunking_demands_to_64() {
+    fn prioritized_demands_ordering() {
         let manager = AvatarManager::new();
-        for i in 0..130 {
-            manager.enqueue_demand(AvatarDemand {
-                jid: format!("user{}@s.whatsapp.net", i),
+        manager.enqueue_demand(
+            AvatarDemand {
+                jid: "overscan@s.whatsapp.net".to_string(),
                 known_picture_id: None,
                 cache_key: None,
                 need_bytes: true,
-            });
+            },
+            DemandPriority::Low,
+        );
+        manager.enqueue_demand(
+            AvatarDemand {
+                jid: "visible@s.whatsapp.net".to_string(),
+                known_picture_id: None,
+                cache_key: None,
+                need_bytes: true,
+            },
+            DemandPriority::High,
+        );
+
+        let demands = manager.take_demands();
+        assert_eq!(demands.len(), 2);
+        assert_eq!(demands[0].jid, "visible@s.whatsapp.net");
+        assert_eq!(demands[1].jid, "overscan@s.whatsapp.net");
+    }
+
+    #[test]
+    fn failure_cooldown_prevents_immediate_redemand() {
+        let manager = AvatarManager::new();
+        let chat = ChatDemand {
+            jid: "failing@s.whatsapp.net".to_string(),
+            picture_id: None,
+            cache_key: None,
+        };
+
+        manager.demand_chat(&chat);
+        assert!(manager.is_in_flight("failing@s.whatsapp.net"));
+        assert_eq!(manager.take_demands().len(), 1);
+
+        // Notify failure
+        manager.on_avatar_failed("failing@s.whatsapp.net", true);
+        assert!(!manager.is_in_flight("failing@s.whatsapp.net"));
+
+        // Immediate subsequent demand must be throttled by cooldown
+        manager.demand_chat(&chat);
+        assert!(!manager.is_in_flight("failing@s.whatsapp.net"));
+        assert!(manager.take_demands().is_empty());
+
+        // on_avatar_ready clears cooldown
+        manager.on_avatar_ready("failing@s.whatsapp.net", "");
+        manager.demand_chat(&chat);
+        assert!(manager.is_in_flight("failing@s.whatsapp.net"));
+        assert_eq!(manager.take_demands().len(), 1);
+    }
+
+    #[test]
+    fn chunking_demands_to_64() {
+        let manager = AvatarManager::new();
+        for i in 0..130 {
+            manager.enqueue_demand(
+                AvatarDemand {
+                    jid: format!("user{}@s.whatsapp.net", i),
+                    known_picture_id: None,
+                    cache_key: None,
+                    need_bytes: true,
+                },
+                DemandPriority::Low,
+            );
         }
 
         let demands = manager.take_demands();
@@ -366,14 +594,17 @@ mod tests {
     #[test]
     fn clear_resets_manager_state() {
         let manager = AvatarManager::new();
-        manager.enqueue_demand(AvatarDemand {
-            jid: "user3@s.whatsapp.net".to_string(),
-            known_picture_id: None,
-            cache_key: None,
-            need_bytes: true,
-        });
+        manager.enqueue_demand(
+            AvatarDemand {
+                jid: "user3@s.whatsapp.net".to_string(),
+                known_picture_id: None,
+                cache_key: None,
+                need_bytes: true,
+            },
+            DemandPriority::High,
+        );
         manager
-            .in_flight
+            .network_in_flight
             .lock()
             .unwrap()
             .insert("user3@s.whatsapp.net".to_string());
@@ -393,14 +624,17 @@ mod tests {
     #[test]
     fn reset_connection_clears_in_flight_and_revalidated() {
         let manager = AvatarManager::new();
-        manager.enqueue_demand(AvatarDemand {
-            jid: "user4@s.whatsapp.net".to_string(),
-            known_picture_id: None,
-            cache_key: None,
-            need_bytes: true,
-        });
+        manager.enqueue_demand(
+            AvatarDemand {
+                jid: "user4@s.whatsapp.net".to_string(),
+                known_picture_id: None,
+                cache_key: None,
+                need_bytes: true,
+            },
+            DemandPriority::High,
+        );
         manager
-            .in_flight
+            .network_in_flight
             .lock()
             .unwrap()
             .insert("user4@s.whatsapp.net".to_string());
@@ -443,5 +677,164 @@ mod tests {
         let end_bot = (bot_range.end + 10).min(total_rows);
         assert_eq!(start_bot, 485);
         assert_eq!(end_bot, 500);
+    }
+
+    #[test]
+    fn windowed_demand_prioritization_and_overscan_pruning() {
+        let manager = AvatarManager::new();
+        let chat_vis1 = ChatDemand {
+            jid: "vis1@s.whatsapp.net".to_string(),
+            picture_id: None,
+            cache_key: None,
+        };
+        let chat_vis2 = ChatDemand {
+            jid: "vis2@s.whatsapp.net".to_string(),
+            picture_id: None,
+            cache_key: None,
+        };
+        let chat_over1 = ChatDemand {
+            jid: "over1@s.whatsapp.net".to_string(),
+            picture_id: None,
+            cache_key: None,
+        };
+        let chat_over2 = ChatDemand {
+            jid: "over2@s.whatsapp.net".to_string(),
+            picture_id: None,
+            cache_key: None,
+        };
+
+        // Demand initial window: vis1, vis2 visible; over1, over2 overscan
+        manager.demand_chats_windowed(
+            &[chat_vis1.clone(), chat_vis2.clone()],
+            &[chat_over1.clone(), chat_over2.clone()],
+        );
+
+        // Verify initial pending demands
+        {
+            let pending = manager.pending_demands.lock().unwrap();
+            assert_eq!(pending.len(), 4);
+            assert_eq!(
+                pending.get("vis1@s.whatsapp.net").unwrap().1,
+                DemandPriority::High
+            );
+            assert_eq!(
+                pending.get("vis2@s.whatsapp.net").unwrap().1,
+                DemandPriority::High
+            );
+            assert_eq!(
+                pending.get("over1@s.whatsapp.net").unwrap().1,
+                DemandPriority::Low
+            );
+            assert_eq!(
+                pending.get("over2@s.whatsapp.net").unwrap().1,
+                DemandPriority::Low
+            );
+        }
+
+        // Fast scroll: window moves down to chat_over2 and a new chat_vis3.
+        // over1 is no longer in visible or overscan!
+        let chat_vis3 = ChatDemand {
+            jid: "vis3@s.whatsapp.net".to_string(),
+            picture_id: None,
+            cache_key: None,
+        };
+        manager.demand_chats_windowed(
+            std::slice::from_ref(&chat_vis3),
+            std::slice::from_ref(&chat_over2),
+        );
+
+        // over1 (Low priority and not in new active window) must have been pruned.
+        // vis1 and vis2 (High priority) are preserved.
+        // over2 is retained because it's still in overscan.
+        // vis3 is added as High priority.
+        {
+            let pending = manager.pending_demands.lock().unwrap();
+            assert!(
+                !pending.contains_key("over1@s.whatsapp.net"),
+                "stale overscan demand must be pruned"
+            );
+            assert!(
+                pending.contains_key("vis1@s.whatsapp.net"),
+                "high priority demand is preserved"
+            );
+            assert!(
+                pending.contains_key("vis2@s.whatsapp.net"),
+                "high priority demand is preserved"
+            );
+            assert!(
+                pending.contains_key("over2@s.whatsapp.net"),
+                "active overscan demand is retained"
+            );
+            assert!(
+                pending.contains_key("vis3@s.whatsapp.net"),
+                "new visible demand is added"
+            );
+        }
+
+        // take_demands must return all High priority first, followed by Low priority
+        let demands = manager.take_demands();
+        assert_eq!(demands.len(), 4);
+        let high_jids: HashSet<_> = demands[..3].iter().map(|d| d.jid.as_str()).collect();
+        assert!(high_jids.contains("vis1@s.whatsapp.net"));
+        assert!(high_jids.contains("vis2@s.whatsapp.net"));
+        assert!(high_jids.contains("vis3@s.whatsapp.net"));
+        assert_eq!(demands[3].jid, "over2@s.whatsapp.net");
+    }
+
+    #[test]
+    fn account_and_session_switch_invalidates_generation() {
+        let manager = AvatarManager::new();
+        let initial_gen = manager.generation.load(Ordering::Relaxed);
+        assert_eq!(initial_gen, 0);
+
+        let chat = ChatDemand {
+            jid: "stale@s.whatsapp.net".to_string(),
+            picture_id: None,
+            cache_key: None,
+        };
+        manager.demand_chat(&chat);
+        assert!(manager.is_in_flight("stale@s.whatsapp.net"));
+
+        // Simulate session switch / account clear
+        manager.set_session(None);
+        let next_gen = manager.generation.load(Ordering::Relaxed);
+        assert!(
+            next_gen > initial_gen,
+            "generation must increment on session switch"
+        );
+        assert!(
+            !manager.is_in_flight("stale@s.whatsapp.net"),
+            "in-flight must be cleared on session switch"
+        );
+        assert!(
+            manager.take_demands().is_empty(),
+            "pending demands must be cleared on session switch"
+        );
+    }
+
+    #[test]
+    fn failure_cooldown_retryable_vs_non_retryable() {
+        let manager = AvatarManager::new();
+        let jid_retryable = "retryable@s.whatsapp.net";
+        let jid_terminal = "terminal@s.whatsapp.net";
+
+        manager.on_avatar_failed(jid_retryable, true);
+        manager.on_avatar_failed(jid_terminal, false);
+
+        let cooldowns = manager.failed_cooldowns.lock().unwrap();
+        let (retryable, until_retryable) = cooldowns.get(jid_retryable).unwrap();
+        let (terminal, until_terminal) = cooldowns.get(jid_terminal).unwrap();
+
+        assert!(*retryable);
+        assert!(!*terminal);
+
+        let now = Instant::now();
+        // Retryable cooldown is ~15s
+        assert!(*until_retryable > now + std::time::Duration::from_secs(10));
+        assert!(*until_retryable <= now + std::time::Duration::from_secs(20));
+
+        // Terminal cooldown is ~300s
+        assert!(*until_terminal > now + std::time::Duration::from_secs(250));
+        assert!(*until_terminal <= now + std::time::Duration::from_secs(310));
     }
 }

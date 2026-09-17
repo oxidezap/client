@@ -303,7 +303,13 @@ impl<'a> Frames<'a> {
             DaemonMessage::AvatarReady { jid, key } => {
                 // Avatar keys are also carried by the owning chat frame. The
                 // readiness signal only announces that its cache entry is ready.
+                if !key.is_empty() {
+                    materialize_avatar(&key, self.media);
+                }
                 self.publish(FromDaemon::Avatar { jid, key })?;
+            }
+            DaemonMessage::AvatarFailed { jid, retryable } => {
+                self.publish(FromDaemon::AvatarFailed { jid, retryable })?;
             }
             // The daemon truncated our stream, so arbitrary events are gone.
             // Asking for the history back would restore the chats and nothing
@@ -798,7 +804,34 @@ fn load_media(event: &mut UiEvent, cache: &dyn MediaCache) {
                 }
             }
         }
+        UiEvent::AvatarReady { key, .. } if !key.is_empty() => {
+            materialize_avatar(key, cache);
+        }
         _ => {}
+    }
+}
+
+/// Materialize an avatar into the in-memory decoded image cache and persistent storage.
+///
+/// Shared across all transports: reading bytes from the transport cache, decoding to
+/// GPUI image source, caching in RAM LRU, and saving to persistent storage.
+fn materialize_avatar(key: &str, cache: &dyn MediaCache) {
+    if key.is_empty() {
+        return;
+    }
+    if crate::session::media::get_avatar_image(key).is_some() {
+        return;
+    }
+    match cache.read(key) {
+        Ok(bytes) => {
+            if let Some((image, decoded_size)) = crate::session::media::decode_avatar(&bytes) {
+                crate::session::media::put_avatar_image(key.to_string(), image, decoded_size);
+                crate::session::avatar::save_avatar(key, &bytes);
+            }
+        }
+        Err(e) => {
+            debug!("avatar {key} is not available in cache: {e}");
+        }
     }
 }
 
@@ -1625,5 +1658,81 @@ mod tests {
             )),
             "an empty snapshot produced a load event"
         );
+    }
+
+    #[test]
+    fn materialize_avatar_populates_ram_cache_from_media_cache() {
+        use std::sync::Arc;
+
+        let rgba = image::Rgba([10, 20, 30, 255]);
+        let mut decoded = image::RgbaImage::from_pixel(1, 1, rgba);
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(std::mem::take(&mut decoded))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        struct MockMediaCache {
+            key: String,
+            data: Arc<Vec<u8>>,
+        }
+        impl MediaCache for MockMediaCache {
+            fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
+                if key == self.key {
+                    Ok(Arc::clone(&self.data))
+                } else {
+                    Err("not found".into())
+                }
+            }
+            fn stage(&self, _: &str, _: &[u8]) -> Result<(), String> {
+                Ok(())
+            }
+            fn discard(&self, _: &str) {}
+        }
+
+        let key = "a-unit-test-avatar-key-123";
+        let mock_cache = MockMediaCache {
+            key: key.to_string(),
+            data: Arc::new(bytes),
+        };
+
+        assert!(crate::session::media::get_avatar_image(key).is_none());
+        materialize_avatar(key, &mock_cache);
+        assert!(crate::session::media::get_avatar_image(key).is_some());
+
+        // Also test through Frames::apply
+        let (sink, mut events) = super::super::sink::channel();
+        let pending = Pending::default();
+        let pictures = crate::video::LatestFrames::default();
+
+        let key2 = "a-unit-test-avatar-key-456";
+        let mock_cache2 = MockMediaCache {
+            key: key2.to_string(),
+            data: mock_cache.data.clone(),
+        };
+        let mut frames = Frames::new(
+            &sink,
+            &pending,
+            &mock_cache2,
+            &pictures,
+            Arc::new(|_, _| false),
+        );
+
+        assert!(crate::session::media::get_avatar_image(key2).is_none());
+        assert!(
+            frames
+                .apply(DaemonMessage::AvatarReady {
+                    jid: "peer@s.whatsapp.net".into(),
+                    key: key2.into(),
+                })
+                .is_continue()
+        );
+        assert!(crate::session::media::get_avatar_image(key2).is_some());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(FromDaemon::Avatar { jid, key }) if jid == "peer@s.whatsapp.net" && key == key2
+        ));
     }
 }

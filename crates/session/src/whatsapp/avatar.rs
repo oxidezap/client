@@ -302,26 +302,43 @@ pub(super) async fn resolve(
         .await;
 
         let mut resolutions = Vec::with_capacity(answered.len());
-        for (jid, _need_bytes, answer) in answered {
+        for (jid, need_bytes, answer) in answered {
             let jid_str = jid.to_string();
-            let outcome = match answer {
-                Lookup::Found { picture_id, source } => oxidezap_core::AvatarOutcome::Found {
-                    picture_id,
-                    source: Some(source),
-                },
-                Lookup::NotFound => oxidezap_core::AvatarOutcome::NotFound,
-                // An answer with nothing to act on: unchanged, a refusal, a
-                // rate limit, a partial response. Remembered as asked so the
-                // next page does not repeat the request, and not published,
-                // because nothing on the other side would do anything with it.
-                Lookup::Unchanged | Lookup::Unknown => {
+            let (outcome, had_bytes) = match answer {
+                Lookup::Found { picture_id, source } => (
+                    oxidezap_core::AvatarOutcome::Found {
+                        picture_id,
+                        source: Some(source),
+                    },
+                    need_bytes,
+                ),
+                Lookup::NotFound => (oxidezap_core::AvatarOutcome::NotFound, true),
+                Lookup::Unchanged => {
                     resolver.mark_asked(&jid_str, generation, false);
                     continue;
                 }
+                // An answer with nothing to act on: a refusal, a rate limit,
+                // or a partial response. Mark asked and notify non-retryable failure.
+                Lookup::Unknown => {
+                    resolver.mark_asked(&jid_str, generation, false);
+                    let _ = ui_tx.send(UiEvent::AvatarFailed {
+                        jid: jid_str,
+                        retryable: false,
+                    });
+                    continue;
+                }
                 // A failure is deliberately not remembered, so a transient one
-                // is retried the next time a demand names the chat.
-                Lookup::Failed => continue,
+                // is retried the next time a demand names the chat, but clear
+                // in_flight in the manager via a retryable failure event.
+                Lookup::Failed => {
+                    let _ = ui_tx.send(UiEvent::AvatarFailed {
+                        jid: jid_str,
+                        retryable: true,
+                    });
+                    continue;
+                }
             };
+            resolver.mark_asked(&jid_str, generation, had_bytes);
             resolutions.push(oxidezap_core::AvatarResolution {
                 jid: jid_str,
                 outcome,
@@ -329,10 +346,6 @@ pub(super) async fn resolve(
         }
         if resolutions.is_empty() {
             continue;
-        }
-        for resolution in &resolutions {
-            let had_bytes = matches!(resolution.outcome, oxidezap_core::AvatarOutcome::NotFound);
-            resolver.mark_asked(&resolution.jid, generation, had_bytes);
         }
         let count = resolutions.len();
         match ui_tx.send(UiEvent::AvatarsResolved { resolutions }) {
@@ -490,5 +503,36 @@ mod tests {
             resolver.needs("a@s.whatsapp.net", 1, true),
             "byte demand must proceed even after metadata Unchanged"
         );
+    }
+
+    #[test]
+    fn need_bytes_true_with_found_prevents_subsequent_lookups_in_same_generation() {
+        let mut resolver = Resolver::new();
+        // Found with need_bytes = true marks had_bytes = true
+        resolver.mark_asked("a@s.whatsapp.net", 1, true);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
+
+        // But next generation needs lookup again
+        assert!(resolver.needs("a@s.whatsapp.net", 2, true));
+    }
+
+    #[test]
+    fn need_bytes_false_with_found_permits_subsequent_byte_demand() {
+        let mut resolver = Resolver::new();
+        // Found with need_bytes = false (e.g. freshness revalidation) marks had_bytes = false
+        resolver.mark_asked("a@s.whatsapp.net", 1, false);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
+        // If local bytes are missing, need_bytes = true must still proceed
+        assert!(resolver.needs("a@s.whatsapp.net", 1, true));
+    }
+
+    #[test]
+    fn not_found_prevents_subsequent_lookups_in_same_generation() {
+        let mut resolver = Resolver::new();
+        // NotFound marks had_bytes = true
+        resolver.mark_asked("a@s.whatsapp.net", 1, true);
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
     }
 }

@@ -130,6 +130,7 @@ pub fn build() -> Result<()> {
         .current_dir(&web)
         // Named rather than exported, so nothing else this process goes on to
         // do is silently a nightly build.
+        .env_remove("RUSTC")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("MBX_CARGO_SHIM_MODE")

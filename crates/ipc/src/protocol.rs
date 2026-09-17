@@ -530,6 +530,8 @@ pub enum DaemonMessage {
     SendFailed { jid: String, reason: String },
     /// A profile picture was fetched into the daemon media cache.
     AvatarReady { jid: String, key: String },
+    /// An avatar resolution, download, or materialization failed.
+    AvatarFailed { jid: String, retryable: bool },
     /// One encoded frame of a live call's video.
     ///
     /// The third kind of frame, beside state and news, and it obeys neither's

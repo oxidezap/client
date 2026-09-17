@@ -86,6 +86,11 @@ pub enum UiEvent {
         jid: String,
         key: String,
     },
+    /// An avatar resolution, download, or materialization failed.
+    AvatarFailed {
+        jid: String,
+        retryable: bool,
+    },
     /// The session resolved profile-picture metadata for a batch of chats.
     ///
     /// Its own event rather than a field on `HistoryLoaded`, which is the

@@ -144,6 +144,8 @@ pub enum FromDaemon {
     Account(Option<oxidezap_ipc::AccountIdentity>),
     /// A profile picture is ready in the daemon media cache.
     Avatar { jid: String, key: String },
+    /// An avatar resolution, download, or materialization failed.
+    AvatarFailed { jid: String, retryable: bool },
     /// Every plugin the daemon has loaded, and what each wants drawn.
     ///
     /// State, and whole every time: a plugin published its interface when it
@@ -965,6 +967,11 @@ impl Session {
     pub fn handle(&self) -> SessionHandle {
         self.handle.clone()
     }
+
+    /// The account bound to this connection.
+    pub fn account(&self) -> oxidezap_core::AccountId {
+        self.handle.account()
+    }
 }
 
 impl SessionHandle {
@@ -1628,9 +1635,23 @@ impl SessionHandle {
         }));
     }
 
+    /// The account bound to this connection.
+    pub fn account(&self) -> oxidezap_core::AccountId {
+        self.conn.account
+    }
+
     /// Publish an avatar ready notification to the UI event sink.
     pub fn notify_avatar_ready(&self, jid: String, key: String) {
         let _ = self.conn.events.try_send(FromDaemon::Avatar { jid, key });
+    }
+
+    /// Publish an avatar failed notification to the UI event sink.
+    #[allow(dead_code)]
+    pub fn notify_avatar_failed(&self, jid: String, retryable: bool) {
+        let _ = self
+            .conn
+            .events
+            .try_send(FromDaemon::AvatarFailed { jid, retryable });
     }
 
     /// Fetch media, answered when the bytes are available.

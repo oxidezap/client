@@ -379,25 +379,7 @@ mod page {
                 match fetch(&key, ration).await {
                     Ok(bytes) => {
                         so_far = so_far.saturating_add(bytes.len() as u64);
-                        // Through the account wrapper: an avatar key is
-                        // account-scoped now (`a<id>-a-...`), so testing the
-                        // whole key against the bare `a-` avatar prefix would
-                        // miss every one of them and draw them in the ordinary
-                        // media map, where the avatar lookup never finds them.
-                        if oxidezap_ipc::key_local_name(&key).starts_with("a-") {
-                            if let Some((image, decoded_size)) =
-                                crate::session::media::decode_avatar(&bytes)
-                            {
-                                crate::session::media::put_avatar_image(
-                                    key.clone(),
-                                    image,
-                                    decoded_size,
-                                );
-                            }
-                            crate::session::avatar::save_avatar(&key, &bytes);
-                        } else {
-                            into.put(key, bytes);
-                        }
+                        into.put(key, bytes);
                     }
                     Err(e) => log::debug!("media {key} is not available: {e}"),
                 }

@@ -903,6 +903,8 @@ pub struct WhatsAppApp {
     heartbeat: Option<Task<()>>,
     /// Demand-driven avatar pipeline and cache coordinator.
     pub(crate) avatar_manager: crate::session::avatar::AvatarManager,
+    /// Cached fingerprint of the visible row range and avatar state to avoid redundant work.
+    last_avatar_window_fingerprint: Option<u64>,
 }
 
 impl WhatsAppApp {
@@ -925,20 +927,46 @@ impl WhatsAppApp {
         if start >= end || start >= rows.len() {
             return;
         }
-        let demands: Vec<crate::session::avatar::ChatDemand> = rows[start..end]
-            .iter()
-            .map(|row| {
-                let picture_id = self
-                    .find_chat(&row.jid)
-                    .and_then(|c| c.avatar_picture_id.clone());
-                crate::session::avatar::ChatDemand {
-                    jid: row.jid.clone(),
-                    picture_id,
-                    cache_key: row.avatar_key.clone(),
-                }
-            })
-            .collect();
-        self.avatar_manager.demand_chats(&demands);
+
+        // Fast fingerprint check to avoid recalculating or locking on identical renders
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        visible_range.hash(&mut hasher);
+        for row in &rows[start..end] {
+            row.jid.hash(&mut hasher);
+            row.avatar_key.hash(&mut hasher);
+        }
+        let fingerprint = hasher.finish();
+        if self.last_avatar_window_fingerprint == Some(fingerprint) {
+            return;
+        }
+        self.last_avatar_window_fingerprint = Some(fingerprint);
+
+        let vis_start = visible_range.start.min(rows.len());
+        let vis_end = visible_range.end.min(rows.len());
+        let to_demand = |row: &ChatRow| {
+            let picture_id = self
+                .find_chat(&row.jid)
+                .and_then(|c| c.avatar_picture_id.clone());
+            crate::session::avatar::ChatDemand {
+                jid: row.jid.clone(),
+                picture_id,
+                cache_key: row.avatar_key.clone(),
+            }
+        };
+        let visible_demands: Vec<crate::session::avatar::ChatDemand> =
+            rows[vis_start..vis_end].iter().map(&to_demand).collect();
+
+        let mut overscan_demands = Vec::new();
+        if start < vis_start {
+            overscan_demands.extend(rows[start..vis_start].iter().map(&to_demand));
+        }
+        if vis_end < end {
+            overscan_demands.extend(rows[vis_end..end].iter().map(&to_demand));
+        }
+
+        self.avatar_manager
+            .demand_chats_windowed(&visible_demands, &overscan_demands);
         if let Some(session) = &self.client {
             self.avatar_manager.flush_demands(session);
         }
@@ -1029,6 +1057,7 @@ impl WhatsAppApp {
                         cx.notify();
                     }),
                     FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
+                        app.last_avatar_window_fingerprint = None;
                         app.avatar_manager.on_avatar_ready(&jid, &key);
                         if let Some(chat) = app.find_chat_mut(&jid) {
                             chat.avatar_cache_key = (!key.is_empty()).then_some(key);
@@ -1036,6 +1065,10 @@ impl WhatsAppApp {
                             app.invalidate_chat_cache();
                             cx.notify();
                         }
+                    }),
+                    FromDaemon::AvatarFailed { jid, retryable } => entity.update(cx, |app, _cx| {
+                        app.last_avatar_window_fingerprint = None;
+                        app.avatar_manager.on_avatar_failed(&jid, retryable);
                     }),
                     // Refused, or it never left this process. The ring came
                     // down when the update was opened, which is right — a
@@ -1204,6 +1237,7 @@ impl WhatsAppApp {
             status_tick: None,
             heartbeat: None,
             avatar_manager: crate::session::avatar::AvatarManager::new(),
+            last_avatar_window_fingerprint: None,
         }
     }
 
@@ -1800,9 +1834,10 @@ impl WhatsAppApp {
         self.decoded_images.borrow_mut().clear();
         self.avatar_manager.clear();
         self.avatar_manager.set_session(None);
+        self.last_avatar_window_fingerprint = None;
         let old_scope = crate::session::avatar::rotate_account_scope();
         crate::session::avatar::spawn_task(async move {
-            crate::session::avatar::delete_account_storage(&old_scope).await;
+            crate::session::avatar::delete_account_storage(old_scope).await;
         });
         self.sticker_validation.borrow_mut().clear();
         self.timeline_anchor = None;
@@ -2475,6 +2510,7 @@ impl WhatsAppApp {
     pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
         self.avatar_manager.reset_connection();
         self.avatar_manager.set_session(None);
+        self.last_avatar_window_fingerprint = None;
         self.app_state = AppState::Loading;
 
         // Drop the old connection first: a second one alongside it would be

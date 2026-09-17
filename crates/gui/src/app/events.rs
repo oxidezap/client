@@ -145,6 +145,9 @@ impl WhatsAppApp {
                     cx.notify();
                 }
             }
+            UiEvent::AvatarFailed { jid, retryable } => {
+                self.avatar_manager.on_avatar_failed(&jid, retryable);
+            }
             UiEvent::QrCode { code, timeout_secs } => {
                 // The phone code keeps the deadline it was issued with. A
                 // QR rotates every few seconds and a phone code lives for

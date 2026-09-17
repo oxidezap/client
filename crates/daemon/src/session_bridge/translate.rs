@@ -419,6 +419,14 @@ fn passthrough(event: &UiEvent) -> Option<DaemonMessage> {
             jid: chat_jid.clone(),
             reason: reason.clone(),
         }),
+        UiEvent::AvatarReady { jid, key } => Some(DaemonMessage::AvatarReady {
+            jid: jid.clone(),
+            key: key.clone(),
+        }),
+        UiEvent::AvatarFailed { jid, retryable } => Some(DaemonMessage::AvatarFailed {
+            jid: jid.clone(),
+            retryable: *retryable,
+        }),
         _ => None,
     }
 }

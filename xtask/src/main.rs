@@ -55,7 +55,12 @@ macro_rules! note {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let args: &[String] = if let Some(pos) = raw_args.iter().position(|a| a == "--") {
+        &raw_args[pos + 1..]
+    } else {
+        &raw_args[..]
+    };
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     if let Err(e) = dispatch(&argv) {
         note!("xtask: {e}");

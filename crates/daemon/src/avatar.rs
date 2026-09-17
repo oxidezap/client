@@ -11,7 +11,7 @@ mod native;
 #[cfg(target_family = "wasm")]
 mod web;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 
@@ -25,6 +25,18 @@ struct AvatarResponse {
     body: Vec<u8>,
 }
 use oxidezap_ipc::DaemonMessage;
+
+/// In-flight CDN fetches per `(hub_id, jid, picture_id)`.
+static IN_FLIGHT: LazyLock<Mutex<HashSet<(u64, String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+struct InFlightGuard((u64, String, String));
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        in_flight.remove(&self.0);
+    }
+}
 
 /// One fetch in flight, and what makes it current.
 ///
@@ -120,23 +132,37 @@ pub fn resolve(
     let Some(source) = source else {
         return;
     };
+    let in_flight_key = (hub.id(), jid.to_string(), id.clone());
+    if !IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(in_flight_key.clone())
+    {
+        return;
+    }
     let source = source.to_string();
     oxidezap_session::spawn({
         let hub = Arc::clone(hub);
         let jid = jid.to_string();
         let recorder = recorder.clone();
         async move {
+            let _guard = InFlightGuard(in_flight_key);
             let Ok(response) = fetch(&source).await else {
                 // A transient failure keeps whatever was cached before: the
                 // old avatar is a better answer than initials.
+                publish_failed(&hub, &jid, true);
                 return;
             };
-            let Ok(bytes) = accept(response) else { return };
+            let Ok(bytes) = accept(response) else {
+                publish_failed(&hub, &jid, false);
+                return;
+            };
             // This account's epoch and this account's key: a clear of another
             // account must not refuse this fetch.
             if crate::media::put_since(selection.account, selection.cache_epoch, &cache_key, &bytes)
                 .is_err()
             {
+                publish_failed(&hub, &jid, true);
                 return;
             }
             if !is_current(&hub, &jid, &selection) {
@@ -151,6 +177,7 @@ pub fn resolve(
                 .record(jid.clone(), id, cache_key.clone(), selection.token)
                 .await
             {
+                publish_failed(&hub, &jid, true);
                 return;
             }
             if !is_current(&hub, &jid, &selection) {
@@ -209,11 +236,28 @@ fn publish_cleared(hub: &StateHub, jid: &str) {
     publish_ready(hub, jid.to_string(), String::new());
 }
 
+fn publish_failed(hub: &StateHub, jid: &str, retryable: bool) {
+    let event = oxidezap_core::UiEvent::AvatarFailed {
+        jid: jid.to_string(),
+        retryable,
+    };
+    match serde_json::to_string(&DaemonMessage::Session {
+        event: Box::new(event),
+    }) {
+        Ok(frame) => hub.publish_session(frame),
+        Err(error) => log::error!("could not serialize avatar failure: {error}"),
+    }
+}
+
 pub fn purge(hub: &StateHub) {
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     latest.retain(|(id, _), _| *id != hub.id());
+    let mut in_flight = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    in_flight.retain(|(id, _, _)| *id != hub.id());
 }
 
 fn record_selection(
