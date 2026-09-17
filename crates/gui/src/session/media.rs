@@ -43,6 +43,7 @@ pub trait MediaCache: Send + Sync {
     /// gigabyte against a budget that had counted it once.
     fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String>;
 
+    #[allow(dead_code)]
     fn image_source(&self, key: &str) -> Option<ImageSource> {
         cached_image_source(key, || self.read(key))
     }
@@ -111,19 +112,16 @@ fn cached_image_source(
     key: &str,
     read: impl FnOnce() -> Result<Arc<Vec<u8>>, String>,
 ) -> Option<ImageSource> {
-    AVATAR_IMAGES.with(|images| {
-        let mut images = images.borrow_mut();
-        if let Some(source) = images.get(key) {
-            return Some(source);
-        }
-        let bytes = read().ok()?;
-        let (source, decoded_size) = decode_avatar(&bytes)?;
-        images.put(key.to_string(), source.clone(), decoded_size);
-        Some(source)
-    })
+    if let Some(source) = get_avatar_image(key) {
+        return Some(source);
+    }
+    let bytes = read().ok()?;
+    let (image, decoded_size) = decode_avatar(&bytes)?;
+    put_avatar_image(key.to_string(), image.clone(), decoded_size);
+    Some(ImageSource::from(image))
 }
 
-pub(crate) fn decode_avatar(bytes: &[u8]) -> Option<(ImageSource, u64)> {
+pub(crate) fn decode_avatar(bytes: &[u8]) -> Option<(Arc<RenderImage>, u64)> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -147,23 +145,32 @@ pub(crate) fn decode_avatar(bytes: &[u8]) -> Option<(ImageSource, u64)> {
         pixel.swap(0, 2);
     }
     Some((
-        ImageSource::from(Arc::new(RenderImage::new(smallvec::smallvec![
-            image::Frame::new(image),
-        ]))),
+        Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            image
+        ),])),
         decoded_size,
     ))
 }
 
 pub(crate) fn get_avatar_image(key: &str) -> Option<ImageSource> {
-    AVATAR_IMAGES.with(|images| images.borrow_mut().get(key))
+    AVATAR_IMAGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
 }
 
-pub(crate) fn put_avatar_image(key: String, source: ImageSource, decoded_size: u64) {
-    AVATAR_IMAGES.with(|images| images.borrow_mut().put(key, source, decoded_size));
+pub(crate) fn put_avatar_image(key: String, image: Arc<RenderImage>, decoded_size: u64) {
+    AVATAR_IMAGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(key, image, decoded_size);
 }
 
 pub(crate) fn clear_image_sources() {
-    AVATAR_IMAGES.with(|images| images.borrow_mut().clear());
+    AVATAR_IMAGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// The media cache as a process that shares the daemon's filesystem sees it:
@@ -171,10 +178,8 @@ pub(crate) fn clear_image_sources() {
 #[cfg(not(target_family = "wasm"))]
 pub struct Directory;
 
-thread_local! {
-    static AVATAR_IMAGES: std::cell::RefCell<SourceCache> =
-        std::cell::RefCell::new(SourceCache::default());
-}
+static AVATAR_IMAGES: std::sync::LazyLock<std::sync::Mutex<SourceCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(SourceCache::default()));
 
 #[derive(Default)]
 struct SourceCache {
@@ -186,7 +191,7 @@ struct SourceCache {
 const MAX_SOURCE_ENTRIES: usize = 256;
 
 struct SourceEntry {
-    source: ImageSource,
+    image: Arc<RenderImage>,
     bytes: u64,
     touched: u64,
 }
@@ -196,11 +201,11 @@ impl SourceCache {
         self.clock = self.clock.wrapping_add(1);
         self.entries.get_mut(key).map(|entry| {
             entry.touched = self.clock;
-            entry.source.clone()
+            ImageSource::from(entry.image.clone())
         })
     }
 
-    fn put(&mut self, key: String, source: ImageSource, bytes: u64) {
+    fn put(&mut self, key: String, image: Arc<RenderImage>, bytes: u64) {
         if let Some(entry) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(entry.bytes);
         }
@@ -209,7 +214,7 @@ impl SourceCache {
         self.entries.insert(
             key,
             SourceEntry {
-                source,
+                image,
                 bytes,
                 touched: self.clock,
             },
@@ -247,17 +252,14 @@ impl MediaCache for Directory {
     }
 
     fn image_source(&self, key: &str) -> Option<ImageSource> {
-        AVATAR_IMAGES.with(|images| {
-            let mut images = images.borrow_mut();
-            if let Some(source) = images.get(key) {
-                return Some(source);
-            }
-            let path = oxidezap_ipc::media_path(key)?;
-            let bytes = std::fs::read(path).ok()?;
-            let (source, decoded_size) = decode_avatar(&bytes)?;
-            images.put(key.to_string(), source.clone(), decoded_size);
-            Some(source)
-        })
+        if let Some(source) = get_avatar_image(key) {
+            return Some(source);
+        }
+        let path = oxidezap_ipc::media_path(key)?;
+        let bytes = std::fs::read(path).ok()?;
+        let (image, decoded_size) = decode_avatar(&bytes)?;
+        put_avatar_image(key.to_string(), image.clone(), decoded_size);
+        Some(ImageSource::from(image))
     }
 
     fn clear_cached(&self) {
@@ -491,6 +493,7 @@ impl Held {
             .insert(key, Arc::new(bytes));
     }
 
+    #[allow(dead_code)]
     pub fn put_avatar(&self, key: String, bytes: Vec<u8>) {
         self.avatars
             .lock()
@@ -572,6 +575,7 @@ struct AvatarEntry {
 
 #[cfg(target_family = "wasm")]
 impl AvatarCache {
+    #[allow(dead_code)]
     fn put(&mut self, key: String, bytes: Vec<u8>) {
         let bytes = Arc::new(bytes);
         if let Some(entry) = self.entries.remove(&key) {
@@ -603,6 +607,7 @@ impl AvatarCache {
         self.bytes = 0;
     }
 
+    #[allow(dead_code)]
     fn evict(&mut self) {
         while self.bytes > oxidezap_core::WEB_MEDIA_BUDGET_BYTES as u64 {
             let Some(key) = self
@@ -820,14 +825,18 @@ mod tests {
     #[test]
     fn image_sources_follow_the_media_budget() {
         let mut cache = SourceCache::default();
-        let source = || ImageSource::from("avatar");
+        let dummy = || -> Arc<RenderImage> {
+            Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+                image::RgbaImage::new(1, 1)
+            ),]))
+        };
 
         cache.put(
             "old".to_string(),
-            source(),
+            dummy(),
             oxidezap_core::DECODED_IMAGE_BUDGET_BYTES,
         );
-        cache.put("new".to_string(), source(), 1);
+        cache.put("new".to_string(), dummy(), 1);
 
         assert!(cache.get("old").is_none());
         assert!(cache.get("new").is_some());
@@ -836,8 +845,13 @@ mod tests {
     #[test]
     fn image_sources_have_an_entry_ceiling_when_their_cost_is_unknown() {
         let mut cache = SourceCache::default();
+        let dummy = || -> Arc<RenderImage> {
+            Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+                image::RgbaImage::new(1, 1)
+            ),]))
+        };
         for index in 0..=MAX_SOURCE_ENTRIES {
-            cache.put(index.to_string(), ImageSource::from("avatar"), 0);
+            cache.put(index.to_string(), dummy(), 0);
         }
 
         assert_eq!(cache.entries.len(), MAX_SOURCE_ENTRIES);
@@ -875,10 +889,7 @@ mod tests {
             )
             .unwrap();
 
-        let (source, _) = decode_avatar(&bytes).expect("a 1x1 avatar decodes");
-        let ImageSource::Render(image) = source else {
-            panic!("a decoded avatar is a render image");
-        };
+        let (image, _) = decode_avatar(&bytes).expect("a 1x1 avatar decodes");
         let pixels = image.as_bytes(0).expect("the one frame");
 
         assert_eq!(

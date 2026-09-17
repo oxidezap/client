@@ -6,7 +6,7 @@ use crate::app::WhatsAppApp;
 use crate::platform::picker::Chosen;
 use gpui::WeakEntity;
 
-pub struct Listener(imp::Listener);
+pub struct Listener(#[allow(dead_code)] imp::Listener);
 
 pub fn install(entity: WeakEntity<WhatsAppApp>, cx: gpui::AsyncApp) -> Result<Listener, String> {
     imp::install(entity, cx).map(Listener)
@@ -153,6 +153,7 @@ mod imp {
 }
 
 #[cfg(target_family = "wasm")]
+#[allow(unused_imports)]
 pub use imp::read_files;
 
 #[cfg(all(test, not(target_family = "wasm")))]

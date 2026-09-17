@@ -1574,6 +1574,11 @@ impl SessionHandle {
         }));
     }
 
+    /// Publish an avatar ready notification to the UI event sink.
+    pub fn notify_avatar_ready(&self, jid: String, key: String) {
+        let _ = self.conn.events.try_send(FromDaemon::Avatar { jid, key });
+    }
+
     /// Fetch media, answered when the bytes are available.
     ///
     /// The same signature the old client had, so the callers that thread this

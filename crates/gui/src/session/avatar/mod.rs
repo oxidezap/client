@@ -58,11 +58,18 @@ pub struct AvatarManager {
     in_flight: Arc<Mutex<HashSet<String>>>,
     revalidated: Arc<Mutex<HashSet<String>>>,
     pending_demands: Arc<Mutex<HashMap<String, AvatarDemand>>>,
+    session: Arc<Mutex<Option<crate::session::SessionHandle>>>,
 }
 
 impl AvatarManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set or clear the active session handle.
+    pub fn set_session(&self, session: Option<crate::session::SessionHandle>) {
+        let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        *s = session;
     }
 
     /// Reset in-memory cache and tracking (e.g. on cache clear or account change).
@@ -122,6 +129,7 @@ impl AvatarManager {
                     let in_flight = Arc::clone(&self.in_flight);
                     let revalidated = Arc::clone(&self.revalidated);
                     let pending_demands = Arc::clone(&self.pending_demands);
+                    let session_handle = Arc::clone(&self.session);
 
                     spawn_task(async move {
                         let persistent_bytes = read_persistent(&key_clone).await;
@@ -134,22 +142,37 @@ impl AvatarManager {
                                 .unwrap_or_else(|e| e.into_inner())
                                 .remove(&key_clone);
 
-                            // If successfully loaded from persistent cache, queue a
+                            // Notify UI that the avatar image is ready in RAM
+                            if let Some(session) = session_handle
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .as_ref()
+                            {
+                                session.notify_avatar_ready(jid_clone.clone(), key_clone.clone());
+                            }
+
+                            // If successfully loaded from persistent cache, queue/dispatch a
                             // conditional check to verify freshness with the server:
                             let mut reval = revalidated.lock().unwrap_or_else(|e| e.into_inner());
                             if reval.insert(jid_clone.clone()) {
-                                pending_demands
+                                let demand = AvatarDemand {
+                                    jid: jid_clone,
+                                    known_picture_id: pic_id,
+                                    cache_key: Some(key_clone),
+                                    need_bytes: false,
+                                };
+                                if let Some(session) = session_handle
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
-                                    .insert(
-                                        jid_clone.clone(),
-                                        AvatarDemand {
-                                            jid: jid_clone,
-                                            known_picture_id: pic_id,
-                                            cache_key: Some(key_clone),
-                                            need_bytes: false,
-                                        },
-                                    );
+                                    .as_ref()
+                                {
+                                    session.ensure_avatars(vec![demand]);
+                                } else {
+                                    pending_demands
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(demand.jid.clone(), demand);
+                                }
                             }
                             return;
                         }
@@ -159,18 +182,24 @@ impl AvatarManager {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .remove(&key_clone);
-                        pending_demands
+                        let demand = AvatarDemand {
+                            jid: jid_clone,
+                            known_picture_id: None,
+                            cache_key: None,
+                            need_bytes: true,
+                        };
+                        if let Some(session) = session_handle
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .insert(
-                                jid_clone.clone(),
-                                AvatarDemand {
-                                    jid: jid_clone,
-                                    known_picture_id: None,
-                                    cache_key: None,
-                                    need_bytes: true,
-                                },
-                            );
+                            .as_ref()
+                        {
+                            session.ensure_avatars(vec![demand]);
+                        } else {
+                            pending_demands
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(demand.jid.clone(), demand);
+                        }
                     });
                 }
             } else {

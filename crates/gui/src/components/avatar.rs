@@ -93,11 +93,8 @@ impl Avatar {
         self
     }
 
-    pub fn picture(mut self, key: Option<String>, cache: Option<Arc<dyn MediaCache>>) -> Self {
-        self.picture = key.and_then(|key| {
-            crate::session::get_avatar_image(&key)
-                .or_else(|| cache.and_then(|c| c.image_source(&key)))
-        });
+    pub fn picture(mut self, key: Option<String>, _cache: Option<Arc<dyn MediaCache>>) -> Self {
+        self.picture = key.and_then(|key| crate::session::get_avatar_image(&key));
         self
     }
 }

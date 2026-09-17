@@ -1755,6 +1755,7 @@ impl WhatsAppApp {
         self.status_feed_cache.borrow_mut().take();
         self.decoded_images.borrow_mut().clear();
         self.avatar_manager.clear();
+        self.avatar_manager.set_session(None);
         let old_scope = crate::session::avatar::rotate_account_scope();
         crate::session::avatar::spawn_task(async move {
             crate::session::avatar::delete_account_storage(&old_scope).await;
@@ -2429,6 +2430,7 @@ impl WhatsAppApp {
 
     pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
         self.avatar_manager.reset_connection();
+        self.avatar_manager.set_session(None);
         self.app_state = AppState::Loading;
 
         // Drop the old connection first: a second one alongside it would be
@@ -2449,6 +2451,8 @@ impl WhatsAppApp {
                 match connected {
                     Ok((client, ui_rx)) => {
                         app.event_task = Some(Self::spawn_event_task(ui_rx, cx));
+                        app.avatar_manager.set_session(Some(client.handle()));
+                        app.avatar_manager.flush_demands(&client);
                         app.client = Some(client);
                         // A level chosen while this was unreachable reached
                         // nobody, and the daemon on the other end may be a

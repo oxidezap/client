@@ -330,16 +330,14 @@ pub(super) async fn resolve(
         if resolutions.is_empty() {
             continue;
         }
-        let chats: Vec<String> = resolutions
-            .iter()
-            .map(|resolution| resolution.jid.clone())
-            .collect();
+        for resolution in &resolutions {
+            let had_bytes = matches!(resolution.outcome, oxidezap_core::AvatarOutcome::NotFound);
+            resolver.mark_asked(&resolution.jid, generation, had_bytes);
+        }
+        let count = resolutions.len();
         match ui_tx.send(UiEvent::AvatarsResolved { resolutions }) {
             Ok(()) => {
-                for jid in &chats {
-                    resolver.mark_asked(jid, generation, true);
-                }
-                published += chats.len();
+                published += count;
             }
             Err(_) => return,
         }

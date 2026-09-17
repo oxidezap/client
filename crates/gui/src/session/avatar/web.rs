@@ -64,7 +64,11 @@ pub fn cache_name() -> String {
 }
 
 pub fn cache_url(key: &str) -> String {
-    format!("http://localhost/_oxidezap/avatar/{key}")
+    let origin = web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .filter(|o| !o.is_empty() && o != "null")
+        .unwrap_or_else(|| "https://oxidezap.local".to_string());
+    format!("{origin}/_oxidezap/avatar/{key}")
 }
 
 pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {

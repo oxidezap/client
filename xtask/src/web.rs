@@ -115,12 +115,29 @@ pub fn build() -> Result<()> {
         // the build from and `Trunk.toml`'s own `target` is what it overrides.
         trunk = trunk.arg(index);
     }
+    let toolchain = env_or("RUSTUP_TOOLCHAIN", "nightly");
+    let cargo_bin = Run::new("rustup")
+        .args(["which", "cargo", "--toolchain", &toolchain])
+        .read()
+        .unwrap_or_else(|_| "cargo".to_string());
+    let mut path = std::env::var("PATH").unwrap_or_default();
+    if let Some(parent) = std::path::Path::new(&cargo_bin).parent() {
+        path = format!("{}:{}", parent.display(), path);
+    }
+
     trunk
         // Trunk finds `Trunk.toml` and `index.html` beside it.
         .current_dir(&web)
         // Named rather than exported, so nothing else this process goes on to
         // do is silently a nightly build.
-        .env("RUSTUP_TOOLCHAIN", env_or("RUSTUP_TOOLCHAIN", "nightly"))
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("MBX_CARGO_SHIM_MODE")
+        .env_remove("MBX_CARGO_SHIM_PATH")
+        .env("PATH", path)
+        .env("MBX_DISABLE", "1")
+        .env("CARGO", cargo_bin)
+        .env("RUSTUP_TOOLCHAIN", toolchain)
         .env("CARGO_UNSTABLE_BUILD_STD", "std,panic_abort")
         // The standard library, which `build-std` is already paying to rebuild
         // and was rebuilding at the defaults. `optimize_for_size` is what
