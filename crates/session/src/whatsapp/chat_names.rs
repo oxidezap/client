@@ -537,10 +537,9 @@ impl NameResolver {
     }
 
     fn global_retry_expired(&self, generation: u64) -> bool {
-        self.global_cooling
-            .is_some_and(|(cooling_generation, until)| {
-                cooling_generation == generation && until.elapsed().as_nanos() > 0
-            })
+        self.global_cooling.is_some_and(|(cooling_generation, _)| {
+            cooling_generation == generation && self.global_retry_after(generation).is_none()
+        })
     }
 
     /// Advance a chat past its cooldown the way its expiry would, without

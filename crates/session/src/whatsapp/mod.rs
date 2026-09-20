@@ -1326,7 +1326,7 @@ impl WhatsAppClient {
                         // trigger for a newly seen special chat. Re-cover
                         // durable state after a mailbox overflow; run_pass's
                         // flush barrier waits for the store's commit first.
-                        names_on_drop.request_full();
+                        names_on_drop.new_connection();
                     }
                     // The kind, and only the kind. It is `Copy`, carries no
                     // payload and names the variant, which makes this the one
@@ -1521,7 +1521,11 @@ impl WhatsAppClient {
                 // pass that learned nothing broadcasts nothing.
                 debug!("offline sync completed ({} messages)", done.count);
                 if let Some(resolve) = &resolve_chat_names {
-                    resolve.request_full();
+                    // A post-sync repair is a new durable snapshot, not just
+                    // another ask for rows already settled before the drain.
+                    // Advance the metadata generation so names overwritten by
+                    // late history are revalidated in this same connection.
+                    resolve.new_connection();
                 }
             }
             Event::DeleteChatUpdate(update) => {
