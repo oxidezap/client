@@ -21,7 +21,7 @@
 //! the list, with no extra publish step.
 //!
 //! The query shape is "selective, not N+1": unnamed groups cost one
-//! `get_metadata` each under a small concurrency cap, deduplicated per
+//! `fetch_overviews` each under a small concurrency cap, deduplicated per
 //! connection generation; channels cost a single `list_subscribed` that
 //! materializes every subscribed name at once, with a selective
 //! `get_metadata` only for channels absent from that list. A lookup that
@@ -123,8 +123,20 @@ impl MetadataSource for Client {
     #[allow(clippy::manual_async_fn)]
     fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
         async move {
-            match self.groups().fetch_metadata(jid).await {
-                Ok(meta) => NameLookup::Found(meta.subject.unwrap_or_default()),
+            match self
+                .groups()
+                .fetch_overviews(std::slice::from_ref(jid))
+                .await
+            {
+                Ok(mut overviews) => match overviews.pop() {
+                    Some(whatsapp_rust::features::GroupOverviewResult::Found(meta)) => {
+                        NameLookup::Found(meta.subject.unwrap_or_default())
+                    }
+                    Some(_) | None => NameLookup::Failed {
+                        retry_after: NAME_RETRY_COOLDOWN,
+                        scope: RetryScope::Chat,
+                    },
+                },
                 Err(e) => {
                     let retry = name_retry_after(&e);
                     NameLookup::Failed {
