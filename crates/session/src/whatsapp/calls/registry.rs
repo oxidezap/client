@@ -3833,12 +3833,14 @@ mod tests {
     fn only_a_lost_picture_asks_for_a_keyframe() {
         use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
 
-        let feedback = |packet_type, fmt| RtcpFeedback {
-            packet_type,
-            fmt,
-            sender_ssrc: 1,
-            media_ssrc: 2,
-            fci: Vec::new(),
+        let feedback = |packet_type, fmt| {
+            RtcpFeedback::builder()
+                .packet_type(packet_type)
+                .fmt(fmt)
+                .sender_ssrc(1)
+                .media_ssrc(2)
+                .fci(Vec::new())
+                .build()
         };
         // Picture Loss Indication and Full Intra Request.
         assert!(reports_loss(&feedback(206, 1)));
@@ -3859,12 +3861,14 @@ mod tests {
     fn decrypted_feedback_names_its_targets() {
         use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
 
-        let feedback = |packet_type, fmt, media_ssrc, fci: &[u8]| RtcpFeedback {
-            packet_type,
-            fmt,
-            sender_ssrc: 1,
-            media_ssrc,
-            fci: fci.to_vec(),
+        let feedback = |packet_type, fmt, media_ssrc, fci: &[u8]| {
+            RtcpFeedback::builder()
+                .packet_type(packet_type)
+                .fmt(fmt)
+                .sender_ssrc(1)
+                .media_ssrc(media_ssrc)
+                .fci(fci.to_vec())
+                .build()
         };
         assert_eq!(describe_feedback(&[]), None);
         assert_eq!(
@@ -3894,12 +3898,14 @@ mod tests {
     fn remb_reports_the_ssrcs_it_estimates() {
         use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
 
-        let remb = |fci: &[u8]| RtcpFeedback {
-            packet_type: 206,
-            fmt: 15,
-            sender_ssrc: 1,
-            media_ssrc: 0,
-            fci: fci.to_vec(),
+        let remb = |fci: &[u8]| {
+            RtcpFeedback::builder()
+                .packet_type(206)
+                .fmt(15)
+                .sender_ssrc(1)
+                .media_ssrc(0)
+                .fci(fci.to_vec())
+                .build()
         };
         // Magic, a two-stream count, three bitrate bytes, then the list.
         let mut fci = b"REMB".to_vec();
@@ -3982,26 +3988,28 @@ mod tests {
             let mut lines = 0;
             for raw in feedback.lines().map(str::trim).filter(|l| !l.is_empty()) {
                 let (packet_type, fmt, media) = parse_feedback_line(raw);
-                let rendered = describe_feedback(&[RtcpFeedback {
-                    packet_type,
-                    fmt,
-                    sender_ssrc: 1,
-                    media_ssrc: media,
-                    fci: Vec::new(),
-                }]);
+                let rendered = describe_feedback(&[RtcpFeedback::builder()
+                    .packet_type(packet_type)
+                    .fmt(fmt)
+                    .sender_ssrc(1)
+                    .media_ssrc(media)
+                    .fci(Vec::new())
+                    .build()]);
                 assert_eq!(rendered.as_deref(), Some(raw), "cycle {cycle}");
                 assert_eq!(
                     media, ours,
                     "cycle {cycle}: feedback must name our video stream"
                 );
                 assert!(
-                    reports_loss(&RtcpFeedback {
-                        packet_type,
-                        fmt,
-                        sender_ssrc: 1,
-                        media_ssrc: media,
-                        fci: Vec::new(),
-                    }),
+                    reports_loss(
+                        &RtcpFeedback::builder()
+                            .packet_type(packet_type)
+                            .fmt(fmt)
+                            .sender_ssrc(1)
+                            .media_ssrc(media)
+                            .fci(Vec::new())
+                            .build()
+                    ),
                     "cycle {cycle}: every replayed line is a lost-picture report"
                 );
                 lines += 1;

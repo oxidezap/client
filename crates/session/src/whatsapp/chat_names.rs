@@ -119,8 +119,8 @@ impl MetadataSource for Client {
     #[allow(clippy::manual_async_fn)]
     fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
         async move {
-            match self.groups().get_metadata(jid).await {
-                Ok(meta) => NameLookup::Found(meta.subject),
+            match self.groups().fetch_metadata(jid).await {
+                Ok(meta) => NameLookup::Found(meta.subject.unwrap_or_default()),
                 Err(e) => {
                     let retry = name_retry_after(&e);
                     NameLookup::Failed {

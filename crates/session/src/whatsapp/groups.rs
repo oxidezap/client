@@ -22,14 +22,9 @@ use crate::exec::Task;
 impl WhatsAppClient {
     /// Everyone in `jid`, named the way every other surface names them.
     ///
-    /// Through [`Groups::query_info`], which is the cached, send-oriented
-    /// view: a group that has been written to or read from since the last
-    /// membership change is answered without touching the network, and a miss
-    /// sends the participant hash so an unchanged group costs a
-    /// `not-modified` rather than a full download. The fuller
-    /// `Groups::get_metadata` — subject, description, admin roles — has no
-    /// cache in front of it at all, and none of what it adds is drawn
-    /// anywhere yet.
+    /// Through [`Groups::fetch_metadata`], which returns the complete group
+    /// metadata needed for the participant list, including current membership
+    /// and admin roles.
     ///
     /// Names come from the [`NameBook`](crate::names::NameBook) like a
     /// bubble's do, so the same person is not "Ana" over their message and a
@@ -49,7 +44,7 @@ impl WhatsAppClient {
             let info = live
                 .client
                 .groups()
-                .query_info(&group)
+                .fetch_metadata(&group)
                 .await
                 .map_err(|e| e.to_string())?;
             // Both of this account's addresses, because a group addresses its
@@ -58,17 +53,17 @@ impl WhatsAppClient {
             let mine = own_jids(&live.client);
             let mut members = Vec::with_capacity(info.participants.len());
             for participant in &info.participants {
-                let is_self = mine.contains(&participant.to_non_ad_string());
+                let is_self = mine.contains(&participant.jid.to_non_ad_string());
                 // Not looked up for this account: it is drawn as "You", and
                 // asking would put the owner's own address-book entry — or
                 // their number — in a line about everybody else.
                 let name = if is_self {
                     None
                 } else {
-                    live.names.known(&live.client, participant, None).await
+                    live.names.known(&live.client, &participant.jid, None).await
                 };
                 members.push(GroupMember {
-                    jid: participant.to_string(),
+                    jid: participant.jid.to_string(),
                     name,
                     is_self,
                 });
@@ -94,15 +89,15 @@ impl WhatsAppClient {
             let participating = live
                 .client
                 .groups()
-                .get_participating()
+                .list_participating()
                 .await
                 .map_err(|e| e.to_string())?;
             let mut groups: Vec<GroupListEntry> = participating
-                .into_values()
+                .into_iter()
                 .map(|meta| GroupListEntry {
                     jid: meta.id.to_string(),
-                    subject: meta.subject,
-                    participant_count: meta.participants.len(),
+                    subject: meta.subject.unwrap_or_default(),
+                    participant_count: meta.participant_count.unwrap_or_default() as usize,
                 })
                 .collect();
             groups.sort_by(|a, b| a.subject.cmp(&b.subject));
@@ -126,12 +121,12 @@ impl WhatsAppClient {
             let meta = live
                 .client
                 .groups()
-                .get_metadata(&group)
+                .fetch_metadata(&group)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(GroupDetails {
                 jid: meta.id.to_string(),
-                subject: meta.subject,
+                subject: meta.subject.unwrap_or_default(),
                 description: meta.description,
                 owner_jid: meta.creator.map(|j| j.to_string()),
                 participant_count: meta.participants.len(),
