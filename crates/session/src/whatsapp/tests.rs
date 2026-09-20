@@ -1564,8 +1564,13 @@ async fn a_session_is_never_observed_half_open() {
     let session: super::SessionSlot = Arc::new(super::Mutex::new(None));
 
     let stores = StoreRegistry::new("file:oxidezap-session-half-open?mode=memory&cache=shared");
-    let opening =
-        WhatsAppClient::open_session(&stores, oxidezap_core::AccountId::LEGACY, &ui_tx, &session);
+    let opening = WhatsAppClient::open_session(
+        &stores,
+        oxidezap_core::AccountId::LEGACY,
+        &ui_tx,
+        &session,
+        super::chat_names::ChatNameResolveSignal::new(),
+    );
     let mut opening = std::pin::pin!(opening);
     let mut cx = Context::from_waker(Waker::noop());
 
@@ -1607,9 +1612,15 @@ async fn closing_takes_the_client_away_with_the_store() {
     );
     let session: super::SessionSlot = Arc::new(super::Mutex::new(None));
     let stores = StoreRegistry::new("file:oxidezap-session-close?mode=memory&cache=shared");
-    WhatsAppClient::open_session(&stores, oxidezap_core::AccountId::LEGACY, &ui_tx, &session)
-        .await
-        .expect("the session opens offline");
+    WhatsAppClient::open_session(
+        &stores,
+        oxidezap_core::AccountId::LEGACY,
+        &ui_tx,
+        &session,
+        super::chat_names::ChatNameResolveSignal::new(),
+    )
+    .await
+    .expect("the session opens offline");
     assert_eq!(super::parts_visible(&session).await, [true; 3]);
 
     // What `drain_chat_store` does: the whole session, in one take.

@@ -243,6 +243,9 @@ pub(super) struct ChatNameResolveSignal {
     ask: Arc<Notify>,
     state: Arc<std::sync::Mutex<PendingNames>>,
     generation: Arc<AtomicU64>,
+    /// Serializes a generation bump with the final stale-check and write
+    /// enqueue, so an old pass cannot slip a write between those operations.
+    generation_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// What asks are outstanding, under one lock so they are taken atomically.
@@ -279,8 +282,18 @@ impl ChatNameResolveSignal {
     /// for a full pass, because a subject can change while the process is
     /// offline and the previous socket's answers say nothing about this one.
     pub(super) fn new_connection(&self) {
+        let _generation_lock = self
+            .generation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.request_full();
+    }
+
+    fn lock_generation(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.generation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Ask for a full pass over the stored special chats, under the current
@@ -364,6 +377,9 @@ pub(super) struct NameResolver {
     asked: HashMap<String, u64>,
     cooling: HashMap<String, (u64, wacore::time::Instant)>,
     global_cooling: Option<(u64, wacore::time::Instant)>,
+    /// Sightings coalesced into a pass that was interrupted by global
+    /// throttling. They must survive until the one global retry timer fires.
+    global_named: HashSet<String>,
 }
 
 impl NameResolver {
@@ -416,6 +432,26 @@ impl NameResolver {
         };
         if replace {
             self.global_cooling = Some((generation, until));
+        }
+    }
+
+    fn defer_global_named(&mut self, generation: u64, jids: impl IntoIterator<Item = String>) {
+        if self
+            .global_cooling
+            .is_some_and(|(cooling_generation, _)| cooling_generation == generation)
+        {
+            self.global_named.extend(jids);
+        }
+    }
+
+    fn take_global_named(&mut self, generation: u64) -> Vec<String> {
+        if self
+            .global_cooling
+            .is_some_and(|(cooling_generation, _)| cooling_generation == generation)
+        {
+            self.global_named.drain().collect()
+        } else {
+            Vec::new()
         }
     }
 
@@ -483,6 +519,12 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     stop: &mut watch::Receiver<()>,
 ) {
     let generation = signal.generation();
+    if resolver.global_retry_after(generation).is_some() {
+        // Requests arriving while a global throttle is active must not consume
+        // their sightings before the timer can combine them with the retry.
+        resolver.defer_global_named(generation, request.named.iter().cloned());
+        return;
+    }
     // The event handler and the ChatStore have independent subscriptions. A
     // completion/sighting can therefore wake this task while the materializer
     // still has history or the message that caused the sighting in its queue.
@@ -809,19 +851,23 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         failed.extend(channels.iter().map(|jid| (jid.to_string(), retry_after)));
     }
 
-    // The staleness gate: a pass whose lookups landed after a reconnect
-    // discards its answers rather than writing the previous socket's
-    // metadata over the new one — and marks nothing, so the new
-    // generation's pass retries every one of them.
-    if signal.generation() != generation {
-        debug!("chat-name resolver: discarding a pass from a superseded connection");
-        return;
-    }
-    if !resolved.is_empty() {
-        if let Err(e) = chat_store.apply_chat_names(resolved.clone()) {
-            warn!("chat-name resolver could not queue resolved names: {e}");
+    // The staleness gate and queue enqueue share a lock with
+    // `new_connection`: an old pass cannot observe the old generation, get
+    // preempted, and enqueue its writes after the new socket has advanced it.
+    {
+        let _generation_lock = signal.lock_generation();
+        if signal.generation() != generation {
+            debug!("chat-name resolver: discarding a pass from a superseded connection");
             return;
         }
+        if !resolved.is_empty() {
+            if let Err(e) = chat_store.apply_chat_names(resolved.clone()) {
+                warn!("chat-name resolver could not queue resolved names: {e}");
+                return;
+            }
+        }
+    }
+    if !resolved.is_empty() {
         let flushed = chat_store.flush();
         tokio::pin!(flushed);
         let flushed = tokio::select! {
@@ -833,14 +879,25 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             return;
         }
     }
+    // A CAS can legitimately match no row when a chat was deleted during the
+    // lookup. Do not mark that JID settled: if a later message recreates it in
+    // this generation, its new row still needs a name lookup.
     for jid in settled {
-        resolver.mark(&jid, generation);
+        let Ok(parsed) = jid.parse::<Jid>() else {
+            continue;
+        };
+        match chat_store.chat(&parsed).await {
+            Ok(Some(_)) => resolver.mark(&jid, generation),
+            Ok(None) => {}
+            Err(e) => debug!("chat-name resolver could not confirm {jid}: {e}"),
+        }
     }
     for (jid, retry_after) in failed {
         resolver.cool(&jid, generation, retry_after);
     }
     if let Some(retry_after) = global_backoff {
         resolver.cool_global(generation, retry_after);
+        resolver.defer_global_named(generation, request.named.iter().cloned());
     }
     debug!(
         "chat-name resolver: {} chat(s) learned a name",
@@ -874,7 +931,9 @@ impl WhatsAppClient {
                     tokio::select! {
                         request = signal.next() => request,
                         _ = sleep(delay) => {
+                            let named = resolver.take_global_named(signal.generation());
                             signal.request_full();
+                            signal.request_named(named);
                             continue;
                         },
                         _ = stopping.changed() => return,
@@ -916,6 +975,7 @@ mod tests {
         listed: StdMutex<Option<HashMap<String, String>>>,
         fail_groups: portable_atomic::AtomicBool,
         fail_list: portable_atomic::AtomicBool,
+        fail_channel_global: portable_atomic::AtomicBool,
     }
 
     impl FakeMeta {
@@ -926,6 +986,7 @@ mod tests {
                 listed: StdMutex::new(Some(HashMap::new())),
                 fail_groups: portable_atomic::AtomicBool::new(false),
                 fail_list: portable_atomic::AtomicBool::new(false),
+                fail_channel_global: portable_atomic::AtomicBool::new(false),
             }
         }
 
@@ -1016,18 +1077,25 @@ mod tests {
 
         #[allow(clippy::manual_async_fn)]
         fn channel_name(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
-            let answer = match self
-                .channels
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&jid.to_string())
-                .cloned()
-            {
-                Some(name) => NameLookup::Found(name),
-                None => NameLookup::Failed {
-                    retry_after: NAME_RETRY_COOLDOWN,
-                    scope: RetryScope::Chat,
-                },
+            let answer = if self.fail_channel_global.load(Ordering::Relaxed) {
+                NameLookup::Failed {
+                    retry_after: Duration::ZERO,
+                    scope: RetryScope::Global,
+                }
+            } else {
+                match self
+                    .channels
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&jid.to_string())
+                    .cloned()
+                {
+                    Some(name) => NameLookup::Found(name),
+                    None => NameLookup::Failed {
+                        retry_after: NAME_RETRY_COOLDOWN,
+                        scope: RetryScope::Chat,
+                    },
+                }
             };
             async move { answer }
         }
@@ -1185,6 +1253,42 @@ mod tests {
         )
         .await;
 
+        assert_eq!(
+            stored_name(&store, CHANNEL).await.as_deref(),
+            Some("Quiet updates")
+        );
+    }
+
+    /// A global backoff during a selectively sighted channel fallback keeps
+    /// that sighting until the timer-driven full retry, so the absent channel
+    /// does not lose its only selective lookup.
+    #[tokio::test]
+    async fn a_global_channel_backoff_retries_the_sighted_fallback() {
+        let store = test_store("channel-global-backoff").await;
+        feed(&store, group_message(CHANNEL, "MSG-C4")).await;
+
+        let source = FakeMeta::with_channel(CHANNEL, "Quiet updates", false);
+        source.fail_channel_global.store(true, Ordering::Relaxed);
+        let signal = ChatNameResolveSignal::new();
+        let mut resolver = NameResolver::new();
+        drive(
+            &source,
+            &store,
+            &signal,
+            &mut resolver,
+            named_request(&[CHANNEL]),
+        )
+        .await;
+        assert_eq!(stored_name(&store, CHANNEL).await, None);
+
+        source.fail_channel_global.store(false, Ordering::Relaxed);
+        let named = resolver.take_global_named(signal.generation());
+        assert_eq!(named, vec![CHANNEL.to_string()]);
+        signal.request_full();
+        signal.request_named(named);
+        let retry = signal.next().await;
+        assert!(retry.full);
+        drive(&source, &store, &signal, &mut resolver, retry).await;
         assert_eq!(
             stored_name(&store, CHANNEL).await.as_deref(),
             Some("Quiet updates")

@@ -81,7 +81,13 @@ impl WhatsAppClient {
             if let Some(announce) = announce {
                 let _ = announce.send(msg_id.clone());
             }
-            super::record_outgoing(&live.chat_store, &chat, &msg_id, &message);
+            super::record_outgoing(
+                &live.chat_store,
+                &chat,
+                &msg_id,
+                &message,
+                &live.resolve_chat_names,
+            );
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)
@@ -160,7 +166,13 @@ impl WhatsAppClient {
             };
             let message = super::outgoing::message(&file, shape, uploaded, None);
             let msg_id = client.generate_message_id();
-            super::record_outgoing(&live.chat_store, &chat, &msg_id, &message);
+            super::record_outgoing(
+                &live.chat_store,
+                &chat,
+                &msg_id,
+                &message,
+                &live.resolve_chat_names,
+            );
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)
@@ -229,7 +241,13 @@ impl WhatsAppClient {
                 ..Default::default()
             };
             let msg_id = client.generate_message_id();
-            super::record_outgoing(&live.chat_store, &chat, &msg_id, &message);
+            super::record_outgoing(
+                &live.chat_store,
+                &chat,
+                &msg_id,
+                &message,
+                &live.resolve_chat_names,
+            );
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)
@@ -292,7 +310,13 @@ impl WhatsAppClient {
                 ..Default::default()
             };
             let msg_id = client.generate_message_id();
-            super::record_outgoing(&live.chat_store, &chat, &msg_id, &message);
+            super::record_outgoing(
+                &live.chat_store,
+                &chat,
+                &msg_id,
+                &message,
+                &live.resolve_chat_names,
+            );
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)

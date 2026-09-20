@@ -213,6 +213,9 @@ pub(crate) struct Session {
     /// The session's one address book, so a live bubble, the row it lands in
     /// and the typing line above it name the same person the same way.
     pub(crate) names: Arc<NameBook>,
+    /// The name resolver signal used by outgoing writes as well as inbound
+    /// sightings, so a locally created special-chat row is not left nameless.
+    resolve_chat_names: chat_names::ChatNameResolveSignal,
 }
 
 /// Where the one session lives: `None` until it is open, and `None` again the
@@ -933,6 +936,7 @@ impl WhatsAppClient {
         account_id: AccountId,
         ui_tx: &UiEventSender,
         session: &SessionSlot,
+        resolve_chat_names: chat_names::ChatNameResolveSignal,
     ) -> Option<(Bot, Arc<Session>, ColdStart)> {
         // `began` is this function's own, and the caller's total is the
         // caller's: resolving where the database lives happens before this and
@@ -1073,6 +1077,7 @@ impl WhatsAppClient {
             client: bot.client(),
             chat_store: chat_store.clone(),
             names: Arc::new(NameBook::new(Some(chat_store))),
+            resolve_chat_names,
         });
         *session.lock().await = Some(live.clone());
         crate::exec::breathe().await;
@@ -1106,8 +1111,14 @@ impl WhatsAppClient {
         // one WAL writer). The registry is owned by the daemon and its schema
         // cell prevents concurrent account runtimes from rerunning migrations.
         let resolving = cold_start.elapsed();
-        let Some((bot, live, cold)) =
-            Self::open_session(&stores, account_id, &ui_tx, &session).await
+        let Some((bot, live, cold)) = Self::open_session(
+            &stores,
+            account_id,
+            &ui_tx,
+            &session,
+            resolve_chat_names.clone(),
+        )
+        .await
         else {
             return;
         };
@@ -2101,7 +2112,13 @@ impl WhatsAppClient {
                 // Receipts/reactions arrive keyed by this id; rename the
                 // optimistic bubble before they can race it.
                 notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
-                record_outgoing(&live.chat_store, &jid, &msg_id, &message);
+                record_outgoing(
+                    &live.chat_store,
+                    &jid,
+                    &msg_id,
+                    &message,
+                    &live.resolve_chat_names,
+                );
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
                     .send_message_with_options(jid.clone(), message, options)
@@ -2257,7 +2274,13 @@ impl WhatsAppClient {
                 // the ack can't precede the row in the writer queue.
                 let msg_id = client.generate_message_id();
                 notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
-                record_outgoing(&live.chat_store, &jid, &msg_id, &message);
+                record_outgoing(
+                    &live.chat_store,
+                    &jid,
+                    &msg_id,
+                    &message,
+                    &live.resolve_chat_names,
+                );
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
                     .send_message_with_options(jid.clone(), message, options)
@@ -2393,7 +2416,13 @@ impl WhatsAppClient {
             // the ack can't precede the row in the writer queue.
             let msg_id = client.generate_message_id();
             notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
-            record_outgoing(&live.chat_store, &jid, &msg_id, &message);
+            record_outgoing(
+                &live.chat_store,
+                &jid,
+                &msg_id,
+                &message,
+                &live.resolve_chat_names,
+            );
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(jid.clone(), message, options)
@@ -2704,7 +2733,13 @@ fn notify_send_failed(ui_sender: &UiEventSender, chat_jid: &str, message_id: &st
 
 /// Best-effort durable record of a message this client just sent; the UI's
 /// optimistic bubble is independent of this.
-fn record_outgoing(store: &ChatStore, jid: &Jid, message_id: &str, message: &wa::Message) {
+fn record_outgoing(
+    store: &ChatStore,
+    jid: &Jid,
+    message_id: &str,
+    message: &wa::Message,
+    resolve_chat_names: &chat_names::ChatNameResolveSignal,
+) {
     if let Err(e) = store.record_outgoing(
         jid,
         message_id,
@@ -2712,6 +2747,12 @@ fn record_outgoing(store: &ChatStore, jid: &Jid, message_id: &str, message: &wa:
         whatsapp_rust::wacore::time::now_utc(),
     ) {
         warn!("Failed to record outgoing message {}: {e}", message_id);
+    } else if jid.is_group() || jid.is_newsletter() {
+        // Outgoing traffic creates its row through the same writer as
+        // inbound traffic, but it does not produce an inbound Messages event
+        // on this device. Queue the sighting after the write so a newly
+        // created group/channel is resolved without waiting for a reconnect.
+        resolve_chat_names.request_named([jid.to_non_ad_string()]);
     }
 }
 
