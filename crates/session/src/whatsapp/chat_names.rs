@@ -40,7 +40,7 @@ use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt};
 
 use super::WhatsAppClient;
-use crate::exec::{MaybeSend, spawn_owned};
+use crate::exec::{MaybeSend, sleep, spawn_owned};
 
 /// How many per-chat metadata lookups may be in flight at once.
 ///
@@ -50,22 +50,36 @@ use crate::exec::{MaybeSend, spawn_owned};
 /// quickly.
 const CHAT_NAME_CONCURRENCY: usize = 4;
 
+/// Whether a failed request only affects its chat or indicates account-wide
+/// throttling. Only a server-provided IQ backoff is global; ordinary lookup
+/// failures must not stop unrelated chats from being resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryScope {
+    /// Cool only the JID that failed.
+    Chat,
+    /// Stop work not started yet and retry the pass after the delay.
+    Global,
+}
+
+/// Retry information returned by a metadata operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NameRetry {
+    pub(crate) retry_after: std::time::Duration,
+    pub(crate) scope: RetryScope,
+}
+
 /// What one metadata lookup told us.
-///
-/// The distinction is why this is not an `Option`: a failure must stay
-/// distinguishable from an answer. `Failed` carries the retry hint the
-/// server gave (`Some` = wait this long before asking again; `None` = a
-/// short local cooldown), so a busy group cannot re-request on every
-/// message and a transient bulk-list failure does not fan out into per-chat
-/// requests while the service is down.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NameLookup {
     /// The server named the chat (possibly blank, which settles the
     /// question for this generation without writing anything).
     Found(String),
-    /// The request failed. The duration is how long this chat must wait
-    /// before it is asked about again.
-    Failed(std::time::Duration),
+    /// The request failed. A global failure is a server-directed throttle;
+    /// other failures cool only this chat.
+    Failed {
+        retry_after: std::time::Duration,
+        scope: RetryScope,
+    },
 }
 
 /// Fallback cooldown when the server named no delay: transport hiccups and
@@ -94,7 +108,7 @@ pub(crate) trait MetadataSource {
     fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend;
     fn subscribed_channels(
         &self,
-    ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend;
+    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend;
     fn channel_name(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend;
 }
 
@@ -107,7 +121,13 @@ impl MetadataSource for Client {
         async move {
             match self.groups().get_metadata(jid).await {
                 Ok(meta) => NameLookup::Found(meta.subject),
-                Err(e) => NameLookup::Failed(name_retry_after(&e)),
+                Err(e) => {
+                    let retry = name_retry_after(&e);
+                    NameLookup::Failed {
+                        retry_after: retry.retry_after,
+                        scope: retry.scope,
+                    }
+                }
             }
         }
     }
@@ -115,8 +135,7 @@ impl MetadataSource for Client {
     #[allow(clippy::manual_async_fn)]
     fn subscribed_channels(
         &self,
-    ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend
-    {
+    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
         async move {
             match self.newsletter().list_subscribed().await {
                 Ok(subscribed) => Ok(subscribed
@@ -133,23 +152,33 @@ impl MetadataSource for Client {
         async move {
             match self.newsletter().get_metadata(jid).await {
                 Ok(meta) => NameLookup::Found(meta.name),
-                Err(e) => NameLookup::Failed(name_retry_after(&e)),
+                Err(e) => {
+                    let retry = name_retry_after(&e);
+                    NameLookup::Failed {
+                        retry_after: retry.retry_after,
+                        scope: retry.scope,
+                    }
+                }
             }
         }
     }
 }
 
-/// How long a failed lookup keeps its chat quiet.
-///
-/// The `get_metadata` the client is pinned on preserves the server's own
-/// `backoff` on rejection: honoring it is what keeps a throttled account
-/// from re-requesting into the limit it just hit. Anything without a
-/// server-directed delay falls back to [`NAME_RETRY_COOLDOWN`].
-fn name_retry_after(error: &impl NameErrorBackoff) -> std::time::Duration {
-    error
-        .backoff_secs()
-        .map(|secs| std::time::Duration::from_secs(u64::from(secs.max(1))))
-        .unwrap_or(NAME_RETRY_COOLDOWN)
+/// Classify a failed lookup without turning an ordinary error into a global
+/// throttle. The client is pinned on a protocol where only
+/// `ServerError.backoff` is evidence that the account must stop issuing more
+/// metadata requests; 403/404, timeouts and local failures cool one JID.
+fn name_retry_after(error: &impl NameErrorBackoff) -> NameRetry {
+    match error.backoff_secs() {
+        Some(secs) => NameRetry {
+            retry_after: std::time::Duration::from_secs(u64::from(secs.max(1))),
+            scope: RetryScope::Global,
+        },
+        None => NameRetry {
+            retry_after: NAME_RETRY_COOLDOWN,
+            scope: RetryScope::Chat,
+        },
+    }
 }
 
 /// The one field of a metadata failure the resolver acts on.
@@ -193,8 +222,7 @@ impl<T: MetadataSource + ?Sized> MetadataSource for Arc<T> {
 
     fn subscribed_channels(
         &self,
-    ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend
-    {
+    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
         (**self).subscribed_channels()
     }
 
@@ -335,6 +363,7 @@ impl ChatNameResolveSignal {
 pub(super) struct NameResolver {
     asked: HashMap<String, u64>,
     cooling: HashMap<String, (u64, wacore::time::Instant)>,
+    global_cooling: Option<(u64, wacore::time::Instant)>,
 }
 
 impl NameResolver {
@@ -346,6 +375,12 @@ impl NameResolver {
     /// asked-and-failed with its cooldown elapsed.
     fn needs(&self, jid: &str, generation: u64) -> bool {
         if self.asked.get(jid) == Some(&generation) {
+            return false;
+        }
+        if let Some((global_generation, until)) = self.global_cooling
+            && global_generation == generation
+            && until.elapsed().as_nanos() == 0
+        {
             return false;
         }
         match self.cooling.get(jid) {
@@ -369,6 +404,29 @@ impl NameResolver {
             jid.to_string(),
             (generation, wacore::time::Instant::now() + retry_after),
         );
+    }
+
+    fn cool_global(&mut self, generation: u64, retry_after: std::time::Duration) {
+        let until = wacore::time::Instant::now() + retry_after;
+        let replace = match self.global_cooling {
+            None => true,
+            Some((current_generation, current_until)) => {
+                current_generation != generation || current_until < until
+            }
+        };
+        if replace {
+            self.global_cooling = Some((generation, until));
+        }
+    }
+
+    /// Remaining delay before a global server backoff may be retried.
+    fn global_retry_after(&self, generation: u64) -> Option<std::time::Duration> {
+        let (cooling_generation, until) = self.global_cooling?;
+        if cooling_generation != generation {
+            return None;
+        }
+        let remaining = until.saturating_duration_since(wacore::time::Instant::now());
+        (!remaining.is_zero()).then_some(remaining)
     }
 
     /// Advance a chat past its cooldown the way its expiry would, without
@@ -543,7 +601,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     let mut settled: Vec<String> = Vec::new();
     let mut resolved: Vec<oxidezap_chat_store::ChatNameWrite> = Vec::new();
     let mut failed: Vec<(String, std::time::Duration)> = Vec::new();
-    let mut group_backoff: Option<std::time::Duration> = None;
+    let mut global_backoff: Option<std::time::Duration> = None;
     for (chunk_index, chunk) in groups.chunks(CHAT_NAME_CONCURRENCY).enumerate() {
         let lookup = whatsapp_rust::futures::future::join_all(chunk.iter().map(|jid| async {
             let name = source.group_subject(jid).await;
@@ -578,17 +636,27 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 // Failed, not forgotten-without-a-trace: the cooldown is
                 // what keeps a busy unnamed group from re-requesting on
                 // every message while still retrying on a later sighting.
-                NameLookup::Failed(retry_after) => {
-                    group_backoff =
-                        Some(group_backoff.map_or(retry_after, |current| current.max(retry_after)));
+                NameLookup::Failed {
+                    retry_after,
+                    scope: RetryScope::Chat,
+                } => {
+                    failed.push((jid.to_string(), retry_after));
+                }
+                NameLookup::Failed {
+                    retry_after,
+                    scope: RetryScope::Global,
+                } => {
+                    global_backoff = Some(
+                        global_backoff.map_or(retry_after, |current| current.max(retry_after)),
+                    );
                     failed.push((jid.to_string(), retry_after));
                 }
             }
         }
-        if let Some(retry_after) = group_backoff {
+        if let Some(retry_after) = global_backoff {
             // A server-directed backoff applies to work not started too. Do
             // not immediately issue every later chunk into the same throttle
-            // window; those JIDs will be retried by a later pass.
+            // window; those JIDs will be retried by the timer-driven pass.
             let remaining_start = (chunk_index + 1) * CHAT_NAME_CONCURRENCY;
             failed.extend(
                 groups
@@ -599,7 +667,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             break;
         }
     }
-    if !channels.is_empty() && group_backoff.is_none() {
+    if !channels.is_empty() && global_backoff.is_none() {
         // One call for every subscribed channel, which is normally all of
         // them — but ONLY when the bulk call succeeds. A failed list must
         // not read as "every channel absent": that turns one transient
@@ -631,22 +699,12 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                         None => fallback.push(jid),
                     }
                 }
-                // A live-sighted channel absent from a GOOD list is a real
-                // absence (unsubscribed, or too new for the list) and earns
-                // its selective lookup. A full pass does not fan out here:
-                // hundreds of unsubscribed rows each buying an IQ is the
-                // N+1 the bulk call exists to avoid — they wait for a live
-                // sighting of their own, which is the chat anyone is
-                // actually looking at. Either way a chat that already
-                // carries a usable stored name needs no fallback lookup —
-                // same retry rule as groups: a chat this generation
-                // settled skips; a failed one past its cooldown retries.
-                // A live-sighted absence earns its lookup only when
-                // the chat is actually due (unnamed, or a failed lookup
-                // past its cooldown). A full pass never fans out here:
-                // an unnamed row absent from the list is the unsubscribed
-                // case — it waits for a live sighting of its own, which
-                // is the chat anyone is actually looking at.
+                // A channel absent from a GOOD list is either unsubscribed
+                // or too new for it. A full pass avoids the N+1 fallback for
+                // ordinary stored rows, while a live sighting is stronger
+                // evidence and earns its selective lookup. A chat that
+                // already carries a usable stored name still retries when a
+                // previous lookup failed and its cooldown has elapsed.
                 let explicitly_sighted: HashSet<String> = request
                     .named
                     .iter()
@@ -671,7 +729,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                             && (!known || explicitly_sighted.contains(&key))
                     })
                     .collect();
-                for chunk in fallback.chunks(CHAT_NAME_CONCURRENCY) {
+                for (chunk_index, chunk) in fallback.chunks(CHAT_NAME_CONCURRENCY).enumerate() {
                     let lookup =
                         whatsapp_rust::futures::future::join_all(chunk.iter().map(|jid| async {
                             let name = source.channel_name(jid).await;
@@ -698,24 +756,53 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                                     ));
                                 }
                             }
-                            NameLookup::Failed(retry_after) => {
+                            NameLookup::Failed {
+                                retry_after,
+                                scope: RetryScope::Chat,
+                            } => {
+                                failed.push((jid.to_string(), retry_after));
+                            }
+                            NameLookup::Failed {
+                                retry_after,
+                                scope: RetryScope::Global,
+                            } => {
+                                global_backoff = Some(
+                                    global_backoff
+                                        .map_or(retry_after, |current| current.max(retry_after)),
+                                );
                                 failed.push((jid.to_string(), retry_after));
                             }
                         }
                     }
+                    if let Some(retry_after) = global_backoff {
+                        let remaining_start = (chunk_index + 1) * CHAT_NAME_CONCURRENCY;
+                        failed.extend(
+                            fallback
+                                .iter()
+                                .skip(remaining_start)
+                                .map(|jid| (jid.to_string(), retry_after)),
+                        );
+                        break;
+                    }
                 }
             }
-            Err(retry_after) => {
+            Err(retry) => {
                 // The list itself failed: cool every channel of this pass
                 // rather than treating them as absent. Nothing is settled,
                 // nothing fans out, and a later sighting past the cooldown
                 // retries the bulk call first.
+                if retry.scope == RetryScope::Global {
+                    global_backoff = Some(
+                        global_backoff
+                            .map_or(retry.retry_after, |current| current.max(retry.retry_after)),
+                    );
+                }
                 for jid in channels {
-                    failed.push((jid.to_string(), retry_after));
+                    failed.push((jid.to_string(), retry.retry_after));
                 }
             }
         }
-    } else if let Some(retry_after) = group_backoff {
+    } else if let Some(retry_after) = global_backoff {
         // A group request was rate-limited. Do not spend the same pass on a
         // channel bulk request either; cool its pending rows with the same
         // server-directed delay and let the next pass start cleanly.
@@ -752,6 +839,9 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     for (jid, retry_after) in failed {
         resolver.cool(&jid, generation, retry_after);
     }
+    if let Some(retry_after) = global_backoff {
+        resolver.cool_global(generation, retry_after);
+    }
     debug!(
         "chat-name resolver: {} chat(s) learned a name",
         resolved.len()
@@ -775,9 +865,25 @@ impl WhatsAppClient {
             let mut resolver = NameResolver::new();
             let mut stopping = stopping;
             loop {
-                let request = tokio::select! {
-                    request = signal.next() => request,
-                    _ = stopping.changed() => return,
+                // A global server backoff cancels work that was not started,
+                // so it must also schedule the pass that retries that work.
+                // One timer for the resolver is enough; per-chat failures
+                // remain event-driven and never turn into timer storms.
+                let request = if let Some(delay) = resolver.global_retry_after(signal.generation())
+                {
+                    tokio::select! {
+                        request = signal.next() => request,
+                        _ = sleep(delay) => {
+                            signal.request_full();
+                            continue;
+                        },
+                        _ = stopping.changed() => return,
+                    }
+                } else {
+                    tokio::select! {
+                        request = signal.next() => request,
+                        _ = stopping.changed() => return,
+                    }
                 };
                 // The pass itself races teardown too: `stopping` is threaded
                 // through so a shutdown mid-lookup ends the pass instead of
@@ -861,7 +967,10 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
             let answer = if self.fail_groups.load(Ordering::Relaxed) {
-                NameLookup::Failed(NAME_RETRY_COOLDOWN)
+                NameLookup::Failed {
+                    retry_after: NAME_RETRY_COOLDOWN,
+                    scope: RetryScope::Chat,
+                }
             } else {
                 match self
                     .groups
@@ -874,7 +983,10 @@ mod tests {
                     // Unknown to the fake = network failure, not a blank
                     // subject: a blank settles, a failure cools. Tests that
                     // want a blank answer insert one explicitly.
-                    None => NameLookup::Failed(NAME_RETRY_COOLDOWN),
+                    None => NameLookup::Failed {
+                        retry_after: NAME_RETRY_COOLDOWN,
+                        scope: RetryScope::Chat,
+                    },
                 }
             };
             async move { answer }
@@ -883,16 +995,21 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn subscribed_channels(
             &self,
-        ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend
-        {
+        ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
             let listed = if self.fail_list.load(Ordering::Relaxed) {
-                Err(NAME_RETRY_COOLDOWN)
+                Err(NameRetry {
+                    retry_after: NAME_RETRY_COOLDOWN,
+                    scope: RetryScope::Chat,
+                })
             } else {
                 self.listed
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone()
-                    .ok_or(NAME_RETRY_COOLDOWN)
+                    .ok_or(NameRetry {
+                        retry_after: NAME_RETRY_COOLDOWN,
+                        scope: RetryScope::Chat,
+                    })
             };
             async move { listed }
         }
@@ -907,7 +1024,10 @@ mod tests {
                 .cloned()
             {
                 Some(name) => NameLookup::Found(name),
-                None => NameLookup::Failed(NAME_RETRY_COOLDOWN),
+                None => NameLookup::Failed {
+                    retry_after: NAME_RETRY_COOLDOWN,
+                    scope: RetryScope::Chat,
+                },
             };
             async move { answer }
         }
@@ -1264,7 +1384,7 @@ mod tests {
             #[allow(clippy::manual_async_fn)]
             fn subscribed_channels(
                 &self,
-            ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend
+            ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend
             {
                 async move { Ok(HashMap::new()) }
             }

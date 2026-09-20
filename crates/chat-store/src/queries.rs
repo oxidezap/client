@@ -452,9 +452,8 @@ impl ChatStore {
     /// the stored JID plus the stored name (or lack of one), which is
     /// exactly what the pass's CAS writes compare against.
     ///
-    /// One statement per 400 keys at most (`BIND_CHUNK`), which is one
-    /// statement in practice: JIDs are bound as `LIKE` patterns, not
-    /// enumerated.
+    /// One statement in practice: the two domain suffixes are SQL `LIKE`
+    /// predicates, not a bound list of JIDs.
     pub async fn special_chat_names(&self) -> Result<Vec<(Jid, Option<String>)>> {
         use schema::chats::dsl;
         let device_id = self.device_id();
