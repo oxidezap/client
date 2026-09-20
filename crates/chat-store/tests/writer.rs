@@ -650,3 +650,159 @@ async fn a_resolved_chat_name_broadcasts_only_on_real_change() {
         Ok(other) => panic!("a blank name must broadcast nothing, got {other:?}"),
     }
 }
+
+/// A stale metadata answer never clobbers a live rename: the write is
+/// compare-and-swap against the value the lookup started from, so a
+/// `GroupUpdate::Subject` that commits mid-flight wins over the older
+/// answer finishing later.
+#[tokio::test]
+async fn a_stale_metadata_answer_does_not_clobber_a_live_rename() {
+    use oxidezap_chat_store::ChatNameWrite;
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(GROUP, GROUP, "MSG-GC", 1_700_000_000),
+        )],
+    )
+    .await;
+    let group = jid(GROUP);
+
+    // The lookup starts while the row is still nameless...
+    // ...a live rename commits first (the group-subject arm writes `B`)...
+    chat_store
+        .set_chat_name(&group, "B live rename".to_string())
+        .expect("queue the live rename");
+    chat_store.flush().await.expect("flush");
+    // ...and the stale answer (`expected` = NULL, resolved = "A") finds
+    // no match and is discarded, silently.
+    chat_store
+        .apply_chat_names(vec![ChatNameWrite::checked(
+            group.clone(),
+            None,
+            "A".to_string(),
+        )])
+        .expect("queue the stale answer");
+    chat_store.flush().await.expect("flush");
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("group row")
+            .name
+            .as_deref(),
+        Some("B live rename"),
+        "the older metadata answer must not overwrite the live rename"
+    );
+
+    // The other direction: a `Was` expectation against a moved row matches
+    // nothing either.
+    chat_store
+        .apply_chat_names(vec![ChatNameWrite::checked(
+            group.clone(),
+            Some("A".to_string()),
+            "C".to_string(),
+        )])
+        .expect("queue the mismatched answer");
+    chat_store.flush().await.expect("flush");
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("group row")
+            .name
+            .as_deref(),
+        Some("B live rename")
+    );
+
+    // And the current answer still lands: `Was` matching the live value.
+    let mut changes = chat_store.subscribe();
+    chat_store
+        .apply_chat_names(vec![ChatNameWrite::checked(
+            group.clone(),
+            Some("B live rename".to_string()),
+            "C".to_string(),
+        )])
+        .expect("queue the current answer");
+    chat_store.flush().await.expect("flush");
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("group row")
+            .name
+            .as_deref(),
+        Some("C")
+    );
+    match tokio::time::timeout(Duration::from_secs(5), changes.recv()).await {
+        Ok(Ok(StoreChange::Chats)) => {}
+        other => panic!("a CAS match must broadcast Chats, got {other:?}"),
+    }
+}
+
+/// A metadata answer for a chat deleted mid-lookup resurrects nothing: the
+/// write has no insert, so a gone row simply does not match.
+#[tokio::test]
+async fn a_metadata_answer_for_a_deleted_chat_writes_nothing() {
+    use oxidezap_chat_store::ChatNameWrite;
+    use wacore::types::events::DeleteChatUpdate;
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(GROUP, GROUP, "MSG-GD", 1_700_000_000),
+        )],
+    )
+    .await;
+    let group = jid(GROUP);
+    assert!(
+        chat_store.chat(&group).await.unwrap().is_some(),
+        "the group row exists before the delete"
+    );
+
+    // The user deletes the chat while the lookup is in flight.
+    feed(
+        &chat_store,
+        [Event::DeleteChatUpdate(
+            DeleteChatUpdate::builder()
+                .jid(group.clone())
+                .delete_media(false)
+                .timestamp(ts(1_700_000_100))
+                .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert!(
+        chat_store.chat(&group).await.unwrap().is_none(),
+        "the delete removed the row"
+    );
+
+    // The late answer (`expected` = NULL, the pre-lookup value) matches no
+    // row and broadcasts nothing: no empty named row comes back.
+    let mut changes = chat_store.subscribe();
+    chat_store
+        .apply_chat_names(vec![ChatNameWrite::checked(
+            group.clone(),
+            None,
+            "Late".to_string(),
+        )])
+        .expect("queue the late answer");
+    chat_store.flush().await.expect("flush");
+    assert!(
+        chat_store.chat(&group).await.unwrap().is_none(),
+        "the metadata answer must not recreate a deleted chat"
+    );
+    match tokio::time::timeout(Duration::from_millis(200), changes.recv()).await {
+        Err(_) => {}
+        Ok(other) => {
+            panic!("a late answer for a deleted chat must broadcast nothing, got {other:?}")
+        }
+    }
+}

@@ -461,6 +461,65 @@ pub struct AvatarDescriptor {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One resolved display name and the value its lookup started from.
+///
+/// The pair is what makes the store write compare-and-swap: `expected` is
+/// the `chats.name` the resolver observed BEFORE its network request, and
+/// the write lands only when the row still holds it. A live rename that
+/// commits while the request is in flight changes the row first, so the
+/// older answer finds no match and is discarded rather than clobbering the
+/// newer name. `None` matches only a NULL row.
+///
+/// Built with [`ChatNameWrite::checked`] by the resolver pass (which did
+/// observe a pre-lookup value) or [`ChatNameWrite::set`] by a direct caller
+/// (which holds none and wants plain "set to X" semantics, resolved live
+/// inside the writer transaction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatNameWrite {
+    pub jid: Jid,
+    pub expected: ChatNameExpected,
+    pub name: String,
+}
+
+/// What a [`ChatNameWrite`] compares against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatNameExpected {
+    /// The row held this name when the lookup started. Matches only it.
+    Was(String),
+    /// The row held NULL when the lookup started. Matches only NULL — so a
+    /// chat deleted in flight cannot match either.
+    WasUnnamed,
+    /// No pre-lookup observation: read the row live in the writer and set
+    /// unconditionally (a same-value write is still a no-op broadcast).
+    /// For direct setters, not for passes racing live renames.
+    Any,
+}
+
+impl ChatNameWrite {
+    /// A resolver answer: write `name` only if the row still holds the
+    /// value the lookup started from (`None` = it held NULL).
+    pub fn checked(jid: Jid, expected: Option<String>, name: String) -> Self {
+        Self {
+            jid,
+            expected: match expected {
+                Some(was) => ChatNameExpected::Was(was),
+                None => ChatNameExpected::WasUnnamed,
+            },
+            name,
+        }
+    }
+
+    /// A direct set: write `name` whatever the row holds now (still a
+    /// no-op broadcast when it already holds it).
+    pub fn set(jid: Jid, name: String) -> Self {
+        Self {
+            jid,
+            expected: ChatNameExpected::Any,
+            name,
+        }
+    }
+}
+
 /// Invalidation signal emitted after each committed write batch. Consumers
 /// re-run the queries backing their visible state; the store never pushes row
 /// data (query + invalidation, not cache duplication).

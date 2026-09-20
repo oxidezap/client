@@ -44,7 +44,7 @@ use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
 use crate::error::db_err;
 use crate::error::{ChatStoreError, Result};
 use crate::materialize::{extract_text, message_kind};
-use crate::types::StoreChange;
+use crate::types::{ChatNameWrite, StoreChange};
 
 // Reachable at the paths they had while this was one file, so the rest of the
 // crate names them the same way.
@@ -99,7 +99,7 @@ pub(crate) enum WriterMsg {
     /// channel names) for chats whose rows hold NULL. Written only when a
     /// name is news — like the group-subject arm — so a pass that learned
     /// nothing broadcasts nothing and the debounced reload stays quiet.
-    ChatNames(Vec<(Jid, String)>),
+    ChatNames(Vec<ChatNameWrite>),
     SendFailed {
         chat: Jid,
         msg_id: String,
@@ -615,22 +615,41 @@ impl ChatStore {
     ///
     /// The resolver on the session side decides *which* chats to ask about
     /// and *what* their names are; this is only the durable half: one queued
-    /// write per pass, committed in order with every other write. A name
-    /// equal to the stored one (or blank) is not news and broadcasts nothing;
-    /// a real change emits [`StoreChange::Chats`] so the list re-renders.
-    /// History still wins where it speaks — a nameless chunk never clobbers
-    /// a name written here, and a named one still updates over it — so the
-    /// two paths compose rather than race.
+    /// write per pass, committed in order with every other write.
+    ///
+    /// The write is compare-and-swap against `expected` — the name the row
+    /// held when the lookup STARTED — so a live rename that lands while the
+    /// metadata request is in flight is never clobbered by the older answer
+    /// finishing later. A mismatch discards the answer silently. The write
+    /// also never creates rows: a chat deleted mid-lookup stays deleted.
+    /// A name equal to the stored one (or blank) is not news and broadcasts
+    /// nothing; a real change emits [`StoreChange::Chats`] so the list
+    /// re-renders. History still wins where it speaks — a nameless chunk
+    /// never clobbers a name written here, and a named one still updates
+    /// over it — so the two paths compose rather than race.
     ///
     /// Goes through the writer queue; use [`flush`](Self::flush) to await
     /// completion.
     pub fn set_chat_name(&self, chat: &Jid, name: impl Into<String>) -> Result<()> {
-        self.apply_chat_names(vec![(chat.clone(), name.into())])
+        // The direct-write counterpart of the group-subject arm: the caller
+        // holds no earlier observation, so `expected` is read live inside
+        // the writer transaction — same ordering, same CAS, no extra hop.
+        // `None` would only match a NULL row and refuse a rename; reading
+        // live keeps "set to X" meaning what it says.
+        self.tx
+            .send(WriterMsg::ChatNames(vec![ChatNameWrite::set(
+                chat.clone(),
+                name.into(),
+            )]))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
     /// [`set_chat_name`](Self::set_chat_name) for a whole resolution pass:
     /// one queued write rather than one per chat.
-    pub fn apply_chat_names(&self, names: Vec<(Jid, String)>) -> Result<()> {
+    ///
+    /// Each entry carries the `expected` value its lookup started from;
+    /// see [`set_chat_name`](Self::set_chat_name) for the CAS contract.
+    pub fn apply_chat_names(&self, names: Vec<ChatNameWrite>) -> Result<()> {
         if names.is_empty() {
             return Ok(());
         }

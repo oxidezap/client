@@ -1176,6 +1176,13 @@ impl WhatsAppClient {
                 EventKind::MissedCall,
                 EventKind::CallEndedElsewhere,
                 EventKind::GroupUpdate,
+                // Post-sync repair for the name resolver: an offline drain
+                // or a history chunk can materialize a previously unknown
+                // group/channel AFTER the Connected full-pass snapshot, and
+                // neither reaches the session handler as a live sighting —
+                // so the drain's completion re-asks for a full pass over
+                // what the store holds now.
+                EventKind::OfflineSyncCompleted,
             ],
             64,
         );
@@ -1450,6 +1457,10 @@ impl WhatsAppClient {
                 // is offline, and the previous socket's answers say nothing
                 // about this one. The pass revalidates every stored special
                 // chat; a write that learned nothing broadcasts nothing.
+                // (The pass snapshots the store when it RUNS, not when it
+                // is queued — so a drain still materializing behind this
+                // event is covered, and `OfflineSyncCompleted` below
+                // re-asks once the backlog is fully in.)
                 if let Some(resolve) = resolve_chat_names {
                     resolve.new_connection();
                 }
@@ -1465,6 +1476,18 @@ impl WhatsAppClient {
                 // Not a Disconnected: reconnecting reuses the credentials the
                 // server just rejected, which is the 401 loop.
                 let _ = ui_tx.send(UiEvent::LoggedOut(logout_message(logged_out)));
+            }
+            Event::OfflineSyncCompleted(done) => {
+                // The backlog is fully materialized now: whatever the drain
+                // (and any history chunk behind it) created after the
+                // Connected snapshot is in the store, so re-ask for a full
+                // pass over what it holds. Coalesced by the signal — ten
+                // completions while a pass runs are one `full` bit — and a
+                // pass that learned nothing broadcasts nothing.
+                debug!("offline sync completed ({} messages)", done.count);
+                if let Some(resolve) = &resolve_chat_names {
+                    resolve.request_full();
+                }
             }
             Event::IncomingCall(call) => match &call.action {
                 CallAction::Offer {
@@ -1566,13 +1589,15 @@ impl WhatsAppClient {
                     batch.origin,
                     whatsapp_rust::wacore::types::events::BatchOrigin::Live
                 );
-                // The first sighting of an unnamed special chat: a live
-                // message creates its row nameless, and no restart should
-                // be needed for the name to arrive. Sightings are cheap —
-                // the resolver deduplicates per generation and skips chats
-                // the store already names — and only live traffic asks,
-                // never the offline drain behind this batch.
-                if eager && let Some(resolve) = &resolve_chat_names {
+                // The first sighting of an unnamed special chat: a message
+                // creates its row nameless, and no restart should be needed
+                // for the name to arrive. Sightings are cheap — the resolver
+                // deduplicates per generation and skips chats the store
+                // already names. Live traffic asks per chat; the offline
+                // drain asks once per batch (its chats may postdate the
+                // Connected snapshot, and `OfflineSyncCompleted` below is
+                // the backstop that re-covers whatever is still unnamed).
+                if let Some(resolve) = &resolve_chat_names {
                     let mut sighted = Vec::new();
                     for inbound in batch.iter() {
                         let chat = &inbound.info.source.chat;

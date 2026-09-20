@@ -50,12 +50,27 @@ use crate::exec::{MaybeSend, spawn_owned};
 /// quickly.
 const CHAT_NAME_CONCURRENCY: usize = 4;
 
-/// How many stored chats one full pass revalidates.
+/// What one metadata lookup told us.
 ///
-/// The chat list is drawn from a hundred at a time; five pages cover the
-/// visible list and the near tail, and the next connect covers any more — the
-/// same bound the avatar resolver holds, for the same reason.
-const CHAT_NAME_LIST_LIMIT: i64 = 500;
+/// The distinction is why this is not an `Option`: a failure must stay
+/// distinguishable from an answer. `Failed` carries the retry hint the
+/// server gave (`Some` = wait this long before asking again; `None` = a
+/// short local cooldown), so a busy group cannot re-request on every
+/// message and a transient bulk-list failure does not fan out into per-chat
+/// requests while the service is down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NameLookup {
+    /// The server named the chat (possibly blank, which settles the
+    /// question for this generation without writing anything).
+    Found(String),
+    /// The request failed. The duration is how long this chat must wait
+    /// before it is asked about again.
+    Failed(std::time::Duration),
+}
+
+/// Fallback cooldown when the server named no delay: transport hiccups and
+/// timeouts retry soon, but never on the very next message.
+const NAME_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Where a special chat's display name is read from.
 ///
@@ -76,11 +91,11 @@ const CHAT_NAME_LIST_LIMIT: i64 = 500;
 /// `async fn` in a trait is not.
 #[allow(clippy::manual_async_fn)]
 pub(crate) trait MetadataSource {
-    fn group_subject(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend;
+    fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend;
     fn subscribed_channels(
         &self,
-    ) -> impl Future<Output = Option<HashMap<String, String>>> + MaybeSend;
-    fn channel_name(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend;
+    ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend;
+    fn channel_name(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend;
 }
 
 impl MetadataSource for Client {
@@ -88,42 +103,83 @@ impl MetadataSource for Client {
     // blanket below; `impl Future` keeps the call shape while staying
     // callable through it.
     #[allow(clippy::manual_async_fn)]
-    fn group_subject(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend {
+    fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
         async move {
-            self.groups()
-                .get_metadata(jid)
-                .await
-                .map(|meta| meta.subject)
-                .ok()
+            match self.groups().get_metadata(jid).await {
+                Ok(meta) => NameLookup::Found(meta.subject),
+                Err(e) => NameLookup::Failed(name_retry_after(&e)),
+            }
         }
     }
 
     #[allow(clippy::manual_async_fn)]
     fn subscribed_channels(
         &self,
-    ) -> impl Future<Output = Option<HashMap<String, String>>> + MaybeSend {
+    ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend
+    {
         async move {
-            self.newsletter()
-                .list_subscribed()
-                .await
-                .map(|subscribed| {
-                    subscribed
-                        .into_iter()
-                        .map(|meta| (meta.jid.to_string(), meta.name))
-                        .collect()
-                })
-                .ok()
+            match self.newsletter().list_subscribed().await {
+                Ok(subscribed) => Ok(subscribed
+                    .into_iter()
+                    .map(|meta| (meta.jid.to_string(), meta.name))
+                    .collect()),
+                Err(e) => Err(name_retry_after(&e)),
+            }
         }
     }
 
     #[allow(clippy::manual_async_fn)]
-    fn channel_name(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend {
+    fn channel_name(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
         async move {
-            self.newsletter()
-                .get_metadata(jid)
-                .await
-                .map(|meta| meta.name)
-                .ok()
+            match self.newsletter().get_metadata(jid).await {
+                Ok(meta) => NameLookup::Found(meta.name),
+                Err(e) => NameLookup::Failed(name_retry_after(&e)),
+            }
+        }
+    }
+}
+
+/// How long a failed lookup keeps its chat quiet.
+///
+/// The `get_metadata` the client is pinned on preserves the server's own
+/// `backoff` on rejection: honoring it is what keeps a throttled account
+/// from re-requesting into the limit it just hit. Anything without a
+/// server-directed delay falls back to [`NAME_RETRY_COOLDOWN`].
+fn name_retry_after(error: &impl NameErrorBackoff) -> std::time::Duration {
+    error
+        .backoff_secs()
+        .map(|secs| std::time::Duration::from_secs(u64::from(secs.max(1))))
+        .unwrap_or(NAME_RETRY_COOLDOWN)
+}
+
+/// The one field of a metadata failure the resolver acts on.
+///
+/// A tiny trait rather than a match per call site: group and newsletter
+/// failures are different types with the same question, and the question
+/// is asked in exactly one place above per lookup kind.
+trait NameErrorBackoff {
+    fn backoff_secs(&self) -> Option<u32>;
+}
+
+impl NameErrorBackoff for whatsapp_rust::features::GroupError {
+    fn backoff_secs(&self) -> Option<u32> {
+        use whatsapp_rust::features::GroupError;
+        use whatsapp_rust::request::IqError;
+        match self {
+            GroupError::Iq(IqError::ServerError { backoff, .. }) => *backoff,
+            _ => None,
+        }
+    }
+}
+
+impl NameErrorBackoff for whatsapp_rust::features::NewsletterError {
+    fn backoff_secs(&self) -> Option<u32> {
+        use whatsapp_rust::features::{MexError, NewsletterError};
+        use whatsapp_rust::request::IqError;
+        match self {
+            NewsletterError::Mex(MexError::Request(IqError::ServerError { backoff, .. }))
+            | NewsletterError::Iq(IqError::ServerError { backoff, .. }) => *backoff,
+            _ => None,
         }
     }
 }
@@ -131,17 +187,18 @@ impl MetadataSource for Client {
 /// So a caller holding the shared client — which is the resolver task —
 /// names it the way it already holds it.
 impl<T: MetadataSource + ?Sized> MetadataSource for Arc<T> {
-    fn group_subject(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend {
+    fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
         (**self).group_subject(jid)
     }
 
     fn subscribed_channels(
         &self,
-    ) -> impl Future<Output = Option<HashMap<String, String>>> + MaybeSend {
+    ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend
+    {
         (**self).subscribed_channels()
     }
 
-    fn channel_name(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend {
+    fn channel_name(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
         (**self).channel_name(jid)
     }
 }
@@ -195,6 +252,15 @@ impl ChatNameResolveSignal {
     /// offline and the previous socket's answers say nothing about this one.
     pub(super) fn new_connection(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.request_full();
+    }
+
+    /// Ask for a full pass over the stored special chats, under the current
+    /// generation. For post-sync repair (`OfflineSyncCompleted`): whatever
+    /// the drain materialized after the connect snapshot is in the store
+    /// now, so re-cover it without advancing the generation — the answers
+    /// still belong to this socket.
+    pub(super) fn request_full(&self) {
         self.set(|pending| pending.full = true);
     }
 
@@ -256,11 +322,19 @@ impl ChatNameResolveSignal {
 /// already asked about costs a hash lookup rather than an IQ, so a busy
 /// group does not repeat its traffic per message. A new connection makes
 /// every entry stale, because a name can change while the process is
-/// offline. A lookup that failed is deliberately not recorded, so a
-/// transient failure is retried the next time its chat is sighted.
+/// offline.
+///
+/// Three states per chat, because "has a name" and "was revalidated"
+/// are different claims. A full pass that FAILS a lookup leaves the chat
+/// unmarked, so a later sighting retries rather than accepting the stale
+/// stored name as sufficient (a non-full pass skips only chats the CURRENT
+/// generation settled). A failed lookup still records a cooldown, so a
+/// busy unnamed group retries on the next sighting after the delay — never
+/// on every message, and never before the server's own backoff.
 #[derive(Default)]
 pub(super) struct NameResolver {
     asked: HashMap<String, u64>,
+    cooling: HashMap<String, (u64, wacore::time::Instant)>,
 }
 
 impl NameResolver {
@@ -268,13 +342,40 @@ impl NameResolver {
         Self::default()
     }
 
-    /// Whether `jid` still needs a lookup in this generation.
+    /// Whether `jid` still needs a lookup in this generation: unasked, or
+    /// asked-and-failed with its cooldown elapsed.
     fn needs(&self, jid: &str, generation: u64) -> bool {
-        self.asked.get(jid) != Some(&generation)
+        if self.asked.get(jid) == Some(&generation) {
+            return false;
+        }
+        match self.cooling.get(jid) {
+            Some((gen_number, until)) if *gen_number == generation => {
+                until.elapsed().as_nanos() > 0
+            }
+            _ => true,
+        }
     }
 
     fn mark(&mut self, jid: &str, generation: u64) {
         self.asked.insert(jid.to_string(), generation);
+        self.cooling.remove(jid);
+    }
+
+    /// A failed lookup: retryable after `retry_after`, not on the next
+    /// message. Deliberately NOT marked asked — the chat stays due, and a
+    /// later sighting past the cooldown looks it up again.
+    fn cool(&mut self, jid: &str, generation: u64, retry_after: std::time::Duration) {
+        self.cooling.insert(
+            jid.to_string(),
+            (generation, wacore::time::Instant::now() + retry_after),
+        );
+    }
+
+    /// Advance a chat past its cooldown the way its expiry would, without
+    /// sleeping out the wall clock. Test-only: production waits.
+    #[cfg(test)]
+    fn expire_cooldown(&mut self, jid: &str) {
+        self.cooling.remove(jid);
     }
 }
 
@@ -288,17 +389,19 @@ fn usable_name(name: &str) -> bool {
 }
 
 /// The stored special chats: every `@g.us` and `@newsletter` row, named or
-/// not. A full pass revalidates them all rather than only the unnamed ones,
-/// because a subject can change while the process is offline — and a write
-/// that learned nothing broadcasts nothing, so an unchanged account costs
-/// lookups but no reload.
-async fn stored_special_chats(chat_store: &Arc<ChatStore>) -> Vec<Jid> {
-    match chat_store.chats(false, CHAT_NAME_LIST_LIMIT).await {
-        Ok(entries) => entries
-            .into_iter()
-            .map(|entry| entry.jid)
-            .filter(|jid| jid.is_group() || jid.is_newsletter())
-            .collect(),
+/// not — archived included, since the archived list draws them with the
+/// same fallback. A full pass revalidates them all rather than only the
+/// unnamed ones, because a subject can change while the process is offline
+/// — and a write that learned nothing broadcasts nothing, so an unchanged
+/// account costs lookups but no reload.
+///
+/// Read from the dedicated query rather than the paged chat list: names are
+/// durable per-chat data, not viewport data like avatar bytes, so a page
+/// bound (and its pinned-first order) has no business deciding which chats
+/// get revalidated.
+async fn stored_special_chats(chat_store: &Arc<ChatStore>) -> Vec<(Jid, Option<String>)> {
+    match chat_store.special_chat_names().await {
+        Ok(rows) => rows,
         Err(e) => {
             debug!("chat-name resolver could not read the chat list: {e}");
             Vec::new()
@@ -319,81 +422,121 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     signal: &ChatNameResolveSignal,
     resolver: &mut NameResolver,
     request: NameResolveRequest,
+    stop: &mut watch::Receiver<()>,
 ) {
     let generation = signal.generation();
+    // What the rows held when this pass started, keyed by address. The
+    // CAS writes below compare against THESE values — not a re-read at
+    // write time — so a live rename that commits mid-flight is never
+    // clobbered by the older answer. Read once, up front, in one query;
+    // a chat created after this snapshot is simply not in this pass
+    // (its sighting queues its own ask).
+    let mut pre: HashMap<String, Option<String>> = HashMap::new();
     let mut groups: Vec<Jid> = Vec::new();
     let mut channels: Vec<Jid> = Vec::new();
     {
         let mut seen: HashSet<String> = HashSet::new();
-        let mut push = |jid: Jid| {
+        // `push` borrows `seen`/`resolver`/`pre`/the vecs; the sighting
+        // loop below needs `seen` back for its contains-check, so it is
+        // scoped to the full-pass fill and the sightings push inline.
+        {
+            let mut push = |jid: Jid, stored: Option<String>| {
+                if !seen.insert(jid.to_string()) {
+                    return;
+                }
+                if !resolver.needs(&jid.to_string(), generation) {
+                    return;
+                }
+                pre.insert(jid.to_string(), stored);
+                if jid.is_group() {
+                    groups.push(jid);
+                } else if jid.is_newsletter() {
+                    channels.push(jid);
+                }
+            };
+            if request.full {
+                for (jid, stored) in stored_special_chats(chat_store).await {
+                    push(jid, stored);
+                }
+            }
+        }
+        // Sightings too: a chat created after the snapshot (offline drain
+        // still materializing, a history chunk landing late) carries its
+        // own ask rather than waiting for the next reconnect. Its stored
+        // value is read per chat — sightings are a handful, not a page —
+        // and a read error resolves rather than being filed as named.
+        for raw in &request.named {
+            let Ok(jid) = raw.parse::<Jid>() else {
+                continue;
+            };
+            if seen.contains(&jid.to_string()) {
+                continue;
+            }
+            let stored = match chat_store.chat(&jid).await {
+                Ok(Some(entry)) => entry.name,
+                Ok(None) => None,
+                Err(e) => {
+                    debug!(
+                        "chat-name resolver could not read {}: {e}",
+                        jid.to_non_ad_string()
+                    );
+                    None
+                }
+            };
+            // A non-full sighting of an already-named chat needs no
+            // lookup — UNLESS this generation owes it a retry: a full
+            // pass that failed it left it unmarked precisely so a later
+            // sighting would try the network again, and accepting the
+            // stale stored name here would lose the offline rename until
+            // the next reconnect. `needs` already encodes that: asked
+            // chats skip, failed-and-cooled chats retry.
+            if !request.full
+                && stored.as_deref().is_some_and(usable_name)
+                && !resolver.needs(&jid.to_string(), generation)
+            {
+                continue;
+            }
             if !seen.insert(jid.to_string()) {
-                return;
+                continue;
             }
             if !resolver.needs(&jid.to_string(), generation) {
-                return;
+                continue;
             }
+            pre.insert(jid.to_string(), stored);
             if jid.is_group() {
                 groups.push(jid);
             } else if jid.is_newsletter() {
                 channels.push(jid);
-            }
-        };
-        for raw in &request.named {
-            if let Ok(jid) = raw.parse::<Jid>() {
-                push(jid);
-            }
-        }
-        if request.full {
-            for jid in stored_special_chats(chat_store).await {
-                push(jid);
             }
         }
     }
     if groups.is_empty() && channels.is_empty() {
         return;
     }
-    // A sighted chat that is already named needs no lookup: mark it asked so
-    // the next message in it costs a hash lookup rather than another store
-    // read. A full pass revalidates regardless, which is what picks up a
-    // rename that happened while the process was offline.
-    if !request.full {
-        let mut still_unknown: Vec<Jid> = Vec::with_capacity(groups.len() + channels.len());
-        for jid in groups.into_iter().chain(channels) {
-            match chat_store.chat(&jid).await {
-                Ok(Some(entry)) if entry.name.as_deref().is_some_and(usable_name) => {
-                    resolver.mark(&jid.to_string(), generation);
-                }
-                // No row, or a row with nothing worth keeping: resolve it.
-                // A read error is not an answer either, so it resolves too
-                // rather than being filed as named for the generation.
-                _ => still_unknown.push(jid),
-            }
-        }
-        groups = Vec::new();
-        channels = Vec::new();
-        for jid in still_unknown {
-            if jid.is_group() {
-                groups.push(jid);
-            } else {
-                channels.push(jid);
-            }
-        }
-        if groups.is_empty() && channels.is_empty() {
-            return;
-        }
-    }
+    // `stop` races the network below, not just the wait for the next
+    // ask: on teardown (notably a page's, where `spawn_owned` tasks are
+    // accounted and waited on) a pass stuck in a hung metadata request
+    // must not hold the close grace hostage. Each race is written out
+    // below: `stop.changed()` borrows `stop` for the select's lifetime,
+    // so the awaits cannot share one helper.
 
     // JIDs whose lookup produced an answer this pass (a usable name or a
     // blank one — both settle the question for this generation). Failures
-    // stay unmarked so the next sighting retries them.
+    // record a cooldown (server backoff honored) so the next sighting
+    // retries after the delay rather than on the next message.
     let mut settled: Vec<String> = Vec::new();
-    let mut resolved: Vec<(Jid, String)> = Vec::new();
+    let mut resolved: Vec<oxidezap_chat_store::ChatNameWrite> = Vec::new();
+    let mut failed: Vec<(String, std::time::Duration)> = Vec::new();
     for chunk in groups.chunks(CHAT_NAME_CONCURRENCY) {
-        let answered = whatsapp_rust::futures::future::join_all(chunk.iter().map(|jid| async {
+        let lookup = whatsapp_rust::futures::future::join_all(chunk.iter().map(|jid| async {
             let name = source.group_subject(jid).await;
             (jid.clone(), name)
-        }))
-        .await;
+        }));
+        tokio::pin!(lookup);
+        let answered = tokio::select! {
+            out = &mut lookup => out,
+            _ = stop.changed() => return,
+        };
         // A reconnect mid-pass ends it here: the remaining chunks — and the
         // one that just landed — belong to the previous socket. Answers are
         // accumulated, never written, until the final gate below confirms
@@ -403,52 +546,130 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             return;
         }
         for (jid, name) in answered {
-            // A failed lookup is not remembered: a transient failure
-            // retried on the next sighting self-heals, while a memoized
-            // one files the chat as nameless until the next reconnect.
-            // `if let` rather than `match`, because there is only one
-            // answer worth keeping.
-            if let Some(name) = name {
-                settled.push(jid.to_string());
-                if usable_name(&name) {
-                    resolved.push((jid, name));
+            match name {
+                NameLookup::Found(name) => {
+                    let key = jid.to_string();
+                    settled.push(key.clone());
+                    if usable_name(&name) {
+                        resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
+                            jid,
+                            pre.get(&key).cloned().flatten(),
+                            name,
+                        ));
+                    }
+                }
+                // Failed, not forgotten-without-a-trace: the cooldown is
+                // what keeps a busy unnamed group from re-requesting on
+                // every message while still retrying on a later sighting.
+                NameLookup::Failed(retry_after) => {
+                    failed.push((jid.to_string(), retry_after));
                 }
             }
         }
     }
     if !channels.is_empty() {
         // One call for every subscribed channel, which is normally all of
-        // them: the per-channel lookup below is only for chats absent from
-        // that list.
-        let subscribed = source.subscribed_channels().await.unwrap_or_default();
-        let mut fallback: Vec<Jid> = Vec::new();
-        for jid in channels {
-            match subscribed.get(&jid.to_string()) {
-                Some(name) => {
-                    settled.push(jid.to_string());
-                    if usable_name(name) {
-                        resolved.push((jid, name.clone()));
+        // them — but ONLY when the bulk call succeeds. A failed list must
+        // not read as "every channel absent": that turns one transient
+        // failure of the cheapest call into per-channel requests for all
+        // of them, exactly while the service is down. On failure the whole
+        // channel half stays pending (cooled per chat) for a later pass.
+        let listed = source.subscribed_channels();
+        tokio::pin!(listed);
+        let listed = tokio::select! {
+            out = &mut listed => out,
+            _ = stop.changed() => return,
+        };
+        match listed {
+            Ok(subscribed) => {
+                let mut fallback: Vec<Jid> = Vec::new();
+                for jid in channels {
+                    match subscribed.get(&jid.to_string()) {
+                        Some(name) => {
+                            let key = jid.to_string();
+                            settled.push(key.clone());
+                            if usable_name(name) {
+                                resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
+                                    jid,
+                                    pre.get(&key).cloned().flatten(),
+                                    name.clone(),
+                                ));
+                            }
+                        }
+                        None => fallback.push(jid),
                     }
                 }
-                None => fallback.push(jid),
-            }
-        }
-        for chunk in fallback.chunks(CHAT_NAME_CONCURRENCY) {
-            let answered =
-                whatsapp_rust::futures::future::join_all(chunk.iter().map(|jid| async {
-                    let name = source.channel_name(jid).await;
-                    (jid.clone(), name)
-                }))
-                .await;
-            if signal.generation() != generation {
-                return;
-            }
-            for (jid, name) in answered {
-                if let Some(name) = name {
-                    settled.push(jid.to_string());
-                    if usable_name(&name) {
-                        resolved.push((jid, name));
+                // A live-sighted channel absent from a GOOD list is a real
+                // absence (unsubscribed, or too new for the list) and earns
+                // its selective lookup. A full pass does not fan out here:
+                // hundreds of unsubscribed rows each buying an IQ is the
+                // N+1 the bulk call exists to avoid — they wait for a live
+                // sighting of their own, which is the chat anyone is
+                // actually looking at. Either way a chat that already
+                // carries a usable stored name needs no fallback lookup —
+                // same retry rule as groups: a chat this generation
+                // settled skips; a failed one past its cooldown retries.
+                // A live-sighted absence earns its lookup only when
+                // the chat is actually due (unnamed, or a failed lookup
+                // past its cooldown). A full pass never fans out here:
+                // an unnamed row absent from the list is the unsubscribed
+                // case — it waits for a live sighting of its own, which
+                // is the chat anyone is actually looking at.
+                let fallback: Vec<Jid> = if request.full {
+                    Vec::new()
+                } else {
+                    fallback
+                        .into_iter()
+                        .filter(|jid| {
+                            let known = pre
+                                .get(&jid.to_string())
+                                .and_then(|stored| stored.as_deref())
+                                .is_some_and(usable_name);
+                            !known && resolver.needs(&jid.to_string(), generation)
+                        })
+                        .collect()
+                };
+                for chunk in fallback.chunks(CHAT_NAME_CONCURRENCY) {
+                    let lookup =
+                        whatsapp_rust::futures::future::join_all(chunk.iter().map(|jid| async {
+                            let name = source.channel_name(jid).await;
+                            (jid.clone(), name)
+                        }));
+                    tokio::pin!(lookup);
+                    let answered = tokio::select! {
+                        out = &mut lookup => out,
+                        _ = stop.changed() => return,
+                    };
+                    if signal.generation() != generation {
+                        return;
                     }
+                    for (jid, name) in answered {
+                        match name {
+                            NameLookup::Found(name) => {
+                                let key = jid.to_string();
+                                settled.push(key.clone());
+                                if usable_name(&name) {
+                                    resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
+                                        jid,
+                                        pre.get(&key).cloned().flatten(),
+                                        name,
+                                    ));
+                                }
+                            }
+                            NameLookup::Failed(retry_after) => {
+                                failed.push((jid.to_string(), retry_after));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(retry_after) => {
+                // The list itself failed: cool every channel of this pass
+                // rather than treating them as absent. Nothing is settled,
+                // nothing fans out, and a later sighting past the cooldown
+                // retries the bulk call first.
+                for jid in channels {
+                    failed.push((jid.to_string(), retry_after));
                 }
             }
         }
@@ -463,22 +684,26 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         return;
     }
     if !resolved.is_empty() {
-        if let Err(e) = chat_store.apply_chat_names(
-            resolved
-                .iter()
-                .map(|(jid, name)| (jid.clone(), name.clone()))
-                .collect(),
-        ) {
+        if let Err(e) = chat_store.apply_chat_names(resolved.clone()) {
             warn!("chat-name resolver could not queue resolved names: {e}");
             return;
         }
-        if let Err(e) = chat_store.flush().await {
+        let flushed = chat_store.flush();
+        tokio::pin!(flushed);
+        let flushed = tokio::select! {
+            out = &mut flushed => out,
+            _ = stop.changed() => return,
+        };
+        if let Err(e) = flushed {
             warn!("chat-name resolver's names did not commit: {e}");
             return;
         }
     }
     for jid in settled {
         resolver.mark(&jid, generation);
+    }
+    for (jid, retry_after) in failed {
+        resolver.cool(&jid, generation, retry_after);
     }
     debug!(
         "chat-name resolver: {} chat(s) learned a name",
@@ -507,7 +732,18 @@ impl WhatsAppClient {
                     request = signal.next() => request,
                     _ = stopping.changed() => return,
                 };
-                run_pass(&client, &chat_store, &signal, &mut resolver, request).await;
+                // The pass itself races teardown too: `stopping` is threaded
+                // through so a shutdown mid-lookup ends the pass instead of
+                // holding the close grace behind hundreds of network calls.
+                run_pass(
+                    &client,
+                    &chat_store,
+                    &signal,
+                    &mut resolver,
+                    request,
+                    &mut stopping,
+                )
+                .await;
             }
         });
     }
@@ -526,6 +762,7 @@ mod tests {
         channels: StdMutex<HashMap<String, String>>,
         listed: StdMutex<Option<HashMap<String, String>>>,
         fail_groups: portable_atomic::AtomicBool,
+        fail_list: portable_atomic::AtomicBool,
     }
 
     impl FakeMeta {
@@ -535,6 +772,7 @@ mod tests {
                 channels: StdMutex::new(HashMap::new()),
                 listed: StdMutex::new(Some(HashMap::new())),
                 fail_groups: portable_atomic::AtomicBool::new(false),
+                fail_list: portable_atomic::AtomicBool::new(false),
             }
         }
 
@@ -574,39 +812,56 @@ mod tests {
 
     impl MetadataSource for FakeMeta {
         #[allow(clippy::manual_async_fn)]
-        fn group_subject(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend {
-            let answer = (!self.fail_groups.load(Ordering::Relaxed))
-                .then(|| {
-                    self.groups
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .get(&jid.to_string())
-                        .cloned()
-                })
-                .flatten();
+        fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
+            let answer = if self.fail_groups.load(Ordering::Relaxed) {
+                NameLookup::Failed(NAME_RETRY_COOLDOWN)
+            } else {
+                match self
+                    .groups
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&jid.to_string())
+                    .cloned()
+                {
+                    Some(name) => NameLookup::Found(name),
+                    // Unknown to the fake = network failure, not a blank
+                    // subject: a blank settles, a failure cools. Tests that
+                    // want a blank answer insert one explicitly.
+                    None => NameLookup::Failed(NAME_RETRY_COOLDOWN),
+                }
+            };
             async move { answer }
         }
 
         #[allow(clippy::manual_async_fn)]
         fn subscribed_channels(
             &self,
-        ) -> impl Future<Output = Option<HashMap<String, String>>> + MaybeSend {
-            let listed = self
-                .listed
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+        ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend
+        {
+            let listed = if self.fail_list.load(Ordering::Relaxed) {
+                Err(NAME_RETRY_COOLDOWN)
+            } else {
+                self.listed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .ok_or(NAME_RETRY_COOLDOWN)
+            };
             async move { listed }
         }
 
         #[allow(clippy::manual_async_fn)]
-        fn channel_name(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend {
-            let answer = self
+        fn channel_name(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
+            let answer = match self
                 .channels
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&jid.to_string())
-                .cloned();
+                .cloned()
+            {
+                Some(name) => NameLookup::Found(name),
+                None => NameLookup::Failed(NAME_RETRY_COOLDOWN),
+            };
             async move { answer }
         }
     }
@@ -667,6 +922,23 @@ mod tests {
         }
     }
 
+    async fn drive<S: MetadataSource + ?Sized>(
+        source: &S,
+        store: &Arc<ChatStore>,
+        signal: &ChatNameResolveSignal,
+        resolver: &mut NameResolver,
+        request: NameResolveRequest,
+    ) {
+        // The sender is kept alive in this scope so `stop.changed()`
+        // never fires: dropping it would make every select return
+        // immediately and abort each lookup before it runs.
+        let (_guard, mut stop) = {
+            let (tx, rx) = tokio::sync::watch::channel(());
+            (tx, rx)
+        };
+        run_pass(source, store, signal, resolver, request, &mut stop).await;
+    }
+
     async fn stored_name(store: &Arc<ChatStore>, jid: &str) -> Option<String> {
         store
             .chat(&jid.parse().expect("test JID"))
@@ -686,7 +958,7 @@ mod tests {
         let source = FakeMeta::with_group(GROUP, "Trip planning");
         let signal = ChatNameResolveSignal::new();
         let mut resolver = NameResolver::new();
-        run_pass(
+        drive(
             &source,
             &store,
             &signal,
@@ -712,7 +984,7 @@ mod tests {
         let source = FakeMeta::with_channel(CHANNEL, "Announcements", true);
         let signal = ChatNameResolveSignal::new();
         let mut resolver = NameResolver::new();
-        run_pass(
+        drive(
             &source,
             &store,
             &signal,
@@ -737,7 +1009,7 @@ mod tests {
         let source = FakeMeta::with_channel(CHANNEL, "Quiet updates", false);
         let signal = ChatNameResolveSignal::new();
         let mut resolver = NameResolver::new();
-        run_pass(
+        drive(
             &source,
             &store,
             &signal,
@@ -753,8 +1025,8 @@ mod tests {
     }
 
     /// A metadata failure leaves the fallback rendering alone: no row, no
-    /// broadcast-worthy write, and no memory of the failure — the next
-    /// sighting retries rather than filing the chat as nameless.
+    /// broadcast-worthy write — and the chat stays retryable rather than
+    /// filed as asked, cooling only for the failure's delay.
     #[tokio::test]
     async fn a_metadata_failure_keeps_the_fallback() {
         let store = test_store("group-failure").await;
@@ -764,7 +1036,7 @@ mod tests {
         source.fail_groups.store(true, Ordering::Relaxed);
         let signal = ChatNameResolveSignal::new();
         let mut resolver = NameResolver::new();
-        run_pass(
+        drive(
             &source,
             &store,
             &signal,
@@ -773,11 +1045,25 @@ mod tests {
         )
         .await;
         assert_eq!(stored_name(&store, GROUP).await, None);
+        // Cooled, not settled: still within its delay the chat is not due
+        // (no per-message hammering), and it was never marked asked.
+        assert!(
+            !resolver.needs(GROUP, signal.generation()),
+            "a fresh cooldown holds the next message off"
+        );
 
-        // And the failure bought no dedup entry: healing the source and
-        // asking again resolves, without a reconnect in between.
+        // Healing the source and expiring the cooldown resolves, without a
+        // reconnect in between. The fake cools for the real 60s, so the
+        // test expires it the way its own expiry would — the timing half
+        // is covered by `a_failed_lookup_cools_then_retries`; this half
+        // covers that a failed chat IS retryable, not filed as asked.
         source.fail_groups.store(false, Ordering::Relaxed);
-        run_pass(
+        resolver.expire_cooldown(GROUP);
+        assert!(
+            resolver.needs(GROUP, signal.generation()),
+            "an expired cooldown is due again"
+        );
+        drive(
             &source,
             &store,
             &signal,
@@ -788,6 +1074,66 @@ mod tests {
         assert_eq!(
             stored_name(&store, GROUP).await.as_deref(),
             Some("Trip planning")
+        );
+    }
+
+    /// A failed full-pass revalidation retries on a later sighting: the
+    /// pass leaves the chat unmarked, and the sighting does not accept the
+    /// stale stored name as sufficient — it looks the network up again.
+    #[tokio::test]
+    async fn a_failed_full_pass_retries_on_a_later_sighting() {
+        let store = test_store("group-full-fail-retry").await;
+        feed(&store, group_message(GROUP, "MSG-G6")).await;
+
+        let source = FakeMeta::with_group(GROUP, "Old name");
+        let signal = ChatNameResolveSignal::new();
+        let mut resolver = NameResolver::new();
+        // Seed the stored name through a good sighting first.
+        drive(
+            &source,
+            &store,
+            &signal,
+            &mut resolver,
+            named_request(&[GROUP]),
+        )
+        .await;
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Old name")
+        );
+
+        // Offline rename the server now carries — but the reconnect's full
+        // pass fails, so nothing is marked and the stale name stands.
+        source.rename_group(GROUP, "New name");
+        source.fail_groups.store(true, Ordering::Relaxed);
+        signal.new_connection();
+        let request = signal.next().await;
+        assert!(request.full);
+        drive(&source, &store, &signal, &mut resolver, request).await;
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Old name"),
+            "the failed full pass writes nothing"
+        );
+
+        // A later live message sights the chat: the resolver must NOT
+        // accept the stored "Old name" as sufficient — the generation
+        // owes this chat a retry. Past the cooldown, the network is tried
+        // again and the rename lands.
+        source.fail_groups.store(false, Ordering::Relaxed);
+        resolver.expire_cooldown(GROUP);
+        drive(
+            &source,
+            &store,
+            &signal,
+            &mut resolver,
+            named_request(&[GROUP]),
+        )
+        .await;
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("New name"),
+            "a failed revalidation retries on the next sighting past its cooldown"
         );
     }
 
@@ -802,7 +1148,7 @@ mod tests {
         let source = FakeMeta::with_group(GROUP, "Trip planning");
         let signal = ChatNameResolveSignal::new();
         let mut resolver = NameResolver::new();
-        run_pass(
+        drive(
             &source,
             &store,
             &signal,
@@ -821,7 +1167,7 @@ mod tests {
         // one the reconnect queued.
         let request = signal.next().await;
         assert!(request.full);
-        run_pass(&source, &store, &signal, &mut resolver, request).await;
+        drive(&source, &store, &signal, &mut resolver, request).await;
         assert_eq!(
             stored_name(&store, GROUP).await.as_deref(),
             Some("Trip planning v2")
@@ -861,7 +1207,7 @@ mod tests {
         }
         impl MetadataSource for SlowGate<'_> {
             #[allow(clippy::manual_async_fn)]
-            fn group_subject(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend {
+            fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
                 async move {
                     self.gate.entered.notify_one();
                     self.gate.release.notified().await;
@@ -871,11 +1217,12 @@ mod tests {
             #[allow(clippy::manual_async_fn)]
             fn subscribed_channels(
                 &self,
-            ) -> impl Future<Output = Option<HashMap<String, String>>> + MaybeSend {
-                async move { Some(HashMap::new()) }
+            ) -> impl Future<Output = Result<HashMap<String, String>, std::time::Duration>> + MaybeSend
+            {
+                async move { Ok(HashMap::new()) }
             }
             #[allow(clippy::manual_async_fn)]
-            fn channel_name(&self, jid: &Jid) -> impl Future<Output = Option<String>> + MaybeSend {
+            fn channel_name(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
                 let jid = jid.clone();
                 async move { self.inner.channel_name(&jid).await }
             }
@@ -911,12 +1258,19 @@ mod tests {
                 gate: pass_gate,
             };
             let mut pass_resolver = NameResolver::new();
+            // The spawned pass must not race teardown: keep the sender
+            // alive so `stop.changed()` never fires mid-lookup.
+            let (_guard, mut stop) = {
+                let (tx, rx) = tokio::sync::watch::channel(());
+                (tx, rx)
+            };
             run_pass(
                 &slow,
                 &pass_store,
                 &pass_signal,
                 &mut pass_resolver,
                 named_request(&[GROUP]),
+                &mut stop,
             )
             .await;
             let _ = done_tx.send(());
@@ -953,7 +1307,7 @@ mod tests {
         let mut drained = false;
         while let Ok(request) = tokio::time::timeout(Duration::from_secs(5), signal.next()).await {
             drained = drained || request.full;
-            run_pass(&source, &store, &signal, &mut resolver, request).await;
+            drive(&source, &store, &signal, &mut resolver, request).await;
             if stored_name(&store, GROUP).await.is_some() {
                 break;
             }
@@ -976,6 +1330,83 @@ mod tests {
         assert!(resolver.needs(GROUP, 2), "a new connection revalidates");
     }
 
+    /// A failed lookup cools the chat: due again after the delay, not on
+    /// the next message — and the server's own backoff is what sets the
+    /// length, so a throttled account does not re-request into its limit.
+    #[test]
+    fn a_failed_lookup_cools_then_retries() {
+        // `wacore::time::Instant` is the monotonic clock the tree reads
+        // everywhere (clippy bans `std::time::Instant`); it has no manual
+        // advance, so the test cools with a zero delay for "already due"
+        // and a day for "still quiet" rather than sleeping.
+        let mut resolver = NameResolver::new();
+        assert!(resolver.needs(GROUP, 1), "unasked is due");
+        resolver.cool(GROUP, 1, std::time::Duration::ZERO);
+        assert!(resolver.needs(GROUP, 1), "an elapsed cooldown is due again");
+        resolver.cool(GROUP, 1, std::time::Duration::from_secs(86_400));
+        assert!(
+            !resolver.needs(GROUP, 1),
+            "a fresh cooldown holds the next message off"
+        );
+        assert!(
+            resolver.needs(GROUP, 2),
+            "a new connection revalidates past any cooldown"
+        );
+        resolver.mark(GROUP, 1);
+        assert!(!resolver.needs(GROUP, 1), "settling clears the cooldown");
+    }
+
+    /// A failed bulk list cools the channel half instead of fanning out:
+    /// no per-channel request fires, nothing is settled, and a later pass
+    /// past the cooldown retries the list first.
+    #[tokio::test]
+    async fn a_failed_channel_list_fans_out_to_nothing() {
+        let store = test_store("channel-list-fails").await;
+        feed(&store, group_message(CHANNEL, "MSG-C3")).await;
+
+        // The channel HAS selective metadata ready — the point is that a
+        // failed list must not reach for it.
+        let source = FakeMeta::with_channel(CHANNEL, "Quiet updates", false);
+        source.fail_list.store(true, Ordering::Relaxed);
+        let signal = ChatNameResolveSignal::new();
+        let mut resolver = NameResolver::new();
+        drive(
+            &source,
+            &store,
+            &signal,
+            &mut resolver,
+            named_request(&[CHANNEL]),
+        )
+        .await;
+
+        assert_eq!(
+            stored_name(&store, CHANNEL).await,
+            None,
+            "a failed list must not fan out into selective lookups"
+        );
+        assert!(
+            !resolver.needs(CHANNEL, signal.generation()),
+            "the failed list cools the chat"
+        );
+
+        // Healed and expired, the retry goes through the list first: the
+        // channel is listed this time and resolves without any fallback.
+        let source = FakeMeta::with_channel(CHANNEL, "Announcements", true);
+        resolver.expire_cooldown(CHANNEL);
+        drive(
+            &source,
+            &store,
+            &signal,
+            &mut resolver,
+            named_request(&[CHANNEL]),
+        )
+        .await;
+        assert_eq!(
+            stored_name(&store, CHANNEL).await.as_deref(),
+            Some("Announcements")
+        );
+    }
+
     /// A blank subject settles nothing to write, but settles the question:
     /// the pass must not loop a lookup per message on a chat whose metadata
     /// has no usable name.
@@ -987,7 +1418,7 @@ mod tests {
         let source = FakeMeta::with_group(GROUP, "   ");
         let signal = ChatNameResolveSignal::new();
         let mut resolver = NameResolver::new();
-        run_pass(
+        drive(
             &source,
             &store,
             &signal,
