@@ -704,9 +704,9 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             if seen.contains(&jid.to_string()) {
                 continue;
             }
-            let stored = match chat_store.chat(&jid).await {
-                Ok(Some(entry)) => entry.name,
-                Ok(None) => None,
+            let (exists, stored) = match chat_store.chat(&jid).await {
+                Ok(Some(entry)) => (true, entry.name),
+                Ok(None) => (false, None),
                 Err(e) => {
                     retry_after_store_failure(resolver, signal, &request, stop).await;
                     warn!(
@@ -716,6 +716,13 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                     return;
                 }
             };
+            // A forced request is caused by deletion. If the store has
+            // already confirmed that deletion, do not spend a metadata
+            // request on a row that no longer exists; a later recreation
+            // will arrive as a fresh named sighting.
+            if forced && !exists {
+                continue;
+            }
             // A non-full sighting of an already-named chat needs no
             // lookup — UNLESS this generation owes it a retry: a full
             // pass that failed it left it unmarked precisely so a later

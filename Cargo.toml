@@ -105,37 +105,14 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "4b5f5fd89049f7d1d219a439c5a56c78fd8e1764" }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "4b5f5fd89049f7d1d219a439c5a56c78fd8e1764" }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "4b5f5fd89049f7d1d219a439c5a56c78fd8e1764" }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d" }
 
-# The library and its satellites. One git source, one revision: cargo resolves
-# every entry below to the SAME commit, so `cargo update` moves them together
-# and no two crates can drift onto incompatible revisions. The exact commit is
-# pinned in the committed Cargo.lock.
-#
-# whatsapp-rust#1473 exposes the builder's immutable resolved call target.
-# whatsapp-rust#1476 sends zero screens in 1:1 video offers.
-#
-# `whatsapp-rust` re-exports wacore, wacore-binary and waproto wholesale, so
-# anything already depending on it reaches them through that and does not
-# declare them here. The satellites below stay because `oxidezap-core`,
-# `-audio` and `-chat-store` deliberately do NOT depend on `whatsapp-rust`:
-# they are domain types, device I/O and storage, and routing them through the
-# client would drag the whole Tokio runtime, VoIP stack and transport into
-# crates that need none of it. `SharedSqlite` is also not re-exported, so the
-# chat store needs sqlite-storage directly regardless.
-#
-# Featureless on purpose: inheritance can only repeat `default-features`,
-# never override it, so the workspace says none and every host crate lists
-# exactly what it takes. The wasm halves then stay free of `voip` (UDP
-# sockets and C) and `bundled-sqlite` (a C toolchain) by simply not naming
-# them. A target split is still two entries, but the source and branch below
-# are the only place either is said — and a new upstream default has to be
-# adopted here by hand, which is the price of that split staying honest.
-#
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "4b5f5fd89049f7d1d219a439c5a56c78fd8e1764", default-features = false }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "4b5f5fd89049f7d1d219a439c5a56c78fd8e1764", default-features = false }
+# Keep every whatsapp-rust crate on one revision.
+
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d", default-features = false }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and

@@ -22,11 +22,10 @@ use crate::exec::Task;
 impl WhatsAppClient {
     /// Everyone in `jid`, named the way every other surface names them.
     ///
-    /// Through [`Groups::fetch_metadata`], which returns the complete group
-    /// metadata needed for the participant list, including current membership
-    /// and admin roles. The merged upstream API exposes this as the public
-    /// participant lookup; it is intentionally a full uncached fetch here,
-    /// rather than an upstream API change in this client-only PR.
+    /// Through [`Groups::routing_info`], the cache-preferred participant
+    /// lookup exposed by the companion upstream API PR. Repeated opens are
+    /// therefore served from the existing routing cache; only cache misses
+    /// reach the network.
     ///
     /// Names come from the [`NameBook`](crate::names::NameBook) like a
     /// bubble's do, so the same person is not "Ana" over their message and a
@@ -46,7 +45,7 @@ impl WhatsAppClient {
             let info = live
                 .client
                 .groups()
-                .fetch_metadata(&group)
+                .routing_info(&group)
                 .await
                 .map_err(|e| e.to_string())?;
             // Both of this account's addresses, because a group addresses its
@@ -55,17 +54,17 @@ impl WhatsAppClient {
             let mine = own_jids(&live.client);
             let mut members = Vec::with_capacity(info.participants.len());
             for participant in &info.participants {
-                let is_self = mine.contains(&participant.jid.to_non_ad_string());
+                let is_self = mine.contains(&participant.to_non_ad_string());
                 // Not looked up for this account: it is drawn as "You", and
                 // asking would put the owner's own address-book entry — or
                 // their number — in a line about everybody else.
                 let name = if is_self {
                     None
                 } else {
-                    live.names.known(&live.client, &participant.jid, None).await
+                    live.names.known(&live.client, participant, None).await
                 };
                 members.push(GroupMember {
-                    jid: participant.jid.to_string(),
+                    jid: participant.to_string(),
                     name,
                     is_self,
                 });

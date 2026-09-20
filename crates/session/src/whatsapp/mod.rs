@@ -1194,6 +1194,7 @@ impl WhatsAppClient {
                 // so the drain's completion re-asks for a full pass over
                 // what the store holds now.
                 EventKind::OfflineSyncCompleted,
+                EventKind::HistorySync,
                 EventKind::DeleteChatUpdate,
             ],
             64,
@@ -1324,9 +1325,11 @@ impl WhatsAppClient {
                         // The store materializes these events independently,
                         // but the session-side sighting can be the only name
                         // trigger for a newly seen special chat. Re-cover
-                        // durable state after a mailbox overflow; run_pass's
-                        // flush barrier waits for the store's commit first.
-                        names_on_drop.new_connection();
+                        // durable state after a mailbox overflow without
+                        // invalidating settled names or per-chat cooldowns;
+                        // run_pass's flush barrier waits for the store's
+                        // commit first.
+                        names_on_drop.request_full();
                     }
                     // The kind, and only the kind. It is `Copy`, carries no
                     // payload and names the variant, which makes this the one
@@ -1525,6 +1528,15 @@ impl WhatsAppClient {
                     // another ask for rows already settled before the drain.
                     // Advance the metadata generation so names overwritten by
                     // late history are revalidated in this same connection.
+                    resolve.new_connection();
+                }
+            }
+            Event::HistorySync(_) => {
+                // On-demand history backfills arrive independently of the
+                // offline-drain completion. The store applies their
+                // conversation snapshots too, so revalidate metadata after
+                // the materialization rather than leaving a stale subject.
+                if let Some(resolve) = &resolve_chat_names {
                     resolve.new_connection();
                 }
             }
