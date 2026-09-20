@@ -134,7 +134,8 @@ async fn dispatch(
                 let names = names.clone();
                 let processed = processed.clone();
                 async move {
-                    WhatsAppClient::handle_event(event, client, ui, calls, names, None, None).await;
+                    WhatsAppClient::handle_event(event, client, ui, calls, names, None, None, None)
+                        .await;
                     processed.send(()).await.unwrap();
                 }
             }

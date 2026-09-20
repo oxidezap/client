@@ -9,6 +9,7 @@
 
 mod ack;
 mod avatar;
+mod chat_names;
 mod chat_rows;
 mod contacts;
 mod edit;
@@ -94,6 +95,11 @@ pub(crate) enum WriterMsg {
         timestamp_ms: i64,
     },
     Reconcile(Jid),
+    /// Display names resolved from server metadata (group subjects,
+    /// channel names) for chats whose rows hold NULL. Written only when a
+    /// name is news — like the group-subject arm — so a pass that learned
+    /// nothing broadcasts nothing and the debounced reload stays quiet.
+    ChatNames(Vec<(Jid, String)>),
     SendFailed {
         chat: Jid,
         msg_id: String,
@@ -601,6 +607,35 @@ impl ChatStore {
     pub fn reconcile_chat(&self, chat: &Jid) -> Result<()> {
         self.tx
             .send(WriterMsg::Reconcile(chat.clone()))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Persist display names resolved from server metadata (group subjects,
+    /// channel names) for chats whose rows hold NULL.
+    ///
+    /// The resolver on the session side decides *which* chats to ask about
+    /// and *what* their names are; this is only the durable half: one queued
+    /// write per pass, committed in order with every other write. A name
+    /// equal to the stored one (or blank) is not news and broadcasts nothing;
+    /// a real change emits [`StoreChange::Chats`] so the list re-renders.
+    /// History still wins where it speaks — a nameless chunk never clobbers
+    /// a name written here, and a named one still updates over it — so the
+    /// two paths compose rather than race.
+    ///
+    /// Goes through the writer queue; use [`flush`](Self::flush) to await
+    /// completion.
+    pub fn set_chat_name(&self, chat: &Jid, name: impl Into<String>) -> Result<()> {
+        self.apply_chat_names(vec![(chat.clone(), name.into())])
+    }
+
+    /// [`set_chat_name`](Self::set_chat_name) for a whole resolution pass:
+    /// one queued write rather than one per chat.
+    pub fn apply_chat_names(&self, names: Vec<(Jid, String)>) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::ChatNames(names))
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 

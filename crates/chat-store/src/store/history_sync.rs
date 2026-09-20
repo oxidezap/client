@@ -78,6 +78,11 @@ fn apply_history_conversation(
             .as_deref()
             .or(conv.display_name.as_deref())
             .or(conv.username.as_deref());
+        // History is the stale copy: a nameless chunk must not erase a name
+        // live traffic (or an earlier metadata pass) already stored. An
+        // incoming `Some` still updates; an incoming `None` leaves the row
+        // it would otherwise clobber alone.
+        let persist_name = name.filter(|n| !n.trim().is_empty());
         let unread_count = match conv.unread_count {
             _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
             Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
@@ -87,7 +92,7 @@ fn apply_history_conversation(
             .values((
                 dsl::device_id.eq(device_id),
                 dsl::jid.eq(chat),
-                dsl::name.eq(name),
+                dsl::name.eq(persist_name),
                 dsl::last_message_ts.eq(last_ts_ms),
                 dsl::unread_count.eq(unread_count),
                 // Wire values are unix SECONDS; the columns (and the live
@@ -106,9 +111,14 @@ fn apply_history_conversation(
             .on_conflict((dsl::device_id, dsl::jid))
             .do_update()
             // Live rows already track unread/mute/pin; history only refreshes
-            // identity + activity floor.
+            // identity + activity floor. A nameless chunk preserves an
+            // existing name rather than clobbering it with NULL; a named one
+            // still updates. Two statements rather than one, because the SET
+            // clause is static and the two cases write different columns.
             .set((
-                dsl::name.eq(name),
+                dsl::name.eq(diesel::dsl::sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                >("COALESCE(excluded.name, name)")),
                 dsl::last_message_ts.eq(diesel::dsl::sql::<diesel::sql_types::BigInt>(
                     "MAX(last_message_ts, excluded.last_message_ts)",
                 )),

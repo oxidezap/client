@@ -332,3 +332,98 @@ async fn history_hydration_costs() {
          attach:    8 per chat in one read {attach_read:?}"
     );
 }
+
+/// The counterfactual gate: a stored name survives a nameless sync.
+///
+/// A live group row holds a name the metadata pass wrote; a later history
+/// chunk for the same conversation carries none. History is the stale copy,
+/// so the chunk must not erase what it does not know — and a chunk that
+/// does carry a name still updates.
+#[tokio::test]
+async fn history_without_name_does_not_erase_existing_name() {
+    let (_store, chat_store) = test_store().await;
+    let group = jid(GROUP);
+
+    // A live group message creates the nameless row production showed.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(GROUP, GROUP, "MSG-G1", 1_700_000_000),
+        )],
+    )
+    .await;
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("group row")
+            .name,
+        None
+    );
+
+    // The metadata pass writes the subject.
+    chat_store
+        .set_chat_name(&group, "Trip planning".to_string())
+        .expect("queue the resolved name");
+    chat_store.flush().await.expect("flush");
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("named group row")
+            .name
+            .as_deref(),
+        Some("Trip planning")
+    );
+
+    // A history chunk for the same conversation carries no name at all.
+    let history = wa::HistorySync {
+        sync_type: wa::history_sync::HistorySyncType::RECENT,
+        conversations: vec![wa::Conversation {
+            id: GROUP.to_string(),
+            conversation_timestamp: Some(1_700_000_100),
+            unread_count: Some(0),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    feed(&chat_store, [history_sync_event(history)]).await;
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("group row after nameless sync")
+            .name
+            .as_deref(),
+        Some("Trip planning"),
+        "a nameless history chunk must not erase the stored name"
+    );
+
+    // And a chunk that does carry a name still updates over it.
+    let renamed = wa::HistorySync {
+        sync_type: wa::history_sync::HistorySyncType::RECENT,
+        conversations: vec![wa::Conversation {
+            id: GROUP.to_string(),
+            name: Some("Trip planning v2".into()),
+            conversation_timestamp: Some(1_700_000_200),
+            unread_count: Some(0),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    feed(&chat_store, [history_sync_event(renamed)]).await;
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .expect("group row after named sync")
+            .name
+            .as_deref(),
+        Some("Trip planning v2")
+    );
+}

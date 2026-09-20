@@ -583,3 +583,70 @@ async fn a_close_commits_what_was_queued_and_ends_the_writer() {
     assert!(chat_store.flush().await.is_err());
     assert!(chat_store.close().await.is_err());
 }
+
+/// A resolved chat name lands on the row and buys the whole list, once: a
+/// repeat of the same name is not news and broadcasts nothing.
+#[tokio::test]
+async fn a_resolved_chat_name_broadcasts_only_on_real_change() {
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(GROUP, GROUP, "MSG-GN", 1_700_000_000),
+        )],
+    )
+    .await;
+    // Drain the invalidations the live message bought.
+    let mut changes = chat_store.subscribe();
+
+    chat_store
+        .set_chat_name(&jid(GROUP), "Trip planning".to_string())
+        .expect("queue the resolved name");
+    chat_store.flush().await.expect("flush");
+    assert_eq!(
+        chat_store
+            .chat(&jid(GROUP))
+            .await
+            .unwrap()
+            .expect("group row")
+            .name
+            .as_deref(),
+        Some("Trip planning")
+    );
+    match tokio::time::timeout(Duration::from_secs(5), changes.recv()).await {
+        Ok(Ok(StoreChange::Chats)) => {}
+        other => panic!("a new name must broadcast Chats, got {other:?}"),
+    }
+
+    // Same name again: the write is a no-op and buys no reload.
+    chat_store
+        .set_chat_name(&jid(GROUP), "Trip planning".to_string())
+        .expect("queue the same name");
+    chat_store.flush().await.expect("flush");
+    match tokio::time::timeout(Duration::from_millis(200), changes.recv()).await {
+        Err(_) => {}
+        Ok(other) => panic!("an unchanged name must broadcast nothing, got {other:?}"),
+    }
+
+    // A blank name is never news either.
+    chat_store
+        .set_chat_name(&jid(GROUP), "   ".to_string())
+        .expect("queue a blank name");
+    chat_store.flush().await.expect("flush");
+    assert_eq!(
+        chat_store
+            .chat(&jid(GROUP))
+            .await
+            .unwrap()
+            .expect("group row")
+            .name
+            .as_deref(),
+        Some("Trip planning"),
+        "a blank resolution must not erase the stored name"
+    );
+    match tokio::time::timeout(Duration::from_millis(200), changes.recv()).await {
+        Err(_) => {}
+        Ok(other) => panic!("a blank name must broadcast nothing, got {other:?}"),
+    }
+}
