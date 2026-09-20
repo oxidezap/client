@@ -1194,6 +1194,7 @@ impl WhatsAppClient {
                 // so the drain's completion re-asks for a full pass over
                 // what the store holds now.
                 EventKind::OfflineSyncCompleted,
+                EventKind::DeleteChatUpdate,
             ],
             64,
         );
@@ -1306,11 +1307,12 @@ impl WhatsAppClient {
                         );
                         control_drops = control_snapshot.dropped_full;
                         control_fault_ui.signal_control_overflow();
-                        // OfflineSyncCompleted is a control event. If that
-                        // mailbox overflowed, its post-sync repair ask may
-                        // have been the dropped event; a full durable pass
-                        // recovers the names it would have scheduled.
-                        names_on_drop.request_full();
+                        // Connected and OfflineSyncCompleted are control
+                        // events. If either was among the dropped entries,
+                        // advance the name generation as well as requesting
+                        // a full durable pass, so changed subjects are not
+                        // skipped as already settled on the old socket.
+                        names_on_drop.new_connection();
                     }
                     let data_snapshot = data_stats.stats();
                     if data_snapshot.dropped_full > data_drops {
@@ -1520,6 +1522,15 @@ impl WhatsAppClient {
                 debug!("offline sync completed ({} messages)", done.count);
                 if let Some(resolve) = &resolve_chat_names {
                     resolve.request_full();
+                }
+            }
+            Event::DeleteChatUpdate(update) => {
+                // A delete can retire a row after this generation already
+                // settled its metadata. The next message may recreate the
+                // row under the same JID, so force that address through a
+                // fresh metadata lookup rather than trusting the old answer.
+                if let Some(resolve) = &resolve_chat_names {
+                    resolve.request_forced([update.jid.to_non_ad_string()]);
                 }
             }
             Event::IncomingCall(call) => match &call.action {

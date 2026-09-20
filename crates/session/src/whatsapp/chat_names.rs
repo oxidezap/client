@@ -255,6 +255,9 @@ struct PendingNames {
     full: bool,
     /// Chats sighted live that may still be unnamed.
     named: HashSet<String>,
+    /// Chats whose row was deleted/cleared and must be revalidated even if
+    /// this generation already settled their address.
+    forced: HashSet<String>,
 }
 
 /// One pass's worth of asks, taken from the signal together.
@@ -264,6 +267,9 @@ pub(super) struct NameResolveRequest {
     pub(super) full: bool,
     /// Chats sighted live that may still be unnamed.
     pub(super) named: Vec<String>,
+    /// Chats whose row was deleted/cleared and must be revalidated even if
+    /// this generation already settled their address.
+    pub(super) forced: Vec<String>,
 }
 
 impl ChatNameResolveSignal {
@@ -321,6 +327,19 @@ impl ChatNameResolveSignal {
         });
     }
 
+    /// Force a fresh lookup for rows invalidated by a local delete/clear.
+    pub(super) fn request_forced(&self, jids: impl IntoIterator<Item = String>) {
+        self.set(|pending| {
+            let jids: Vec<String> = jids.into_iter().collect();
+            let before = pending.forced.len();
+            pending.named.extend(jids.iter().cloned());
+            pending.forced.extend(jids);
+            if pending.forced.len() != before {
+                self.ask.notify_one();
+            }
+        });
+    }
+
     fn set(&self, f: impl FnOnce(&mut PendingNames)) {
         let mut pending = self
             .state
@@ -345,6 +364,7 @@ impl ChatNameResolveSignal {
                 let taken = NameResolveRequest {
                     full: pending.full,
                     named: pending.named.drain().collect(),
+                    forced: pending.forced.drain().collect(),
                 };
                 pending.full = false;
                 taken
@@ -516,6 +536,7 @@ fn requeue_request(signal: &ChatNameResolveSignal, request: &NameResolveRequest)
         signal.request_full();
     }
     signal.request_named(request.named.iter().cloned());
+    signal.request_forced(request.forced.iter().cloned());
 }
 
 /// Run one pass: decide which chats need a lookup, fetch their names, and
@@ -545,6 +566,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // still has history or the message that caused the sighting in its queue.
     // Make the snapshot a real barrier before consuming the ask.
     if !request.full
+        && request.forced.is_empty()
         && !request.named.iter().any(|raw| {
             raw.parse::<Jid>()
                 .ok()
@@ -614,6 +636,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             let Ok(jid) = raw.parse::<Jid>() else {
                 continue;
             };
+            let forced = request.forced.iter().any(|candidate| candidate == raw);
             if seen.contains(&jid.to_string()) {
                 continue;
             }
@@ -636,6 +659,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             // the next reconnect. `needs` already encodes that: asked
             // chats skip, failed-and-cooled chats retry.
             if !request.full
+                && !forced
                 && stored.as_deref().is_some_and(usable_name)
                 && !resolver.needs(&jid.to_string(), generation)
             {
@@ -644,7 +668,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             if !seen.insert(jid.to_string()) {
                 continue;
             }
-            if !resolver.needs(&jid.to_string(), generation) {
+            if !forced && !resolver.needs(&jid.to_string(), generation) {
                 continue;
             }
             pre.insert(jid.to_string(), stored);
@@ -1189,6 +1213,7 @@ mod tests {
         NameResolveRequest {
             full: false,
             named: jids.iter().map(|jid| (*jid).to_string()).collect(),
+            forced: Vec::new(),
         }
     }
 
@@ -1461,6 +1486,40 @@ mod tests {
             stored_name(&store, GROUP).await.as_deref(),
             Some("New name"),
             "a failed revalidation retries on the next sighting past its cooldown"
+        );
+    }
+
+    /// A delete followed by a same-JID recreation forces a fresh lookup in
+    /// the current generation instead of trusting the old settled answer.
+    #[tokio::test]
+    async fn a_recreated_chat_is_revalidated_after_delete() {
+        let store = test_store("recreated-chat").await;
+        feed(&store, group_message(GROUP, "MSG-GRECREATE")).await;
+
+        let source = FakeMeta::with_group(GROUP, "Old name");
+        let signal = ChatNameResolveSignal::new();
+        let mut resolver = NameResolver::new();
+        drive(
+            &source,
+            &store,
+            &signal,
+            &mut resolver,
+            named_request(&[GROUP]),
+        )
+        .await;
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Old name")
+        );
+
+        source.rename_group(GROUP, "New name");
+        signal.request_forced([GROUP.to_string()]);
+        let request = signal.next().await;
+        assert_eq!(request.forced, vec![GROUP.to_string()]);
+        drive(&source, &store, &signal, &mut resolver, request).await;
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("New name")
         );
     }
 
