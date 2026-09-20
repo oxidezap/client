@@ -24,7 +24,9 @@ impl WhatsAppClient {
     ///
     /// Through [`Groups::fetch_metadata`], which returns the complete group
     /// metadata needed for the participant list, including current membership
-    /// and admin roles.
+    /// and admin roles. The merged upstream API exposes this as the public
+    /// participant lookup; it is intentionally a full uncached fetch here,
+    /// rather than an upstream API change in this client-only PR.
     ///
     /// Names come from the [`NameBook`](crate::names::NameBook) like a
     /// bubble's do, so the same person is not "Ana" over their message and a
