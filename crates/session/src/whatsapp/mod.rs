@@ -1531,7 +1531,7 @@ impl WhatsAppClient {
                     resolve.new_connection();
                 }
             }
-            Event::HistorySync(_) => {
+            Event::HistorySync(history) if history.peer_data_request_session_id().is_some() => {
                 // On-demand history backfills arrive independently of the
                 // offline-drain completion. The store applies their
                 // conversation snapshots too, so revalidate metadata after
@@ -1539,6 +1539,11 @@ impl WhatsAppClient {
                 if let Some(resolve) = &resolve_chat_names {
                     resolve.new_connection();
                 }
+            }
+            Event::HistorySync(_) => {
+                // Server-pushed offline chunks can arrive in many pieces;
+                // OfflineSyncCompleted is the single repair point once all
+                // of them have materialized.
             }
             Event::DeleteChatUpdate(update) => {
                 // A delete can retire a row after this generation already
