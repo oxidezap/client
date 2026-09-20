@@ -85,6 +85,10 @@ pub(crate) enum NameLookup {
 /// Fallback cooldown when the server named no delay: transport hiccups and
 /// timeouts retry soon, but never on the very next message.
 const NAME_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+/// Store failures are retried slowly and only a few times; later sightings or
+/// a reconnect can reopen the circuit without a hot loop on a broken writer.
+const STORE_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+const STORE_RETRY_LIMIT: u8 = 3;
 
 /// Where a special chat's display name is read from.
 ///
@@ -369,7 +373,7 @@ impl ChatNameResolveSignal {
                 pending.full = false;
                 taken
             };
-            if taken.full || !taken.named.is_empty() {
+            if taken.full || !taken.named.is_empty() || !taken.forced.is_empty() {
                 return taken;
             }
             self.ask.notified().await;
@@ -400,6 +404,7 @@ pub(super) struct NameResolver {
     /// Sightings coalesced into a pass that was interrupted by global
     /// throttling. They must survive until the one global retry timer fires.
     global_named: HashSet<String>,
+    store_failures: u8,
 }
 
 impl NameResolver {
@@ -430,6 +435,26 @@ impl NameResolver {
     fn mark(&mut self, jid: &str, generation: u64) {
         self.asked.insert(jid.to_string(), generation);
         self.cooling.remove(jid);
+    }
+
+    fn forget(&mut self, jid: &str, generation: u64) {
+        if self.asked.get(jid) == Some(&generation) {
+            self.asked.remove(jid);
+        }
+        self.cooling.remove(jid);
+    }
+
+    fn store_failure_due(&mut self) -> bool {
+        if self.store_failures >= STORE_RETRY_LIMIT {
+            false
+        } else {
+            self.store_failures += 1;
+            true
+        }
+    }
+
+    fn clear_store_failures(&mut self) {
+        self.store_failures = 0;
     }
 
     /// A failed lookup: retryable after `retry_after`, not on the next
@@ -539,6 +564,22 @@ fn requeue_request(signal: &ChatNameResolveSignal, request: &NameResolveRequest)
     signal.request_forced(request.forced.iter().cloned());
 }
 
+async fn retry_after_store_failure(
+    resolver: &mut NameResolver,
+    signal: &ChatNameResolveSignal,
+    request: &NameResolveRequest,
+    stop: &mut watch::Receiver<()>,
+) {
+    if !resolver.store_failure_due() {
+        warn!("chat-name resolver store retry circuit is open");
+        return;
+    }
+    tokio::select! {
+        _ = sleep(STORE_RETRY_COOLDOWN) => requeue_request(signal, request),
+        _ = stop.changed() => {}
+    }
+}
+
 /// Run one pass: decide which chats need a lookup, fetch their names, and
 /// write back what was learned.
 ///
@@ -587,7 +628,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             _ = stop.changed() => return,
         };
         if let Err(e) = flushed {
-            requeue_request(signal, &request);
+            retry_after_store_failure(resolver, signal, &request, stop).await;
             warn!("chat-name resolver could not flush the chat store: {e}");
             return;
         }
@@ -718,6 +759,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         for (jid, name) in answered {
             match name {
                 NameLookup::Found(name) => {
+                    let name = name.trim().to_owned();
                     let key = jid.to_string();
                     settled.push((key.clone(), usable_name(&name).then(|| name.clone())));
                     if usable_name(&name) {
@@ -823,6 +865,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                     for (jid, name) in answered {
                         match name {
                             NameLookup::Found(name) => {
+                                let name = name.trim().to_owned();
                                 let key = jid.to_string();
                                 settled
                                     .push((key.clone(), usable_name(&name).then(|| name.clone())));
@@ -890,6 +933,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // The staleness gate and queue enqueue share a lock with
     // `new_connection`: an old pass cannot observe the old generation, get
     // preempted, and enqueue its writes after the new socket has advanced it.
+    let mut queue_error = None;
     {
         let _generation_lock = signal.lock_generation();
         if signal.generation() != generation {
@@ -899,10 +943,20 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         if !resolved.is_empty()
             && let Err(e) = chat_store.apply_chat_names(resolved.clone())
         {
-            requeue_request(signal, &request);
-            warn!("chat-name resolver could not queue resolved names: {e}");
-            return;
+            queue_error = Some(e);
         }
+    }
+    if let Some(e) = queue_error {
+        for (jid, retry_after) in &failed {
+            resolver.cool(jid, generation, *retry_after);
+        }
+        if let Some(retry_after) = global_backoff {
+            resolver.cool_global(generation, retry_after);
+            resolver.defer_global_named(generation, request.named.iter().cloned());
+        }
+        retry_after_store_failure(resolver, signal, &request, stop).await;
+        warn!("chat-name resolver could not queue resolved names: {e}");
+        return;
     }
     if !resolved.is_empty() {
         let flushed = chat_store.flush();
@@ -912,7 +966,14 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             _ = stop.changed() => return,
         };
         if let Err(e) = flushed {
-            requeue_request(signal, &request);
+            for (jid, retry_after) in &failed {
+                resolver.cool(jid, generation, *retry_after);
+            }
+            if let Some(retry_after) = global_backoff {
+                resolver.cool_global(generation, retry_after);
+                resolver.defer_global_named(generation, request.named.iter().cloned());
+            }
+            retry_after_store_failure(resolver, signal, &request, stop).await;
             warn!("chat-name resolver's names did not commit: {e}");
             return;
         }
@@ -930,7 +991,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             {
                 resolver.mark(&jid, generation);
             }
-            Ok(Some(_)) | Ok(None) => {}
+            Ok(Some(_)) | Ok(None) => resolver.forget(&jid, generation),
             Err(e) => debug!("chat-name resolver could not confirm {jid}: {e}"),
         }
     }
@@ -941,6 +1002,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         resolver.cool_global(generation, retry_after);
         resolver.defer_global_named(generation, request.named.iter().cloned());
     }
+    resolver.clear_store_failures();
     debug!(
         "chat-name resolver: {} chat(s) learned a name",
         resolved.len()
@@ -1374,6 +1436,32 @@ mod tests {
             stored_name(&store, CHANNEL).await.as_deref(),
             Some("Quiet updates")
         );
+    }
+
+    /// Names are normalized before the CAS and before settlement, matching
+    /// the store's trimmed persistence value.
+    #[tokio::test]
+    async fn a_metadata_name_is_trimmed_before_persistence() {
+        let store = test_store("trimmed-name").await;
+        feed(&store, group_message(GROUP, "MSG-GTRIM")).await;
+
+        let source = FakeMeta::with_group(GROUP, "  Trip planning  ");
+        let signal = ChatNameResolveSignal::new();
+        let mut resolver = NameResolver::new();
+        drive(
+            &source,
+            &store,
+            &signal,
+            &mut resolver,
+            named_request(&[GROUP]),
+        )
+        .await;
+
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Trip planning")
+        );
+        assert!(!resolver.needs(GROUP, signal.generation()));
     }
 
     /// A metadata failure leaves the fallback rendering alone: no row, no
