@@ -444,11 +444,12 @@ impl NameResolver {
         }
     }
 
-    fn take_global_named(&mut self, generation: u64) -> Vec<String> {
-        if self
-            .global_cooling
-            .is_some_and(|(cooling_generation, _)| cooling_generation == generation)
-        {
+    /// Consume an expired account-wide retry window and its deferred
+    /// sightings together. Clearing the window is essential: an expired
+    /// cooldown must schedule one retry, not make the resolver spin forever.
+    fn take_expired_global_retry(&mut self, generation: u64) -> Vec<String> {
+        if self.global_retry_expired(generation) {
+            self.global_cooling = None;
             self.global_named.drain().collect()
         } else {
             Vec::new()
@@ -543,6 +544,19 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // completion/sighting can therefore wake this task while the materializer
     // still has history or the message that caused the sighting in its queue.
     // Make the snapshot a real barrier before consuming the ask.
+    if !request.full
+        && !request.named.iter().any(|raw| {
+            raw.parse::<Jid>()
+                .ok()
+                .is_some_and(|jid| resolver.needs(&jid.to_string(), generation))
+        })
+    {
+        // A settled or cooling sighting is only a wake-up for the resolver;
+        // do not break the writer's batching or read the row just to discard
+        // it. A due/new JID still takes the barrier below so its message has
+        // materialized before the lookup snapshot.
+        return;
+    }
     if request.full || !request.named.is_empty() {
         let flushed = chat_store.flush();
         tokio::pin!(flushed);
@@ -655,7 +669,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // blank one — both settle the question for this generation). Failures
     // record a cooldown (server backoff honored) so the next sighting
     // retries after the delay rather than on the next message.
-    let mut settled: Vec<String> = Vec::new();
+    let mut settled: Vec<(String, Option<String>)> = Vec::new();
     let mut resolved: Vec<oxidezap_chat_store::ChatNameWrite> = Vec::new();
     let mut failed: Vec<(String, std::time::Duration)> = Vec::new();
     let mut global_backoff: Option<std::time::Duration> = None;
@@ -681,7 +695,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             match name {
                 NameLookup::Found(name) => {
                     let key = jid.to_string();
-                    settled.push(key.clone());
+                    settled.push((key.clone(), usable_name(&name).then(|| name.clone())));
                     if usable_name(&name) {
                         resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
                             jid,
@@ -744,7 +758,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                     match subscribed.get(&jid.to_string()) {
                         Some(name) => {
                             let key = jid.to_string();
-                            settled.push(key.clone());
+                            settled.push((key.clone(), usable_name(name).then(|| name.clone())));
                             if usable_name(name) {
                                 resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
                                     jid,
@@ -786,7 +800,8 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                         match name {
                             NameLookup::Found(name) => {
                                 let key = jid.to_string();
-                                settled.push(key.clone());
+                                settled
+                                    .push((key.clone(), usable_name(&name).then(|| name.clone())));
                                 if usable_name(&name) {
                                     resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
                                         jid,
@@ -881,13 +896,17 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // A CAS can legitimately match no row when a chat was deleted during the
     // lookup. Do not mark that JID settled: if a later message recreates it in
     // this generation, its new row still needs a name lookup.
-    for jid in settled {
+    for (jid, learned_name) in settled {
         let Ok(parsed) = jid.parse::<Jid>() else {
             continue;
         };
         match chat_store.chat(&parsed).await {
-            Ok(Some(_)) => resolver.mark(&jid, generation),
-            Ok(None) => {}
+            Ok(Some(entry))
+                if learned_name.is_none() || entry.name.as_deref() == learned_name.as_deref() =>
+            {
+                resolver.mark(&jid, generation);
+            }
+            Ok(Some(_)) | Ok(None) => {}
             Err(e) => debug!("chat-name resolver could not confirm {jid}: {e}"),
         }
     }
@@ -930,7 +949,7 @@ impl WhatsAppClient {
                 // One timer for the resolver is enough; per-chat failures
                 // remain event-driven and never turn into timer storms.
                 if resolver.global_retry_expired(generation) {
-                    let named = resolver.take_global_named(generation);
+                    let named = resolver.take_expired_global_retry(generation);
                     signal.request_full();
                     signal.request_named(named);
                     continue;
@@ -940,12 +959,14 @@ impl WhatsAppClient {
                         mut request = signal.next() => {
                             if resolver.global_retry_expired(generation) {
                                 request.full = true;
-                                request.named.extend(resolver.take_global_named(generation));
+                                request
+                                    .named
+                                    .extend(resolver.take_expired_global_retry(generation));
                             }
                             request
                         },
                         _ = sleep(delay) => {
-                            let named = resolver.take_global_named(generation);
+                            let named = resolver.take_expired_global_retry(generation);
                             signal.request_full();
                             signal.request_named(named);
                             continue;
@@ -1317,7 +1338,7 @@ mod tests {
         assert_eq!(stored_name(&store, CHANNEL).await, None);
 
         source.fail_channel_global.store(false, Ordering::Relaxed);
-        let named = resolver.take_global_named(signal.generation());
+        let named = resolver.take_expired_global_retry(signal.generation());
         assert_eq!(named, vec![CHANNEL.to_string()]);
         signal.request_full();
         signal.request_named(named);
@@ -1645,7 +1666,11 @@ mod tests {
         resolver.cool_global(1, Duration::ZERO);
         resolver.defer_global_named(1, [CHANNEL.to_string()]);
         assert!(resolver.global_retry_expired(1));
-        assert_eq!(resolver.take_global_named(1), vec![CHANNEL.to_string()]);
+        assert_eq!(
+            resolver.take_expired_global_retry(1),
+            vec![CHANNEL.to_string()]
+        );
+        assert!(!resolver.global_retry_expired(1));
     }
 
     #[test]
