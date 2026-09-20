@@ -431,8 +431,7 @@ impl NameResolver {
         if self.asked.get(jid) == Some(&generation) {
             return false;
         }
-        if let Some((global_generation, until)) = self.global_cooling
-            && global_generation == generation
+        if let Some((_, until)) = self.global_cooling
             && until.elapsed().as_nanos() == 0
         {
             return false;
@@ -484,29 +483,21 @@ impl NameResolver {
         let until = wacore::time::Instant::now() + retry_after;
         let replace = match self.global_cooling {
             None => true,
-            Some((current_generation, current_until)) => {
-                current_generation != generation || current_until < until
-            }
+            Some((_, current_until)) => current_until < until,
         };
         if replace {
             self.global_cooling = Some((generation, until));
         }
     }
 
-    fn defer_global_named(&mut self, generation: u64, jids: impl IntoIterator<Item = String>) {
-        if self
-            .global_cooling
-            .is_some_and(|(cooling_generation, _)| cooling_generation == generation)
-        {
+    fn defer_global_named(&mut self, _generation: u64, jids: impl IntoIterator<Item = String>) {
+        if self.global_cooling.is_some() {
             self.global_named.extend(jids);
         }
     }
 
-    fn defer_global_forced(&mut self, generation: u64, jids: impl IntoIterator<Item = String>) {
-        if self
-            .global_cooling
-            .is_some_and(|(cooling_generation, _)| cooling_generation == generation)
-        {
+    fn defer_global_forced(&mut self, _generation: u64, jids: impl IntoIterator<Item = String>) {
+        if self.global_cooling.is_some() {
             self.global_forced.extend(jids);
         }
     }
@@ -527,19 +518,15 @@ impl NameResolver {
     }
 
     /// Remaining delay before a global server backoff may be retried.
-    fn global_retry_after(&self, generation: u64) -> Option<std::time::Duration> {
-        let (cooling_generation, until) = self.global_cooling?;
-        if cooling_generation != generation {
-            return None;
-        }
+    fn global_retry_after(&self, _generation: u64) -> Option<std::time::Duration> {
+        let (_, until) = self.global_cooling?;
         let remaining = until.saturating_duration_since(wacore::time::Instant::now());
         (!remaining.is_zero()).then_some(remaining)
     }
 
     fn global_retry_expired(&self, generation: u64) -> bool {
-        self.global_cooling.is_some_and(|(cooling_generation, _)| {
-            cooling_generation == generation && self.global_retry_after(generation).is_none()
-        })
+        self.global_cooling
+            .is_some_and(|(_, _)| self.global_retry_after(generation).is_none())
     }
 
     /// Advance a chat past its cooldown the way its expiry would, without
@@ -707,7 +694,8 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         // still materializing, a history chunk landing late) carries its
         // own ask rather than waiting for the next reconnect. Its stored
         // value is read per chat — sightings are a handful, not a page —
-        // and a read error resolves rather than being filed as named.
+        // and a read error retries the whole request rather than fabricating
+        // an unnamed expectation.
         for raw in &request.named {
             let Ok(jid) = raw.parse::<Jid>() else {
                 continue;
@@ -720,11 +708,12 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 Ok(Some(entry)) => entry.name,
                 Ok(None) => None,
                 Err(e) => {
-                    debug!(
+                    retry_after_store_failure(resolver, signal, &request, stop).await;
+                    warn!(
                         "chat-name resolver could not read {}: {e}",
                         jid.to_non_ad_string()
                     );
-                    None
+                    return;
                 }
             };
             // A non-full sighting of an already-named chat needs no
