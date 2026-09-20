@@ -1844,10 +1844,11 @@ mod tests {
         let mut resolver = NameResolver::new();
         resolver.cool_global(1, Duration::ZERO);
         resolver.defer_global_named(1, [CHANNEL.to_string()]);
+        resolver.defer_global_forced(1, [GROUP.to_string()]);
         assert!(resolver.global_retry_expired(1));
         let (named, forced) = resolver.take_expired_global_retry(1);
         assert_eq!(named, vec![CHANNEL.to_string()]);
-        assert!(forced.is_empty());
+        assert_eq!(forced, vec![GROUP.to_string()]);
         assert!(!resolver.global_retry_expired(1));
     }
 
