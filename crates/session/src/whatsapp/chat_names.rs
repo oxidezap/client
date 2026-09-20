@@ -404,6 +404,7 @@ pub(super) struct NameResolver {
     /// Sightings coalesced into a pass that was interrupted by global
     /// throttling. They must survive until the one global retry timer fires.
     global_named: HashSet<String>,
+    global_forced: HashSet<String>,
     store_failures: u8,
 }
 
@@ -489,15 +490,27 @@ impl NameResolver {
         }
     }
 
+    fn defer_global_forced(&mut self, generation: u64, jids: impl IntoIterator<Item = String>) {
+        if self
+            .global_cooling
+            .is_some_and(|(cooling_generation, _)| cooling_generation == generation)
+        {
+            self.global_forced.extend(jids);
+        }
+    }
+
     /// Consume an expired account-wide retry window and its deferred
     /// sightings together. Clearing the window is essential: an expired
     /// cooldown must schedule one retry, not make the resolver spin forever.
-    fn take_expired_global_retry(&mut self, generation: u64) -> Vec<String> {
+    fn take_expired_global_retry(&mut self, generation: u64) -> (Vec<String>, Vec<String>) {
         if self.global_retry_expired(generation) {
             self.global_cooling = None;
-            self.global_named.drain().collect()
+            (
+                self.global_named.drain().collect(),
+                self.global_forced.drain().collect(),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     }
 
@@ -546,14 +559,13 @@ fn usable_name(name: &str) -> bool {
 /// durable per-chat data, not viewport data like avatar bytes, so a page
 /// bound (and its pinned-first order) has no business deciding which chats
 /// get revalidated.
-async fn stored_special_chats(chat_store: &Arc<ChatStore>) -> Vec<(Jid, Option<String>)> {
-    match chat_store.special_chat_names().await {
-        Ok(rows) => rows,
-        Err(e) => {
-            debug!("chat-name resolver could not read the chat list: {e}");
-            Vec::new()
-        }
-    }
+async fn stored_special_chats(
+    chat_store: &Arc<ChatStore>,
+) -> Result<Vec<(Jid, Option<String>)>, String> {
+    chat_store
+        .special_chat_names()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn requeue_request(signal: &ChatNameResolveSignal, request: &NameResolveRequest) {
@@ -596,10 +608,14 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     stop: &mut watch::Receiver<()>,
 ) {
     let generation = signal.generation();
+    for jid in &request.forced {
+        resolver.forget(jid, generation);
+    }
     if resolver.global_retry_after(generation).is_some() {
         // Requests arriving while a global throttle is active must not consume
         // their sightings before the timer can combine them with the retry.
         resolver.defer_global_named(generation, request.named.iter().cloned());
+        resolver.defer_global_forced(generation, request.forced.iter().cloned());
         return;
     }
     // The event handler and the ChatStore have independent subscriptions. A
@@ -663,7 +679,15 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 }
             };
             if request.full {
-                for (jid, stored) in stored_special_chats(chat_store).await {
+                let stored = match stored_special_chats(chat_store).await {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        retry_after_store_failure(resolver, signal, &request, stop).await;
+                        warn!("chat-name resolver could not read the chat list: {e}");
+                        return;
+                    }
+                };
+                for (jid, stored) in stored {
                     push(jid, stored);
                 }
             }
@@ -823,13 +847,14 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 for jid in channels {
                     match subscribed.get(&jid.to_string()) {
                         Some(name) => {
+                            let name = name.trim().to_owned();
                             let key = jid.to_string();
-                            settled.push((key.clone(), usable_name(name).then(|| name.clone())));
-                            if usable_name(name) {
+                            settled.push((key.clone(), usable_name(&name).then(|| name.clone())));
+                            if usable_name(&name) {
                                 resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
                                     jid,
                                     pre.get(&key).cloned().flatten(),
-                                    name.clone(),
+                                    name,
                                 ));
                             }
                         }
@@ -953,6 +978,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         if let Some(retry_after) = global_backoff {
             resolver.cool_global(generation, retry_after);
             resolver.defer_global_named(generation, request.named.iter().cloned());
+            resolver.defer_global_forced(generation, request.forced.iter().cloned());
         }
         retry_after_store_failure(resolver, signal, &request, stop).await;
         warn!("chat-name resolver could not queue resolved names: {e}");
@@ -972,6 +998,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             if let Some(retry_after) = global_backoff {
                 resolver.cool_global(generation, retry_after);
                 resolver.defer_global_named(generation, request.named.iter().cloned());
+                resolver.defer_global_forced(generation, request.forced.iter().cloned());
             }
             retry_after_store_failure(resolver, signal, &request, stop).await;
             warn!("chat-name resolver's names did not commit: {e}");
@@ -1001,6 +1028,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     if let Some(retry_after) = global_backoff {
         resolver.cool_global(generation, retry_after);
         resolver.defer_global_named(generation, request.named.iter().cloned());
+        resolver.defer_global_forced(generation, request.forced.iter().cloned());
     }
     resolver.clear_store_failures();
     debug!(
@@ -1035,9 +1063,10 @@ impl WhatsAppClient {
                 // One timer for the resolver is enough; per-chat failures
                 // remain event-driven and never turn into timer storms.
                 if resolver.global_retry_expired(generation) {
-                    let named = resolver.take_expired_global_retry(generation);
+                    let (named, forced) = resolver.take_expired_global_retry(generation);
                     signal.request_full();
                     signal.request_named(named);
+                    signal.request_forced(forced);
                     continue;
                 }
                 let request = if let Some(delay) = resolver.global_retry_after(generation) {
@@ -1045,16 +1074,18 @@ impl WhatsAppClient {
                         mut request = signal.next() => {
                             if resolver.global_retry_expired(generation) {
                                 request.full = true;
-                                request
-                                    .named
-                                    .extend(resolver.take_expired_global_retry(generation));
+                                let (named, forced) =
+                                    resolver.take_expired_global_retry(generation);
+                                request.named.extend(named);
+                                request.forced.extend(forced);
                             }
                             request
                         },
                         _ = sleep(delay) => {
-                            let named = resolver.take_expired_global_retry(generation);
+                            let (named, forced) = resolver.take_expired_global_retry(generation);
                             signal.request_full();
                             signal.request_named(named);
+                            signal.request_forced(forced);
                             continue;
                         },
                         _ = stopping.changed() => return,
@@ -1425,10 +1456,11 @@ mod tests {
         assert_eq!(stored_name(&store, CHANNEL).await, None);
 
         source.fail_channel_global.store(false, Ordering::Relaxed);
-        let named = resolver.take_expired_global_retry(signal.generation());
+        let (named, forced) = resolver.take_expired_global_retry(signal.generation());
         assert_eq!(named, vec![CHANNEL.to_string()]);
         signal.request_full();
         signal.request_named(named);
+        signal.request_forced(forced);
         let retry = signal.next().await;
         assert!(retry.full);
         drive(&source, &store, &signal, &mut resolver, retry).await;
@@ -1813,10 +1845,9 @@ mod tests {
         resolver.cool_global(1, Duration::ZERO);
         resolver.defer_global_named(1, [CHANNEL.to_string()]);
         assert!(resolver.global_retry_expired(1));
-        assert_eq!(
-            resolver.take_expired_global_retry(1),
-            vec![CHANNEL.to_string()]
-        );
+        let (named, forced) = resolver.take_expired_global_retry(1);
+        assert_eq!(named, vec![CHANNEL.to_string()]);
+        assert!(forced.is_empty());
         assert!(!resolver.global_retry_expired(1));
     }
 
