@@ -757,34 +757,16 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                     }
                 }
                 // A channel absent from a GOOD list is either unsubscribed
-                // or too new for it. A full pass avoids the N+1 fallback for
-                // ordinary stored rows, while a live sighting is stronger
-                // evidence and earns its selective lookup. A chat that
-                // already carries a usable stored name still retries when a
-                // previous lookup failed and its cooldown has elapsed.
-                let explicitly_sighted: HashSet<String> = request
-                    .named
-                    .iter()
-                    .filter_map(|raw| raw.parse::<Jid>().ok())
-                    .map(|jid| jid.to_string())
-                    .collect();
+                // or too new for it. It earns the defined selective fallback
+                // lookup even during a full pass: the bulk list has already
+                // covered every channel it knows, so this is one request only
+                // for the channels absent from that response, not an N+1
+                // lookup over the subscribed set. The generation resolver
+                // still deduplicates repeated sightings and retries only
+                // chats that are due.
                 let fallback: Vec<Jid> = fallback
                     .into_iter()
-                    .filter(|jid| {
-                        let key = jid.to_string();
-                        // A full pass normally avoids fanning out for rows
-                        // absent from the subscribed list. A sighting is
-                        // stronger evidence: an unsubscribed/new channel can
-                        // only be resolved through this fallback.
-                        let eligible = !request.full || explicitly_sighted.contains(&key);
-                        let known = pre
-                            .get(&key)
-                            .and_then(|stored| stored.as_deref())
-                            .is_some_and(usable_name);
-                        eligible
-                            && resolver.needs(&key, generation)
-                            && (!known || explicitly_sighted.contains(&key))
-                    })
+                    .filter(|jid| resolver.needs(&jid.to_string(), generation))
                     .collect();
                 for (chunk_index, chunk) in fallback.chunks(CHAT_NAME_CONCURRENCY).enumerate() {
                     let lookup =
@@ -1284,6 +1266,27 @@ mod tests {
             named_request(&[CHANNEL]),
         )
         .await;
+
+        assert_eq!(
+            stored_name(&store, CHANNEL).await.as_deref(),
+            Some("Quiet updates")
+        );
+    }
+
+    /// A full pass also falls back for a channel absent from the bulk list;
+    /// this covers rows created by history or by a dropped message event that
+    /// carry no selective sighting into the resolver.
+    #[tokio::test]
+    async fn a_full_pass_falls_back_for_an_unlisted_channel() {
+        let store = test_store("channel-full-fallback").await;
+        feed(&store, group_message(CHANNEL, "MSG-CFULL")).await;
+
+        let source = FakeMeta::with_channel(CHANNEL, "Quiet updates", false);
+        let signal = ChatNameResolveSignal::new();
+        signal.request_full();
+        let request = signal.next().await;
+        let mut resolver = NameResolver::new();
+        drive(&source, &store, &signal, &mut resolver, request).await;
 
         assert_eq!(
             stored_name(&store, CHANNEL).await.as_deref(),
