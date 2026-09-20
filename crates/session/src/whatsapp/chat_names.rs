@@ -465,6 +465,13 @@ impl NameResolver {
         (!remaining.is_zero()).then_some(remaining)
     }
 
+    fn global_retry_expired(&self, generation: u64) -> bool {
+        self.global_cooling
+            .is_some_and(|(cooling_generation, until)| {
+                cooling_generation == generation && until.elapsed().as_nanos() > 0
+            })
+    }
+
     /// Advance a chat past its cooldown the way its expiry would, without
     /// sleeping out the wall clock. Test-only: production waits.
     #[cfg(test)]
@@ -503,6 +510,13 @@ async fn stored_special_chats(chat_store: &Arc<ChatStore>) -> Vec<(Jid, Option<S
     }
 }
 
+fn requeue_request(signal: &ChatNameResolveSignal, request: &NameResolveRequest) {
+    if request.full {
+        signal.request_full();
+    }
+    signal.request_named(request.named.iter().cloned());
+}
+
 /// Run one pass: decide which chats need a lookup, fetch their names, and
 /// write back what was learned.
 ///
@@ -537,6 +551,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             _ = stop.changed() => return,
         };
         if let Err(e) = flushed {
+            requeue_request(signal, &request);
             warn!("chat-name resolver could not flush the chat store: {e}");
             return;
         }
@@ -860,11 +875,12 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             debug!("chat-name resolver: discarding a pass from a superseded connection");
             return;
         }
-        if !resolved.is_empty() {
-            if let Err(e) = chat_store.apply_chat_names(resolved.clone()) {
-                warn!("chat-name resolver could not queue resolved names: {e}");
-                return;
-            }
+        if !resolved.is_empty()
+            && let Err(e) = chat_store.apply_chat_names(resolved.clone())
+        {
+            requeue_request(signal, &request);
+            warn!("chat-name resolver could not queue resolved names: {e}");
+            return;
         }
     }
     if !resolved.is_empty() {
@@ -875,6 +891,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             _ = stop.changed() => return,
         };
         if let Err(e) = flushed {
+            requeue_request(signal, &request);
             warn!("chat-name resolver's names did not commit: {e}");
             return;
         }
@@ -922,16 +939,31 @@ impl WhatsAppClient {
             let mut resolver = NameResolver::new();
             let mut stopping = stopping;
             loop {
+                let generation = signal.generation();
                 // A global server backoff cancels work that was not started,
                 // so it must also schedule the pass that retries that work.
+                // If the timer became ready just before this loop selected a
+                // new request, do not leave the deferred sightings stranded
+                // in global_named — fold the retry into the next pass.
                 // One timer for the resolver is enough; per-chat failures
                 // remain event-driven and never turn into timer storms.
-                let request = if let Some(delay) = resolver.global_retry_after(signal.generation())
-                {
+                if resolver.global_retry_expired(generation) {
+                    let named = resolver.take_global_named(generation);
+                    signal.request_full();
+                    signal.request_named(named);
+                    continue;
+                }
+                let request = if let Some(delay) = resolver.global_retry_after(generation) {
                     tokio::select! {
-                        request = signal.next() => request,
+                        mut request = signal.next() => {
+                            if resolver.global_retry_expired(generation) {
+                                request.full = true;
+                                request.named.extend(resolver.take_global_named(generation));
+                            }
+                            request
+                        },
                         _ = sleep(delay) => {
-                            let named = resolver.take_global_named(signal.generation());
+                            let named = resolver.take_global_named(generation);
                             signal.request_full();
                             signal.request_named(named);
                             continue;
@@ -1604,6 +1636,15 @@ mod tests {
     /// A failed lookup cools the chat: due again after the delay, not on
     /// the next message — and the server's own backoff is what sets the
     /// length, so a throttled account does not re-request into its limit.
+    #[test]
+    fn an_expired_global_retry_keeps_deferred_sightings_ready() {
+        let mut resolver = NameResolver::new();
+        resolver.cool_global(1, Duration::ZERO);
+        resolver.defer_global_named(1, [CHANNEL.to_string()]);
+        assert!(resolver.global_retry_expired(1));
+        assert_eq!(resolver.take_global_named(1), vec![CHANNEL.to_string()]);
+    }
+
     #[test]
     fn a_failed_lookup_cools_then_retries() {
         // `wacore::time::Instant` is the monotonic clock the tree reads

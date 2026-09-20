@@ -1306,6 +1306,11 @@ impl WhatsAppClient {
                         );
                         control_drops = control_snapshot.dropped_full;
                         control_fault_ui.signal_control_overflow();
+                        // OfflineSyncCompleted is a control event. If that
+                        // mailbox overflowed, its post-sync repair ask may
+                        // have been the dropped event; a full durable pass
+                        // recovers the names it would have scheduled.
+                        names_on_drop.request_full();
                     }
                     let data_snapshot = data_stats.stats();
                     if data_snapshot.dropped_full > data_drops {
@@ -1330,14 +1335,18 @@ impl WhatsAppClient {
                     // nothing to say — the arms below speak only for the
                     // variants they handle.
                     debug!("client event: {:?}", event.kind());
-                    if lanes
+                    let dropped = lanes
                         .dispatch(&dispatch_client, &dispatch_names, event)
-                        .await
-                    {
+                        .await;
+                    if dropped.dropped_recoverable {
                         // A full lane drops only recoverable events. The
                         // ChatStore still sees them, so a full metadata pass
-                        // is enough to recover a name sighting we missed.
+                        // recovers a name sighting we missed. Keep the exact
+                        // special-chat JIDs too: a new or unsubscribed
+                        // channel may be absent from list_subscribed and
+                        // needs the selective get_metadata fallback.
                         names_on_drop.request_full();
+                        names_on_drop.request_named(dropped.special_chat_jids);
                     }
                 }
             });

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore::types::events::Event;
+use whatsapp_rust::wacore_binary::JidExt;
 use whatsapp_rust::wacore_binary::jid::Jid;
 
 use crate::names::NameBook;
@@ -76,17 +77,18 @@ impl EventLanes {
         Self { lanes, stopping }
     }
 
-    /// Dispatch an event and report whether a recoverable message/receipt
-    /// was dropped because its lane was full. ChatStore receives the same
-    /// stream independently, so the caller can use that signal to schedule a
-    /// durable-state recovery pass for metadata that the UI lane missed.
+    /// Dispatch an event and report recoverable events dropped because their
+    /// lane was full. ChatStore receives the same stream independently, so the
+    /// caller can use the durable-state recovery pass for metadata the UI
+    /// lane missed; preserving the dropped special-chat JIDs also lets that
+    /// pass use the selective channel fallback for a new/unsubscribed chat.
     pub(super) async fn dispatch(
         &mut self,
         client: &Client,
         names: &NameBook,
         event: Arc<Event>,
-    ) -> bool {
-        let mut dropped_recoverable = false;
+    ) -> DispatchOutcome {
+        let mut outcome = DispatchOutcome::default();
         // A batch may span chats, and a lane is one chat's order: sent whole
         // on the first message's lane, a receipt for a later chat in it runs
         // on that chat's own lane and can overtake the message it answers.
@@ -96,8 +98,21 @@ impl EventLanes {
         for event in split_by_subject(&event) {
             let lane = lane_for(client, names, &event).await;
             if recoverable(&event) {
-                if self.lanes[lane].try_send(event).is_err() {
-                    dropped_recoverable = true;
+                if self.lanes[lane].try_send(Arc::clone(&event)).is_err() {
+                    outcome.dropped_recoverable = true;
+                    if let Event::Messages(batch) = &*event {
+                        for inbound in batch.iter() {
+                            let chat = &inbound.info.source.chat;
+                            if (chat.is_group() || chat.is_newsletter())
+                                && !outcome
+                                    .special_chat_jids
+                                    .iter()
+                                    .any(|jid| jid == &chat.to_string())
+                            {
+                                outcome.special_chat_jids.push(chat.to_string());
+                            }
+                        }
+                    }
                     log::warn!(
                         "dropping recoverable WhatsApp event from full lane {}; ChatStore invalidation will drive recovery after commit",
                         lane,
@@ -108,15 +123,21 @@ impl EventLanes {
                 tokio::select! {
                     result = self.lanes[lane].send(event) => {
                         if result.is_err() {
-                            return dropped_recoverable;
+                            return outcome;
                         }
                     }
-                    _ = stopping.changed() => return dropped_recoverable,
+                    _ = stopping.changed() => return outcome,
                 }
             }
         }
-        dropped_recoverable
+        outcome
     }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DispatchOutcome {
+    pub(super) dropped_recoverable: bool,
+    pub(super) special_chat_jids: Vec<String>,
 }
 
 fn recoverable(event: &Event) -> bool {
