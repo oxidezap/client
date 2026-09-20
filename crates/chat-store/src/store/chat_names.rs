@@ -57,6 +57,11 @@ pub(super) fn apply_chat_names(
             let scope =
                 || schema::chats::table.filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(key)));
             let updated = match &write.expected {
+                // Same-value checked writes are not news: without this a
+                // full revalidation of an already-correct name would still
+                // match its row and broadcast a reload (plus one write per
+                // named special chat per reconnect) for nothing.
+                ChatNameExpected::Was(was) if was == name => 0,
                 ChatNameExpected::Was(was) => diesel::update(scope().filter(dsl::name.eq(was)))
                     .set(dsl::name.eq(name))
                     .execute(conn)?,

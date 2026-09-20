@@ -76,7 +76,17 @@ impl EventLanes {
         Self { lanes, stopping }
     }
 
-    pub(super) async fn dispatch(&mut self, client: &Client, names: &NameBook, event: Arc<Event>) {
+    /// Dispatch an event and report whether a recoverable message/receipt
+    /// was dropped because its lane was full. ChatStore receives the same
+    /// stream independently, so the caller can use that signal to schedule a
+    /// durable-state recovery pass for metadata that the UI lane missed.
+    pub(super) async fn dispatch(
+        &mut self,
+        client: &Client,
+        names: &NameBook,
+        event: Arc<Event>,
+    ) -> bool {
+        let mut dropped_recoverable = false;
         // A batch may span chats, and a lane is one chat's order: sent whole
         // on the first message's lane, a receipt for a later chat in it runs
         // on that chat's own lane and can overtake the message it answers.
@@ -87,6 +97,7 @@ impl EventLanes {
             let lane = lane_for(client, names, &event).await;
             if recoverable(&event) {
                 if self.lanes[lane].try_send(event).is_err() {
+                    dropped_recoverable = true;
                     log::warn!(
                         "dropping recoverable WhatsApp event from full lane {}; ChatStore invalidation will drive recovery after commit",
                         lane,
@@ -97,13 +108,14 @@ impl EventLanes {
                 tokio::select! {
                     result = self.lanes[lane].send(event) => {
                         if result.is_err() {
-                            return;
+                            return dropped_recoverable;
                         }
                     }
-                    _ = stopping.changed() => return,
+                    _ = stopping.changed() => return dropped_recoverable,
                 }
             }
         }
+        dropped_recoverable
     }
 }
 

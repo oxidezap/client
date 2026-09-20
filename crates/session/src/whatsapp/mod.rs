@@ -1226,6 +1226,7 @@ impl WhatsAppClient {
             let control_fault_ui = ui_tx.clone();
             let avatar_signal = resolve_avatars.clone();
             let names_signal = resolve_chat_names.clone();
+            let names_on_drop = resolve_chat_names.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
                 // The dispatch loop's own handle. The one below is moved into
@@ -1302,6 +1303,12 @@ impl WhatsAppClient {
                             data_snapshot.dropped_full - data_drops
                         );
                         data_drops = data_snapshot.dropped_full;
+                        // The store materializes these events independently,
+                        // but the session-side sighting can be the only name
+                        // trigger for a newly seen special chat. Re-cover
+                        // durable state after a mailbox overflow; run_pass's
+                        // flush barrier waits for the store's commit first.
+                        names_on_drop.request_full();
                     }
                     // The kind, and only the kind. It is `Copy`, carries no
                     // payload and names the variant, which makes this the one
@@ -1312,9 +1319,15 @@ impl WhatsAppClient {
                     // nothing to say — the arms below speak only for the
                     // variants they handle.
                     debug!("client event: {:?}", event.kind());
-                    lanes
+                    if lanes
                         .dispatch(&dispatch_client, &dispatch_names, event)
-                        .await;
+                        .await
+                    {
+                        // A full lane drops only recoverable events. The
+                        // ChatStore still sees them, so a full metadata pass
+                        // is enough to recover a name sighting we missed.
+                        names_on_drop.request_full();
+                    }
                 }
             });
         }
@@ -1597,18 +1610,19 @@ impl WhatsAppClient {
                 // drain asks once per batch (its chats may postdate the
                 // Connected snapshot, and `OfflineSyncCompleted` below is
                 // the backstop that re-covers whatever is still unnamed).
-                if let Some(resolve) = &resolve_chat_names {
-                    let mut sighted = Vec::new();
-                    for inbound in batch.iter() {
-                        let chat = &inbound.info.source.chat;
-                        if chat.is_group() || chat.is_newsletter() {
-                            sighted.push(chat.to_non_ad_string());
-                        }
-                    }
-                    if !sighted.is_empty() {
-                        resolve.request_named(sighted);
-                    }
-                }
+                // Keep the ask after materialization: the resolver has its
+                // own task and could otherwise snapshot the store before this
+                // message's independent ChatStore subscription is committed.
+                let sighted = resolve_chat_names.as_ref().map(|_| {
+                    batch
+                        .iter()
+                        .filter_map(|inbound| {
+                            let chat = &inbound.info.source.chat;
+                            (chat.is_group() || chat.is_newsletter())
+                                .then(|| chat.to_non_ad_string())
+                        })
+                        .collect::<Vec<_>>()
+                });
                 for inbound in batch.iter() {
                     Self::handle_inbound_message(
                         &inbound.message,
@@ -1619,6 +1633,11 @@ impl WhatsAppClient {
                         eager,
                     )
                     .await;
+                }
+                if let (Some(resolve), Some(sighted)) = (&resolve_chat_names, sighted)
+                    && !sighted.is_empty()
+                {
+                    resolve.request_named(sighted);
                 }
             }
             Event::Receipt(receipt) => {

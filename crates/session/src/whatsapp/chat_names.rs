@@ -425,6 +425,22 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     stop: &mut watch::Receiver<()>,
 ) {
     let generation = signal.generation();
+    // The event handler and the ChatStore have independent subscriptions. A
+    // completion/sighting can therefore wake this task while the materializer
+    // still has history or the message that caused the sighting in its queue.
+    // Make the snapshot a real barrier before consuming the ask.
+    if request.full || !request.named.is_empty() {
+        let flushed = chat_store.flush();
+        tokio::pin!(flushed);
+        let flushed = tokio::select! {
+            result = &mut flushed => result,
+            _ = stop.changed() => return,
+        };
+        if let Err(e) = flushed {
+            warn!("chat-name resolver could not flush the chat store: {e}");
+            return;
+        }
+    }
     // What the rows held when this pass started, keyed by address. The
     // CAS writes below compare against THESE values — not a re-read at
     // write time — so a live rename that commits mid-flight is never
@@ -527,7 +543,8 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     let mut settled: Vec<String> = Vec::new();
     let mut resolved: Vec<oxidezap_chat_store::ChatNameWrite> = Vec::new();
     let mut failed: Vec<(String, std::time::Duration)> = Vec::new();
-    for chunk in groups.chunks(CHAT_NAME_CONCURRENCY) {
+    let mut group_backoff: Option<std::time::Duration> = None;
+    for (chunk_index, chunk) in groups.chunks(CHAT_NAME_CONCURRENCY).enumerate() {
         let lookup = whatsapp_rust::futures::future::join_all(chunk.iter().map(|jid| async {
             let name = source.group_subject(jid).await;
             (jid.clone(), name)
@@ -562,12 +579,27 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 // what keeps a busy unnamed group from re-requesting on
                 // every message while still retrying on a later sighting.
                 NameLookup::Failed(retry_after) => {
+                    group_backoff =
+                        Some(group_backoff.map_or(retry_after, |current| current.max(retry_after)));
                     failed.push((jid.to_string(), retry_after));
                 }
             }
         }
+        if let Some(retry_after) = group_backoff {
+            // A server-directed backoff applies to work not started too. Do
+            // not immediately issue every later chunk into the same throttle
+            // window; those JIDs will be retried by a later pass.
+            let remaining_start = (chunk_index + 1) * CHAT_NAME_CONCURRENCY;
+            failed.extend(
+                groups
+                    .iter()
+                    .skip(remaining_start)
+                    .map(|jid| (jid.to_string(), retry_after)),
+            );
+            break;
+        }
     }
-    if !channels.is_empty() {
+    if !channels.is_empty() && group_backoff.is_none() {
         // One call for every subscribed channel, which is normally all of
         // them — but ONLY when the bulk call succeeds. A failed list must
         // not read as "every channel absent": that turns one transient
@@ -615,20 +647,30 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 // an unnamed row absent from the list is the unsubscribed
                 // case — it waits for a live sighting of its own, which
                 // is the chat anyone is actually looking at.
-                let fallback: Vec<Jid> = if request.full {
-                    Vec::new()
-                } else {
-                    fallback
-                        .into_iter()
-                        .filter(|jid| {
-                            let known = pre
-                                .get(&jid.to_string())
-                                .and_then(|stored| stored.as_deref())
-                                .is_some_and(usable_name);
-                            !known && resolver.needs(&jid.to_string(), generation)
-                        })
-                        .collect()
-                };
+                let explicitly_sighted: HashSet<String> = request
+                    .named
+                    .iter()
+                    .filter_map(|raw| raw.parse::<Jid>().ok())
+                    .map(|jid| jid.to_string())
+                    .collect();
+                let fallback: Vec<Jid> = fallback
+                    .into_iter()
+                    .filter(|jid| {
+                        let key = jid.to_string();
+                        // A full pass normally avoids fanning out for rows
+                        // absent from the subscribed list. A sighting is
+                        // stronger evidence: an unsubscribed/new channel can
+                        // only be resolved through this fallback.
+                        let eligible = !request.full || explicitly_sighted.contains(&key);
+                        let known = pre
+                            .get(&key)
+                            .and_then(|stored| stored.as_deref())
+                            .is_some_and(usable_name);
+                        eligible
+                            && resolver.needs(&key, generation)
+                            && (!known || explicitly_sighted.contains(&key))
+                    })
+                    .collect();
                 for chunk in fallback.chunks(CHAT_NAME_CONCURRENCY) {
                     let lookup =
                         whatsapp_rust::futures::future::join_all(chunk.iter().map(|jid| async {
@@ -673,6 +715,11 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 }
             }
         }
+    } else if let Some(retry_after) = group_backoff {
+        // A group request was rate-limited. Do not spend the same pass on a
+        // channel bulk request either; cool its pending rows with the same
+        // server-directed delay and let the next pass start cleanly.
+        failed.extend(channels.iter().map(|jid| (jid.to_string(), retry_after)));
     }
 
     // The staleness gate: a pass whose lookups landed after a reconnect

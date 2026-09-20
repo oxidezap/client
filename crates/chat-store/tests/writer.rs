@@ -742,6 +742,22 @@ async fn a_stale_metadata_answer_does_not_clobber_a_live_rename() {
         Ok(Ok(StoreChange::Chats)) => {}
         other => panic!("a CAS match must broadcast Chats, got {other:?}"),
     }
+
+    // A checked write that already holds the resolved value is also a no-op:
+    // the CAS must not count a matched row as a changed row.
+    let mut unchanged = chat_store.subscribe();
+    chat_store
+        .apply_chat_names(vec![ChatNameWrite::checked(
+            group,
+            Some("C".to_string()),
+            "C".to_string(),
+        )])
+        .expect("queue the same checked answer");
+    chat_store.flush().await.expect("flush");
+    match tokio::time::timeout(Duration::from_millis(200), unchanged.recv()).await {
+        Err(_) => {}
+        Ok(other) => panic!("an unchanged checked name must broadcast nothing, got {other:?}"),
+    }
 }
 
 /// A metadata answer for a chat deleted mid-lookup resurrects nothing: the
