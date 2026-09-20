@@ -1018,21 +1018,39 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         }
     }
     // A CAS can legitimately match no row when a chat was deleted during the
-    // lookup. Do not mark that JID settled: if a later message recreates it in
-    // this generation, its new row still needs a name lookup.
-    for (jid, learned_name) in settled {
-        let Ok(parsed) = jid.parse::<Jid>() else {
-            continue;
-        };
-        match chat_store.chat(&parsed).await {
-            Ok(Some(entry))
-                if learned_name.is_none() || entry.name.as_deref() == learned_name.as_deref() =>
-            {
-                resolver.mark(&jid, generation);
+    // lookup. Confirm every result in one read rather than one task/snapshot
+    // per JID; if a later message recreates a row, its new name still has to
+    // be looked up in this generation. The read races teardown like the
+    // network and flushes above, so a large account cannot hold shutdown.
+    let confirmation_jids: Vec<Jid> = settled
+        .iter()
+        .filter_map(|(jid, _)| jid.parse::<Jid>().ok())
+        .collect();
+    let confirmation = chat_store.chats_by_jids(confirmation_jids);
+    tokio::pin!(confirmation);
+    let confirmation = tokio::select! {
+        rows = &mut confirmation => rows,
+        _ = stop.changed() => return,
+    };
+    match confirmation {
+        Ok(rows) => {
+            let rows: HashMap<String, oxidezap_chat_store::ChatEntry> = rows
+                .into_iter()
+                .map(|entry| (entry.jid.to_string(), entry))
+                .collect();
+            for (jid, learned_name) in settled {
+                match rows.get(&jid) {
+                    Some(entry)
+                        if learned_name.is_none()
+                            || entry.name.as_deref() == learned_name.as_deref() =>
+                    {
+                        resolver.mark(&jid, generation);
+                    }
+                    Some(_) | None => resolver.forget(&jid, generation),
+                }
             }
-            Ok(Some(_)) | Ok(None) => resolver.forget(&jid, generation),
-            Err(e) => debug!("chat-name resolver could not confirm {jid}: {e}"),
         }
+        Err(e) => debug!("chat-name resolver could not confirm resolved names: {e}"),
     }
     for (jid, retry_after) in failed {
         resolver.cool(&jid, generation, retry_after);
