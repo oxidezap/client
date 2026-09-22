@@ -180,15 +180,14 @@
   already encoded rather than re-recording them. Worth measuring against a
   real account before this line is deleted.
 
-- **An attachment is sent as it is, and without a caption.** Picking a file
-  sends it: there is no step between the chooser and the send for a caption to
-  be typed in, for a photo to be cropped, or for the kind to be overridden —
-  and the composer's own text stays a message of its own rather than becoming
-  one, because taking it at the press would lose it to a dismissed chooser and
-  taking it at the completion means reaching for a `Window` from inside an
-  async continuation. The protocol carries `caption` and `kind` per file
-  precisely so that step is a front-end change rather than a protocol one.
-  Two smaller gaps go with it. A video is sent without a poster frame: the
+- **Attachment editing still lacks cropping and a kind override.** Files
+  chosen with the paperclip, pasted or dropped now wait in a confirmation
+  modal with a caption before sending. The caption travels on the first file;
+  the composer's own text remains a separate draft, since taking it at the
+  chooser press would lose it if the chooser is dismissed. What the modal
+  cannot yet do is crop a photo or override how a file is sent, although the
+  protocol already carries `kind` per file.
+  Two smaller gaps remain. A video is sent without a poster frame: the
   `jpegThumbnail` is what the recipient draws before downloading anything, and
   producing one means decoding H.264 inside the process holding the account —
   the decoder is in `oxidezap-video`, which the session already depends on, so
