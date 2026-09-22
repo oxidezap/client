@@ -269,6 +269,15 @@ pub(crate) fn strip_redundant_secret(msg: &mut wa::Message) -> bool {
 fn is_poll_creation(msg: &wa::Message) -> bool {
     use wacore::proto_helpers::MessageExt as _;
     let base = msg.get_base_message();
+    let base = [
+        &base.group_mentioned_message,
+        &base.associated_child_message,
+        &base.poll_creation_message_v4,
+    ]
+    .into_iter()
+    .find_map(|wrapper| wrapper.as_option().and_then(|w| w.message.as_option()))
+    .map(|inner| inner.get_base_message())
+    .unwrap_or(base);
     base.poll_creation_message.is_set()
         || base.poll_creation_message_v2.is_set()
         || base.poll_creation_message_v3.is_set()

@@ -61,6 +61,28 @@ async fn outgoing_direct_poll_with_empty_sender_recovers_secret() {
     );
 }
 
+/// An index row captured under PN is still found when the conversation
+/// was later canonicalized to LID by the mapping table.
+#[tokio::test]
+async fn poll_secret_resolves_the_other_chat_alias() {
+    let (store, chat_store) = test_store().await;
+    let peer = jid(PEER);
+    store
+        .put_msg_secrets(vec![MsgSecretEntry::new(
+            &peer, &peer, "POLL-ALIAS", [4u8; 32], 0, 1_700_000_000,
+        )])
+        .await
+        .expect("seed secret");
+    add_lid_mapping(&store).await;
+    assert_eq!(
+        chat_store
+            .poll_secret(&jid(PEER_LID), &jid(PEER_LID), "POLL-ALIAS")
+            .await
+            .expect("query"),
+        Some(vec![4u8; 32])
+    );
+}
+
 /// No row, no secret: the vote is refused rather than guessed.
 #[tokio::test]
 async fn poll_secret_is_none_without_an_index_row() {

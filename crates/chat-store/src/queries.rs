@@ -1295,19 +1295,29 @@ impl ChatStore {
                     #[diesel(sql_type = diesel::sql_types::Binary)]
                     secret: Vec<u8>,
                 }
-                let row: Option<SecretRow> = diesel::sql_query(
-                    "SELECT secret FROM msg_secrets WHERE device_id = ? AND chat = ? \
-                     AND (sender = ? OR ?) AND msg_id = ? LIMIT 1",
-                )
-                .bind::<diesel::sql_types::Integer, _>(device_id)
-                .bind::<diesel::sql_types::Text, _>(&chat_key)
-                .bind::<diesel::sql_types::Text, _>(&sender_key)
-                .bind::<diesel::sql_types::Bool, _>(direct)
-                .bind::<diesel::sql_types::Text, _>(&msg_id)
-                .get_result(conn)
-                .optional()
-                .map_err(db_err)?;
-                Ok(row.map(|row| row.secret))
+                // The message lookup accepts mapped PN/LID chat keys. The
+                // library may have captured the secret before that mapping
+                // was learned, so try those same keys here too.
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat_key).map_err(db_err)?;
+                for key in keys {
+                    let row: Option<SecretRow> = diesel::sql_query(
+                        "SELECT secret FROM msg_secrets WHERE device_id = ? AND chat = ? \
+                         AND (sender = ? OR ?) AND msg_id = ? LIMIT 1",
+                    )
+                    .bind::<diesel::sql_types::Integer, _>(device_id)
+                    .bind::<diesel::sql_types::Text, _>(&key)
+                    .bind::<diesel::sql_types::Text, _>(&sender_key)
+                    .bind::<diesel::sql_types::Bool, _>(direct)
+                    .bind::<diesel::sql_types::Text, _>(&msg_id)
+                    .get_result(conn)
+                    .optional()
+                    .map_err(db_err)?;
+                    if let Some(row) = row {
+                        return Ok(Some(row.secret));
+                    }
+                }
+                Ok(None)
             })
             .await?;
         Ok(secret)
