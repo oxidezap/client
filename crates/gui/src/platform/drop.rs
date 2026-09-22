@@ -71,8 +71,8 @@ mod imp {
             .and_then(|window| window.document())
             .ok_or_else(|| "the browser document is unavailable".to_string())?;
         let dragover = Closure::new(|event: web_sys::DragEvent| event.prevent_default());
-        let drop_entity = entity;
-        let mut app = cx;
+        let drop_entity = entity.clone();
+        let mut drop_app = cx.clone();
         let drop = Closure::new(move |event: web_sys::DragEvent| {
             event.prevent_default();
             let Some(files) = event.data_transfer().and_then(|data| data.files()) else {
@@ -83,14 +83,15 @@ mod imp {
                 .collect::<Vec<_>>();
             let entity = drop_entity.clone();
             let Some((jid, reply)) = entity
-                .update(&mut app, |app, cx| app.prepare_incoming_files(cx))
+                .update(&mut drop_app, |app, cx| app.prepare_incoming_files(cx))
                 .ok()
                 .flatten()
             else {
                 return;
             };
-            let mut task_app = app.clone();
-            app.foreground_executor()
+            let mut task_app = drop_app.clone();
+            drop_app
+                .foreground_executor()
                 .spawn(async move {
                     let chosen = read_files(files).await;
                     let _ = entity.update(&mut task_app, |app, cx| {
@@ -107,8 +108,8 @@ mod imp {
         // handler, which inserts them into the composer. Never
         // `prevent_default` here: the event is also what feeds gpui's own
         // paste handling.
-        let paste_entity = entity.clone();
-        let mut paste_app = app.clone();
+        let paste_entity = entity;
+        let mut paste_app = cx;
         let paste = Closure::new(move |event: web_sys::ClipboardEvent| {
             let files = event
                 .clipboard_data()
