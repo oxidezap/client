@@ -1024,7 +1024,20 @@ impl WhatsAppApp {
         log::debug!("keyboard: {:?} -> {wanted:?}", self.keyboard_owner);
         match &wanted {
             KeyboardOwner::RingingCall(_) => window.focus(&self.call_focus, cx),
-            KeyboardOwner::PastePreview => window.focus(&self.paste_preview_focus, cx),
+            KeyboardOwner::PastePreview => {
+                // Put typing immediately into the caption after Ctrl-V. The
+                // modal's outer focus trap still owns Escape and Tab; the
+                // inner input is the focus target, not the scrim behind it.
+                if let Some(caption) = self
+                    .paste_preview
+                    .as_ref()
+                    .and_then(|preview| preview.caption.as_ref())
+                {
+                    window.focus(&caption.read(cx).focus_handle(cx), cx);
+                } else {
+                    window.focus(&self.paste_preview_focus, cx);
+                }
+            }
             KeyboardOwner::Viewer => {
                 let handle = self.viewer.read(cx).focus().clone();
                 window.focus(&handle, cx)

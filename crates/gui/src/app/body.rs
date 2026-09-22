@@ -453,7 +453,13 @@ mod tests {
             );
         });
         cx.update(|window, cx| {
-            assert!(app.read(cx).paste_preview_focus.is_focused(window));
+            let app = app.read(cx);
+            let caption = app
+                .paste_preview
+                .as_ref()
+                .and_then(|preview| preview.caption.as_ref())
+                .expect("caption input");
+            assert!(caption.read(cx).focus_handle(cx).is_focused(window));
         });
         assert!(
             cx.debug_bounds("paste-preview").is_some(),
@@ -530,6 +536,29 @@ mod tests {
             cx.debug_bounds("paste-preview-caption").is_some(),
             "the confirmation modal must offer a caption box"
         );
+    }
+
+    #[gpui::test]
+    fn keyboard_paste_focuses_caption_and_enter_confirms(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = paste_preview_fixture(cx);
+        cx.simulate_keystrokes("look");
+        cx.read(|cx| {
+            let app = app.read(cx);
+            let caption = app
+                .paste_preview
+                .as_ref()
+                .and_then(|preview| preview.caption.as_ref())
+                .expect("caption input");
+            assert_eq!(caption.read(cx).value(), "look");
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(app.paste_preview.is_none());
+            assert_eq!(app.attachment_attempts.len(), 1);
+            assert_eq!(app.attachment_attempts[0].1.as_deref(), Some("look"));
+        });
     }
 
     #[gpui::test]
@@ -671,11 +700,42 @@ mod tests {
         let (mut cx, app) = connected_app_fixture(cx);
         cx.update(|_window, cx| {
             app.update(cx, |app, cx| {
-                assert!(app.prepare_incoming_files(cx).is_some());
+                let (_, _, epoch) = app.prepare_incoming_files(cx).expect("visible chat");
+                assert!(app.incoming_files_busy());
+                // Two fast pastes cannot start two reads before either
+                // finishes: both would hold the entire selection budget.
+                assert!(app.prepare_incoming_files(cx).is_none());
+                assert!(app.finish_incoming_file_read(epoch));
                 // A phone's chat list or a fullscreen viewer keeps the
                 // selected chat but replaces the composer entirely.
                 app.visible_chat = None;
                 assert!(app.prepare_incoming_files(cx).is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn a_read_finishing_after_chat_navigation_does_not_open_a_modal(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                let (jid, reply, epoch) = app.prepare_incoming_files(cx).expect("visible chat");
+                app.visible_chat = None;
+                assert!(app.finish_incoming_file_read(epoch));
+                app.offer_dropped_files(
+                    jid,
+                    reply,
+                    crate::platform::picker::Chosen {
+                        files: vec![crate::platform::picker::Picked {
+                            file_name: "clipe.mp4".to_owned(),
+                            mime_type: "video/mp4".to_owned(),
+                            bytes: b"clip".to_vec(),
+                        }],
+                        refused: Vec::new(),
+                    },
+                    cx,
+                );
+                assert!(app.paste_preview.is_none());
             });
         });
     }
@@ -687,7 +747,8 @@ mod tests {
             app.update(cx, |app, cx| {
                 let (_, _, epoch) = app.prepare_incoming_files(cx).expect("chat visible");
                 app.incoming_file_epoch = app.incoming_file_epoch.wrapping_add(1);
-                assert!(!app.incoming_files_are_current(epoch));
+                app.incoming_file_reading = false;
+                assert!(!app.finish_incoming_file_read(epoch));
             });
         });
     }

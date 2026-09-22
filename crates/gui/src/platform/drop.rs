@@ -80,7 +80,7 @@ mod imp {
             // would copy up to a trip's worth into memory merely to discard
             // it. The race stays answered in `offer_dropped_files`.
             if drop_entity
-                .update(&mut drop_app, |app, _| app.paste_preview_showing())
+                .update(&mut drop_app, |app, _| app.incoming_files_busy())
                 .unwrap_or(true)
             {
                 let _ = drop_entity.update(&mut drop_app, |app, cx| app.warn_preview_busy(cx));
@@ -106,7 +106,7 @@ mod imp {
                 .spawn(async move {
                     let chosen = read_files(files).await;
                     let _ = entity.update(&mut task_app, |app, cx| {
-                        if app.incoming_files_are_current(epoch) {
+                        if app.finish_incoming_file_read(epoch) {
                             app.offer_dropped_files(jid, reply, chosen, cx);
                         }
                     });
@@ -140,7 +140,7 @@ mod imp {
             // files are still on the clipboard, and reading them first
             // would hold a trip's worth of memory merely to discard it.
             if paste_entity
-                .update(&mut paste_app, |app, _| app.paste_preview_showing())
+                .update(&mut paste_app, |app, _| app.incoming_files_busy())
                 .unwrap_or(true)
             {
                 return;
@@ -159,7 +159,7 @@ mod imp {
                 .spawn(async move {
                     let chosen = read_files(files).await;
                     let _ = entity.update(&mut task_app, |app, cx| {
-                        if app.incoming_files_are_current(epoch) {
+                        if app.finish_incoming_file_read(epoch) {
                             app.offer_dropped_files(jid, reply, chosen, cx);
                         }
                     });

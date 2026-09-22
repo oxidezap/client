@@ -681,6 +681,10 @@ pub struct WhatsAppApp {
     /// Bumped on account departure; async file drops and web pastes capture
     /// it before reading so an old account cannot offer files in a new one.
     incoming_file_epoch: u64,
+    /// One file read at a time. A web paste can hold the whole staging
+    /// budget while `File.array_buffer()` awaits; starting another before
+    /// the first returns would multiply that budget in wasm memory.
+    incoming_file_reading: bool,
     paste_preview: Option<PendingPastePreview>,
     #[cfg(test)]
     /// What `send_attachment` was asked to send in tests: the file and the
@@ -1320,6 +1324,7 @@ impl WhatsAppApp {
             client: None,
             pending_pastes: HashMap::new(),
             incoming_file_epoch: 0,
+            incoming_file_reading: false,
             paste_preview: None,
             #[cfg(test)]
             attachment_attempts: Vec::new(),
@@ -1975,6 +1980,7 @@ impl WhatsAppApp {
         // newly paired one.
         self.leave_connected_view(cx);
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
+        self.incoming_file_reading = false;
         self.pending_pastes.clear();
         self.paste_preview = None;
         self.notified_messages.clear();

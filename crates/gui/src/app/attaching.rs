@@ -35,7 +35,7 @@ impl WhatsAppApp {
         // first would hold up to a trip's worth of memory merely to discard
         // it. The race — a modal opening between this check and the read
         // finishing — stays answered in `offer_dropped_files`.
-        if self.paste_preview.is_some() {
+        if self.incoming_files_busy() {
             self.warn_preview_busy(cx);
             return;
         }
@@ -48,7 +48,7 @@ impl WhatsAppApp {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let chosen = task.await;
             let _ = entity.update(cx, |app, cx| {
-                if app.incoming_file_epoch != epoch {
+                if !app.finish_incoming_file_read(epoch) {
                     return;
                 }
                 match chosen {
@@ -60,10 +60,19 @@ impl WhatsAppApp {
         .detach();
     }
 
-    /// Whether an async web file read still belongs to this account.
-    #[cfg(any(test, target_family = "wasm"))]
-    pub(crate) fn incoming_files_are_current(&self, epoch: u64) -> bool {
-        self.incoming_file_epoch == epoch
+    /// Whether accepting another dropped or pasted file would waste a read.
+    pub(crate) fn incoming_files_busy(&self) -> bool {
+        self.paste_preview.is_some() || self.incoming_file_reading
+    }
+
+    /// Complete the read only for the account that began it. An old read
+    /// cannot clear the new account's in-flight guard or present its files.
+    pub(crate) fn finish_incoming_file_read(&mut self, epoch: u64) -> bool {
+        if self.incoming_file_epoch != epoch {
+            return false;
+        }
+        self.incoming_file_reading = false;
+        true
     }
 
     /// Finish a drop (or a web paste) that arrived with its files already
@@ -81,6 +90,15 @@ impl WhatsAppApp {
         chosen: crate::platform::picker::Chosen,
         cx: &mut Context<Self>,
     ) {
+        // If the user left this conversation while its bytes were read, a
+        // confirmation addressed to it would open over a different surface.
+        // A fresh paste there starts a fresh read; no hidden send is queued.
+        if self.destination != Destination::Chats
+            || self.showing_settings(cx)
+            || self.visible_chat.as_deref() != Some(jid.as_str())
+        {
+            return;
+        }
         if !chosen.files.is_empty() && self.paste_preview.is_some() {
             for refusal in &chosen.refused {
                 self.notify_user(refusal.clone(), notices::Tone::Problem, cx);
@@ -95,7 +113,7 @@ impl WhatsAppApp {
     /// nothing would read as the window swallowing the file.
     pub(crate) fn warn_preview_busy(&mut self, cx: &mut Context<Self>) {
         self.notify_user(
-            "Finish or cancel the file preview first, then drop again.",
+            "Finish or cancel the pending file first, then drop again.",
             notices::Tone::Problem,
             cx,
         );
@@ -119,7 +137,7 @@ impl WhatsAppApp {
         // `selected_chat` persists while the mobile list, fullscreen viewer,
         // or Settings replaces the composer. `visible_chat` is reported by
         // the rendered conversation, and is None for all those surfaces.
-        if self.visible_chat.as_deref() != Some(jid.as_str()) {
+        if self.visible_chat.as_deref() != Some(jid.as_str()) || self.incoming_files_busy() {
             return None;
         }
         if !self.is_connected() {
@@ -130,6 +148,7 @@ impl WhatsAppApp {
             );
             return None;
         }
+        self.incoming_file_reading = true;
         Some((jid, self.reply_to.clone(), self.incoming_file_epoch))
     }
 
@@ -174,10 +193,9 @@ impl WhatsAppApp {
                 .ok()
         });
         if let Some(caption) = &caption {
-            let entity = cx.entity().clone();
-            cx.subscribe(caption, move |_, _, event: &InputEvent, cx| {
+            cx.subscribe(caption, |app, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    entity.update(cx, |app, cx| app.confirm_paste_preview(cx));
+                    app.confirm_paste_preview(cx);
                 }
             })
             .detach();
