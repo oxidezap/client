@@ -1,11 +1,8 @@
-//! Attaching files: choose, send, and draw the bubble for it.
+//! Attaching files: choose, confirm, send, and draw the bubble for it.
 //!
-//! The twin of [`super::recording`], and the same three acts in the same
-//! order — get the payload, hand it to the session, draw the message before
-//! the network has said anything. What differs is where the payload comes
-//! from: a recording is made here and a file is chosen, so the failure worth
-//! reporting is not "the microphone was refused" but "that file is too big"
-//! or "four of the five could be read".
+//! Files from the chooser, clipboard or a drop share one confirmation and
+//! media-send path. Nothing is staged until Send; refusals from the chooser
+//! are still reported by name, without consuming a reply draft on cancel.
 //!
 //! Nothing in here knows what a browser is. Choosing is
 //! [`crate::platform::picker`], staging is the media cache, and both are one
@@ -93,10 +90,7 @@ impl WhatsAppApp {
         // If the user left this conversation while its bytes were read, a
         // confirmation addressed to it would open over a different surface.
         // A fresh paste there starts a fresh read; no hidden send is queued.
-        if self.destination != Destination::Chats
-            || self.showing_settings(cx)
-            || self.visible_chat.as_deref() != Some(jid.as_str())
-        {
+        if !self.incoming_chat_still_visible(&jid, cx) {
             return;
         }
         if !chosen.files.is_empty() && self.paste_preview.is_some() {
@@ -152,12 +146,20 @@ impl WhatsAppApp {
         Some((jid, self.reply_to.clone(), self.incoming_file_epoch))
     }
 
+    /// Whether the captured chat is still visible after a file read. A paste
+    /// or drop may take long enough for the user to move to another chat or
+    /// surface; opening a modal over it would name the previous destination.
+    pub(crate) fn incoming_chat_still_visible(&self, jid: &str, cx: &App) -> bool {
+        self.destination == Destination::Chats
+            && !self.showing_settings(cx)
+            && self.visible_chat.as_deref() == Some(jid)
+    }
+
     /// Offer files for confirmation instead of sending them outright.
     ///
-    /// Pastes and drops land here; the file chooser keeps its immediate send
-    /// below, where no confirmation was ever promised. Refusals are said out
-    /// loud whatever happens to the rest, and an empty arrival — everything
-    /// refused, or nothing at all — opens nothing.
+    /// Pastes, drops and the paperclip chooser land here. Refusals are said
+    /// out loud whatever happens to the rest, and an empty arrival —
+    /// everything refused, or nothing at all — opens nothing.
     pub(crate) fn open_confirmation(
         &mut self,
         jid: String,
@@ -213,90 +215,45 @@ impl WhatsAppApp {
         true
     }
 
-    /// Ask for files and send them into the open conversation.
-    ///
-    /// The choosing is asynchronous on both platforms — a modal on one, a
-    /// promise on the other — so everything after it happens in a
-    /// continuation, and the conversation it was started from travels with it
-    /// rather than being read again at the end: somebody who picks a file and
-    /// then opens another chat meant to send it to the first.
+    /// Ask for files and offer the same captioned confirmation as a paste or
+    /// drop. The picker reads asynchronously; the captured destination and
+    /// account epoch prevent a late result opening over another chat/account.
     pub(super) fn attach_files(&mut self, cx: &mut Context<Self>) {
-        let Some(jid) = self.selected_chat.clone() else {
+        let Some((jid, reply, epoch)) = self.prepare_incoming_files(cx) else {
             return;
         };
-        if !self.is_connected() {
-            self.notify_user(
-                "Files cannot be sent right now: not connected.",
-                notices::Tone::Problem,
-                cx,
-            );
-            return;
-        }
-
-        // Cloned rather than taken, the way a recording's is: the file
-        // chooser can be dismissed, and a draft consumed by a dialog nobody
-        // chose anything in is a reply the person still thinks they are
-        // composing. It is cleared where it is used.
-        let reply = self.reply_to.clone();
         let chosen = crate::platform::picker::choose(cx);
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let chosen = chosen.await;
-            let _ = entity.update(cx, |app, cx| app.finish_attaching(&jid, reply, chosen, cx));
+            let _ = entity.update(cx, |app, cx| {
+                app.finish_attaching(jid, reply, epoch, chosen, cx);
+            });
         })
         .detach();
     }
 
-    /// Send what was chosen, and say what could not be.
+    /// Bring a chooser result through the same confirmation as a paste/drop.
+    /// A dismissed chooser opens nothing; a late result cannot cross an
+    /// account boundary or reopen over a chat the user has left.
     pub(crate) fn finish_attaching(
         &mut self,
-        jid: &str,
+        jid: String,
         reply: Option<ReplyDraft>,
+        epoch: u64,
         chosen: Result<crate::platform::picker::Chosen, String>,
         cx: &mut Context<Self>,
     ) {
-        let chosen = match chosen {
-            Ok(chosen) => chosen,
+        if !self.finish_incoming_file_read(epoch) || !self.incoming_chat_still_visible(&jid, cx) {
+            return;
+        }
+        match chosen {
+            Ok(chosen) => {
+                self.open_confirmation(jid, reply, chosen, cx);
+            }
             Err(e) => {
                 error!("the file chooser failed: {e}");
                 self.notify_user(e, notices::Tone::Problem, cx);
-                return;
             }
-        };
-        // Dismissed. Not a failure, and not worth a line on screen.
-        if chosen.is_empty() {
-            return;
-        }
-
-        // Every refusal, and each one names its own file: picking four photos
-        // and one film has to send the four and say what happened to the
-        // fifth, which one line about "some files" does not.
-        for refusal in chosen.refused {
-            self.notify_user(refusal, notices::Tone::Problem, cx);
-        }
-
-        // The quote goes on the first file only. Attaching four photos to
-        // answer one message is one answer, and quoting it four times is what
-        // the recipient would see otherwise.
-        //
-        // And only where there is a first file: a trip that refused everything
-        // it was given sent nothing, so taking the draft there would clear the
-        // reply bar over a message the person is still composing an answer to.
-        let mut quoted = if chosen.files.is_empty() {
-            None
-        } else {
-            self.take_reply_draft(reply, cx)
-        };
-        let mut drawn = false;
-        for file in chosen.files {
-            drawn |= self.send_attachment(jid, file, quoted.take(), None, cx);
-        }
-
-        // Following the file down is only what the sender expects if they are
-        // looking at where it landed — the same rule a voice note follows,
-        // and for the same reason: reading a conversation must not be yanked
-        // to its newest message by something that finished elsewhere.
-        if drawn && self.visible_chat.as_deref() == Some(jid) {
-            self.scroll_to_last_message();
         }
     }
 

@@ -27,6 +27,13 @@ pub fn read(cx: &gpui::App) -> gpui::Task<Result<Chosen, String>> {
     imp::read(cx)
 }
 
+/// Whether composer paste actions read bytes themselves. The page reads
+/// files from its document event instead, so its action is a no-op and must
+/// not claim the incoming-file slot ahead of that event listener.
+pub fn reads_composer_paste() -> bool {
+    imp::READS_COMPOSER_PASTE
+}
+
 /// An image entry as a file that can be sent.
 fn image_as_picked(image: gpui::Image) -> Result<Picked, String> {
     let file_name = format!("pasted.{}", image.format.extension());
@@ -94,6 +101,8 @@ fn fit_images(
 mod imp {
     use super::{Chosen, split_entries};
 
+    pub(super) const READS_COMPOSER_PASTE: bool = true;
+
     pub(super) fn read(cx: &gpui::App) -> gpui::Task<Result<Chosen, String>> {
         let Some(item) = cx.read_from_clipboard() else {
             return gpui::Task::ready(Ok(Chosen::default()));
@@ -123,6 +132,8 @@ mod imp {
 #[cfg(target_family = "wasm")]
 mod imp {
     use super::Chosen;
+
+    pub(super) const READS_COMPOSER_PASTE: bool = false;
 
     pub(super) fn read(_cx: &gpui::App) -> gpui::Task<Result<Chosen, String>> {
         // Answered by the document `paste` listener instead: it reads the

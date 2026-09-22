@@ -677,7 +677,7 @@ pub struct WhatsAppApp {
     /// the control plane" — see `session::attach::begin_control`.
     control: Option<Session>,
     /// Destination captured while an asynchronous clipboard read is pending.
-    pending_pastes: HashMap<u64, (String, Option<ReplyDraft>)>,
+    pending_pastes: HashMap<u64, (String, Option<ReplyDraft>, u64)>,
     /// Bumped on account departure; async file drops and web pastes capture
     /// it before reading so an old account cannot offer files in a new one.
     incoming_file_epoch: u64,
@@ -2840,27 +2840,40 @@ impl WhatsAppApp {
                 let Some(chosen) = chosen.borrow_mut().take() else {
                     return;
                 };
-                let Some((jid, reply)) = self.pending_pastes.remove(paste_id) else {
+                let Some((jid, reply, epoch)) = self.pending_pastes.remove(paste_id) else {
                     return;
                 };
-                // A newcomer while the modal is open is dropped silently: on
-                // the web the document paste event opens the modal while the
-                // permission-gated clipboard read for the same content can
-                // still resolve afterwards.
-                self.open_confirmation(jid, reply, chosen, cx);
+                // Clipboard paths are read asynchronously on native. A
+                // second paste/drop must not start another read in parallel;
+                // a navigation or account switch meanwhile must not offer a
+                // send to the old destination over the new screen.
+                if self.finish_incoming_file_read(epoch)
+                    && self.incoming_chat_still_visible(&jid, cx)
+                {
+                    self.open_confirmation(jid, reply, chosen, cx);
+                }
             }
             InputAreaEvent::PasteImageError(paste_id, error) => {
-                if self.pending_pastes.remove(paste_id).is_some() && self.paste_preview.is_none() {
+                if let Some((_, _, epoch)) = self.pending_pastes.remove(paste_id)
+                    && self.finish_incoming_file_read(epoch)
+                    && self.paste_preview.is_none()
+                {
                     self.notify_user(error, notices::Tone::Problem, cx);
                 }
             }
             InputAreaEvent::PasteImageFinished(paste_id) => {
-                self.pending_pastes.remove(paste_id);
+                if let Some((_, _, epoch)) = self.pending_pastes.remove(paste_id) {
+                    self.finish_incoming_file_read(epoch);
+                }
             }
             InputAreaEvent::PasteImageStarted(paste_id) => {
-                if let Some(jid) = self.selected_chat.clone() {
-                    self.pending_pastes
-                        .insert(*paste_id, (jid, self.reply_to.clone()));
+                // On the web, document paste events carry files while this
+                // action's clipboard read is a no-op. Reserving here would
+                // race the event listener and lose the actual files.
+                if crate::platform::clipboard::reads_composer_paste()
+                    && let Some(target) = self.prepare_incoming_files(cx)
+                {
+                    self.pending_pastes.insert(*paste_id, target);
                 }
             }
             InputAreaEvent::StartRecording => {

@@ -1728,13 +1728,12 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   only on `NotAuthorized`, keeping just a `Found` from it. docs/roadmap.md
   carries what that costs.
 
-- **Pastes and drops confirm before anything uploads, and the caption goes on
-  the first file.** The modal pastes and drops share (`gui`'s
-  `open_confirmation`) previews what would go out — the picture where one was
-  pasted, a file row naming the rest — beside a caption box, and nothing
-  reaches the media pipeline until Send. The file chooser keeps its immediate
-  send, where no confirmation was ever promised. One caption for the trip, on
-  the first file: a quote is consumed once for the same reason, and a caption
+- **Pastes, drops and paperclip selections confirm before anything uploads;
+  the caption goes on the first file.** All three meet at `gui`'s
+  `open_confirmation`, which previews what would go out — the picture where
+  there is one, a file row naming the rest — beside a caption box. Nothing
+  reaches the media pipeline until Send. One caption for the trip, on the
+  first file: a quote is consumed once for the same reason, and a caption
   repeated on every file of four reads as four captions at the other end. The
   echo bubble carries it as its text, which is how an incoming captioned
   photo arrives, so the sender sees what the recipient will.

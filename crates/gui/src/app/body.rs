@@ -636,6 +636,61 @@ mod tests {
     }
 
     #[gpui::test]
+    fn paperclip_selection_waits_for_caption_and_confirmation(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        // Outside a window update, the same way the async chooser completion
+        // arrives in production: the modal can borrow its retained window
+        // to construct the caption editor.
+        cx.cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                let (jid, reply, epoch) = app.prepare_incoming_files(cx).expect("chat visible");
+                app.finish_attaching(
+                    jid,
+                    reply,
+                    epoch,
+                    Ok(crate::platform::picker::Chosen {
+                        files: vec![crate::platform::picker::Picked {
+                            file_name: "clipe.mp4".to_owned(),
+                            mime_type: "video/mp4".to_owned(),
+                            bytes: b"clip".to_vec(),
+                        }],
+                        refused: Vec::new(),
+                    }),
+                    cx,
+                );
+                assert!(app.attachment_attempts.is_empty());
+                assert!(app.paste_preview.is_some());
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            let app = app.read(cx);
+            let caption = app
+                .paste_preview
+                .as_ref()
+                .unwrap()
+                .caption
+                .as_ref()
+                .unwrap();
+            assert!(
+                caption.read(cx).focus_handle(cx).is_focused(window),
+                "caption must own focus"
+            );
+        });
+        cx.simulate_keystrokes("myclip");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(app.paste_preview.is_none());
+            assert_eq!(app.attachment_attempts.len(), 1);
+            assert_eq!(app.attachment_attempts[0].0.mime_type, "video/mp4");
+            assert_eq!(app.attachment_attempts[0].1.as_deref(), Some("myclip"));
+        });
+    }
+
+    #[gpui::test]
     fn dropped_video_confirms_as_a_file_without_an_image_preview(cx: &mut gpui::TestAppContext) {
         let (mut cx, app) = connected_app_fixture(cx);
         let path = std::env::temp_dir().join(format!(
