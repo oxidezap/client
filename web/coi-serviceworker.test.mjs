@@ -22,7 +22,7 @@ function workerWith(clients) {
         console,
     };
     vm.runInNewContext(script, context);
-    return listeners.get("notificationclick");
+    return listeners;
 }
 
 test("notification click opens the scoped focused page with the opaque tag", async () => {
@@ -31,17 +31,20 @@ test("notification click opens the scoped focused page with the opaque tag", asy
         throw new Error("wrong scope");
     } };
     const page = {
+        id: "page-191",
         url: "https://example.test/client/pr/191/",
         focused: true,
         focus: async () => {},
         postMessage: (message) => delivered.push(message.oxidezapNotificationTag),
     };
-    const click = workerWith([other, page]);
+    const listeners = workerWith([other, page]);
+    listeners.get("message")({ data: { oxidezapClientId: "tab-191" }, source: { id: "page-191" } });
+    const click = listeners.get("notificationclick");
     let closed = false;
     let completion;
     click({
         notification: {
-            data: { oxidezapTag: "oxidezap-chat-123" },
+            data: { oxidezapTag: "oxidezap-chat-123", oxidezapClientId: "tab-191" },
             close: () => { closed = true; },
         },
         waitUntil: (promise) => { completion = promise; },
@@ -51,8 +54,25 @@ test("notification click opens the scoped focused page with the opaque tag", asy
     assert.deepEqual(delivered, ["oxidezap-chat-123"]);
 });
 
+test("a click cannot open a matching chat in a different account tab", async () => {
+    const received = [];
+    const other = {
+        id: "other-tab", url: "https://example.test/client/pr/191/", focused: true,
+        focus: async () => {}, postMessage: (value) => received.push(value),
+    };
+    const listeners = workerWith([other]);
+    listeners.get("message")({ data: { oxidezapClientId: "departed-tab" }, source: { id: "old-tab" } });
+    let completion;
+    listeners.get("notificationclick")({
+        notification: { data: { oxidezapTag: "oxidezap-chat-123", oxidezapClientId: "departed-tab" }, close: () => {} },
+        waitUntil: (promise) => { completion = promise; },
+    });
+    await completion;
+    assert.deepEqual(received, []);
+});
+
 test("unrelated notification clicks are ignored", () => {
-    const click = workerWith([]);
+    const click = workerWith([]).get("notificationclick");
     let closed = false;
     click({ notification: { data: { oxidezapTag: "other" }, close: () => { closed = true; } } });
     assert.equal(closed, false);

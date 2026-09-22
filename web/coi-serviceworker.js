@@ -71,8 +71,20 @@ if (typeof window === "undefined") {
     // even when permission is granted. A persistent notification is posted
     // through this worker instead; its click must travel back to the page,
     // because the GPUI conversation selection lives there, not in the worker.
+    // A page identifies itself to this worker before posting a persistent
+    // notification. Scoped pages can be attached to different accounts, so
+    // a click must never be sent to whichever tab happens to be focused.
+    const notificationClients = new Map();
+    self.addEventListener("message", (event) => {
+        const id = event.data?.oxidezapClientId;
+        if (typeof id === "string" && event.source?.id) {
+            notificationClients.set(id, event.source.id);
+        }
+    });
+
     self.addEventListener("notificationclick", (event) => {
         const tag = event.notification.data?.oxidezapTag;
+        const origin = event.notification.data?.oxidezapClientId;
         if (typeof tag !== "string" || !tag.startsWith("oxidezap-chat-")) {
             return;
         }
@@ -80,16 +92,15 @@ if (typeof window === "undefined") {
         event.waitUntil((async () => {
             const scope = self.registration.scope;
             const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-            const page = windows.find((client) => client.url.startsWith(scope) && client.focused)
-                || windows.find((client) => client.url.startsWith(scope));
+            const page = windows.find((client) => client.url.startsWith(scope)
+                && client.id === notificationClients.get(origin));
             if (page) {
                 await page.focus();
                 page.postMessage({ oxidezapNotificationTag: tag });
             } else {
-                // No page can receive a click; open the application rather
-                // than leave a banner that seems inert. Its ordinary startup
-                // opens the chat list because no account-specific URL is
-                // stored in a notification.
+                // The originating tab is gone. Open the application but do
+                // not deliver its old tag to a different account that might
+                // share the same JID.
                 await self.clients.openWindow(scope);
             }
         })());

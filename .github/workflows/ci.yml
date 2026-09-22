@@ -103,6 +103,7 @@ jobs:
           node --version
           node --test crates/gui/tests/webcodecs/benchmark-cleanup.test.mjs
           node --test crates/gui/tests/webcodecs/transform-metadata.test.mjs
+          node --test web/coi-serviceworker.test.mjs
       # --all-features so the chat store's `search` feature (FTS5) is covered;
       # a default-features run silently skips its index and query tests.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
