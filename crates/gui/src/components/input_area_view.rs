@@ -3,7 +3,7 @@
 //! This component is designed for performance: when the user types,
 //! only this component re-renders, NOT the parent app.
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::time::Duration;
 
 use wacore::time::Instant;
 
@@ -28,14 +28,10 @@ pub enum InputAreaEvent {
     /// files are chosen after the press — a dialog the composer neither owns
     /// nor waits for.
     AttachFiles,
-    /// Media pasted into this conversation.
-    PasteImage(u64, Rc<RefCell<Option<crate::platform::picker::Chosen>>>),
-    /// An image paste was rejected before it could be sent.
-    PasteImageError(u64, String),
-    /// An image paste read completed without an image.
-    PasteImageFinished(u64),
-    /// An image paste started and its destination should be captured.
-    PasteImageStarted(u64),
+    /// Ask the parent to paste clipboard media. It reserves an incoming-file
+    /// slot before reading anything; entity events are delivered later, so
+    /// the composer cannot itself start a read on this action.
+    PasteMedia,
     /// User started PTT recording
     StartRecording,
     /// User stopped PTT recording (send the audio)
@@ -135,7 +131,6 @@ pub struct InputAreaView {
     /// configured and closed, real work, on every render of the composer,
     /// for a value that cannot change while the tab is open.
     can_record: bool,
-    paste_id: u64,
 }
 
 impl EventEmitter<InputAreaEvent> for InputAreaView {}
@@ -173,7 +168,6 @@ impl InputAreaView {
             // to send what it encodes: a daemon over the bridge, the tab
             // holding the account, or the page's own session.
             can_record: oxidezap_audio::can_record(),
-            paste_id: 0,
         }
     }
 
@@ -198,32 +192,7 @@ impl InputAreaView {
     }
 
     fn paste_image(&mut self, cx: &mut Context<Self>) {
-        let paste_id = self.paste_id;
-        self.paste_id = self.paste_id.wrapping_add(1);
-        cx.emit(InputAreaEvent::PasteImageStarted(paste_id));
-        let entity = cx.entity().downgrade();
-        let task = crate::platform::clipboard::read(cx);
-        cx.spawn(async move |_, cx| match task.await {
-            Ok(chosen) if !chosen.is_empty() => {
-                let _ = entity.update(cx, |_, cx| {
-                    cx.emit(InputAreaEvent::PasteImage(
-                        paste_id,
-                        Rc::new(RefCell::new(Some(chosen))),
-                    ))
-                });
-            }
-            Ok(_) => {
-                let _ = entity.update(cx, |_, cx| {
-                    cx.emit(InputAreaEvent::PasteImageFinished(paste_id));
-                });
-            }
-            Err(error) => {
-                let _ = entity.update(cx, |_, cx| {
-                    cx.emit(InputAreaEvent::PasteImageError(paste_id, error));
-                });
-            }
-        })
-        .detach();
+        cx.emit(InputAreaEvent::PasteMedia);
     }
 
     /// Handle a keystroke - updates typing state
@@ -704,7 +673,7 @@ mod tests {
         cx: gpui::HeadlessAppContext,
         window: gpui::WindowHandle<ComposerHarness>,
         input: Entity<InputAreaView>,
-        pasted_images: Rc<RefCell<Vec<Vec<u8>>>>,
+        paste_requests: Rc<RefCell<usize>>,
         _events: Subscription,
     }
 
@@ -743,16 +712,12 @@ mod tests {
         let input = window
             .update(&mut cx, |harness, _, _| harness.input.clone())
             .unwrap();
-        let pasted_images = Rc::new(RefCell::new(Vec::new()));
-        let observed = pasted_images.clone();
+        let paste_requests = Rc::new(RefCell::new(0));
+        let observed = paste_requests.clone();
         let events = cx.update(|cx| {
             cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
-                if let InputAreaEvent::PasteImage(_, chosen) = event
-                    && let Some(chosen) = chosen.borrow().as_ref()
-                {
-                    observed
-                        .borrow_mut()
-                        .extend(chosen.files.iter().map(|file| file.bytes.clone()));
+                if matches!(event, InputAreaEvent::PasteMedia) {
+                    *observed.borrow_mut() += 1;
                 }
             })
         });
@@ -765,7 +730,7 @@ mod tests {
             cx,
             window,
             input,
-            pasted_images,
+            paste_requests,
             _events: events,
         }
     }
@@ -788,11 +753,11 @@ mod tests {
     }
 
     #[test]
-    fn focused_composer_pastes_a_clipboard_image() {
+    fn focused_composer_requests_a_clipboard_media_read() {
         let ComposerFixture {
             mut cx,
             window,
-            pasted_images,
+            paste_requests,
             _events,
             ..
         } = setup();
@@ -807,8 +772,10 @@ mod tests {
 
         paste(&mut cx, &window);
 
-        let pasted = pasted_images.borrow().clone();
-        assert_eq!(pasted, vec![bytes]);
+        // The full app fixture checks the actual clipboard bytes. This
+        // isolated composer requests the parent to read only after it has
+        // reserved a slot, never reading paths here before that decision.
+        assert_eq!(*paste_requests.borrow(), 1);
     }
 
     #[test]
@@ -817,7 +784,7 @@ mod tests {
             mut cx,
             window,
             input,
-            pasted_images,
+            paste_requests,
             _events,
             ..
         } = setup();
@@ -826,6 +793,6 @@ mod tests {
         paste(&mut cx, &window);
 
         cx.update(|cx| assert_eq!(input.read(cx).input.read(cx).text(), "hello"));
-        assert!(pasted_images.borrow().is_empty());
+        assert_eq!(*paste_requests.borrow(), 1);
     }
 }

@@ -167,6 +167,10 @@ impl WhatsAppApp {
         chosen: crate::platform::picker::Chosen,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Dismissing the chooser or pasting plain text is not a refusal.
+        if chosen.is_empty() {
+            return false;
+        }
         for refusal in chosen.refused {
             self.notify_user(refusal, notices::Tone::Problem, cx);
         }
@@ -213,6 +217,39 @@ impl WhatsAppApp {
         });
         cx.notify();
         true
+    }
+
+    /// Paste media only after reserving the single incoming-file slot. The
+    /// composer emits the request but does not touch clipboard paths itself:
+    /// GPUI delivers entity events asynchronously, so its attempt to read
+    /// immediately after emitting would race this reservation.
+    pub(super) fn paste_media(&mut self, cx: &mut Context<Self>) {
+        // Web's document paste listener owns file pastes; the composer's
+        // action has no clipboard media to read there.
+        if !crate::platform::clipboard::reads_composer_paste() {
+            return;
+        }
+        let Some((jid, reply, epoch)) = self.prepare_incoming_files(cx) else {
+            return;
+        };
+        let task = crate::platform::clipboard::read(cx);
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let chosen = task.await;
+            let _ = entity.update(cx, |app, cx| {
+                if !app.finish_incoming_file_read(epoch)
+                    || !app.incoming_chat_still_visible(&jid, cx)
+                {
+                    return;
+                }
+                match chosen {
+                    Ok(chosen) => {
+                        app.open_confirmation(jid, reply, chosen, cx);
+                    }
+                    Err(error) => app.notify_user(error, notices::Tone::Problem, cx),
+                }
+            });
+        })
+        .detach();
     }
 
     /// Ask for files and offer the same captioned confirmation as a paste or
