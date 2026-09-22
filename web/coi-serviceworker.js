@@ -96,7 +96,10 @@ if (typeof window === "undefined") {
                 && client.id === notificationClients.get(origin));
             if (page) {
                 await page.focus();
-                page.postMessage({ oxidezapNotificationTag: tag });
+                page.postMessage({
+                    oxidezapNotificationTag: tag,
+                    oxidezapAccountEpoch: event.notification.data?.oxidezapAccountEpoch,
+                });
             } else {
                 // The originating tab is gone. Open the application but do
                 // not deliver its old tag to a different account that might

@@ -293,6 +293,15 @@ fn watch_worker_clicks() {
         };
         let worker = window.navigator().service_worker();
         let handler = Closure::new(move |event: web_sys::MessageEvent| {
+            let epoch =
+                js_sys::Reflect::get(&event.data(), &JsValue::from_str("oxidezapAccountEpoch"))
+                    .ok()
+                    .and_then(|value| value.as_string());
+            if epoch.as_deref() != Some(&ACCOUNT_EPOCH.load(Ordering::Relaxed).to_string()) {
+                // A notification shown for a departed account must not
+                // select a JID in the account paired afterward.
+                return;
+            }
             let Ok(tag) =
                 js_sys::Reflect::get(&event.data(), &JsValue::from_str("oxidezapNotificationTag"))
             else {

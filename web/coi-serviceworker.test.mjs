@@ -35,7 +35,7 @@ test("notification click opens the scoped focused page with the opaque tag", asy
         url: "https://example.test/client/pr/191/",
         focused: true,
         focus: async () => {},
-        postMessage: (message) => delivered.push(message.oxidezapNotificationTag),
+        postMessage: (message) => delivered.push(message),
     };
     const listeners = workerWith([other, page]);
     listeners.get("message")({ data: { oxidezapClientId: "tab-191" }, source: { id: "page-191" } });
@@ -44,14 +44,16 @@ test("notification click opens the scoped focused page with the opaque tag", asy
     let completion;
     click({
         notification: {
-            data: { oxidezapTag: "oxidezap-chat-123", oxidezapClientId: "tab-191" },
+            data: { oxidezapTag: "oxidezap-chat-123", oxidezapClientId: "tab-191", oxidezapAccountEpoch: "0" },
             close: () => { closed = true; },
         },
         waitUntil: (promise) => { completion = promise; },
     });
     await completion;
     assert.equal(closed, true);
-    assert.deepEqual(delivered, ["oxidezap-chat-123"]);
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].oxidezapNotificationTag, "oxidezap-chat-123");
+    assert.equal(delivered[0].oxidezapAccountEpoch, "0");
 });
 
 test("a click cannot open a matching chat in a different account tab", async () => {
