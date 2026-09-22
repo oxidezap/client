@@ -1994,6 +1994,7 @@ impl WhatsAppApp {
         self.pending_pastes.clear();
         self.paste_preview = None;
         self.notified_messages.clear();
+        crate::platform::clear_notifications();
         self.pending_notification_tags.clear();
         self.latest_notification_tag = None;
         self.notification_retry_task = None;
@@ -2559,7 +2560,6 @@ impl WhatsAppApp {
         // Asked only while undecided — a grant or a block ends it — and only
         // on this target, where the prompt is the browser's rather than the
         // operating system's.
-        #[cfg(target_family = "wasm")]
         crate::platform::request_notification_authorization();
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,

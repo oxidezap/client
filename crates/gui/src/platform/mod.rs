@@ -52,8 +52,8 @@ pub use identity::front_end_id;
 pub use launch::run;
 pub use lifecycle::{leave, watch_for_departure};
 pub use notifications::{
-    next_notification_activation, request_authorization as request_notification_authorization,
-    show_notification_with_avatar,
+    clear_notifications, next_notification_activation,
+    request_authorization as request_notification_authorization, show_notification_with_avatar,
 };
 pub use plugins::Home as PluginHome;
 pub use startup::{application, clocks, logging};

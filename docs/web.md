@@ -481,7 +481,8 @@ icon URL, and a click focuses the window and queues the tag for a pump task
 that takes the same selection path. The live set is a `thread_local`, not a
 `static` — a `Notification` is a JS object and neither `Send` nor `Sync`
 under the shared-memory build — while the tag queue carries only strings, so
-the pump can wait on a worker. Permission denied, undecided, or no
-Notification API at all (a non-secure context) degrades to silence rather
-than a prompt or a panic.
+the pump can wait on a worker. Permission is requested when a user opens a chat (a gesture), and an
+undecided permission means messages remain silent until it is granted.
+Permission denied or no Notification API at all (a non-secure context)
+degrades to silence rather than a panic.
 

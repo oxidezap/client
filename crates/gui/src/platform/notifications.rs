@@ -48,6 +48,11 @@ pub async fn next_notification_activation() -> String {
     imp::next_notification_activation().await
 }
 
+/// Forget banners and queued clicks belonging to the departing account.
+pub fn clear_notifications() {
+    imp::clear_notifications();
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use std::collections::{HashMap, hash_map::DefaultHasher};
@@ -109,6 +114,8 @@ mod imp {
     pub(super) async fn next_notification_activation() -> String {
         std::future::pending().await
     }
+
+    pub(super) fn clear_notifications() {}
 
     pub(super) fn request_authorization() {
         // The API raises an Objective-C exception outside an application
@@ -699,6 +706,26 @@ mod imp {
         web_sys::Url::create_object_url_with_blob(&blob).ok()
     }
 
+    pub(super) fn clear_notifications() {
+        // Clear queued clicks first; callbacks from closing old banners must
+        // not be able to select a chat in the next account.
+        if let Ok(mut queue) = activations().lock() {
+            queue.tags.clear();
+        }
+        LIVE.with(|live| {
+            let Ok(mut live) = live.try_borrow_mut() else {
+                return;
+            };
+            // Remove before closing: a close event must not see an old entry.
+            for (_, entry) in live.drain() {
+                entry.notification.close();
+                if let Some(url) = entry.icon_url.as_deref() {
+                    let _ = web_sys::Url::revoke_object_url(url);
+                }
+            }
+        });
+    }
+
     fn push_activation(tag: String) {
         // Queued and the pump woken under the one lock; the wake itself
         // happens after it is released, so a woken poll never blocks on us.
@@ -735,6 +762,7 @@ mod imp {
 #[cfg(not(any(target_os = "macos", target_family = "wasm")))]
 mod imp {
     pub(super) const fn request_authorization() {}
+    pub(super) const fn clear_notifications() {}
 
     pub(super) fn show_notification_with_avatar(
         _tag: &str,
