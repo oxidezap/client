@@ -792,13 +792,6 @@ pub struct WhatsAppApp {
     /// every row is a row without messages, so two of them can be opened
     /// before either load lands.
     owed_reads: std::collections::HashSet<String>,
-    /// Options this window voted for, by chat and poll message. Optimistic
-    /// and local: the vote travels fire-and-forget and no receipt comes
-    /// back, so the bubble draws the taps itself rather than waiting for an
-    /// event that will never arrive. A set per poll, because a multi-select
-    /// ballot accumulates taps and every tap re-sends the whole ballot the
-    /// server then replaces.
-    my_poll_votes: std::collections::HashMap<(String, String), Vec<u32>>,
     /// Where both paged lists continue, and whether either is asking. See
     /// [`paging`].
     pages: Entity<paging::Pages>,
@@ -1328,7 +1321,6 @@ impl WhatsAppApp {
             // up on a restored selection is one nobody has typed into.
             keyboard_intent: ChatOpen::ToPreview,
             keyboard_surfaces: KeyboardSurfaces::default(),
-            my_poll_votes: std::collections::HashMap::new(),
             playback_epoch: 0,
             status_tick_at: None,
             visible_chat: None,
@@ -1991,10 +1983,6 @@ impl WhatsAppApp {
         // account's rows are not behind them.
         self.forget_paging(cx);
         self.owed_reads.clear();
-        // Optimistic poll taps are votes in another account's polls until
-        // they are: a message id that lands again under the new account
-        // would draw its radio filled for a ballot nobody cast here.
-        self.my_poll_votes.clear();
         // The reader is a selection too, and a JID-keyed one. Left alone, it
         // pointed the new account at the old account's contact: at their
         // updates if that contact exists there — watched by nobody in this

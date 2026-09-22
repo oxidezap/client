@@ -4,9 +4,9 @@
 //! Tallies travel in when they exist and stay out when they do not: votes
 //! arrive as updates this client does not store yet, so a poll nobody has
 //! counted draws its options bare — radios and names, no bars, no counts —
-//! rather than zeros that claim a knowledge nobody has. The window's own tap
-//! is drawn at once from `my_vote`, because the vote travels fire-and-forget
-//! and no event answers it.
+//! rather than zeros that claim a knowledge nobody has. A tap is not painted
+//! as a vote: legacy IPC has no completion event, so marking it selected
+//! would falsely confirm a refused ballot.
 
 use gpui::{
     App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder as _,
@@ -21,15 +21,13 @@ use oxidezap_core::PollContent;
 
 /// A poll and its options, each one a vote for that option.
 ///
-/// `my_votes` are the option indexes this window tapped, if any. `vote_counts`
-/// parallels the options with their tallies when somebody counted them;
+/// `vote_counts` parallels the options with their tallies when counted;
 /// `None` draws no bars and no counts rather than zeros.
 #[allow(clippy::too_many_arguments)]
 pub fn render_poll(
     poll: &PollContent,
     chat_jid: SharedString,
     message_id: &str,
-    my_votes: &[u32],
     vote_counts: Option<&[u32]>,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
@@ -70,7 +68,6 @@ pub fn render_poll(
                     let vote_chat = chat_jid.clone();
                     let vote_id = message_id.to_string();
                     let index = ix as u32;
-                    let voted = my_votes.contains(&index);
                     let count = counts.and_then(|c| c.get(ix).copied());
                     // A share of the total, or nothing when nobody counted: a bar at
                     // zero for an uncounted poll reads as "nobody voted", which is a
@@ -104,7 +101,7 @@ pub fn render_poll(
                                         .w_full()
                                         .items_center()
                                         .gap(metrics.space_sm())
-                                        .child(render_radio(voted, accent, metrics, cx))
+                                        .child(render_radio(metrics, cx))
                                         .child(
                                             div()
                                                 .flex_1()
@@ -143,13 +140,8 @@ pub fn render_poll(
         )
 }
 
-/// A radio circle: hollow until tapped, filled with the accent after.
-fn render_radio(
-    voted: bool,
-    accent: gpui::Hsla,
-    metrics: Metrics,
-    cx: &App,
-) -> impl IntoElement + use<> {
+/// A hollow radio: without a vote receipt, selection cannot be confirmed.
+fn render_radio(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     div()
         .flex_shrink_0()
         .flex()
@@ -158,17 +150,6 @@ fn render_radio(
         .w(metrics.icon_small())
         .h(metrics.icon_small())
         .rounded_full()
-        .map(|el| {
-            if voted {
-                el.bg(accent).child(
-                    div()
-                        .w(metrics.space_sm())
-                        .h(metrics.space_sm())
-                        .rounded_full()
-                        .bg(cx.theme().primary_foreground),
-                )
-            } else {
-                el.border_1().border_color(cx.theme().muted_foreground)
-            }
-        })
+        .border_1()
+        .border_color(cx.theme().muted_foreground)
 }

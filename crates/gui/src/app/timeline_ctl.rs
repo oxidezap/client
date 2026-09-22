@@ -185,11 +185,10 @@ impl WhatsAppApp {
     /// sending its local vector would silently replace those selections.
     /// Offline the daemon would refuse,
     /// so the tap is refused here where the window can say why. The tap is
-    /// drawn at once: the vote travels fire-and-forget and no event answers
-    /// it, so waiting would leave the chosen option looking untapped until
-    /// the next reload. The last option cannot be toggled off: the session
-    /// refuses an empty ballot, so clearing it locally would falsely claim
-    /// the vote was withdrawn while the server still holds it.
+    /// not drawn as confirmed: the daemon may still refuse the ballot, and
+    /// the legacy IPC request has no completion event. The radio therefore
+    /// stays empty and the user can retry rather than being locked into a
+    /// false local result.
     pub fn vote_poll(
         &mut self,
         chat_jid: &str,
@@ -201,10 +200,7 @@ impl WhatsAppApp {
             warn!("Cannot vote: this window is offline");
             return;
         }
-        let key = (chat_jid.to_string(), message_id.to_string());
-        let mut ballot = self.my_poll_votes.get(&key).cloned().unwrap_or_default();
-        // Single-select replaces where multi-select accumulates, read off
-        // the poll itself so the two cannot disagree about what a tap means.
+        // Read the limit off the poll itself: no local ballot is authoritative.
         let limit = self
             .find_chat(chat_jid)
             .and_then(|chat| chat.messages.iter().find(|m| m.id == message_id))
@@ -217,25 +213,11 @@ impl WhatsAppApp {
             warn!("Multiple-choice voting needs synchronized ballots");
             return;
         }
-        if ballot.contains(&option_index) {
-            return; // No withdrawal frame is supported; do not lie to the user.
+        if let Some(client) = self.client.as_ref() {
+            client.vote_poll(chat_jid, message_id, vec![option_index]);
+            debug!("poll vote requested for {message_id}; awaiting no confirmation on legacy IPC");
         }
-        ballot = vec![option_index];
-        let Some(client) = self.client.as_ref() else {
-            return;
-        };
-        client.vote_poll(chat_jid, message_id, ballot.clone());
-        self.my_poll_votes.insert(key, ballot);
-        self.invalidate_message_cache(chat_jid, cx);
-        cx.notify();
-    }
-
-    /// The options this window voted for on a poll, if it tapped any.
-    pub fn voted_options(&self, chat_jid: &str, message_id: &str) -> Vec<u32> {
-        self.my_poll_votes
-            .get(&(chat_jid.to_string(), message_id.to_string()))
-            .cloned()
-            .unwrap_or_default()
+        let _ = cx;
     }
 
     ///
