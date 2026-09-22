@@ -2560,7 +2560,7 @@ impl WhatsAppApp {
         // Asked only while undecided — a grant or a block ends it — and only
         // on this target, where the prompt is the browser's rather than the
         // operating system's.
-        crate::platform::request_notification_authorization();
+        crate::platform::request_gesture_authorization();
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on

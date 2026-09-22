@@ -478,7 +478,12 @@ tray blink the daemon already owned stays exactly as it was. GPUI's web
 backend leaves notifications a no-op, so the page posts through the
 Notification API instead: same per-conversation tag, same avatar as a blob
 icon URL, and a click focuses the window and queues the tag for a pump task
-that takes the same selection path. The live set is a `thread_local`, not a
+that takes the same selection path. On mobile browsers that grant permission
+but reject a page-level `Notification` constructor, the existing isolation
+service worker posts the banner; its `notificationclick` handler focuses a
+client and sends the opaque tag back for that same pump task. A browser
+without an active service worker or the Notification API still degrades to
+silence. The live set is a `thread_local`, not a
 `static` — a `Notification` is a JS object and neither `Send` nor `Sync`
 under the shared-memory build — while the tag queue carries only strings, so
 the pump can wait on a worker. Permission is requested when a user opens a chat (a gesture), and an

@@ -10,6 +10,12 @@ pub fn request_authorization() {
     imp::request_authorization();
 }
 
+/// Retry authorization from a user gesture on the web; native startup
+/// authorization is a different operation and must not run on every chat.
+pub fn request_gesture_authorization() {
+    imp::request_gesture_authorization();
+}
+
 /// Post a native notification, attaching an already-cached profile image when
 /// the bytes are a format macOS can thumbnail.
 ///
@@ -116,6 +122,7 @@ mod imp {
     }
 
     pub(super) fn clear_notifications() {}
+    pub(super) fn request_gesture_authorization() {}
 
     pub(super) fn request_authorization() {
         // The API raises an Objective-C exception outside an application
@@ -447,6 +454,9 @@ mod imp {
         /// never touched from a worker; the cross-thread half of the design
         /// is the tag queue below, which carries only strings.
         static LIVE: RefCell<HashMap<String, LiveNotification>> = RefCell::new(HashMap::new());
+        /// Kept alive while the page listens for worker notification clicks.
+        static WORKER_CLICKS: RefCell<Option<Closure<dyn FnMut(web_sys::MessageEvent)>>> =
+            const { RefCell::new(None) };
     }
 
     use futures_lite::future::poll_fn;
@@ -511,7 +521,12 @@ mod imp {
         js_sys::Reflect::has(&js_sys::global(), &JsValue::from_str("Notification")).unwrap_or(false)
     }
 
+    pub(super) fn request_gesture_authorization() {
+        request_permission_for_prompt();
+    }
+
     pub(super) fn request_authorization() {
+        watch_worker_clicks();
         // Best effort: where the browser wants transient activation for the
         // prompt, this startup ask is ignored and the post-time ask below is
         // the one that counts — a message arriving while the user is in the
@@ -563,6 +578,7 @@ mod imp {
         avatar: impl Fn() -> Option<std::sync::Arc<Vec<u8>>> + Send + Sync + 'static,
     ) -> bool {
         if !notifications_available() {
+            log::warn!("notification unavailable: this browser has no Notification API");
             return false;
         }
         // One banner per message, not per tab: every open tab receives the
@@ -573,6 +589,7 @@ mod imp {
         // a page onto an external daemon is its own window and posts, a
         // follower stays silent and leaves it to the leader.
         if !this_tab_should_post() {
+            log::debug!("notification skipped: this tab does not own the account");
             return false;
         }
         if Notification::permission() == NotificationPermission::Default {
@@ -586,6 +603,7 @@ mod imp {
             return false;
         }
         if Notification::permission() != NotificationPermission::Granted {
+            log::info!("notification suppressed: permission not granted");
             return false;
         }
         let options = NotificationOptions::new();
@@ -604,15 +622,20 @@ mod imp {
         let notification = match Notification::new_with_options(title, &options) {
             Ok(notification) => notification,
             Err(error) => {
-                log::debug!("browser refused the notification: {error:?}");
+                // Mobile browsers can grant permission yet reject the page's
+                // non-persistent Notification constructor. Pages already has
+                // a service worker for isolation; it can show a persistent
+                // banner and return its click through `message` instead.
+                log::info!("page notification unavailable ({error:?}); trying service worker");
                 if let Some(url) = icon_url.as_deref() {
                     let _ = web_sys::Url::revoke_object_url(url);
                 }
-                return false;
+                return show_from_worker(tag, title, body);
             }
         };
         let id = next_live_id();
         let clicked_tag = tag.to_string();
+        let clicked_notification = notification.clone();
         let onclick = Closure::new(move || {
             // The click is a user activation, so focusing is allowed here;
             // opening the conversation itself happens on the pump task. It is
@@ -623,6 +646,11 @@ mod imp {
                 let _ = window.focus();
             }
             push_activation(clicked_tag.clone());
+            // Some browsers keep non-persistent banners open after activation.
+            // `close` fires the close callback that removes the live entry;
+            // keep that handler installed until the event has run.
+            clicked_notification.set_onclick(None);
+            clicked_notification.close();
         });
         notification.set_onclick(Some(onclick.as_ref().unchecked_ref()));
         // A dismissed banner cleans up after itself: without this every
@@ -683,6 +711,92 @@ mod imp {
                 }
             }
         });
+    }
+
+    /// Install the click bridge before a worker can show a banner. A worker
+    /// click has no access to this page's GPUI entity, so the worker focuses
+    /// a client and sends back the same opaque tag desktop GPUI reports.
+    fn watch_worker_clicks() {
+        WORKER_CLICKS.with(|slot| {
+            let Ok(mut slot) = slot.try_borrow_mut() else {
+                return;
+            };
+            if slot.is_some() {
+                return;
+            }
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            let worker = window.navigator().service_worker();
+            let handler = Closure::new(move |event: web_sys::MessageEvent| {
+                let Ok(tag) = js_sys::Reflect::get(
+                    &event.data(),
+                    &JsValue::from_str("oxidezapNotificationTag"),
+                ) else {
+                    return;
+                };
+                if let Some(tag) = tag
+                    .as_string()
+                    .filter(|tag| tag.starts_with("oxidezap-chat-"))
+                {
+                    push_activation(tag);
+                }
+            });
+            worker.set_onmessage(Some(handler.as_ref().unchecked_ref()));
+            *slot = Some(handler);
+        });
+    }
+
+    /// Mobile browsers reject `new Notification` even with permission granted.
+    /// `ready` resolves once the existing isolation worker controls the page;
+    /// this async fallback does not delay the UI's incoming-message path.
+    fn show_from_worker(tag: &str, title: &str, body: &str) -> bool {
+        let Some(window) = web_sys::window() else {
+            return false;
+        };
+        watch_worker_clicks();
+        let worker = window.navigator().service_worker();
+        let ready = match worker.ready() {
+            Ok(ready) => ready,
+            Err(error) => {
+                log::warn!("notification worker unavailable: {error:?}");
+                return false;
+            }
+        };
+        let tag = tag.to_string();
+        let title = title.to_string();
+        let body = body.to_string();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(registration) = wasm_bindgen_futures::JsFuture::from(ready).await else {
+                log::warn!("notification worker did not become ready");
+                return;
+            };
+            let registration: web_sys::ServiceWorkerRegistration = registration.unchecked_into();
+            let options = NotificationOptions::new();
+            options.set_body(&body);
+            options.set_tag(&tag);
+            options.set_renotify(true);
+            let data = js_sys::Object::new();
+            if js_sys::Reflect::set(
+                &data,
+                &JsValue::from_str("oxidezapTag"),
+                &JsValue::from_str(&tag),
+            )
+            .is_err()
+            {
+                return;
+            }
+            options.set_data(&data);
+            match registration.show_notification_with_options(&title, &options) {
+                Ok(sent) => {
+                    if let Err(error) = wasm_bindgen_futures::JsFuture::from(sent).await {
+                        log::warn!("browser refused worker notification: {error:?}");
+                    }
+                }
+                Err(error) => log::warn!("browser refused worker notification: {error:?}"),
+            }
+        });
+        true
     }
 
     /// Stage the avatar as a blob URL the banner can show.
@@ -775,6 +889,7 @@ mod imp {
 #[cfg(not(any(target_os = "macos", target_family = "wasm")))]
 mod imp {
     pub(super) const fn request_authorization() {}
+    pub(super) const fn request_gesture_authorization() {}
     pub(super) const fn clear_notifications() {}
 
     pub(super) fn show_notification_with_avatar(

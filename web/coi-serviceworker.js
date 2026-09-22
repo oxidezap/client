@@ -67,6 +67,34 @@ if (typeof window === "undefined") {
         "document",
     ]);
 
+    // On mobile browsers the page-level Notification constructor is absent
+    // even when permission is granted. A persistent notification is posted
+    // through this worker instead; its click must travel back to the page,
+    // because the GPUI conversation selection lives there, not in the worker.
+    self.addEventListener("notificationclick", (event) => {
+        const tag = event.notification.data?.oxidezapTag;
+        if (typeof tag !== "string" || !tag.startsWith("oxidezap-chat-")) {
+            return;
+        }
+        event.notification.close();
+        event.waitUntil((async () => {
+            const scope = self.registration.scope;
+            const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+            const page = windows.find((client) => client.url.startsWith(scope) && client.focused)
+                || windows.find((client) => client.url.startsWith(scope));
+            if (page) {
+                await page.focus();
+                page.postMessage({ oxidezapNotificationTag: tag });
+            } else {
+                // No page can receive a click; open the application rather
+                // than leave a banner that seems inert. Its ordinary startup
+                // opens the chat list because no account-specific URL is
+                // stored in a notification.
+                await self.clients.openWindow(scope);
+            }
+        })());
+    });
+
     self.addEventListener("fetch", (event) => {
         const request = event.request;
         // A navigation preload response cannot have headers rewritten, and a
