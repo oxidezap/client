@@ -2552,6 +2552,15 @@ impl WhatsAppApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Opening a chat by hand is the explicit user action a notification
+        // permission prompt needs: on the web the startup ask runs without
+        // transient activation and most browsers ignore it, so without this
+        // the permission would sit undecided and every banner stay silent.
+        // Asked only while undecided — a grant or a block ends it — and only
+        // on this target, where the prompt is the browser's rather than the
+        // operating system's.
+        #[cfg(target_family = "wasm")]
+        crate::platform::request_notification_authorization();
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on

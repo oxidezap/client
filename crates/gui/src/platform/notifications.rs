@@ -512,6 +512,17 @@ mod imp {
         request_permission_for_prompt();
     }
 
+    /// Whether this tab is the one that should post for an incoming message.
+    ///
+    /// Asked per post rather than settled once, because the arrangement can
+    /// change under the tab: a follower is promoted when its leader goes.
+    fn this_tab_should_post() -> bool {
+        match oxidezap_ipc::web::named_daemon() {
+            oxidezap_ipc::web::NamedDaemon::Named(_) => true,
+            _ => crate::session::this_tab_holds_the_account(),
+        }
+    }
+
     /// Ask for notification permission where the browser will honour the ask.
     ///
     /// Fire and forget: the promise settles after the user decides, and every
@@ -547,11 +558,23 @@ mod imp {
         if !notifications_available() {
             return false;
         }
+        // One banner per message, not per tab: every open tab receives the
+        // same broadcast, so only the tab running the account posts — with
+        // `renotify` on, a follower echoing the same tag would sound the
+        // alert a second time for a banner only one tab keeps. Same
+        // arrangement check as `capabilities::calls_belong_to_another_tab`:
+        // a page onto an external daemon is its own window and posts, a
+        // follower stays silent and leaves it to the leader.
+        if !this_tab_should_post() {
+            return false;
+        }
         if Notification::permission() == NotificationPermission::Default {
-            // A message arriving mid-interaction carries its own gesture, so
-            // this ask can prompt where the startup one could not. The banner
-            // itself still waits for the grant: this post stays silent and
-            // the next message finds the permission settled.
+            // Opportunistic, not relied on: an arriving message carries no
+            // activation of its own, so this prompts only when it lands
+            // inside another gesture's window. The real ask is the
+            // gesture-driven one in `select_chat`; the banner itself still
+            // waits for the grant, and the next message finds the permission
+            // settled.
             request_permission_for_prompt();
             return false;
         }
