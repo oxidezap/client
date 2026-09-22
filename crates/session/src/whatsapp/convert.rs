@@ -118,10 +118,16 @@ fn poll_of(message: &wa::Message) -> Option<PollContent> {
         .or_else(|| message.poll_creation_message.as_option())?;
     Some(PollContent {
         question: creation.name.clone().unwrap_or_default(),
+        // One entry per raw option, unnamed ones kept as empty
+        // placeholders: filtering them out would shift every later option's
+        // index, and the bubble votes by index into this list while the
+        // session votes by index into the raw one. An empty slot stays
+        // non-votable through `vote_poll`'s missing-name validation, and
+        // the bubble draws nothing to tap for it.
         options: creation
             .options
             .iter()
-            .filter_map(|o| o.option_name.clone())
+            .map(|o| o.option_name.clone().unwrap_or_default())
             .collect(),
         selectable_count: creation.selectable_options_count.unwrap_or(1).max(1),
     })
@@ -275,5 +281,25 @@ mod tests {
         let message = stored_to_chat_message(stored);
         assert!(message.poll.is_none());
         assert_eq!(message.content, "[Message deleted]");
+    }
+
+    /// An unnamed raw option keeps its slot as an empty placeholder: the
+    /// bubble votes by index into this list while the session votes by
+    /// index into the raw one, so filtering it out would silently move
+    /// every later option onto the wrong ballot line.
+    #[test]
+    fn an_unnamed_option_keeps_its_index_as_a_placeholder() {
+        let mut stored = stored_poll_creation();
+        let proto = stored.message.as_mut().expect("proto");
+        let creation = proto
+            .poll_creation_message_v3
+            .as_option_mut()
+            .expect("v3 creation");
+        creation.options[0].option_name = None;
+        let message = stored_to_chat_message(stored);
+        let poll = message.poll.expect("a poll creation hydrates a poll");
+        assert_eq!(poll.options.len(), 2);
+        assert_eq!(poll.options[0], String::new());
+        assert_eq!(poll.options[1], "Praia");
     }
 }

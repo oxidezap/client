@@ -21,7 +21,7 @@ use oxidezap_core::PollContent;
 
 /// A poll and its options, each one a vote for that option.
 ///
-/// `my_vote` is the option index this window tapped, if any. `vote_counts`
+/// `my_votes` are the option indexes this window tapped, if any. `vote_counts`
 /// parallels the options with their tallies when somebody counted them;
 /// `None` draws no bars and no counts rather than zeros.
 #[allow(clippy::too_many_arguments)]
@@ -29,7 +29,7 @@ pub fn render_poll(
     poll: &PollContent,
     chat_jid: SharedString,
     message_id: &str,
-    my_vote: Option<u32>,
+    my_votes: &[u32],
     vote_counts: Option<&[u32]>,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
@@ -57,75 +57,85 @@ pub fn render_poll(
                     "Select one"
                 }),
         )
-        .children(poll.options.iter().enumerate().map(|(ix, option)| {
-            let vote_entity = entity.clone();
-            let vote_chat = chat_jid.clone();
-            let vote_id = message_id.to_string();
-            let index = ix as u32;
-            let voted = my_vote == Some(index);
-            let count = counts.and_then(|c| c.get(ix).copied());
-            // A share of the total, or nothing when nobody counted: a bar at
-            // zero for an uncounted poll reads as "nobody voted", which is a
-            // claim rather than an absence.
-            let share = match (count, total) {
-                (Some(count), total) if total > 0 => count as f32 / total as f32,
-                _ => 0.0,
-            };
-            let accent = cx.theme().accent;
-            let track = cx.theme().secondary;
-            Button::new(SharedString::from(format!("poll-vote-{message_id}-{ix}")))
-                .ghost()
-                .w_full()
-                .tooltip(format!("Vote for {option}"))
-                .on_click(move |_, _, cx| {
-                    vote_entity
-                        .update(cx, |app, cx| app.vote_poll(&vote_chat, &vote_id, index, cx));
-                })
-                .child(
-                    v_flex()
+        .children(
+            poll.options
+                .iter()
+                .enumerate()
+                // Unnamed raw options keep their index (see `PollContent`)
+                // but draw nothing to tap: there is no name to show and no
+                // ballot to cast for them.
+                .filter(|(_, option)| !option.is_empty())
+                .map(|(ix, option)| {
+                    let vote_entity = entity.clone();
+                    let vote_chat = chat_jid.clone();
+                    let vote_id = message_id.to_string();
+                    let index = ix as u32;
+                    let voted = my_votes.contains(&index);
+                    let count = counts.and_then(|c| c.get(ix).copied());
+                    // A share of the total, or nothing when nobody counted: a bar at
+                    // zero for an uncounted poll reads as "nobody voted", which is a
+                    // claim rather than an absence.
+                    let share = match (count, total) {
+                        (Some(count), total) if total > 0 => count as f32 / total as f32,
+                        _ => 0.0,
+                    };
+                    let accent = cx.theme().accent;
+                    let track = cx.theme().secondary;
+                    Button::new(SharedString::from(format!("poll-vote-{message_id}-{ix}")))
+                        .ghost()
                         .w_full()
-                        .gap(metrics.space_xs())
+                        .tooltip(format!("Vote for {option}"))
+                        .on_click(move |_, _, cx| {
+                            vote_entity.update(cx, |app, cx| {
+                                app.vote_poll(&vote_chat, &vote_id, index, cx)
+                            });
+                        })
                         .child(
-                            h_flex()
+                            v_flex()
                                 .w_full()
-                                .items_center()
-                                .gap(metrics.space_sm())
-                                .child(render_radio(voted, accent, metrics, cx))
+                                .gap(metrics.space_xs())
                                 .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_size(metrics.text_body())
-                                        .text_color(cx.theme().foreground)
-                                        .child(SharedString::from(option.clone())),
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .gap(metrics.space_sm())
+                                        .child(render_radio(voted, accent, metrics, cx))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_size(metrics.text_body())
+                                                .text_color(cx.theme().foreground)
+                                                .child(SharedString::from(option.clone())),
+                                        )
+                                        .children(count.map(|count| {
+                                            div()
+                                                .flex_shrink_0()
+                                                .font_family(cx.theme().mono_font_family.clone())
+                                                .text_size(metrics.text_small())
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!("{count}"))
+                                        })),
                                 )
-                                .children(count.map(|count| {
-                                    div()
-                                        .flex_shrink_0()
-                                        .font_family(cx.theme().mono_font_family.clone())
-                                        .text_size(metrics.text_small())
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("{count}"))
-                                })),
-                        )
-                        .when(count.is_some(), |el| {
-                            el.child(
-                                div()
-                                    .w_full()
-                                    .h(metrics.bar_thin())
-                                    .rounded_full()
-                                    .bg(track)
-                                    .child(
+                                .when(count.is_some(), |el| {
+                                    el.child(
                                         div()
-                                            .h_full()
+                                            .w_full()
+                                            .h(metrics.bar_thin())
                                             .rounded_full()
-                                            .bg(accent)
-                                            .w(gpui::relative(share.max(0.02))),
-                                    ),
-                            )
-                        }),
-                )
-        }))
+                                            .bg(track)
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .rounded_full()
+                                                    .bg(accent)
+                                                    .w(gpui::relative(share.max(0.02))),
+                                            ),
+                                    )
+                                }),
+                        )
+                }),
+        )
 }
 
 /// A radio circle: hollow until tapped, filled with the accent after.

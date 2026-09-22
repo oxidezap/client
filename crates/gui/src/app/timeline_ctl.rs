@@ -179,13 +179,17 @@ impl WhatsAppApp {
     /// The emojis the quick-react strip offers, in the order it offers them.
     /// Vote on a poll option.
     ///
-    /// One tap, one option: multi-select polls exist on the wire and the
-    /// vote carries a list for them, but the bubble offers one option per
-    /// tap rather than a ballot to assemble. Offline the daemon would
-    /// refuse, so the tap is refused here where the window can say why.
-    /// The tap is drawn at once: the vote travels fire-and-forget and no
-    /// event answers it, so waiting would leave the chosen option looking
-    /// untapped until the next reload.
+    /// One tap toggles one option, and every tap re-sends the whole ballot:
+    /// a multi-select poll accumulates taps this way, while a single-select
+    /// one replaces — the ballot the server holds is always the last one it
+    /// was sent, so the window keeps the same contract and never assembles
+    /// anything the wire would not accept. Offline the daemon would refuse,
+    /// so the tap is refused here where the window can say why. The tap is
+    /// drawn at once: the vote travels fire-and-forget and no event answers
+    /// it, so waiting would leave the chosen option looking untapped until
+    /// the next reload. Toggling the last option off clears the local
+    /// ballot without sending: the session refuses an empty ballot, and the
+    /// server keeps the previous one.
     pub fn vote_poll(
         &mut self,
         chat_jid: &str,
@@ -197,21 +201,41 @@ impl WhatsAppApp {
             warn!("Cannot vote: this window is offline");
             return;
         }
-        let Some(client) = self.client.as_ref() else {
-            return;
-        };
-        client.vote_poll(chat_jid, message_id, vec![option_index]);
-        self.my_poll_votes
-            .insert((chat_jid.to_string(), message_id.to_string()), option_index);
+        let key = (chat_jid.to_string(), message_id.to_string());
+        let mut ballot = self.my_poll_votes.get(&key).cloned().unwrap_or_default();
+        // Single-select replaces where multi-select accumulates, read off
+        // the poll itself so the two cannot disagree about what a tap means.
+        let single = self
+            .find_chat(chat_jid)
+            .and_then(|chat| chat.messages.iter().find(|m| m.id == message_id))
+            .and_then(|message| message.poll.as_ref())
+            .is_none_or(|poll| poll.selectable_count <= 1);
+        if ballot.contains(&option_index) {
+            ballot.retain(|index| *index != option_index);
+        } else if single {
+            ballot = vec![option_index];
+        } else {
+            ballot.push(option_index);
+            ballot.sort_unstable();
+        }
+        if ballot.is_empty() {
+            self.my_poll_votes.remove(&key);
+        } else {
+            if let Some(client) = self.client.as_ref() {
+                client.vote_poll(chat_jid, message_id, ballot.clone());
+            }
+            self.my_poll_votes.insert(key, ballot);
+        }
         self.invalidate_message_cache(chat_jid, cx);
         cx.notify();
     }
 
-    /// The option this window voted for on a poll, if it tapped one.
-    pub fn my_poll_vote(&self, chat_jid: &str, message_id: &str) -> Option<u32> {
+    /// The options this window voted for on a poll, if it tapped any.
+    pub fn voted_options(&self, chat_jid: &str, message_id: &str) -> Vec<u32> {
         self.my_poll_votes
             .get(&(chat_jid.to_string(), message_id.to_string()))
-            .copied()
+            .cloned()
+            .unwrap_or_default()
     }
 
     ///

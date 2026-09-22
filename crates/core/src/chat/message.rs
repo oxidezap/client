@@ -72,7 +72,10 @@ pub enum Resend<'a> {
 
 /// A poll a message opens: its question and its votable options.
 ///
-/// Tallies are deliberately absent — see [`ChatMessage::poll`].
+/// Tallies are deliberately absent — see [`ChatMessage::poll`]. One entry
+/// per raw creation option, in raw order: an unnamed option is an empty
+/// placeholder the bubble draws nothing for and the vote refuses, so named
+/// choices keep the indexes the ballot resolves..
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollContent {
     pub question: String,
