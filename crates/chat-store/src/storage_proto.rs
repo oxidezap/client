@@ -6,7 +6,8 @@
 //! message carries a `MessageContextInfo` whose only field is the 32-byte
 //! `messageSecret` the pipeline already captured upstream. Both are stripped
 //! from the *storage copy only* — the live `wa::Message` the pipeline holds
-//! is never touched — and a cheap structural gate decides per message, so
+//! is never touched — except a poll creation's secret, which the session
+//! reads back out of the stored proto to cast votes — and a cheap structural gate decides per message, so
 //! small messages pay nothing.
 //!
 //! What is deliberately NOT here: `MsgSecretPolicy::Disabled` (the secrets
@@ -230,18 +231,23 @@ fn is_secret_only(ctx: &wa::MessageContextInfo) -> bool {
 
 /// Strip a secret-only [`is_secret_only`] envelope from the storage copy.
 ///
-/// Safe because the storage copy is never a secret source: `whatsapp-rust`
-/// captures `messageSecret` into its own secret store in the receive lane
-/// *before* the event reaches this crate's materializer (dispatch captures,
-/// then decrypts, then dispatches), and nothing in this workspace reads the
-/// secret back out of a stored proto. What stays authoritative are that
-/// store under `Managed` — which is why this must be revisited, not just
-/// kept, if the client ever moves to `Disabled` with a resolver reading
-/// secrets out of these rows: it would find them gone.
+/// Safe because the storage copy is never a secret source — with one
+/// exception: a poll creation keeps its envelope. Votes encrypt to the
+/// creation's secret and the session reads that secret back out of the
+/// stored proto (`vote_poll`), while `whatsapp-rust`'s own secret store is
+/// not readable from this crate. The store is one file holding device
+/// identity and Signal state already, so 32 bytes beside them change no
+/// threat model.
 ///
 /// Returns true when the message was touched.
 pub(crate) fn strip_redundant_secret(msg: &mut wa::Message) -> bool {
     use buffa::Message as _;
+    // A vote that cannot find its secret is a refusal, not a retryable
+    // error — and the stored copy is the only copy this crate can read
+    // back. Strip nothing here; the envelope is the ballot's key.
+    if is_poll_creation(msg) {
+        return false;
+    }
     let Some(ctx) = msg.message_context_info.as_option_mut() else {
         return false;
     };
@@ -253,6 +259,20 @@ pub(crate) fn strip_redundant_secret(msg: &mut wa::Message) -> bool {
         msg.message_context_info = Default::default();
     }
     true
+}
+
+/// Whether `msg` opens a poll: a creation in any version.
+///
+/// Unwrapped first, for the reason `classify` peels: a creation inside an
+/// envelope `get_base_message` does not open is still the ballot whose
+/// secret the store has to keep.
+fn is_poll_creation(msg: &wa::Message) -> bool {
+    use wacore::proto_helpers::MessageExt as _;
+    let base = msg.get_base_message();
+    base.poll_creation_message.is_set()
+        || base.poll_creation_message_v2.is_set()
+        || base.poll_creation_message_v3.is_set()
+        || base.poll_creation_message_v4.is_set()
 }
 
 /// Whether `msg` holds anything the storage copy would compact: a quoted
@@ -636,6 +656,35 @@ mod tests {
         });
         assert!(strip_redundant_secret(&mut msg));
         assert!(msg.message_context_info.as_option().is_none());
+    }
+
+    #[test]
+    fn secret_envelope_on_a_poll_creation_is_kept_for_voting() {
+        let mut msg = wa::Message {
+            poll_creation_message_v3: buffa::MessageField::some(wa::message::PollCreationMessage {
+                name: Some("Onde jantamos?".into()),
+                options: ["Centro", "Praia"]
+                    .iter()
+                    .map(|name| wa::message::poll_creation_message::Option {
+                        option_name: Some((*name).to_owned()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                selectable_options_count: Some(1),
+                ..Default::default()
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![7u8; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // The vote encrypts to this secret and reads it back out of the
+        // stored proto, so stripping it here is what made every vote fail
+        // with "the poll's secret was not stored".
+        assert!(!strip_redundant_secret(&mut msg));
+        let ctx = msg.message_context_info.as_option().expect("kept");
+        assert_eq!(ctx.message_secret.as_deref(), Some([7u8; 32].as_slice()));
     }
 
     #[test]

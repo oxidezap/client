@@ -792,6 +792,12 @@ pub struct WhatsAppApp {
     /// every row is a row without messages, so two of them can be opened
     /// before either load lands.
     owed_reads: std::collections::HashSet<String>,
+    /// Options this window voted for, by chat and poll message. Optimistic
+    /// and local: the vote travels fire-and-forget and no receipt comes
+    /// back, so the bubble draws the tap itself rather than waiting for an
+    /// back, so the bubble draws the tap itself rather than waiting for an
+    /// event that will never arrive. Last tap wins, like the tally will.
+    my_poll_votes: std::collections::HashMap<(String, String), u32>,
     /// Where both paged lists continue, and whether either is asking. See
     /// [`paging`].
     pages: Entity<paging::Pages>,
@@ -1321,6 +1327,7 @@ impl WhatsAppApp {
             // up on a restored selection is one nobody has typed into.
             keyboard_intent: ChatOpen::ToPreview,
             keyboard_surfaces: KeyboardSurfaces::default(),
+            my_poll_votes: std::collections::HashMap::new(),
             playback_epoch: 0,
             status_tick_at: None,
             visible_chat: None,

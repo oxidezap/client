@@ -183,6 +183,9 @@ impl WhatsAppApp {
     /// vote carries a list for them, but the bubble offers one option per
     /// tap rather than a ballot to assemble. Offline the daemon would
     /// refuse, so the tap is refused here where the window can say why.
+    /// The tap is drawn at once: the vote travels fire-and-forget and no
+    /// event answers it, so waiting would leave the chosen option looking
+    /// untapped until the next reload.
     pub fn vote_poll(
         &mut self,
         chat_jid: &str,
@@ -198,7 +201,17 @@ impl WhatsAppApp {
             return;
         };
         client.vote_poll(chat_jid, message_id, vec![option_index]);
-        let _ = cx;
+        self.my_poll_votes
+            .insert((chat_jid.to_string(), message_id.to_string()), option_index);
+        self.invalidate_message_cache(chat_jid, cx);
+        cx.notify();
+    }
+
+    /// The option this window voted for on a poll, if it tapped one.
+    pub fn my_poll_vote(&self, chat_jid: &str, message_id: &str) -> Option<u32> {
+        self.my_poll_votes
+            .get(&(chat_jid.to_string(), message_id.to_string()))
+            .copied()
     }
 
     ///
