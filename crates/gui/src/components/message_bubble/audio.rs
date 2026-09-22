@@ -120,6 +120,7 @@ fn render_play_button(
         .h(metrics.avatar_inline())
         .disabled(!can_play)
         .tooltip(if is_playing { "Pause" } else { "Play" })
+        .cursor_pointer()
         .on_click(move |_, _window, cx| {
             let message_id = message_id.clone();
             entity.update(cx, |app, cx| {
@@ -247,6 +248,7 @@ fn render_speed_chip(
         cx.theme().primary
     })
     .tooltip("Playback speed")
+    .cursor_pointer()
     .on_click(move |_, _window, cx| {
         entity.update(cx, |app, cx| app.cycle_playback_speed(cx));
     })

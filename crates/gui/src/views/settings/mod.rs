@@ -125,6 +125,7 @@ fn render_nav(
                         .ghost()
                         .small()
                         .tooltip("Back to chats")
+                        .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             close_entity.update(cx, |app, cx| {
                                 app.close_settings(cx);
@@ -209,6 +210,7 @@ fn render_nav_item(
                         )
                         .child(section.label()),
                 )
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| app.set_settings_section(section, cx));
                 }),
@@ -252,6 +254,7 @@ fn render_section_strip(
                 .ghost()
                 .small()
                 .selected(item == section)
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| app.set_settings_section(item, cx));
                 })
@@ -286,6 +289,7 @@ fn render_header(
                     .ghost()
                     .small()
                     .tooltip("Back to chats")
+                    .cursor_pointer()
                     .on_click(move |_, _window, cx| {
                         back_entity.update(cx, |app, cx| app.close_settings(cx));
                     }),
@@ -315,6 +319,7 @@ fn render_header(
                 .ghost()
                 .small()
                 .tooltip("Close settings")
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| {
                         app.close_settings(cx);

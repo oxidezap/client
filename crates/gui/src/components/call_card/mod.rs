@@ -205,6 +205,7 @@ fn waiting_strip(
                 .danger()
                 .small()
                 .tooltip("Decline the waiting call")
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| app.decline_waiting_call(cx));
                 }),
@@ -394,6 +395,7 @@ fn minimized_pill(
                 .ghost()
                 .small()
                 .tooltip("Return to call")
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     expand_entity.update(cx, |app, cx| app.set_call_minimized(false, cx));
                 }),
@@ -404,6 +406,7 @@ fn minimized_pill(
                 .danger()
                 .small()
                 .tooltip("End call")
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     end_entity.update(cx, |app, cx| app.hang_up(cx));
                 }),
@@ -498,6 +501,7 @@ fn mobile_banner(
                     .primary()
                     .tooltip("Accept")
                     .h(metrics.touch_target())
+                    .cursor_pointer()
                     .on_click(move |_, _window, cx| {
                         accept_entity.update(cx, |app, cx| app.accept_call(cx));
                     }),
@@ -520,6 +524,7 @@ fn mobile_banner(
                     "Turn the camera on"
                 })
                 .h(metrics.touch_target())
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     camera_entity.update(cx, |app, cx| app.toggle_call_video(cx));
                 })
@@ -534,6 +539,7 @@ fn mobile_banner(
                     Stage::Active(_) => "End call",
                 })
                 .h(metrics.touch_target())
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     end_entity.update(cx, |app, cx| app.hang_up(cx));
                 }),

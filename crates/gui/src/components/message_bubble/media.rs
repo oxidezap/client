@@ -615,6 +615,7 @@ fn render_document_placeholder(
                     metrics.icon_button(),
                 )
                 .disabled(is_downloading)
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     let msg_id = message_id.clone();
                     let name = file_name.clone();
@@ -825,6 +826,7 @@ fn render_video_player(
                                 )
                                 .ghost()
                                 .disabled(downloadable.is_none())
+                                .cursor_pointer()
                                 .on_click({
                                     let downloadable = downloadable.clone();
                                     move |_, _window, cx| {
@@ -848,6 +850,7 @@ fn render_video_player(
                         )
                         .ghost()
                         .disabled(!can_download)
+                        .cursor_pointer()
                         .on_click({
                             let downloadable = downloadable.clone();
                             move |_, _window, cx| {
@@ -874,6 +877,7 @@ fn render_video_player(
                                 .size(metrics.icon_media_playing()),
                         )
                         .ghost()
+                        .cursor_pointer()
                         .on_click({
                             let downloadable = downloadable.clone();
                             move |_, _window, cx| {

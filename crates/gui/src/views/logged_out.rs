@@ -54,6 +54,7 @@ pub fn render_logged_out_view(
                     .label("Clear data and pair again")
                     .danger()
                     .outline()
+                    .cursor_pointer()
                     .on_click(move |_, window, cx| {
                         pair_entity.update(cx, |this, cx| this.reset_and_pair_again(window, cx));
                     }),

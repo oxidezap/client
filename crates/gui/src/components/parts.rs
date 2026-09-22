@@ -150,6 +150,7 @@ pub fn icon_button(
         .icon(icon)
         .ghost()
         .tooltip(tooltip)
+        .cursor_pointer()
         .w(frame)
         .h(frame)
 }

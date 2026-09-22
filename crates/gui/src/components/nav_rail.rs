@@ -119,6 +119,7 @@ fn render_destination(
         .rounded(metrics.radius_md())
         .tooltip(destination.label())
         .when(is_current, |el| el.bg(cx.theme().list_active))
+        .cursor_pointer()
         .on_click(move |_, _window, cx| {
             entity.update(cx, |app, cx| app.set_destination(destination, cx));
         })

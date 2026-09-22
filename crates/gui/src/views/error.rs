@@ -61,6 +61,7 @@ pub fn render_error_view(
                             _ => "Retry now".to_string(),
                         })
                         .primary()
+                        .cursor_pointer()
                         .on_click(move |_, _, cx| {
                             retry_entity.update(cx, |this, cx| this.retry_connection(cx));
                         })
@@ -71,6 +72,7 @@ pub fn render_error_view(
                     Button::new("work-offline")
                         .label("Work offline")
                         .outline()
+                        .cursor_pointer()
                         .on_click({
                             let entity = detail_entity.clone();
                             move |_, _, cx| {
@@ -126,6 +128,7 @@ fn render_detail(
                 } else {
                     "Technical detail"
                 })
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| app.toggle_error_detail(cx));
                 }),
@@ -187,6 +190,7 @@ pub fn render_refused_view(
             Button::new("retry")
                 .label("Try again")
                 .primary()
+                .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     retry_entity.update(cx, |this, cx| this.retry_connection(cx));
                 }),

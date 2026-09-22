@@ -229,6 +229,7 @@ fn render_identity(
                     .icon(IconName::ArrowLeft)
                     .ghost()
                     .tooltip("Back to chats")
+                    .cursor_pointer()
                     .on_click(move |_, _window, cx| {
                         back_entity.update(cx, |app, cx| app.navigate_back(cx));
                     }),
@@ -323,6 +324,7 @@ fn render_actions(
                     Icon::new(IconName::Search),
                     "Search in conversation",
                 )
+                .cursor_pointer()
                 .on_click(move |_, window, cx| {
                     search_entity.update(cx, |app, cx| app.toggle_conversation_search(window, cx));
                 }),

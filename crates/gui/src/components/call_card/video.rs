@@ -284,6 +284,7 @@ fn video_controls(
                 if muted { "Unmute" } else { "Mute" },
             )
             .selected(muted)
+            .cursor_pointer()
             .on_click(move |_, _window, cx| {
                 mute_entity.update(cx, |app, cx| app.toggle_call_muted(cx));
             }),
@@ -302,6 +303,7 @@ fn video_controls(
             // on it: the peer's request has no dialog of its own, because
             // turning this on *is* the answer.
             .selected(camera_on || asked)
+            .cursor_pointer()
             .on_click(move |_, _window, cx| {
                 camera_entity.update(cx, |app, cx| app.toggle_call_video(cx));
             }),
@@ -325,6 +327,7 @@ fn video_controls(
         .child(
             round("call-end", ProductIcon::PhoneOff.into(), "End call")
                 .danger()
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     end_entity.update(cx, |app, cx| app.hang_up(cx));
                 }),

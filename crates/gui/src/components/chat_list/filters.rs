@@ -82,6 +82,7 @@ fn render_chip(
                 .text_color(cx.theme().foreground)
                 .child(count.to_string())
         }))
+        .cursor_pointer()
         .on_click(move |_, _window, cx| {
             entity.update(cx, |app, cx| app.set_chat_filter(filter, cx));
         })

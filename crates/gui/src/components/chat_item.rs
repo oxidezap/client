@@ -77,6 +77,7 @@ pub fn render_chat_item(
                     .bg(cx.theme().primary),
             )
         })
+        .cursor_pointer()
         .on_click(move |_, window, cx| {
             entity.update(cx, |this, cx| {
                 this.select_chat(jid.clone(), ChatOpen::ToCompose, window, cx)

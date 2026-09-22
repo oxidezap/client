@@ -64,6 +64,7 @@ pub fn live_header(
                         .ghost()
                         .xsmall()
                         .tooltip("Minimise")
+                        .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             minimize_entity.update(cx, |app, cx| app.set_call_minimized(true, cx));
                         }),
@@ -74,6 +75,7 @@ pub fn live_header(
                         .ghost()
                         .xsmall()
                         .tooltip("End call")
+                        .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             end_entity.update(cx, |app, cx| app.hang_up(cx));
                         }),
@@ -239,6 +241,7 @@ fn controls(
             // Muted is a persistent state, not a hover: it stays lit until
             // it is turned off.
             .selected(muted)
+            .cursor_pointer()
             .on_click(move |_, _window, cx| {
                 mute_entity.update(cx, |app, cx| app.toggle_call_muted(cx));
             }),
@@ -282,6 +285,7 @@ fn controls(
                 },
             )
             .selected(asked || coming_on)
+            .cursor_pointer()
             .on_click(move |_, _window, cx| {
                 camera_entity.update(cx, |app, cx| app.toggle_call_video(cx));
             }),
@@ -303,6 +307,7 @@ fn controls(
             cx,
             round("call-end", ProductIcon::PhoneOff.into(), "End call")
                 .danger()
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     end_entity.update(cx, |app, cx| app.hang_up(cx));
                 }),

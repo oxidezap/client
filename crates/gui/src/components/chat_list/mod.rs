@@ -182,6 +182,7 @@ fn render_title_bar(
                         .ghost()
                         .small()
                         .tooltip("Settings")
+                        .cursor_pointer()
                         .on_click(move |_, window, cx| {
                             settings_entity.update(cx, |app, cx| app.open_settings(window, cx));
                         }),

@@ -83,6 +83,7 @@ pub fn render_call_record(
                     .ghost()
                     .small()
                     .tooltip("Call back")
+                    .cursor_pointer()
                     .on_click(move |_, _window, cx| {
                         entity.update(cx, |app, cx| app.start_call(peer_jid.clone(), false, cx));
                     }),

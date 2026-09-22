@@ -275,6 +275,7 @@ fn render_author_row(
         .px(metrics.chat_row_padding_x())
         .rounded(metrics.radius_lg())
         .when(is_selected, |el| el.bg(cx.theme().list_active))
+        .cursor_pointer()
         .on_click(move |_, _window, cx| {
             entity.update(cx, |app, cx| app.open_status(jid.clone(), cx));
         })

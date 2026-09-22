@@ -67,6 +67,7 @@ pub fn render_quote(
                         .child(summary),
                 ),
         )
+        .cursor_pointer()
         .on_click(move |_, _window, cx| {
             entity.update(cx, |app, cx| app.jump_to_message(&target, cx));
         })

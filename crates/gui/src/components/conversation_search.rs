@@ -62,6 +62,7 @@ pub fn render_conversation_search(
                 .small()
                 .tooltip("Previous match")
                 .disabled(!can_step)
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     prev_entity.update(cx, |app, cx| app.step_conversation_search(false, cx));
                 }),
@@ -73,6 +74,7 @@ pub fn render_conversation_search(
                 .small()
                 .tooltip("Next match")
                 .disabled(!can_step)
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     next_entity.update(cx, |app, cx| app.step_conversation_search(true, cx));
                 }),
@@ -83,6 +85,7 @@ pub fn render_conversation_search(
                 .ghost()
                 .small()
                 .tooltip("Close search")
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     close_entity.update(cx, |app, cx| {
                         app.close_conversation_search(cx);

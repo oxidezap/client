@@ -527,6 +527,7 @@ fn render_offline_strip(
             Button::new("reconnect")
                 .label("Reconnect")
                 .ghost()
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| app.retry_connection(cx));
                 }),
@@ -578,6 +579,7 @@ fn render_return_banner(
                 .label("Return to call")
                 .icon(Icon::new(IconName::ArrowRight))
                 .ghost()
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| app.return_to_call(cx));
                 }),

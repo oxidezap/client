@@ -153,6 +153,7 @@ impl RenderOnce for EmptyState {
                 Button::new("empty-state-action")
                     .label(label)
                     .outline()
+                    .cursor_pointer()
                     .on_click(move |_, window, cx| on_action(window, cx))
             }))
             .when(!self.shortcuts.is_empty(), |el| {

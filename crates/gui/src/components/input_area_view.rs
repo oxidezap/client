@@ -473,6 +473,7 @@ impl InputAreaView {
                     "Attach a photo, a video or a document",
                     control,
                 )
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     attach_entity.update(cx, |_view, cx| cx.emit(InputAreaEvent::AttachFiles));
                 }),
@@ -505,6 +506,7 @@ impl InputAreaView {
                     .tooltip("Send")
                     .w(control)
                     .h(control)
+                    .cursor_pointer()
                     .on_click(move |_, window, cx| {
                         entity.update(cx, |view, cx| view.submit_input(window, cx));
                     })
@@ -528,7 +530,7 @@ impl InputAreaView {
                     .w(control)
                     .h(control)
                     .when(can_record, |button| {
-                        button.on_click(move |_, _window, cx| {
+                        button.cursor_pointer().on_click(move |_, _window, cx| {
                             record_entity.update(cx, |view, cx| view.toggle_recording(cx));
                         })
                     })
@@ -561,6 +563,7 @@ impl InputAreaView {
                     "Discard recording",
                     control,
                 )
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     cancel_entity.update(cx, |view, cx| view.cancel_recording(cx));
                 }),
@@ -598,6 +601,7 @@ impl InputAreaView {
                     .tooltip("Send voice message")
                     .w(control)
                     .h(control)
+                    .cursor_pointer()
                     .on_click(move |_, _window, cx| {
                         entity.update(cx, |view, cx| view.toggle_recording(cx));
                     }),
@@ -674,6 +678,7 @@ fn render_reply_bar(
                 .ghost()
                 .xsmall()
                 .tooltip("Cancel reply")
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |view, cx| view.clear_reply(cx));
                 }),

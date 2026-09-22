@@ -193,6 +193,7 @@ fn render_header(
                 .icon(Icon::new(IconName::Close))
                 .ghost()
                 .tooltip("Close")
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     close_entity.update(cx, |app, cx| app.close_status(cx));
                 }),
@@ -294,5 +295,6 @@ fn step_button<F: Fn(&mut App) + 'static>(
         .large()
         .tooltip(tooltip)
         .disabled(!enabled)
+        .cursor_pointer()
         .on_click(move |_, _window, cx| on_click(cx))
 }

@@ -93,6 +93,7 @@ fn widget(
             .ghost()
             .small()
             .disabled(!live)
+            .cursor_pointer()
             .on_click(move |_, _window, cx| {
                 let (plugin, action) = (plugin.clone(), action.clone());
                 entity.update(cx, |app, cx| {
@@ -114,6 +115,7 @@ fn widget(
                 )))
                 .checked(checked)
                 .disabled(!live)
+                .cursor_pointer()
                 .on_click(move |now: &bool, _window, cx| {
                     let (plugin, action) = (plugin.clone(), action.clone());
                     // What the switch is *now*, taken from the press rather
@@ -302,6 +304,7 @@ fn unsaved_row(
             .label("Save")
             .primary()
             .small()
+            .cursor_pointer()
             .on_click(move |_, _window, cx| {
                 let (plugin, id) = (plugin.clone(), id.clone());
                 entity.update(cx, |app, cx| {
@@ -574,6 +577,7 @@ pub fn settings_entry(
                 "Let it act on your account",
                 Switch::new(SharedString::from(format!("plugin-allow-{}", surface.id)))
                     .checked(approved)
+                    .cursor_pointer()
                     .on_click(move |now: &bool, _window, cx| {
                         let id = id.clone();
                         // The switch's own state, not the surface this was

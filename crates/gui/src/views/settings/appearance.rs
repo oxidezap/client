@@ -132,6 +132,7 @@ fn render_preset_card(
                         }),
                 ),
         )
+        .cursor_pointer()
         .on_click(move |_, window, cx| {
             entity.update(cx, |app, cx| app.set_theme_preset(preset, window, cx));
         })
@@ -263,6 +264,7 @@ fn render_density(
                     .py(metrics.space_md())
                     .rounded(metrics.radius_md())
                     .text_size(metrics.text_small())
+                    .cursor_pointer()
                     .on_click(move |_, window, cx| {
                         entity.update(cx, |app, cx| app.set_theme_density(density, window, cx));
                     })
@@ -315,6 +317,7 @@ fn render_font_size(
                             .small()
                             .tooltip("Smaller")
                             .disabled(size <= MIN_FONT_SIZE)
+                            .cursor_pointer()
                             .on_click(move |_, window, cx| {
                                 smaller.update(cx, |app, cx| app.step_font_size(-1.0, window, cx));
                             }),
@@ -327,6 +330,7 @@ fn render_font_size(
                             .small()
                             .tooltip("Larger")
                             .disabled(size >= MAX_FONT_SIZE)
+                            .cursor_pointer()
                             .on_click(move |_, window, cx| {
                                 larger.update(cx, |app, cx| app.step_font_size(1.0, window, cx));
                             }),
@@ -393,6 +397,7 @@ fn render_theme_file(
                                 .label("Revert")
                                 .ghost()
                                 .small()
+                                .cursor_pointer()
                                 .on_click(move |_, window, cx| {
                                     revert_entity
                                         .update(cx, |app, cx| app.revert_theme(window, cx));
@@ -405,6 +410,7 @@ fn render_theme_file(
                             .outline()
                             .small()
                             .tooltip("Re-read the file from disk")
+                            .cursor_pointer()
                             .on_click(move |_, window, cx| {
                                 reload_entity.update(cx, |app, cx| app.reload_theme(window, cx));
                             }),
@@ -415,6 +421,7 @@ fn render_theme_file(
                             .primary()
                             .small()
                             .disabled(!is_dirty)
+                            .cursor_pointer()
                             .on_click(move |_, _window, cx| {
                                 save_entity.update(cx, |app, cx| app.save_theme(cx));
                             }),

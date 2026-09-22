@@ -69,6 +69,7 @@ pub fn render_paste_preview(
                         .child(
                             Button::new("paste-preview-cancel-button")
                                 .label("Cancel")
+                                .cursor_pointer()
                                 .on_click({
                                     let app = app.clone();
                                     move |_event, _window, cx| {
@@ -88,6 +89,7 @@ pub fn render_paste_preview(
                                 .label("Send")
                                 .primary()
                                 .disabled(!can_send)
+                                .cursor_pointer()
                                 .on_click(move |_event, _window, cx| {
                                     app.update(cx, |app, cx| app.confirm_paste_preview(cx));
                                 }),

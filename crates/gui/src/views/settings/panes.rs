@@ -190,6 +190,7 @@ fn removal(
             .label("Remove")
             .ghost()
             .small()
+            .cursor_pointer()
             .on_click(move |_, _window, cx| {
                 let id = id.clone();
                 entity.update(cx, |app, cx| app.remove_plugin(id, cx));
@@ -247,6 +248,7 @@ fn plugin_controls(
             Button::new("reload-plugins")
                 .label("Reload plugins")
                 .ghost()
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| app.reload_plugins(cx));
                 }),
@@ -255,6 +257,7 @@ fn plugin_controls(
             Button::new("install-plugin")
                 .label("Add a plugin…")
                 .outline()
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     installer.update(cx, |app, cx| app.install_plugin(cx));
                 }),
@@ -514,6 +517,7 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
                             .label("Clear data and pair again")
                             .danger()
                             .outline()
+                            .cursor_pointer()
                             .on_click(move |_, window, cx| {
                                 entity.update(cx, |app, cx| app.reset_and_pair_again(window, cx));
                             }),
@@ -598,6 +602,7 @@ fn storage(
                             .label("Clear cached media")
                             .outline()
                             .disabled(usage.is_none_or(|u| u.media_files == 0))
+                            .cursor_pointer()
                             .on_click(move |_, _window, cx| {
                                 entity.update(cx, |app, cx| app.clear_media_cache(cx));
                             }),
@@ -679,6 +684,7 @@ fn advanced(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyEleme
                             .py(metrics.space_md())
                             .rounded(metrics.radius_md())
                             .text_size(metrics.text_small())
+                            .cursor_pointer()
                             .on_click(move |_, _window, cx| {
                                 entity.update(cx, |app, cx| app.set_log_level(level, cx));
                             })

@@ -61,6 +61,7 @@ pub fn incoming(
                         .outline()
                         .flex_1()
                         .h(metrics.call_action_height())
+                        .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             decline_entity.update(cx, |app, cx| app.decline_call(cx));
                         }),
@@ -74,6 +75,7 @@ pub fn incoming(
                         .primary()
                         .flex_1()
                         .h(metrics.call_action_height())
+                        .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             accept_entity.update(cx, |app, cx| app.accept_call(cx));
                         }),
@@ -128,6 +130,7 @@ pub fn outgoing(
                         .outline()
                         .flex_1()
                         .h(metrics.call_action_height())
+                        .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             cancel_entity.update(cx, |app, cx| app.hang_up(cx));
                         }),
