@@ -176,18 +176,88 @@ impl WhatsAppApp {
         }
     }
 
-    /// Offer the emoji picker for a message.
+    /// The emojis the quick-react strip offers, in the order it offers them.
     ///
-    /// Not built yet: the reaction path exists inbound only, and a picker that
-    /// cannot send is worse than one that says so.
-    #[expect(dead_code, reason = "the outbound reaction path is not built yet")]
-    pub fn open_reaction_picker(
+    /// Fixed rather than the full emoji table: this is a reaction control,
+    /// not an emoji picker, and anything typed beyond these travels the
+    /// composer's own path. Kept here rather than in the bubble so the strip
+    /// and the context menu cannot disagree about what a tap sends.
+    pub const QUICK_REACTIONS: [&'static str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
+    /// Open the quick-react strip under one message, or close it when it is
+    /// already that message's.
+    pub fn toggle_reaction_picker(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let open = self.reaction_picker_for.as_deref() == Some(message_id);
+        self.reaction_picker_for = (!open).then(|| message_id.to_string());
+        // The strip moves every row below it, so the cached measurements the
+        // list laid out against are laid out against a timeline without it.
+        if let Some(jid) = self.selected_chat_jid() {
+            self.invalidate_message_cache(&jid, cx);
+        }
+        cx.notify();
+    }
+
+    /// Send `emoji` as our reaction to `message_id`, or take ours back when
+    /// it names the reaction already drawn as ours.
+    ///
+    /// Painted optimistically: the row is updated before the daemon answers,
+    /// and the network echo arriving as `ReactionReceived` confirms it. Our
+    /// own sender is the LID first, which is the canonical form the echo
+    /// carries — stamping the phone number beside it would draw one person
+    /// as two until the next history load.
+    pub fn toggle_reaction(
         &mut self,
         message_id: &str,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        emoji: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        debug!("reaction picker for {message_id} is not implemented yet");
+        let _ = window;
+        // Same rule as the composer: in the offline state the history is
+        // readable and nothing else, and a tap that silently went nowhere
+        // would leave the optimistic row as a lie.
+        if !self.can_send() {
+            warn!("Cannot react: this window is offline");
+            return;
+        }
+        let Some(own) = self
+            .account_lid
+            .clone()
+            .or_else(|| self.account_jid.clone())
+        else {
+            warn!("Cannot react: the account identity is not known yet");
+            return;
+        };
+        let Some(chat) = self.selected_chat_data() else {
+            return;
+        };
+        let Some(message) = chat.messages.iter().find(|m| m.id == message_id) else {
+            return;
+        };
+        // Lifted before sending, which needs `self` mutably.
+        let chat_jid = chat.jid.clone();
+        let already_ours = message
+            .reactions
+            .get(emoji)
+            .is_some_and(|senders| senders.contains(&own));
+        let send = if already_ours {
+            String::new()
+        } else {
+            emoji.to_string()
+        };
+
+        if let Some(session) = self.control() {
+            session.send_reaction(&chat_jid, message_id, &send);
+        }
+        // Optimistic, in the same form the echo will confirm: an empty send
+        // removes rather than adds, which is the one spelling
+        // `add_reaction` already gives a removal.
+        if let Some(chat) = self.find_chat_mut(&chat_jid) {
+            chat.add_reaction(message_id, send, own);
+            self.invalidate_message_cache(&chat_jid, cx);
+        }
+        self.reaction_picker_for = None;
+        cx.notify();
     }
 
     /// Entry point reserved for the emoji and sticker picker.

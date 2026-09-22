@@ -29,10 +29,11 @@ pub use system::render_encryption_notice;
 pub(crate) use media::sticker_payload_is_valid;
 use media::{MediaProps, render_media_content};
 use quote::render_quote;
-use reactions::{render_hover_actions, render_reactions};
+use reactions::{render_hover_actions, render_reaction_picker, render_reactions};
 
 use crate::app::{
-    BubbleIds, CopyMessage, OpenMessageLink, ReplyToMessage, RetryMessage, WhatsAppApp,
+    BubbleIds, CopyMessage, OpenMessageLink, ReactToMessage, ReplyToMessage, RetryMessage,
+    WhatsAppApp,
 };
 use crate::components::parts;
 use crate::components::{BubbleText, bubble_status_ticks, render_rich_text};
@@ -75,6 +76,10 @@ pub struct BubbleProps {
     pub playback_speed: f32,
     /// Whether this message's media is being fetched right now.
     pub is_downloading: bool,
+    /// Whether the quick-react strip is open under this bubble. Travels
+    /// with the row for the reason the ids do: reading the app here would
+    /// re-enter the entity the virtual list already leased to build it.
+    pub reaction_picker_open: bool,
 }
 
 /// How far into the voice note the player is.
@@ -343,6 +348,14 @@ pub fn render_message_bubble(
                         ),
                     )
                 })
+                .when(props.reaction_picker_open, |el| {
+                    el.child(render_reaction_picker(
+                        &message_id,
+                        entity.clone(),
+                        metrics,
+                        cx,
+                    ))
+                })
                 .when(has_reactions, |el| {
                     el.child(render_reactions(
                         message.reactions.clone(),
@@ -371,6 +384,22 @@ pub fn render_message_bubble(
         // Last in the chain: the wrapper is no longer a `Div`, so anything
         // styled after this would have nowhere to go.
         .context_menu(move |menu, _window, _cx| {
+            // The same emojis the hover button's strip offers, one item
+            // each: a strip is a pointer surface, and this menu is the
+            // route keyboard and assistive-technology users take to the
+            // same command. Tapping ours again takes it back, exactly as
+            // the strip does.
+            let mut menu = menu;
+            for emoji in WhatsAppApp::QUICK_REACTIONS {
+                let react_id = menu_id.clone();
+                menu = menu.menu(
+                    format!("React {emoji}"),
+                    Box::new(ReactToMessage {
+                        id: react_id.into(),
+                        emoji: SharedString::from(emoji),
+                    }),
+                );
+            }
             let menu = menu.menu(
                 "Reply",
                 Box::new(ReplyToMessage {

@@ -5,6 +5,13 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 35: `ClientRequest::SendReaction`, which carries a message reaction to
+/// the daemon the way the sends above it carry their payloads. A v34 daemon
+/// does not know the request and refuses it as malformed — and the daemon
+/// is the half that deliberately outlives an upgrade, so without a version
+/// an upgraded window would offer reactions that are refused after the tap.
+/// Exactly the case v15, v21, v23, v24, v25 and v27 were bumped for.
+///
 /// 34: `LoadChats.archived` lets the desktop request the store's
 /// include-archived view, and full `Chat` frames carry the durable archive
 /// state used to separate that view. A v33 daemon would ignore the request
@@ -257,7 +264,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 34;
+pub const PROTOCOL_VERSION: u32 = 35;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

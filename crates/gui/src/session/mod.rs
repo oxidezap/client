@@ -91,8 +91,8 @@ use oxidezap_ipc::{CallAction, ClientRequest, Link, PageCursor, Request, Request
 // so `Typing` and `Download` read at the call site as what they are: the
 // request's own payload, built here and moved onto the wire unchanged.
 use oxidezap_ipc::{
-    Download, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, SendAudio, SendMedia, SendText,
-    Typing,
+    Download, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, SendAudio, SendMedia,
+    SendReaction, SendText, Typing,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
@@ -1268,6 +1268,20 @@ impl SessionHandle {
             jid: jid.to_string(),
             composing,
         }));
+    }
+
+    /// React to a message, or remove our reaction with an empty emoji.
+    ///
+    /// Fire-and-forget like typing, not tracked like a send: there is no
+    /// bubble drawn ahead of it to rename or fail, and the network echo
+    /// arriving as `ReactionReceived` is the confirmation. The optimistic
+    /// row the timeline paints is reverted only by the next history load.
+    pub fn send_reaction(&self, chat_jid: &str, message_id: &str, emoji: &str) {
+        self.tell(ClientRequest::SendReaction(Box::new(SendReaction {
+            chat_jid: chat_jid.to_string(),
+            message_id: message_id.to_string(),
+            emoji: emoji.to_string(),
+        })));
     }
 
     /// Mark a chat read up to the message the UI is looking at.

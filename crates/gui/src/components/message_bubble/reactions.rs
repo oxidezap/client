@@ -6,7 +6,8 @@ use gpui::{
     App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::{Disableable as _, Icon, Sizable as _};
+use gpui_component::button::ButtonVariants as _;
+use gpui_component::{Icon, Sizable as _};
 
 use crate::app::{BubbleIds, WhatsAppApp};
 use crate::components::{ProductIcon, parts};
@@ -67,6 +68,51 @@ pub fn render_reactions(
         }))
 }
 
+/// The quick-react strip drawn under a bubble while it is open.
+///
+/// Inline rather than a popup: the timeline already moves rows for content,
+/// and a surface positioned against the bubble would need an anchor the
+/// virtual list does not give back. One tap sends — or takes back, when it
+/// names the reaction already drawn as ours.
+pub fn render_reaction_picker(
+    message_id: &str,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .gap(metrics.space_xxs())
+        .items_center()
+        .px(metrics.space_xs())
+        .py(metrics.space_xxs())
+        .mt(metrics.space_xs())
+        .rounded_full()
+        .bg(cx.theme().popover)
+        .border_1()
+        .border_color(cx.theme().border)
+        .children(WhatsAppApp::QUICK_REACTIONS.into_iter().map(|emoji| {
+            let picker_entity = entity.clone();
+            let picker_id = message_id.to_string();
+            let picker_emoji = emoji.to_string();
+            // A `Button`, not a styled div: reacting is a command, and the
+            // same rule that made the retry control one applies here — a
+            // pointer-only surface is not a route keyboard users can take.
+            gpui_component::button::Button::new(SharedString::from(format!(
+                "quick-react-{message_id}-{emoji}"
+            )))
+            .ghost()
+            .xsmall()
+            .label(emoji)
+            .tooltip(format!("React {emoji}"))
+            .on_click(move |_, window, cx| {
+                picker_entity.update(cx, |app, cx| {
+                    app.toggle_reaction(&picker_id, &picker_emoji, window, cx)
+                });
+            })
+        }))
+}
+
 /// React, reply and copy, revealed on hover.
 ///
 /// Hover-only is acceptable here because none of the three is the only route
@@ -81,8 +127,10 @@ pub fn render_hover_actions(
     metrics: Metrics,
     _cx: &App,
 ) -> impl IntoElement + use<> {
-    let reply_id = message_id;
-    let reply_entity = entity;
+    let reply_id = message_id.clone();
+    let reply_entity = entity.clone();
+    let picker_id = message_id;
+    let picker_entity = entity;
     let has_text = !content.is_empty();
 
     let action = |id: SharedString, icon: Icon, tip: &'static str| {
@@ -94,17 +142,15 @@ pub fn render_hover_actions(
         .gap(metrics.space_xxs())
         .items_center()
         .child(
-            // Drawn and disabled: there is no picker behind it and no
-            // outbound reaction request in the session API, so the click it
-            // used to accept went to a `debug!` and nowhere else. The slot
-            // stays because reactions are already *rendered* on bubbles —
-            // hiding it would suggest they are not a thing here.
-            action(
-                ids.react.clone(),
-                ProductIcon::Smile.into(),
-                "Reacting is not available yet",
-            )
-            .disabled(true),
+            // Opens the quick-react strip under this bubble, drawn inline
+            // rather than as a popup the virtual list cannot anchor. The
+            // same emojis are on the message's context menu, which is the
+            // route keyboard users take.
+            action(ids.react.clone(), ProductIcon::Smile.into(), "React").on_click(
+                move |_, _window, cx| {
+                    picker_entity.update(cx, |app, cx| app.toggle_reaction_picker(&picker_id, cx));
+                },
+            ),
         )
         .child(
             action(ids.reply.clone(), ProductIcon::Reply.into(), "Reply").on_click(

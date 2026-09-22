@@ -1386,6 +1386,27 @@ impl Bridge {
                 );
                 CommandOutcome::Accepted
             }
+            Action::SendReaction(oxidezap_ipc::SendReaction {
+                chat_jid,
+                message_id,
+                emoji,
+            }) => {
+                let Some(permit) = self.permit() else {
+                    return too_busy();
+                };
+                // Nothing to draw ahead of the send: the front end paints
+                // its own reaction optimistically and the network echo
+                // confirms it, so the task's answer is dropped like a send's
+                // own delivery is — `hold` only keeps the permit for it.
+                let task = client.send_reaction(chat_jid, message_id, emoji);
+                hold(
+                    permit,
+                    [oxidezap_session::spawn(async move {
+                        let _ = task.await;
+                    })],
+                );
+                CommandOutcome::Accepted
+            }
             Action::SendAudio(oxidezap_ipc::SendAudio {
                 jid,
                 upload,
@@ -2252,6 +2273,14 @@ mod tests {
         })
     }
 
+    fn send_reaction() -> Action {
+        Action::SendReaction(oxidezap_ipc::SendReaction {
+            chat_jid: fixtures::PEER.to_string(),
+            message_id: "3EB0A".to_string(),
+            emoji: "👍".to_string(),
+        })
+    }
+
     /// The refusal for being busy asks the client to retry, so it must not
     /// have spent what the retry would need. `media::take` removes the only
     /// copy of a staged payload: taking it before the permit meant "retry
@@ -2342,6 +2371,24 @@ mod tests {
         let _held = saturate(&bridge);
 
         assert_eq!(bridge.act(&client, send_text()).await, too_busy());
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    /// A reaction holds a permit like a send does: a busy refusal — not a
+    /// queued send — when none is free, and accepted once one is.
+    #[tokio::test]
+    async fn a_reaction_without_a_free_permit_is_refused() {
+        let mut bridge = connected();
+        let client = client();
+        let held = saturate(&bridge);
+
+        assert_eq!(bridge.act(&client, send_reaction()).await, too_busy());
+
+        drop(held);
+        assert_eq!(
+            bridge.act(&client, send_reaction()).await,
+            CommandOutcome::Accepted
+        );
         client.close(Duration::from_secs(1)).await;
     }
 

@@ -766,6 +766,20 @@ pub struct SendMedia {
     pub quoted: Option<QuotedMessage>,
 }
 
+/// React to a message with an emoji. See [`ClientRequest::SendReaction`].
+///
+/// Small enough for the socket, unlike the sends above it: an emoji is a
+/// few bytes, so there is no staging and no local id — the front end draws
+/// nothing ahead of the send. An empty `emoji` removes our reaction rather
+/// than adding one, the same spelling the session's own `send_reaction`
+/// already accepts on the wire protocol's path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendReaction {
+    pub chat_jid: String,
+    pub message_id: String,
+    pub emoji: String,
+}
+
 /// Put a `.wasm` in the daemon's plugin folder. See
 /// [`ClientRequest::InstallPlugin`].
 ///
@@ -941,6 +955,13 @@ pub enum ClientRequest {
     /// recording knows its length and its shape, and a file knows its name
     /// and its type.
     SendMedia(Box<SendMedia>),
+    /// React to a message, or remove our reaction with an empty emoji.
+    ///
+    /// Boxed for the reason the three sends above it are: the largest frame
+    /// on this half of the protocol sets the size of every request. The wire
+    /// is unchanged — `Box` is transparent to serde — and the round-trip
+    /// test pins the bytes.
+    SendReaction(Box<SendReaction>),
     /// Tell the peer whether we are typing. One request rather than two,
     /// because it is one piece of state with two values.
     Typing(Typing),
@@ -1840,6 +1861,14 @@ mod tests {
                     quoted: None,
                 })),
                 r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-2","kind":"document","mime_type":"application/pdf","file_name":"nota.pdf","local_id":null}"#.to_string(),
+            ),
+            (
+                ClientRequest::SendReaction(Box::new(SendReaction {
+                    chat_jid: "559900000001@s.whatsapp.net".into(),
+                    message_id: "3EB0A".into(),
+                    emoji: "👍".into(),
+                })),
+                r#"{"request":"send_reaction","chat_jid":"559900000001@s.whatsapp.net","message_id":"3EB0A","emoji":"👍"}"#.to_string(),
             ),
             (
                 ClientRequest::Typing(Typing {

@@ -363,6 +363,20 @@ pub struct RetryMessage {
     pub id: gpui::SharedString,
 }
 
+/// React to one message with one emoji, or un-react when it names the
+/// reaction already drawn as ours.
+///
+/// Carries its subject like [`ReplyToMessage`]: a timeline has no selection,
+/// and both the quick-react strip and the context menu are opened on a
+/// specific bubble. `no_json` for the same reason — there is no emoji to
+/// write into a keymap.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct ReactToMessage {
+    pub id: gpui::SharedString,
+    pub emoji: gpui::SharedString,
+}
+
 use crate::components::{
     AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft, new_timeline_state,
     render_paste_preview,
@@ -918,6 +932,10 @@ pub struct WhatsAppApp {
     /// The message being replied to, mirrored here so the send path can
     /// attach it and the composer can show it.
     reply_to: Option<ReplyDraft>,
+    /// The message whose quick-react strip is open, if any. One at a time:
+    /// the strip is drawn inline under its bubble, and two open strips would
+    /// each move the timeline the other measured against.
+    reaction_picker_for: Option<String>,
     /// Who is typing and who is around. Expires on its own, so it is view
     /// state rather than anything the store carries.
     presence: PresenceRegistry,
@@ -1355,6 +1373,7 @@ impl WhatsAppApp {
             mobile_panel: MobilePanel::default(),
             chat_filter: ChatFilter::default(),
             reply_to: None,
+            reaction_picker_for: None,
             presence: PresenceRegistry::new(),
             account_name: None,
             account_jid: None,
@@ -2135,6 +2154,11 @@ impl WhatsAppApp {
     /// Get the selected chat JID
     pub fn selected_chat_jid(&self) -> Option<String> {
         self.selected_chat.clone()
+    }
+
+    /// The message whose quick-react strip is open, if any.
+    pub fn reaction_picker_for(&self) -> Option<&str> {
+        self.reaction_picker_for.as_deref()
     }
 
     /// Get the currently selected chat data
@@ -3936,6 +3960,9 @@ impl Render for WhatsAppApp {
             }))
             .on_action(cx.listener(|app, retry: &RetryMessage, window, cx| {
                 app.retry_send(&retry.id, window, cx);
+            }))
+            .on_action(cx.listener(|app, react: &ReactToMessage, window, cx| {
+                app.toggle_reaction(&react.id, &react.emoji, window, cx);
             }))
             .on_action(|copy: &CopyMessage, _window, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.text.to_string()));

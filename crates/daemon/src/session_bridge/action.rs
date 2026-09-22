@@ -26,6 +26,7 @@ pub enum Action {
     SendText(oxidezap_ipc::SendText),
     SendAudio(oxidezap_ipc::SendAudio),
     SendMedia(oxidezap_ipc::SendMedia),
+    SendReaction(oxidezap_ipc::SendReaction),
     MarkRead(oxidezap_ipc::MarkRead),
     MarkStatusWatched(oxidezap_ipc::MarkStatusWatched),
     Typing(oxidezap_ipc::Typing),

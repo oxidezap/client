@@ -109,6 +109,9 @@ pub(super) async fn handle_request(
         ClientRequest::SendMedia(request) => {
             acted(dispatch(hub, commands, Action::SendMedia(*request)).await)
         }
+        ClientRequest::SendReaction(request) => {
+            acted(dispatch(hub, commands, Action::SendReaction(*request)).await)
+        }
         ClientRequest::Typing(request) => {
             acted(dispatch(hub, commands, Action::Typing(request)).await)
         }
