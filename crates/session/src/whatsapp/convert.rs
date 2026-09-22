@@ -108,14 +108,10 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
 
 /// A stored poll creation as the bubble's votable content.
 ///
-/// Reads the v3 creation first: v1/v2 creations predate the secret the vote
-/// needs, and `vote_poll` resolves the same way, so the bubble and the vote
-/// never disagree about which options exist.
-fn poll_of(message: &wa::Message) -> Option<PollContent> {
-    let creation = message
-        .poll_creation_message_v3
-        .as_option()
-        .or_else(|| message.poll_creation_message.as_option())?;
+/// Reads the same creation variants the vote resolves, so the bubble and
+/// the ballot never disagree about which options exist.
+pub(super) fn poll_of(message: &wa::Message) -> Option<PollContent> {
+    let creation = poll_creation_of(message)?;
     Some(PollContent {
         question: creation.name.clone().unwrap_or_default(),
         // One entry per raw option, unnamed ones kept as empty
@@ -131,6 +127,33 @@ fn poll_of(message: &wa::Message) -> Option<PollContent> {
             .collect(),
         selectable_count: creation.selectable_options_count.unwrap_or(1).max(1),
     })
+}
+
+/// The poll creation a message carries, in any version the store files as
+/// a poll.
+///
+/// One spelling shared by the bubble and the ballot: `poll_of` draws from
+/// it and `vote_poll` votes against it, so a variant added here reaches
+/// both and a variant missing here misleads neither. v3 first, then v2,
+/// then v1 — all three are the same struct, and v3 is what current clients
+/// send. v4 is a future-proof wrapper around the same creation, unwrapped
+/// for the reason `materialize` peels it: `get_base_message` does not open
+/// it, so without this a v4 poll is a creation no lookup below can see.
+/// v5/v6 stay out: the classifier files them as unknown rather than polls,
+/// and teaching the bubble to draw one while the vote refuses it would be
+/// the disagreement this sharing exists to prevent.
+pub(super) fn poll_creation_of(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
+    let base = message.get_base_message();
+    let base = base
+        .poll_creation_message_v4
+        .as_option()
+        .and_then(|wrapper| wrapper.message.as_option())
+        .map(|inner| inner.get_base_message())
+        .unwrap_or(base);
+    base.poll_creation_message_v3
+        .as_option()
+        .or_else(|| base.poll_creation_message_v2.as_option())
+        .or_else(|| base.poll_creation_message.as_option())
 }
 
 /// Map the store's durable delivery state onto the one the UI draws.
@@ -301,5 +324,43 @@ mod tests {
         assert_eq!(poll.options.len(), 2);
         assert_eq!(poll.options[0], String::new());
         assert_eq!(poll.options[1], "Praia");
+    }
+
+    fn stored_poll_v2() -> oxidezap_chat_store::StoredMessage {
+        let mut stored = stored_poll_creation();
+        let proto = stored.message.as_mut().expect("proto");
+        let creation = proto.poll_creation_message_v3.take().expect("v3 creation");
+        proto.poll_creation_message_v2 = MessageField::some(creation);
+        stored.kind = oxidezap_chat_store::MessageKind::Poll;
+        stored
+    }
+
+    /// v2 creations hydrate like v3 ones: same struct, same ballot, and the
+    /// vote resolves the same variant.
+    #[test]
+    fn a_v2_creation_hydrates_as_a_votable_poll() {
+        let message = stored_to_chat_message(stored_poll_v2());
+        let poll = message.poll.expect("a v2 creation hydrates a poll");
+        assert_eq!(poll.question, "Onde jantamos?");
+        assert_eq!(poll.options.len(), 2);
+    }
+
+    /// A v4 future-proof wrapper opens onto the creation inside:
+    /// `get_base_message` does not peel it, so without this the poll
+    /// renders with no options despite being stored as one.
+    #[test]
+    fn a_v4_wrapped_creation_hydrates_as_a_votable_poll() {
+        let mut stored = stored_poll_v2();
+        let proto = stored.message.take().expect("proto");
+        stored.message = Some(Box::new(wa::Message {
+            poll_creation_message_v4: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(*proto),
+            }),
+            ..Default::default()
+        }));
+        let message = stored_to_chat_message(stored);
+        let poll = message.poll.expect("a v4 creation hydrates a poll");
+        assert_eq!(poll.question, "Onde jantamos?");
+        assert_eq!(poll.options.len(), 2);
     }
 }

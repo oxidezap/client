@@ -220,6 +220,7 @@ impl WhatsAppApp {
         }
         if ballot.is_empty() {
             self.my_poll_votes.remove(&key);
+            debug!("poll vote cleared for {message_id}");
         } else {
             if let Some(client) = self.client.as_ref() {
                 client.vote_poll(chat_jid, message_id, ballot.clone());

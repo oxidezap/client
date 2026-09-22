@@ -50,7 +50,7 @@ mod tests;
 mod browser_tests;
 
 use calls::CallRegistry;
-use convert::{account_event, quote_context};
+use convert::{account_event, poll_of, quote_context};
 use durability::ChatStoreDurabilityHook;
 use lanes::EventLanes;
 use paging::{participant_keyed_chat, read_message_range};
@@ -2013,11 +2013,18 @@ impl WhatsAppClient {
         // Try to extract media content
         let media_result = media::media_now(base_msg, client, eager).await;
 
+        // A poll draws its question, not its absence of a body: creations
+        // carry neither text nor media, so without this a live poll is a
+        // `[Media]` bubble until the next reload rehydrates it from the
+        // store. Same extraction the stored path uses, so the two agree.
+        let poll = poll_of(base_msg);
+
         // Extract text content
         let content = msg
             .text_content()
             .map(|s| s.to_string())
             .or_else(|| msg.get_caption().map(|s| s.to_string()))
+            .or_else(|| poll.as_ref().map(|poll| poll.question.clone()))
             .unwrap_or_else(|| {
                 if media_result.is_some() {
                     String::new() // Empty for media-only messages
@@ -2070,7 +2077,7 @@ impl WhatsAppClient {
             quoted: quoted_from(base_msg),
             revoked: false,
             system: None,
-            poll: None,
+            poll,
         };
 
         if let Some(media) = media_result {

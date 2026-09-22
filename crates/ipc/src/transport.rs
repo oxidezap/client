@@ -5,6 +5,14 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 36: `ClientRequest::VotePoll`, which carries a poll ballot to the daemon
+/// the way the sends above it carry their payloads. A v35 daemon does not
+/// know the request and refuses it as malformed — and the daemon is the
+/// half that deliberately outlives an upgrade, so without a version an
+/// upgraded window would offer votes that are refused after the tap while
+/// optimistically drawing them as cast. Exactly the case v15, v21, v23,
+/// v24, v25, v27 and v35 were bumped for.
+///
 /// 35: `ClientRequest::SendReaction`, which carries a message reaction to
 /// the daemon the way the sends above it carry their payloads. A v34 daemon
 /// does not know the request and refuses it as malformed — and the daemon
@@ -264,7 +272,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 36;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

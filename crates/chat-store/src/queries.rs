@@ -1256,6 +1256,59 @@ impl ChatStore {
         }
     }
 
+    /// A poll creation's secret from the library's `msg_secrets` index.
+    ///
+    /// The fallback when the stored proto carries no secret: rows compacted
+    /// before poll votes existed had their secret-only envelope stripped,
+    /// and history re-inserts never overwrite them, so those polls would
+    /// otherwise stay unvotable forever. The library captures the secret
+    /// into this same file at receive time (and seeds history in bulk),
+    /// keyed by non-AD chat and sender exactly as derived here — the same
+    /// derivation its own `MsgSecretEntry::new` uses, so the two cannot
+    /// drift. `None` when no row is there (pruned, or never captured), in
+    /// which case the vote is refused rather than guessed.
+    pub async fn poll_secret(
+        &self,
+        chat: &Jid,
+        sender: &Jid,
+        msg_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let device_id = self.device_id();
+        let chat_key = chat.to_non_ad_string();
+        // A direct message is filed under the chat itself, a group message
+        // under its author — the sender rule the library's index is written
+        // with.
+        let sender_key = if sender.is_same_chat_as(chat) {
+            chat_key.clone()
+        } else {
+            sender.to_non_ad_string()
+        };
+        let msg_id = msg_id.to_owned();
+        let secret = self
+            .db()
+            .read(move |conn| {
+                #[derive(diesel::QueryableByName)]
+                struct SecretRow {
+                    #[diesel(sql_type = diesel::sql_types::Binary)]
+                    secret: Vec<u8>,
+                }
+                let row: Option<SecretRow> = diesel::sql_query(
+                    "SELECT secret FROM msg_secrets WHERE device_id = ? AND chat = ? \
+                     AND sender = ? AND msg_id = ? LIMIT 1",
+                )
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .bind::<diesel::sql_types::Text, _>(&chat_key)
+                .bind::<diesel::sql_types::Text, _>(&sender_key)
+                .bind::<diesel::sql_types::Text, _>(&msg_id)
+                .get_result(conn)
+                .optional()
+                .map_err(db_err)?;
+                Ok(row.map(|row| row.secret))
+            })
+            .await?;
+        Ok(secret)
+    }
+
     /// Every reaction on one message.
     ///
     /// The page query with a page of one, so there is a single statement to
