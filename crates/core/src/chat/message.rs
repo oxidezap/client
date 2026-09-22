@@ -53,6 +53,12 @@ pub struct ChatMessage {
     pub revoked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemNotice>,
+    /// A poll this message opens, if it is one. Tallies are not carried:
+    /// votes arrive as separate updates and counting them is a separate
+    /// pass, so what a bubble draws is the question and what can be voted
+    /// on. `None` on every other message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<PollContent>,
 }
 
 /// What a failed message can be sent again as.
@@ -62,6 +68,18 @@ pub struct ChatMessage {
 pub enum Resend<'a> {
     Text(&'a str),
     VoiceNote(&'a MediaContent),
+}
+
+/// A poll a message opens: its question and its votable options.
+///
+/// Tallies are deliberately absent — see [`ChatMessage::poll`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollContent {
+    pub question: String,
+    pub options: Vec<String>,
+    /// How many options one vote may select. One on every creation this
+    /// client has seen; carried because the protocol allows more.
+    pub selectable_count: u32,
 }
 
 impl ChatMessage {
@@ -98,6 +116,7 @@ impl ChatMessage {
             quoted: None,
             revoked: false,
             system: None,
+            poll: None,
         }
     }
 
@@ -126,6 +145,7 @@ impl ChatMessage {
             quoted: None,
             revoked: false,
             system: None,
+            poll: None,
         }
     }
 
@@ -190,6 +210,9 @@ impl ChatMessage {
     /// - For text-only messages: the message content
     /// - For media messages: "[MediaType] caption" or just "[MediaType]"
     pub fn preview_text(&self) -> String {
+        if let Some(poll) = &self.poll {
+            return format!("\u{1f4ca} {}", poll.question);
+        }
         if let Some(media) = &self.media {
             let label = media.media_type.display_label();
             // Check caption first, then fall back to content
@@ -278,6 +301,20 @@ mod tests {
 
         message.sender_name = Some("Ana".into());
         assert_eq!(message.author_label(), "Ana");
+    }
+
+    /// A poll reads as its question in the list, marked as a poll so it
+    /// does not pass for something somebody typed.
+    #[test]
+    fn a_poll_previews_as_its_question() {
+        let mut message =
+            ChatMessage::new_incoming("m".into(), "a@s.whatsapp.net".into(), String::new());
+        message.poll = Some(PollContent {
+            question: "Onde jantamos?".into(),
+            options: vec!["Centro".into(), "Praia".into()],
+            selectable_count: 1,
+        });
+        assert_eq!(message.preview_text(), "\u{1f4ca} Onde jantamos?");
     }
 
     /// Their message in your own chat is not yours to have ticks on at all.

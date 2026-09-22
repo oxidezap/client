@@ -13,7 +13,7 @@ mod reactions;
 mod retain;
 
 pub use media::{DownloadableMedia, MediaContent, MediaType, OutgoingMedia};
-pub use message::{ChatMessage, Resend};
+pub use message::{ChatMessage, PollContent, Resend};
 pub use retain::ReleasedMedia;
 
 use chrono::{DateTime, Utc};

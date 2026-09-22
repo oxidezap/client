@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use oxidezap_core::{ChatMessage, MessageStatus, UiEvent};
+use oxidezap_core::{ChatMessage, MessageStatus, PollContent, UiEvent};
 use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::waproto::whatsapp as wa;
@@ -52,9 +52,17 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         .then_some(stored.message.as_deref())
         .flatten()
         .and_then(|m| media::media_of(m.get_base_message(), None));
+    let poll = (!stored.revoked)
+        .then_some(stored.message.as_deref())
+        .flatten()
+        .and_then(|m| poll_of(m.get_base_message()));
     let content = match (&stored.text, stored.revoked) {
         (_, true) => "[Message deleted]".to_string(),
         (Some(text), _) => text.clone(),
+        (None, _) if poll.is_some() => poll
+            .as_ref()
+            .map(|p| p.question.clone())
+            .unwrap_or_default(),
         (None, _) if media.is_some() => String::new(),
         (None, _) => format!("[{}]", stored.kind.as_str()),
     };
@@ -94,7 +102,29 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         quoted,
         revoked: stored.revoked,
         system: None,
+        poll,
     }
+}
+
+/// A stored poll creation as the bubble's votable content.
+///
+/// Reads the v3 creation first: v1/v2 creations predate the secret the vote
+/// needs, and `vote_poll` resolves the same way, so the bubble and the vote
+/// never disagree about which options exist.
+fn poll_of(message: &wa::Message) -> Option<PollContent> {
+    let creation = message
+        .poll_creation_message_v3
+        .as_option()
+        .or_else(|| message.poll_creation_message.as_option())?;
+    Some(PollContent {
+        question: creation.name.clone().unwrap_or_default(),
+        options: creation
+            .options
+            .iter()
+            .filter_map(|o| o.option_name.clone())
+            .collect(),
+        selectable_count: creation.selectable_options_count.unwrap_or(1).max(1),
+    })
 }
 
 /// Map the store's durable delivery state onto the one the UI draws.
@@ -180,5 +210,70 @@ pub(super) fn account_event(client: &Arc<Client>) -> UiEvent {
         name: Some(device.push_name.clone()).filter(|name| !name.is_empty()),
         jid: device.pn.as_ref().map(ToString::to_string),
         lid: device.lid.as_ref().map(ToString::to_string),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whatsapp_rust::buffa::MessageField;
+
+    fn stored_poll_creation() -> oxidezap_chat_store::StoredMessage {
+        let proto = wa::Message {
+            poll_creation_message_v3: MessageField::some(wa::message::PollCreationMessage {
+                name: Some("Onde jantamos?".into()),
+                options: ["Centro", "Praia"]
+                    .iter()
+                    .map(|name| wa::message::poll_creation_message::Option {
+                        option_name: Some((*name).to_owned()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                selectable_options_count: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        oxidezap_chat_store::StoredMessage {
+            chat_jid: "559900000001-1620000000@g.us".parse().unwrap(),
+            id: "3EB0C".to_string(),
+            sender_jid: "559900000001@s.whatsapp.net".parse().unwrap(),
+            from_me: false,
+            timestamp: wacore::time::now_utc(),
+            kind: oxidezap_chat_store::MessageKind::Poll,
+            text: None,
+            message: Some(Box::new(proto)),
+            status: oxidezap_chat_store::MessageStatus::Delivered,
+            starred: false,
+            edited_at: None,
+            revoked: false,
+            seq: 1,
+        }
+    }
+
+    /// A stored poll creation hydrates as a votable poll, with the question
+    /// as its content so previews and search read what the bubble draws.
+    #[test]
+    fn a_stored_poll_creation_hydrates_as_a_votable_poll() {
+        let message = stored_to_chat_message(stored_poll_creation());
+        let poll = message.poll.expect("a poll creation hydrates a poll");
+        assert_eq!(poll.question, "Onde jantamos?");
+        assert_eq!(
+            poll.options,
+            vec!["Centro".to_string(), "Praia".to_string()]
+        );
+        assert_eq!(poll.selectable_count, 1);
+        assert_eq!(message.content, "Onde jantamos?");
+    }
+
+    /// A revoked poll is a tombstone, not a ballot: no options to draw and
+    /// nothing to vote on.
+    #[test]
+    fn a_revoked_poll_hydrates_without_poll_content() {
+        let mut stored = stored_poll_creation();
+        stored.revoked = true;
+        let message = stored_to_chat_message(stored);
+        assert!(message.poll.is_none());
+        assert_eq!(message.content, "[Message deleted]");
     }
 }

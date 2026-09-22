@@ -1535,6 +1535,24 @@ impl Bridge {
                 }
                 CommandOutcome::Accepted
             }
+            Action::VotePoll(oxidezap_ipc::VotePoll {
+                chat_jid,
+                poll_id,
+                selected_option_indices,
+            }) => {
+                // Off this loop like a wire vote: the ballot encrypts to
+                // the creation's secret and the network round trip is not
+                // this loop's work. A failure is a log line — the bubble
+                // draws the options, not the outcome, and there is no
+                // staged send to un-draw.
+                let task = client.vote_poll(chat_jid, poll_id, selected_option_indices);
+                oxidezap_session::spawn(async move {
+                    if let Err(detail) = task.await {
+                        log::warn!("poll vote failed: {detail}");
+                    }
+                });
+                CommandOutcome::Accepted
+            }
             // The daemon mirrors what the caller just did to its own call
             // state, because a call placed here is not an event anybody could
             // replay: `OutgoingCallStarted` only renames one that already
@@ -2389,6 +2407,30 @@ mod tests {
             bridge.act(&client, send_reaction()).await,
             CommandOutcome::Accepted
         );
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    /// A vote is taken, not staged: there is no bubble to un-draw on
+    /// refusal, so the session takes it and a ballot it cannot cast is a
+    /// log line rather than an outcome. Here there is no session at all,
+    /// and the answer is still acceptance — the failure has nowhere to go
+    /// that the voter could act on.
+    #[tokio::test]
+    async fn a_vote_is_accepted_and_cast_off_the_command_path() {
+        let mut bridge = connected();
+        let client = client();
+
+        let outcome = bridge
+            .act(
+                &client,
+                Action::VotePoll(oxidezap_ipc::VotePoll {
+                    chat_jid: fixtures::PEER.to_string(),
+                    poll_id: "3EB0C".to_string(),
+                    selected_option_indices: vec![0],
+                }),
+            )
+            .await;
+        assert_eq!(outcome, CommandOutcome::Accepted);
         client.close(Duration::from_secs(1)).await;
     }
 

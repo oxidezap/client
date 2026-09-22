@@ -2070,6 +2070,7 @@ impl WhatsAppClient {
             quoted: quoted_from(base_msg),
             revoked: false,
             system: None,
+            poll: None,
         };
 
         if let Some(media) = media_result {

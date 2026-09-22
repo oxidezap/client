@@ -466,6 +466,7 @@ fn render_chat_area(
                         cache,
                         message_list,
                         entity.clone(),
+                        SharedString::from(chat.jid.clone()),
                         is_group,
                         is_own_number,
                         layout,

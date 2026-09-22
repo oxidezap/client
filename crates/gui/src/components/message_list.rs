@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Entity, IntoElement, ListAlignment, ListState, ParentElement, Styled, div,
-    list, prelude::FluentBuilder as _,
+    AnyElement, App, Entity, IntoElement, ListAlignment, ListState, ParentElement, SharedString,
+    Styled, div, list, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::scroll::Scrollbar;
@@ -55,10 +55,12 @@ pub fn new_timeline_state(item_count: usize, metrics: Metrics) -> ListState {
 /// instead moves the list — and the scrollbar with it. And the bar goes over
 /// the bounds `state` reports, so the overlay it sits in only has to cover
 /// the pane.
+#[allow(clippy::too_many_arguments)]
 pub fn render_message_list(
     cache: MessageListCache,
     state: &ListState,
     entity: Entity<WhatsAppApp>,
+    chat_jid: SharedString,
     is_group: bool,
     is_own_number: bool,
     layout: ResponsiveLayout,
@@ -120,6 +122,7 @@ pub fn render_message_list(
                         &text,
                         ix,
                         &entity,
+                        &chat_jid,
                         is_group,
                         is_own_number,
                         layout,
@@ -159,6 +162,7 @@ fn render_row(
     text: &[BubbleText],
     ix: usize,
     entity: &Entity<WhatsAppApp>,
+    chat_jid: &SharedString,
     is_group: bool,
     is_own_number: bool,
     layout: ResponsiveLayout,
@@ -224,6 +228,7 @@ fn render_row(
                 ids: ids.clone(),
                 text: text.clone(),
                 message: Arc::clone(msg),
+                chat_jid: chat_jid.clone(),
                 playing_message_id: app.playing_message_id().map(|s| s.to_string()),
                 is_group,
                 is_own_number,

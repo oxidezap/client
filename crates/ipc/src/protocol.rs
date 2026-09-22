@@ -832,6 +832,15 @@ pub struct MarkStatusWatched {
     pub message_ids: Vec<String>,
 }
 
+/// A vote on a poll. See [`ClientRequest::VotePoll`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VotePoll {
+    pub chat_jid: String,
+    pub poll_id: String,
+    /// Options by index into the creation's option list.
+    pub selected_option_indices: Vec<u32>,
+}
+
 /// One page of a chat's messages. See [`ClientRequest::LoadMessages`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadMessages {
@@ -1010,6 +1019,15 @@ pub enum ClientRequest {
     /// Nothing is sent to anyone. A status read receipt is a privacy setting
     /// the library does not expose.
     MarkStatusWatched(MarkStatusWatched),
+    /// Vote on a poll by option index.
+    ///
+    /// Fire-and-forget like typing, not staged like a send: there is no
+    /// bubble to rename on refusal, and the vote the daemon cannot cast is
+    /// one the session answers with a log line rather than a state change.
+    /// The option names, the secret and the creator behind the indexes come
+    /// from the stored creation message, so a vote on a poll this device
+    /// never saw is refused rather than guessed.
+    VotePoll(VotePoll),
     /// One page of a chat's messages, older than `before`.
     ///
     /// Answered with [`DaemonMessage::Messages`] under the request's id. This
@@ -1896,6 +1914,14 @@ mod tests {
                     message_ids: vec!["3EB0A".into(), "3EB0B".into()],
                 }),
                 r#"{"request":"mark_status_watched","message_ids":["3EB0A","3EB0B"]}"#.to_string(),
+            ),
+            (
+                ClientRequest::VotePoll(VotePoll {
+                    chat_jid: "559900000001-1620000000@g.us".into(),
+                    poll_id: "3EB0C".into(),
+                    selected_option_indices: vec![1],
+                }),
+                r#"{"request":"vote_poll","chat_jid":"559900000001-1620000000@g.us","poll_id":"3EB0C","selected_option_indices":[1]}"#.to_string(),
             ),
             (
                 ClientRequest::LoadMessages(LoadMessages {

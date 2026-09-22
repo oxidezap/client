@@ -8,6 +8,7 @@
 
 pub mod audio;
 mod media;
+mod poll;
 mod quote;
 mod reactions;
 mod system;
@@ -28,6 +29,7 @@ pub use system::render_encryption_notice;
 
 pub(crate) use media::sticker_payload_is_valid;
 use media::{MediaProps, render_media_content};
+use poll::render_poll;
 use quote::render_quote;
 use reactions::{render_hover_actions, render_reaction_picker, render_reactions};
 
@@ -55,6 +57,9 @@ pub struct BubbleProps {
     /// `ChatMessage` is four `String`s, a reaction map, a quote and a media
     /// handle, and the list builds one of these per visible row per frame.
     pub message: Arc<ChatMessage>,
+    /// Which conversation this row is drawn in. A bubble does not carry it
+    /// — the vote names the chat, so it travels in beside the message.
+    pub chat_jid: SharedString,
     pub playing_message_id: Option<String>,
     pub is_group: bool,
     /// Whether the conversation is with your own number, which is what makes
@@ -246,6 +251,16 @@ pub fn render_message_bubble(
                                 .children(message.quoted.as_ref().map(|quoted| {
                                     render_quote(quoted, entity.clone(), metrics, cx)
                                 }))
+                                .children(message.poll.as_ref().map(|poll| {
+                                    render_poll(
+                                        poll,
+                                        props.chat_jid.clone(),
+                                        &message_id,
+                                        entity.clone(),
+                                        metrics,
+                                        cx,
+                                    )
+                                }))
                                 .when_some(message.media.clone(), |el, media_content| {
                                     render_media_content(
                                         el,
@@ -273,7 +288,7 @@ pub fn render_message_bubble(
                                         .flex_wrap()
                                         .items_end()
                                         .gap(metrics.space_md())
-                                        .when(!content.is_empty(), |el| {
+                                        .when(message.poll.is_none() && !content.is_empty(), |el| {
                                             el.child(
                                                 div()
                                                     .flex_1()

@@ -31,6 +31,10 @@ pub enum Action {
     MarkStatusWatched(oxidezap_ipc::MarkStatusWatched),
     Typing(oxidezap_ipc::Typing),
     Call(CallAction),
+    /// A vote on a poll, by option index. Answered like typing: accepted
+    /// means the session took it, and a vote it cannot cast (unknown poll,
+    /// bad index, missing secret) is a log line rather than a state change.
+    VotePoll(oxidezap_ipc::VotePoll),
     /// Fetch media and answer on `answer_to` rather than through the command's
     /// own reply, which resolves in microseconds while this takes seconds.
     Download {

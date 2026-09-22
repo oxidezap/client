@@ -148,6 +148,8 @@ pub(crate) fn chat_message_to_dto(chat_jid: &str, msg: ChatMessage) -> MessageDt
         (kind, Some(dto))
     } else if msg.system.is_some() {
         ("call", None)
+    } else if msg.poll.is_some() {
+        ("poll", None)
     } else {
         ("text", None)
     };
@@ -188,6 +190,11 @@ pub(crate) fn chat_message_to_dto(chat_jid: &str, msg: ChatMessage) -> MessageDt
         reply_to_id: msg.quoted.map(|q| q.message_id),
         media,
         reactions,
+        poll: msg.poll.map(|poll| oxidezap_wire::dto::MessagePollDto {
+            question: poll.question,
+            options: poll.options,
+            selectable_count: poll.selectable_count,
+        }),
     }
 }
 

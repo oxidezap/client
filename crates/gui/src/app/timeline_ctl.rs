@@ -177,6 +177,30 @@ impl WhatsAppApp {
     }
 
     /// The emojis the quick-react strip offers, in the order it offers them.
+    /// Vote on a poll option.
+    ///
+    /// One tap, one option: multi-select polls exist on the wire and the
+    /// vote carries a list for them, but the bubble offers one option per
+    /// tap rather than a ballot to assemble. Offline the daemon would
+    /// refuse, so the tap is refused here where the window can say why.
+    pub fn vote_poll(
+        &mut self,
+        chat_jid: &str,
+        message_id: &str,
+        option_index: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_send() {
+            warn!("Cannot vote: this window is offline");
+            return;
+        }
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        client.vote_poll(chat_jid, message_id, vec![option_index]);
+        let _ = cx;
+    }
+
     ///
     /// Fixed rather than the full emoji table: this is a reaction control,
     /// not an emoji picker, and anything typed beyond these travels the

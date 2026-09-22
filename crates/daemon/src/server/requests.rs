@@ -115,6 +115,9 @@ pub(super) async fn handle_request(
         ClientRequest::Typing(request) => {
             acted(dispatch(hub, commands, Action::Typing(request)).await)
         }
+        ClientRequest::VotePoll(request) => {
+            acted(dispatch(hub, commands, Action::VotePoll(request)).await)
+        }
         ClientRequest::Call(action) => acted(dispatch(hub, commands, Action::Call(action)).await),
         // The bytes come back as `Downloaded` under this id, seconds later,
         // from the task the action spawns.

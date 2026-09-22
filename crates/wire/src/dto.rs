@@ -47,6 +47,11 @@ pub struct MessageDto {
     pub reply_to_id: Option<String>,
     pub media: Option<MediaDto>,
     pub reactions: Vec<ReactionDto>,
+    /// The poll this message opens, when `kind` is `"poll"`. Tallies are
+    /// not carried — see [`PollDto` as built by `poll_view_to_dto`]: votes
+    /// arrive as separate updates and this task counts none of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<MessagePollDto>,
 }
 
 /// Media attachment metadata.
@@ -128,6 +133,18 @@ pub struct PollOptionDto {
     pub name: String,
     pub vote_count: u32,
     pub voters: Vec<String>,
+}
+
+/// A poll carried on a message, as the creation describes it.
+///
+/// Separate from [`PollDto`] on purpose: that one names a stored poll by
+/// id and chat for the poll endpoints, while this one travels on the
+/// message that opens it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagePollDto {
+    pub question: String,
+    pub options: Vec<String>,
+    pub selectable_count: u32,
 }
 
 /// User presence status.

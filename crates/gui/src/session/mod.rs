@@ -92,7 +92,7 @@ use oxidezap_ipc::{CallAction, ClientRequest, Link, PageCursor, Request, Request
 // request's own payload, built here and moved onto the wire unchanged.
 use oxidezap_ipc::{
     Download, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, SendAudio, SendMedia,
-    SendReaction, SendText, Typing,
+    SendReaction, SendText, Typing, VotePoll,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
@@ -1295,6 +1295,20 @@ impl SessionHandle {
         self.tell(ClientRequest::MarkRead(MarkRead {
             jid: jid.to_string(),
             through_message_id,
+        }));
+    }
+
+    /// Vote on a poll by option index.
+    ///
+    /// Fire-and-forget like typing: there is no bubble to rename on refusal,
+    /// and the daemon answers a vote it cannot cast with a log line. The
+    /// caller names the chat because a bubble does not know which
+    /// conversation it is drawn in.
+    pub fn vote_poll(&self, chat_jid: &str, poll_id: &str, selected_option_indices: Vec<u32>) {
+        self.tell(ClientRequest::VotePoll(VotePoll {
+            chat_jid: chat_jid.to_string(),
+            poll_id: poll_id.to_string(),
+            selected_option_indices,
         }));
     }
 
