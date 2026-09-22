@@ -647,6 +647,11 @@ mod imp {
                         icon_url,
                     },
                 ) {
+                    // `close()` dispatches `close` later: remove both JS
+                    // references before dropping the Rust closures, or the
+                    // delayed event invokes a destroyed wasm-bindgen closure.
+                    previous.notification.set_onclose(None);
+                    previous.notification.set_onclick(None);
                     previous.notification.close();
                     if let Some(url) = previous.icon_url.as_deref() {
                         let _ = web_sys::Url::revoke_object_url(url);
@@ -667,6 +672,10 @@ mod imp {
                 let stale = live.get(tag).is_some_and(|entry| entry.id == id);
                 if stale {
                     if let Some(entry) = live.remove(tag) {
+                        // This callback may still be running; detach it
+                        // before its owning closure leaves the live map.
+                        entry.notification.set_onclose(None);
+                        entry.notification.set_onclick(None);
                         if let Some(url) = entry.icon_url.as_deref() {
                             let _ = web_sys::Url::revoke_object_url(url);
                         }
@@ -718,6 +727,10 @@ mod imp {
             };
             // Remove before closing: a close event must not see an old entry.
             for (_, entry) in live.drain() {
+                // A manual close queues a later close event. Detach its
+                // handlers before dropping their Rust owners.
+                entry.notification.set_onclose(None);
+                entry.notification.set_onclick(None);
                 entry.notification.close();
                 if let Some(url) = entry.icon_url.as_deref() {
                     let _ = web_sys::Url::revoke_object_url(url);
