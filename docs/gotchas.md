@@ -1728,3 +1728,25 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   only on `NotAuthorized`, keeping just a `Found` from it. docs/roadmap.md
   carries what that costs.
 
+- **Pastes and drops confirm before anything uploads, and the caption goes on
+  the first file.** The modal pastes and drops share (`gui`'s
+  `open_confirmation`) previews what would go out — the picture where one was
+  pasted, a file row naming the rest — beside a caption box, and nothing
+  reaches the media pipeline until Send. The file chooser keeps its immediate
+  send, where no confirmation was ever promised. One caption for the trip, on
+  the first file: a quote is consumed once for the same reason, and a caption
+  repeated on every file of four reads as four captions at the other end. The
+  echo bubble carries it as its text, which is how an incoming captioned
+  photo arrives, so the sender sees what the recipient will.
+- **A page's pastes arrive through the document's `paste` event, not the
+  asynchronous clipboard API.** The event carries the files directly — every
+  kind, including videos gpui's own paste handler skips — with no permission
+  prompt, while `navigator.clipboard.read()` prompts and then answers with
+  what the event already gave. So the web half of `gui`'s clipboard read
+  answers nothing and the event listener owns pastes outright; text-only
+  pastes carry no files and fall through to gpui's handler, which inserts
+  them. By the same token nobody copies video *bytes*: a video reaches the
+  composer as copied files, which the clipboard reports as paths on macOS and
+  Windows and nowhere on Linux (both backends declare `text/uri-list`
+  without reading it) — file copy-paste degrades there and drag-and-drop
+  covers it.

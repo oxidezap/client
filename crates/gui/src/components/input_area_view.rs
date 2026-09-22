@@ -28,8 +28,8 @@ pub enum InputAreaEvent {
     /// files are chosen after the press — a dialog the composer neither owns
     /// nor waits for.
     AttachFiles,
-    /// An image pasted into this conversation.
-    PasteImage(u64, Rc<RefCell<Option<crate::platform::picker::Picked>>>),
+    /// Media pasted into this conversation.
+    PasteImage(u64, Rc<RefCell<Option<crate::platform::picker::Chosen>>>),
     /// An image paste was rejected before it could be sent.
     PasteImageError(u64, String),
     /// An image paste read completed without an image.
@@ -204,15 +204,15 @@ impl InputAreaView {
         let entity = cx.entity().downgrade();
         let task = crate::platform::clipboard::read(cx);
         cx.spawn(async move |_, cx| match task.await {
-            Ok(Some(file)) => {
+            Ok(chosen) if !chosen.is_empty() => {
                 let _ = entity.update(cx, |_, cx| {
                     cx.emit(InputAreaEvent::PasteImage(
                         paste_id,
-                        Rc::new(RefCell::new(Some(file))),
+                        Rc::new(RefCell::new(Some(chosen))),
                     ))
                 });
             }
-            Ok(None) => {
+            Ok(_) => {
                 let _ = entity.update(cx, |_, cx| {
                     cx.emit(InputAreaEvent::PasteImageFinished(paste_id));
                 });
@@ -747,10 +747,12 @@ mod tests {
         let observed = pasted_images.clone();
         let events = cx.update(|cx| {
             cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
-                if let InputAreaEvent::PasteImage(_, file) = event
-                    && let Some(file) = file.borrow().as_ref()
+                if let InputAreaEvent::PasteImage(_, chosen) = event
+                    && let Some(chosen) = chosen.borrow().as_ref()
                 {
-                    observed.borrow_mut().push(file.bytes.clone());
+                    observed
+                        .borrow_mut()
+                        .extend(chosen.files.iter().map(|file| file.bytes.clone()));
                 }
             })
         });

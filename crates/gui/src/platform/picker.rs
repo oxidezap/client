@@ -39,7 +39,7 @@ pub struct Picked {
 /// Two lists rather than a `Result` per file: picking four photos and one
 /// film should send the four and say what happened to the fifth, which a
 /// single failure cannot express and a silently shortened list does not say.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Chosen {
     /// The files that can be sent, in the order they were picked.
     pub files: Vec<Picked>,

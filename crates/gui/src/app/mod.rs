@@ -125,7 +125,8 @@ enum KeyboardOwner {
     /// A call that is ringing — not one that has been answered, which is a
     /// call people type through.
     RingingCall(String),
-    /// An image pasted into the composer, waiting for explicit confirmation.
+    /// Files pasted or dropped into the composer, waiting for explicit
+    /// confirmation before anything is uploaded.
     PastePreview,
     /// The fullscreen viewer, which owns the arrow keys while it is up.
     Viewer,
@@ -156,17 +157,22 @@ pub struct KeyboardSurfaces {
     /// `leave_connected_view` does not close it — while the error screen that
     /// replaces the conversation draws nothing of it.
     pub viewer: bool,
-    /// The modal preview for a pasted image.
+    /// The modal preview for files waiting to be sent.
     pub paste_preview: bool,
     /// The call card, which only the connected screens float.
     pub call_card: bool,
 }
 
+/// Files waiting in the send-confirmation modal: pasted from the clipboard
+/// or dropped onto the conversation, previewed with an optional caption
+/// before anything is uploaded.
 struct PendingPastePreview {
     jid: String,
     reply: Option<ReplyDraft>,
-    file: crate::platform::picker::Picked,
-    image: Arc<gpui::Image>,
+    files: Vec<crate::components::PreviewFile>,
+    /// The caption box. `None` where no window was available to build one
+    /// in — the modal still confirms, it just sends without a caption.
+    caption: Option<Entity<gpui_component::input::InputState>>,
     /// Whether the captured destination was the conversation on screen before
     /// this modal deliberately hid it from read/paging accounting.
     chat_was_visible: bool,
@@ -671,7 +677,10 @@ pub struct WhatsAppApp {
     pending_pastes: HashMap<u64, (String, Option<ReplyDraft>)>,
     paste_preview: Option<PendingPastePreview>,
     #[cfg(test)]
-    attachment_attempts: Vec<crate::platform::picker::Picked>,
+    /// What `send_attachment` was asked to send in tests: the file and the
+    /// caption that would have travelled with it, recorded before the
+    /// missing session refuses the send.
+    attachment_attempts: Vec<(crate::platform::picker::Picked, Option<String>)>,
     /// Scroll handle for chat list
     chat_list_scroll: VirtualListScrollHandle,
     /// The Status sidebar's scroll position, so that list can have a
@@ -708,6 +717,11 @@ pub struct WhatsAppApp {
     /// a later archived page), so resolving only against `chats` at click time
     /// would silently lose the action.
     notification_window: Option<gpui::AnyWindowHandle>,
+    /// The window the send-confirmation modal builds its caption field in.
+    /// An editor entity needs a live `Window` at construction, and the modal
+    /// opens from event continuations that only hold the app — the same
+    /// reason the notification path keeps its handle rather than a borrow.
+    modal_window: Option<gpui::AnyWindowHandle>,
     /// Clicked notifications whose chats are not hydrated in this window yet.
     /// Keep them in click order so a burst of responses is retried one by one;
     /// the newest click is consequently the final selection when both arrive.
@@ -1313,6 +1327,7 @@ impl WhatsAppApp {
             window_activation: None,
             notified_messages: IndexMap::new(),
             notification_window: None,
+            modal_window: None,
             pending_notification_tags: VecDeque::new(),
             latest_notification_tag: None,
             notification_retry_task: None,
@@ -2141,7 +2156,7 @@ impl WhatsAppApp {
         self.is_connected()
     }
 
-    /// Whether the conversation is covered by a pasted-image confirmation.
+    /// Whether the conversation is covered by the send-confirmation modal.
     pub fn paste_preview_showing(&self) -> bool {
         self.paste_preview.is_some()
     }
@@ -2807,31 +2822,21 @@ impl WhatsAppApp {
             InputAreaEvent::AttachFiles => {
                 self.attach_files(cx);
             }
-            InputAreaEvent::PasteImage(paste_id, file) => {
-                let Some(file) = file.borrow_mut().take() else {
+            InputAreaEvent::PasteImage(paste_id, chosen) => {
+                let Some(chosen) = chosen.borrow_mut().take() else {
                     return;
                 };
                 let Some((jid, reply)) = self.pending_pastes.remove(paste_id) else {
                     return;
                 };
-                let Some(format) = gpui::ImageFormat::from_mime_type(&file.mime_type) else {
-                    return;
-                };
-                if self.paste_preview.is_none() {
-                    let image = Arc::new(gpui::Image::from_bytes(format, file.bytes.clone()));
-                    let chat_was_visible = self.visible_chat.as_deref() == Some(jid.as_str());
-                    self.paste_preview = Some(PendingPastePreview {
-                        jid,
-                        reply,
-                        file,
-                        image,
-                        chat_was_visible,
-                    });
-                    cx.notify();
-                }
+                // A newcomer while the modal is open is dropped silently: on
+                // the web the document paste event opens the modal while the
+                // permission-gated clipboard read for the same content can
+                // still resolve afterwards.
+                self.open_confirmation(jid, reply, chosen, cx);
             }
             InputAreaEvent::PasteImageError(paste_id, error) => {
-                if self.pending_pastes.remove(paste_id).is_some() {
+                if self.pending_pastes.remove(paste_id).is_some() && self.paste_preview.is_none() {
                     self.notify_user(error, notices::Tone::Problem, cx);
                 }
             }
@@ -3326,6 +3331,12 @@ impl WhatsAppApp {
     /// callback's `&mut Window` would make a retry impossible.
     pub fn set_notification_window(&mut self, window: gpui::AnyWindowHandle) {
         self.notification_window = Some(window);
+    }
+
+    /// Give the send-confirmation modal a window to build its caption field
+    /// in. Called once, where the window is created beside the app.
+    pub fn set_modal_window(&mut self, window: gpui::AnyWindowHandle) {
+        self.modal_window = Some(window);
     }
 
     /// Retry queued notification responses after a chat/list hydration pass.
@@ -3986,7 +3997,8 @@ impl Render for WhatsAppApp {
 
         let paste_preview = self.paste_preview.as_ref().map(|preview| {
             render_paste_preview(
-                preview.image.clone(),
+                &preview.files,
+                preview.caption.as_ref(),
                 cx.entity().clone(),
                 self.can_send(),
                 &self.paste_preview_focus,

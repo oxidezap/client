@@ -113,6 +113,10 @@ fn open_the_window() {
                 // the next restart.
                 view.update(cx, |app, cx| {
                     app.set_notification_window(app_notification_window);
+                    // Beside it, so the send-confirmation modal can build
+                    // its caption field from event continuations that hold
+                    // the app but no window.
+                    app.set_modal_window(window.window_handle());
                     app.watch_theme_file(cx);
                     // After the window exists, so the ten seconds a cold
                     // start can spend waiting for a daemon to come up are

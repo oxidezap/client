@@ -366,11 +366,9 @@ mod tests {
         ]
     }
 
-    fn paste_preview_fixture(
+    fn connected_app_fixture(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {
-        use gpui::{ClipboardItem, Image, ImageFormat};
-
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
@@ -395,6 +393,9 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             app.update(cx, |app, cx| {
+                // Beside the app the way production does, so the modal can
+                // build its caption field.
+                app.set_modal_window(window.window_handle());
                 app.select_chat(
                     "peer@example.invalid".into(),
                     ChatOpen::ToCompose,
@@ -405,7 +406,15 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, app)
+    }
 
+    fn paste_preview_fixture(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {
+        use gpui::{ClipboardItem, Image, ImageFormat};
+
+        let (mut cx, app) = connected_app_fixture(cx);
         cx.write_to_clipboard(ClipboardItem::new_image(&Image {
             format: ImageFormat::Png,
             bytes: one_pixel_png(),
@@ -468,9 +477,9 @@ mod tests {
         cx.read(|cx| {
             let app = app.read(cx);
             assert_eq!(app.attachment_attempts.len(), 1);
-            assert_eq!(app.attachment_attempts[0].file_name, "pasted.png");
-            assert_eq!(app.attachment_attempts[0].mime_type, "image/png");
-            assert_eq!(app.attachment_attempts[0].bytes, one_pixel_png());
+            assert_eq!(app.attachment_attempts[0].0.file_name, "pasted.png");
+            assert_eq!(app.attachment_attempts[0].0.mime_type, "image/png");
+            assert_eq!(app.attachment_attempts[0].0.bytes, one_pixel_png());
             assert!(app.paste_preview.is_none());
         });
         cx.simulate_click(send.center(), gpui::Modifiers::default());
@@ -511,6 +520,149 @@ mod tests {
             let app = app.read(cx);
             let composer = app.input_area.as_ref().unwrap().read(cx).focus_handle(cx);
             assert!(composer.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn preview_modal_renders_a_caption_box(cx: &mut gpui::TestAppContext) {
+        let (mut cx, _app) = paste_preview_fixture(cx);
+        assert!(
+            cx.debug_bounds("paste-preview-caption").is_some(),
+            "the confirmation modal must offer a caption box"
+        );
+    }
+
+    #[gpui::test]
+    fn caption_typed_in_modal_is_sent_with_the_image(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = paste_preview_fixture(cx);
+        cx.update(|window, cx| {
+            let caption = app
+                .read(cx)
+                .paste_preview
+                .as_ref()
+                .expect("preview open")
+                .caption
+                .clone()
+                .expect("caption box built");
+            caption.update(cx, |caption, cx| {
+                caption.set_value("olha a foto", window, cx);
+            });
+        });
+        let send = cx
+            .debug_bounds("paste-preview-send")
+            .expect("preview must render a Send control");
+        cx.simulate_click(send.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert_eq!(app.attachment_attempts.len(), 1);
+            // The caption travels with the send, the way the protocol's own
+            // does — the echo bubble it would land in is drawn from the same
+            // value (see `send_attachment`).
+            assert_eq!(app.attachment_attempts[0].1.as_deref(), Some("olha a foto"));
+        });
+    }
+
+    #[gpui::test]
+    fn dropped_file_waits_in_preview_instead_of_sending(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        let path = std::env::temp_dir().join(format!(
+            "oxidezap-modal-drop-{}-foto.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, one_pixel_png()).expect("write test file");
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.drop_paths(vec![path.clone()], cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(
+                app.attachment_attempts.is_empty(),
+                "a drop must not send before confirmation"
+            );
+            assert!(
+                app.paste_preview.is_some(),
+                "a drop must open the confirmation modal"
+            );
+        });
+        assert!(
+            cx.debug_bounds("paste-preview").is_some(),
+            "the dropped file must open a rendered preview"
+        );
+        let send = cx
+            .debug_bounds("paste-preview-send")
+            .expect("preview must render a Send control");
+        cx.simulate_click(send.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx).attachment_attempts.len(),
+                1,
+                "confirming the preview sends the dropped file"
+            );
+        });
+        std::fs::remove_file(path).expect("remove test file");
+    }
+
+    #[gpui::test]
+    fn dropped_video_confirms_as_a_file_without_an_image_preview(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        let path = std::env::temp_dir().join(format!(
+            "oxidezap-modal-drop-{}-clipe.mp4",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"not really a video").expect("write test file");
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.drop_paths(vec![path.clone()], cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        std::fs::remove_file(path).expect("remove test file");
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(app.attachment_attempts.is_empty());
+            let preview = app.paste_preview.as_ref().expect("preview open");
+            assert_eq!(preview.files.len(), 1);
+            assert_eq!(preview.files[0].file.mime_type, "video/mp4");
+            assert!(
+                preview.files[0].image.is_none(),
+                "a video has no poster frame this side can draw"
+            );
+        });
+        assert!(cx.debug_bounds("paste-preview").is_some());
+        assert!(
+            cx.debug_bounds("paste-preview-image").is_none(),
+            "a video must not draw the picture preview"
+        );
+    }
+
+    #[gpui::test]
+    fn second_paste_while_preview_open_is_dropped(cx: &mut gpui::TestAppContext) {
+        use gpui::{ClipboardItem, Image, ImageFormat};
+
+        let (mut cx, app) = paste_preview_fixture(cx);
+        cx.write_to_clipboard(ClipboardItem::new_image(&Image {
+            format: ImageFormat::Png,
+            bytes: one_pixel_png(),
+            id: 0,
+        }));
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-v"
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx)
+                    .paste_preview
+                    .as_ref()
+                    .map(|preview| preview.files.len()),
+                Some(1),
+                "a paste while the modal is open must not queue a second preview"
+            );
         });
     }
 

@@ -13,6 +13,10 @@
 
 use oxidezap_core::OutgoingMedia;
 
+use gpui_component::input::{InputEvent, InputState};
+
+use crate::components::PreviewFile;
+
 use super::*;
 
 impl WhatsAppApp {
@@ -26,7 +30,7 @@ impl WhatsAppApp {
     }
 
     pub(crate) fn drop_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
-        let Some((jid, reply)) = self.prepare_file_drop(cx) else {
+        let Some((jid, reply)) = self.prepare_incoming_files(cx) else {
             return;
         };
         let task = cx
@@ -34,12 +38,51 @@ impl WhatsAppApp {
             .spawn(async move { crate::platform::drop::read_paths(paths) });
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let chosen = task.await;
-            let _ = entity.update(cx, |app, cx| app.finish_attaching(&jid, reply, chosen, cx));
+            let _ = entity.update(cx, |app, cx| match chosen {
+                Ok(chosen) => app.offer_dropped_files(jid, reply, chosen, cx),
+                Err(error) => {
+                    app.notify_user(error, notices::Tone::Problem, cx);
+                }
+            });
         })
         .detach();
     }
 
-    pub(crate) fn prepare_file_drop(
+    /// Finish a drop (or a web paste) that arrived with its files already
+    /// read: confirm rather than send.
+    ///
+    /// A drop while the modal is open names itself: saying nothing would read
+    /// as the window swallowing the file. A paste in the same spot stays
+    /// silent — the web's duplicate clipboard read can resolve after the
+    /// modal already opened for it.
+    pub(crate) fn offer_dropped_files(
+        &mut self,
+        jid: String,
+        reply: Option<ReplyDraft>,
+        chosen: crate::platform::picker::Chosen,
+        cx: &mut Context<Self>,
+    ) {
+        if !chosen.files.is_empty() && self.paste_preview.is_some() {
+            for refusal in &chosen.refused {
+                self.notify_user(refusal.clone(), notices::Tone::Problem, cx);
+            }
+            self.notify_user(
+                "Finish or cancel the file preview first, then drop again.",
+                notices::Tone::Problem,
+                cx,
+            );
+            return;
+        }
+        self.open_confirmation(jid, reply, chosen, cx);
+    }
+
+    /// The destination an incoming file — dropped or pasted — would go to.
+    ///
+    /// `None` answers "nowhere": no conversation open, or nothing to send
+    /// with while offline. Callers drop the files silently on `None`; a
+    /// notice for every drag over Settings would nag, and the composer
+    /// underneath says why nothing can be sent already.
+    pub(crate) fn prepare_incoming_files(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<(String, Option<ReplyDraft>)> {
@@ -56,6 +99,62 @@ impl WhatsAppApp {
             return None;
         }
         Some((jid, self.reply_to.clone()))
+    }
+
+    /// Offer files for confirmation instead of sending them outright.
+    ///
+    /// Pastes and drops land here; the file chooser keeps its immediate send
+    /// below, where no confirmation was ever promised. Refusals are said out
+    /// loud whatever happens to the rest, and an empty arrival — everything
+    /// refused, or nothing at all — opens nothing.
+    pub(crate) fn open_confirmation(
+        &mut self,
+        jid: String,
+        reply: Option<ReplyDraft>,
+        chosen: crate::platform::picker::Chosen,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        for refusal in chosen.refused {
+            self.notify_user(refusal, notices::Tone::Problem, cx);
+        }
+        if chosen.files.is_empty() || self.paste_preview.is_some() {
+            return false;
+        }
+        let files = chosen
+            .files
+            .into_iter()
+            .map(PreviewFile::new)
+            .collect::<Vec<_>>();
+        // Built against the retained window: the modal opens from event
+        // continuations that hold the app but no window. Where none is left
+        // — tests that never set one, a window that closed mid-read — the
+        // modal still confirms, it just sends without a caption.
+        let caption = self.modal_window.and_then(|window| {
+            window
+                .update(cx, |_, window, cx| {
+                    cx.new(|cx| InputState::new(window, cx).placeholder("Add a caption"))
+                })
+                .ok()
+        });
+        if let Some(caption) = &caption {
+            let entity = cx.entity().clone();
+            cx.subscribe(caption, move |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    entity.update(cx, |app, cx| app.confirm_paste_preview(cx));
+                }
+            })
+            .detach();
+        }
+        let chat_was_visible = self.visible_chat.as_deref() == Some(jid.as_str());
+        self.paste_preview = Some(PendingPastePreview {
+            jid,
+            reply,
+            files,
+            caption,
+            chat_was_visible,
+        });
+        cx.notify();
+        true
     }
 
     /// Ask for files and send them into the open conversation.
@@ -133,7 +232,7 @@ impl WhatsAppApp {
         };
         let mut drawn = false;
         for file in chosen.files {
-            drawn |= self.send_attachment(jid, file, quoted.take(), cx);
+            drawn |= self.send_attachment(jid, file, quoted.take(), None, cx);
         }
 
         // Following the file down is only what the sender expects if they are
@@ -180,11 +279,32 @@ impl WhatsAppApp {
         let Some(preview) = self.paste_preview.take() else {
             return;
         };
-        let quoted = self.take_reply_draft(preview.reply, cx);
-        let drawn = self.send_attachment(&preview.jid, preview.file, quoted, cx);
+        let caption = preview
+            .caption
+            .as_ref()
+            .map(|caption| caption.read(cx).value().to_string())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        let super::PendingPastePreview {
+            jid,
+            reply,
+            files,
+            caption: _,
+            chat_was_visible,
+        } = preview;
+        let quoted = self.take_reply_draft(reply, cx);
+        // One caption for the trip, and it goes on the first file: quoting
+        // once is the same rule the refusals follow, and a caption repeated
+        // on every file of four reads as four captions to the recipient.
+        let mut quoted = quoted;
+        let mut caption = caption;
+        let mut drawn = false;
+        for file in files {
+            drawn |= self.send_attachment(&jid, file.file, quoted.take(), caption.take(), cx);
+        }
         let destination_still_open = self.destination == Destination::Chats
-            && self.selected_chat.as_deref() == Some(preview.jid.as_str());
-        if drawn && preview.chat_was_visible && destination_still_open {
+            && self.selected_chat.as_deref() == Some(jid.as_str());
+        if drawn && chat_was_visible && destination_still_open {
             self.scroll_to_last_message();
         }
         cx.notify();
@@ -193,16 +313,22 @@ impl WhatsAppApp {
     /// Hand one file to the session and draw its bubble.
     ///
     /// Answers whether a bubble was added, which is what decides if the
-    /// timeline should follow it down.
+    /// timeline should follow it down. A caption, where one was typed in the
+    /// confirmation modal, travels both ways the protocol's own does: into
+    /// the upload, and into the echo bubble's text — which is how an
+    /// incoming captioned photo arrives, so the sender sees what the
+    /// recipient will.
     pub(super) fn send_attachment(
         &mut self,
         jid: &str,
         file: crate::platform::picker::Picked,
         quoted: Option<QuotedMessage>,
+        caption: Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
         #[cfg(test)]
-        self.attachment_attempts.push(file.clone());
+        self.attachment_attempts
+            .push((file.clone(), caption.clone()));
 
         let Some(client) = &self.client else {
             warn!("Cannot send a file: client is unavailable");
@@ -234,18 +360,14 @@ impl WhatsAppApp {
                 kind,
                 mime_type: file.mime_type,
                 file_name: file.file_name,
-                // Nothing types a caption yet: the composer's own text is a
-                // message of its own until there is a step between choosing a
-                // file and sending it for the caption to be typed in. The
-                // protocol carries one so that step is a front end change and
-                // not a protocol change.
-                caption: None,
+                caption: caption.clone(),
             },
             local_id.clone(),
             quoted.clone(),
         );
 
-        let mut message = ChatMessage::new_outgoing_with_media(local_id, String::new(), media);
+        let mut message =
+            ChatMessage::new_outgoing_with_media(local_id, caption.unwrap_or_default(), media);
         // The bubble shows the quote too, or the sender sees a bare photo
         // where the recipient sees a reply.
         message.quoted = quoted;
