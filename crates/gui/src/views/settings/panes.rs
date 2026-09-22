@@ -535,6 +535,7 @@ fn storage(
     cx: &App,
 ) -> AnyElement {
     let usage = app.storage_usage(cx);
+    let can_clear_media = usage.is_some_and(|u| u.media_files > 0);
 
     div()
         .flex()
@@ -601,8 +602,8 @@ fn storage(
                         Button::new("clear-media-cache")
                             .label("Clear cached media")
                             .outline()
-                            .disabled(usage.is_none_or(|u| u.media_files == 0))
-                            .cursor_pointer()
+                            .disabled(!can_clear_media)
+                            .when(can_clear_media, |button| button.cursor_pointer())
                             .on_click(move |_, _window, cx| {
                                 entity.update(cx, |app, cx| app.clear_media_cache(cx));
                             }),

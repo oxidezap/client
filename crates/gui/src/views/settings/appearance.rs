@@ -317,7 +317,7 @@ fn render_font_size(
                             .small()
                             .tooltip("Smaller")
                             .disabled(size <= MIN_FONT_SIZE)
-                            .cursor_pointer()
+                            .when(size > MIN_FONT_SIZE, |button| button.cursor_pointer())
                             .on_click(move |_, window, cx| {
                                 smaller.update(cx, |app, cx| app.step_font_size(-1.0, window, cx));
                             }),
@@ -330,7 +330,7 @@ fn render_font_size(
                             .small()
                             .tooltip("Larger")
                             .disabled(size >= MAX_FONT_SIZE)
-                            .cursor_pointer()
+                            .when(size < MAX_FONT_SIZE, |button| button.cursor_pointer())
                             .on_click(move |_, window, cx| {
                                 larger.update(cx, |app, cx| app.step_font_size(1.0, window, cx));
                             }),
@@ -421,7 +421,7 @@ fn render_theme_file(
                             .primary()
                             .small()
                             .disabled(!is_dirty)
-                            .cursor_pointer()
+                            .when(is_dirty, |button| button.cursor_pointer())
                             .on_click(move |_, _window, cx| {
                                 save_entity.update(cx, |app, cx| app.save_theme(cx));
                             }),

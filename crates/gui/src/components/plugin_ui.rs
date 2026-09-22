@@ -93,7 +93,7 @@ fn widget(
             .ghost()
             .small()
             .disabled(!live)
-            .cursor_pointer()
+            .when(live, |button| button.cursor_pointer())
             .on_click(move |_, _window, cx| {
                 let (plugin, action) = (plugin.clone(), action.clone());
                 entity.update(cx, |app, cx| {

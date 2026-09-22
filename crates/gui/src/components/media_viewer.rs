@@ -9,7 +9,7 @@ use std::sync::Arc;
 use gpui::StyledImage as _;
 use gpui::{
     App, Entity, Image, ImageSource, InteractiveElement, IntoElement, ParentElement, RenderImage,
-    SharedString, StatefulInteractiveElement, Styled, div, img,
+    SharedString, StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -273,7 +273,7 @@ fn render_bar(
                 } else {
                     "Nothing to save: this file could not be read"
                 })
-                .cursor_pointer()
+                .when(can_save, |button| button.cursor_pointer())
                 .on_click(move |_, _window, cx| {
                     save_entity.update(cx, |app, cx| app.save_media(&message_id, cx));
                 }),
@@ -360,6 +360,6 @@ fn step_button<F: Fn(&mut App) + 'static>(
         .large()
         .tooltip(tooltip)
         .disabled(!enabled)
-        .cursor_pointer()
+        .when(enabled, |button| button.cursor_pointer())
         .on_click(move |_, _window, cx| on_click(cx))
 }

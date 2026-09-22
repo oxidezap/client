@@ -10,7 +10,7 @@ use std::sync::Arc;
 use gpui::StyledImage as _;
 use gpui::{
     App, Entity, Image, ImageSource, InteractiveElement as _, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, div, img,
+    SharedString, StatefulInteractiveElement as _, Styled, div, img, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -295,6 +295,6 @@ fn step_button<F: Fn(&mut App) + 'static>(
         .large()
         .tooltip(tooltip)
         .disabled(!enabled)
-        .cursor_pointer()
+        .when(enabled, |button| button.cursor_pointer())
         .on_click(move |_, _window, cx| on_click(cx))
 }

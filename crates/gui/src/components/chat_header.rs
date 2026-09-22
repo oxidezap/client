@@ -332,20 +332,20 @@ fn render_actions(
         })
         .when(callable && layout.show_call_buttons(), |el| {
             el.child(
-                action("voice-call", ProductIcon::Phone.into(), "Voice call").on_click(
-                    move |_, _window, cx| {
+                action("voice-call", ProductIcon::Phone.into(), "Voice call")
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
                         call_entity
                             .update(cx, |app, cx| app.start_call(call_jid.clone(), false, cx));
-                    },
-                ),
+                    }),
             )
             .child(
-                action("video-call", ProductIcon::Video.into(), "Video call").on_click(
-                    move |_, _window, cx| {
+                action("video-call", ProductIcon::Video.into(), "Video call")
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
                         video_entity
                             .update(cx, |app, cx| app.start_call(video_jid.clone(), true, cx));
-                    },
-                ),
+                    }),
             )
         })
         .child(render_overflow_menu(
@@ -378,6 +378,7 @@ fn render_overflow_menu(
         "More",
         layout.icon_button_size(),
     )
+    .cursor_pointer()
     .dropdown_menu(move |menu, _window, _cx| {
         let search_entity = search_entity.clone();
         let call_entity = call_entity.clone();

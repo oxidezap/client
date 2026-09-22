@@ -120,7 +120,7 @@ fn render_play_button(
         .h(metrics.avatar_inline())
         .disabled(!can_play)
         .tooltip(if is_playing { "Pause" } else { "Play" })
-        .cursor_pointer()
+        .when(can_play, |button| button.cursor_pointer())
         .on_click(move |_, _window, cx| {
             let message_id = message_id.clone();
             entity.update(cx, |app, cx| {

@@ -146,11 +146,14 @@ pub fn icon_button(
     tooltip: impl Into<SharedString>,
     frame: Pixels,
 ) -> Button {
+    // No cursor here: `Button` replays the caller's style over its disabled
+    // state, so a pointer set inside this helper would stay on while a
+    // caller chains `.disabled(..)`. Each clickable call site sets its own,
+    // gated on the same condition as its handler where one exists.
     Button::new(id)
         .icon(icon)
         .ghost()
         .tooltip(tooltip)
-        .cursor_pointer()
         .w(frame)
         .h(frame)
 }
