@@ -246,7 +246,11 @@ impl WhatsAppApp {
             emoji.to_string()
         };
 
-        if let Some(session) = self.control() {
+        // The account connection, not the control plane: a reaction touches
+        // the account, and the daemon refuses account requests anywhere
+        // else. `control()` is the process-wide connection beside it, which
+        // is why this sent nothing on a page until it moved here.
+        if let Some(session) = &self.client {
             session.send_reaction(&chat_jid, message_id, &send);
         }
         // Optimistic, in the same form the echo will confirm: an empty send
