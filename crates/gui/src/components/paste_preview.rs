@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use gpui::{
     App, Entity, FocusHandle, Image, ImageSource, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, Styled as _, StyledImage as _, div, img, prelude::FluentBuilder as _,
+    ParentElement as _, StatefulInteractiveElement as _, Styled as _, StyledImage as _, div, img,
+    prelude::FluentBuilder as _,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
@@ -31,8 +32,13 @@ pub struct PreviewFile {
 }
 
 impl PreviewFile {
-    pub fn new(file: crate::platform::picker::Picked) -> Self {
-        let image = (crate::platform::picker::kind_for(&file.mime_type) == OutgoingMedia::Image)
+    /// One file waiting in the modal, decoding its preview image only where
+    /// asked: the modal draws the picture for a sole file and rows for a
+    /// batch, so decoding every image of a batch retains copies nothing
+    /// draws.
+    pub fn with_preview(file: crate::platform::picker::Picked, decode: bool) -> Self {
+        let image = (decode
+            && crate::platform::picker::kind_for(&file.mime_type) == OutgoingMedia::Image)
             .then(|| {
                 gpui::ImageFormat::from_mime_type(&file.mime_type)
                     .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())))
@@ -46,15 +52,30 @@ impl PreviewFile {
     }
 }
 
-pub fn render_paste_preview(
-    files: &[PreviewFile],
-    caption: Option<&Entity<InputState>>,
-    app: Entity<WhatsAppApp>,
-    can_send: bool,
-    focus_handle: &FocusHandle,
-    metrics: Metrics,
-    cx: &App,
-) -> impl IntoElement + use<> {
+/// What the send-confirmation modal draws, borrowed for the frame.
+///
+/// One struct rather than eight arguments: the modal outgrew the argument
+/// list when the file list learned to scroll.
+pub struct PastePreviewProps<'a> {
+    pub files: &'a [PreviewFile],
+    pub caption: Option<&'a Entity<InputState>>,
+    pub list_scroll: &'a gpui::ScrollHandle,
+    pub app: Entity<WhatsAppApp>,
+    pub can_send: bool,
+    pub focus_handle: &'a FocusHandle,
+    pub metrics: Metrics,
+}
+
+pub fn render_paste_preview(props: PastePreviewProps<'_>, cx: &App) -> impl IntoElement + use<> {
+    let PastePreviewProps {
+        files,
+        caption,
+        list_scroll,
+        app,
+        can_send,
+        focus_handle,
+        metrics,
+    } = props;
     div()
         .id("paste-preview")
         .debug_selector(|| "paste-preview".into())
@@ -76,7 +97,7 @@ pub fn render_paste_preview(
                 .text_color(parts::on_scrim(cx))
                 .child(title_for(files)),
         )
-        .child(render_files(files, metrics, cx))
+        .child(render_files(files, list_scroll, metrics, cx))
         .children(caption.map(|caption| {
             div()
                 .id("paste-preview-caption")
@@ -144,7 +165,12 @@ fn title_for(files: &[PreviewFile]) -> String {
 /// A video has no poster frame this side can draw — the composer holds no
 /// decoder — and a document has nothing to draw at all, so both are a row
 /// naming what would go out rather than a blank frame pretending to show it.
-fn render_files(files: &[PreviewFile], metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+fn render_files(
+    files: &[PreviewFile],
+    list_scroll: &gpui::ScrollHandle,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
     if let [only] = files
         && let Some(image) = only.image.clone()
     {
@@ -163,13 +189,24 @@ fn render_files(files: &[PreviewFile], metrics: Metrics, cx: &App) -> impl IntoE
             )
             .into_any_element();
     }
+    // Scrollable rather than centred: the picker bounds a selection in
+    // bytes, not in rows, so a batch of small files can outgrow the modal —
+    // and the modal swallows wheel events, so the list must catch them
+    // first. The wheel reaches this region before the root's stop, which is
+    // what keeps the caption and the controls where they are while the rows
+    // move. The `id` is load-bearing, not labelling: it wraps the region in
+    // `Stateful`, which is what the scroll builders below belong to.
     div()
+        .id("paste-preview-files")
+        .debug_selector(|| "paste-preview-files".into())
         .flex_1()
         .min_h_0()
         .flex()
         .flex_col()
         .justify_center()
         .gap(metrics.space_md())
+        .overflow_y_scroll()
+        .track_scroll(list_scroll)
         .children(files.iter().map(|file| render_file_row(file, metrics, cx)))
         .into_any_element()
 }
@@ -222,21 +259,30 @@ mod tests {
     #[test]
     fn title_names_what_would_go_out() {
         assert_eq!(
-            title_for(&[PreviewFile::new(picked("foto.png", "image/png"))]),
+            title_for(&[PreviewFile::with_preview(
+                picked("foto.png", "image/png"),
+                true
+            )]),
             "Send this image?"
         );
         assert_eq!(
-            title_for(&[PreviewFile::new(picked("clipe.mp4", "video/mp4"))]),
+            title_for(&[PreviewFile::with_preview(
+                picked("clipe.mp4", "video/mp4"),
+                true
+            )]),
             "Send this video?"
         );
         assert_eq!(
-            title_for(&[PreviewFile::new(picked("nota.pdf", "application/pdf"))]),
+            title_for(&[PreviewFile::with_preview(
+                picked("nota.pdf", "application/pdf"),
+                true
+            )]),
             "Send this file?"
         );
         assert_eq!(
             title_for(&[
-                PreviewFile::new(picked("foto.png", "image/png")),
-                PreviewFile::new(picked("clipe.mp4", "video/mp4")),
+                PreviewFile::with_preview(picked("foto.png", "image/png"), true),
+                PreviewFile::with_preview(picked("clipe.mp4", "video/mp4"), true),
             ]),
             "Send 2 files?"
         );
@@ -245,18 +291,29 @@ mod tests {
     #[test]
     fn only_drawable_pictures_decode_a_preview() {
         assert!(
-            PreviewFile::new(picked("foto.png", "image/png"))
+            PreviewFile::with_preview(picked("foto.png", "image/png"), true)
                 .image
                 .is_some()
         );
         // An SVG goes as a document, so there is nothing to draw.
         assert!(
-            PreviewFile::new(picked("desenho.svg", "image/svg+xml"))
+            PreviewFile::with_preview(picked("desenho.svg", "image/svg+xml"), true)
                 .image
                 .is_none()
         );
         assert!(
-            PreviewFile::new(picked("clipe.mp4", "video/mp4"))
+            PreviewFile::with_preview(picked("clipe.mp4", "video/mp4"), true)
+                .image
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_batch_holds_no_preview_copies() {
+        // The modal draws rows for a batch, not pictures, so decoding there
+        // retains bytes nothing draws.
+        assert!(
+            PreviewFile::with_preview(picked("foto.png", "image/png"), false)
                 .image
                 .is_none()
         );

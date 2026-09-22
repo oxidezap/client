@@ -309,19 +309,22 @@ mod imp {
                 Ok(Err(e)) => return Err(format!("the file chooser could not be opened: {e}")),
                 Err(_) => return Err("the file chooser closed without answering".to_string()),
             };
-            Ok(executor.spawn(async move { read_all(&paths) }).await)
+            Ok(executor
+                .spawn(async move { read_all(&paths, &mut super::Budget::default()) })
+                .await)
         }
     }
 
     /// Read what was picked, keeping what can be sent and saying what cannot.
     ///
     /// One budget across the whole selection, asked before each read: four
-    /// photos are read and held together, and nothing else bounds that.
-    fn read_all(paths: &[PathBuf]) -> Chosen {
+    /// photos are read and held together, and nothing else bounds that. The
+    /// budget arrives seeded where the selection started before the paths —
+    /// a clipboard holding images beside copied files charges those first.
+    fn read_all(paths: &[PathBuf], budget: &mut super::Budget) -> Chosen {
         let mut chosen = Chosen::default();
-        let mut budget = super::Budget::default();
         for path in paths {
-            match read_one(path, &mut budget) {
+            match read_one(path, budget) {
                 Ok(picked) => chosen.files.push(picked),
                 Err(refusal) => chosen.refused.push(refusal),
             }
@@ -330,7 +333,11 @@ mod imp {
     }
 
     pub(crate) fn read_paths(paths: &[PathBuf]) -> Chosen {
-        read_all(paths)
+        read_all(paths, &mut super::Budget::default())
+    }
+
+    pub(crate) fn read_paths_seeded(paths: &[PathBuf], budget: &mut super::Budget) -> Chosen {
+        read_all(paths, budget)
     }
 
     /// One file, or the sentence to show instead.
@@ -369,6 +376,13 @@ mod imp {
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn read_paths(paths: &[std::path::PathBuf]) -> Chosen {
     imp::read_paths(paths)
+}
+
+/// Read copied files against a budget already holding the clipboard images
+/// beside them, so one trip cannot carry twice its ceiling.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn read_paths_seeded(paths: &[std::path::PathBuf], budget: &mut Budget) -> Chosen {
+    imp::read_paths_seeded(paths, budget)
 }
 
 #[cfg(target_family = "wasm")]

@@ -65,6 +65,31 @@ fn split_entries(item: gpui::ClipboardItem) -> (Vec<Picked>, Vec<std::path::Path
     (images, paths, refused)
 }
 
+/// Charge already-in-hand images against the selection budget the copied
+/// files will draw from, refusing what the trip cannot carry.
+///
+/// Images arrive as bytes, so unlike chooser files there is no read to skip
+/// — but the ceiling they share with copied files still holds, or a
+/// near-limit image beside a near-limit file would ride out as twice it.
+fn fit_images(
+    images: Vec<Picked>,
+    budget: &mut crate::platform::picker::Budget,
+) -> (Vec<Picked>, Vec<String>) {
+    let mut kept = Vec::with_capacity(images.len());
+    let mut refused = Vec::new();
+    for image in images {
+        let size = image.bytes.len() as u64;
+        match budget.refuse(&image.file_name, size) {
+            Some(reason) => refused.push(reason),
+            None => {
+                budget.took(size);
+                kept.push(image);
+            }
+        }
+    }
+    (kept, refused)
+}
+
 #[cfg(not(target_family = "wasm"))]
 mod imp {
     use super::{Chosen, split_entries};
@@ -73,7 +98,10 @@ mod imp {
         let Some(item) = cx.read_from_clipboard() else {
             return gpui::Task::ready(Ok(Chosen::default()));
         };
-        let (images, paths, refused) = split_entries(item);
+        let (images, paths, mut refused) = split_entries(item);
+        let mut budget = crate::platform::picker::Budget::default();
+        let (images, over_budget) = super::fit_images(images, &mut budget);
+        refused.extend(over_budget);
         if paths.is_empty() {
             return gpui::Task::ready(Ok(Chosen {
                 files: images,
@@ -81,9 +109,10 @@ mod imp {
             }));
         }
         // Copied files are real file I/O and read like dropped ones: off
-        // the thread that draws the window.
+        // the thread that draws the window, against the budget the images
+        // already drew from.
         cx.background_executor().spawn(async move {
-            let mut chosen = crate::platform::picker::read_paths(&paths);
+            let mut chosen = crate::platform::picker::read_paths_seeded(&paths, &mut budget);
             chosen.files.splice(0..0, images);
             chosen.refused.splice(0..0, refused);
             Ok(chosen)
@@ -107,7 +136,8 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::split_entries;
+    use super::{fit_images, split_entries};
+    use crate::platform::picker::{Budget, Picked};
 
     #[test]
     fn text_clipboard_holds_no_media() {
@@ -146,5 +176,41 @@ mod tests {
         assert!(images.is_empty());
         assert!(refused.is_empty());
         assert_eq!(paths, vec![path]);
+    }
+
+    /// Images already in hand still share the trip budget with the copied
+    /// files beside them: a near-limit image must refuse room for a
+    /// near-limit file, not ride out beside it as twice the ceiling.
+    #[test]
+    fn images_share_the_trip_budget_with_copied_files() {
+        let ceiling = oxidezap_ipc::MAX_STAGED_BYTES;
+        let mut budget = Budget::default();
+        budget.took(ceiling - 8);
+        let image = Picked {
+            file_name: "pasted.png".to_string(),
+            mime_type: "image/png".to_string(),
+            bytes: vec![0; 16],
+        };
+        let (kept, refused) = fit_images(vec![image], &mut budget);
+        assert!(kept.is_empty());
+        assert_eq!(refused.len(), 1);
+    }
+
+    /// ...while an image that fits is charged, so the files after it draw
+    /// from what is left rather than from a fresh ceiling.
+    #[test]
+    fn a_fitting_image_is_charged_before_the_files() {
+        let ceiling = oxidezap_ipc::MAX_STAGED_BYTES;
+        let mut budget = Budget::default();
+        let image = Picked {
+            file_name: "pasted.png".to_string(),
+            mime_type: "image/png".to_string(),
+            bytes: vec![0; 16],
+        };
+        let (kept, refused) = fit_images(vec![image], &mut budget);
+        assert_eq!(kept.len(), 1);
+        assert!(refused.is_empty());
+        assert!(budget.refuse("clipe.mp4", ceiling).is_some());
+        assert!(budget.refuse("clipe.mp4", ceiling - 16).is_none());
     }
 }

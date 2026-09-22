@@ -172,7 +172,12 @@ impl ChatMessage {
         if !self.is_failed() {
             return None;
         }
-        if !self.content.is_empty() {
+        // Text only where there is nothing else: a captioned photo carries
+        // its caption as its content, and retrying that as a plain-text
+        // message would send the caption without the file. Failed media has
+        // no resendable form here — the echo of a video holds no bytes — so
+        // it offers no retry rather than a wrong one.
+        if self.media.is_none() && !self.content.is_empty() {
             return Some(Resend::Text(&self.content));
         }
         // A voice note has no text and is not therefore beyond recovery: the
@@ -286,5 +291,26 @@ mod tests {
         let mut message = ChatMessage::new_outgoing("m".into(), "hi".into());
         message.is_from_me = false;
         assert_eq!(message.delivery_in(true), None);
+    }
+
+    /// A failed captioned photo offers no text retry: its caption rides as
+    /// the content, and retrying that would send the caption as a new
+    /// plain-text message while the file stays unsent. Failed media has no
+    /// resendable form, so no retry is offered rather than a wrong one —
+    /// while a failed text still retries, and a failed voice note still
+    /// carries its opus.
+    #[test]
+    fn a_failed_captioned_photo_is_not_retried_as_text() {
+        use std::sync::Arc;
+
+        let media = MediaContent::image(Arc::new(b"bytes".to_vec()), "image/png".into(), false);
+        let mut photo =
+            ChatMessage::new_outgoing_with_media("m".into(), "olha a foto".into(), media);
+        photo.status = MessageStatus::Failed;
+        assert!(photo.resend().is_none());
+
+        let mut text = ChatMessage::new_outgoing("m".into(), "hi".into());
+        text.status = MessageStatus::Failed;
+        assert!(matches!(text.resend(), Some(Resend::Text("hi"))));
     }
 }

@@ -75,6 +75,17 @@ mod imp {
         let mut drop_app = cx.clone();
         let drop = Closure::new(move |event: web_sys::DragEvent| {
             event.prevent_default();
+            // Before the read: while the modal is open the files are still
+            // on the disk, so refusing here costs nothing and reading first
+            // would copy up to a trip's worth into memory merely to discard
+            // it. The race stays answered in `offer_dropped_files`.
+            if drop_entity
+                .update(&mut drop_app, |app, _| app.paste_preview_showing())
+                .unwrap_or(true)
+            {
+                let _ = drop_entity.update(&mut drop_app, |app, cx| app.warn_preview_busy(cx));
+                return;
+            }
             let Some(files) = event.data_transfer().and_then(|data| data.files()) else {
                 return;
             };
@@ -121,6 +132,15 @@ mod imp {
                 })
                 .unwrap_or_default();
             if files.is_empty() {
+                return;
+            }
+            // Silent while the modal is open, like every other paste: the
+            // files are still on the clipboard, and reading them first
+            // would hold a trip's worth of memory merely to discard it.
+            if paste_entity
+                .update(&mut paste_app, |app, _| app.paste_preview_showing())
+                .unwrap_or(true)
+            {
                 return;
             }
             let Some((jid, reply)) = paste_entity

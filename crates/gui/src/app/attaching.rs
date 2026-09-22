@@ -30,6 +30,15 @@ impl WhatsAppApp {
     }
 
     pub(crate) fn drop_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        // Before the read, not after it: while the modal is open the bytes
+        // are still on the disk, so refusing here costs nothing and reading
+        // first would hold up to a trip's worth of memory merely to discard
+        // it. The race — a modal opening between this check and the read
+        // finishing — stays answered in `offer_dropped_files`.
+        if self.paste_preview.is_some() {
+            self.warn_preview_busy(cx);
+            return;
+        }
         let Some((jid, reply)) = self.prepare_incoming_files(cx) else {
             return;
         };
@@ -51,10 +60,11 @@ impl WhatsAppApp {
     /// Finish a drop (or a web paste) that arrived with its files already
     /// read: confirm rather than send.
     ///
-    /// A drop while the modal is open names itself: saying nothing would read
-    /// as the window swallowing the file. A paste in the same spot stays
-    /// silent — the web's duplicate clipboard read can resolve after the
-    /// modal already opened for it.
+    /// The busy branch is the race the pre-read checks cannot close — a
+    /// modal opening between the check and the read finishing — so arrivals
+    /// normally never reach it. A drop there names itself, while a paste
+    /// stays silent: the web's duplicate clipboard read can resolve after
+    /// the modal already opened for it.
     pub(crate) fn offer_dropped_files(
         &mut self,
         jid: String,
@@ -66,14 +76,20 @@ impl WhatsAppApp {
             for refusal in &chosen.refused {
                 self.notify_user(refusal.clone(), notices::Tone::Problem, cx);
             }
-            self.notify_user(
-                "Finish or cancel the file preview first, then drop again.",
-                notices::Tone::Problem,
-                cx,
-            );
+            self.warn_preview_busy(cx);
             return;
         }
         self.open_confirmation(jid, reply, chosen, cx);
+    }
+
+    /// Tell whoever dropped a file onto a busy window to come back: saying
+    /// nothing would read as the window swallowing the file.
+    pub(crate) fn warn_preview_busy(&mut self, cx: &mut Context<Self>) {
+        self.notify_user(
+            "Finish or cancel the file preview first, then drop again.",
+            notices::Tone::Problem,
+            cx,
+        );
     }
 
     /// The destination an incoming file — dropped or pasted — would go to.
@@ -87,6 +103,13 @@ impl WhatsAppApp {
         cx: &mut Context<Self>,
     ) -> Option<(String, Option<ReplyDraft>)> {
         if self.destination != Destination::Chats {
+            return None;
+        }
+        // Settings replaces the conversation while the destination and the
+        // selection stay put, so without this a file pasted into a Settings
+        // field on the web — where the document listener hears every paste —
+        // would open a send modal over it, aimed at a hidden conversation.
+        if self.showing_settings(cx) {
             return None;
         }
         let jid = self.selected_chat.clone()?;
@@ -120,10 +143,15 @@ impl WhatsAppApp {
         if chosen.files.is_empty() || self.paste_preview.is_some() {
             return false;
         }
+        // The preview image is decoded only where it is drawn — a sole
+        // file. A batch near the selection ceiling would otherwise retain a
+        // second copy of every image in it until confirmation, which on a
+        // page comes out of the bounded linear memory.
+        let sole = chosen.files.len() == 1;
         let files = chosen
             .files
             .into_iter()
-            .map(PreviewFile::new)
+            .map(|file| PreviewFile::with_preview(file, sole))
             .collect::<Vec<_>>();
         // Built against the retained window: the modal opens from event
         // continuations that hold the app but no window. Where none is left
@@ -151,6 +179,7 @@ impl WhatsAppApp {
             reply,
             files,
             caption,
+            list_scroll: gpui::ScrollHandle::new(),
             chat_was_visible,
         });
         cx.notify();
@@ -276,6 +305,12 @@ impl WhatsAppApp {
     }
 
     pub(crate) fn confirm_paste_preview(&mut self, cx: &mut Context<Self>) {
+        // The keyboard path bypasses the rendered Send button's disabled
+        // state: leaving `Connected` with the modal open must keep the files
+        // waiting, not send through a lingering session or discard them.
+        if !self.can_send() {
+            return;
+        }
         let Some(preview) = self.paste_preview.take() else {
             return;
         };
@@ -290,6 +325,7 @@ impl WhatsAppApp {
             reply,
             files,
             caption: _,
+            list_scroll: _,
             chat_was_visible,
         } = preview;
         let quoted = self.take_reply_draft(reply, cx);

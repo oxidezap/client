@@ -666,6 +666,29 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn confirm_while_offline_keeps_the_preview_waiting(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = paste_preview_fixture(cx);
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                // The connection dropped with the modal open: the rendered
+                // Send button is disabled there, and the keyboard path must
+                // not bypass it — neither sending through a lingering session
+                // nor discarding the files.
+                app.app_state = AppState::Offline;
+                app.confirm_paste_preview(cx);
+            });
+        });
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(app.attachment_attempts.is_empty());
+            assert!(
+                app.paste_preview.is_some(),
+                "losing the connection must not consume the preview"
+            );
+        });
+    }
+
     #[test]
     fn body_invalidates_for_controllers_theme_resize_and_focus() {
         let (mut cx, window, app) = setup();

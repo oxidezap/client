@@ -173,6 +173,9 @@ struct PendingPastePreview {
     /// The caption box. `None` where no window was available to build one
     /// in — the modal still confirms, it just sends without a caption.
     caption: Option<Entity<gpui_component::input::InputState>>,
+    /// The file list's scroll position, so a batch taller than the modal
+    /// scrolls instead of painting into the caption and the controls.
+    list_scroll: gpui::ScrollHandle,
     /// Whether the captured destination was the conversation on screen before
     /// this modal deliberately hid it from read/paging accounting.
     chat_was_visible: bool,
@@ -384,8 +387,8 @@ pub struct ReactToMessage {
 }
 
 use crate::components::{
-    AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft, new_timeline_state,
-    render_paste_preview,
+    AccountSummary, InputAreaEvent, InputAreaView, PastePreviewProps, ReplyDraft,
+    new_timeline_state, render_paste_preview,
 };
 use log::{debug, error, info, warn};
 use wacore_binary::jid::{Jid, JidExt, observe_str};
@@ -3997,12 +4000,15 @@ impl Render for WhatsAppApp {
 
         let paste_preview = self.paste_preview.as_ref().map(|preview| {
             render_paste_preview(
-                &preview.files,
-                preview.caption.as_ref(),
-                cx.entity().clone(),
-                self.can_send(),
-                &self.paste_preview_focus,
-                cx.product().metrics,
+                PastePreviewProps {
+                    files: &preview.files,
+                    caption: preview.caption.as_ref(),
+                    list_scroll: &preview.list_scroll,
+                    app: cx.entity().clone(),
+                    can_send: self.can_send(),
+                    focus_handle: &self.paste_preview_focus,
+                    metrics: cx.product().metrics,
+                },
                 cx,
             )
             .into_any_element()
