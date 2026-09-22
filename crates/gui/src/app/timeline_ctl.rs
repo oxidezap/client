@@ -179,11 +179,11 @@ impl WhatsAppApp {
     /// The emojis the quick-react strip offers, in the order it offers them.
     /// Vote on a poll option.
     ///
-    /// One tap toggles one option, and every tap re-sends the whole ballot:
-    /// a multi-select poll accumulates taps this way, while a single-select
-    /// one replaces — the ballot the server holds is always the last one it
-    /// was sent, so the window keeps the same contract and never assembles
-    /// anything the wire would not accept. Offline the daemon would refuse,
+    /// One tap replaces the single-choice ballot. Multi-select voting is
+    /// disabled until the daemon owns the authoritative ballot: another tab
+    /// may already have selected options that this window cannot see, and
+    /// sending its local vector would silently replace those selections.
+    /// Offline the daemon would refuse,
     /// so the tap is refused here where the window can say why. The tap is
     /// drawn at once: the vote travels fire-and-forget and no event answers
     /// it, so waiting would leave the chosen option looking untapped until
@@ -210,20 +210,17 @@ impl WhatsAppApp {
             .and_then(|chat| chat.messages.iter().find(|m| m.id == message_id))
             .and_then(|message| message.poll.as_ref())
             .map_or(1, |poll| poll.selectable_count.max(1));
-        if ballot.contains(&option_index) {
-            if ballot.len() == 1 {
-                return;
-            }
-            ballot.retain(|index| *index != option_index);
-        } else if limit == 1 {
-            ballot = vec![option_index];
-        } else {
-            if ballot.len() >= limit as usize {
-                return;
-            }
-            ballot.push(option_index);
-            ballot.sort_unstable();
+        // Without the daemon's current ballot, a second tab cannot know
+        // whether this vote would replace selections made in the first.
+        // Refuse multi-select until authoritative ballots are available.
+        if limit > 1 {
+            warn!("Multiple-choice voting needs synchronized ballots");
+            return;
         }
+        if ballot.contains(&option_index) {
+            return; // No withdrawal frame is supported; do not lie to the user.
+        }
+        ballot = vec![option_index];
         let Some(client) = self.client.as_ref() else {
             return;
         };

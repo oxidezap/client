@@ -11,8 +11,8 @@
 use gpui::{
     App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder as _,
 };
-use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{ActiveTheme as _, Disableable as _};
 use gpui_component::{h_flex, v_flex};
 
 use crate::app::WhatsAppApp;
@@ -52,7 +52,7 @@ pub fn render_poll(
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().muted_foreground)
                 .child(if poll.selectable_count > 1 {
-                    "Select one or more"
+                    "Multiple choices · voting unavailable here"
                 } else {
                     "Select one"
                 }),
@@ -79,12 +79,17 @@ pub fn render_poll(
                         (Some(count), total) if total > 0 => count as f32 / total as f32,
                         _ => 0.0,
                     };
-                    let accent = cx.theme().accent;
+                    let accent = cx.theme().primary;
                     let track = cx.theme().secondary;
                     Button::new(SharedString::from(format!("poll-vote-{message_id}-{ix}")))
                         .ghost()
                         .w_full()
-                        .tooltip(format!("Vote for {option}"))
+                        .disabled(poll.selectable_count > 1)
+                        .tooltip(if poll.selectable_count > 1 {
+                            "Multiple-choice voting requires synchronized ballots".to_string()
+                        } else {
+                            format!("Vote for {option}")
+                        })
                         .on_click(move |_, _, cx| {
                             vote_entity.update(cx, |app, cx| {
                                 app.vote_poll(&vote_chat, &vote_id, index, cx)
@@ -155,7 +160,13 @@ fn render_radio(
         .rounded_full()
         .map(|el| {
             if voted {
-                el.bg(accent)
+                el.bg(accent).child(
+                    div()
+                        .w(metrics.space_sm())
+                        .h(metrics.space_sm())
+                        .rounded_full()
+                        .bg(cx.theme().primary_foreground),
+                )
             } else {
                 el.border_1().border_color(cx.theme().muted_foreground)
             }
