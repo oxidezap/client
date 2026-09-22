@@ -69,7 +69,12 @@ async fn poll_secret_resolves_the_other_chat_alias() {
     let peer = jid(PEER);
     store
         .put_msg_secrets(vec![MsgSecretEntry::new(
-            &peer, &peer, "POLL-ALIAS", [4u8; 32], 0, 1_700_000_000,
+            &peer,
+            &peer,
+            "POLL-ALIAS",
+            [4u8; 32],
+            0,
+            1_700_000_000,
         )])
         .await
         .expect("seed secret");
