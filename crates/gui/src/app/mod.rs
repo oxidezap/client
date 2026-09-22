@@ -792,6 +792,10 @@ pub struct WhatsAppApp {
     /// every row is a row without messages, so two of them can be opened
     /// before either load lands.
     owed_reads: std::collections::HashSet<String>,
+    /// The last option this window attempted to vote for. An attempted vote
+    /// is not a confirmed one: legacy IPC does not report async completion.
+    /// Kept only to display honest feedback and allow retry.
+    attempted_poll_votes: std::collections::HashMap<(String, String), u32>,
     /// Where both paged lists continue, and whether either is asking. See
     /// [`paging`].
     pages: Entity<paging::Pages>,
@@ -1328,6 +1332,7 @@ impl WhatsAppApp {
             departed_chats: std::collections::HashSet::new(),
             archived_scan: std::collections::HashSet::new(),
             owed_reads: std::collections::HashSet::new(),
+            attempted_poll_votes: std::collections::HashMap::new(),
             pages: cx.new(|_| paging::Pages::new()),
             watched_status: std::collections::HashSet::new(),
             viewer: cx.new(viewer::Viewer::new),
@@ -1983,6 +1988,7 @@ impl WhatsAppApp {
         // account's rows are not behind them.
         self.forget_paging(cx);
         self.owed_reads.clear();
+        self.attempted_poll_votes.clear();
         // The reader is a selection too, and a JID-keyed one. Left alone, it
         // pointed the new account at the old account's contact: at their
         // updates if that contact exists there — watched by nobody in this

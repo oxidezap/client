@@ -28,6 +28,7 @@ pub fn render_poll(
     poll: &PollContent,
     chat_jid: SharedString,
     message_id: &str,
+    attempted_vote: Option<u32>,
     vote_counts: Option<&[u32]>,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
@@ -51,6 +52,8 @@ pub fn render_poll(
                 .text_color(cx.theme().muted_foreground)
                 .child(if poll.selectable_count > 1 {
                     "Multiple choices · voting unavailable here"
+                } else if attempted_vote.is_some() {
+                    "Vote requested · not confirmed · tap to retry"
                 } else {
                     "Select one"
                 }),
@@ -68,6 +71,7 @@ pub fn render_poll(
                     let vote_chat = chat_jid.clone();
                     let vote_id = message_id.to_string();
                     let index = ix as u32;
+                    let attempted = attempted_vote == Some(index);
                     let count = counts.and_then(|c| c.get(ix).copied());
                     // A share of the total, or nothing when nobody counted: a bar at
                     // zero for an uncounted poll reads as "nobody voted", which is a
@@ -110,6 +114,13 @@ pub fn render_poll(
                                                 .text_color(cx.theme().foreground)
                                                 .child(SharedString::from(option.clone())),
                                         )
+                                        .children(attempted.then(|| {
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_size(metrics.text_small())
+                                                .text_color(cx.theme().primary)
+                                                .child("Requested")
+                                        }))
                                         .children(count.map(|count| {
                                             div()
                                                 .flex_shrink_0()

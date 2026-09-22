@@ -215,9 +215,19 @@ impl WhatsAppApp {
         }
         if let Some(client) = self.client.as_ref() {
             client.vote_poll(chat_jid, message_id, vec![option_index]);
-            debug!("poll vote requested for {message_id}; awaiting no confirmation on legacy IPC");
+            self.attempted_poll_votes
+                .insert((chat_jid.to_string(), message_id.to_string()), option_index);
+            self.invalidate_message_cache(chat_jid, cx);
+            cx.notify();
+            debug!("poll vote requested for {message_id}; no confirmation on legacy IPC");
         }
-        let _ = cx;
+    }
+
+    /// An attempt, not a confirmed selection. The bubble labels it as such.
+    pub fn attempted_poll_vote(&self, chat_jid: &str, message_id: &str) -> Option<u32> {
+        self.attempted_poll_votes
+            .get(&(chat_jid.to_string(), message_id.to_string()))
+            .copied()
     }
 
     ///

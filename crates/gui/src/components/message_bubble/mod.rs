@@ -60,6 +60,8 @@ pub struct BubbleProps {
     /// Which conversation this row is drawn in. A bubble does not carry it
     /// — the vote names the chat, so it travels in beside the message.
     pub chat_jid: SharedString,
+    /// Last vote requested here, not a confirmed vote.
+    pub attempted_vote: Option<u32>,
     pub playing_message_id: Option<String>,
     pub is_group: bool,
     /// Whether the conversation is with your own number, which is what makes
@@ -256,6 +258,7 @@ pub fn render_message_bubble(
                                         poll,
                                         props.chat_jid.clone(),
                                         &message_id,
+                                        props.attempted_vote,
                                         None,
                                         entity.clone(),
                                         metrics,
