@@ -1275,10 +1275,9 @@ impl ChatStore {
     ) -> Result<Option<Vec<u8>>> {
         let device_id = self.device_id();
         let chat_key = chat.to_non_ad_string();
-        // A direct message is filed under the chat itself, a group message
-        // under its author — the sender rule the library's index is written
-        // with.
-        let sender_key = if sender.is_same_chat_as(chat) {
+        // A direct message is filed under the chat itself even when an
+        // outgoing history row has no sender; group messages use the author.
+        let sender_key = if !chat.is_group() {
             chat_key.clone()
         } else {
             sender.to_non_ad_string()

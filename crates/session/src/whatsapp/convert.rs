@@ -144,12 +144,15 @@ pub(super) fn poll_of(message: &wa::Message) -> Option<PollContent> {
 /// the disagreement this sharing exists to prevent.
 pub(super) fn poll_creation_of(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
     let base = message.get_base_message();
-    let base = base
-        .poll_creation_message_v4
-        .as_option()
-        .and_then(|wrapper| wrapper.message.as_option())
-        .map(|inner| inner.get_base_message())
-        .unwrap_or(base);
+    let base = [
+        &base.group_mentioned_message,
+        &base.associated_child_message,
+        &base.poll_creation_message_v4,
+    ]
+    .into_iter()
+    .find_map(|wrapper| wrapper.as_option().and_then(|w| w.message.as_option()))
+    .map(|inner| inner.get_base_message())
+    .unwrap_or(base);
     base.poll_creation_message_v3
         .as_option()
         .or_else(|| base.poll_creation_message_v2.as_option())

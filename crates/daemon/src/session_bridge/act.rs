@@ -1545,13 +1545,19 @@ impl Bridge {
                 // this loop's work. A failure is a log line — the bubble
                 // draws the options, not the outcome, and there is no
                 // staged send to un-draw.
+                let Some(permit) = self.permit() else {
+                    return too_busy();
+                };
                 let task =
                     client.vote_poll(chat_jid.clone(), poll_id.clone(), selected_option_indices);
-                oxidezap_session::spawn(async move {
-                    if let Err(detail) = task.await {
-                        log::warn!("poll vote for {poll_id} failed: {detail}");
-                    }
-                });
+                hold(
+                    permit,
+                    [oxidezap_session::spawn(async move {
+                        if let Err(detail) = task.await {
+                            log::warn!("poll vote for {poll_id} failed: {detail}");
+                        }
+                    })],
+                );
                 CommandOutcome::Accepted
             }
             // The daemon mirrors what the caller just did to its own call

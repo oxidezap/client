@@ -187,9 +187,9 @@ impl WhatsAppApp {
     /// so the tap is refused here where the window can say why. The tap is
     /// drawn at once: the vote travels fire-and-forget and no event answers
     /// it, so waiting would leave the chosen option looking untapped until
-    /// the next reload. Toggling the last option off clears the local
-    /// ballot without sending: the session refuses an empty ballot, and the
-    /// server keeps the previous one.
+    /// the next reload. The last option cannot be toggled off: the session
+    /// refuses an empty ballot, so clearing it locally would falsely claim
+    /// the vote was withdrawn while the server still holds it.
     pub fn vote_poll(
         &mut self,
         chat_jid: &str,
@@ -205,28 +205,30 @@ impl WhatsAppApp {
         let mut ballot = self.my_poll_votes.get(&key).cloned().unwrap_or_default();
         // Single-select replaces where multi-select accumulates, read off
         // the poll itself so the two cannot disagree about what a tap means.
-        let single = self
+        let limit = self
             .find_chat(chat_jid)
             .and_then(|chat| chat.messages.iter().find(|m| m.id == message_id))
             .and_then(|message| message.poll.as_ref())
-            .is_none_or(|poll| poll.selectable_count <= 1);
+            .map_or(1, |poll| poll.selectable_count.max(1));
         if ballot.contains(&option_index) {
+            if ballot.len() == 1 {
+                return;
+            }
             ballot.retain(|index| *index != option_index);
-        } else if single {
+        } else if limit == 1 {
             ballot = vec![option_index];
         } else {
+            if ballot.len() >= limit as usize {
+                return;
+            }
             ballot.push(option_index);
             ballot.sort_unstable();
         }
-        if ballot.is_empty() {
-            self.my_poll_votes.remove(&key);
-            debug!("poll vote cleared for {message_id}");
-        } else {
-            if let Some(client) = self.client.as_ref() {
-                client.vote_poll(chat_jid, message_id, ballot.clone());
-            }
-            self.my_poll_votes.insert(key, ballot);
-        }
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        client.vote_poll(chat_jid, message_id, ballot.clone());
+        self.my_poll_votes.insert(key, ballot);
         self.invalidate_message_cache(chat_jid, cx);
         cx.notify();
     }
