@@ -23,7 +23,10 @@ pub fn request_authorization() {
 ///
 /// Returns `true` when the native path accepted the request. A non-macOS build,
 /// or a process not launched from an app bundle, returns `false` so callers
-/// can retain their normal GPUI path.
+/// can retain their normal GPUI path. On the web the request is posted through
+/// the browser's Notification API instead — GPUI's web backend leaves system
+/// notifications a no-op — and `false` means permission is missing or the API
+/// is unavailable, so the same GPUI fallback applies there too.
 pub fn show_notification_with_avatar(
     tag: &str,
     title: &str,
@@ -31,6 +34,18 @@ pub fn show_notification_with_avatar(
     avatar: impl Fn() -> Option<std::sync::Arc<Vec<u8>>> + Send + Sync + 'static,
 ) -> bool {
     imp::show_notification_with_avatar(tag, title, body, avatar)
+}
+
+/// Wait for the next web-notification click.
+///
+/// The browser hands a click to a JS callback, not to GPUI's response path,
+/// so the callback queues the tag and the application's pump task awaits it
+/// here, then opens the conversation through the ordinary
+/// [`crate::app::WhatsAppApp::open_system_notification`] path. Away from the
+/// web there is no such queue — clicks arrive through GPUI already — so this
+/// never resolves and the pump task parks forever.
+pub async fn next_notification_activation() -> String {
+    imp::next_notification_activation().await
 }
 
 #[cfg(target_os = "macos")]
@@ -87,6 +102,12 @@ mod imp {
 
     fn may_retry_plain(tag: &str, generation: u64, has_attachment: bool) -> bool {
         has_attachment && is_current_tag_submission(tag, generation)
+    }
+
+    /// Unreachable by construction: clicks arrive through GPUI's response
+    /// path here, so the pump task parked on this never wakes.
+    pub(super) async fn next_notification_activation() -> String {
+        std::future::pending().await
     }
 
     pub(super) fn request_authorization() {
@@ -397,7 +418,208 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The page: GPUI's web backend leaves system notifications a no-op, so the
+/// browser's Notification API stands in. One live notification per stable tag
+/// mirrors the replacement semantics the desktop path gets from GPUI — a
+/// newer message in the same conversation replaces its banner — and the
+/// click handler focuses the window and queues the tag for the application's
+/// pump task (see [`super::next_notification_activation`]).
+#[cfg(target_family = "wasm")]
+mod imp {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+    use std::task::{Poll, Waker};
+
+    thread_local! {
+        /// The banners still up, on the page's main thread — the only thread
+        /// that ever shows a notification or receives its click. A `static`
+        /// is out of reach here: `Notification` is a JS object and neither
+        /// `Send` nor `Sync` under the shared-memory build. GPUI application
+        /// callbacks and DOM events both run on this thread, so the map is
+        /// never touched from a worker; the cross-thread half of the design
+        /// is the tag queue below, which carries only strings.
+        static LIVE: RefCell<HashMap<String, LiveNotification>> = RefCell::new(HashMap::new());
+    }
+
+    use futures_lite::future::poll_fn;
+    use wasm_bindgen::prelude::*;
+    use web_sys::{Notification, NotificationOptions, NotificationPermission};
+
+    /// A banner the browser is still showing, kept alive for exactly as long.
+    ///
+    /// Dropping the Rust wrapper lets the JS object be collected, which would
+    /// take its click handler with it, so the live set owns both the
+    /// notification and its closure. Replacing the entry for a tag drops the
+    /// previous pair — the same moment the browser replaces the banner — and
+    /// revokes its icon URL, which bounds the retained closures and blob URLs
+    /// by the number of conversations with a banner up.
+    struct LiveNotification {
+        notification: Notification,
+        _onclick: Closure<dyn FnMut()>,
+        icon_url: Option<String>,
+    }
+
+    static PENDING_TAGS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+    static TAG_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
+
+    fn pending_tags() -> &'static Mutex<VecDeque<String>> {
+        PENDING_TAGS.get_or_init(|| Mutex::new(VecDeque::new()))
+    }
+
+    fn tag_waker() -> &'static Mutex<Option<Waker>> {
+        TAG_WAKER.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Whether the Notification constructor exists in this context. Outside a
+    /// secure context the binding throws, so check before touching it and
+    /// degrade to silence rather than a panic.
+    fn notifications_available() -> bool {
+        js_sys::Reflect::has(&js_sys::global(), &JsValue::from_str("Notification")).unwrap_or(false)
+    }
+
+    pub(super) fn request_authorization() {
+        if !notifications_available() {
+            return;
+        }
+        // Fire and forget: the promise settles after the user decides, and
+        // every post re-reads the permission, so nothing here needs to wait.
+        // Asked outside a user gesture most browsers keep it undecided, in
+        // which case posts stay silent until a later ask succeeds.
+        if Notification::permission() == NotificationPermission::Default {
+            let _ = Notification::request_permission();
+        }
+    }
+
+    pub(super) fn show_notification_with_avatar(
+        tag: &str,
+        title: &str,
+        body: &str,
+        avatar: impl Fn() -> Option<std::sync::Arc<Vec<u8>>> + Send + Sync + 'static,
+    ) -> bool {
+        if !notifications_available() {
+            return false;
+        }
+        if Notification::permission() != NotificationPermission::Granted {
+            return false;
+        }
+        let options = NotificationOptions::new();
+        options.set_body(body);
+        // The tag is what makes a newer message replace the conversation's
+        // banner instead of stacking one banner per message.
+        options.set_tag(tag);
+        let icon_url = avatar().as_deref().and_then(|bytes| make_icon_url(bytes));
+        if let Some(url) = icon_url.as_deref() {
+            options.set_icon(url);
+        }
+        let notification = match Notification::new_with_options(title, &options) {
+            Ok(notification) => notification,
+            Err(error) => {
+                log::debug!("browser refused the notification: {error:?}");
+                if let Some(url) = icon_url.as_deref() {
+                    let _ = web_sys::Url::revoke_object_url(url);
+                }
+                return false;
+            }
+        };
+        let clicked_tag = tag.to_string();
+        let onclick = Closure::new(move || {
+            // The click is a user activation, so focusing is allowed here;
+            // opening the conversation itself happens on the pump task.
+            if let Some(window) = web_sys::window() {
+                let _ = window.focus();
+            }
+            push_activation(clicked_tag.clone());
+        });
+        notification.set_onclick(Some(onclick.as_ref().unchecked_ref()));
+        LIVE.with(|live| {
+            if let Ok(mut live) = live.try_borrow_mut() {
+                if let Some(previous) = live.insert(
+                    tag.to_string(),
+                    LiveNotification {
+                        notification,
+                        _onclick: onclick,
+                        icon_url,
+                    },
+                ) {
+                    previous.notification.close();
+                    if let Some(url) = previous.icon_url.as_deref() {
+                        let _ = web_sys::Url::revoke_object_url(url);
+                    }
+                }
+            }
+        });
+        true
+    }
+
+    /// Stage the avatar as a blob URL the banner can show.
+    ///
+    /// The bytes are copied into a JS-owned array first: the module is built
+    /// with shared memory, so a view over wasm memory is a shared
+    /// ArrayBufferView the Blob constructor refuses (see /clippy.toml).
+    fn make_icon_url(bytes: &[u8]) -> Option<String> {
+        // A banner icon is a thumbnail; never retain megabytes of blob URL
+        // for one. The macOS path caps attachments at 10 MiB for the same
+        // reason at a different scale.
+        if bytes.len() > 1024 * 1024 {
+            return None;
+        }
+        let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png"
+        } else if bytes.starts_with(b"\xff\xd8\xff") {
+            "image/jpeg"
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            "image/gif"
+        } else {
+            return None;
+        };
+        let array = js_sys::Uint8Array::from(bytes);
+        let parts = js_sys::Array::new();
+        parts.push(&array.buffer());
+        let bag = web_sys::BlobPropertyBag::new();
+        bag.set_type(mime);
+        let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &bag).ok()?;
+        web_sys::Url::create_object_url_with_blob(&blob).ok()
+    }
+
+    fn push_activation(tag: String) {
+        let waker = pending_tags()
+            .lock()
+            .map(|mut pending| {
+                pending.push_back(tag);
+                tag_waker().lock().ok().and_then(|mut slot| slot.take())
+            })
+            .unwrap_or(None);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    pub(super) async fn next_notification_activation() -> String {
+        poll_fn(|cx| {
+            if let Ok(mut pending) = pending_tags().lock() {
+                if let Some(tag) = pending.pop_front() {
+                    return Poll::Ready(tag);
+                }
+            }
+            // Stored before the second look: a click landing between the pop
+            // and the store either precedes the store, and the recheck below
+            // sees it, or follows it, and the push wakes it.
+            if let Ok(mut slot) = tag_waker().lock() {
+                *slot = Some(cx.waker().clone());
+            }
+            if let Ok(mut pending) = pending_tags().lock() {
+                if let Some(tag) = pending.pop_front() {
+                    return Poll::Ready(tag);
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_family = "wasm")))]
 mod imp {
     pub(super) const fn request_authorization() {}
 
@@ -408,5 +630,12 @@ mod imp {
         _avatar: impl Fn() -> Option<std::sync::Arc<Vec<u8>>> + Send + Sync + 'static,
     ) -> bool {
         false
+    }
+
+    /// Unreachable by construction: clicks arrive through GPUI's response
+    /// path on every platform that compiles this half, so the pump task
+    /// parked on this never wakes.
+    pub(super) async fn next_notification_activation() -> String {
+        std::future::pending().await
     }
 }

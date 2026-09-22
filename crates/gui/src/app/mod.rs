@@ -1396,6 +1396,45 @@ impl WhatsAppApp {
     /// built. Off the UI thread, exactly like the retry it shares.
     pub fn start(&mut self, cx: &mut Context<Self>) {
         self.retry_connection(cx);
+        self.pump_notification_activations(cx);
+    }
+
+    /// Deliver web-notification clicks to the conversation they name.
+    ///
+    /// The browser reports a click to a JS callback, not to GPUI's
+    /// notification-response path, so the callback queues the banner's tag
+    /// (see `platform::notifications`) and this task opens each queued tag
+    /// through the same [`Self::open_system_notification`] the desktop path
+    /// calls. One task for the window's whole life: the queue is empty until
+    /// a click lands, and a dropped view ends the loop. Away from the web the
+    /// queue never fills — clicks arrive through GPUI already — so the task
+    /// parks on the first wait and costs nothing.
+    fn pump_notification_activations(&mut self, cx: &mut Context<Self>) {
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            loop {
+                let tag = crate::platform::next_notification_activation().await;
+                let alive = cx.update(|cx| {
+                    let window = entity
+                        .update(cx, |app, _| app.notification_window)
+                        .unwrap_or(None);
+                    let Some(window) = window else {
+                        return false;
+                    };
+                    let _ = window.update(cx, |_, window, cx| {
+                        window.activate_window();
+                        let _ = entity.update(cx, |app, cx| {
+                            app.open_system_notification(&tag, window, cx);
+                        });
+                    });
+                    true
+                });
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     // ========== Responsive Layout ==========
