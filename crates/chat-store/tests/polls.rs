@@ -34,6 +34,33 @@ async fn poll_secret_falls_back_to_the_library_secret_index() {
     assert_eq!(secret.as_deref(), Some([9u8; 32].as_slice()));
 }
 
+/// Outgoing direct history rows can have an empty sender, while the
+/// library indexed the secret under our own JID rather than the peer.
+#[tokio::test]
+async fn outgoing_direct_poll_with_empty_sender_recovers_secret() {
+    let (store, chat_store) = test_store().await;
+    let peer = jid(PEER);
+    let mine = jid("559900000099@s.whatsapp.net");
+    store
+        .put_msg_secrets(vec![MsgSecretEntry::new(
+            &peer,
+            &mine,
+            "MY-POLL",
+            [5u8; 32],
+            0,
+            1_700_000_000,
+        )])
+        .await
+        .expect("seed secret");
+    assert_eq!(
+        chat_store
+            .poll_secret(&peer, &jid("559900000077@s.whatsapp.net"), "MY-POLL")
+            .await
+            .expect("query"),
+        Some(vec![5u8; 32])
+    );
+}
+
 /// No row, no secret: the vote is refused rather than guessed.
 #[tokio::test]
 async fn poll_secret_is_none_without_an_index_row() {

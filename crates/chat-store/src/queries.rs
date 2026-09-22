@@ -1275,13 +1275,17 @@ impl ChatStore {
     ) -> Result<Option<Vec<u8>>> {
         let device_id = self.device_id();
         let chat_key = chat.to_non_ad_string();
-        // A direct message is filed under the chat itself even when an
-        // outgoing history row has no sender; group messages use the author.
-        let sender_key = if !chat.is_group() {
+        // Incoming direct messages use the peer; outgoing ones use our own
+        // identity (and their history rows can have an empty sender). For
+        // a direct-chat miss, look up by chat and message id without sender:
+        // IDs are unique within that chat, while group chats must always
+        // disambiguate by participant.
+        let sender_key = if sender.is_same_chat_as(chat) {
             chat_key.clone()
         } else {
             sender.to_non_ad_string()
         };
+        let direct = !chat.is_group();
         let msg_id = msg_id.to_owned();
         let secret = self
             .db()
@@ -1293,11 +1297,12 @@ impl ChatStore {
                 }
                 let row: Option<SecretRow> = diesel::sql_query(
                     "SELECT secret FROM msg_secrets WHERE device_id = ? AND chat = ? \
-                     AND sender = ? AND msg_id = ? LIMIT 1",
+                     AND (sender = ? OR ?) AND msg_id = ? LIMIT 1",
                 )
                 .bind::<diesel::sql_types::Integer, _>(device_id)
                 .bind::<diesel::sql_types::Text, _>(&chat_key)
                 .bind::<diesel::sql_types::Text, _>(&sender_key)
+                .bind::<diesel::sql_types::Bool, _>(direct)
                 .bind::<diesel::sql_types::Text, _>(&msg_id)
                 .get_result(conn)
                 .optional()
