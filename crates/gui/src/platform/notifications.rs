@@ -449,26 +449,52 @@ mod imp {
     /// A banner the browser is still showing, kept alive for exactly as long.
     ///
     /// Dropping the Rust wrapper lets the JS object be collected, which would
-    /// take its click handler with it, so the live set owns both the
-    /// notification and its closure. Replacing the entry for a tag drops the
-    /// previous pair — the same moment the browser replaces the banner — and
-    /// revokes its icon URL, which bounds the retained closures and blob URLs
-    /// by the number of conversations with a banner up.
+    /// take its click handler with it, so the live set owns the notification
+    /// and both its closures. Replacing the entry for a tag drops the
+    /// previous set — the same moment the browser replaces the banner — and
+    /// revokes its icon URL, while a dismissed banner removes itself through
+    /// its close handler; either way nothing outlives its banner.
     struct LiveNotification {
+        id: u64,
         notification: Notification,
         _onclick: Closure<dyn FnMut()>,
+        _onclose: Closure<dyn FnMut()>,
         icon_url: Option<String>,
     }
 
-    static PENDING_TAGS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
-    static TAG_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
-
-    fn pending_tags() -> &'static Mutex<VecDeque<String>> {
-        PENDING_TAGS.get_or_init(|| Mutex::new(VecDeque::new()))
+    /// Clicked tags waiting for the pump task, and the waker to end its wait.
+    ///
+    /// One lock for both, taken once per operation and never nested: the
+    /// click callback and the pump poll run on different threads, and two
+    /// locks taken in opposite orders would be a circular wait between the
+    /// browser thread and the pump.
+    struct ActivationQueue {
+        tags: VecDeque<String>,
+        waker: Option<Waker>,
     }
 
-    fn tag_waker() -> &'static Mutex<Option<Waker>> {
-        TAG_WAKER.get_or_init(|| Mutex::new(None))
+    static ACTIVATIONS: OnceLock<Mutex<ActivationQueue>> = OnceLock::new();
+    static NEXT_LIVE_ID: OnceLock<Mutex<u64>> = OnceLock::new();
+
+    fn activations() -> &'static Mutex<ActivationQueue> {
+        ACTIVATIONS.get_or_init(|| {
+            Mutex::new(ActivationQueue {
+                tags: VecDeque::new(),
+                waker: None,
+            })
+        })
+    }
+
+    fn next_live_id() -> u64 {
+        NEXT_LIVE_ID
+            .get_or_init(|| Mutex::new(1))
+            .lock()
+            .map(|mut next| {
+                let id = *next;
+                *next = next.wrapping_add(1);
+                id
+            })
+            .unwrap_or(0)
     }
 
     /// Whether the Notification constructor exists in this context. Outside a
@@ -479,14 +505,35 @@ mod imp {
     }
 
     pub(super) fn request_authorization() {
+        // Best effort: where the browser wants transient activation for the
+        // prompt, this startup ask is ignored and the post-time ask below is
+        // the one that counts — a message arriving while the user is in the
+        // page — so an early grant here only ever saves that later round.
+        request_permission_for_prompt();
+    }
+
+    /// Ask for notification permission where the browser will honour the ask.
+    ///
+    /// Fire and forget: the promise settles after the user decides, and every
+    /// post re-reads the permission, so nothing here waits. A prompt needs
+    /// transient user activation on the browsers that gate it, so outside a
+    /// gesture this is a no-op and the call sites are the gesture-adjacent
+    /// moments: startup, a post attempted mid-interaction, and a banner click.
+    fn request_permission_for_prompt() {
         if !notifications_available() {
             return;
         }
-        // Fire and forget: the promise settles after the user decides, and
-        // every post re-reads the permission, so nothing here needs to wait.
-        // Asked outside a user gesture most browsers keep it undecided, in
-        // which case posts stay silent until a later ask succeeds.
-        if Notification::permission() == NotificationPermission::Default {
+        if Notification::permission() != NotificationPermission::Default {
+            return;
+        }
+        // Absent on browsers without the concept, where the answer is yes —
+        // a browser that never heard of activation does not gate prompts on
+        // it either. Same shape as `platform::download`'s check.
+        let engaged = web_sys::window().is_some_and(|window| {
+            let activation = window.navigator().user_activation();
+            activation.is_undefined() || activation.is_active()
+        });
+        if engaged {
             let _ = Notification::request_permission();
         }
     }
@@ -500,14 +547,26 @@ mod imp {
         if !notifications_available() {
             return false;
         }
+        if Notification::permission() == NotificationPermission::Default {
+            // A message arriving mid-interaction carries its own gesture, so
+            // this ask can prompt where the startup one could not. The banner
+            // itself still waits for the grant: this post stays silent and
+            // the next message finds the permission settled.
+            request_permission_for_prompt();
+            return false;
+        }
         if Notification::permission() != NotificationPermission::Granted {
             return false;
         }
         let options = NotificationOptions::new();
         options.set_body(body);
         // The tag is what makes a newer message replace the conversation's
-        // banner instead of stacking one banner per message.
+        // banner instead of stacking one banner per message, and `renotify`
+        // is what makes the replacement alert again: without it the browser
+        // updates the banner silently and every message after the first is
+        // missed by anyone away from the page.
         options.set_tag(tag);
+        options.set_renotify(true);
         let icon_url = avatar().as_deref().and_then(|bytes| make_icon_url(bytes));
         if let Some(url) = icon_url.as_deref() {
             options.set_icon(url);
@@ -522,23 +581,39 @@ mod imp {
                 return false;
             }
         };
+        let id = next_live_id();
         let clicked_tag = tag.to_string();
         let onclick = Closure::new(move || {
             // The click is a user activation, so focusing is allowed here;
-            // opening the conversation itself happens on the pump task.
+            // opening the conversation itself happens on the pump task. It is
+            // also a moment a permission ask would be honoured, for the case
+            // where an earlier prompt was dismissed without deciding.
+            request_permission_for_prompt();
             if let Some(window) = web_sys::window() {
                 let _ = window.focus();
             }
             push_activation(clicked_tag.clone());
         });
         notification.set_onclick(Some(onclick.as_ref().unchecked_ref()));
+        // A dismissed banner cleans up after itself: without this every
+        // conversation ever bannered keeps its notification, closures and
+        // blob URL until reload. The id guard is what keeps the replacement
+        // below honest — closing the old banner fires *its* close handler,
+        // which must not take down the entry the new banner just installed.
+        let closed_tag = tag.to_string();
+        let onclose = Closure::new(move || {
+            remove_live_notification(&closed_tag, id);
+        });
+        notification.set_onclose(Some(onclose.as_ref().unchecked_ref()));
         LIVE.with(|live| {
             if let Ok(mut live) = live.try_borrow_mut() {
                 if let Some(previous) = live.insert(
                     tag.to_string(),
                     LiveNotification {
+                        id,
                         notification,
                         _onclick: onclick,
+                        _onclose: onclose,
                         icon_url,
                     },
                 ) {
@@ -550,6 +625,25 @@ mod imp {
             }
         });
         true
+    }
+
+    /// Drop one live banner's entry, revoking its icon URL — but only while
+    /// the entry is still the banner asking. A replacement installs the new
+    /// banner first and closes the old one after, so the old banner's own
+    /// close event lands on an entry that is no longer its to remove.
+    fn remove_live_notification(tag: &str, id: u64) {
+        LIVE.with(|live| {
+            if let Ok(mut live) = live.try_borrow_mut() {
+                let stale = live.get(tag).is_some_and(|entry| entry.id == id);
+                if stale {
+                    if let Some(entry) = live.remove(tag) {
+                        if let Some(url) = entry.icon_url.as_deref() {
+                            let _ = web_sys::Url::revoke_object_url(url);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Stage the avatar as a blob URL the banner can show.
@@ -583,11 +677,13 @@ mod imp {
     }
 
     fn push_activation(tag: String) {
-        let waker = pending_tags()
+        // Queued and the pump woken under the one lock; the wake itself
+        // happens after it is released, so a woken poll never blocks on us.
+        let waker = activations()
             .lock()
-            .map(|mut pending| {
-                pending.push_back(tag);
-                tag_waker().lock().ok().and_then(|mut slot| slot.take())
+            .map(|mut queue| {
+                queue.tags.push_back(tag);
+                queue.waker.take()
             })
             .unwrap_or(None);
         if let Some(waker) = waker {
@@ -597,21 +693,15 @@ mod imp {
 
     pub(super) async fn next_notification_activation() -> String {
         poll_fn(|cx| {
-            if let Ok(mut pending) = pending_tags().lock() {
-                if let Some(tag) = pending.pop_front() {
+            if let Ok(mut queue) = activations().lock() {
+                if let Some(tag) = queue.tags.pop_front() {
                     return Poll::Ready(tag);
                 }
-            }
-            // Stored before the second look: a click landing between the pop
-            // and the store either precedes the store, and the recheck below
-            // sees it, or follows it, and the push wakes it.
-            if let Ok(mut slot) = tag_waker().lock() {
-                *slot = Some(cx.waker().clone());
-            }
-            if let Ok(mut pending) = pending_tags().lock() {
-                if let Some(tag) = pending.pop_front() {
-                    return Poll::Ready(tag);
-                }
+                // Stored before returning, under the same lock that guards
+                // the queue: a click landing between the pop and the store
+                // either precedes the store, and the pop above already saw
+                // it, or follows it, and the push wakes what was stored.
+                queue.waker = Some(cx.waker().clone());
             }
             Poll::Pending
         })
