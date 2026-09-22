@@ -197,6 +197,20 @@ impl WhatsAppClient {
                     .ok_or_else(|| format!("poll has no option {index}"))?;
                 names.push(option);
             }
+            // Outgoing direct history rows can have an empty sender. The
+            // poll's creator is us, not the default JID hydrated from that
+            // empty column; encryption and the vote key both need our real
+            // identity in the chat's addressing namespace.
+            let creator = if stored.from_me && !chat.is_group() {
+                if chat.is_lid() {
+                    live.client.lid().or_else(|| live.client.pn())
+                } else {
+                    live.client.pn()
+                }
+                .ok_or_else(|| "account JID unavailable for poll vote".to_string())?
+            } else {
+                stored.sender_jid.clone()
+            };
             let secret = base
                 .message_context_info
                 .as_option()
@@ -205,14 +219,14 @@ impl WhatsAppClient {
                 Some(secret) => secret,
                 None => live
                     .chat_store
-                    .poll_secret(&chat, &stored.sender_jid, &poll_id)
+                    .poll_secret(&chat, &creator, &poll_id)
                     .await
                     .map_err(|e| format!("database query failed: {e}"))?
                     .ok_or_else(|| "the poll's secret was not stored".to_string())?,
             };
             live.client
                 .polls()
-                .vote(&chat, &poll_id, &stored.sender_jid, &secret, &names)
+                .vote(&chat, &poll_id, &creator, &secret, &names)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
