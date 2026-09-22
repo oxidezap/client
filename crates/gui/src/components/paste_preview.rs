@@ -194,8 +194,9 @@ fn render_files(
     // and the modal swallows wheel events, so the list must catch them
     // first. The wheel reaches this region before the root's stop, which is
     // what keeps the caption and the controls where they are while the rows
-    // move. The `id` is load-bearing, not labelling: it wraps the region in
-    // `Stateful`, which is what the scroll builders below belong to.
+    // move. Start alignment matters: centering overflow puts the first rows
+    // above the scroll origin, where no scroll offset can reveal them. The
+    // `id` wraps the region in `Stateful`, which owns the scroll builders.
     div()
         .id("paste-preview-files")
         .debug_selector(|| "paste-preview-files".into())
@@ -203,7 +204,6 @@ fn render_files(
         .min_h_0()
         .flex()
         .flex_col()
-        .justify_center()
         .gap(metrics.space_md())
         .overflow_y_scroll()
         .track_scroll(list_scroll)

@@ -39,7 +39,7 @@ impl WhatsAppApp {
             self.warn_preview_busy(cx);
             return;
         }
-        let Some((jid, reply)) = self.prepare_incoming_files(cx) else {
+        let Some((jid, reply, epoch)) = self.prepare_incoming_files(cx) else {
             return;
         };
         let task = cx
@@ -47,14 +47,23 @@ impl WhatsAppApp {
             .spawn(async move { crate::platform::drop::read_paths(paths) });
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let chosen = task.await;
-            let _ = entity.update(cx, |app, cx| match chosen {
-                Ok(chosen) => app.offer_dropped_files(jid, reply, chosen, cx),
-                Err(error) => {
-                    app.notify_user(error, notices::Tone::Problem, cx);
+            let _ = entity.update(cx, |app, cx| {
+                if app.incoming_file_epoch != epoch {
+                    return;
+                }
+                match chosen {
+                    Ok(chosen) => app.offer_dropped_files(jid, reply, chosen, cx),
+                    Err(error) => app.notify_user(error, notices::Tone::Problem, cx),
                 }
             });
         })
         .detach();
+    }
+
+    /// Whether an async web file read still belongs to this account.
+    #[cfg(any(test, target_family = "wasm"))]
+    pub(crate) fn incoming_files_are_current(&self, epoch: u64) -> bool {
+        self.incoming_file_epoch == epoch
     }
 
     /// Finish a drop (or a web paste) that arrived with its files already
@@ -94,25 +103,25 @@ impl WhatsAppApp {
 
     /// The destination an incoming file — dropped or pasted — would go to.
     ///
-    /// `None` answers "nowhere": no conversation open, or nothing to send
-    /// with while offline. Callers drop the files silently on `None`; a
-    /// notice for every drag over Settings would nag, and the composer
-    /// underneath says why nothing can be sent already.
+    /// `None` answers "nowhere": no visible conversation, or nothing to
+    /// send with while offline. The account epoch travels with the destination
+    /// so a read started before an account switch cannot open a modal in the
+    /// next account. A hidden composer (Settings, the phone's chat list, or
+    /// the media viewer) is not a destination for document-wide web pastes.
     pub(crate) fn prepare_incoming_files(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<(String, Option<ReplyDraft>)> {
-        if self.destination != Destination::Chats {
-            return None;
-        }
-        // Settings replaces the conversation while the destination and the
-        // selection stay put, so without this a file pasted into a Settings
-        // field on the web — where the document listener hears every paste —
-        // would open a send modal over it, aimed at a hidden conversation.
-        if self.showing_settings(cx) {
+    ) -> Option<(String, Option<ReplyDraft>, u64)> {
+        if self.destination != Destination::Chats || self.showing_settings(cx) {
             return None;
         }
         let jid = self.selected_chat.clone()?;
+        // `selected_chat` persists while the mobile list, fullscreen viewer,
+        // or Settings replaces the composer. `visible_chat` is reported by
+        // the rendered conversation, and is None for all those surfaces.
+        if self.visible_chat.as_deref() != Some(jid.as_str()) {
+            return None;
+        }
         if !self.is_connected() {
             self.notify_user(
                 "Files cannot be sent right now: not connected.",
@@ -121,7 +130,7 @@ impl WhatsAppApp {
             );
             return None;
         }
-        Some((jid, self.reply_to.clone()))
+        Some((jid, self.reply_to.clone(), self.incoming_file_epoch))
     }
 
     /// Offer files for confirmation instead of sending them outright.

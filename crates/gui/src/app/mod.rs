@@ -678,6 +678,9 @@ pub struct WhatsAppApp {
     control: Option<Session>,
     /// Destination captured while an asynchronous clipboard read is pending.
     pending_pastes: HashMap<u64, (String, Option<ReplyDraft>)>,
+    /// Bumped on account departure; async file drops and web pastes capture
+    /// it before reading so an old account cannot offer files in a new one.
+    incoming_file_epoch: u64,
     paste_preview: Option<PendingPastePreview>,
     #[cfg(test)]
     /// What `send_attachment` was asked to send in tests: the file and the
@@ -1316,6 +1319,7 @@ impl WhatsAppApp {
             selected_chat: None,
             client: None,
             pending_pastes: HashMap::new(),
+            incoming_file_epoch: 0,
             paste_preview: None,
             #[cfg(test)]
             attachment_attempts: Vec::new(),
@@ -1970,6 +1974,7 @@ impl WhatsAppApp {
         // epoch nothing had bumped, and send the old account's note from the
         // newly paired one.
         self.leave_connected_view(cx);
+        self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.pending_pastes.clear();
         self.paste_preview = None;
         self.notified_messages.clear();

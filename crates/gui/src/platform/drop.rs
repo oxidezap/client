@@ -93,7 +93,7 @@ mod imp {
                 .filter_map(|index| files.get(index))
                 .collect::<Vec<_>>();
             let entity = drop_entity.clone();
-            let Some((jid, reply)) = entity
+            let Some((jid, reply, epoch)) = entity
                 .update(&mut drop_app, |app, cx| app.prepare_incoming_files(cx))
                 .ok()
                 .flatten()
@@ -106,7 +106,9 @@ mod imp {
                 .spawn(async move {
                     let chosen = read_files(files).await;
                     let _ = entity.update(&mut task_app, |app, cx| {
-                        app.offer_dropped_files(jid, reply, chosen, cx)
+                        if app.incoming_files_are_current(epoch) {
+                            app.offer_dropped_files(jid, reply, chosen, cx);
+                        }
                     });
                 })
                 .detach();
@@ -143,7 +145,7 @@ mod imp {
             {
                 return;
             }
-            let Some((jid, reply)) = paste_entity
+            let Some((jid, reply, epoch)) = paste_entity
                 .update(&mut paste_app, |app, cx| app.prepare_incoming_files(cx))
                 .ok()
                 .flatten()
@@ -157,7 +159,9 @@ mod imp {
                 .spawn(async move {
                     let chosen = read_files(files).await;
                     let _ = entity.update(&mut task_app, |app, cx| {
-                        app.offer_dropped_files(jid, reply, chosen, cx)
+                        if app.incoming_files_are_current(epoch) {
+                            app.offer_dropped_files(jid, reply, chosen, cx);
+                        }
                     });
                 })
                 .detach();

@@ -667,6 +667,32 @@ mod tests {
     }
 
     #[gpui::test]
+    fn hidden_chat_does_not_accept_files(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                assert!(app.prepare_incoming_files(cx).is_some());
+                // A phone's chat list or a fullscreen viewer keeps the
+                // selected chat but replaces the composer entirely.
+                app.visible_chat = None;
+                assert!(app.prepare_incoming_files(cx).is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn files_read_for_an_old_account_cannot_open_a_new_preview(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                let (_, _, epoch) = app.prepare_incoming_files(cx).expect("chat visible");
+                app.incoming_file_epoch = app.incoming_file_epoch.wrapping_add(1);
+                assert!(!app.incoming_files_are_current(epoch));
+            });
+        });
+    }
+
+    #[gpui::test]
     fn confirm_while_offline_keeps_the_preview_waiting(cx: &mut gpui::TestAppContext) {
         let (mut cx, app) = paste_preview_fixture(cx);
         cx.update(|_window, cx| {
