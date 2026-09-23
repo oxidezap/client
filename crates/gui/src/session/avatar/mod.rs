@@ -224,6 +224,7 @@ impl AvatarManager {
                             known_picture_id: chat.picture_id.clone(),
                             cache_key: Some(key.clone()),
                             need_bytes: false,
+                            cache_miss: false,
                         },
                         priority,
                     );
@@ -295,6 +296,7 @@ impl AvatarManager {
                                     known_picture_id: pic_id,
                                     cache_key: Some(key_clone),
                                     need_bytes: false,
+                                    cache_miss: false,
                                 };
                                 if let Some(session) = session_handle
                                     .lock()
@@ -345,6 +347,7 @@ impl AvatarManager {
                             known_picture_id: None,
                             cache_key: None,
                             need_bytes: true,
+                            cache_miss: true,
                         };
                         if let Some(session) = session_handle
                             .lock()
@@ -374,6 +377,7 @@ impl AvatarManager {
                         known_picture_id: None,
                         cache_key: None,
                         need_bytes: true,
+                        cache_miss: false,
                     },
                     priority,
                 );
@@ -393,6 +397,7 @@ impl AvatarManager {
                     existing_demand.need_bytes = true;
                     existing_demand.known_picture_id = None;
                 }
+                existing_demand.cache_miss |= demand.cache_miss;
                 if priority == DemandPriority::High {
                     *existing_priority = DemandPriority::High;
                 }
@@ -527,6 +532,7 @@ mod tests {
                 known_picture_id: Some("pic-12345".to_string()),
                 cache_key: Some("a-oldkey".to_string()),
                 need_bytes: false,
+                cache_miss: false,
             },
             DemandPriority::Low,
         );
@@ -538,6 +544,7 @@ mod tests {
                 known_picture_id: None,
                 cache_key: None,
                 need_bytes: true,
+                cache_miss: true,
             },
             DemandPriority::High,
         );
@@ -546,6 +553,7 @@ mod tests {
         assert_eq!(demands.len(), 1);
         assert_eq!(demands[0].jid, "user2@s.whatsapp.net");
         assert!(demands[0].need_bytes);
+        assert!(demands[0].cache_miss);
         assert_eq!(
             demands[0].known_picture_id, None,
             "must clear known_picture_id to avoid the Unchanged trap"
@@ -561,6 +569,7 @@ mod tests {
                 known_picture_id: None,
                 cache_key: None,
                 need_bytes: true,
+                cache_miss: false,
             },
             DemandPriority::Low,
         );
@@ -570,6 +579,7 @@ mod tests {
                 known_picture_id: None,
                 cache_key: None,
                 need_bytes: true,
+                cache_miss: false,
             },
             DemandPriority::High,
         );
@@ -619,6 +629,7 @@ mod tests {
                     known_picture_id: None,
                     cache_key: None,
                     need_bytes: true,
+                    cache_miss: false,
                 },
                 DemandPriority::Low,
             );
@@ -642,6 +653,7 @@ mod tests {
                 known_picture_id: None,
                 cache_key: None,
                 need_bytes: true,
+                cache_miss: false,
             },
             DemandPriority::High,
         );
@@ -672,6 +684,7 @@ mod tests {
                 known_picture_id: None,
                 cache_key: None,
                 need_bytes: true,
+                cache_miss: false,
             },
             DemandPriority::High,
         );

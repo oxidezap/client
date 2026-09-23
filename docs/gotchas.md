@@ -282,8 +282,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   untouched (a screenshot is a PNG, and re-encoding one is the loss nobody
   wants); everything else this build can decode becomes a JPEG, at the same
   dimensions, out of the decode the thumbnail was already paying for. What
-  cannot be decoded goes out as it came, because bytes nothing here can read
-  are bytes nothing here can improve.
+  cannot be decoded is refused before upload rather than sent as an inline
+  photo the recipient cannot open. On macOS, readable HEIC/HEIF, AVIF, BMP
+  and TIFF originals can first become JPEG through the native image converter;
+  an explicit document send remains the way to preserve their original bytes.
   Two smaller things fall out of having read the bytes at all. The message
   states the type the *payload* is rather than the one it was picked as —
   those are two different claims, and only one of them was read out of the
@@ -300,6 +302,12 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   through, so a message sent without one is a grey box on *both* sides. A
   video has none, and that is the gap rather than a decision: producing one
   means decoding H.264 where the account is held.
+  The same last gate checks video bytes, not just the file's extension. A
+  compatible MP4 with H.264/AAC keeps its bytes; a MOV or another format the
+  macOS converter understands is exported to MP4 and inspected again before
+  upload. Unknown or unconvertible containers fail visibly instead of earning
+  a server ack for a video the recipient never receives. Both GUI and CLI
+  enter this preparation path, and the explicit document path bypasses it.
   Nothing about the staging is new here. A picked file goes out exactly the
   way a voice note does — `Session::send_staged` is the one path, and the four
   media caches, the reservation order and the abandoned-upload race are all

@@ -6592,6 +6592,7 @@ dependencies = [
  "serde_json",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",
+ "tempfile",
  "tokio",
  "wacore",
  "wasm-bindgen",

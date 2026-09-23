@@ -448,10 +448,16 @@ fn echo_of(
     match kind {
         OutgoingMedia::Image => {
             let (width, height) = image_size(&file.bytes);
+            let actual_mime = crate::platform::picker::image_mime_from_bytes(&file.bytes);
+            let drawable = crate::platform::picker::previewable_image_mime(&file.bytes).is_some();
             MediaContent::image(
-                Arc::new(file.bytes.clone()),
-                file.mime_type.clone(),
-                // These *are* the picture, so nothing is left to fetch.
+                Arc::new(if drawable {
+                    file.bytes.clone()
+                } else {
+                    Vec::new()
+                }),
+                actual_mime.unwrap_or(&file.mime_type).to_string(),
+                // A native-convertible source gets its JPEG from the daemon.
                 false,
             )
             .with_size(width, height)
@@ -493,14 +499,21 @@ mod tests {
     use super::echo_of;
     use crate::platform::picker::{Picked, kind_for};
 
-    /// A file of this type, with bytes that are nothing in particular: what is
-    /// being asserted is what the *type* decides, and no branch here reads a
-    /// byte of a document.
+    /// Document bytes need no signature; photo echoes must match real bytes.
     fn picked(file_name: &str, mime_type: &str) -> Picked {
+        let mut bytes = vec![0; 4096];
+        let signature: &[u8] = match mime_type {
+            "image/jpeg" => b"\xff\xd8\xff",
+            "image/png" => b"\x89PNG\r\n\x1a\n",
+            "image/gif" => b"GIF89a",
+            "image/webp" => b"RIFF\0\0\0\0WEBP",
+            _ => b"",
+        };
+        bytes[..signature.len()].copy_from_slice(signature);
         Picked {
             file_name: file_name.to_string(),
             mime_type: mime_type.to_string(),
-            bytes: vec![0; 4096],
+            bytes,
         }
     }
 
@@ -514,14 +527,17 @@ mod tests {
     /// of an SVG until the upload finished bought nothing at all.
     #[test]
     fn a_picture_nothing_draws_is_sent_and_echoed_as_a_document() {
-        for undrawable in [
-            "image/svg+xml",
-            "image/heic",
-            "image/heif",
-            "image/avif",
-            "image/tiff",
-            "image/bmp",
-        ] {
+        let mut undrawable = vec!["image/svg+xml"];
+        if !cfg!(target_os = "macos") {
+            undrawable.extend([
+                "image/heic",
+                "image/heif",
+                "image/avif",
+                "image/tiff",
+                "image/bmp",
+            ]);
+        }
+        for undrawable in undrawable {
             let file = picked("desenho", undrawable);
             let kind = kind_for(&file.mime_type);
             assert_eq!(kind, OutgoingMedia::Document, "{undrawable}");
@@ -551,5 +567,20 @@ mod tests {
             assert_eq!(echo.media_type, MediaType::Image, "{photo}");
             assert_eq!(echo.data.len(), file.bytes.len(), "{photo}");
         }
+    }
+
+    #[test]
+    fn optimistic_echo_uses_image_bytes_not_a_wrong_declared_mime() {
+        let mut png = picked("wrong.jpg", "image/jpeg");
+        png.bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let echo = echo_of(&png, OutgoingMedia::Image);
+        assert_eq!(echo.mime_type, "image/png");
+        assert_eq!(echo.data.as_slice(), png.bytes.as_slice());
+
+        let mut heic = picked("wrong.jpg", "image/jpeg");
+        heic.bytes[..12].copy_from_slice(b"\0\0\0\x18ftypheic");
+        let echo = echo_of(&heic, OutgoingMedia::Image);
+        assert_eq!(echo.mime_type, "image/heic");
+        assert!(echo.data.is_empty(), "JPEG cannot render HEIC bytes");
     }
 }

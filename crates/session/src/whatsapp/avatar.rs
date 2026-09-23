@@ -149,7 +149,7 @@ impl Resolver {
     }
 
     /// Whether `jid` still needs a lookup in this generation.
-    fn needs(&self, jid: &str, generation: u64, need_bytes: bool) -> bool {
+    fn needs(&self, jid: &str, generation: u64, need_bytes: bool, cache_miss: bool) -> bool {
         match self.asked.get(jid) {
             None => true,
             Some(&(recorded_gen, state)) => {
@@ -158,7 +158,13 @@ impl Resolver {
                 } else {
                     match state {
                         AvatarResolutionState::NotFound => false,
-                        AvatarResolutionState::BytesReady => false,
+                        // The daemon can outlive every window, so its earlier
+                        // `BytesReady` observation may describe a file the
+                        // cache budget (or the OS runtime-directory cleanup)
+                        // has since removed. Only an explicit front-end cache
+                        // miss overrides it; ordinary byte demands remain
+                        // deduplicated within this connection.
+                        AvatarResolutionState::BytesReady => need_bytes && cache_miss,
                         AvatarResolutionState::SourceDelivered => false,
                         AvatarResolutionState::MetadataKnown => need_bytes,
                     }
@@ -295,7 +301,12 @@ pub(super) async fn resolve(
         if lookup_is_useless(&jid) {
             continue;
         }
-        if !resolver.needs(&demand.jid, generation, demand.need_bytes) {
+        if !resolver.needs(
+            &demand.jid,
+            generation,
+            demand.need_bytes,
+            demand.cache_miss,
+        ) {
             continue;
         }
         let entry = filtered
@@ -466,6 +477,7 @@ impl WhatsAppClient {
                             known_picture_id: None,
                             cache_key: None,
                             need_bytes: true,
+                            cache_miss: false,
                         })
                         .collect();
                     resolve(&client, &ui_tx, &mut resolver, demands, request.generation).await;
@@ -503,14 +515,14 @@ mod tests {
     #[test]
     fn an_asked_chat_is_not_asked_again() {
         let mut resolver = Resolver::new();
-        assert!(resolver.needs("a@s.whatsapp.net", 1, true));
+        assert!(resolver.needs("a@s.whatsapp.net", 1, true, false));
         resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::BytesReady);
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
-        assert!(resolver.needs("b@s.whatsapp.net", 1, true));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
+        assert!(resolver.needs("b@s.whatsapp.net", 1, true, false));
 
         resolver.forget_all();
         assert!(
-            resolver.needs("a@s.whatsapp.net", 1, true),
+            resolver.needs("a@s.whatsapp.net", 1, true, false),
             "a clear re-queries"
         );
     }
@@ -521,9 +533,9 @@ mod tests {
     fn a_new_connection_revalidates_what_the_last_one_resolved() {
         let mut resolver = Resolver::new();
         resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::BytesReady);
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
         assert!(
-            resolver.needs("a@s.whatsapp.net", 2, true),
+            resolver.needs("a@s.whatsapp.net", 2, true, false),
             "the answer belongs to the socket that gave it"
         );
     }
@@ -533,8 +545,8 @@ mod tests {
     fn needing_bytes_supersedes_a_metadata_only_ask() {
         let mut resolver = Resolver::new();
         resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::MetadataKnown);
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
-        assert!(resolver.needs("a@s.whatsapp.net", 1, true));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, false));
+        assert!(resolver.needs("a@s.whatsapp.net", 1, true, false));
     }
 
     /// A metadata-only Unchanged lookup records MetadataKnown, so a subsequent byte demand proceeds.
@@ -542,9 +554,9 @@ mod tests {
     fn metadata_only_unchanged_lookup_permits_subsequent_byte_demand() {
         let mut resolver = Resolver::new();
         resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::MetadataKnown);
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, false));
         assert!(
-            resolver.needs("a@s.whatsapp.net", 1, true),
+            resolver.needs("a@s.whatsapp.net", 1, true, false),
             "byte demand must proceed even after metadata Unchanged"
         );
     }
@@ -558,19 +570,19 @@ mod tests {
             1,
             AvatarResolutionState::SourceDelivered,
         );
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, false));
 
         // When CDN download fails, resolver marks failure, downgrading to MetadataKnown:
         resolver.mark_failed("a@s.whatsapp.net");
         assert!(
-            resolver.needs("a@s.whatsapp.net", 1, true),
+            resolver.needs("a@s.whatsapp.net", 1, true, false),
             "retry must be allowed after failure"
         );
     }
 
     #[test]
-    fn ready_marks_bytes_ready_and_suppresses_subsequent_demands() {
+    fn a_missing_cache_file_can_refetch_after_bytes_were_ready() {
         let mut resolver = Resolver::new();
         resolver.mark(
             "a@s.whatsapp.net",
@@ -578,15 +590,19 @@ mod tests {
             AvatarResolutionState::SourceDelivered,
         );
         resolver.mark_ready("a@s.whatsapp.net");
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
+        assert!(
+            resolver.needs("a@s.whatsapp.net", 1, true, true),
+            "an explicit persistent-cache miss must override stale daemon state"
+        );
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, true));
     }
 
     #[test]
     fn not_found_prevents_subsequent_lookups_in_same_generation() {
         let mut resolver = Resolver::new();
         resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::NotFound);
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, true));
-        assert!(!resolver.needs("a@s.whatsapp.net", 1, false));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, true, true));
+        assert!(!resolver.needs("a@s.whatsapp.net", 1, false, true));
     }
 }

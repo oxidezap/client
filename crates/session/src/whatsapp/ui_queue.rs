@@ -484,6 +484,7 @@ fn estimated_bytes(event: &UiEvent) -> usize {
             chat_jid,
             message,
             sender_name,
+            chat_name,
             notification_title,
             ..
         } => {
@@ -491,6 +492,7 @@ fn estimated_bytes(event: &UiEvent) -> usize {
                 + string_bytes(chat_jid)
                 + message_bytes(message)
                 + sender_name.as_deref().map(string_bytes).unwrap_or_default()
+                + chat_name.as_deref().map(string_bytes).unwrap_or_default()
                 + notification_title
                     .as_deref()
                     .map(string_bytes)
@@ -720,6 +722,7 @@ mod tests {
                     "body".into(),
                 )),
                 sender_name: None,
+                chat_name: None,
                 notification_allowed: false,
                 notification_title: None,
                 notification_archived: None,
@@ -734,6 +737,7 @@ mod tests {
                     "body".into(),
                 )),
                 sender_name: None,
+                chat_name: None,
                 notification_allowed: false,
                 notification_title: None,
                 notification_archived: None,

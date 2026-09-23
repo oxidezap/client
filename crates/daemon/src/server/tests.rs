@@ -1525,6 +1525,7 @@ async fn an_ensure_avatars_request_dispatches_to_session_bridge() {
                 known_picture_id: Some("pic_1".into()),
                 cache_key: Some("a-123".into()),
                 need_bytes: false,
+                cache_miss: false,
             }],
         }),
     };

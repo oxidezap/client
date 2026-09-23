@@ -137,12 +137,8 @@ impl WhatsAppClient {
             let mime = mime_type.unwrap_or_else(|| guess_mime(&file_name));
             let kind = if as_document {
                 oxidezap_core::OutgoingMedia::Document
-            } else if mime.starts_with("image/") {
-                oxidezap_core::OutgoingMedia::Image
-            } else if mime.starts_with("video/") {
-                oxidezap_core::OutgoingMedia::Video
             } else {
-                oxidezap_core::OutgoingMedia::Document
+                oxidezap_core::OutgoingMedia::for_mime(&mime)
             };
             let file = super::OutgoingFile {
                 data,
@@ -153,8 +149,9 @@ impl WhatsAppClient {
             };
 
             let (shape, mut file) =
-                match crate::exec::unblock(move || super::outgoing::prepare(file)).await {
-                    Ok(prepared) => prepared,
+                match crate::exec::unblock(move || super::outgoing::prepare_for_send(file)).await {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(reason)) => return Err(reason),
                     Err(e) => return Err(format!("that file could not be prepared: {e}")),
                 };
             let data = std::mem::take(&mut file.data);
@@ -374,13 +371,20 @@ fn guess_mime(file_name: &str) -> String {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
+        "jpg" | "jpeg" | "jfif" => "image/jpeg",
         "png" => "image/png",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        "mp4" => "video/mp4",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "mp4" | "m4v" => "video/mp4",
         "mov" => "video/quicktime",
         "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
         "3gp" => "video/3gpp",
         "mp3" => "audio/mpeg",
         "ogg" | "opus" => "audio/ogg; codecs=opus",
@@ -405,6 +409,10 @@ mod tests {
         assert_eq!(guess_mime("foto.jpg"), "image/jpeg");
         assert_eq!(guess_mime("foto.PNG"), "image/png");
         assert_eq!(guess_mime("clipe.mp4"), "video/mp4");
+        assert_eq!(guess_mime("clipe.m4v"), "video/mp4");
+        assert_eq!(guess_mime("clipe.mkv"), "video/x-matroska");
+        assert_eq!(guess_mime("foto.HEIC"), "image/heic");
+        assert_eq!(guess_mime("foto.avif"), "image/avif");
         assert_eq!(guess_mime("nota.ogg"), "audio/ogg; codecs=opus");
         assert_eq!(guess_mime("doc.pdf"), "application/pdf");
     }

@@ -82,6 +82,11 @@ whatsapp-rust = { workspace = true, features = [
     "signal",
 ] }
 
+# A MOV is converted in a private temporary directory before being uploaded
+# as an MP4 video. Only the macOS implementation uses the system converter.
+[target.'cfg(target_os = "macos")'.dependencies]
+tempfile = "3"
+
 [target.'cfg(target_family = "wasm")'.dependencies]
 # `voip-mlow` and not `voip`: the library's VoIP runtime is portable, and what
 # is not is the half that owns a UDP socket (`voip-relay-native`) and the half

@@ -28,6 +28,13 @@
 //! and in this tree it is a grey box *here* too, because the store keeps what
 //! was sent and hydration reads it back through the same `media_of` an
 //! arriving message goes through.
+//!
+//! Every inline photo and video passes [`prepare_for_send`] before upload.
+//! A QuickTime MOV upload once received a server ack without a delivery
+//! receipt; the compatible MP4 of the same recording reached the recipient.
+//! The preparation validates real bytes and uses native conversion where
+//! possible, outside the UI thread. Unsupported media can still be sent
+//! explicitly as an unchanged document.
 
 use log::{debug, info, warn};
 use oxidezap_core::{OutgoingMedia, QuotedMessage};
@@ -199,6 +206,144 @@ pub(super) fn prepare(mut file: OutgoingFile) -> (Shape, OutgoingFile) {
         // the process holding the account, which is a much larger thing than
         // this.
         OutgoingMedia::Document => (Shape::default(), file),
+    }
+}
+
+/// The last gate before an inline upload. A name or MIME from a picker is a
+/// hint, not evidence that a recipient can open the bytes. Explicit documents
+/// alone promise to preserve arbitrary bytes without interpreting them.
+pub(super) fn prepare_for_send(file: OutgoingFile) -> Result<(Shape, OutgoingFile), String> {
+    match file.kind {
+        OutgoingMedia::Image => prepare_image_for_send(file),
+        OutgoingMedia::Video => prepare_video_for_send(file),
+        OutgoingMedia::Document => Ok(prepare(file)),
+    }
+}
+
+fn prepare_image_for_send(mut file: OutgoingFile) -> Result<(Shape, OutgoingFile), String> {
+    const ERROR: &str =
+        "Esta imagem não pôde ser preparada como foto. Tente enviá-la como Documento.";
+
+    if let Some(extension) = native_image_source_extension(&file.data) {
+        file.data = super::outgoing_image::to_jpeg(&file.data, extension)?;
+        file.mime_type = PHOTO_MIME.to_string();
+        file.file_name = file_name_with_extension(&file.file_name, "jpg");
+    } else if crate::media::allowed_image_format(&file.data).is_none() {
+        return Err(ERROR.to_string());
+    }
+    if image_has_animation(&file.data)? {
+        return Err(
+            "GIF ou WebP animado perderia a animação como foto. Envie como Documento.".to_string(),
+        );
+    }
+    let (shape, mut file) = prepare(file);
+    if !inline_photo_is_compatible(&shape, &file.mime_type) {
+        return Err(ERROR.to_string());
+    }
+    if file.mime_type == PHOTO_MIME {
+        file.file_name = file_name_with_extension(&file.file_name, "jpg");
+    }
+    Ok((shape, file))
+}
+
+fn inline_photo_is_compatible(shape: &Shape, mime_type: &str) -> bool {
+    let Some((width, height)) = shape.width.zip(shape.height) else {
+        return false;
+    };
+    let oversized_original = u64::from(width) * u64::from(height) > MAX_THUMBNAIL_SOURCE_PIXELS;
+    matches!(mime_type, "image/jpeg" | "image/png")
+        && (shape.thumbnail.is_some() || oversized_original)
+}
+
+fn prepare_video_for_send(mut file: OutgoingFile) -> Result<(Shape, OutgoingFile), String> {
+    let shape = match compatible_mp4_shape(&file.data) {
+        Some(shape) => shape,
+        None => {
+            let extension = video_source_extension(&file.data).ok_or_else(|| {
+                "Este vídeo não tem um formato reconhecido. Tente enviá-lo como Documento."
+                    .to_string()
+            })?;
+            file.data = super::outgoing_video::to_mp4(&file.data, extension)?;
+            compatible_mp4_shape(&file.data).ok_or_else(|| {
+                "O vídeo convertido não é um MP4 compatível. Envie como Documento.".to_string()
+            })?
+        }
+    };
+    file.mime_type = "video/mp4".to_string();
+    file.file_name = file_name_with_extension(&file.file_name, "mp4");
+    Ok((shape, file))
+}
+
+fn file_name_with_extension(name: &str, extension: &str) -> String {
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    format!("{stem}.{extension}")
+}
+
+fn ftyp_brand(data: &[u8]) -> Option<&[u8]> {
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        Some(&data[8..12])
+    } else {
+        None
+    }
+}
+
+fn video_source_extension(data: &[u8]) -> Option<&'static str> {
+    if native_image_source_extension(data).is_some() {
+        return None;
+    }
+    if let Some(brand) = ftyp_brand(data) {
+        return Some(if brand == b"qt  " {
+            "mov"
+        } else if brand.starts_with(b"3g") {
+            "3gp"
+        } else {
+            "mp4"
+        });
+    }
+    (data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"AVI ").then_some("avi")
+}
+
+fn native_image_source_extension(data: &[u8]) -> Option<&'static str> {
+    match crate::media::named_image_format(data) {
+        Some(image::ImageFormat::Bmp) => return Some("bmp"),
+        Some(image::ImageFormat::Tiff) => return Some("tiff"),
+        Some(image::ImageFormat::Avif) => return Some("avif"),
+        _ => {}
+    }
+    match ftyp_brand(data)? {
+        b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1" => Some("heic"),
+        b"avif" | b"avis" => Some("avif"),
+        _ => None,
+    }
+}
+
+fn image_has_animation(data: &[u8]) -> Result<bool, String> {
+    use image::ImageDecoder as _;
+
+    const ERROR: &str = "Não foi possível verificar esta animação. Envie como Documento.";
+    match crate::media::named_image_format(data) {
+        Some(image::ImageFormat::Gif) => {
+            use image::AnimationDecoder as _;
+
+            let mut decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(data))
+                .map_err(|_| ERROR.to_string())?;
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(MAX_THUMBNAIL_DECODE_BYTES);
+            decoder.set_limits(limits).map_err(|_| ERROR.to_string())?;
+            let mut frames = decoder.into_frames();
+            frames.next().transpose().map_err(|_| ERROR.to_string())?;
+            Ok(frames
+                .next()
+                .transpose()
+                .map_err(|_| ERROR.to_string())?
+                .is_some())
+        }
+        Some(image::ImageFormat::WebP) => {
+            let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(data))
+                .map_err(|_| ERROR.to_string())?;
+            Ok(decoder.has_animation())
+        }
+        _ => Ok(false),
     }
 }
 
@@ -445,10 +590,9 @@ fn fit_within(width: u32, height: u32, edge: u32) -> (u32, u32) {
 
 /// A video: what its container will admit to.
 ///
-/// ISO-MP4 only, which is what the picker's own filter asks for and what every
-/// phone records. A WebM or a MKV is sent with its shape unstated rather than
-/// refused — the recipient's client plays it or does not, and that is a fact
-/// about the file rather than about this.
+/// ISO-MP4 only. This pure helper can measure an MP4 without deciding whether
+/// it is safe to upload. The real send calls [`prepare_for_send`], which
+/// validates codecs and samples or converts/refuses the file first.
 fn moving(data: &[u8]) -> Shape {
     let cursor = std::io::Cursor::new(data);
     let reader = match mp4::Mp4Reader::read_header(cursor, data.len() as u64) {
@@ -479,6 +623,72 @@ fn moving(data: &[u8]) -> Shape {
         // have and a page has only asynchronously.
         thumbnail: None,
     }
+}
+
+/// A conversion only succeeds as an inline video when the resulting MP4 has
+/// a video track the recipient can decode. Passthrough preserves the source
+/// codec, so a successful `avconvert` exit alone is not that guarantee.
+pub(super) fn compatible_mp4_shape(data: &[u8]) -> Option<Shape> {
+    let brand = ftyp_brand(data)?;
+    if brand == b"qt  " || brand.starts_with(b"3g") || native_image_source_extension(data).is_some()
+    {
+        return None;
+    }
+    let mut reader =
+        mp4::Mp4Reader::read_header(std::io::Cursor::new(data), data.len() as u64).ok()?;
+    if reader.is_fragmented() {
+        // Native conversion can flatten fragmented MP4. Its sample sizes are
+        // held in movie fragments rather than the bounded stsz table below.
+        return None;
+    }
+    let video = reader.tracks().values().find(|track| {
+        track
+            .track_type()
+            .is_ok_and(|kind| kind == mp4::TrackType::Video)
+    })?;
+    if reader
+        .tracks()
+        .values()
+        .any(|track| match track.track_type().ok() {
+            Some(mp4::TrackType::Video) => track.media_type().ok() != Some(mp4::MediaType::H264),
+            Some(mp4::TrackType::Audio) => track.media_type().ok() != Some(mp4::MediaType::AAC),
+            _ => false,
+        })
+    {
+        return None;
+    }
+    let (width, height) = (u32::from(video.width()), u32::from(video.height()));
+    let duration_secs = video.duration().as_secs_f64().ceil() as u32;
+    let sample_sizes = &video.trak.mdia.minf.stbl.stsz;
+    let first_sample_size = if sample_sizes.sample_size != 0 {
+        sample_sizes.sample_size
+    } else {
+        *sample_sizes.sample_sizes.first()?
+    };
+    if width == 0
+        || height == 0
+        || duration_secs == 0
+        || video.sample_count() == 0
+        || first_sample_size == 0
+        || u64::from(first_sample_size) > data.len() as u64
+    {
+        return None;
+    }
+    let video_track_id = video.track_id();
+    if reader
+        .read_sample(video_track_id, 1)
+        .ok()??
+        .bytes
+        .is_empty()
+    {
+        return None;
+    }
+    Some(Shape {
+        width: Some(width),
+        height: Some(height),
+        duration_secs: Some(duration_secs),
+        thumbnail: None,
+    })
 }
 
 /// What the CDN answered, in a shape a test can build.
@@ -652,6 +862,174 @@ mod tests {
             mime_type: mime.to_string(),
             ..file(OutgoingMedia::Image, data)
         })
+    }
+
+    fn valid_mp4() -> Vec<u8> {
+        use mp4::{AvcConfig, Bytes, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
+
+        let mut writer = Mp4Writer::write_start(
+            std::io::Cursor::new(Vec::new()),
+            &Mp4Config {
+                major_brand: (*b"isom").into(),
+                minor_version: 512,
+                compatible_brands: vec![(*b"isom").into(), (*b"avc1").into()],
+                timescale: 1000,
+            },
+        )
+        .expect("MP4 writer");
+        writer
+            .add_track(&TrackConfig::from(MediaConfig::AvcConfig(AvcConfig {
+                width: 16,
+                height: 16,
+                seq_param_set: vec![0x67, 0x42, 0, 0x0a],
+                pic_param_set: vec![0x68, 0xce, 0x38, 0x80],
+            })))
+            .expect("H.264 track");
+        writer
+            .write_sample(
+                1,
+                &Mp4Sample {
+                    start_time: 0,
+                    duration: 1000,
+                    rendering_offset: 0,
+                    is_sync: true,
+                    bytes: Bytes::from_static(&[0, 0, 0, 2, 0x65, 0x88]),
+                },
+            )
+            .expect("one sample");
+        writer.write_end().expect("end of MP4");
+        writer.into_writer().into_inner()
+    }
+
+    #[test]
+    fn quicktime_video_is_selected_for_conversion_by_its_container() {
+        let mut movie = file(OutgoingMedia::Video, b"\0\0\0\x18ftypqt  rest".to_vec());
+        movie.mime_type = "video/mp4".to_string();
+        assert_eq!(video_source_extension(&movie.data), Some("mov"));
+
+        // A document is explicitly the original file, even when it contains
+        // a QuickTime movie; conversion is only for inline video messages.
+        movie.kind = OutgoingMedia::Document;
+        let (_, document) = prepare_for_send(movie.clone()).expect("document preparation");
+        assert_eq!(document.data, movie.data);
+        assert_eq!(document.mime_type, movie.mime_type);
+    }
+
+    #[test]
+    fn a_mov_name_alone_does_not_make_unverified_bytes_an_mp4() {
+        let mut movie = file(OutgoingMedia::Video, b"\0\0\0\x18ftypisomrest".to_vec());
+        movie.mime_type = "video/quicktime".to_string();
+        movie.file_name = "clipe.mov".to_string();
+        assert_eq!(video_source_extension(&movie.data), Some("mp4"));
+
+        // A failed conversion is reported before upload; no label alone is
+        // allowed to turn this invalid file into an inline MP4 message.
+        assert!(prepare_for_send(movie).is_err());
+    }
+
+    #[test]
+    fn a_valid_mp4_skips_conversion_and_corrects_a_wrong_mime() {
+        let mut movie = file(OutgoingMedia::Video, valid_mp4());
+        movie.mime_type = "video/quicktime; codecs=h264".to_string();
+        movie.file_name = "clipe.mov".to_string();
+        let (shape, prepared) = prepare_for_send(movie.clone()).expect("compatible MP4");
+        assert_eq!(prepared.data, movie.data);
+        assert_eq!(prepared.mime_type, "video/mp4");
+        assert_eq!(prepared.file_name, "clipe.mp4");
+        assert_eq!(shape.duration_secs, Some(1));
+    }
+
+    #[test]
+    fn converted_mp4_must_have_a_measurable_h264_track() {
+        let mut bytes = valid_mp4();
+
+        let shape = compatible_mp4_shape(&bytes).expect("supported MP4 shape");
+        assert_eq!(
+            (shape.width, shape.height, shape.duration_secs),
+            (Some(16), Some(16), Some(1))
+        );
+
+        bytes[8..12].copy_from_slice(b"qt  ");
+        assert!(compatible_mp4_shape(&bytes).is_none());
+        assert!(compatible_mp4_shape(b"not an MP4").is_none());
+    }
+
+    #[test]
+    fn only_recognized_video_containers_can_reach_the_native_converter() {
+        assert_eq!(
+            video_source_extension(b"\0\0\0\x18ftyp3gp4rest"),
+            Some("3gp")
+        );
+        assert_eq!(video_source_extension(b"RIFF\0\0\0\0AVI "), Some("avi"));
+        assert_eq!(video_source_extension(b"\0\0\0\x18ftypheicrest"), None);
+        assert_eq!(video_source_extension(b"\x1a\x45\xdf\xa3webm"), None);
+        assert_eq!(video_source_extension(b"not a movie"), None);
+        let mut movie = file(OutgoingMedia::Video, b"\x1a\x45\xdf\xa3webm".to_vec());
+        movie.mime_type = "video/mp4".to_string();
+        assert!(prepare_for_send(movie).is_err());
+    }
+
+    #[test]
+    fn a_gif_with_two_frames_is_not_silently_flattened() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            let frames = [
+                image::Frame::new(image::RgbaImage::from_pixel(
+                    2,
+                    2,
+                    image::Rgba([255, 0, 0, 255]),
+                )),
+                image::Frame::new(image::RgbaImage::from_pixel(
+                    2,
+                    2,
+                    image::Rgba([0, 0, 255, 255]),
+                )),
+            ];
+            encoder.encode_frames(frames).expect("animated GIF fixture");
+        }
+        let mut animated = file(OutgoingMedia::Image, bytes.clone());
+        animated.mime_type = "image/gif".to_string();
+        assert!(image_has_animation(&bytes).expect("read GIF frames"));
+        let refusal = prepare_for_send(animated.clone()).expect_err("must preserve animation");
+        assert!(refusal.contains("Documento"));
+
+        animated.kind = OutgoingMedia::Document;
+        let (_, document) = prepare_for_send(animated).expect("send original animation");
+        assert_eq!(document.data, bytes);
+    }
+
+    #[test]
+    fn a_mislabeled_or_broken_photo_never_uploads_inline() {
+        let mut fake = file(OutgoingMedia::Image, b"not a picture".to_vec());
+        fake.mime_type = "image/jpeg".to_string();
+        assert!(prepare_for_send(fake).is_err());
+
+        let mut real = file(OutgoingMedia::Image, png(4, 4));
+        real.mime_type = "image/jpeg".to_string();
+        real.file_name = "wrong.jpg".to_string();
+        let (shape, corrected) = prepare_for_send(real).expect("the bytes are a valid PNG");
+        assert_eq!(corrected.mime_type, "image/png");
+        assert!(shape.thumbnail.is_some());
+    }
+
+    #[test]
+    fn an_oversized_jpeg_keeps_the_original_without_a_thumbnail() {
+        let oversized = Shape {
+            width: Some(8_000),
+            height: Some(8_000),
+            thumbnail: None,
+            ..Shape::default()
+        };
+        assert!(inline_photo_is_compatible(&oversized, "image/jpeg"));
+        assert!(inline_photo_is_compatible(&oversized, "image/png"));
+        assert!(!inline_photo_is_compatible(&oversized, "image/webp"));
+        let small_unreadable = Shape {
+            width: Some(800),
+            height: Some(800),
+            ..Shape::default()
+        };
+        assert!(!inline_photo_is_compatible(&small_unreadable, "image/jpeg"));
     }
 
     /// The dimensions the recipient draws the placeholder at, and a thumbnail

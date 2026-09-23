@@ -144,15 +144,10 @@ pub fn mime_for_name(file_name: &str) -> &'static str {
 /// no opinion about what is inside them. This is the front end's amendment to
 /// it, and it is about the recipient rather than about us.
 ///
-/// A photo message is expected to carry a photo, and the expectation is the
-/// far end's: WhatsApp's own clients re-encode everything they send to JPEG,
-/// so the session re-encodes a picture on the way out — but only one it can
-/// decode, and what it cannot decode "goes out as it came" (see the entry in
-/// docs/gotchas.md and `session/whatsapp/outgoing.rs`). Its decoders are JPEG,
-/// PNG, GIF and WebP. So an SVG, a HEIC or a TIFF picked here would be
-/// uploaded as an `imageMessage` carrying bytes nothing on the other side
-/// draws: no dimensions, no thumbnail, and a bubble the recipient can neither
-/// see nor open. The sender is told nothing, because nothing failed.
+/// A photo message is expected to carry bytes the recipient can draw. The
+/// session decodes JPEG, PNG, GIF and WebP; on macOS it can also convert HEIC,
+/// HEIF, AVIF, BMP and TIFF to JPEG before upload. Other image formats stay
+/// documents instead of becoming unopenable inline bubbles.
 ///
 /// A document instead, and deliberately not a refusal at the chooser. The
 /// capability rule — a control that is drawn and then always fails is worse
@@ -191,7 +186,46 @@ fn arrives_as_a_photo(mime_type: &str) -> bool {
     matches!(
         family.as_str(),
         "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp"
-    )
+    ) || (cfg!(target_os = "macos")
+        && matches!(
+            family.as_str(),
+            "image/heic" | "image/heif" | "image/avif" | "image/bmp" | "image/tiff"
+        ))
+}
+
+/// A declared MIME or extension is only a hint for previews. Use the magic
+/// bytes so a misnamed photo does not decode using the wrong format.
+pub(crate) fn image_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        Some("image/tiff")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        match &bytes[8..12] {
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1" => Some("image/heic"),
+            b"avif" | b"avis" => Some("image/avif"),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+pub(crate) fn previewable_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    image_mime_from_bytes(bytes).filter(|mime| {
+        matches!(
+            *mime,
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        )
+    })
 }
 
 /// What one trip to the chooser may hold in memory at once.
@@ -550,28 +584,27 @@ mod imp {
 mod tests {
     use oxidezap_core::OutgoingMedia;
 
-    use super::{Budget, SELECTION_BUDGET_BYTES, kind_for, mime_for_name, unsendable};
+    use super::{
+        Budget, SELECTION_BUDGET_BYTES, image_mime_from_bytes, kind_for, mime_for_name,
+        previewable_image_mime, unsendable,
+    };
 
-    /// A photo message is expected to carry a photo, and the expectation is
-    /// the recipient's: the session re-encodes what it can decode and sends
-    /// what it cannot as it came, so a picture in a format it has no decoder
-    /// for would arrive as an `imageMessage` no client draws. It goes as a
-    /// document, which keeps the bytes and gives the recipient something they
-    /// can actually open.
+    /// A format without an inline decoder or native converter remains a
+    /// document so the recipient can still open the original file.
     #[test]
     fn a_picture_this_tree_cannot_turn_into_a_photo_is_sent_as_a_document() {
-        for undrawable in [
-            "image/svg+xml",
-            "image/heic",
-            "image/heif",
-            "image/avif",
-            "image/tiff",
-            "image/bmp",
-            // The picker's own table produces these from a name, so the two
-            // have to agree about what happens next.
-            mime_for_name("desenho.svg"),
-            mime_for_name("foto.HEIC"),
-        ] {
+        let mut undrawable = vec!["image/svg+xml", mime_for_name("desenho.svg")];
+        if !cfg!(target_os = "macos") {
+            undrawable.extend([
+                "image/heic",
+                "image/heif",
+                "image/avif",
+                "image/tiff",
+                "image/bmp",
+                mime_for_name("foto.HEIC"),
+            ]);
+        }
+        for undrawable in undrawable {
             assert_eq!(
                 kind_for(undrawable),
                 OutgoingMedia::Document,
@@ -605,6 +638,30 @@ mod tests {
             kind_for("application/octet-stream"),
             OutgoingMedia::Document
         );
+        for convertible in [
+            "image/heic",
+            "image/heif",
+            "image/avif",
+            "image/tiff",
+            "image/bmp",
+        ] {
+            assert_eq!(
+                kind_for(convertible) == OutgoingMedia::Image,
+                cfg!(target_os = "macos"),
+                "{convertible}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_preview_uses_actual_bytes_and_avoids_native_only_formats() {
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        assert_eq!(image_mime_from_bytes(png), Some("image/png"));
+        assert_eq!(previewable_image_mime(png), Some("image/png"));
+        let heic = b"\0\0\0\x18ftypheic";
+        assert_eq!(image_mime_from_bytes(heic), Some("image/heic"));
+        assert_eq!(previewable_image_mime(heic), None);
+        assert_eq!(image_mime_from_bytes(b"not an image"), None);
     }
 
     /// The type decides what the message is sent *as*, so an extension nobody

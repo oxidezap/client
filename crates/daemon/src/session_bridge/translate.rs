@@ -297,8 +297,20 @@ impl Bridge {
                 chat_jid,
                 message,
                 sender_name,
+                chat_name,
+                notification_archived,
                 ..
             } => {
+                // The active snapshot intentionally excludes archived chats.
+                // This answer came from the durable store with the committed
+                // message, so it can remove a stale summary (or mark a chat
+                // inactive before any summary exists) without waiting for a
+                // later complete active-page reload.
+                if notification_archived == Some(true) {
+                    return vec![Change::from_store(DaemonEvent::ChatRemoved {
+                        jid: chat_jid,
+                    })];
+                }
                 // A complete store load removed this JID from the active
                 // list. Do not resurrect it from live traffic while the
                 // store is deciding whether the message unarchived/recreated
@@ -309,6 +321,7 @@ impl Bridge {
                     self.reads().forget(&chat_jid);
                     return Vec::new();
                 }
+                let durable_name = chat_name.filter(|name| !name.trim().is_empty());
                 let mut summary = self.hub.chat(&chat_jid).unwrap_or_else(|| ChatSummary {
                     name: live_chat_name(&chat_jid, &message, sender_name),
                     jid: chat_jid.clone(),
@@ -317,6 +330,9 @@ impl Bridge {
                     last_message: None,
                     pinned_at_ms: None,
                 });
+                if let Some(name) = durable_name {
+                    summary.name = name;
+                }
                 // Asked of the tracker rather than recomputed, so the badge
                 // and the receipts this side owes cannot disagree: the same
                 // event delivered twice used to add 2 while the tracker

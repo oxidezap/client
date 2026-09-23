@@ -39,11 +39,10 @@ impl PreviewFile {
     pub fn with_preview(file: crate::platform::picker::Picked, decode: bool) -> Self {
         let image = (decode
             && crate::platform::picker::kind_for(&file.mime_type) == OutgoingMedia::Image)
-            .then(|| {
-                gpui::ImageFormat::from_mime_type(&file.mime_type)
-                    .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())))
-            })
-            .flatten();
+            .then(|| crate::platform::picker::previewable_image_mime(&file.bytes))
+            .flatten()
+            .and_then(gpui::ImageFormat::from_mime_type)
+            .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())));
         Self { file, image }
     }
 
@@ -249,10 +248,15 @@ mod tests {
     use crate::platform::picker::Picked;
 
     fn picked(file_name: &str, mime_type: &str) -> Picked {
+        let bytes = if mime_type == "image/png" {
+            b"\x89PNG\r\n\x1a\nrest".to_vec()
+        } else {
+            vec![1, 2, 3]
+        };
         Picked {
             file_name: file_name.to_string(),
             mime_type: mime_type.to_string(),
-            bytes: vec![0; 8],
+            bytes,
         }
     }
 
@@ -306,6 +310,12 @@ mod tests {
                 .image
                 .is_none()
         );
+        let mislabeled = Picked {
+            file_name: "foto.jpg".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            bytes: b"\x89PNG\r\n\x1a\nrest".to_vec(),
+        };
+        assert!(PreviewFile::with_preview(mislabeled, true).image.is_some());
     }
 
     #[test]

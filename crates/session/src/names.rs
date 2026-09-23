@@ -120,21 +120,30 @@ pub(crate) struct NameBook {
     /// without the other. `None` is for the history paths, which are handed a
     /// store with every call and never read this.
     chat_store: Option<Arc<ChatStore>>,
+    /// Both memoized answers and their generation share one lock. Lookups do
+    /// I/O without holding it, then compare-and-insert under this same lock;
+    /// consequently `forget` cannot slip between that comparison and write
+    /// and let an old miss repopulate the cache it just cleared.
+    cache: Mutex<NameCache>,
+}
+
+#[derive(Default)]
+struct NameCache {
+    generation: u64,
     /// Address-book name per *contact* JID, misses included.
-    contacts: Mutex<HashMap<String, Option<String>>>,
+    contacts: HashMap<String, Option<String>>,
     /// The PN/LID pair behind a sender JID. A separate map on purpose: the
     /// two are keyed by JIDs that look alike and mean different things, and
     /// one map for both lets a resolved label be read back as an address-book
     /// entry it never was.
-    identities: Mutex<HashMap<String, Arc<ChatIdentity>>>,
+    identities: HashMap<String, Arc<ChatIdentity>>,
 }
 
 impl NameBook {
     pub(crate) fn new(chat_store: Option<Arc<ChatStore>>) -> Self {
         Self {
             chat_store,
-            contacts: Mutex::new(HashMap::new()),
-            identities: Mutex::new(HashMap::new()),
+            cache: Mutex::new(NameCache::default()),
         }
     }
 
@@ -149,8 +158,10 @@ impl NameBook {
     /// re-read anyway, so a contact renamed on the phone appears under its
     /// new name without a restart.
     pub(crate) fn forget(&self) {
-        clear(&self.contacts);
-        clear(&self.identities);
+        let mut cache = lock(&self.cache);
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.contacts.clear();
+        cache.identities.clear();
     }
 
     /// The PN/LID pair behind a JID.
@@ -160,9 +171,13 @@ impl NameBook {
         jid: &Jid,
     ) -> Arc<ChatIdentity> {
         let key = jid.to_non_ad_string();
-        if let Some(known) = read(&self.identities, &key) {
-            return known;
-        }
+        let generation = {
+            let cache = lock(&self.cache);
+            if let Some(known) = cache.identities.get(&key) {
+                return Arc::clone(known);
+            }
+            cache.generation
+        };
         let identity = Arc::new(build_identity(client, jid).await);
         // A lookup that failed answers the source JID, which is the same
         // answer as "no mapping" and is wrong in a way nothing later
@@ -171,7 +186,10 @@ impl NameBook {
         // under a phone number, their `paused` under a LID, and a typing line
         // nothing clears until its TTL runs out.
         if identity.settled {
-            write(&self.identities, key, identity.clone());
+            let mut cache = lock(&self.cache);
+            if cache.generation == generation {
+                cache.identities.insert(key, identity.clone());
+            }
         }
         identity
     }
@@ -286,9 +304,13 @@ impl NameBook {
     /// The address book's answer for one alias.
     async fn contact_name(&self, store: &ChatStore, jid: &Jid) -> Option<String> {
         let key = jid.to_string();
-        if let Some(known) = read(&self.contacts, &key) {
-            return known;
-        }
+        let generation = {
+            let cache = lock(&self.cache);
+            if let Some(known) = cache.contacts.get(&key) {
+                return known.clone();
+            }
+            cache.generation
+        };
         // An error is not an answer, so it is not written down: memoizing it
         // would file somebody as nameless for the rest of the session over a
         // pool that was busy for a moment.
@@ -302,7 +324,10 @@ impl NameBook {
         let name = contact
             .and_then(|contact| contact.display_name().map(str::to_owned))
             .filter(|name| !name.trim().is_empty());
-        write(&self.contacts, key, name.clone());
+        let mut cache = lock(&self.cache);
+        if cache.generation == generation {
+            cache.contacts.insert(key, name.clone());
+        }
         name
     }
 }
@@ -358,13 +383,14 @@ fn usable_name(name: &str, has_phone: bool) -> bool {
 
 /// Whether a name carried by a stored chat is a real user/server answer.
 ///
-/// Group rows created by older builds could persist the UI fallback as if it
-/// were a subject. Treat both generations of that fallback as unresolved so
-/// history does not give them `SELF_CHOSEN` priority and block metadata repair.
-/// The rule is deliberately scoped to groups: a person may legitimately name a
-/// direct chat "Group name unavailable".
+/// Older builds could persist a UI fallback as if it came from the peer or
+/// metadata. Keep those labels unresolved so history does not give them
+/// `SELF_CHOSEN` priority and block repair. Group placeholders are scoped to
+/// groups; the direct placeholder is scoped to LIDs, where it is generated.
 fn usable_offered_name(jid: &Jid, name: &str, has_phone: bool) -> bool {
-    usable_name(name, has_phone) && !is_generated_group_placeholder(jid, name)
+    usable_name(name, has_phone)
+        && !is_generated_group_placeholder(jid, name)
+        && !(jid.is_lid() && name.trim() == "Unknown contact")
 }
 
 fn is_generated_group_placeholder(jid: &Jid, name: &str) -> bool {
@@ -385,23 +411,10 @@ fn is_masked_phone_label(name: &str) -> bool {
 // A poisoned lock here means a panic while holding a `HashMap`, which cannot
 // leave one inconsistent. Recovering is strictly better than turning a naming
 // question into a second panic.
-fn read<T: Clone>(map: &Mutex<HashMap<String, T>>, key: &str) -> Option<T> {
-    map.lock()
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(key)
-        .cloned()
-}
-
-fn write<T>(map: &Mutex<HashMap<String, T>>, key: String, value: T) {
-    map.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key, value);
-}
-
-fn clear<T>(map: &Mutex<HashMap<String, T>>) {
-    map.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
 }
 
 #[cfg(test)]
@@ -458,6 +471,94 @@ mod tests {
 
         fn reads(&self) -> usize {
             self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    struct LearningPairs {
+        entry: Mutex<Option<LidPnEntry>>,
+        reads: AtomicUsize,
+    }
+
+    struct PausingPairs {
+        entry: Mutex<Option<LidPnEntry>>,
+        pause_next: AtomicBool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        reads: AtomicUsize,
+    }
+
+    impl LearningPairs {
+        fn unknown() -> Self {
+            Self {
+                entry: Mutex::new(None),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn learns(&self, lid: &str, phone: &str) {
+            *self
+                .entry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(LidPnEntry {
+                lid: lid.into(),
+                phone_number: phone.into(),
+                created_at: 0,
+                learning_source: LearningSource::Usync,
+            });
+        }
+    }
+
+    impl PausingPairs {
+        fn unknown() -> Self {
+            Self {
+                entry: Mutex::new(None),
+                pause_next: AtomicBool::new(true),
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn learns(&self, lid: &str, phone: &str) {
+            *lock(&self.entry) = Some(LidPnEntry {
+                lid: lid.into(),
+                phone_number: phone.into(),
+                created_at: 0,
+                learning_source: LearningSource::Usync,
+            });
+        }
+    }
+
+    impl LidPnSource for LearningPairs {
+        fn lid_pn_entry(
+            &self,
+            _jid: &Jid,
+        ) -> impl Future<Output = Result<Option<LidPnEntry>>> + MaybeSend {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let answer = self
+                .entry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            async move { Ok(answer) }
+        }
+    }
+
+    impl LidPnSource for PausingPairs {
+        fn lid_pn_entry(
+            &self,
+            _jid: &Jid,
+        ) -> impl Future<Output = Result<Option<LidPnEntry>>> + MaybeSend {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let answer = lock(&self.entry).clone();
+            let pause = self.pause_next.swap(false, Ordering::Relaxed);
+            async move {
+                if pause {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(answer)
+            }
         }
     }
 
@@ -549,6 +650,67 @@ mod tests {
         );
     }
 
+    /// A LID may be visible in history before its phone-number mapping is
+    /// learned. The first honest miss must not become a session-long answer:
+    /// once the mapping arrives, the same row needs the phone-number fallback
+    /// (or its PN-keyed address-book name) instead of "Unknown contact".
+    #[tokio::test]
+    async fn an_absent_mapping_is_memoized_until_identity_data_changes() {
+        let pairs = LearningPairs::unknown();
+        let book = book();
+
+        let before = book.identity(&pairs, &jid(PEER_LID)).await;
+        assert_eq!(before.fallback_name, "Unknown contact");
+        let repeated = book.identity(&pairs, &jid(PEER_LID)).await;
+        assert_eq!(repeated.fallback_name, "Unknown contact");
+        assert_eq!(
+            pairs.reads.load(Ordering::Relaxed),
+            1,
+            "messages from the same unmapped participant share one lookup"
+        );
+
+        pairs.learns("111000011112222", "559900000001");
+        book.forget();
+        let after = book.identity(&pairs, &jid(PEER_LID)).await;
+
+        assert_eq!(after.canonical_jid, PEER_LID);
+        assert_eq!(after.fallback_name, "+559900000001");
+        assert_eq!(
+            pairs.reads.load(Ordering::Relaxed),
+            2,
+            "a contact/mapping invalidation re-reads the learned pair"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_miss_cannot_repopulate_after_identity_data_changes() {
+        let pairs = Arc::new(PausingPairs::unknown());
+        let book = Arc::new(book());
+        let lookup = tokio::spawn({
+            let pairs = Arc::clone(&pairs);
+            let book = Arc::clone(&book);
+            async move { book.identity(&pairs, &jid(PEER_LID)).await }
+        });
+
+        pairs.started.notified().await;
+        pairs.learns("111000011112222", "559900000001");
+        book.forget();
+        pairs.release.notify_one();
+
+        let stale = lookup.await.expect("lookup task");
+        assert_eq!(stale.fallback_name, "Unknown contact");
+
+        let current = book.identity(&pairs, &jid(PEER_LID)).await;
+        assert_eq!(current.fallback_name, "+559900000001");
+        let repeated = book.identity(&pairs, &jid(PEER_LID)).await;
+        assert_eq!(repeated.fallback_name, "+559900000001");
+        assert_eq!(
+            pairs.reads.load(Ordering::Relaxed),
+            2,
+            "the stale lookup did not repopulate the invalidated miss"
+        );
+    }
+
     #[test]
     fn a_blank_or_masked_push_name_is_not_a_name() {
         assert!(!usable_name("   ", false));
@@ -577,6 +739,11 @@ mod tests {
             "Group name unavailable",
             false
         ));
+        assert!(
+            !usable_offered_name(&jid(PEER_LID), "Unknown contact", false),
+            "a generated LID fallback is not a durable contact name"
+        );
+        assert!(usable_offered_name(&jid(PEER_LID), "Ana", false));
     }
 
     #[test]

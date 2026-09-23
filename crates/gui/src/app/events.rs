@@ -247,6 +247,7 @@ impl WhatsAppApp {
                 chat_jid,
                 message,
                 sender_name,
+                chat_name,
                 notification_allowed,
                 notification_title,
                 notification_archived,
@@ -255,10 +256,11 @@ impl WhatsAppApp {
                     chat_jid,
                     *message,
                     sender_name,
-                    IncomingAlert::new(
+                    IncomingMessageMetadata::new(
                         notification_allowed,
                         notification_title,
                         notification_archived,
+                        chat_name,
                     ),
                     cx,
                 );
@@ -305,6 +307,7 @@ impl WhatsAppApp {
                     self.invalidate_chat_cache();
                     cx.notify();
                 }
+                self.notify_user(reason, notices::Tone::Problem, cx);
             }
             UiEvent::ChatPresence {
                 chat_jid,

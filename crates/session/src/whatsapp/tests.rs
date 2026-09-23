@@ -83,6 +83,48 @@ fn the_live_data_lane_subscribes_to_server_acks() {
 }
 
 #[test]
+fn the_identity_lane_subscribes_to_contact_updates() {
+    assert!(
+        super::IDENTITY_EVENT_KINDS
+            .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactUpdate)
+    );
+    assert!(
+        !super::CONTROL_EVENT_KINDS
+            .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactUpdate),
+        "a contact full sync must not block latency-sensitive control events"
+    );
+}
+
+#[test]
+fn a_contact_sync_burst_is_not_dropped_at_identity_ingress() {
+    use whatsapp_rust::wacore::types::events::{ContactUpdate, EventHandler};
+
+    let (handler, receiver, stats) = super::interested_unbounded_channel(&[
+        whatsapp_rust::wacore::types::events::EventKind::ContactUpdate,
+    ]);
+    let update = Arc::new(Event::ContactUpdate(
+        ContactUpdate::builder()
+            .jid(TEST_PEER.parse().expect("test PN"))
+            .timestamp(
+                whatsapp_rust::wacore::time::from_secs(1_700_000_100).expect("test timestamp"),
+            )
+            .action(Box::new(wa::sync_action_value::ContactAction {
+                lid_jid: Some(TEST_AUTHOR.to_string()),
+                ..Default::default()
+            }))
+            .from_full_sync(true)
+            .build(),
+    ));
+
+    for _ in 0..256 {
+        handler.handle_event(update.clone());
+    }
+
+    assert_eq!(stats.stats().dropped_full, 0);
+    assert_eq!(receiver.len(), 256);
+}
+
+#[test]
 fn a_server_ack_uses_its_chats_recoverable_lane() {
     let ack = Event::ServerAck(
         ServerAck::builder()
@@ -893,8 +935,10 @@ async fn direct_group_mention_alerts_through_mute_and_archive() {
             ui_rx.try_recv(),
             Ok(oxidezap_core::UiEvent::MessageReceived {
                 notification_allowed: false,
+                chat_name: Some(name),
+                notification_archived: Some(true),
                 ..
-            })
+            }) if name == "Example group"
         ));
     }
 }
@@ -1871,6 +1915,83 @@ async fn alias_hydration_is_archived_only_when_both_rows_are_archived() {
     }
 }
 
+/// App-state contact rows carry the missing bridge between a PN-keyed address
+/// book entry and a LID-keyed conversation. The protocol library deliberately
+/// leaves those pairs to the embedder; ignoring them makes a saved contact
+/// remain "Unknown contact" even after the update has supplied both aliases.
+#[tokio::test]
+async fn a_contact_update_repairs_an_already_seen_lid_chat() {
+    use whatsapp_rust::wacore::types::events::ContactUpdate;
+
+    let (chat_store, client) = test_session("contact-update-lid-mapping").await;
+    let lid = "111000011119999@lid";
+    let pn = "559900000099@s.whatsapp.net";
+    feed(
+        &chat_store,
+        incoming_in(lid, wa::Message::text("oi"), "MSG-LID", 1_700_000_000),
+    )
+    .await;
+
+    let names = Arc::new(book_with(&chat_store));
+    let before = WhatsAppClient::load_history(&chat_store, &client, &names)
+        .await
+        .expect("history loads before the contact pair");
+    assert_eq!(before.chats[0].name, "Unknown contact");
+
+    let update = Event::ContactUpdate(
+        ContactUpdate::builder()
+            .jid(pn.parse().expect("test PN"))
+            .timestamp(
+                whatsapp_rust::wacore::time::from_secs(1_700_000_100).expect("test timestamp"),
+            )
+            .action(Box::new(wa::sync_action_value::ContactAction {
+                full_name: Some("Bia".to_string()),
+                lid_jid: Some(lid.to_string()),
+                ..Default::default()
+            }))
+            .from_full_sync(false)
+            .build(),
+    );
+    feed(&chat_store, update.clone()).await;
+    let (identity_events, identity_incoming, _identity_stats) =
+        super::interested_unbounded_channel(super::IDENTITY_EVENT_KINDS);
+    let (_session_over, stopping) = tokio::sync::watch::channel(());
+    WhatsAppClient::spawn_contact_identity_learner(
+        client.clone(),
+        identity_incoming,
+        names.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        stopping,
+    );
+    use whatsapp_rust::wacore::types::events::EventHandler;
+    identity_events.handle_event(Arc::new(update));
+    let learned = crate::exec::with_timeout(
+        async {
+            loop {
+                if client
+                    .get_lid_pn_entry(&lid.parse().expect("test LID"))
+                    .await
+                    .expect("mapping lookup")
+                    .is_some()
+                {
+                    break;
+                }
+                crate::exec::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    assert!(learned.is_some(), "the identity worker drains the update");
+
+    let after = WhatsAppClient::load_history(&chat_store, &client, &names)
+        .await
+        .expect("history loads after the contact pair");
+    assert_eq!(after.chats.len(), 1);
+    assert_eq!(after.chats[0].jid, lid);
+    assert_eq!(after.chats[0].name, "Bia");
+}
+
 /// A cursor is this crate's to write and to read, and the only thing that
 /// makes that safe is that the two agree.
 #[test]
@@ -2203,6 +2324,7 @@ async fn a_new_connection_advances_the_generation_without_eager_full_pass() {
         known_picture_id: None,
         cache_key: None,
         need_bytes: true,
+        cache_miss: false,
     }]);
     let taken = signal.next().await;
     assert_eq!(taken.generation, before + 1);
@@ -2220,12 +2342,14 @@ async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
             known_picture_id: Some("pic-1".to_string()),
             cache_key: Some("a-1".to_string()),
             need_bytes: false,
+            cache_miss: false,
         },
         oxidezap_core::AvatarDemand {
             jid: "b@s.whatsapp.net".to_string(),
             known_picture_id: None,
             cache_key: None,
             need_bytes: false,
+            cache_miss: false,
         },
     ]);
 
@@ -2235,6 +2359,7 @@ async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
         known_picture_id: None,
         cache_key: None,
         need_bytes: true,
+        cache_miss: true,
     }]);
 
     let taken = signal.next().await;
@@ -2244,6 +2369,7 @@ async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
 
     assert_eq!(demands[0].jid, "a@s.whatsapp.net");
     assert!(demands[0].need_bytes, "upgraded to need_bytes = true");
+    assert!(demands[0].cache_miss, "preserved the explicit cache miss");
     assert_eq!(
         demands[0].known_picture_id, None,
         "cleared known_picture_id"

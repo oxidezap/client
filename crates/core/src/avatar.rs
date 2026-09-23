@@ -51,11 +51,16 @@ pub struct AvatarDemand {
     pub cache_key: Option<String>,
     #[serde(default)]
     pub need_bytes: bool,
+    /// The front end had a durable descriptor but the referenced bytes were
+    /// absent or corrupt. This is stronger than an ordinary byte demand: it
+    /// permits the long-lived daemon to replace a stale `BytesReady` result.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_miss: bool,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::cache_key;
+    use super::{AvatarDemand, cache_key};
 
     #[test]
     fn keys_are_safe_and_distinct() {
@@ -78,5 +83,16 @@ mod tests {
             cache_key("5599@s.whatsapp.net", "123"),
             "a-25-5599.40s.2Ewhatsapp.2Enet-3-123"
         );
+    }
+
+    #[test]
+    fn an_older_avatar_demand_has_no_explicit_cache_miss() {
+        let demand: AvatarDemand = serde_json::from_value(serde_json::json!({
+            "jid": "user@example.invalid",
+            "need_bytes": true
+        }))
+        .expect("older demand");
+
+        assert!(!demand.cache_miss);
     }
 }

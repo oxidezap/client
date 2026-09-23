@@ -999,12 +999,13 @@ pub struct WhatsAppApp {
     last_avatar_window_fingerprint: Option<u64>,
 }
 
-/// Store-backed attention decision delivered with a live message. The GUI's
-/// paged chat row may not yet know any of these facts.
-struct IncomingAlert {
+/// Store-backed conversation and attention facts delivered with a message.
+/// The GUI's paged chat row may not yet know any of them.
+struct IncomingMessageMetadata {
     allowed: bool,
     title: Option<String>,
     archived: Option<bool>,
+    chat_name: Option<String>,
 }
 
 const NOTIFICATION_PAGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
@@ -1034,12 +1035,18 @@ fn remove_pending_notification(queue: &mut VecDeque<String>, tag: &str) -> bool 
     queue.remove(index).is_some()
 }
 
-impl IncomingAlert {
-    fn new(allowed: bool, title: Option<String>, archived: Option<bool>) -> Self {
+impl IncomingMessageMetadata {
+    fn new(
+        allowed: bool,
+        title: Option<String>,
+        archived: Option<bool>,
+        chat_name: Option<String>,
+    ) -> Self {
         Self {
             allowed,
             title,
             archived,
+            chat_name,
         }
     }
 }
@@ -3150,7 +3157,7 @@ impl WhatsAppApp {
         chat_jid: String,
         mut message: ChatMessage,
         sender_name: Option<String>,
-        alert: IncomingAlert,
+        metadata: IncomingMessageMetadata,
         cx: &mut App,
     ) {
         // Parse JID to determine chat type
@@ -3187,8 +3194,8 @@ impl WhatsAppApp {
         // Capture the user-facing part before the message moves into its
         // conversation. Statuses have their own reader and do not represent a
         // chat asking for attention; our own sends likewise never notify us.
-        let notification =
-            (alert.allowed && !read_now && !message.is_from_me && !is_status).then(|| {
+        let notification = (metadata.allowed && !read_now && !message.is_from_me && !is_status)
+            .then(|| {
                 let body = if is_group {
                     format!("{}: {}", message.author_label(), message.preview_text())
                 } else {
@@ -3213,8 +3220,12 @@ impl WhatsAppApp {
         if let Some(index) = chat_index {
             // Update the existing chat
             let chat = Arc::make_mut(&mut self.chats[index]);
-            if let Some(archived) = alert.archived {
+            if let Some(archived) = metadata.archived {
                 chat.archived = archived;
+            }
+
+            if let Some(ref name) = metadata.chat_name {
+                chat.set_name_if_not_worse(name.clone(), 2);
             }
 
             // For groups: update participant name, NOT the chat name
@@ -3224,7 +3235,8 @@ impl WhatsAppApp {
                 }
             } else if !is_status {
                 // For DMs only: update chat name if we have a better one
-                if let Some(ref name) = sender_name
+                if metadata.chat_name.is_none()
+                    && let Some(ref name) = sender_name
                     && !message.is_from_me
                 {
                     chat.set_name_if_not_worse(name.clone(), 2);
@@ -3245,14 +3257,18 @@ impl WhatsAppApp {
         } else {
             // Create new chat
             let display_name = if is_group || is_status {
-                // For groups/status, don't use sender name as chat name
-                None
+                // A participant is not the conversation. Only use the
+                // store-backed subject delivered separately by the session.
+                metadata.chat_name.clone()
             } else if message.is_from_me {
-                // For outgoing DMs, use cached name
-                self.name_cache.get(&chat_jid).cloned()
+                // Prefer the durable contact name, then a local cache entry.
+                metadata
+                    .chat_name
+                    .clone()
+                    .or_else(|| self.name_cache.get(&chat_jid).cloned())
             } else {
-                // For incoming DMs, use sender name
-                sender_name.clone()
+                // The resolved address-book name outranks a push name.
+                metadata.chat_name.clone().or_else(|| sender_name.clone())
             };
 
             let mut new_chat = if let Some(name) = display_name {
@@ -3260,7 +3276,10 @@ impl WhatsAppApp {
             } else {
                 Chat::new(chat_jid.clone())
             };
-            new_chat.archived = alert.archived.unwrap_or(false);
+            // An absent row has no previous archive state to preserve. Keep
+            // an unknown answer out of the active inbox until store hydration
+            // supplies an explicit state; `Some(false)` still unarchives it.
+            new_chat.archived = metadata.archived.unwrap_or(true);
 
             // For groups: track participant
             if is_group && let Some(ref name) = sender_name {
@@ -3293,7 +3312,7 @@ impl WhatsAppApp {
         }
 
         if let Some((message_id, sender, body)) = notification {
-            self.notify_incoming_message(&chat_jid, &message_id, &sender, body, alert.title, cx);
+            self.notify_incoming_message(&chat_jid, &message_id, &sender, body, metadata.title, cx);
         }
     }
 
@@ -4482,7 +4501,7 @@ mod tests {
                             "New message".into(),
                         ),
                         Some("Example contact".into()),
-                        IncomingAlert::new(true, None, Some(false)),
+                        IncomingMessageMetadata::new(true, None, Some(false), None),
                         cx,
                     );
                 });
@@ -4499,7 +4518,7 @@ mod tests {
                         "Quiet message".into(),
                     ),
                     Some("Muted contact".into()),
-                    IncomingAlert::new(false, None, None),
+                    IncomingMessageMetadata::new(false, None, None, None),
                     cx,
                 );
             });
@@ -4517,7 +4536,7 @@ mod tests {
                         "No longer quiet".into(),
                     ),
                     Some("Muted contact".into()),
-                    IncomingAlert::new(true, None, Some(false)),
+                    IncomingMessageMetadata::new(true, None, Some(false), None),
                     cx,
                 );
             });
@@ -4545,7 +4564,7 @@ mod tests {
                             "Group message".into(),
                         ),
                         Some(sender.into()),
-                        IncomingAlert::new(true, None, Some(false)),
+                        IncomingMessageMetadata::new(true, None, Some(false), None),
                         cx,
                     );
                 });
@@ -4570,8 +4589,18 @@ mod tests {
                         "Muted before hydration".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(false, Some("Stored subject".into()), None),
+                    IncomingMessageMetadata::new(
+                        false,
+                        Some("Stored subject".into()),
+                        None,
+                        Some("Stored subject".into()),
+                    ),
                     cx,
+                );
+                assert!(
+                    app.find_chat("new-group@g.us")
+                        .is_some_and(|chat| chat.archived),
+                    "unknown archive state must not place an absent chat in the active inbox"
                 );
                 app.handle_message_received(
                     "new-group@g.us".into(),
@@ -4581,7 +4610,12 @@ mod tests {
                         "Allowed before hydration".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(true, Some("Stored subject".into()), Some(false)),
+                    IncomingMessageMetadata::new(
+                        true,
+                        Some("Stored subject".into()),
+                        Some(false),
+                        Some("Stored subject".into()),
+                    ),
                     cx,
                 );
             });
@@ -4589,6 +4623,41 @@ mod tests {
         let notifications = cx.shown_system_notifications();
         assert_eq!(notifications.len(), 5);
         assert_eq!(notifications[4].title.as_ref(), "Stored subject");
+        cx.update(|cx| {
+            app.update(cx, |app, _cx| {
+                assert_eq!(
+                    app.find_chat("new-group@g.us")
+                        .map(|chat| chat.name.as_str()),
+                    Some("Stored subject")
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.handle_message_received(
+                    "known-contact@lid".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-KNOWN-CONTACT".into(),
+                        "known-contact@lid".into(),
+                        "Known before hydration".into(),
+                    ),
+                    None,
+                    IncomingMessageMetadata::new(
+                        false,
+                        None,
+                        Some(false),
+                        Some("Address book contact".into()),
+                    ),
+                    cx,
+                );
+                assert_eq!(
+                    app.find_chat("known-contact@lid")
+                        .map(|chat| chat.name.as_str()),
+                    Some("Address book contact")
+                );
+            });
+        });
 
         cx.update(|cx| {
             app.update(cx, |app, cx| {
@@ -4600,10 +4669,11 @@ mod tests {
                         "Mentioned you".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(
+                    IncomingMessageMetadata::new(
                         true,
                         Some("Mentioned in Archived example".into()),
                         Some(true),
+                        Some("Archived example".into()),
                     ),
                     cx,
                 );
@@ -4611,6 +4681,11 @@ mod tests {
                     app.find_chat("archived-group@g.us")
                         .is_some_and(|chat| chat.archived),
                     "a mentioned archived group must not reappear in the active list"
+                );
+                assert_eq!(
+                    app.find_chat("archived-group@g.us")
+                        .map(|chat| chat.name.as_str()),
+                    Some("Archived example")
                 );
             });
         });
@@ -4632,7 +4707,12 @@ mod tests {
                         "No longer archived".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(false, None, Some(false)),
+                    IncomingMessageMetadata::new(
+                        false,
+                        None,
+                        Some(false),
+                        Some("Archived example".into()),
+                    ),
                     cx,
                 );
                 assert!(
@@ -4651,7 +4731,12 @@ mod tests {
                         "Unknown archive state".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(false, None, None),
+                    IncomingMessageMetadata::new(
+                        false,
+                        None,
+                        None,
+                        Some("Archived example".into()),
+                    ),
                     cx,
                 );
                 assert!(
