@@ -37,8 +37,7 @@ impl PreviewFile {
     /// batch, so decoding every image of a batch retains copies nothing
     /// draws.
     pub fn with_preview(file: crate::platform::picker::Picked, decode: bool) -> Self {
-        let image = (decode
-            && crate::platform::picker::kind_for(&file.mime_type) == OutgoingMedia::Image)
+        let image = (decode && file.kind == OutgoingMedia::Image)
             .then(|| {
                 gpui::ImageFormat::from_mime_type(&file.mime_type)
                     .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())))
@@ -48,7 +47,7 @@ impl PreviewFile {
     }
 
     fn kind(&self) -> OutgoingMedia {
-        crate::platform::picker::kind_for(&self.file.mime_type)
+        self.file.kind
     }
 }
 
@@ -249,11 +248,12 @@ mod tests {
     use crate::platform::picker::Picked;
 
     fn picked(file_name: &str, mime_type: &str) -> Picked {
-        Picked {
-            file_name: file_name.to_string(),
-            mime_type: mime_type.to_string(),
-            bytes: vec![0; 8],
-        }
+        let bytes = if mime_type == "image/png" {
+            b"\x89PNG\r\n\x1a\nrest".to_vec()
+        } else {
+            vec![1, 2, 3]
+        };
+        Picked::automatic(file_name.to_string(), mime_type.to_string(), bytes)
     }
 
     #[test]
@@ -306,6 +306,13 @@ mod tests {
                 .image
                 .is_none()
         );
+        let document = Picked {
+            file_name: "foto.jpg".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            kind: oxidezap_core::OutgoingMedia::Document,
+            bytes: b"\x89PNG\r\n\x1a\nrest".to_vec(),
+        };
+        assert!(PreviewFile::with_preview(document, true).image.is_none());
     }
 
     #[test]

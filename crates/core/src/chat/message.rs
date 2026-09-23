@@ -41,8 +41,6 @@ pub struct ChatMessage {
     /// The message this one replies to, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedMessage>,
-    /// Set when nobody typed this: a call record, a group change. Such a row
-    /// has no author and no ticks, and renders centred rather than as a bubble.
     /// Whether the sender took this message back.
     ///
     /// Kept as a fact rather than left implicit in the "[Message deleted]"
@@ -51,6 +49,12 @@ pub struct ChatMessage {
     /// deleted update to watch — should not have to recognise a sentence.
     #[serde(default, skip_serializing_if = "is_false")]
     pub revoked: bool,
+    /// Whether the durable store has accepted an edit of this message.
+    /// The store retains the timestamp and ordering; the UI needs only this fact.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edited: bool,
+    /// Set when nobody typed this: a call record, a group change. Such a row
+    /// has no author and no ticks, and renders centred rather than as a bubble.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemNotice>,
     /// A poll this message opens, if it is one. Tallies are not carried:
@@ -118,6 +122,7 @@ impl ChatMessage {
             status: MessageStatus::Pending,
             quoted: None,
             revoked: false,
+            edited: false,
             system: None,
             poll: None,
         }
@@ -147,6 +152,7 @@ impl ChatMessage {
             status: MessageStatus::default(),
             quoted: None,
             revoked: false,
+            edited: false,
             system: None,
             poll: None,
         }

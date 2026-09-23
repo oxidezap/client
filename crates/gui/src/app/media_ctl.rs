@@ -4,6 +4,31 @@
 //! output device and the same "what is playing right now" slot.
 
 use super::*;
+use gpui::AppContext as _;
+
+/// A voice note whose expensive preparation is running off the UI executor.
+///
+/// The position and intent are captured here rather than read from
+/// `AudioPlayer` when a later speed click arrives: the native player has no
+/// loaded samples while preparation is in flight, so reading it would reset a
+/// rapid 1x -> 1.5x -> 2x sequence to the beginning.
+pub(super) struct PendingAudioPreparation {
+    message_id: String,
+    source: Arc<Vec<u8>>,
+    epoch: usize,
+    position: f32,
+    was_playing: bool,
+}
+
+impl PendingAudioPreparation {
+    fn matches(&self, message_id: &str, epoch: usize) -> bool {
+        self.epoch == epoch && self.message_id == message_id
+    }
+
+    fn resume_snapshot(&self) -> (f32, bool) {
+        (self.position, self.was_playing)
+    }
+}
 
 fn media_identity(data: &Arc<Vec<u8>>) -> usize {
     Arc::as_ptr(data) as usize
@@ -137,25 +162,37 @@ impl WhatsAppApp {
 
     /// Update a message's media data (used to cache downloaded media)
     fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>, cx: &mut App) {
-        // Find the message in any chat and update its media data
+        // Locate the owning chat through shared references first. Calling
+        // `Arc::make_mut` while scanning used to clone every chat in the
+        // window, including unrelated conversations, whenever one download
+        // completed. Only the target chat needs to become mutable.
+        let Some(chat_index) = self
+            .chats
+            .iter()
+            .position(|chat| chat.messages.iter().any(|message| message.id == message_id))
+        else {
+            return;
+        };
         let mut touched: Option<String> = None;
-        for chat in self.chats.iter_mut().map(std::sync::Arc::make_mut) {
-            if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id) {
-                if let Some(ref mut media) = msg.media {
-                    // Bytes and the metadata that describes them, together:
-                    // decoding a WebP sticker as the `image/jpeg` its poster
-                    // frame claimed fails every time.
-                    media.adopt_full_bytes(data);
-                    // Drop any render-cached image built from the old bytes
-                    self.decoded_images.borrow_mut().shift_remove(message_id);
-                    self.sticker_validation
-                        .borrow_mut()
-                        .shift_remove(message_id);
-                    info!("Cached media data for message {}", message_id);
-                    touched = Some(chat.jid.clone());
-                }
-                break;
+        {
+            let chat = std::sync::Arc::make_mut(&mut self.chats[chat_index]);
+            if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id)
+                && let Some(ref mut media) = msg.media
+            {
+                // Bytes and the metadata that describes them, together:
+                // decoding a WebP sticker as the `image/jpeg` its poster
+                // frame claimed fails every time.
+                media.adopt_full_bytes(data);
+                info!("Cached media data for message {}", message_id);
+                touched = Some(chat.jid.clone());
             }
+        }
+        if touched.is_some() {
+            // Drop any render-cached image built from the old bytes.
+            self.decoded_images.borrow_mut().shift_remove(message_id);
+            self.sticker_validation
+                .borrow_mut()
+                .shift_remove(message_id);
         }
 
         // Through the shared invalidation rather than by poking one cache:
@@ -177,6 +214,15 @@ impl WhatsAppApp {
     /// Stop any currently playing media. Does NOT call cx.notify().
     pub(super) fn stop_current_media(&mut self) {
         self.audio_player.stop();
+        // A stopped tick may still be between its sleep and `entity.update`.
+        // Drop the handle before a new preparation starts; otherwise the new
+        // playback sees `Some` and refuses to install its own repaint loop,
+        // while the old task can then clear the slot underneath it.
+        self.playback_tick = None;
+        // Invalidate and forget any native preparation that is still running.
+        // The detached worker may finish later, but its epoch no longer names
+        // the media sink and its result must be dropped.
+        self.audio_preparation = None;
         // Name and bytes together, always: this is the whole reason they are
         // one field.
         self.audio = AudioHolder::None;
@@ -199,6 +245,18 @@ impl WhatsAppApp {
         // meaning anything.
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
     }
+
+    /// Keep an in-flight download, but revoke playback that has not begun
+    /// when its conversation is hidden. A note already playing may continue
+    /// while its listener browses; a worker still preparing its first samples
+    /// must not start sound behind the chat list, Settings, or Status.
+    pub(super) fn cancel_hidden_media_autoplay(&mut self) {
+        if self.audio_preparation.is_some() {
+            self.stop_current_media();
+        } else {
+            self.pending_media_request = None;
+        }
+    }
     /// Get the currently playing audio message ID (if audio is playing)
     pub fn playing_message_id(&self) -> Option<&str> {
         match &self.active_media {
@@ -212,8 +270,17 @@ impl WhatsAppApp {
             //
             // A paused note still renders as paused, which is what this was
             // gated for: `is_active` is playing *or on its way*, and a pause
-            // during a decode sets `pending_pause`, which takes it out.
-            ActiveMedia::Audio { message_id } if self.audio_player.is_active() => Some(message_id),
+            // during a decode sets `pending_pause`, which takes it out. Native
+            // preparation has the same gap, so use its captured intent until
+            // the stream is installed.
+            ActiveMedia::Audio { message_id }
+                if self.audio_player.is_active()
+                    || self.audio_preparation.as_ref().is_some_and(|pending| {
+                        pending.message_id == *message_id && pending.was_playing
+                    }) =>
+            {
+                Some(message_id)
+            }
             _ => None,
         }
     }
@@ -236,11 +303,31 @@ impl WhatsAppApp {
         self.audio_player.elapsed_secs()
     }
 
+    /// Whether this voice note is being decoded or re-timed off the UI thread.
+    ///
+    /// The message bubble uses this separately from `is_downloading`: bytes
+    /// may already be local while the native player is still preparing them.
+    pub fn is_audio_preparing(&self, message_id: &str) -> bool {
+        self.audio_preparation
+            .as_ref()
+            .is_some_and(|pending| pending.message_id == message_id)
+            || (self.audio.message_id() == Some(message_id) && self.audio_player.is_loading())
+    }
+
     /// Jump to `fraction` of the way through the loaded voice note.
     ///
     /// Playback continues from there rather than restarting, which is what
     /// makes the waveform a scrub bar and not a progress read-out.
     pub fn seek_audio(&mut self, message_id: &str, fraction: f32, cx: &mut Context<Self>) {
+        if let Some(pending) = self
+            .audio_preparation
+            .as_mut()
+            .filter(|pending| pending.message_id == message_id)
+        {
+            pending.position = fraction.clamp(0.0, 1.0);
+            cx.notify();
+            return;
+        }
         // Named, not merely "something is loaded": every downloaded voice note
         // draws a scrubbable waveform, and an unnamed seek let a click on one
         // row move the position of whichever clip happened to be loaded.
@@ -254,7 +341,11 @@ impl WhatsAppApp {
         if self.audio_player.is_finished()
             && let Some(bytes) = self.audio.note_source(message_id)
         {
-            self.play_audio(message_id.to_string(), (*bytes).clone(), cx);
+            // A finished stream must be rebuilt before it can seek. Keep the
+            // requested fraction in the pending snapshot so the worker's
+            // completion cannot reset a scrub to zero.
+            self.begin_audio_preparation(message_id.to_string(), bytes, fraction, true, cx);
+            return;
         }
         self.audio_player.seek(fraction);
         self.ensure_playback_tick(cx);
@@ -281,36 +372,39 @@ impl WhatsAppApp {
             .position(|s| (s - self.playback_speed).abs() < f32::EPSILON)
             .map_or(0, |ix| (ix + 1) % SPEEDS.len());
         self.playback_speed = SPEEDS[next];
-        self.audio_player.set_speed(self.playback_speed);
 
-        // Whether it is *playing* is not the question: `set_speed` only takes
-        // effect the next time a clip is prepared, so a paused note resumed
-        // afterwards ran at the old rate while the chip and the clock had
-        // already moved to the new one. What matters is whether a clip is
-        // loaded — and one that was paused is put back paused.
-        if let Some((message_id, bytes)) =
-            self.audio
-                .message_id()
-                .map(str::to_owned)
-                .and_then(|message_id| {
-                    let source = self.audio.note_source(&message_id)?;
-                    Some((message_id, source))
-                })
-        {
-            let at = self.audio_player.progress();
-            // `is_active`, not `is_playing`: on the web a clip is neither
-            // playing nor paused for the whole of a decode, and `is_playing`
-            // is false throughout it. Reading that as "was paused" made the
-            // restart bank a `pending_pause`, so changing speed on a note
-            // that had been tapped but had not started yet meant it never
-            // started at all. What a play/pause control has to ask is whether
-            // the clip is playing *or going to*, which is this.
-            let was_playing = self.audio_player.is_active();
-            self.play_audio(message_id, (*bytes).clone(), cx);
-            self.audio_player.seek(at);
-            if !was_playing {
-                self.audio_player.pause();
-            }
+        // A preparation has no loaded samples on the native player yet, so
+        // `progress()` would report zero. Reuse the pending snapshot instead;
+        // this is what makes rapid 1x -> 1.5x -> 2x changes resume at the
+        // original position rather than jumping back to the start.
+        let pending = self.audio_preparation.as_ref().map(|pending| {
+            (
+                pending.message_id.clone(),
+                Arc::clone(&pending.source),
+                pending.position,
+                pending.was_playing,
+            )
+        });
+        let loaded = self
+            .audio
+            .message_id()
+            .map(str::to_owned)
+            .and_then(|message_id| {
+                let source = self.audio.note_source(&message_id)?;
+                Some((
+                    message_id,
+                    source,
+                    self.audio_player.progress(),
+                    self.audio_player.is_active(),
+                ))
+            });
+
+        if let Some((message_id, source, position, was_playing)) = pending.or(loaded) {
+            self.begin_audio_preparation(message_id, source, position, was_playing, cx);
+        } else {
+            // No voice note is loaded (for example, a video soundtrack owns
+            // the sink), so keep the preference for the next voice note.
+            self.audio_player.set_speed(self.playback_speed);
         }
         cx.notify();
     }
@@ -329,12 +423,24 @@ impl WhatsAppApp {
         if self.playback_tick.is_some() {
             return;
         }
+        let epoch = self.playback_epoch;
         self.playback_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
                 // ~15fps: the playhead only has to look continuous, and a
                 // voice note is not worth a frame-rate repaint of the list.
                 crate::platform::sleep(std::time::Duration::from_millis(66)).await;
                 let running = entity.update(cx, |app, cx| {
+                    if app.playback_epoch != epoch {
+                        return false;
+                    }
+                    // The browser's `play_prepared` returns before
+                    // decodeAudioData resolves. Once that promise lands the
+                    // player no longer needs the app-level snapshot; while it
+                    // is pending, speed changes must continue reading the
+                    // saved position instead of the player's zero duration.
+                    if !app.audio_player.is_loading() {
+                        app.audio_preparation = None;
+                    }
                     let playing = app.audio_player.is_playing();
                     if playing {
                         cx.notify();
@@ -346,7 +452,11 @@ impl WhatsAppApp {
                     Ok(false) | Err(_) => break,
                 }
             }
-            let _ = entity.update(cx, |app, _| app.playback_tick = None);
+            let _ = entity.update(cx, |app, _| {
+                if app.playback_epoch == epoch {
+                    app.playback_tick = None;
+                }
+            });
         }));
     }
 
@@ -357,59 +467,132 @@ impl WhatsAppApp {
             _ => None,
         }
     }
-    pub fn play_audio(&mut self, message_id: String, audio_data: Vec<u8>, cx: &mut Context<Self>) {
+
+    /// Queue decode, output conversion and time-stretching on GPUI's worker.
+    ///
+    /// Only the final CPAL/WebAudio installation returns to the entity thread.
+    /// Every request receives a fresh epoch, so a stopped note, a different
+    /// message, or a newer speed change can safely leave its worker running
+    /// until it naturally returns without letting it steal the sink.
+    fn begin_audio_preparation(
+        &mut self,
+        message_id: String,
+        source: Arc<Vec<u8>>,
+        position: f32,
+        was_playing: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.stop_current_media();
         self.pending_media_request = Some(message_id.clone());
-        // Whatever the chip says, applied before the clip is prepared: the
-        // re-timing happens once, on these samples.
         self.audio_player.set_speed(self.playback_speed);
+        // On the web this must happen synchronously while the click still has
+        // transient user activation. Native unlock is intentionally a no-op.
+        self.audio_player.unlock();
+        self.audio = AudioHolder::Note {
+            message_id: message_id.clone(),
+            source: Arc::clone(&source),
+        };
+        self.active_media = ActiveMedia::Audio {
+            message_id: message_id.clone(),
+        };
 
+        let epoch = self.playback_epoch;
+        let speed = self.playback_speed;
+        self.audio_preparation = Some(PendingAudioPreparation {
+            message_id: message_id.clone(),
+            source: Arc::clone(&source),
+            epoch,
+            position: position.clamp(0.0, 1.0),
+            was_playing,
+        });
+
+        // Install the completion sender before the worker starts. Native
+        // playback consumes it when its stream starts; the web backend keeps
+        // it through its asynchronous decode.
         let completion_rx = self.audio_player.on_complete();
-        let source = Arc::new(audio_data);
-
-        match self.audio_player.play((*source).clone()) {
-            Ok(()) => {
-                self.audio = AudioHolder::Note {
-                    message_id: message_id.clone(),
-                    source,
+        let bytes = (*source).clone();
+        let preparation = cx.background_spawn(async move { AudioPlayer::prepare(bytes, speed) });
+        let completed_id = message_id;
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let prepared = preparation.await;
+            let _ = entity.update(cx, |app, cx| {
+                let Some(pending) = app.audio_preparation.as_ref() else {
+                    return;
                 };
-                self.active_media = ActiveMedia::Audio {
-                    message_id: message_id.clone(),
-                };
-                info!("Started audio playback for message {}", message_id);
-                // Drives the playhead and the clock while it runs.
-                self.ensure_playback_tick(cx);
+                if !pending.matches(&completed_id, epoch) {
+                    return;
+                }
+                let pending = app
+                    .audio_preparation
+                    .take()
+                    .expect("audio preparation checked immediately above");
 
-                // Wait for completion event (no polling needed)
-                let completed_id = message_id;
-                // Which playback this belongs to. The id alone is not enough:
-                // replaying the *same* note — scrubbing one that ran to its
-                // end does exactly that — drops the first playback's sender
-                // while the id still matches, so the old wakeup would clear
-                // the new playback's state with the audio still running.
-                let epoch = self.playback_epoch;
-                cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-                    let _ = completion_rx.await;
+                match prepared {
+                    Ok(prepared) => match app.audio_player.play_prepared(prepared) {
+                        Ok(()) => {
+                            // `play_prepared` starts at zero. Restore the
+                            // snapshot captured before the worker began, then
+                            // put a paused note back down if needed.
+                            let (position, was_playing) = pending.resume_snapshot();
+                            let keep_snapshot = app.audio_player.is_loading();
+                            if keep_snapshot {
+                                // WebAudio has accepted the bytes but is still
+                                // decoding them. Keep the snapshot until the
+                                // playback tick observes that decode complete.
+                                app.audio_preparation = Some(pending);
+                            }
+                            app.audio_player.seek(position);
+                            if !was_playing {
+                                app.audio_player.pause();
+                            }
+                            app.ensure_playback_tick(cx);
 
-                    let _ = entity.update(cx, |app, cx| {
-                        // Id check, not just is_audio: switching A -> B drops
-                        // A's completion sender after B is active, and A's
-                        // stale wakeup must not clear B's state.
-                        if app.playback_epoch == epoch && app.active_media.is_playing(&completed_id)
-                        {
-                            app.active_media = ActiveMedia::None;
-                            info!("Audio playback completed");
+                            let completed_id = completed_id.clone();
+                            let completion_epoch = app.playback_epoch;
+                            cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                                let _ = completion_rx.await;
+                                let _ = entity.update(cx, |app, cx| {
+                                    if app.playback_epoch == completion_epoch
+                                        && app.active_media.is_playing(&completed_id)
+                                    {
+                                        app.active_media = ActiveMedia::None;
+                                        info!("Audio playback completed");
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .detach();
+                        }
+                        Err(error) => {
+                            error!("Failed to start prepared audio: {error}");
+                            app.notify_user(
+                                format!("Could not start that audio: {error}"),
+                                crate::app::notices::Tone::Problem,
+                                cx,
+                            );
+                            app.stop_current_media();
                             cx.notify();
                         }
-                    });
-                })
-                .detach();
-            }
-            Err(e) => {
-                error!("Failed to play audio: {}", e);
-            }
-        }
+                    },
+                    Err(error) => {
+                        error!("Failed to prepare audio: {error}");
+                        app.notify_user(
+                            format!("Could not prepare that audio: {error}"),
+                            crate::app::notices::Tone::Problem,
+                            cx,
+                        );
+                        app.stop_current_media();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
         cx.notify();
+    }
+
+    pub fn play_audio(&mut self, message_id: String, audio_data: Vec<u8>, cx: &mut Context<Self>) {
+        self.begin_audio_preparation(message_id, Arc::new(audio_data), 0.0, true, cx);
     }
     /// Toggle play/pause for the current audio
     pub fn toggle_audio(
@@ -418,6 +601,18 @@ impl WhatsAppApp {
         audio_data: Vec<u8>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(pending) = self
+            .audio_preparation
+            .as_mut()
+            .filter(|pending| pending.message_id == message_id)
+        {
+            // A native preparation has no stream to pause yet. Flip the
+            // intent stored beside the worker; completion will install the
+            // samples at the saved position and honour this pause.
+            pending.was_playing = !pending.was_playing;
+            cx.notify();
+            return;
+        }
         if self.active_media.is_playing(&message_id) && self.active_media.is_audio() {
             // Same message - toggle play/pause. `is_active` rather than
             // `is_playing`: a clip the browser is still decoding is not
@@ -445,6 +640,15 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
+        if let Some(pending) = self
+            .audio_preparation
+            .as_mut()
+            .filter(|pending| pending.message_id == message_id)
+        {
+            pending.was_playing = !pending.was_playing;
+            cx.notify();
+            return;
+        }
         // If already playing this audio message, just toggle. `is_active`
         // for the same reason as above: a decode in flight is a note on its
         // way, and a tap during it means stop.
@@ -478,6 +682,11 @@ impl WhatsAppApp {
         let Some(client) = &self.client else {
             warn!("Cannot download audio: client is unavailable");
             self.finish_download(&message_id);
+            self.notify_user(
+                "Cannot download audio while disconnected",
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             return;
         };
         let download_rx = client.download_downloadable_media(downloadable);
@@ -1208,5 +1417,89 @@ async fn hand_to_user(
             .await
     } else {
         crate::platform::download::save(&file_name, &data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(epoch: usize, position: f32, was_playing: bool) -> PendingAudioPreparation {
+        PendingAudioPreparation {
+            message_id: "voice-1".to_string(),
+            source: Arc::new(Vec::new()),
+            epoch,
+            position,
+            was_playing,
+        }
+    }
+
+    #[test]
+    fn speed_restart_preserves_position_and_pause_intent() {
+        let pending = pending(7, 0.625, false);
+
+        assert_eq!(pending.resume_snapshot(), (0.625, false));
+        assert!(pending.matches("voice-1", 7));
+    }
+
+    #[test]
+    fn an_old_preparation_cannot_install_after_a_new_epoch() {
+        let pending = pending(8, 0.25, true);
+
+        assert!(!pending.matches("voice-1", 7));
+        assert!(!pending.matches("voice-2", 8));
+        assert!(pending.matches("voice-1", 8));
+    }
+
+    #[gpui::test]
+    fn hiding_a_chat_cancels_pending_autoplay_without_cancelling_download(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, _| {
+            app.downloads_in_flight.insert("voice-1".into());
+            app.pending_media_request = Some("voice-1".into());
+            app.audio_preparation = Some(pending(app.playback_epoch, 0.5, true));
+            app.active_media = ActiveMedia::Audio {
+                message_id: "voice-1".into(),
+            };
+            let epoch = app.playback_epoch;
+
+            app.cancel_hidden_media_autoplay();
+
+            assert!(app.downloads_in_flight.contains("voice-1"));
+            assert!(app.pending_media_request.is_none());
+            assert!(app.audio_preparation.is_none());
+            assert!(matches!(app.active_media, ActiveMedia::None));
+            assert_eq!(app.playback_epoch, epoch.wrapping_add(1));
+        });
+    }
+
+    #[gpui::test]
+    fn hiding_a_chat_keeps_audio_that_was_already_playing(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, _| {
+            app.downloads_in_flight.insert("voice-1".into());
+            app.pending_media_request = Some("voice-1".into());
+            app.active_media = ActiveMedia::Audio {
+                message_id: "voice-1".into(),
+            };
+            let epoch = app.playback_epoch;
+
+            app.cancel_hidden_media_autoplay();
+
+            assert!(app.downloads_in_flight.contains("voice-1"));
+            assert!(app.pending_media_request.is_none());
+            assert!(matches!(app.active_media, ActiveMedia::Audio { .. }));
+            assert_eq!(app.playback_epoch, epoch);
+        });
     }
 }

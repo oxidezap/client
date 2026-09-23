@@ -207,15 +207,16 @@ mod imp {
                 Ok(buffer) => {
                     let bytes = Uint8Array::new(&buffer).to_vec();
                     budget.took(bytes.len() as u64);
-                    chosen.files.push(crate::platform::picker::Picked {
-                        mime_type: if file.type_().is_empty() {
-                            crate::platform::picker::mime_for_name(&file_name).to_string()
-                        } else {
-                            file.type_()
-                        },
-                        file_name,
-                        bytes,
-                    });
+                    let mime_type = if file.type_().is_empty() {
+                        crate::platform::picker::mime_for_name(&file_name).to_string()
+                    } else {
+                        file.type_()
+                    };
+                    chosen
+                        .files
+                        .push(crate::platform::picker::Picked::automatic(
+                            file_name, mime_type, bytes,
+                        ));
                 }
                 Err(error) => chosen
                     .refused
@@ -253,6 +254,7 @@ mod tests {
         assert_eq!(chosen.files.len(), 1);
         assert_eq!(chosen.files[0].file_name, expected_name);
         assert_eq!(chosen.files[0].bytes, b"test payload");
+        assert_eq!(chosen.files[0].kind, oxidezap_core::OutgoingMedia::Document);
     }
 
     #[test]

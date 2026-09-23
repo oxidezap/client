@@ -564,6 +564,38 @@ impl ChatStore {
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
+    /// Apply a locally requested delete-for-me through the same materializer
+    /// as the app-state event that will later arrive from linked devices.
+    pub fn record_delete_for_me(
+        &self,
+        chat: &Jid,
+        target_id: &str,
+        from_me: bool,
+        participant: Option<Jid>,
+        message_timestamp_ms: i64,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        use wacore::types::events::DeleteMessageForMeUpdate;
+
+        let update = DeleteMessageForMeUpdate::builder()
+            .chat_jid(chat.clone())
+            .maybe_participant_jid(participant)
+            .message_id(target_id.to_owned())
+            .from_me(from_me)
+            .timestamp(timestamp)
+            .action(Box::new(wa::sync_action_value::DeleteMessageForMeAction {
+                delete_media: Some(false),
+                message_timestamp: Some(message_timestamp_ms),
+            }))
+            .from_full_sync(false)
+            .build();
+        self.tx
+            .send(WriterMsg::Event(Arc::new(Event::DeleteMessageForMeUpdate(
+                update,
+            ))))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
     /// Record a reaction this client just sent. An empty `emoji` removes this
     /// client's existing reaction, matching the inbound event semantics.
     ///

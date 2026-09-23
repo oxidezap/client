@@ -32,7 +32,7 @@ mod player;
 mod recorder;
 
 pub use call_device::open_call_audio;
-pub use player::AudioPlayer;
+pub use player::{AudioPlayer, PreparedAudio};
 pub use recorder::AudioRecorder;
 
 /// The page's event loop, which is the only executor there is here.

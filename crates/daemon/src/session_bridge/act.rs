@@ -84,6 +84,43 @@ impl Bridge {
         reply: tokio::sync::oneshot::Sender<CommandOutcome>,
     ) -> Option<(Action, tokio::sync::oneshot::Sender<CommandOutcome>)> {
         match action {
+            Action::EditMessage {
+                id,
+                request,
+                answer_to,
+            } => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let task = client.edit_message(request.jid, request.message_id, request.new_text);
+                oxidezap_session::spawn(async move {
+                    let result = mutation_answer(id, task.await);
+                    answer_now(&answer_to, answered(id, result));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
+            Action::RevokeMessage {
+                id,
+                request,
+                answer_to,
+            } => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let task =
+                    client.revoke_message(request.jid, request.message_id, request.for_everyone);
+                oxidezap_session::spawn(async move {
+                    let result = mutation_answer(id, task.await);
+                    answer_now(&answer_to, answered(id, result));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
             Action::MarkStatusWatched(oxidezap_ipc::MarkStatusWatched { message_ids }) => {
                 // The other actions are finished when the session has taken
                 // them and what the network makes of them arrives later; this
@@ -1360,7 +1397,9 @@ impl Bridge {
         }
 
         match action {
-            Action::Wire { .. } => unreachable!("Wire actions are handled in begin_slow"),
+            Action::Wire { .. } | Action::EditMessage { .. } | Action::RevokeMessage { .. } => {
+                unreachable!("addressed actions are handled in begin_slow")
+            }
             Action::SendText(oxidezap_ipc::SendText {
                 jid,
                 text,
@@ -2035,6 +2074,19 @@ fn answered(id: RequestId, result: Result<DaemonMessage, ProtocolError>) -> Stri
     });
     serde_json::to_string(&frame)
         .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
+}
+
+fn mutation_answer<T, E: std::fmt::Display>(
+    id: RequestId,
+    result: Result<Result<T, String>, E>,
+) -> Result<DaemonMessage, ProtocolError> {
+    match result {
+        Ok(Ok(_)) => Ok(DaemonMessage::Accepted { id: Some(id) }),
+        Ok(Err(detail)) => Err(ProtocolError::Refused { detail }),
+        Err(error) => Err(ProtocolError::NoSession {
+            detail: format!("session stopped before the message action finished: {error}"),
+        }),
+    }
 }
 
 /// Unique optimistic-send id.

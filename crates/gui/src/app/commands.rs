@@ -262,6 +262,10 @@ impl WhatsAppApp {
         if !matches!(self.app_state, AppState::Connected | AppState::Offline) {
             return;
         }
+        // Settings replaces the conversation surface. A media fetch may keep
+        // running, but its autoplay intent belongs to the conversation that
+        // was just hidden and must not start behind Settings.
+        self.cancel_hidden_media_autoplay();
         if self.showing_settings(cx) {
             return;
         }
@@ -325,6 +329,12 @@ impl WhatsAppApp {
         // Escape refuses that caller and leaves the call underneath alone.
         if self.call_state(cx).waiting().is_some() {
             self.decline_waiting_call(cx);
+            return;
+        }
+        if self.cancel_message_delete(cx) {
+            return;
+        }
+        if self.cancel_message_edit(cx) {
             return;
         }
         if self.cancel_paste_preview(cx) {

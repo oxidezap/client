@@ -18,6 +18,7 @@ mod events;
 mod frame_cost;
 mod media;
 mod media_ctl;
+mod message_actions;
 mod messages;
 pub mod notices;
 mod paging;
@@ -38,6 +39,7 @@ pub use chats::{
     ChatFilter, ChatListCache, Survival, survives_archived_scan, survives_complete_load,
 };
 pub use media::RecordingState;
+pub(crate) use message_actions::{can_delete_sent, can_edit_sent};
 pub use messages::{BubbleIds, MessageListCache, TimelineItem};
 pub use paging::nearing_end;
 
@@ -125,6 +127,10 @@ enum KeyboardOwner {
     /// A call that is ringing — not one that has been answered, which is a
     /// call people type through.
     RingingCall(String),
+    /// A sent message's replacement text, in its own modal field.
+    MessageEdit,
+    /// An addressed sent-message deletion awaiting final confirmation.
+    MessageDelete,
     /// Files pasted or dropped into the composer, waiting for explicit
     /// confirmation before anything is uploaded.
     PastePreview,
@@ -159,6 +165,8 @@ pub struct KeyboardSurfaces {
     pub viewer: bool,
     /// The modal preview for files waiting to be sent.
     pub paste_preview: bool,
+    pub message_edit: bool,
+    pub message_delete: bool,
     /// The call card, which only the connected screens float.
     pub call_card: bool,
 }
@@ -295,7 +303,7 @@ pub use status::{Destination, StatusPane};
 pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -384,6 +392,21 @@ pub struct RetryMessage {
 pub struct ReactToMessage {
     pub id: gpui::SharedString,
     pub emoji: gpui::SharedString,
+}
+
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct EditSentMessage {
+    pub jid: gpui::SharedString,
+    pub id: gpui::SharedString,
+}
+
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct DeleteSentMessage {
+    pub jid: gpui::SharedString,
+    pub id: gpui::SharedString,
+    pub for_everyone: bool,
 }
 
 use crate::components::{
@@ -684,6 +707,10 @@ pub struct WhatsAppApp {
     /// the first returns would multiply that budget in wasm memory.
     incoming_file_reading: bool,
     paste_preview: Option<PendingPastePreview>,
+    /// Accepted selections that completed while another confirmation was open.
+    /// Keeping these instead of dropping a late picker/drop result guarantees
+    /// every accepted attachment gets the same explicit confirmation surface.
+    pending_attachment_previews: VecDeque<PendingPastePreview>,
     #[cfg(test)]
     /// What `send_attachment` was asked to send in tests: the file and the
     /// caption that would have travelled with it, recorded before the
@@ -701,6 +728,8 @@ pub struct WhatsAppApp {
     call_focus: FocusHandle,
     /// Focus target for the pasted-image confirmation modal.
     paste_preview_focus: FocusHandle,
+    /// Focus target for the sent-message deletion confirmation modal.
+    message_delete_focus: FocusHandle,
     /// Focus target for the window itself, so the actions hung off the root
     /// are reachable whatever else is on screen — including on the screens on
     /// the way to a conversation, which have no list and no composer to
@@ -764,6 +793,10 @@ pub struct WhatsAppApp {
     /// Which playback the completion still in flight belongs to. See
     /// `stop_current_media`.
     playback_epoch: usize,
+    /// Voice-note decode/resample/time-stretch currently running off the UI
+    /// executor. The token also carries the position and pause intent needed
+    /// when a speed change arrives before the first preparation completes.
+    audio_preparation: Option<media_ctl::PendingAudioPreparation>,
     /// The deadline `status_tick` is waiting on, so an earlier one that
     /// arrives later can replace it rather than queue behind it.
     status_tick_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -962,6 +995,11 @@ pub struct WhatsAppApp {
     /// the strip is drawn inline under its bubble, and two open strips would
     /// each move the timeline the other measured against.
     reaction_picker_for: Option<String>,
+    edit_draft: Option<message_actions::EditDraft>,
+    delete_confirmation: Option<message_actions::DeleteConfirmation>,
+    pending_message_actions: HashSet<(String, String)>,
+    #[cfg(test)]
+    delete_attempts: Vec<(String, String, bool)>,
     /// Who is typing and who is around. Expires on its own, so it is view
     /// state rather than anything the store carries.
     presence: PresenceRegistry,
@@ -1327,6 +1365,7 @@ impl WhatsAppApp {
             incoming_file_epoch: 0,
             incoming_file_reading: false,
             paste_preview: None,
+            pending_attachment_previews: VecDeque::new(),
             #[cfg(test)]
             attachment_attempts: Vec::new(),
             chat_list_scroll: VirtualListScrollHandle::new(),
@@ -1334,6 +1373,7 @@ impl WhatsAppApp {
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
             paste_preview_focus: cx.focus_handle(),
+            message_delete_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
             keyboard_owner: None,
             window_focused: false,
@@ -1350,6 +1390,7 @@ impl WhatsAppApp {
             keyboard_intent: ChatOpen::ToPreview,
             keyboard_surfaces: KeyboardSurfaces::default(),
             playback_epoch: 0,
+            audio_preparation: None,
             status_tick_at: None,
             visible_chat: None,
             retained_chat: None,
@@ -1403,6 +1444,11 @@ impl WhatsAppApp {
             chat_filter: ChatFilter::default(),
             reply_to: None,
             reaction_picker_for: None,
+            edit_draft: None,
+            delete_confirmation: None,
+            pending_message_actions: HashSet::new(),
+            #[cfg(test)]
+            delete_attempts: Vec::new(),
             presence: PresenceRegistry::new(),
             account_name: None,
             account_jid: None,
@@ -1509,6 +1555,10 @@ impl WhatsAppApp {
     /// Navigate back to chat list (for mobile)
     pub fn navigate_back(&mut self, cx: &mut Context<Self>) {
         self.mobile_panel = MobilePanel::ChatList;
+        // Keep an in-flight media download alive, but revoke its autoplay
+        // intent: its answer may arrive after this conversation is no longer
+        // on screen and must not start audio behind the chat list.
+        self.cancel_hidden_media_autoplay();
         // Leaving the panel means leaving what was in it: a status left open
         // would put the window straight back into it on the next layout,
         // since the panel is derived from whether there is anything to show.
@@ -2023,6 +2073,8 @@ impl WhatsAppApp {
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.incoming_file_reading = false;
         self.paste_preview = None;
+        self.delete_confirmation = None;
+        self.pending_attachment_previews.clear();
         self.notified_messages.clear();
         crate::platform::clear_notifications();
         self.pending_notification_tags.clear();
@@ -2117,6 +2169,8 @@ impl WhatsAppApp {
     /// Not [`AppState::Offline`]: that keeps the conversation on screen and
     /// only refuses to send.
     fn leave_connected_view(&mut self, cx: &mut Context<Self>) {
+        self.edit_draft = None;
+        self.delete_confirmation = None;
         if self.recorder.read(cx).state() != RecordingState::Idle {
             self.cancel_recording(cx);
         }
@@ -2592,6 +2646,10 @@ impl WhatsAppApp {
         // on this target, where the prompt is the browser's rather than the
         // operating system's.
         crate::platform::request_gesture_authorization();
+        if self.selected_chat.as_deref() != Some(jid.as_str()) {
+            self.cancel_message_edit(cx);
+            self.cancel_message_delete(cx);
+        }
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on
@@ -2883,8 +2941,8 @@ impl WhatsAppApp {
             InputAreaEvent::SendMessage(text) => {
                 self.send_message(text, cx);
             }
-            InputAreaEvent::AttachFiles => {
-                self.attach_files(cx);
+            InputAreaEvent::AttachFiles(category) => {
+                self.attach_category(*category, cx);
             }
             InputAreaEvent::PasteMedia => self.paste_media(cx),
             InputAreaEvent::StartRecording => {
@@ -4013,6 +4071,12 @@ impl Render for WhatsAppApp {
             .on_action(cx.listener(|app, react: &ReactToMessage, window, cx| {
                 app.toggle_reaction(&react.id, &react.emoji, window, cx);
             }))
+            .on_action(cx.listener(|app, edit: &EditSentMessage, window, cx| {
+                app.begin_message_edit(&edit.jid, &edit.id, window, cx);
+            }))
+            .on_action(cx.listener(|app, delete: &DeleteSentMessage, _window, cx| {
+                app.begin_message_delete(&delete.jid, &delete.id, delete.for_everyone, cx);
+            }))
             .on_action(|copy: &CopyMessage, _window, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.text.to_string()));
             })
@@ -4048,11 +4112,25 @@ impl Render for WhatsAppApp {
             )
             .into_any_element()
         });
+        let message_edit = self.edit_draft.as_ref().map(|draft| {
+            message_actions::render_message_edit(draft, cx.entity().clone(), cx).into_any_element()
+        });
+        let message_delete = self.delete_confirmation.as_ref().map(|confirmation| {
+            message_actions::render_message_delete(
+                confirmation,
+                cx.entity().clone(),
+                &self.message_delete_focus,
+                cx,
+            )
+            .into_any_element()
+        });
 
         // The card is the one surface the root draws itself, so it is the
         // one the root answers for.
         let call_card = call_overlay.is_some();
         let paste_preview_open = paste_preview.is_some();
+        let message_edit_open = message_edit.is_some();
+        let message_delete_open = message_delete.is_some();
 
         // Above the call card as well as the body: a notice raised by
         // something the call did is about the call, and a card that covered
@@ -4062,6 +4140,8 @@ impl Render for WhatsAppApp {
         // nothing at all while it is empty.
         root.child(body.cached(gpui::StyleRefinement::default().size_full()))
             .children(paste_preview)
+            .children(message_edit)
+            .children(message_delete)
             .children(call_overlay)
             .child(self.notices().clone())
             // Cached views report their surfaces in prepaint. Move focus after
@@ -4072,6 +4152,8 @@ impl Render for WhatsAppApp {
                         entity.update(cx, |app, _| {
                             app.keyboard_surfaces.call_card = call_card;
                             app.keyboard_surfaces.paste_preview = paste_preview_open;
+                            app.keyboard_surfaces.message_edit = message_edit_open;
+                            app.keyboard_surfaces.message_delete = message_delete_open;
                         });
                         let entity = entity.downgrade();
                         window.defer(cx, move |window, cx| {

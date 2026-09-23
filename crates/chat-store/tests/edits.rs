@@ -130,6 +130,39 @@ async fn local_edit_updates_own_message_and_preview() {
 }
 
 #[tokio::test]
+async fn local_delete_for_me_removes_own_copy_without_a_tombstone() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-LOCAL-DELETE",
+            &wa::Message::text("private"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    chat_store
+        .record_delete_for_me(
+            &chat,
+            "OUT-LOCAL-DELETE",
+            true,
+            None,
+            1_700_000_000_000,
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert!(
+        chat_store
+            .message(&chat, "OUT-LOCAL-DELETE")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn local_revoke_tombstones_own_message_and_absorbs_edits() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);

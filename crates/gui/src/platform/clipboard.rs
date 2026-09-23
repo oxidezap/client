@@ -41,11 +41,11 @@ fn image_as_picked(image: gpui::Image) -> Result<Picked, String> {
     {
         return Err(reason);
     }
-    Ok(Picked {
+    Ok(Picked::automatic(
         file_name,
-        mime_type: image.format.mime_type().to_string(),
-        bytes: image.bytes,
-    })
+        image.format.mime_type().to_string(),
+        image.bytes,
+    ))
 }
 
 /// Sort an item's entries into images and copied file paths.
@@ -172,6 +172,7 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].file_name, "pasted.png");
         assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].kind, oxidezap_core::OutgoingMedia::Image);
         assert_eq!(images[0].bytes, vec![1, 2, 3]);
     }
 
@@ -197,11 +198,7 @@ mod tests {
         let ceiling = oxidezap_ipc::MAX_STAGED_BYTES;
         let mut budget = Budget::default();
         budget.took(ceiling - 8);
-        let image = Picked {
-            file_name: "pasted.png".to_string(),
-            mime_type: "image/png".to_string(),
-            bytes: vec![0; 16],
-        };
+        let image = Picked::automatic("pasted.png".into(), "image/png".into(), vec![0; 16]);
         let (kept, refused) = fit_images(vec![image], &mut budget);
         assert!(kept.is_empty());
         assert_eq!(refused.len(), 1);
@@ -213,11 +210,7 @@ mod tests {
     fn a_fitting_image_is_charged_before_the_files() {
         let ceiling = oxidezap_ipc::MAX_STAGED_BYTES;
         let mut budget = Budget::default();
-        let image = Picked {
-            file_name: "pasted.png".to_string(),
-            mime_type: "image/png".to_string(),
-            bytes: vec![0; 16],
-        };
+        let image = Picked::automatic("pasted.png".into(), "image/png".into(), vec![0; 16]);
         let (kept, refused) = fit_images(vec![image], &mut budget);
         assert_eq!(kept.len(), 1);
         assert!(refused.is_empty());

@@ -154,6 +154,10 @@ impl WhatsAppApp {
         if self.destination == destination {
             return;
         }
+        // Switching the destination hides the conversation surface. Keep any
+        // media request alive for caching, but revoke autoplay so a late
+        // download cannot start sound behind Status or the chat list.
+        self.cancel_hidden_media_autoplay();
         // Leaving Status is leaving the update that was playing. Every other
         // way out of the reader stops its media; this one changed which panel
         // was drawn and left a video decoding and talking underneath the

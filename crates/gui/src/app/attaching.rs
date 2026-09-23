@@ -252,14 +252,18 @@ impl WhatsAppApp {
         .detach();
     }
 
-    /// Ask for files and offer the same captioned confirmation as a paste or
-    /// drop. The picker reads asynchronously; the captured destination and
-    /// account epoch prevent a late result opening over another chat/account.
-    pub(super) fn attach_files(&mut self, cx: &mut Context<Self>) {
+    /// Ask for files under the category selected from the attachment button.
+    /// The same captured destination, account epoch, and captioned confirmation
+    /// apply to both picker categories.
+    pub(super) fn attach_category(
+        &mut self,
+        category: crate::platform::picker::AttachmentCategory,
+        cx: &mut Context<Self>,
+    ) {
         let Some((jid, reply, epoch)) = self.prepare_incoming_files(cx) else {
             return;
         };
-        let chosen = crate::platform::picker::choose(cx);
+        let chosen = crate::platform::picker::choose_category(cx, category);
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let chosen = chosen.await;
             let _ = entity.update(cx, |app, cx| {
@@ -397,10 +401,9 @@ impl WhatsAppApp {
             return false;
         };
 
-        // The picker's answer rather than the protocol's: `for_mime` says what
-        // an `image/*` is, and the picker says which of those actually reach
-        // the recipient as a picture. See `picker::kind_for`.
-        let kind = crate::platform::picker::kind_for(&file.mime_type);
+        // The category selected before choosing is authoritative. The MIME
+        // still describes the bytes, but cannot override "Documento" here.
+        let kind = file.kind;
         let local_id = Self::next_local_id("local_media");
         // Built before the bytes are handed over, because for a picture it
         // *is* those bytes: the sender sees what they sent rather than a
@@ -497,21 +500,9 @@ mod tests {
     /// being asserted is what the *type* decides, and no branch here reads a
     /// byte of a document.
     fn picked(file_name: &str, mime_type: &str) -> Picked {
-        Picked {
-            file_name: file_name.to_string(),
-            mime_type: mime_type.to_string(),
-            bytes: vec![0; 4096],
-        }
+        Picked::automatic(file_name.to_string(), mime_type.to_string(), vec![0; 4096])
     }
 
-    /// A picture in a format the far end will not draw goes as a document, so
-    /// the recipient gets a file they can open instead of a bubble that is
-    /// blank on every client — see `picker::kind_for`.
-    ///
-    /// And the bubble for it holds no bytes. The echo carries a copy of the
-    /// payload only where those bytes *are* the picture; drawing a document
-    /// from them is not something this side can do, so keeping a second copy
-    /// of an SVG until the upload finished bought nothing at all.
     #[test]
     fn a_picture_nothing_draws_is_sent_and_echoed_as_a_document() {
         for undrawable in [
@@ -530,16 +521,12 @@ mod tests {
             assert_eq!(echo.media_type, MediaType::Document, "{undrawable}");
             assert!(
                 echo.data.is_empty(),
-                "{undrawable} echoed {} bytes it cannot draw",
-                echo.data.len()
+                "{undrawable} echoed undecodable bytes"
             );
-            // The name still travels, because a document is drawn as one.
             assert_eq!(echo.file_name.as_deref(), Some("desenho"), "{undrawable}");
         }
     }
 
-    /// And a photo is still a photo, drawn from the bytes in hand: the sender
-    /// sees what they sent rather than a placeholder that resolves into it.
     #[test]
     fn a_photo_is_still_echoed_from_its_own_bytes() {
         for photo in ["image/jpeg", "image/png", "image/gif", "image/webp"] {
@@ -551,5 +538,13 @@ mod tests {
             assert_eq!(echo.media_type, MediaType::Image, "{photo}");
             assert_eq!(echo.data.len(), file.bytes.len(), "{photo}");
         }
+    }
+    #[test]
+    fn explicit_document_kind_wins_even_when_the_mime_is_an_image() {
+        let mut file = picked("photo.jpg", "image/jpeg");
+        file.kind = OutgoingMedia::Document;
+        let echo = echo_of(&file, file.kind);
+        assert_eq!(echo.media_type, MediaType::Document);
+        assert!(echo.data.is_empty());
     }
 }

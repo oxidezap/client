@@ -286,6 +286,9 @@ impl<'a> Frames<'a> {
                 // For most requests this only releases the entry. For the few
                 // whose whole answer is that they were done, it is the answer.
                 match take_pending(self.pending, id) {
+                    Some(Awaiting::Mutation(tx)) => {
+                        let _ = tx.send(Ok(()));
+                    }
                     Some(Awaiting::Acted(tx)) => {
                         let _ = tx.send(());
                     }

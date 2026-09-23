@@ -24,6 +24,18 @@ mod cpal_output {
 
     use super::PlayerError;
 
+    /// Samples ready for the output callback.
+    ///
+    /// The expensive work (Opus decode, output-rate conversion and WSOLA) is
+    /// done before this reaches the UI thread. The stream itself still belongs
+    /// to `AudioPlayer`, so pause/seek/stop remain cheap UI operations.
+    pub struct PreparedAudio {
+        samples: Vec<f32>,
+        config: StreamConfig,
+        sample_format: SampleFormat,
+        time_scale: f32,
+    }
+
     /// Audio player for PTT voice messages.
     pub struct AudioPlayer {
         stream: Option<Stream>,
@@ -197,14 +209,46 @@ mod cpal_output {
 
         /// Play a voice note, at whatever speed the listener chose.
         pub fn play(&mut self, ogg_data: Vec<u8>) -> Result<(), PlayerError> {
+            let prepared = Self::prepare(ogg_data, self.speed)?;
+            self.play_prepared(prepared)
+        }
+
+        /// Prepare an OGG voice note without touching player state.
+        ///
+        /// This function is deliberately pure with respect to `AudioPlayer`:
+        /// callers can run it on GPUI's background executor and discard a
+        /// result when a newer playback request supersedes it.
+        pub fn prepare(ogg_data: Vec<u8>, speed: f32) -> Result<PreparedAudio, PlayerError> {
+            if ogg_data.is_empty() {
+                return Err(PlayerError::EmptyAudio);
+            }
             let samples = decode_ogg(&ogg_data)?;
             if samples.is_empty() {
                 return Err(PlayerError::EmptyAudio);
             }
 
             info!("Decoded {} samples for playback", samples.len());
-            let speed = self.speed;
-            self.play_at(&samples, 48000, speed)
+            let (config, sample_format) = output_config()?;
+            Ok(prepare_samples(
+                &samples,
+                48000,
+                speed,
+                config,
+                sample_format,
+            ))
+        }
+
+        /// Install samples prepared off the UI thread and start their stream.
+        pub fn play_prepared(&mut self, prepared: PreparedAudio) -> Result<(), PlayerError> {
+            let PreparedAudio {
+                samples,
+                config,
+                sample_format,
+                time_scale,
+            } = prepared;
+
+            self.replace_stream();
+            self.start_resampled(samples, config, sample_format, time_scale)
         }
 
         /// Play raw f32 PCM samples at the specified sample rate.
@@ -233,10 +277,7 @@ mod cpal_output {
             src_sample_rate: u32,
             speed: f32,
         ) -> Result<(), PlayerError> {
-            // Preserve completion sender through stop() since it may have been set by on_complete()
-            let saved_completion_tx = self.completion_tx.take();
-            self.stop();
-            self.completion_tx = saved_completion_tx;
+            self.replace_stream();
 
             if samples.is_empty() {
                 return Err(PlayerError::EmptyAudio);
@@ -248,71 +289,45 @@ mod cpal_output {
                 src_sample_rate
             );
 
-            let host = cpal::default_host();
-            let device = host
-                .default_output_device()
-                .ok_or(PlayerError::NoOutputDevice)?;
+            let (config, sample_format) = output_config()?;
+            let prepared = prepare_samples(samples, src_sample_rate, speed, config, sample_format);
+            self.start_resampled(
+                prepared.samples,
+                prepared.config,
+                prepared.sample_format,
+                prepared.time_scale,
+            )
+        }
 
-            info!("Using default output device");
+        fn replace_stream(&mut self) {
+            // Preserve completion sender through stop() since it may have been
+            // set by on_complete().
+            let saved_completion_tx = self.completion_tx.take();
+            self.stop();
+            self.completion_tx = saved_completion_tx;
+        }
 
-            // Prefer F32 (native to our samples), but i16/u16-only devices still
-            // play: the callback converts per sample. Formats build_stream can't
-            // dispatch (i32/f64/...) are filtered out up front so a fallback pick
-            // never lands on one while a buildable range exists.
-            let supported_configs: Vec<_> = device
-                .supported_output_configs()
-                .map_err(|e| PlayerError::DeviceError(e.to_string()))?
-                .filter(|c| {
-                    matches!(
-                        c.sample_format(),
-                        SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
-                    )
-                })
-                .collect();
-
-            let supports_48k = |c: &cpal::SupportedStreamConfigRange| {
-                c.min_sample_rate() <= 48000 && c.max_sample_rate() >= 48000
-            };
-            let is_f32 =
-                |c: &cpal::SupportedStreamConfigRange| c.sample_format() == SampleFormat::F32;
-            let chosen = supported_configs
-                .iter()
-                .find(|c| is_f32(c) && supports_48k(c))
-                .or_else(|| supported_configs.iter().find(|c| is_f32(c)))
-                .or_else(|| supported_configs.iter().find(|c| supports_48k(c)))
-                .or_else(|| supported_configs.first())
-                .ok_or(PlayerError::NoSupportedConfig)?;
-
-            let sample_format = chosen.sample_format();
-            let config: StreamConfig = if supports_48k(chosen) {
-                chosen.with_sample_rate(48000)
-            } else {
-                chosen.with_sample_rate(chosen.min_sample_rate())
-            }
-            .into();
+        fn start_resampled(
+            &mut self,
+            resampled: Vec<f32>,
+            config: StreamConfig,
+            sample_format: SampleFormat,
+            time_scale: f32,
+        ) -> Result<(), PlayerError> {
             self.sample_rate = config.sample_rate;
             let output_channels = config.channels as usize;
             self.channels = output_channels.max(1);
+            self.time_scale = time_scale;
+            self.total_samples = resampled.len() as u64;
+
+            let device = cpal::default_host()
+                .default_output_device()
+                .ok_or(PlayerError::NoOutputDevice)?;
 
             info!(
                 "Output config: {} Hz, {} channels, {:?}",
                 config.sample_rate, output_channels, sample_format
             );
-
-            let resampled =
-                resample_audio(samples, src_sample_rate, self.sample_rate, output_channels);
-            let before = resampled.len();
-            let resampled = crate::timescale::stretch(resampled, output_channels, speed);
-            // The ratio achieved, not the one asked for. `stretch` returns a clip
-            // shorter than one frame unchanged, and both clocks are derived from
-            // the samples that are actually queued — so a short note at 2× was
-            // counting up to twice its own length.
-            self.time_scale = if resampled.is_empty() {
-                1.0
-            } else {
-                before as f32 / resampled.len() as f32
-            };
-            self.total_samples = resampled.len() as u64;
 
             let is_playing = self.is_playing.clone();
             let position = self.position.clone();
@@ -591,6 +606,85 @@ mod cpal_output {
         output
     }
 
+    /// Resample and retime once, for both voice notes and the video's 1× track.
+    fn prepare_samples(
+        samples: &[f32],
+        src_sample_rate: u32,
+        speed: f32,
+        config: StreamConfig,
+        sample_format: SampleFormat,
+    ) -> PreparedAudio {
+        let output_channels = config.channels as usize;
+        let resampled = resample_audio(
+            samples,
+            src_sample_rate,
+            config.sample_rate,
+            output_channels,
+        );
+        let before = resampled.len();
+        let resampled = crate::timescale::stretch(resampled, output_channels, speed);
+        // The ratio achieved, not the one asked for. A short clip may not be
+        // stretched at all, and both clocks describe what actually plays.
+        let time_scale = if resampled.is_empty() {
+            1.0
+        } else {
+            before as f32 / resampled.len() as f32
+        };
+        PreparedAudio {
+            samples: resampled,
+            config,
+            sample_format,
+            time_scale,
+        }
+    }
+
+    /// Select the output format once, before the expensive preparation starts.
+    ///
+    /// The returned value is plain data and is safe to move through GPUI's
+    /// background executor. The device is looked up again only when the
+    /// prepared samples are installed, where CPAL needs its handle.
+    fn output_config() -> Result<(StreamConfig, SampleFormat), PlayerError> {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or(PlayerError::NoOutputDevice)?;
+
+        // Prefer F32 (native to our samples), but i16/u16-only devices still
+        // play: the callback converts per sample. Formats build_stream can't
+        // dispatch (i32/f64/...) are filtered out up front.
+        let supported_configs: Vec<_> = device
+            .supported_output_configs()
+            .map_err(|e| PlayerError::DeviceError(e.to_string()))?
+            .filter(|c| {
+                matches!(
+                    c.sample_format(),
+                    SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
+                )
+            })
+            .collect();
+
+        let supports_48k = |c: &cpal::SupportedStreamConfigRange| {
+            c.min_sample_rate() <= 48000 && c.max_sample_rate() >= 48000
+        };
+        let is_f32 = |c: &cpal::SupportedStreamConfigRange| c.sample_format() == SampleFormat::F32;
+        let chosen = supported_configs
+            .iter()
+            .find(|c| is_f32(c) && supports_48k(c))
+            .or_else(|| supported_configs.iter().find(|c| is_f32(c)))
+            .or_else(|| supported_configs.iter().find(|c| supports_48k(c)))
+            .or_else(|| supported_configs.first())
+            .ok_or(PlayerError::NoSupportedConfig)?;
+
+        let sample_format = chosen.sample_format();
+        let config: StreamConfig = if supports_48k(chosen) {
+            chosen.with_sample_rate(48000)
+        } else {
+            chosen.with_sample_rate(chosen.min_sample_rate())
+        }
+        .into();
+        Ok((config, sample_format))
+    }
+
     #[cfg(test)]
     mod tests {
 
@@ -608,6 +702,15 @@ mod cpal_output {
             assert_eq!(player.total_secs(), 0.0);
             assert_eq!(player.elapsed_secs(), 0.0);
         }
+
+        #[test]
+        fn preparing_empty_audio_fails_before_touching_the_output_device() {
+            assert!(matches!(
+                AudioPlayer::prepare(Vec::new(), 1.0),
+                Err(PlayerError::EmptyAudio)
+            ));
+        }
+
         use super::*;
 
         /// A player with nothing loaded is the state every caller sees first, and
@@ -713,7 +816,7 @@ mod cpal_output {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub use cpal_output::AudioPlayer;
+pub use cpal_output::{AudioPlayer, PreparedAudio};
 
 #[derive(Debug)]
 pub enum PlayerError {

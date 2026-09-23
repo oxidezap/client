@@ -14,7 +14,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon, Sizable as _};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::ProductIcon;
@@ -31,6 +31,51 @@ const BARS: usize = 48;
 /// Playback speeds, in the order the chip cycles through them.
 pub const SPEEDS: [f32; 3] = [1.0, 1.5, 2.0];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioLoadState {
+    Ready,
+    Downloadable,
+    Downloading,
+    Preparing,
+    Unavailable,
+}
+
+impl AudioLoadState {
+    fn from_presence(
+        has_data: bool,
+        can_download: bool,
+        is_downloading: bool,
+        is_preparing: bool,
+    ) -> Self {
+        if is_preparing {
+            Self::Preparing
+        } else if is_downloading {
+            Self::Downloading
+        } else if has_data {
+            Self::Ready
+        } else if can_download {
+            Self::Downloadable
+        } else {
+            Self::Unavailable
+        }
+    }
+
+    fn status(self) -> Option<&'static str> {
+        match self {
+            Self::Ready => None,
+            Self::Downloadable => Some("Download"),
+            Self::Downloading => Some("Downloading…"),
+            Self::Preparing => Some("Preparing…"),
+            Self::Unavailable => Some("Unavailable"),
+        }
+    }
+
+    fn can_activate(self) -> bool {
+        matches!(self, Self::Ready | Self::Downloadable | Self::Preparing)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_audio_player(
     media_content: MediaContent,
     message_id: String,
@@ -42,13 +87,19 @@ pub(super) fn render_audio_player(
     // build this row, and reading it again panics.
     audio: Option<super::AudioProgress>,
     speed: f32,
+    is_downloading: bool,
+    is_preparing: bool,
     entity: Entity<WhatsAppApp>,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
     let has_data = media_content.has_data();
-    let can_download = media_content.can_download();
-    let can_play = has_data || can_download;
+    let state = AudioLoadState::from_presence(
+        has_data,
+        media_content.can_download(),
+        is_downloading,
+        is_preparing,
+    );
 
     let progress = audio.map_or(0.0, |audio| audio.fraction);
     let elapsed = audio
@@ -65,7 +116,7 @@ pub(super) fn render_audio_player(
             &media_content,
             message_id.clone(),
             is_playing,
-            can_play,
+            state,
             entity.clone(),
             metrics,
             cx,
@@ -74,20 +125,29 @@ pub(super) fn render_audio_player(
             bars,
             progress,
             message_id.clone(),
-            can_play,
+            has_data && state == AudioLoadState::Ready,
             entity.clone(),
             metrics,
             cx,
         ))
         .child(
             div()
+                .flex()
+                .flex_col()
+                .items_end()
                 .flex_shrink_0()
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_size(metrics.text_meta())
                 .text_color(cx.theme().muted_foreground)
                 // Counts up while playing, shows the total at rest — the same
                 // number a listener wants at each moment.
-                .child(format_clock(elapsed.or(duration))),
+                .child(format_clock(elapsed.or(duration)))
+                .children(state.status().map(|status| {
+                    div()
+                        .text_size(metrics.text_micro())
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status)
+                })),
         )
         .child(render_speed_chip(&message_id, speed, entity, metrics, cx))
 }
@@ -96,7 +156,7 @@ fn render_play_button(
     media_content: &MediaContent,
     message_id: String,
     is_playing: bool,
-    can_play: bool,
+    state: AudioLoadState,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     _cx: &App,
@@ -104,23 +164,42 @@ fn render_play_button(
     let data = media_content.data.clone();
     let downloadable = media_content.downloadable.clone();
     let id: SharedString = format!("play-{message_id}").into();
+    let icon = match state {
+        AudioLoadState::Ready => Icon::from(if is_playing {
+            ProductIcon::Pause
+        } else {
+            ProductIcon::Play
+        }),
+        AudioLoadState::Downloadable => Icon::new(IconName::ArrowDown),
+        AudioLoadState::Downloading => Icon::new(IconName::LoaderCircle),
+        // The preparation is still cancellable as a playback intent: a
+        // second tap must be able to pause it before the stream exists.
+        AudioLoadState::Preparing => Icon::from(if is_playing {
+            ProductIcon::Pause
+        } else {
+            ProductIcon::Play
+        }),
+        AudioLoadState::Unavailable => Icon::from(ProductIcon::Play),
+    };
+    let tooltip = match state {
+        AudioLoadState::Ready if is_playing => "Pause",
+        AudioLoadState::Ready => "Play",
+        AudioLoadState::Downloadable => "Download audio",
+        AudioLoadState::Downloading => "Downloading audio…",
+        AudioLoadState::Preparing if is_playing => "Pause when audio is ready",
+        AudioLoadState::Preparing => "Play when audio is ready",
+        AudioLoadState::Unavailable => "Audio unavailable",
+    };
 
     Button::new(id)
-        .icon(
-            Icon::from(if is_playing {
-                ProductIcon::Pause
-            } else {
-                ProductIcon::Play
-            })
-            .size(metrics.icon_small()),
-        )
+        .icon(icon.size(metrics.icon_small()))
         .primary()
         .rounded_full()
         .w(metrics.avatar_inline())
         .h(metrics.avatar_inline())
-        .disabled(!can_play)
-        .tooltip(if is_playing { "Pause" } else { "Play" })
-        .when(can_play, |button| button.cursor_pointer())
+        .disabled(!state.can_activate())
+        .tooltip(tooltip)
+        .when(state.can_activate(), |button| button.cursor_pointer())
         .on_click(move |_, _window, cx| {
             let message_id = message_id.clone();
             entity.update(cx, |app, cx| {
@@ -311,6 +390,45 @@ fn format_speed(speed: f32) -> String {
 mod tests {
     use super::*;
     use gpui::{point, px, size};
+
+    #[test]
+    fn audio_control_shows_fetch_and_preparation_as_distinct_states() {
+        use AudioLoadState as State;
+
+        assert_eq!(
+            State::from_presence(false, true, false, false),
+            State::Downloadable
+        );
+        assert_eq!(
+            State::from_presence(false, true, true, false),
+            State::Downloading
+        );
+        assert_eq!(
+            State::from_presence(true, true, false, true),
+            State::Preparing
+        );
+        assert_eq!(State::from_presence(true, true, false, false), State::Ready);
+        assert_eq!(
+            State::from_presence(false, false, false, false),
+            State::Unavailable
+        );
+        assert_eq!(State::Downloading.status(), Some("Downloading…"));
+        assert_eq!(State::Preparing.status(), Some("Preparing…"));
+        assert_eq!(State::Ready.status(), None);
+        assert!(State::Downloadable.can_activate());
+        assert!(State::Ready.can_activate());
+        assert!(!State::Downloading.can_activate());
+        assert!(State::Preparing.can_activate());
+        assert!(!State::Unavailable.can_activate());
+    }
+
+    #[test]
+    fn audio_released_from_memory_is_fetchable_again() {
+        // A retained chat may release bytes after its reader leaves; the
+        // daemon can still have them, but this row does not promise that.
+        let state = AudioLoadState::from_presence(false, true, false, false);
+        assert_eq!(state.status(), Some("Download"));
+    }
 
     #[test]
     fn an_absent_envelope_draws_flat_rather_than_inventing_a_shape() {

@@ -34,6 +34,7 @@ pub(super) struct MediaProps {
     pub audio: Option<super::AudioProgress>,
     pub playback_speed: f32,
     pub is_downloading: bool,
+    pub is_preparing: bool,
     pub max_media_size: f32,
 }
 
@@ -53,6 +54,7 @@ pub(super) fn render_media_content(
         audio,
         playback_speed,
         is_downloading,
+        is_preparing,
         max_media_size,
     } = props;
     match media_content.media_type {
@@ -259,6 +261,8 @@ pub(super) fn render_media_content(
             is_playing,
             audio,
             playback_speed,
+            is_downloading,
+            is_preparing,
             entity,
             cx,
         )),

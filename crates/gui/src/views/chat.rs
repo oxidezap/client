@@ -247,6 +247,8 @@ pub fn render_connected_view(
             && !is_offline,
         viewer: viewer.is_some(),
         paste_preview: false,
+        message_edit: false,
+        message_delete: false,
         // The card floats above this view rather than inside it, so the root
         // is what knows whether one was drawn. See `WhatsAppApp::render`.
         call_card: false,

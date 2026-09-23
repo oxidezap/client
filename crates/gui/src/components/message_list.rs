@@ -241,6 +241,7 @@ fn render_row(
                 playback_speed: app.playback_speed(),
                 is_downloading: app.is_downloading(message_id),
                 reaction_picker_open: app.reaction_picker_for() == Some(message_id.as_str()),
+                is_preparing: app.is_audio_preparing(message_id),
             };
 
             render_message_bubble(props, entity.clone(), layout, cx).into_any_element()

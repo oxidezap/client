@@ -31,7 +31,44 @@ pub struct Picked {
     pub file_name: String,
     /// What it is, as far as the platform will say.
     pub mime_type: String,
+    /// The kind the sender chose, or the automatic kind for drops and paste.
+    /// This remains authoritative through preview and confirmation.
+    pub kind: OutgoingMedia,
     pub bytes: Vec<u8>,
+}
+
+/// The two choices offered by the attachment button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentCategory {
+    PhotosVideos,
+    Document,
+}
+
+impl AttachmentCategory {
+    /// A browser chooser hint, not validation: files still need checking
+    /// after selection because browsers may return any file despite `accept`.
+    #[must_use]
+    #[cfg(any(test, target_family = "wasm"))]
+    pub fn accept_hint(self) -> Option<&'static str> {
+        match self {
+            Self::PhotosVideos => Some("image/jpeg,image/png,image/gif,image/webp,video/*"),
+            Self::Document => None,
+        }
+    }
+}
+
+impl Picked {
+    /// Existing automatic classification for clipboard, drag/drop and plugins.
+    #[must_use]
+    pub fn automatic(file_name: String, mime_type: String, bytes: Vec<u8>) -> Self {
+        let kind = kind_for(&mime_type);
+        Self {
+            file_name,
+            mime_type,
+            kind,
+            bytes,
+        }
+    }
 }
 
 /// What one trip to the file chooser produced.
@@ -69,7 +106,18 @@ impl Chosen {
 ///
 /// The chooser could not be opened, or it went away without answering.
 pub fn choose(cx: &gpui::App) -> impl Future<Output = Result<Chosen, String>> + use<> {
-    imp::choose(cx)
+    imp::choose(cx, None)
+}
+
+/// Ask for files under an explicit attachment-button category.
+///
+/// The category controls both the browser's chooser hint and the checked
+/// outgoing kind. The hint alone cannot enforce the category.
+pub fn choose_category(
+    cx: &gpui::App,
+    category: AttachmentCategory,
+) -> impl Future<Output = Result<Chosen, String>> + use<> {
+    imp::choose(cx, Some(category))
 }
 
 /// What a file of this name most likely is.
@@ -168,6 +216,113 @@ pub fn kind_for(mime_type: &str) -> OutgoingMedia {
         OutgoingMedia::Image if !arrives_as_a_photo(mime_type) => OutgoingMedia::Document,
         kind => kind,
     }
+}
+
+/// Resolve a button choice against the type actually selected.
+///
+/// Documents deliberately preserve any valid file. A media selection never
+/// silently becomes a document: unsupported pictures must be refused until
+/// the sender can really convert them to a WhatsApp-drawable photo.
+fn kind_for_category(
+    file_name: &str,
+    mime_type: &str,
+    category: Option<AttachmentCategory>,
+) -> Result<OutgoingMedia, String> {
+    match category {
+        None => Ok(kind_for(mime_type)),
+        Some(AttachmentCategory::Document) => Ok(OutgoingMedia::Document),
+        Some(AttachmentCategory::PhotosVideos) => match kind_for(mime_type) {
+            OutgoingMedia::Image => Ok(OutgoingMedia::Image),
+            OutgoingMedia::Video => Ok(OutgoingMedia::Video),
+            OutgoingMedia::Document => Err(format!(
+                "{file_name} is not a supported photo or video; choose Documento to send the original file."
+            )),
+        },
+    }
+}
+
+/// File.type can be a generic MIME even for a picture. Only infer from its
+/// extension in the media chooser when the bytes confirm that family.
+fn selected_kind_and_mime(
+    file_name: &str,
+    declared_mime: &str,
+    bytes: &[u8],
+    category: Option<AttachmentCategory>,
+) -> Result<(OutgoingMedia, String), String> {
+    let generic_mime = matches!(
+        declared_mime.trim().to_ascii_lowercase().as_str(),
+        "application/octet-stream" | "binary/octet-stream"
+    );
+    let inferred_from_name = declared_mime.is_empty()
+        || (category == Some(AttachmentCategory::PhotosVideos) && generic_mime);
+    let candidate = if inferred_from_name {
+        mime_for_name(file_name)
+    } else {
+        declared_mime
+    };
+    let kind = kind_for_category(file_name, candidate, category)?;
+    if category == Some(AttachmentCategory::PhotosVideos) {
+        let valid = match kind {
+            OutgoingMedia::Image => image_mime_from_bytes(bytes).is_some_and(arrives_as_a_photo),
+            OutgoingMedia::Video => recognizable_video_container(bytes),
+            OutgoingMedia::Document => false,
+        };
+        if !valid {
+            return Err(format!(
+                "{file_name} could not be verified as a supported photo or video; choose Documento to send the original file."
+            ));
+        }
+    }
+    let mime_type =
+        if category == Some(AttachmentCategory::PhotosVideos) && kind == OutgoingMedia::Image {
+            image_mime_from_bytes(bytes).unwrap_or(candidate)
+        } else {
+            candidate
+        };
+    Ok((kind, mime_type.to_string()))
+}
+
+fn image_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn recognizable_video_container(bytes: &[u8]) -> bool {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        // HEIC/AVIF share ISO-BMFF's ftyp marker with MP4 but are not videos.
+        return matches!(
+            &bytes[8..12],
+            b"isom"
+                | b"iso2"
+                | b"iso3"
+                | b"iso4"
+                | b"iso5"
+                | b"iso6"
+                | b"mp41"
+                | b"mp42"
+                | b"avc1"
+                | b"M4V "
+                | b"MSNV"
+                | b"dash"
+        ) || (cfg!(target_os = "macos")
+            && matches!(
+                &bytes[8..12],
+                b"qt  " | b"3gp4" | b"3gp5" | b"3gp6" | b"3g2a" | b"3g2b"
+            ));
+    }
+    cfg!(target_os = "macos")
+        && bytes.len() >= 12
+        && bytes.starts_with(b"RIFF")
+        && &bytes[8..12] == b"AVI "
 }
 
 /// Whether a picture of this type reaches the recipient as one.
@@ -285,7 +440,7 @@ pub fn unsendable(file_name: &str, size: u64) -> Option<String> {
 mod imp {
     use std::path::{Path, PathBuf};
 
-    use super::{Chosen, Picked};
+    use super::{AttachmentCategory, Chosen, Picked};
 
     /// The platform's own file chooser, then a read off the UI thread.
     ///
@@ -293,7 +448,10 @@ mod imp {
     /// window — and the reads must not be: opening four photos is four
     /// synchronous reads of several megabytes each, and the window draws
     /// nothing while they run.
-    pub(super) fn choose(cx: &gpui::App) -> impl Future<Output = Result<Chosen, String>> + use<> {
+    pub(super) fn choose(
+        cx: &gpui::App,
+        category: Option<AttachmentCategory>,
+    ) -> impl Future<Output = Result<Chosen, String>> + use<> {
         let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
@@ -310,7 +468,7 @@ mod imp {
                 Err(_) => return Err("the file chooser closed without answering".to_string()),
             };
             Ok(executor
-                .spawn(async move { read_all(&paths, &mut super::Budget::default()) })
+                .spawn(async move { read_all(&paths, category, &mut super::Budget::default()) })
                 .await)
         }
     }
@@ -318,13 +476,16 @@ mod imp {
     /// Read what was picked, keeping what can be sent and saying what cannot.
     ///
     /// One budget across the whole selection, asked before each read: four
-    /// photos are read and held together, and nothing else bounds that. The
-    /// budget arrives seeded where the selection started before the paths —
-    /// a clipboard holding images beside copied files charges those first.
-    fn read_all(paths: &[PathBuf], budget: &mut super::Budget) -> Chosen {
+    /// photos are read and held together, and nothing else bounds that.
+    /// The budget may arrive seeded where the selection started before the paths.
+    fn read_all(
+        paths: &[PathBuf],
+        category: Option<AttachmentCategory>,
+        budget: &mut super::Budget,
+    ) -> Chosen {
         let mut chosen = Chosen::default();
         for path in paths {
-            match read_one(path, budget) {
+            match read_one(path, category, budget) {
                 Ok(picked) => chosen.files.push(picked),
                 Err(refusal) => chosen.refused.push(refusal),
             }
@@ -333,15 +494,19 @@ mod imp {
     }
 
     pub(crate) fn read_paths(paths: &[PathBuf]) -> Chosen {
-        read_all(paths, &mut super::Budget::default())
+        read_all(paths, None, &mut super::Budget::default())
     }
 
     pub(crate) fn read_paths_seeded(paths: &[PathBuf], budget: &mut super::Budget) -> Chosen {
-        read_all(paths, budget)
+        read_all(paths, None, budget)
     }
 
     /// One file, or the sentence to show instead.
-    fn read_one(path: &Path, budget: &mut super::Budget) -> Result<Picked, String> {
+    fn read_one(
+        path: &Path,
+        category: Option<AttachmentCategory>,
+        budget: &mut super::Budget,
+    ) -> Result<Picked, String> {
         // The last component, and never the path: this becomes the name on
         // the message, and where the file was is nobody else's business.
         let file_name = path.file_name().map_or_else(
@@ -361,15 +526,68 @@ mod imp {
 
         let bytes =
             std::fs::read(path).map_err(|e| format!("{file_name} could not be read: {e}"))?;
+        let (kind, mime_type) = super::selected_kind_and_mime(
+            &file_name,
+            super::mime_for_name(&file_name),
+            &bytes,
+            category,
+        )?;
         // Counted once it is really here, and against what was read rather
         // than against what the metadata promised: a file being appended to
         // between the `stat` and the read is the difference.
         budget.took(bytes.len() as u64);
         Ok(Picked {
-            mime_type: super::mime_for_name(&file_name).to_string(),
+            mime_type,
+            kind,
             file_name,
             bytes,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_picker_validates_each_media_result_after_selection() {
+            let directory = std::env::temp_dir();
+            let marker = format!(
+                "oxidezap-picker-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            );
+            let photo = directory.join(format!("{marker}.png"));
+            let heic = directory.join(format!("{marker}.heic"));
+            std::fs::write(&photo, b"\x89PNG\r\n\x1a\nrest").expect("write photo fixture");
+            std::fs::write(&heic, b"original HEIC bytes").expect("write HEIC fixture");
+
+            let media = read_all(
+                &[photo.clone(), heic.clone()],
+                Some(AttachmentCategory::PhotosVideos),
+                &mut super::super::Budget::default(),
+            );
+            let documents = read_all(
+                &[photo.clone(), heic.clone()],
+                Some(AttachmentCategory::Document),
+                &mut super::super::Budget::default(),
+            );
+            std::fs::remove_file(photo).expect("remove photo fixture");
+            std::fs::remove_file(heic).expect("remove HEIC fixture");
+
+            assert_eq!(media.files.len(), 1);
+            assert_eq!(media.files[0].kind, oxidezap_core::OutgoingMedia::Image);
+            assert_eq!(media.refused.len(), 1);
+            assert!(media.refused[0].contains(".heic"));
+            assert_eq!(documents.files.len(), 2);
+            assert!(
+                documents
+                    .files
+                    .iter()
+                    .all(|file| file.kind == oxidezap_core::OutgoingMedia::Document)
+            );
+            assert_eq!(documents.files[1].bytes, b"original HEIC bytes");
+            assert_eq!(documents.files[1].mime_type, "image/heic");
+        }
     }
 }
 
@@ -397,7 +615,7 @@ mod imp {
     use wasm_bindgen::prelude::Closure;
     use wasm_bindgen_futures::JsFuture;
 
-    use super::{Chosen, Picked};
+    use super::{AttachmentCategory, Chosen, Picked};
 
     /// A file input, clicked from script, then one read per file.
     ///
@@ -407,9 +625,12 @@ mod imp {
     /// joins the document for the length of the gesture and is taken out
     /// again — a detached input's `click()` is ignored outright by some
     /// engines, and one that stays is a control the page grew and never lost.
-    pub(super) fn choose(_cx: &gpui::App) -> impl Future<Output = Result<Chosen, String>> + use<> {
+    pub(super) fn choose(
+        _cx: &gpui::App,
+        category: Option<AttachmentCategory>,
+    ) -> impl Future<Output = Result<Chosen, String>> + use<> {
         async move {
-            let files = match files_picked().await {
+            let files = match files_picked(category).await {
                 Some(files) => files,
                 // Dismissed, or there is no document to ask in. Neither is
                 // worth a line on screen.
@@ -442,21 +663,25 @@ mod imp {
                 match JsFuture::from(file.array_buffer()).await {
                     Ok(buffer) => {
                         let bytes = Uint8Array::new(&buffer).to_vec();
-                        // Counted once it is really here; see `Budget`.
-                        budget.took(bytes.len() as u64);
-                        chosen.files.push(Picked {
-                            // The browser's own answer, and this table only where
-                            // it declined to give one: `File.type` is empty for
-                            // every type the agent does not recognise.
-                            mime_type: match file.type_() {
-                                declared if declared.is_empty() => {
-                                    super::mime_for_name(&file_name).to_string()
-                                }
-                                declared => declared,
-                            },
-                            bytes,
-                            file_name,
-                        });
+                        let browser_mime = file.type_();
+                        match super::selected_kind_and_mime(
+                            &file_name,
+                            &browser_mime,
+                            &bytes,
+                            category,
+                        ) {
+                            Ok((kind, mime_type)) => {
+                                // Only accepted files consume the held selection budget.
+                                budget.took(bytes.len() as u64);
+                                chosen.files.push(Picked {
+                                    mime_type,
+                                    kind,
+                                    bytes,
+                                    file_name,
+                                });
+                            }
+                            Err(refusal) => chosen.refused.push(refusal),
+                        }
                     }
                     Err(e) => chosen
                         .refused
@@ -512,12 +737,15 @@ mod imp {
     /// taken out again by [`Held`]: a detached input's `click()` is ignored
     /// outright by some engines, and one that stays is a control the page grew
     /// and never lost.
-    async fn files_picked() -> Option<web_sys::FileList> {
+    async fn files_picked(category: Option<AttachmentCategory>) -> Option<web_sys::FileList> {
         let document = web_sys::window()?.document()?;
         let input: web_sys::HtmlInputElement =
             document.create_element("input").ok()?.dyn_into().ok()?;
         input.set_type("file");
         input.set_multiple(true);
+        if let Some(accept) = category.and_then(AttachmentCategory::accept_hint) {
+            input.set_accept(accept);
+        }
         let style = input.style();
         let _ = style.set_property("display", "none");
 
@@ -550,7 +778,10 @@ mod imp {
 mod tests {
     use oxidezap_core::OutgoingMedia;
 
-    use super::{Budget, SELECTION_BUDGET_BYTES, kind_for, mime_for_name, unsendable};
+    use super::{
+        AttachmentCategory, Budget, SELECTION_BUDGET_BYTES, kind_for, mime_for_name,
+        selected_kind_and_mime, unsendable,
+    };
 
     /// A photo message is expected to carry a photo, and the expectation is
     /// the recipient's: the session re-encodes what it can decode and sends
@@ -627,6 +858,173 @@ mod tests {
         // A dot in the directory-ish part of a name must not be read as an
         // extension; only what follows the last one is.
         assert_eq!(mime_for_name("v1.2.tar.gz"), "application/gzip");
+    }
+
+    #[test]
+    fn category_hint_and_media_validation_agree() {
+        assert_eq!(AttachmentCategory::Document.accept_hint(), None);
+        assert_eq!(
+            AttachmentCategory::PhotosVideos.accept_hint(),
+            Some("image/jpeg,image/png,image/gif,image/webp,video/*")
+        );
+
+        let jpeg = [0xff, 0xd8, 0xff, 0xe0];
+        assert_eq!(
+            selected_kind_and_mime(
+                "photo.jpg",
+                "image/jpeg",
+                &jpeg,
+                Some(AttachmentCategory::PhotosVideos),
+            ),
+            Ok((OutgoingMedia::Image, "image/jpeg".into()))
+        );
+        for (name, mime, bytes) in [
+            ("photo.png", "image/png", &b"\x89PNG\r\n\x1a\n"[..]),
+            ("photo.gif", "image/gif", &b"GIF89a"[..]),
+            ("photo.webp", "image/webp", &b"RIFF\0\0\0\0WEBP"[..]),
+        ] {
+            assert_eq!(
+                selected_kind_and_mime(name, mime, bytes, Some(AttachmentCategory::PhotosVideos)),
+                Ok((OutgoingMedia::Image, mime.into())),
+                "{name}"
+            );
+        }
+        let mp4 = b"\0\0\0\x18ftypisom";
+        assert_eq!(
+            selected_kind_and_mime(
+                "clip.mp4",
+                "video/mp4",
+                mp4,
+                Some(AttachmentCategory::PhotosVideos),
+            ),
+            Ok((OutgoingMedia::Video, "video/mp4".into()))
+        );
+        assert_eq!(
+            selected_kind_and_mime(
+                "photo.jpg",
+                "image/jpeg",
+                &jpeg,
+                Some(AttachmentCategory::Document),
+            ),
+            Ok((OutgoingMedia::Document, "image/jpeg".into()))
+        );
+        assert_eq!(
+            selected_kind_and_mime(
+                "clip.mp4",
+                "video/mp4",
+                mp4,
+                Some(AttachmentCategory::Document),
+            ),
+            Ok((OutgoingMedia::Document, "video/mp4".into()))
+        );
+        assert_eq!(
+            selected_kind_and_mime(
+                "photo.heic",
+                "image/heic",
+                b"original heic bytes",
+                Some(AttachmentCategory::Document),
+            ),
+            Ok((OutgoingMedia::Document, "image/heic".into()))
+        );
+    }
+
+    #[test]
+    fn incompatible_media_never_falls_back_to_document() {
+        for (file_name, mime_type) in [
+            ("photo.heic", "image/heic"),
+            ("photo.heif", "image/heif"),
+            ("drawing.svg", "image/svg+xml"),
+            ("notes.pdf", "application/pdf"),
+        ] {
+            let refusal = selected_kind_and_mime(
+                file_name,
+                mime_type,
+                b"test bytes",
+                Some(AttachmentCategory::PhotosVideos),
+            )
+            .expect_err(file_name);
+            assert!(refusal.contains(file_name), "{refusal}");
+            assert!(refusal.contains("Documento"), "{refusal}");
+        }
+        let refusal = selected_kind_and_mime(
+            "false.jpg",
+            "image/jpeg",
+            b"not an image",
+            Some(AttachmentCategory::PhotosVideos),
+        )
+        .expect_err("invalid image bytes");
+        assert!(refusal.contains("false.jpg"), "{refusal}");
+        let refusal = selected_kind_and_mime(
+            "false.mp4",
+            "video/mp4",
+            b"not a video",
+            Some(AttachmentCategory::PhotosVideos),
+        )
+        .expect_err("invalid video bytes");
+        assert!(refusal.contains("false.mp4"), "{refusal}");
+    }
+
+    #[test]
+    fn generic_browser_mime_uses_extension_only_with_matching_media_bytes() {
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        assert_eq!(
+            selected_kind_and_mime("photo.png", "", png, Some(AttachmentCategory::PhotosVideos),),
+            Ok((OutgoingMedia::Image, "image/png".into()))
+        );
+        assert_eq!(
+            selected_kind_and_mime(
+                "photo.png",
+                "application/octet-stream",
+                png,
+                Some(AttachmentCategory::PhotosVideos),
+            ),
+            Ok((OutgoingMedia::Image, "image/png".into()))
+        );
+        assert!(
+            selected_kind_and_mime(
+                "false.png",
+                "application/octet-stream",
+                b"fake bytes",
+                Some(AttachmentCategory::PhotosVideos),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            selected_kind_and_mime(
+                "clip.mp4",
+                "application/octet-stream",
+                b"\0\0\0\x18ftypisom",
+                Some(AttachmentCategory::PhotosVideos),
+            ),
+            Ok((OutgoingMedia::Video, "video/mp4".into()))
+        );
+        assert!(
+            selected_kind_and_mime(
+                "false.mp4",
+                "application/octet-stream",
+                b"fake bytes",
+                Some(AttachmentCategory::PhotosVideos),
+            )
+            .is_err()
+        );
+        // Documento must keep the browser's declared MIME, even if generic.
+        assert_eq!(
+            selected_kind_and_mime(
+                "photo.png",
+                "application/octet-stream",
+                png,
+                Some(AttachmentCategory::Document),
+            ),
+            Ok((OutgoingMedia::Document, "application/octet-stream".into()))
+        );
+        assert_eq!(
+            selected_kind_and_mime("photo.png", "", png, Some(AttachmentCategory::Document)),
+            Ok((OutgoingMedia::Document, "image/png".into()))
+        );
+        assert_eq!(
+            selected_kind_and_mime("photo.png", "", png, None),
+            Ok((OutgoingMedia::Image, "image/png".into()))
+        );
     }
 
     /// The ceiling is the protocol's, and the refusal names both numbers:

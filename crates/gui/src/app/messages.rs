@@ -114,6 +114,8 @@ pub struct BubbleIds {
     pub react: SharedString,
     pub reply: SharedString,
     pub copy: SharedString,
+    /// The optional edited indicator beside the time.
+    pub edited: SharedString,
     /// The button a failed send grows.
     pub retry: SharedString,
 }
@@ -128,6 +130,7 @@ impl BubbleIds {
             react: format!("react-{id}").into(),
             reply: format!("reply-{id}").into(),
             copy: format!("copy-{id}").into(),
+            edited: format!("edited-{id}").into(),
             retry: format!("retry-{id}").into(),
         }
     }
@@ -263,8 +266,59 @@ fn build_items(messages: &[ChatMessage], typing: Option<TypingSummary>) -> Vec<T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::WhatsAppApp;
+    use crate::components::message_bubble::BubbleProps;
+    use crate::components::{BubbleText, render_message_bubble};
+    use crate::responsive::{MobilePanel, ResponsiveLayout};
+    use crate::theme::ActiveProductTheme as _;
     use chrono::TimeZone;
-    use oxidezap_core::{Typist, fixtures};
+    use gpui::{AppContext as _, ParentElement as _, Styled as _};
+    use oxidezap_core::{MessageStatus, Typist, fixtures};
+
+    struct EditedBubbleFixture {
+        app: gpui::Entity<WhatsAppApp>,
+        rows: Vec<(String, bool, ChatMessage)>,
+    }
+
+    impl gpui::Render for EditedBubbleFixture {
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let layout = ResponsiveLayout::new(
+                window.viewport_size(),
+                MobilePanel::Chat,
+                cx.product().metrics,
+            );
+            gpui::div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .children(self.rows.iter().cloned().map(|(jid, is_group, message)| {
+                    let props = BubbleProps {
+                        chat_jid: jid.into(),
+                        ids: BubbleIds::of(&message),
+                        text: BubbleText::of(&message.content),
+                        message: Arc::new(message),
+                        attempted_vote: None,
+                        playing_message_id: None,
+                        is_group,
+                        is_own_number: false,
+                        starts_run: true,
+                        video_player_state: None,
+                        video_frame: None,
+                        decoded_image: None,
+                        audio: None,
+                        playback_speed: 1.0,
+                        is_downloading: false,
+                        is_preparing: false,
+                        reaction_picker_open: false,
+                    };
+                    render_message_bubble(props, self.app.clone(), layout, cx)
+                }))
+        }
+    }
 
     fn at(day: u32, hour: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 3, day, hour, 0, 0).unwrap()
@@ -483,6 +537,69 @@ mod tests {
         let cache = MessageListCache::new(&messages, true, Some(typing(&["Ana"])));
         assert!(cache.is_valid_for(1, true, Some(&typing(&["Ana"]))));
         assert!(!cache.is_valid_for(1, true, Some(&typing(&["Ana", "Marcos"]))));
+    }
+
+    #[gpui::test]
+    fn edited_marker_renders_only_on_exact_own_and_peer_rows_in_direct_and_group_chats(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut rows = Vec::new();
+        for (jid, prefix) in [(fixtures::PEER, "D"), (fixtures::GROUP, "G")] {
+            let is_group = prefix == "G";
+            let mut own = fixtures::outgoing(&format!("{prefix}-OWN"), "corrected");
+            own.status = MessageStatus::Sent;
+            own.edited = true;
+            let mut peer = fixtures::message(
+                &format!("{prefix}-PEER"),
+                fixtures::PEER,
+                "corrected by peer",
+            );
+            peer.edited = true;
+            peer.sender_name = Some("Test peer".into());
+            let mut revoked = fixtures::message(
+                &format!("{prefix}-REVOKED"),
+                fixtures::PEER,
+                "[Message deleted]",
+            );
+            revoked.edited = true;
+            revoked.revoked = true;
+            rows.push((jid.into(), is_group, own));
+            rows.push((jid.into(), is_group, peer));
+            rows.push((
+                jid.into(),
+                is_group,
+                fixtures::message(&format!("{prefix}-PLAIN"), fixtures::PEER, "not edited"),
+            ));
+            rows.push((jid.into(), is_group, revoked));
+        }
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(WhatsAppApp::new);
+            let fixture = cx.new(|_| EditedBubbleFixture { app, rows });
+            gpui_component::Root::new(fixture, window, cx)
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for edited in [
+            "edited-D-OWN",
+            "edited-D-PEER",
+            "edited-G-OWN",
+            "edited-G-PEER",
+        ] {
+            assert!(cx.debug_bounds(edited).is_some(), "{edited}");
+        }
+        for unmarked in [
+            "edited-D-PLAIN",
+            "edited-D-REVOKED",
+            "edited-G-PLAIN",
+            "edited-G-REVOKED",
+        ] {
+            assert!(cx.debug_bounds(unmarked).is_none(), "{unmarked}");
+        }
     }
 
     fn typing(names: &[&str]) -> TypingSummary {

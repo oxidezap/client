@@ -1485,6 +1485,7 @@ fn alias_history_unread_deduplicates_only_matching_messages() {
         status: MessageStatus::default(),
         quoted: None,
         revoked: false,
+        edited: false,
         system: None,
         poll: None,
     };
@@ -1527,6 +1528,7 @@ fn watched_updates_come_back_watched() {
         status: MessageStatus::default(),
         quoted: None,
         revoked: false,
+        edited: false,
         system: None,
         poll: None,
     };
@@ -1907,6 +1909,40 @@ fn a_message_cursor_survives_the_round_trip() {
     );
     assert!(parse_message_cursor("m1:notanumber:1").is_none());
     assert!(parse_message_cursor("").is_none());
+}
+
+#[test]
+fn stored_edit_state_reaches_own_and_peer_bubbles_in_direct_and_group_chats() {
+    use super::convert::stored_to_chat_message;
+
+    const PEER: &str = "559900000001@s.whatsapp.net";
+    const GROUP: &str = "120363000000000001@g.us";
+    let timestamp = whatsapp_rust::wacore::time::from_millis(1_700_000_000_000).unwrap();
+    for chat_jid in [PEER, GROUP] {
+        for from_me in [false, true] {
+            let stored = oxidezap_chat_store::StoredMessage {
+                chat_jid: chat_jid.parse().unwrap(),
+                id: format!("EDITED-{from_me}"),
+                sender_jid: PEER.parse().unwrap(),
+                from_me,
+                timestamp,
+                kind: oxidezap_chat_store::MessageKind::Text,
+                text: Some("corrected".into()),
+                message: None,
+                status: oxidezap_chat_store::MessageStatus::Delivered,
+                starred: false,
+                edited_at: Some(timestamp),
+                revoked: false,
+                seq: 1,
+            };
+            let mut plain = stored.clone();
+            plain.edited_at = None;
+            let edited = stored_to_chat_message(stored);
+            assert!(edited.edited, "{chat_jid} from_me={from_me}");
+            assert_eq!(edited.is_from_me, from_me);
+            assert!(!stored_to_chat_message(plain).edited);
+        }
+    }
 }
 
 /// The address goes last and is not split on: a device JID carries a

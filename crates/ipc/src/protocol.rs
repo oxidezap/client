@@ -685,6 +685,23 @@ pub struct SendText {
     pub quoted: Option<QuotedMessage>,
 }
 
+/// Replace the text of one sent message. Answered only after the session's
+/// mutation and durable local materialization finish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditMessage {
+    pub jid: String,
+    pub message_id: String,
+    pub new_text: String,
+}
+
+/// Delete one sent message locally or request deletion for everyone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeMessage {
+    pub jid: String,
+    pub message_id: String,
+    pub for_everyone: bool,
+}
+
 /// Send a recorded voice note. See [`ClientRequest::SendAudio`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendAudio {
@@ -950,6 +967,8 @@ pub enum ClientRequest {
     /// — and the serde working set — of every request. The wire is unchanged:
     /// `Box` is transparent to serde, and the round-trip test pins the bytes.
     SendText(Box<SendText>),
+    EditMessage(EditMessage),
+    RevokeMessage(RevokeMessage),
     /// Send a recorded voice note.
     ///
     /// The audio arrives through the media cache rather than the socket: it
@@ -1842,6 +1861,30 @@ mod tests {
                     quoted: None,
                 })),
                 r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi","local_id":null}"#.to_string(),
+            ),
+            (
+                ClientRequest::EditMessage(EditMessage {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    message_id: "MSG-E".into(),
+                    new_text: "corrigido".into(),
+                }),
+                r#"{"request":"edit_message","jid":"559900000001@s.whatsapp.net","message_id":"MSG-E","new_text":"corrigido"}"#.to_string(),
+            ),
+            (
+                ClientRequest::RevokeMessage(RevokeMessage {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    message_id: "MSG-R".into(),
+                    for_everyone: true,
+                }),
+                r#"{"request":"revoke_message","jid":"559900000001@s.whatsapp.net","message_id":"MSG-R","for_everyone":true}"#.to_string(),
+            ),
+            (
+                ClientRequest::RevokeMessage(RevokeMessage {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    message_id: "MSG-R".into(),
+                    for_everyone: false,
+                }),
+                r#"{"request":"revoke_message","jid":"559900000001@s.whatsapp.net","message_id":"MSG-R","for_everyone":false}"#.to_string(),
             ),
             (
                 ClientRequest::SendAudio(Box::new(SendAudio {

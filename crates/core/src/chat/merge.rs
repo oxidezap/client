@@ -8,6 +8,24 @@ use super::message::ChatMessage;
 use crate::message_status::MessageStatus;
 
 impl Chat {
+    /// Remove one local copy after a delete-for-me succeeded. History loads
+    /// merge present rows but cannot infer deletion from an absent row.
+    pub fn remove_message_for_me(&mut self, id: &str) -> bool {
+        let Some(position) = self.messages.iter().position(|message| message.id == id) else {
+            return false;
+        };
+        self.messages.remove(position);
+        if let Some(newest) = self.messages.last() {
+            self.last_message = Some(newest.preview_text());
+        } else {
+            self.last_message = None;
+        }
+        // The chat-list position is its latest activity, not the timestamp
+        // of the newest surviving preview. The store keeps that activity
+        // when a message is deleted for me; the live list must agree.
+        true
+    }
+
     /// Add a message to the chat, maintaining chronological order by timestamp.
     /// Returns true when the message became the chat's newest content, so the
     /// caller knows whether to bump the chat in the list; duplicates and older
@@ -178,6 +196,15 @@ impl Chat {
             // along wins, so a reload can neither un-fail a send nor pull a
             // read bubble back to delivered.
             message.status.advance(existing.status);
+            // An accepted edit cannot become unedited. A history read begun
+            // before that commit can finish after the live edit acknowledgement;
+            // its stale row must not briefly remove the label while the next
+            // store reload catches up.
+            if message.is_from_me == existing.is_from_me
+                && (message.is_from_me || message.sender == existing.sender)
+            {
+                message.edited |= existing.edited;
+            }
             if message.sender_name.is_none() {
                 message.sender_name = existing.sender_name.clone();
             }
@@ -265,11 +292,115 @@ impl Chat {
 }
 
 #[cfg(test)]
+mod delete_for_me_tests {
+    use super::*;
+
+    #[test]
+    fn local_delete_removes_exact_row_and_updates_preview() {
+        let mut chat = Chat::new("559900000001@s.whatsapp.net".into());
+        let mut first = ChatMessage::new_outgoing("FIRST".into(), "first".into());
+        first.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut second = ChatMessage::new_outgoing("SECOND".into(), "second".into());
+        second.timestamp = chrono::DateTime::from_timestamp(1_700_000_060, 0).unwrap();
+        chat.add_message(first);
+        chat.add_message(second);
+        let activity = chat.last_message_time;
+        assert!(chat.remove_message_for_me("SECOND"));
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].id, "FIRST");
+        assert_eq!(chat.last_message.as_deref(), Some("first"));
+        assert_eq!(chat.last_message_time, activity);
+        assert!(!chat.remove_message_for_me("MISSING"));
+        assert!(chat.remove_message_for_me("FIRST"));
+        assert!(chat.messages.is_empty());
+        assert!(chat.last_message.is_none());
+        assert_eq!(chat.last_message_time, activity);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::chat::media::make_media;
     use crate::chat::message::make_message;
+    use crate::fixtures;
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn history_rebuild_preserves_edited_fact_on_exact_own_and_peer_rows() {
+        for jid in [fixtures::PEER, fixtures::GROUP] {
+            let mut live = Chat::new(jid.into());
+            for id in ["OWN", "PEER", "PLAIN"] {
+                live.add_message(make_message(id, 1_700_000_000));
+            }
+            let mut hydrated = Chat::new(jid.into());
+            let mut own = make_message("OWN", 1_700_000_000);
+            own.is_from_me = true;
+            own.edited = true;
+            let mut peer = make_message("PEER", 1_700_000_000);
+            peer.edited = true;
+            hydrated.messages = vec![own, peer, make_message("PLAIN", 1_700_000_000)];
+
+            live.merge_history(hydrated);
+            assert_eq!(live.messages.len(), 3);
+            assert!(live.messages.iter().find(|m| m.id == "OWN").unwrap().edited);
+            assert!(
+                live.messages
+                    .iter()
+                    .find(|m| m.id == "PEER")
+                    .unwrap()
+                    .edited
+            );
+            assert!(
+                !live
+                    .messages
+                    .iter()
+                    .find(|m| m.id == "PLAIN")
+                    .unwrap()
+                    .edited
+            );
+
+            // A page queried before the edit's commit may be delivered after
+            // the live acknowledgement. It cannot take the marker back.
+            let mut stale = Chat::new(jid.into());
+            let mut stale_own = make_message("OWN", 1_700_000_000);
+            stale_own.is_from_me = true;
+            stale.messages = vec![
+                stale_own,
+                make_message("PEER", 1_700_000_000),
+                make_message("PLAIN", 1_700_000_000),
+            ];
+            live.merge_history(stale);
+            assert!(live.messages.iter().find(|m| m.id == "OWN").unwrap().edited);
+            assert!(
+                live.messages
+                    .iter()
+                    .find(|m| m.id == "PEER")
+                    .unwrap()
+                    .edited
+            );
+            assert!(
+                !live
+                    .messages
+                    .iter()
+                    .find(|m| m.id == "PLAIN")
+                    .unwrap()
+                    .edited
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_id_collision_does_not_transfer_an_edit_marker_to_another_author() {
+        let mut chat = Chat::new(fixtures::GROUP.into());
+        let mut own = make_message("COLLIDING", 1_700_000_000);
+        own.is_from_me = true;
+        own.edited = true;
+        chat.add_message(own);
+        let peer = make_message("COLLIDING", 1_700_000_000);
+        chat.insert_history_message(peer);
+        assert!(!chat.messages[0].edited);
+    }
 
     /// A row that arrives already read is not unread. The case that made this
     /// matter is the call record: it is written as an incoming message, so a

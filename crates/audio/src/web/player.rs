@@ -26,6 +26,12 @@ use web_sys::{AudioBuffer, AudioBufferSourceNode, AudioContext};
 
 use crate::player::PlayerError;
 
+/// Encoded voice note waiting for the browser's asynchronous decoder.
+///
+/// Native preparation yields PCM instead; each platform keeps its own
+/// representation behind the same public prepare/install API.
+pub struct PreparedAudio(Vec<u8>);
+
 /// Where the clip's state lives.
 ///
 /// Shared with the callbacks the browser will run — the decode's completion
@@ -465,6 +471,21 @@ impl AudioPlayer {
             }
         });
         Ok(())
+    }
+
+    /// Keep the browser's decode asynchronous while sharing the native
+    /// prepare/install seam with the desktop player. No JS object is touched
+    /// here, so this value may safely cross GPUI's background executor.
+    pub fn prepare(ogg_data: Vec<u8>, _speed: f32) -> Result<PreparedAudio, PlayerError> {
+        if ogg_data.is_empty() {
+            return Err(PlayerError::EmptyAudio);
+        }
+        Ok(PreparedAudio(ogg_data))
+    }
+
+    /// Start the browser decoder for a prepared voice note.
+    pub fn play_prepared(&mut self, prepared: PreparedAudio) -> Result<(), PlayerError> {
+        self.play(prepared.0)
     }
 
     /// Play raw f32 PCM samples at the given rate.

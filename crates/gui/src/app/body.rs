@@ -649,11 +649,11 @@ mod tests {
                     reply,
                     epoch,
                     Ok(crate::platform::picker::Chosen {
-                        files: vec![crate::platform::picker::Picked {
-                            file_name: "clipe.mp4".to_owned(),
-                            mime_type: "video/mp4".to_owned(),
-                            bytes: b"clip".to_vec(),
-                        }],
+                        files: vec![crate::platform::picker::Picked::automatic(
+                            "clipe.mp4".to_owned(),
+                            "video/mp4".to_owned(),
+                            b"clip".to_vec(),
+                        )],
                         refused: Vec::new(),
                     }),
                     cx,
@@ -781,11 +781,11 @@ mod tests {
                     jid,
                     reply,
                     crate::platform::picker::Chosen {
-                        files: vec![crate::platform::picker::Picked {
-                            file_name: "clipe.mp4".to_owned(),
-                            mime_type: "video/mp4".to_owned(),
-                            bytes: b"clip".to_vec(),
-                        }],
+                        files: vec![crate::platform::picker::Picked::automatic(
+                            "clipe.mp4".to_owned(),
+                            "video/mp4".to_owned(),
+                            b"clip".to_vec(),
+                        )],
                         refused: Vec::new(),
                     },
                     cx,

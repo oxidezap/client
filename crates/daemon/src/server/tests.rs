@@ -750,6 +750,90 @@ fn describe(action: Action) -> oxidezap_ipc::SendMedia {
     }
 }
 
+/// GUI message mutations are addressed, unlike a queued send: the session's
+/// network result, not admission into the bridge, must answer the request.
+#[tokio::test]
+async fn gui_edit_and_delete_reach_the_session_without_an_early_ack() {
+    let hub = connected_hub();
+    let plugins = no_plugins();
+    for request in [
+        ClientRequest::EditMessage(oxidezap_ipc::EditMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "EDIT-1".into(),
+            new_text: "after".into(),
+        }),
+        ClientRequest::RevokeMessage(oxidezap_ipc::RevokeMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "DELETE-1".into(),
+            for_everyone: false,
+        }),
+        ClientRequest::RevokeMessage(oxidezap_ipc::RevokeMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "DELETE-EVERYONE-1".into(),
+            for_everyone: true,
+        }),
+    ] {
+        let (commands, taken) = bridge(CommandOutcome::Accepted);
+        let answer = handle_request(
+            Request {
+                id: Some(42),
+                request,
+            },
+            &hub,
+            &plugins,
+            &commands,
+            &outbox(),
+        )
+        .await;
+        assert!(
+            answer.frame.is_none(),
+            "the bridge has not completed the mutation"
+        );
+        match taken.await.unwrap().unwrap() {
+            Action::EditMessage { id, request, .. } => {
+                assert_eq!(id, 42);
+                assert_eq!(request.message_id, "EDIT-1");
+                assert_eq!(request.new_text, "after");
+            }
+            Action::RevokeMessage { id, request, .. } => {
+                assert_eq!(id, 42);
+                assert_eq!(
+                    request.for_everyone,
+                    request.message_id == "DELETE-EVERYONE-1"
+                );
+            }
+            action => panic!("unexpected action: {action:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn gui_message_mutations_require_an_answer_id() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    for request in [
+        ClientRequest::EditMessage(oxidezap_ipc::EditMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "EDIT-1".into(),
+            new_text: "after".into(),
+        }),
+        ClientRequest::RevokeMessage(oxidezap_ipc::RevokeMessage {
+            jid: "a@s.whatsapp.net".into(),
+            message_id: "DELETE-1".into(),
+            for_everyone: true,
+        }),
+    ] {
+        let answer = handle_request(bare(request), &hub, &no_plugins(), &commands, &outbox()).await;
+        assert!(matches!(
+            parse(answer.frame),
+            DaemonMessage::Error {
+                id: None,
+                error: ProtocolError::Malformed { .. },
+            }
+        ));
+    }
+}
+
 /// `Accepted` has to mean the session took it, not that a queue did. The
 /// account can drop between the check at the door and the moment the
 /// bridge picks the command up, and a client told yes on admission alone

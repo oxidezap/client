@@ -5,6 +5,10 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 37: `ClientRequest::EditMessage` and `RevokeMessage` let the GUI request
+/// existing session mutations with an addressed completion. A v36 daemon
+/// does not know these commands and would silently refuse a menu action.
+///
 /// 36: `ClientRequest::VotePoll`, which carries a poll ballot to the daemon
 /// the way the sends above it carry their payloads. A v35 daemon does not
 /// know the request and refuses it as malformed — and the daemon is the
@@ -272,7 +276,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 36;
+pub const PROTOCOL_VERSION: u32 = 37;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

@@ -11,13 +11,18 @@
 //! string goes straight into a `div` with no highlight vector built and no
 //! second string allocated.
 
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, FontStyle, FontWeight, HighlightStyle, InteractiveText, IntoElement, SharedString,
-    StrikethroughStyle, StyledText, UnderlineStyle,
+    App, BorderStyle, Bounds, Corners, Edges, Element, ElementId, FontStyle, FontWeight,
+    GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
+    LayoutId, MouseButton, MouseDownEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString,
+    StrikethroughStyle, StyledText, UnderlineStyle, Window, transparent_black,
 };
+use gpui_base::{TextSelection, TextSelectionRegistration, TextSelectionRun};
 use gpui_component::ActiveTheme as _;
 
 use crate::theme::ActiveProductTheme as _;
@@ -112,9 +117,17 @@ pub fn render_rich_text(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
         return render_with_links(parsed, cx).into_any_element();
     }
     if parsed.runs.is_empty() {
-        // Nothing to say about any range, so say nothing: `StyledText` with an
-        // empty highlight list still walks and allocates runs.
-        return parsed.text.clone().into_any_element();
+        // The plain path participates in selection too. Layout and paint are
+        // still delegated to StyledText, so wrapping and inherited styling
+        // remain identical to the old fast path.
+        return SelectableRichText::new(
+            "message-text",
+            parsed.text.clone(),
+            StyledText::new(parsed.text.clone()),
+            Vec::new(),
+            Arc::default(),
+        )
+        .into_any_element();
     }
 
     let runs = &parsed.runs;
@@ -134,10 +147,247 @@ pub fn render_rich_text(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
         .map(|(range, emphasis)| (range.clone(), style_for(*emphasis, metrics)))
         .collect();
 
-    StyledText::new(text)
-        .with_highlights(highlights)
-        .with_font_family_overrides(code)
-        .into_any_element()
+    SelectableRichText::new(
+        "message-text",
+        text.clone(),
+        StyledText::new(text)
+            .with_highlights(highlights)
+            .with_font_family_overrides(code),
+        Vec::new(),
+        Arc::default(),
+    )
+    .into_any_element()
+}
+
+/// A StyledText-backed window selection run.
+///
+/// `gpui_base::SelectableText` accepts only an unformatted string. Message
+/// bubbles need the same window-level selection protocol without splitting a
+/// message into one element per emphasis/link range (which would break inline
+/// wrapping). This adapter keeps one StyledText/layout and supplies its text
+/// to `TextSelectionLayer` as one run.
+struct SelectableRichText {
+    id: ElementId,
+    text: SharedString,
+    styled_text: StyledText,
+    links: Vec<Range<usize>>,
+    link_targets: Arc<[SharedString]>,
+}
+
+impl SelectableRichText {
+    fn new(
+        id: impl Into<ElementId>,
+        text: SharedString,
+        styled_text: StyledText,
+        links: Vec<Range<usize>>,
+        link_targets: Arc<[SharedString]>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            text,
+            styled_text,
+            links,
+            link_targets,
+        }
+    }
+
+    fn paint_selection(
+        layout: &gpui::TextLayout,
+        range: Range<usize>,
+        color: gpui::Hsla,
+        window: &mut Window,
+    ) {
+        let (Some(start), Some(end)) = (
+            layout.position_for_index(range.start),
+            layout.position_for_index(range.end),
+        ) else {
+            return;
+        };
+        for bounds in selection_quad_bounds(start, end, layout.bounds(), layout.line_height()) {
+            window.paint_quad(PaintQuad {
+                bounds,
+                background: color.into(),
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+                border_color: transparent_black(),
+                border_style: BorderStyle::default(),
+            });
+        }
+    }
+}
+
+fn selection_quad_bounds(
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    line_height: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    if start.y == end.y {
+        return vec![Bounds::from_corners(
+            start,
+            Point::new(end.x, end.y + line_height),
+        )];
+    }
+
+    let mut quads = vec![Bounds::from_corners(
+        start,
+        Point::new(bounds.right(), start.y + line_height),
+    )];
+    if end.y > start.y + line_height {
+        quads.push(Bounds::from_corners(
+            Point::new(bounds.left(), start.y + line_height),
+            Point::new(bounds.right(), end.y),
+        ));
+    }
+    quads.push(Bounds::from_corners(
+        Point::new(bounds.left(), end.y),
+        Point::new(end.x, end.y + line_height),
+    ));
+    quads
+}
+
+impl IntoElement for SelectableRichText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SelectableRichText {
+    type RequestLayoutState = gpui_base::TextSelectionHandle;
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let handle = window.with_element_state(
+            global_id.expect("SelectableRichText must have a stable element id"),
+            |retained: Option<gpui_base::TextSelectionHandle>, _| {
+                let handle = retained
+                    .unwrap_or_else(|| gpui_base::TextSelectionHandle::new(self.text.clone(), cx));
+                handle.set_fallback_copy_text(self.text.to_string(), cx);
+                (handle.clone(), handle)
+            },
+        );
+        let (layout_id, ()) = self
+            .styled_text
+            .request_layout(global_id, inspector_id, window, cx);
+        (layout_id, handle)
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        handle: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.styled_text
+            .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        handle.register(
+            TextSelectionRegistration::new(hitbox.clone(), bounds)
+                .with_document_order(0)
+                .with_text_bounds(vec![bounds]),
+            window,
+            cx,
+        );
+        hitbox
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        handle: &mut Self::RequestLayoutState,
+        hitbox: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let layout = self.styled_text.layout().clone();
+        let selected_text_before = TextSelection::selected_text(window, cx);
+        let projection = handle.update_runs(
+            &[
+                TextSelectionRun::new(self.text.clone(), layout.clone(), bounds)
+                    .with_document_order(0),
+            ],
+            cx,
+        );
+        if selected_text_before != TextSelection::selected_text(window, cx) {
+            window.refresh();
+        }
+        let color = gpui_base::Theme::global(cx).tokens.colors.selection;
+        for range in projection.ranges().iter().flatten().cloned() {
+            Self::paint_selection(&layout, range, color, window);
+        }
+        self.styled_text.paint(
+            global_id,
+            inspector_id,
+            bounds,
+            &mut (),
+            &mut (),
+            window,
+            cx,
+        );
+
+        if self.links.is_empty() {
+            return;
+        }
+        let links = self.links.clone();
+        let targets = self.link_targets.clone();
+        let text_layout = layout.clone();
+        let link_hitbox = hitbox.clone();
+        let mouse_down_index = Rc::new(Cell::new(None));
+        let down_index = mouse_down_index.clone();
+        let down_layout = text_layout.clone();
+        let down_hitbox = link_hitbox.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _cx| {
+            if !phase.bubble() || event.button != MouseButton::Left {
+                return;
+            }
+            down_index.set(if down_hitbox.is_hovered(window) {
+                down_layout.index_for_position(event.position).ok()
+            } else {
+                None
+            });
+        });
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if !phase.bubble()
+                || event.button != MouseButton::Left
+                || !link_hitbox.is_hovered(window)
+                || mouse_down_index.replace(None)
+                    != text_layout.index_for_position(event.position).ok()
+                || TextSelection::has_selection(window, cx)
+            {
+                return;
+            }
+            let Ok(index) = text_layout.index_for_position(event.position) else {
+                return;
+            };
+            let Some(link_ix) = links.iter().position(|range| range.contains(&index)) else {
+                return;
+            };
+            TextSelection::end(window, cx);
+            cx.stop_propagation();
+            cx.open_url(&targets[link_ix]);
+        });
+    }
 }
 
 /// One run's appearance.
@@ -162,7 +412,7 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
 /// Message text that holds links, in one inline flow.
 ///
 /// A `StyledText` paints but answers no clicks, so the addresses ride along
-/// as clickable ranges on an `InteractiveText` instead of becoming elements
+/// as clickable ranges on the selection adapter instead of becoming elements
 /// of their own. Nothing is split into flex children, so a newline before an
 /// address starts a line the way it does without one, and a long address
 /// wraps the way plain text does rather than overflowing its item into the
@@ -170,7 +420,7 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
 /// which is why this needs no platform split of its own: GPUI answers that
 /// on the desktop and in the page alike. Size and colour are inherited from
 /// the parent; only the link ink comes from the theme.
-fn render_with_links(parsed: &BubbleText, cx: &App) -> impl IntoElement + use<> {
+fn render_with_links(parsed: &BubbleText, cx: &App) -> SelectableRichText {
     let metrics = cx.product().metrics;
     let ink = cx.theme().link;
     let mono = cx.theme().mono_font_family.clone();
@@ -228,17 +478,17 @@ fn render_with_links(parsed: &BubbleText, cx: &App) -> impl IntoElement + use<> 
             code.push((start..end, mono.clone()));
         }
     }
-    let styled = StyledText::new(text)
+    let styled = StyledText::new(text.clone())
         .with_highlights(highlights)
         .with_font_family_overrides(code);
     let ranges: Vec<Range<usize>> = parsed.links.iter().map(|link| link.range.clone()).collect();
     // A refcount per frame, not a copy per target: the strings were shared
     // when the bubble was parsed.
     let targets = parsed.link_targets.clone();
-    // One instance per bubble, scoped under the row's own id.
-    InteractiveText::new("message-links", styled).on_click(ranges, move |ix, _window, cx| {
-        cx.open_url(&targets[ix]);
-    })
+    // One instance per bubble, scoped under the row's own id. The adapter
+    // keeps the complete StyledText flow while TextSelectionLayer handles
+    // drag selection over it.
+    SelectableRichText::new("message-text", text, styled, ranges, targets)
 }
 
 /// One run's appearance inside a link: its own emphasis, inked and underlined
@@ -262,6 +512,8 @@ fn link_style(
 
 #[cfg(test)]
 mod tests {
+    use gpui::{ParentElement as _, Styled as _};
+
     use super::BubbleText;
 
     /// Links are resolved where the rows are built, beside the markup — so a
@@ -424,6 +676,78 @@ mod tests {
         assert_eq!(targets[1], "http://two.example/y");
         assert_eq!(targets[0].as_str(), parsed.links[0].target.as_str());
         assert_eq!(targets[1].as_str(), parsed.links[1].target.as_str());
+    }
+
+    struct SelectableRichTextTestView {
+        source: &'static str,
+    }
+
+    impl gpui::Render for SelectableRichTextTestView {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let parsed = BubbleText::of(self.source);
+            gpui::div()
+                .size_full()
+                .child(gpui_base::TextSelectionLayer)
+                .child(
+                    gpui::div()
+                        .w(gpui::px(240.))
+                        .h(gpui::px(32.))
+                        .child(super::render_rich_text(&parsed, cx)),
+                )
+        }
+    }
+
+    fn selected_prefix(source: &'static str, cx: &mut gpui::TestAppContext) -> String {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let (_, cx) = cx.add_window_view(|_, _| SelectableRichTextTestView { source });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        cx.simulate_mouse_down(
+            gpui::point(gpui::px(1.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            gpui_base::TextSelection::selected_text(window, cx)
+        })
+    }
+
+    #[gpui::test]
+    fn rich_text_selection_copies_a_substring(cx: &mut gpui::TestAppContext) {
+        assert_eq!(selected_prefix("alpha beta", cx), "alpha ");
+    }
+
+    #[gpui::test]
+    fn formatted_selection_copies_visible_text_without_markup(cx: &mut gpui::TestAppContext) {
+        let selected = selected_prefix("*alpha* beta", cx);
+        assert!(selected.starts_with("alpha"), "selected {selected:?}");
+        assert!(!selected.contains('*'), "selected {selected:?}");
+    }
+
+    #[gpui::test]
+    fn linked_message_allows_selection_without_opening_link(cx: &mut gpui::TestAppContext) {
+        let selected = selected_prefix("alpha https://example.invalid", cx);
+        assert_eq!(selected, "alpha ");
     }
 
     /// A stopwatch rather than an assertion: what a conversation pays to
