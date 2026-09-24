@@ -164,7 +164,6 @@ pub struct ChatStore {
 struct ChatStoreHandler {
     tx: mpsc::UnboundedSender<WriterMsg>,
     skip_hook_committed: Arc<std::sync::atomic::AtomicBool>,
-    defer_contact_events: bool,
 }
 
 impl EventHandler for ChatStoreHandler {
@@ -189,12 +188,14 @@ impl EventHandler for ChatStoreHandler {
     }
 
     fn interest(&self) -> EventInterest {
-        let interest = EventInterest::of(&[
+        EventInterest::of(&[
             EventKind::Messages,
             EventKind::Receipt,
             EventKind::ServerAck,
             EventKind::UndecryptableMessage,
             EventKind::HistorySync,
+            EventKind::ContactUpdate,
+            EventKind::ContactRemoved,
             EventKind::PinUpdate,
             EventKind::MuteUpdate,
             EventKind::ArchiveUpdate,
@@ -204,14 +205,7 @@ impl EventHandler for ChatStoreHandler {
             EventKind::ClearChatUpdate,
             EventKind::DeleteMessageForMeUpdate,
             EventKind::GroupUpdate,
-        ]);
-        if self.defer_contact_events {
-            interest
-        } else {
-            interest
-                .with(EventKind::ContactUpdate)
-                .with(EventKind::ContactRemoved)
-        }
+        ])
     }
 }
 
@@ -377,17 +371,6 @@ impl ChatStore {
         Arc::new(ChatStoreHandler {
             tx: self.tx.clone(),
             skip_hook_committed: Arc::clone(&self.skip_hook_committed),
-            defer_contact_events: false,
-        })
-    }
-
-    /// Handler for hosts that order contact identity learning before sending
-    /// contact updates/removals back to the store.
-    pub fn handler_without_contact_events(&self) -> Arc<dyn EventHandler> {
-        Arc::new(ChatStoreHandler {
-            tx: self.tx.clone(),
-            skip_hook_committed: Arc::clone(&self.skip_hook_committed),
-            defer_contact_events: true,
         })
     }
 

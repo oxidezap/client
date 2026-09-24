@@ -83,14 +83,10 @@ fn the_live_data_lane_subscribes_to_server_acks() {
 }
 
 #[test]
-fn the_identity_lane_subscribes_to_contact_events() {
+fn the_identity_lane_subscribes_to_contact_updates() {
     assert!(
         super::IDENTITY_EVENT_KINDS
             .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactUpdate)
-    );
-    assert!(
-        super::IDENTITY_EVENT_KINDS
-            .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactRemoved)
     );
     assert!(
         !super::CONTROL_EVENT_KINDS
@@ -1963,7 +1959,6 @@ async fn a_contact_update_repairs_an_already_seen_lid_chat() {
     WhatsAppClient::spawn_contact_identity_learner(
         client.clone(),
         identity_incoming,
-        chat_store.handler(),
         names.clone(),
         Arc::new(tokio::sync::Notify::new()),
         stopping,
