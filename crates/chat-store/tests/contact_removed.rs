@@ -84,6 +84,35 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
         Ok(StoreChange::Contacts)
     ));
 
+    // The conversation row can hold a history copy of a saved name. Follow a
+    // later contact rename only when it still matches the previous book value,
+    // so removal can retire that copy without touching independent names.
+    feed(
+        &store,
+        [contact_update(PEER, "Renamed Saved Name", "Renamed")],
+    )
+    .await;
+    assert!(matches!(
+        timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap(),
+        Ok(StoreChange::Chats)
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap(),
+        Ok(StoreChange::Contacts)
+    ));
+    let renamed_chat = store
+        .chats(false, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|chat| chat.jid == jid(PEER))
+        .unwrap();
+    assert_eq!(renamed_chat.name.as_deref(), Some("Renamed Saved Name"));
+
     feed(&store, [contact_removed(PEER)]).await;
     let removed = store.contact(&jid(PEER)).await.unwrap().unwrap();
     assert_eq!(removed.full_name, None);
