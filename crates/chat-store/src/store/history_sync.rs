@@ -231,6 +231,7 @@ fn apply_history_message(
                         // History is the stale copy: live rows win.
                         overwrite: false,
                     },
+                    cs,
                 )?;
                 // A reply whose parent lands LATER in this conversation kept
                 // its inline snapshot above (the parent was not visible yet).
@@ -241,7 +242,7 @@ fn apply_history_message(
                 {
                     pending_quotes.push(PendingQuote {
                         msg_id: msg_id.to_string(),
-                        sender: sender.to_string(),
+                        sender: crate::store::message_identity::stored_sender(sender, from_me),
                         target,
                     });
                 }
@@ -266,6 +267,7 @@ fn apply_history_message(
                     new_kind,
                     &new_proto,
                     ts_ms,
+                    cs,
                 )? {
                     cs.chats = true;
                 }
@@ -283,6 +285,7 @@ fn apply_history_message(
                     target_participant.as_deref().unwrap_or(sender),
                     target_from_me,
                     ts_ms,
+                    cs,
                 )? {
                     cs.chats = true;
                 }

@@ -1051,6 +1051,18 @@ impl IncomingMessageMetadata {
     }
 }
 
+pub(super) fn clear_window_message_selection(window: &mut Window, cx: &mut App) {
+    gpui_base::TextSelection::clear(window, cx);
+    crate::components::rich_text_selection::forget_window_selection_registry(
+        window.window_handle().window_id(),
+        cx,
+    );
+}
+
+fn message_has_selectable_text(message: &ChatMessage) -> bool {
+    message.system.is_none() && message.poll.is_none() && !message.content.is_empty()
+}
+
 impl WhatsAppApp {
     pub fn media_cache(&self) -> Option<std::sync::Arc<dyn crate::session::MediaCache>> {
         self.client.as_ref().map(Session::media_cache)
@@ -1207,9 +1219,18 @@ impl WhatsAppApp {
                         // re-pair — its name under the sidebar, its number
                         // beneath, and its JID still reading as "(You)" —
                         // until some later `AccountUpdated` corrected it.
+                        let jid = account.as_ref().and_then(|a| a.jid.clone());
+                        let lid = account.as_ref().and_then(|a| a.lid.clone());
+                        if (app.account_jid != jid || app.account_lid != lid)
+                            && let Some(window) = app.modal_window
+                        {
+                            let _ = window.update(cx, |_, window, cx| {
+                                clear_window_message_selection(window, cx);
+                            });
+                        }
                         app.account_name = account.as_ref().and_then(|a| a.name.clone());
-                        app.account_jid = account.as_ref().and_then(|a| a.jid.clone());
-                        app.account_lid = account.and_then(|a| a.lid);
+                        app.account_jid = jid;
+                        app.account_lid = lid;
                         cx.notify();
                     }),
                     FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
@@ -1901,6 +1922,84 @@ impl WhatsAppApp {
     /// same messages: every caller here is announcing that the chat's history
     /// changed, which is exactly when the search's matches stop describing it.
     fn invalidate_message_cache(&mut self, chat_jid: &str, cx: &mut App) {
+        if self.selected_chat.as_deref() == Some(chat_jid)
+            && let Some(window) = self.modal_window
+        {
+            let selected_messages =
+                crate::components::rich_text_selection::active_selection_message_snapshots(
+                    window.window_id(),
+                    cx,
+                );
+            let selected_ids: Vec<String> = selected_messages
+                .iter()
+                .map(|(message_id, _, _)| message_id.clone())
+                .collect();
+            let selection_is_stale = if selected_ids.is_empty() {
+                false
+            } else {
+                let cache = self.message_list_cache.borrow();
+                match (cache.get(chat_jid), self.find_chat(chat_jid)) {
+                    (Some(previous), Some(current)) => {
+                        let previous_by_id: HashMap<&str, (usize, &ChatMessage)> = previous
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .map(|(index, message)| {
+                                (message.id.as_str(), (index, message.as_ref()))
+                            })
+                            .collect();
+                        let current_by_id: HashMap<&str, (usize, &ChatMessage)> = current
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .map(|(index, message)| (message.id.as_str(), (index, message)))
+                            .collect();
+                        selected_ids.iter().any(|message_id| {
+                            let (Some((old_index, old)), Some((new_index, new))) = (
+                                previous_by_id.get(message_id.as_str()),
+                                current_by_id.get(message_id.as_str()),
+                            ) else {
+                                return true;
+                            };
+                            old_index != new_index
+                                || !message_has_selectable_text(old)
+                                || !message_has_selectable_text(new)
+                                || old.content != new.content
+                                || old.revoked != new.revoked
+                        })
+                    }
+                    (None, Some(current)) => {
+                        // The render cache may already be gone, but retained
+                        // participants keep the visible text to compare against.
+                        let current_by_id: HashMap<&str, (usize, &ChatMessage)> = current
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .map(|(index, message)| (message.id.as_str(), (index, message)))
+                            .collect();
+                        selected_messages.iter().any(
+                            |(message_id, selected_text, selected_order)| {
+                                let Some((current_order, message)) =
+                                    current_by_id.get(message_id.as_str())
+                                else {
+                                    return true;
+                                };
+                                *current_order as u64 != *selected_order
+                                    || !message_has_selectable_text(message)
+                                    || crate::components::BubbleText::of(&message.content).text()
+                                        != selected_text.as_ref()
+                            },
+                        )
+                    }
+                    _ => true,
+                }
+            };
+            if selection_is_stale {
+                let _ = window.update(cx, |_, window, cx| {
+                    clear_window_message_selection(window, cx);
+                });
+            }
+        }
         self.message_list_cache.borrow_mut().remove(chat_jid);
         self.refresh_conversation_search(chat_jid, cx);
         self.refresh_media_viewer(chat_jid, cx);
@@ -1918,8 +2017,22 @@ impl WhatsAppApp {
     /// exactly when its timeline needs filling, and the frame that draws it
     /// is the one place that knows which chat that is — the selection can
     /// name a chat the window is not showing (Settings is up, the reader is
-    /// in Status).
-    pub fn note_visible_conversation(&mut self, jid: Option<String>, cx: &mut App) {
+    /// in Status). Leaving that visible conversation clears its message-text
+    /// selection so the hidden pane cannot keep answering Copy.
+    pub fn note_visible_conversation(
+        &mut self,
+        jid: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .retained_chat
+            .as_deref()
+            .is_some_and(|previous| jid.as_deref() != Some(previous))
+            && gpui_base::TextSelection::has_selection(window, cx)
+        {
+            clear_window_message_selection(window, cx);
+        }
         if let Some(jid) = &jid {
             self.ensure_timeline_page(jid, cx);
         }
@@ -2026,7 +2139,7 @@ impl WhatsAppApp {
         // controls to stop it, and an encode that could still finish, pass an
         // epoch nothing had bumped, and send the old account's note from the
         // newly paired one.
-        self.leave_connected_view(cx);
+        self.leave_connected_view(Some(window), cx);
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.incoming_file_reading = false;
         self.paste_preview = None;
@@ -2123,7 +2236,18 @@ impl WhatsAppApp {
     ///
     /// Not [`AppState::Offline`]: that keeps the conversation on screen and
     /// only refuses to send.
-    fn leave_connected_view(&mut self, cx: &mut Context<Self>) {
+    fn leave_connected_view(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        // The window-scoped text selection outlives the conversation's rows.
+        // Clear it with the rest of the connected view so Copy cannot expose
+        // hidden message text after a disconnect, error, or logout. Account
+        // teardown already has the Window; other transitions use its handle.
+        if let Some(window) = window {
+            clear_window_message_selection(window, cx);
+        } else if let Some(window) = self.modal_window {
+            let _ = window.update(cx, |_, window, cx| {
+                clear_window_message_selection(window, cx);
+            });
+        }
         if self.recorder.read(cx).state() != RecordingState::Idle {
             self.cancel_recording(cx);
         }
@@ -2393,7 +2517,7 @@ impl WhatsAppApp {
             // typed, let alone sent.
             self.drafts.remove(jid);
         }
-        self.forget_missing_selection();
+        self.forget_missing_selection(cx);
         // The viewer names a chat and a message in it, and resolves them every
         // frame: one left open over a chat that has just gone draws nothing,
         // keeps the keyboard, and swallows the Escape meant to close it.
@@ -2408,12 +2532,17 @@ impl WhatsAppApp {
     /// pointing at a deleted chat draws the empty state — and on a phone that
     /// is the whole screen, with the Back button belonging to a conversation
     /// that is not there.
-    fn forget_missing_selection(&mut self) {
+    fn forget_missing_selection(&mut self, cx: &mut App) {
         if self
             .selected_chat
             .as_deref()
             .is_some_and(|jid| !self.chats.iter().any(|chat| chat.jid == jid))
         {
+            if let Some(window) = self.modal_window {
+                let _ = window.update(cx, |_, window, cx| {
+                    clear_window_message_selection(window, cx);
+                });
+            }
             self.selected_chat = None;
         }
     }
@@ -2599,6 +2728,11 @@ impl WhatsAppApp {
         // on this target, where the prompt is the browser's rather than the
         // operating system's.
         crate::platform::request_gesture_authorization();
+        if self.selected_chat.as_deref() != Some(jid.as_str()) {
+            // Message-text selection belongs to the conversation being left,
+            // not to the next list reusing the window selection layer.
+            clear_window_message_selection(window, cx);
+        }
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on
@@ -4189,6 +4323,172 @@ fn timeline_may_page(visible: Option<&str>, anchored: Option<&str>, chat_jid: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SelectionExitTestView {
+        focus_handle: FocusHandle,
+        selection_key: Arc<str>,
+    }
+
+    impl Render for SelectionExitTestView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let text = crate::components::BubbleText::of("alpha beta");
+            div().track_focus(&self.focus_handle).size_full().child(
+                div()
+                    .id("message-row")
+                    .w(gpui::px(400.))
+                    .h(gpui::px(40.))
+                    .child(crate::components::render_rich_text(
+                        &text,
+                        self.selection_key.clone(),
+                        0,
+                        cx,
+                    )),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn repeated_cache_misses_preserve_unchanged_message_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let jid = "peer@example.invalid";
+        let mut focus_handle = None;
+        let mut app_entity = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                let mut chat = Chat::new(jid.to_string());
+                chat.messages.push(ChatMessage::new_incoming(
+                    "test-message".into(),
+                    jid.into(),
+                    "alpha beta".into(),
+                ));
+                app.chats.push(Arc::new(chat));
+                app.selected_chat = Some(jid.to_string());
+                app
+            });
+            app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+            app_entity = Some(app);
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                SelectionExitTestView {
+                    focus_handle: handle,
+                    selection_key: Arc::from("test-message"),
+                }
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            gpui::point(gpui::px(1.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+
+        visual.update(|window, cx| {
+            app_entity.as_ref().unwrap().update(cx, |app, cx| {
+                // Model the call-history path: two updates before another list
+                // frame leaves the render cache absent both times.
+                app.invalidate_message_cache(jid, cx);
+                app.invalidate_message_cache(jid, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+    }
+
+    #[gpui::test]
+    fn leaving_connected_view_clears_selected_message_text(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut focus_handle = None;
+        let mut app_entity = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let app = cx.new(WhatsAppApp::new);
+            app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+            app_entity = Some(app);
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                SelectionExitTestView {
+                    focus_handle: handle,
+                    selection_key: Arc::from("test-message"),
+                }
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            gpui::point(gpui::px(1.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+
+        visual.update(|window, cx| {
+            app_entity
+                .as_ref()
+                .unwrap()
+                .update(cx, |app, cx| app.leave_connected_view(Some(window), cx));
+        });
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            ""
+        );
+    }
 
     #[test]
     fn a_sent_receipt_replaces_only_the_outgoing_pending_clock() {

@@ -90,6 +90,8 @@ async fn every_account_scoped_table_cascades_with_its_device() {
         // not this test's to pin.
         "avatar_descriptors",
         "contact_labels",
+        "message_identity_repair_state",
+        "message_identity_repair_pending",
     ] {
         let sql = table_sql(&store, table).await;
         assert!(
