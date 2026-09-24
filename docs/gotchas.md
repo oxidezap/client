@@ -256,6 +256,29 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   "Unknown contact" six times in a row. The count is the one thing that is
   always true, which is why an all-stranger group reads "50 members" — the
   answer `participants` could never give.
+- **A community tree comes from `GroupOverview`, never from names.** The
+  overview is the engine's typed source for community role, subgroup role and
+  parent JID; a display name that happens to equal another group's says
+  nothing about their relationship. `None` means the relationship has not
+  been resolved, not that WhatsApp declared the group standalone, so history,
+  live message summaries and reconnect snapshots preserve the last known
+  hierarchy until another typed overview changes it. The store updates this
+  metadata by compare-and-swap against the exact stored JSON a lookup started
+  from, just like resolved names, so a late pass cannot replace newer server
+  state. The raw value is retained even if this client cannot decode a newer
+  role, allowing a fresh overview to replace it after a downgrade. On
+  the Groups filter, a subgroup is nested only when its parent JID is present
+  and explicitly a community. Otherwise it remains a visible subgroup at the
+  root; no string comparison repairs missing metadata. Search matches both
+  names and JIDs, and when a matching child is under a collapsed community it
+  reveals that path with the parent as context. The open/closed state is keyed
+  by community JID, not name, so renames and duplicate titles cannot move it.
+  A pinned subgroup of an unpinned community stays in the pinned block at the
+  root instead of being demoted into that community's subtree. With the chat
+  list focused, Space toggles the selected community; while the
+  search field is focused, Space remains ordinary input. If that hides the open
+  subgroup, the parent remains the visible list-selection anchor and arrow-key
+  navigation continues there without closing the conversation.
 - **What a file is sent as is decided in the front end; what it looks like is
   worked out where the bytes land.** Two questions, and they are answered in
   two places because they have two different pieces of evidence. The *kind* —

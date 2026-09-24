@@ -17,6 +17,7 @@ diesel::table! {
         archive_appstate_seen -> Bool,
         name_from_address_book -> Bool,
         address_book_fallback -> Nullable<Text>,
+        group_hierarchy -> Nullable<Text>,
     }
 }
 

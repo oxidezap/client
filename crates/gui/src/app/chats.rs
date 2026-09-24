@@ -8,6 +8,7 @@ use oxidezap_core::Chat;
 
 use super::chat_row::ChatRow;
 use super::{WhatsAppApp, newest_shared_message};
+use crate::utils::contains_ignore_case;
 use log::info;
 use wacore_binary::jid::observe_str;
 
@@ -276,6 +277,142 @@ impl WhatsAppApp {
     }
 }
 
+/// Flatten the authoritative community relationships for the Groups filter.
+/// A child is nested only when its parent JID is present and explicitly marked
+/// as a community; absent/unknown parents leave the subgroup visible at the
+/// root instead of guessing from a matching name. A pinned subgroup whose
+/// parent is unpinned stays at the root in the pinned block rather than being
+/// demoted below that parent.
+pub(super) fn hierarchical_group_rows(
+    rows: &[ChatRow],
+    query: &str,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<ChatRow> {
+    use oxidezap_core::GroupHierarchy;
+
+    let query_active = !query.trim().is_empty();
+    let matches = |row: &ChatRow| {
+        contains_ignore_case(&row.name, query) || contains_ignore_case(&row.jid, query)
+    };
+    let by_jid: HashMap<&str, &ChatRow> = rows.iter().map(|row| (row.jid.as_str(), row)).collect();
+    let mut children: HashMap<&str, Vec<&ChatRow>> = HashMap::new();
+    let mut linked_children: HashMap<&str, Vec<&ChatRow>> = HashMap::new();
+    let mut nested = std::collections::HashSet::new();
+    for row in rows {
+        let Some(GroupHierarchy::Subgroup { parent_jid, .. }) = &row.group_hierarchy else {
+            continue;
+        };
+        let Some(parent) = by_jid.get(parent_jid.as_str()).filter(|parent| {
+            parent_jid != &row.jid
+                && parent
+                    .group_hierarchy
+                    .as_ref()
+                    .is_some_and(|hierarchy| matches!(hierarchy, GroupHierarchy::Community))
+        }) else {
+            continue;
+        };
+        linked_children.entry(parent_jid).or_default().push(row);
+        // Input rows are sorted with pinned chats first. Never nest across
+        // that boundary: an unpinned child under a pinned parent can otherwise
+        // jump ahead of later pinned rows. Keep the relationship for search
+        // context, while rendering cross-boundary children as roots.
+        if row.pinned != parent.pinned {
+            continue;
+        }
+        children.entry(parent_jid).or_default().push(row);
+        nested.insert(row.jid.as_str());
+    }
+
+    let mut flattened = Vec::with_capacity(rows.len());
+    for row in rows {
+        if nested.contains(row.jid.as_str()) {
+            continue;
+        }
+        if row
+            .group_hierarchy
+            .as_ref()
+            .is_some_and(|hierarchy| matches!(hierarchy, GroupHierarchy::Community))
+        {
+            let members = children
+                .get(row.jid.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let matching_child = linked_children
+                .get(row.jid.as_str())
+                .is_some_and(|children| children.iter().any(|child| matches(child)));
+            let row_matches = matches(row);
+            if !row_matches && !matching_child {
+                continue;
+            }
+            let expanded = if query_active {
+                matching_child
+            } else {
+                !collapsed.contains(&row.jid)
+            };
+            let mut parent = row.clone();
+            // Search expands matching paths automatically, so a disclosure
+            // control that could not hide a matching result would be a no-op.
+            parent.community_toggle_visible = !members.is_empty() && !query_active;
+            parent.community_expanded = expanded;
+            parent.hierarchy_context = !row_matches;
+            flattened.push(parent);
+            if expanded {
+                flattened.extend(
+                    members
+                        .iter()
+                        .filter(|child| !query_active || matches(child))
+                        .map(|child| {
+                            let mut child = (*child).clone();
+                            child.tree_depth = 1;
+                            child
+                        }),
+                );
+            }
+        } else if matches(row) {
+            flattened.push(row.clone());
+        }
+    }
+    flattened
+}
+
+/// The keyboard disclosure action applies only when the selected cached row
+/// currently exposes a community toggle.
+pub(super) fn selected_community_toggle(rows: &[ChatRow], selected_jid: &str) -> Option<String> {
+    rows.iter()
+        .find(|row| row.jid == selected_jid && row.community_toggle_visible)
+        .map(|row| row.jid.clone())
+}
+
+/// A selected subgroup hidden by its collapsed parent keeps that parent as the
+/// list's visible selection anchor without changing the open conversation.
+fn visible_chat_list_selection(rows: &[ChatRow], selected: &Chat) -> Option<String> {
+    if rows.iter().any(|row| row.jid == selected.jid) {
+        return Some(selected.jid.clone());
+    }
+    let oxidezap_core::GroupHierarchy::Subgroup { parent_jid, .. } =
+        selected.group_hierarchy.as_ref()?
+    else {
+        return None;
+    };
+    rows.iter()
+        .find(|row| {
+            row.jid == *parent_jid && row.community_toggle_visible && !row.community_expanded
+        })
+        .map(|row| row.jid.clone())
+}
+
+impl WhatsAppApp {
+    /// The row the chat list can visibly highlight for the current
+    /// conversation, including a collapsed subgroup's community parent.
+    pub(crate) fn chat_list_selection_jid(&self, cache: &ChatListCache) -> Option<String> {
+        let selected = self
+            .selected_chat
+            .as_deref()
+            .and_then(|jid| self.find_chat(jid))?;
+        visible_chat_list_selection(&cache.rows, selected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +439,268 @@ mod tests {
             "marked unread by hand is still unread"
         );
         assert!(!ChatFilter::Unread.matches(&chat("a@s.whatsapp.net", false, 0, false)));
+    }
+
+    fn hierarchy_row(jid: &str, name: &str, hierarchy: oxidezap_core::GroupHierarchy) -> ChatRow {
+        let mut chat = Chat::new(jid.to_string());
+        chat.name = name.to_string();
+        chat.is_group = true;
+        chat.group_hierarchy = Some(hierarchy);
+        ChatRow::new(&chat, None, None, false)
+    }
+
+    #[test]
+    fn subgroup_parentage_uses_jids_and_keeps_same_named_communities_separate() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let rows = vec![
+            hierarchy_row(
+                "g2@g.us",
+                "Announcements",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "community2@g.us".into(),
+                    kind: SubgroupKind::Announcement,
+                },
+            ),
+            hierarchy_row("community1@g.us", "Sports", GroupHierarchy::Community),
+            hierarchy_row("community2@g.us", "Sports", GroupHierarchy::Community),
+            hierarchy_row(
+                "g1@g.us",
+                "Announcements",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "community1@g.us".into(),
+                    kind: SubgroupKind::General,
+                },
+            ),
+            hierarchy_row("standalone@g.us", "Sports", GroupHierarchy::Standalone),
+        ];
+        let rows = hierarchical_group_rows(&rows, "", &Default::default());
+
+        assert_eq!(
+            rows.iter().map(|row| row.jid.as_str()).collect::<Vec<_>>(),
+            vec![
+                "community1@g.us",
+                "g1@g.us",
+                "community2@g.us",
+                "g2@g.us",
+                "standalone@g.us",
+            ]
+        );
+        assert!(rows[0].community_toggle_visible);
+        assert_eq!(rows[1].tree_depth, 1);
+        assert_eq!(rows[1].hierarchy_label, Some("General"));
+        assert_eq!(rows[3].hierarchy_label, Some("Announcement"));
+        assert_eq!(rows[4].tree_depth, 0);
+    }
+
+    #[test]
+    fn subgroup_search_reveals_a_collapsed_parent_as_context() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let rows = vec![
+            hierarchy_row("community@g.us", "Games", GroupHierarchy::Community),
+            hierarchy_row(
+                "subgroup@g.us",
+                "Chess",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "community@g.us".into(),
+                    kind: SubgroupKind::Regular,
+                },
+            ),
+        ];
+        let collapsed = std::collections::HashSet::from(["community@g.us".to_string()]);
+        let rows = hierarchical_group_rows(&rows, "chess", &collapsed);
+
+        assert_eq!(rows.len(), 2, "search opens the path to a matching child");
+        assert_eq!(rows[0].jid, "community@g.us");
+        assert!(rows[0].hierarchy_context);
+        assert!(rows[0].community_expanded);
+        assert!(
+            !rows[0].community_toggle_visible,
+            "a matching path is expanded by search rather than a manual toggle"
+        );
+        assert_eq!(rows[1].jid, "subgroup@g.us");
+        assert_eq!(rows[1].tree_depth, 1);
+    }
+
+    #[test]
+    fn collapsing_a_community_hides_only_its_jid_linked_subgroups() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let rows = vec![
+            hierarchy_row("community1@g.us", "First", GroupHierarchy::Community),
+            hierarchy_row(
+                "child1@g.us",
+                "First child",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "community1@g.us".into(),
+                    kind: SubgroupKind::Regular,
+                },
+            ),
+            hierarchy_row("community2@g.us", "Second", GroupHierarchy::Community),
+            hierarchy_row(
+                "child2@g.us",
+                "Second child",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "community2@g.us".into(),
+                    kind: SubgroupKind::Regular,
+                },
+            ),
+        ];
+        let collapsed = std::collections::HashSet::from(["community1@g.us".to_string()]);
+        let rows = hierarchical_group_rows(&rows, "", &collapsed);
+        assert_eq!(
+            rows.iter().map(|row| row.jid.as_str()).collect::<Vec<_>>(),
+            vec!["community1@g.us", "community2@g.us", "child2@g.us"]
+        );
+        assert!(!rows[0].community_expanded);
+        assert!(rows[1].community_expanded);
+        assert_eq!(rows[2].tree_depth, 1);
+    }
+
+    #[test]
+    fn a_collapsed_selected_subgroup_uses_its_parent_as_list_selection_anchor() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+        use std::collections::HashSet;
+
+        let source_rows = vec![
+            hierarchy_row("community@g.us", "Community", GroupHierarchy::Community),
+            hierarchy_row(
+                "subgroup@g.us",
+                "Subgroup",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "community@g.us".into(),
+                    kind: SubgroupKind::Regular,
+                },
+            ),
+        ];
+        let mut selected = chat("subgroup@g.us", true, 0, false);
+        selected.group_hierarchy = Some(GroupHierarchy::Subgroup {
+            parent_jid: "community@g.us".into(),
+            kind: SubgroupKind::Regular,
+        });
+        let expanded_rows = hierarchical_group_rows(&source_rows, "", &HashSet::new());
+        assert_eq!(
+            visible_chat_list_selection(&expanded_rows, &selected),
+            Some("subgroup@g.us".into())
+        );
+        let collapsed_rows =
+            hierarchical_group_rows(&source_rows, "", &HashSet::from(["community@g.us".into()]));
+        let visible_selection = visible_chat_list_selection(&collapsed_rows, &selected)
+            .expect("collapsed parent remains selected in the list");
+        assert_eq!(visible_selection, "community@g.us");
+        assert_eq!(
+            selected_community_toggle(&collapsed_rows, &visible_selection),
+            Some("community@g.us".into())
+        );
+    }
+
+    #[test]
+    fn keyboard_disclosure_targets_only_a_visible_community_row() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let rows = vec![
+            hierarchy_row("community@g.us", "Games", GroupHierarchy::Community),
+            hierarchy_row(
+                "subgroup@g.us",
+                "Chess",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "community@g.us".into(),
+                    kind: SubgroupKind::Regular,
+                },
+            ),
+        ];
+        let rows = hierarchical_group_rows(&rows, "", &Default::default());
+        assert_eq!(
+            selected_community_toggle(&rows, "community@g.us"),
+            Some("community@g.us".into())
+        );
+        assert_eq!(selected_community_toggle(&rows, "subgroup@g.us"), None);
+    }
+
+    #[test]
+    fn a_pinned_subgroup_stays_in_the_pinned_block_when_its_parent_is_unpinned() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let mut pinned_child = hierarchy_row(
+            "pinned-child@g.us",
+            "Pinned subgroup",
+            GroupHierarchy::Subgroup {
+                parent_jid: "community@g.us".into(),
+                kind: SubgroupKind::Regular,
+            },
+        );
+        pinned_child.pinned = true;
+        let rows = vec![
+            pinned_child,
+            hierarchy_row("standalone@g.us", "Standalone", GroupHierarchy::Standalone),
+            hierarchy_row("community@g.us", "Community", GroupHierarchy::Community),
+        ];
+
+        let rows = hierarchical_group_rows(&rows, "", &Default::default());
+        assert_eq!(
+            rows.iter().map(|row| row.jid.as_str()).collect::<Vec<_>>(),
+            vec!["pinned-child@g.us", "standalone@g.us", "community@g.us",]
+        );
+        assert_eq!(rows[0].tree_depth, 0);
+        assert!(!rows[2].community_toggle_visible);
+
+        let searched = hierarchical_group_rows(&rows, "pinned subgroup", &Default::default());
+        assert_eq!(
+            searched
+                .iter()
+                .map(|row| row.jid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pinned-child@g.us", "community@g.us"]
+        );
+        assert!(searched[1].hierarchy_context);
+    }
+
+    #[test]
+    fn an_unpinned_subgroup_does_not_interrupt_the_pinned_block() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let mut community = hierarchy_row("community@g.us", "Community", GroupHierarchy::Community);
+        community.pinned = true;
+        let mut other_pinned = hierarchy_row("pinned@g.us", "Pinned", GroupHierarchy::Standalone);
+        other_pinned.pinned = true;
+        let child = hierarchy_row(
+            "child@g.us",
+            "Child",
+            GroupHierarchy::Subgroup {
+                parent_jid: "community@g.us".into(),
+                kind: SubgroupKind::Regular,
+            },
+        );
+        let rows =
+            hierarchical_group_rows(&[community, other_pinned, child], "", &Default::default());
+
+        assert_eq!(
+            rows.iter().map(|row| row.jid.as_str()).collect::<Vec<_>>(),
+            vec!["community@g.us", "pinned@g.us", "child@g.us"]
+        );
+        assert!(rows.iter().all(|row| row.tree_depth == 0));
+    }
+
+    #[test]
+    fn a_missing_parent_is_not_guessed_from_a_matching_name() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let rows = vec![
+            hierarchy_row("unrelated@g.us", "Same name", GroupHierarchy::Community),
+            hierarchy_row(
+                "child@g.us",
+                "Same name",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "missing@g.us".into(),
+                    kind: SubgroupKind::Other,
+                },
+            ),
+        ];
+        let rows = hierarchical_group_rows(&rows, "", &Default::default());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.tree_depth == 0));
+        assert!(!rows[0].community_toggle_visible);
     }
 
     #[test]

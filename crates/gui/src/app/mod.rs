@@ -308,7 +308,7 @@ use gpui_component::VirtualListScrollHandle;
 use gpui_component::input::InputState;
 
 // Define our own actions since gpui-component's actions module is private
-actions!(chat_list, [SelectUp, SelectDown]);
+actions!(chat_list, [SelectUp, SelectDown, ToggleSelectedCommunity]);
 actions!(
     oxidezap,
     [
@@ -587,6 +587,8 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
     cx.bind_keys([
         KeyBinding::new("up", SelectUp, Some(CHAT_LIST_CONTEXT)),
         KeyBinding::new("down", SelectDown, Some(CHAT_LIST_CONTEXT)),
+        // Exclude the Input context so matched Space remains available to the editor.
+        KeyBinding::new("space", ToggleSelectedCommunity, Some("ChatList && !Input")),
         // Window-wide: reachable whatever owns focus, because both are ways
         // *out* of wherever the user currently is.
         KeyBinding::new("secondary-k", FocusSearch, None),
@@ -962,6 +964,8 @@ pub struct WhatsAppApp {
     mobile_panel: MobilePanel,
     /// Which conversations the sidebar is showing.
     chat_filter: ChatFilter,
+    /// JIDs of community rows the Groups list has collapsed.
+    collapsed_communities: std::collections::HashSet<String>,
     /// The message being replied to, mirrored here so the send path can
     /// attach it and the composer can show it.
     reply_to: Option<ReplyDraft>,
@@ -1439,6 +1443,7 @@ impl WhatsAppApp {
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
             chat_filter: ChatFilter::default(),
+            collapsed_communities: std::collections::HashSet::new(),
             reply_to: None,
             reaction_picker_for: None,
             presence: PresenceRegistry::new(),
@@ -1592,13 +1597,10 @@ impl WhatsAppApp {
         }
 
         let query = self.search.read(cx).list_query();
-        let matches = |chat: &Chat| {
-            self.chat_filter.matches(chat)
-                && (contains_ignore_case(&chat.name, query)
-                    || contains_ignore_case(&chat.jid, query))
-        };
-
-        let filtered: Vec<&Chat> = self.conversations().filter(|c| matches(c)).collect();
+        let filtered: Vec<&Chat> = self
+            .conversations()
+            .filter(|chat| self.chat_filter.matches(chat))
+            .collect();
 
         let mut rows: Vec<ChatRow> = filtered
             .into_iter()
@@ -1615,6 +1617,14 @@ impl WhatsAppApp {
                 )
             })
             .collect();
+        let mut rows = if self.chat_filter == ChatFilter::Groups {
+            chats::hierarchical_group_rows(&rows, query, &self.collapsed_communities)
+        } else {
+            rows.retain(|row| {
+                contains_ignore_case(&row.name, query) || contains_ignore_case(&row.jid, query)
+            });
+            rows
+        };
         chat_row::disambiguate_names(&mut rows);
         let rows: Arc<[ChatRow]> = rows.into();
 
@@ -1661,6 +1671,39 @@ impl WhatsAppApp {
             return;
         }
         self.chat_filter = filter;
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
+    /// Toggle the selected community when the chat list (not its search
+    /// input) owns focus. This keeps the disclosure action keyboard reachable
+    /// without turning a typed space into a list command.
+    pub fn toggle_selected_community(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search_input = self.search.read(cx).list_input().cloned();
+        if search_input.is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window)) {
+            return;
+        }
+        let jid = {
+            let cache = self.chat_list_cache.borrow();
+            let Some(cache) = cache.as_ref() else {
+                return;
+            };
+            let Some(selected) = self.chat_list_selection_jid(cache) else {
+                return;
+            };
+            let Some(jid) = chats::selected_community_toggle(&cache.rows, &selected) else {
+                return;
+            };
+            jid
+        };
+        self.toggle_community(&jid, cx);
+    }
+
+    /// Expand or collapse a community by its stable JID.
+    pub fn toggle_community(&mut self, jid: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_communities.remove(jid) {
+            self.collapsed_communities.insert(jid.to_string());
+        }
         self.invalidate_chat_cache();
         cx.notify();
     }
@@ -2174,6 +2217,7 @@ impl WhatsAppApp {
         // [`plugins_ctl::Plugins::forget`].
         self.plugins.update(cx, |plugins, cx| plugins.forget(cx));
         self.chats.clear();
+        self.collapsed_communities.clear();
         self.selected_chat = None;
         self.visible_chat = None;
         self.retained_chat = None;
@@ -2665,10 +2709,10 @@ impl WhatsAppApp {
             return;
         }
 
-        let current_index = self
-            .selected_chat
-            .as_ref()
-            .and_then(|jid| cache.rows.iter().position(|row| &row.jid == jid));
+        let selected_row = self.chat_list_selection_jid(&cache);
+        let current_index = selected_row
+            .as_deref()
+            .and_then(|jid| cache.rows.iter().position(|row| row.jid == jid));
 
         let next_index = match current_index {
             Some(idx) if idx + 1 < cache.rows.len() => idx + 1,
@@ -2689,10 +2733,10 @@ impl WhatsAppApp {
             return;
         }
 
-        let current_index = self
-            .selected_chat
-            .as_ref()
-            .and_then(|jid| cache.rows.iter().position(|row| &row.jid == jid));
+        let selected_row = self.chat_list_selection_jid(&cache);
+        let current_index = selected_row
+            .as_deref()
+            .and_then(|jid| cache.rows.iter().position(|row| row.jid == jid));
 
         let prev_index = match current_index {
             Some(idx) if idx > 0 => idx - 1,

@@ -87,9 +87,11 @@ pub fn render_connected_view(
     let viewer_focus = app.viewer_focus(cx).clone();
     let media = app.media_cache();
 
+    let chat_list_cache = app.get_chat_list_cache(cx);
+    let list_selected_jid = app.chat_list_selection_jid(&chat_list_cache);
     let list_props = ChatListProps {
-        cache: app.get_chat_list_cache(cx),
-        selected_jid: selected_jid.clone(),
+        cache: chat_list_cache,
+        selected_jid: list_selected_jid,
         filter: app.chat_filter(),
         unread_count: app.unread_chat_count(),
         is_searching: app.is_searching(cx),

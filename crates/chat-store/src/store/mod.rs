@@ -14,6 +14,7 @@ mod chat_rows;
 mod contacts;
 mod edit;
 mod event;
+mod group_hierarchy;
 mod history_sync;
 mod inbound;
 pub(crate) mod message_identity;
@@ -45,7 +46,7 @@ use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
 use crate::error::db_err;
 use crate::error::{ChatStoreError, Result};
 use crate::materialize::{extract_text, message_kind};
-use crate::types::{ChatNameWrite, StoreChange};
+use crate::types::{ChatNameWrite, GroupHierarchyWrite, StoreChange};
 
 // Reachable at the paths they had while this was one file, so the rest of the
 // crate names them the same way.
@@ -103,6 +104,8 @@ pub(crate) enum WriterMsg {
     /// name is news — like the group-subject arm — so a pass that learned
     /// nothing broadcasts nothing and the debounced reload stays quiet.
     ChatNames(Vec<ChatNameWrite>),
+    /// Authoritative, typed community relationships read from group overviews.
+    GroupHierarchies(Vec<GroupHierarchyWrite>),
     SendFailed {
         chat: Jid,
         msg_id: String,
@@ -783,6 +786,20 @@ impl ChatStore {
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
+    /// Apply a batch of authoritative group hierarchy results.
+    ///
+    /// Each write compares against the hierarchy observed before its lookup.
+    /// A changed hierarchy is persisted atomically and invalidates the chat
+    /// list; unknown or stale results never clear an existing relationship.
+    pub fn apply_group_hierarchies(&self, writes: Vec<GroupHierarchyWrite>) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::GroupHierarchies(writes))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
     /// Wait until every write enqueued before this call is committed. Errors
     /// with [`ChatStoreError::WriteBatchFailed`] when any batch since the
     /// previous flush answer rolled back. The contract is TEMPORAL, not
@@ -894,9 +911,20 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // Revert the newest chat-name provenance migration first, then the
-        // pending-alias queue, classifier metadata, and identity-repair state
-        // before the older tested migration edges.
+        // The typed hierarchy column is followed by chat-name provenance,
+        // then the pending-alias queue, classifier metadata, and identity-
+        // repair state before the older tested migration edges.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("community-hierarchy downgrade is reversible");
+        assert!(!has_column(&store, "chats", "group_hierarchy").await);
+
         store
             .shared()
             .run(|conn| {

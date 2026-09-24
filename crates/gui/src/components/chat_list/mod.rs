@@ -16,7 +16,9 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _, VirtualListScrollHandle};
 use gpui_component::{scroll::Scrollbar, v_virtual_list};
 
-use crate::app::{ChatFilter, ChatListCache, SelectDown, SelectUp, WhatsAppApp};
+use crate::app::{
+    ChatFilter, ChatListCache, SelectDown, SelectUp, ToggleSelectedCommunity, WhatsAppApp,
+};
 use crate::components::parts;
 use crate::components::{EmptyState, render_chat_item};
 use crate::responsive::ResponsiveLayout;
@@ -86,6 +88,7 @@ pub fn render_chat_list(
     let metrics = *layout.metrics();
     let entity_for_up = entity.clone();
     let entity_for_down = entity.clone();
+    let entity_for_toggle = entity.clone();
 
     let base = if layout.is_mobile() {
         div().w_full()
@@ -101,6 +104,9 @@ pub fn render_chat_list(
         })
         .on_action(move |_: &SelectDown, window, cx| {
             entity_for_down.update(cx, |app, cx| app.select_next_chat(window, cx));
+        })
+        .on_action(move |_: &ToggleSelectedCommunity, window, cx| {
+            entity_for_toggle.update(cx, |app, cx| app.toggle_selected_community(window, cx));
         })
         .flex()
         .flex_col()
@@ -399,6 +405,17 @@ fn render_account(account: AccountSummary, metrics: Metrics, cx: &App) -> impl I
 mod tests {
     use super::*;
     use gpui::px;
+
+    #[test]
+    fn the_space_toggle_binding_excludes_the_search_input_context() {
+        let predicate = gpui::KeyBindingContextPredicate::parse("ChatList && !Input")
+            .expect("valid list-only key context");
+        let list = gpui::KeyContext::try_from("ChatList").expect("chat-list context");
+        let input = gpui::KeyContext::try_from("Input").expect("input context");
+
+        assert!(predicate.depth_of(std::slice::from_ref(&list)).is_some());
+        assert!(predicate.depth_of(&[list, input]).is_none());
+    }
 
     /// One entry per loaded conversation, rebuilt for every frame that draws
     /// a dozen rows. The sizes move when the geometry does and not otherwise.

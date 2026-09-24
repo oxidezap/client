@@ -2041,6 +2041,35 @@ async fn a_scoped_load_skips_an_archived_chat() {
 }
 
 #[tokio::test]
+async fn history_hydration_carries_persisted_group_hierarchy_to_core_chat() {
+    let (chat_store, client) = test_session("group-hierarchy-hydration").await;
+    let hierarchy = oxidezap_core::GroupHierarchy::Subgroup {
+        parent_jid: "120363000000000009@g.us".into(),
+        kind: oxidezap_core::SubgroupKind::General,
+    };
+    let entry = ChatEntry {
+        jid: "120363000000000001@g.us".parse().expect("group JID"),
+        name: Some("General".into()),
+        last_message_at: None,
+        last_message_preview: None,
+        last_message_kind: None,
+        unread_count: 0,
+        pinned_at: None,
+        muted_until: None,
+        archived: false,
+        ephemeral_expiration: None,
+        group_hierarchy: Some(hierarchy.clone()),
+        group_hierarchy_json: None,
+    };
+
+    let chats = WhatsAppClient::hydrate_entries(&chat_store, &client, &book(), vec![entry], |_| 0)
+        .await
+        .expect("history hydrates");
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].group_hierarchy, Some(hierarchy));
+}
+
+#[tokio::test]
 async fn alias_hydration_is_archived_only_when_both_rows_are_archived() {
     let (chat_store, client) = test_session("archive-aliases").await;
     let pn = "559900000008@s.whatsapp.net";
@@ -2065,6 +2094,8 @@ async fn alias_hydration_is_archived_only_when_both_rows_are_archived() {
         muted_until: None,
         archived,
         ephemeral_expiration: None,
+        group_hierarchy: None,
+        group_hierarchy_json: None,
     };
     for (first, second, expected) in [
         (true, false, false),
@@ -2356,6 +2387,8 @@ fn a_chat_cursor_keeps_an_address_with_a_colon_in_it() {
         muted_until: None,
         archived: false,
         ephemeral_expiration: None,
+        group_hierarchy: None,
+        group_hierarchy_json: None,
     };
     let token = chat_cursor(&entry);
     assert_eq!(

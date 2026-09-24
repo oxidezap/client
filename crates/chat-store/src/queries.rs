@@ -173,10 +173,12 @@ struct ChatRow {
     name_from_address_book: bool,
     #[allow(dead_code)]
     address_book_fallback: Option<String>,
+    group_hierarchy: Option<String>,
 }
 
 impl From<ChatRow> for ChatEntry {
     fn from(row: ChatRow) -> Self {
+        let group_hierarchy_json = row.group_hierarchy;
         ChatEntry {
             jid: parse_jid(&row.jid),
             name: row.name,
@@ -199,6 +201,10 @@ impl From<ChatRow> for ChatEntry {
             }),
             archived: row.archived,
             ephemeral_expiration: row.ephemeral_expiration.map(|e| e as u32),
+            group_hierarchy: group_hierarchy_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok()),
+            group_hierarchy_json,
         }
     }
 }
@@ -725,28 +731,33 @@ impl ChatStore {
     /// like avatar bytes, so an account with more chats than any page holds
     /// still revalidates all of them. Archived chats are included — the
     /// archived list draws them with the same fallback — and the answer is
-    /// the stored JID plus the stored name (or lack of one), which is
-    /// exactly what the pass's CAS writes compare against.
+    /// the stored JID, name and exact hierarchy JSON (or their absence), which
+    /// are the resolver's compare-and-swap expectations. Keeping the raw value
+    /// lets a fresh answer replace metadata this client cannot decode.
     ///
     /// One statement in practice: the two domain suffixes are SQL `LIKE`
     /// predicates, not a bound list of JIDs.
-    pub async fn special_chat_names(&self) -> Result<Vec<(Jid, Option<String>)>> {
+    pub async fn special_chat_names(&self) -> Result<Vec<(Jid, Option<String>, Option<String>)>> {
         use schema::chats::dsl;
         let device_id = self.device_id();
-        let rows: Vec<(String, Option<String>)> = self
+        let rows: Vec<(String, Option<String>, Option<String>)> = self
             .db()
             .read(move |conn| {
                 dsl::chats
                     .filter(dsl::device_id.eq(device_id))
                     .filter(dsl::jid.like("%@g.us").or(dsl::jid.like("%@newsletter")))
-                    .select((dsl::jid, dsl::name))
+                    .select((dsl::jid, dsl::name, dsl::group_hierarchy))
                     .load(conn)
                     .map_err(db_err)
             })
             .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(jid, name)| jid.parse::<Jid>().ok().map(|jid| (jid, name)))
+            .filter_map(|(jid, name, hierarchy_json)| {
+                jid.parse::<Jid>()
+                    .ok()
+                    .map(|jid| (jid, name, hierarchy_json))
+            })
             .collect())
     }
 

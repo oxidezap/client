@@ -329,6 +329,7 @@ impl Bridge {
                     manually_unread: false,
                     last_message: None,
                     pinned_at_ms: None,
+                    group_hierarchy: None,
                 });
                 if let Some(name) = durable_name {
                     summary.name = name;
@@ -513,6 +514,7 @@ pub(super) fn chat_updated(chat: &Chat, reads: &mut ReadTracker) -> Change {
         unread: chat.unread_count,
         manually_unread: chat.manually_unread,
         pinned_at_ms: chat.pinned_at.map(|t| t.timestamp_millis()),
+        group_hierarchy: chat.group_hierarchy.clone(),
         last_message: chat.last_message.as_ref().map(|text| MessagePreview {
             id: newest.map(|m| m.id.clone()),
             text: text.clone(),

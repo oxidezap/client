@@ -329,6 +329,7 @@ mod tests {
                 manually_unread: false,
                 last_message: None,
                 pinned_at_ms: None,
+                group_hierarchy: None,
             })),
         })
         .unwrap();
