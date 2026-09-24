@@ -537,7 +537,7 @@ mod tests {
         (selected, cx.read_from_clipboard(), cx.opened_url())
     }
 
-    fn click_text(source: &'static str, x: Option<f32>, cx: &mut TestAppContext) -> Option<String> {
+    fn click_text(source: &'static str, x: f32, cx: &mut TestAppContext) -> Option<String> {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
@@ -558,10 +558,6 @@ mod tests {
             visual.update(|window, cx| {
                 window.draw(cx).clear(cx);
                 focus_handle.as_ref().unwrap().focus(window, cx);
-            });
-            let x = x.unwrap_or_else(|| {
-                let bounds = visual.debug_bounds("message-text").unwrap();
-                f32::from(bounds.right() - px(1.))
             });
             visual.simulate_mouse_down(
                 point(px(x), px(12.)),
@@ -671,15 +667,7 @@ mod tests {
     #[gpui::test]
     fn clicking_a_message_link_still_opens_it(cx: &mut TestAppContext) {
         assert_eq!(
-            click_text("alpha https://example.invalid", Some(80.), cx).as_deref(),
-            Some("https://example.invalid")
-        );
-    }
-
-    #[gpui::test]
-    fn clicking_the_trailing_edge_of_a_link_still_opens_it(cx: &mut TestAppContext) {
-        assert_eq!(
-            click_text("https://example.invalid", None, cx).as_deref(),
+            click_text("alpha https://example.invalid", 80., cx).as_deref(),
             Some("https://example.invalid")
         );
     }

@@ -383,17 +383,25 @@ fn link_at_position(
     let index = match layout.index_for_position(position) {
         Ok(index) | Err(index) => index,
     };
+    link_index_at_position(index, links, |range| {
+        selection_quad_bounds(text, range.clone(), layout, window)
+            .iter()
+            .any(|bounds| {
+                position.x >= bounds.left()
+                    && position.x <= bounds.right()
+                    && position.y >= bounds.top()
+                    && position.y <= bounds.bottom()
+            })
+    })
+}
+
+fn link_index_at_position(
+    index: usize,
+    links: &[Range<usize>],
+    end_range_contains_pointer: impl Fn(&Range<usize>) -> bool,
+) -> Option<usize> {
     if let Some(link_ix) = links.iter().position(|range| {
-        range.end == index
-            && !range.is_empty()
-            && selection_quad_bounds(text, range.clone(), layout, window)
-                .iter()
-                .any(|bounds| {
-                    position.x >= bounds.left()
-                        && position.x <= bounds.right()
-                        && position.y >= bounds.top()
-                        && position.y <= bounds.bottom()
-                })
+        range.end == index && !range.is_empty() && end_range_contains_pointer(range)
     }) {
         return Some(link_ix);
     }
@@ -697,7 +705,10 @@ impl Element for SelectableRichText {
 mod tests {
     use gpui::{Bounds, point, px};
 
-    use super::{hard_break_selection_bounds, merge_selection_fragments, selection_glyph_bounds};
+    use super::{
+        hard_break_selection_bounds, link_index_at_position, merge_selection_fragments,
+        selection_glyph_bounds,
+    };
 
     #[test]
     fn bidi_selection_fragments_merge_in_visual_order_without_bridging_runs() {
@@ -742,6 +753,14 @@ mod tests {
                 Bounds::from_corners(point(px(60.), px(20.)), point(px(70.), px(40.))),
             ]
         );
+    }
+
+    #[test]
+    fn exclusive_link_end_requires_a_hit_on_the_final_glyph() {
+        let links = [0..4, 4..8];
+        assert_eq!(link_index_at_position(4, &links, |_| false), Some(1));
+        assert_eq!(link_index_at_position(8, &links, |_| false), None);
+        assert_eq!(link_index_at_position(8, &links, |_| true), Some(1));
     }
 
     #[test]
