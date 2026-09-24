@@ -4348,6 +4348,76 @@ mod tests {
     }
 
     #[gpui::test]
+    fn repeated_cache_misses_preserve_unchanged_message_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let jid = "peer@example.invalid";
+        let mut focus_handle = None;
+        let mut app_entity = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                let mut chat = Chat::new(jid.to_string());
+                chat.messages.push(ChatMessage::new_incoming(
+                    "test-message".into(),
+                    jid.into(),
+                    "alpha beta".into(),
+                ));
+                app.chats.push(Arc::new(chat));
+                app.selected_chat = Some(jid.to_string());
+                app
+            });
+            app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+            app_entity = Some(app);
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                SelectionExitTestView {
+                    focus_handle: handle,
+                    selection_key: Arc::from("test-message"),
+                }
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            gpui::point(gpui::px(1.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+            "alpha "
+        );
+
+        app_entity.unwrap().update(cx, |app, cx| {
+            // Model the call-history path: two updates before another list
+            // frame leaves the render cache absent both times.
+            app.invalidate_message_cache(jid, cx);
+            app.invalidate_message_cache(jid, cx);
+        });
+        assert_eq!(
+            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+            "alpha "
+        );
+    }
+
+    #[gpui::test]
     fn leaving_connected_view_clears_selected_message_text(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
