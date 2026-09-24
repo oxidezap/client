@@ -37,6 +37,9 @@ pub fn save(file_name: &str, data: &[u8]) -> Result<DownloadOutcome, String> {
 /// carrying a `cfg` of their own.
 pub const SAVES_OFF_THREAD: bool = cfg!(not(target_family = "wasm"));
 
+/// Whether this platform can act on a returned local path.
+pub const SUPPORTS_SAVED_FILE_ACTIONS: bool = cfg!(not(target_family = "wasm"));
+
 #[cfg(not(target_family = "wasm"))]
 mod imp {
     use std::io::Write as _;
@@ -246,7 +249,7 @@ mod imp {
     /// browser to its own blob and loses often enough to land a zero-byte
     /// file. The timer is the whole fix, and a leaked URL costs one blob until
     /// the tab goes.
-    pub(super) fn save(file_name: &str, data: &[u8]) -> Result<String, String> {
+    pub(super) fn save(file_name: &str, data: &[u8]) -> Result<super::DownloadOutcome, String> {
         let window = web_sys::window().ok_or("no window to save from")?;
         let document = window.document().ok_or("no document to save from")?;
         // Before the blob, because a failure after one is a blob the browser

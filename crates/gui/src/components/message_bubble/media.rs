@@ -612,6 +612,7 @@ fn render_document_placeholder(
                 .file_name
                 .unwrap_or_else(|| "document".to_string());
             let save_entity = entity.clone();
+            let save_id = message_id.clone();
             let row = row.child(
                 parts::icon_button(
                     SharedString::from(format!("save-{message_id}")),
@@ -622,7 +623,7 @@ fn render_document_placeholder(
                 .disabled(is_downloading)
                 .when(!is_downloading, |button| button.cursor_pointer())
                 .on_click(move |_, _window, cx| {
-                    let msg_id = message_id.clone();
+                    let msg_id = save_id.clone();
                     let name = file_name.clone();
                     let dl = dl.clone();
                     save_entity.update(cx, |app, cx| {
@@ -630,9 +631,8 @@ fn render_document_placeholder(
                     });
                 }),
             );
-            #[cfg(not(target_family = "wasm"))]
-            let row = if let Some(path) = saved_document_path {
-                if path.is_file() {
+            let row = if crate::platform::download::SUPPORTS_SAVED_FILE_ACTIONS {
+                if saved_document_path.is_some() {
                     let id = message_id.clone();
                     let open_entity = entity.clone();
                     let open = parts::icon_button(

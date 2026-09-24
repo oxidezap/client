@@ -644,8 +644,8 @@ impl WhatsAppApp {
                     Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
                         let display = path.display().to_string();
                         let _ = entity.update(cx, |app, cx| {
-                            if app.document_scope(&message_id).as_ref() == Some(&expected_scope) {
-                                app.saved_documents.insert(expected_scope, path);
+                            if app.account_scope() == expected_scope.0.as_str() {
+                                app.saved_documents.insert(expected_scope.clone(), path);
                                 cx.notify();
                             }
                         });
@@ -679,13 +679,20 @@ impl WhatsAppApp {
     }
     /// Identity tuple for a document operation; a message id alone is not
     /// unique across accounts or conversations.
-    fn document_scope(&self, message_id: &str) -> Option<(String, String, String)> {
-        let account = format!(
+    fn account_scope(&self) -> String {
+        format!(
             "{}|{}",
             self.account_jid.as_deref().unwrap_or(""),
             self.account_lid.as_deref().unwrap_or("")
-        );
-        Some((account, self.selected_chat.clone()?, message_id.to_owned()))
+        )
+    }
+
+    fn document_scope(&self, message_id: &str) -> Option<(String, String, String)> {
+        Some(document_scope_key(
+            &self.account_scope(),
+            self.selected_chat.as_deref()?,
+            message_id,
+        ))
     }
 
     /// Whether this document is being saved in the current account/chat.
@@ -1261,6 +1268,32 @@ impl WhatsAppApp {
         .detach();
 
         cx.notify();
+    }
+}
+
+fn document_scope_key(account: &str, chat: &str, message_id: &str) -> (String, String, String) {
+    (account.to_owned(), chat.to_owned(), message_id.to_owned())
+}
+
+#[cfg(test)]
+mod document_scope_tests {
+    use super::document_scope_key;
+
+    #[test]
+    fn regression_193_same_message_id_isolated_by_account_and_chat() {
+        let first = document_scope_key("account-a", "chat-a", "message-1");
+        assert_ne!(
+            first,
+            document_scope_key("account-b", "chat-a", "message-1")
+        );
+        assert_ne!(
+            first,
+            document_scope_key("account-a", "chat-b", "message-1")
+        );
+        assert_eq!(
+            first,
+            document_scope_key("account-a", "chat-a", "message-1")
+        );
     }
 }
 
