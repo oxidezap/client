@@ -4435,7 +4435,7 @@ mod tests {
         let mut focus_handle = None;
         let mut app_entity = None;
         let (_, visual) = cx.add_window_view(|window, cx| {
-            let app = cx.new(|cx| WhatsAppApp::new(cx));
+            let app = cx.new(WhatsAppApp::new);
             app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
             app_entity = Some(app);
             let view = cx.new(|cx| {
