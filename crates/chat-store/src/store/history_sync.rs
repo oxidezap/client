@@ -80,7 +80,7 @@ fn apply_history_conversation(
             .or(conv.username.as_deref())
             .filter(|name| !name.trim().is_empty());
         let address_book_name = (!removed)
-            .then(|| conv.name.as_deref())
+            .then_some(conv.name.as_deref())
             .flatten()
             .filter(|name| !name.trim().is_empty());
         let name = address_book_name.or(independent_name);
