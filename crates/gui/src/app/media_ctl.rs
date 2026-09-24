@@ -678,7 +678,12 @@ impl WhatsAppApp {
                                         expected_generation,
                                         &expected_scope.0,
                                     ) {
-                                        app.saved_documents.insert(expected_scope.clone(), path);
+                                        let scope = (
+                                            app.account_scope(),
+                                            expected_scope.1.clone(),
+                                            expected_scope.2.clone(),
+                                        );
+                                        app.saved_documents.insert(scope, path);
                                         cx.notify();
                                     }
                                 });
@@ -1360,14 +1365,15 @@ fn say_if_document_current(
     });
 }
 
-/// Compare both session epoch and account identity for an in-flight document operation.
+/// Compare the epoch and known account identity; an unset identity may hydrate within its epoch.
 fn document_state_matches(
     current_generation: u64,
     current_account: &str,
     expected_generation: u64,
     expected_account: &str,
 ) -> bool {
-    current_generation == expected_generation && current_account == expected_account
+    current_generation == expected_generation
+        && (current_account == expected_account || expected_account == "|")
 }
 
 /// Put a failure in front of the person who asked for it.
@@ -1461,6 +1467,18 @@ mod document_scope_tests {
             })
             .await;
             assert!(switched_account.is_none());
+
+            // The daemon can publish Connected before account metadata. Let
+            // that same session's initial identity hydrate without dropping
+            // its download; saved paths are keyed under the current identity.
+            let hydrated_account = handoff_if_current(4, "account-a", 4, "|", async {
+                std::path::PathBuf::from("hydrated-session.pdf")
+            })
+            .await;
+            assert_eq!(
+                hydrated_account,
+                Some(std::path::PathBuf::from("hydrated-session.pdf"))
+            );
         });
     }
 
