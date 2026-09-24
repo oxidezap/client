@@ -198,6 +198,7 @@ impl EventHandler for ChatStoreHandler {
             EventKind::UndecryptableMessage,
             EventKind::HistorySync,
             EventKind::ContactUpdate,
+            EventKind::ContactRemoved,
             EventKind::PinUpdate,
             EventKind::MuteUpdate,
             EventKind::ArchiveUpdate,
@@ -804,8 +805,22 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // Revert the pending-alias queue before its repair-state table; both
-        // are newer than the older migration edges checked below.
+        // Revert the newest chat-name provenance migration, then the newer
+        // identity-repair migrations before stepping back through preference
+        // provenance to the historical account-cascade assertions.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("chat-name-provenance downgrade is reversible");
+        assert!(!has_column(&store, "chats", "name_from_address_book").await);
+        assert!(!has_column(&store, "chats", "address_book_fallback").await);
+        assert!(!has_table(&store, "contact_name_removals").await);
+
         store
             .shared()
             .run(|conn| {
@@ -829,9 +844,6 @@ mod migration_tests {
             .expect("identity-repair marker downgrade is reversible");
         assert!(!has_table(&store, "message_identity_repair_state").await);
 
-        // The current top migration now tracks which source last supplied
-        // mute/archive preferences. Revert it first so the historical
-        // downgrade assertions below still start at account-cascade.
         store
             .shared()
             .run(|conn| {

@@ -169,6 +169,10 @@ struct ChatRow {
     mute_appstate_seen: bool,
     #[allow(dead_code)]
     archive_appstate_seen: bool,
+    #[allow(dead_code)]
+    name_from_address_book: bool,
+    #[allow(dead_code)]
+    address_book_fallback: Option<String>,
 }
 
 impl From<ChatRow> for ChatEntry {

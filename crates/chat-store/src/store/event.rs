@@ -14,7 +14,10 @@ use crate::store::chat_rows::{
     ChatBump, bump_chat, chat_row, delete_chat_rows, ensure_chat, recompute_chat_preview,
     remaining_messages,
 };
-use crate::store::contacts::upsert_contact_names;
+use crate::store::contacts::{
+    clear_contact_names, clear_contact_removal_tombstones, update_address_book_chat_names,
+    upsert_contact_names,
+};
 use crate::store::history_sync::apply_history_sync;
 use crate::store::inbound::apply_inbound;
 use crate::store::message_identity::resolve_target;
@@ -93,6 +96,7 @@ pub(super) fn apply_event(
         }
         Event::HistorySync(lazy) => apply_history_sync(conn, device_id, lazy, cs),
         Event::ContactUpdate(update) => {
+            clear_contact_removal_tombstones(conn, device_id, &update.jid.to_string())?;
             upsert_contact_names(
                 conn,
                 device_id,
@@ -100,7 +104,21 @@ pub(super) fn apply_event(
                 update.action.full_name.as_deref(),
                 update.action.first_name.as_deref(),
             )?;
+            cs.chats |= update_address_book_chat_names(
+                conn,
+                device_id,
+                &update.jid.to_string(),
+                update.action.full_name.as_deref(),
+                update.action.first_name.as_deref(),
+            )?;
             cs.contacts = true;
+            Ok(())
+        }
+        Event::ContactRemoved(removed) => {
+            let (contacts_changed, chats_changed) =
+                clear_contact_names(conn, device_id, &removed.jid.to_string())?;
+            cs.contacts |= contacts_changed;
+            cs.chats |= chats_changed;
             Ok(())
         }
         // A group renamed is a fact about the chat row, not only a sentence
@@ -128,7 +146,11 @@ pub(super) fn apply_event(
                 return Ok(());
             }
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::name.eq(subject))
+                .set((
+                    schema::chats::name.eq(subject),
+                    schema::chats::name_from_address_book.eq(false),
+                    schema::chats::address_book_fallback.eq(None::<String>),
+                ))
                 .execute(conn)?;
             cs.chats = true;
             Ok(())
