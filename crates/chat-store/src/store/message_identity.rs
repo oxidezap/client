@@ -626,6 +626,7 @@ fn reconcile_groups(
                 diesel::update(dsl::messages.filter(dsl::id.eq(cluster[0].id)))
                     .set(dsl::sender_jid.eq(""))
                     .execute(conn)?;
+                changed_chats.insert(group.chat_jid.clone());
             }
         }
     }

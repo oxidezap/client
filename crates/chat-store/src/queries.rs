@@ -256,14 +256,13 @@ fn fold_read_duplicate(
         None
     } else {
         edited.map(|(row, _)| row).or_else(|| {
-            let stable = if held_is_survivor { &held } else { &incoming };
-            if stable.text_content.is_some() || stable.proto.is_some() {
-                Some(stable)
-            } else if held.text_content.is_some() || held.proto.is_some() {
-                Some(&held)
-            } else {
-                Some(&incoming)
-            }
+            [&held, &incoming].into_iter().max_by_key(|row| {
+                (
+                    row.text_content.is_some(),
+                    row.proto.is_some(),
+                    std::cmp::Reverse(row.id),
+                )
+            })
         })
     };
     let status = if MessageStatus::from_raw(incoming.status)

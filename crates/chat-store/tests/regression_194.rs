@@ -759,7 +759,7 @@ async fn alias_read_folds_recovered_kind_and_keeps_pages_ordered_after_repair() 
         .shared()
         .run(|conn| {
             diesel::sql_query(
-                "UPDATE messages SET kind = 'unknown', text_content = NULL, proto = NULL \
+                "UPDATE messages SET kind = 'unknown', text_content = NULL \
                  WHERE msg_id = 'MSG-194-ORDER' AND chat_jid = ? AND sender_jid = ?",
             )
             .bind::<diesel::sql_types::Text, _>(GROUP)
@@ -903,6 +903,54 @@ async fn skipped_redelivery_emits_invalidations_when_it_repairs_legacy_rows() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn explicit_repair_invalidates_lone_own_sender_normalization() {
+    let (store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("own message"),
+            own_info(GROUP, "MSG-194-OWN-NORMALIZE", 1_700_000_000),
+        )],
+    )
+    .await;
+    let device_id = store.device_id();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(
+                "UPDATE messages SET sender_jid = ? \
+                 WHERE device_id = ? AND chat_jid = ? AND msg_id = ? AND from_me = TRUE",
+            )
+            .bind::<diesel::sql_types::Text, _>(PEER)
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>(GROUP)
+            .bind::<diesel::sql_types::Text, _>("MSG-194-OWN-NORMALIZE")
+            .execute(conn)
+            .map(|_| ())
+            .map_err(db_err)
+        })
+        .await
+        .unwrap();
+
+    let mut changes = chat_store.subscribe();
+    chat_store.reconcile_chat(&jid(GROUP)).unwrap();
+    chat_store.flush().await.unwrap();
+    let mut chats = false;
+    let mut messages = false;
+    while !chats || !messages {
+        match tokio::time::timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .expect("own-sender normalization invalidates subscribers")
+            .expect("change sender remains open")
+        {
+            StoreChange::Chats => chats = true,
+            StoreChange::Messages { chat } if chat == jid(GROUP) => messages = true,
+            other => panic!("unexpected invalidation: {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
