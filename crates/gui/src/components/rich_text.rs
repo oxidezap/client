@@ -564,8 +564,13 @@ mod tests {
                 MouseButton::Left,
                 Modifiers::default(),
             );
+            visual.simulate_mouse_move(
+                point(px(x + 1.), px(12.)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
             // The press requests a repaint; link activation must survive the
-            // fresh element built before the release arrives.
+            // fresh element built before release and tolerate one-pixel jitter.
             visual.update(|window, cx| window.draw(cx).clear(cx));
             visual.simulate_mouse_up(
                 point(px(x), px(12.)),

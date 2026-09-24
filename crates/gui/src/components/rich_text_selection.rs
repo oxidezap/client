@@ -178,17 +178,12 @@ impl SelectableRichText {
 
     fn paint_selection(
         layout: &gpui::TextLayout,
+        text: &str,
         range: Range<usize>,
         color: gpui::Hsla,
         window: &mut Window,
     ) {
-        let (Some(start), Some(end)) = (
-            layout.position_for_index(range.start),
-            layout.position_for_index(range.end),
-        ) else {
-            return;
-        };
-        for bounds in selection_quad_bounds(start, end, layout.bounds(), layout.line_height()) {
+        for bounds in selection_quad_bounds(text, range, layout) {
             window.paint_quad(PaintQuad {
                 bounds,
                 background: color.into(),
@@ -202,33 +197,87 @@ impl SelectableRichText {
 }
 
 fn selection_quad_bounds(
-    start: Point<Pixels>,
-    end: Point<Pixels>,
-    bounds: Bounds<Pixels>,
-    line_height: Pixels,
+    text: &str,
+    range: Range<usize>,
+    layout: &gpui::TextLayout,
 ) -> Vec<Bounds<Pixels>> {
-    if start.y == end.y {
-        return vec![Bounds::from_corners(
-            start,
-            Point::new(end.x, end.y + line_height),
-        )];
+    let bounds = layout.bounds();
+    let line_height = layout.line_height();
+    let mut fragments = Vec::new();
+    for (offset, character) in text[range.clone()].char_indices() {
+        let start_ix = range.start + offset;
+        let end_ix = start_ix + character.len_utf8();
+        let (Some(start), Some(end)) = (
+            layout.position_for_index(start_ix),
+            layout.position_for_index(end_ix),
+        ) else {
+            continue;
+        };
+        if start.y == end.y {
+            let (left, right) = if start.x <= end.x {
+                (start.x, end.x)
+            } else {
+                (end.x, start.x)
+            };
+            if left < right {
+                fragments.push(Bounds::from_corners(
+                    Point::new(left, start.y),
+                    Point::new(right, start.y + line_height),
+                ));
+            }
+        } else {
+            // A hard line break has no glyph on the next line. Extend its
+            // selection to the visual end of the line, which is the nearer
+            // edge for both LTR and RTL paragraphs.
+            let line_edge = if start.x - bounds.left() > bounds.right() - start.x {
+                bounds.right()
+            } else {
+                bounds.left()
+            };
+            let (left, right) = if start.x <= line_edge {
+                (start.x, line_edge)
+            } else {
+                (line_edge, start.x)
+            };
+            if left < right {
+                fragments.push(Bounds::from_corners(
+                    Point::new(left, start.y),
+                    Point::new(right, start.y + line_height),
+                ));
+            }
+        }
     }
 
-    let mut quads = vec![Bounds::from_corners(
-        start,
-        Point::new(bounds.right(), start.y + line_height),
-    )];
-    if end.y > start.y + line_height {
-        quads.push(Bounds::from_corners(
-            Point::new(bounds.left(), start.y + line_height),
-            Point::new(bounds.right(), end.y),
-        ));
+    merge_selection_fragments(fragments)
+}
+
+fn merge_selection_fragments(mut fragments: Vec<Bounds<Pixels>>) -> Vec<Bounds<Pixels>> {
+    fragments.sort_by(|left, right| {
+        left.origin
+            .y
+            .partial_cmp(&right.origin.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.origin
+                    .x
+                    .partial_cmp(&right.origin.x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let mut merged: Vec<Bounds<Pixels>> = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        if let Some(previous) = merged.last_mut()
+            && previous.origin.y == fragment.origin.y
+            && fragment.origin.x <= previous.right()
+        {
+            if fragment.right() > previous.right() {
+                previous.size.width = fragment.right() - previous.origin.x;
+            }
+        } else {
+            merged.push(fragment);
+        }
     }
-    quads.push(Bounds::from_corners(
-        Point::new(bounds.left(), end.y),
-        Point::new(end.x, end.y + line_height),
-    ));
-    quads
+    merged
 }
 
 impl IntoElement for SelectableRichText {
@@ -339,7 +388,7 @@ impl Element for SelectableRichText {
         }
         let selection_color = cx.theme().selection;
         for range in projection.ranges().iter().flatten().cloned() {
-            Self::paint_selection(&layout, range, selection_color, window);
+            Self::paint_selection(&layout, &self.text, range, selection_color, window);
         }
         self.styled_text.paint(
             global_id,
@@ -387,12 +436,14 @@ impl Element for SelectableRichText {
             }
         });
         let move_state = Rc::clone(&down_state);
+        let drag_slop = window.rem_size() * 0.2;
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, _cx| {
             if !phase.bubble() || event.pressed_button != Some(MouseButton::Left) {
                 return;
             }
             if let Some(mut press) = move_state.get()
-                && event.position != press.origin
+                && ((event.position.x - press.origin.x).abs() > drag_slop
+                    || (event.position.y - press.origin.y).abs() > drag_slop)
             {
                 press.dragged = true;
                 move_state.set(Some(press));
@@ -431,26 +482,28 @@ impl Element for SelectableRichText {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Bounds, point, px, size};
+    use gpui::{Bounds, point, px};
 
-    use super::selection_quad_bounds;
+    use super::merge_selection_fragments;
 
     #[test]
-    fn selection_highlight_spans_wrapped_middle_lines() {
-        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(100.)));
-        let quads = selection_quad_bounds(
-            point(px(40.), px(20.)),
-            point(px(30.), px(80.)),
-            bounds,
-            px(20.),
-        );
+    fn bidi_selection_fragments_merge_in_visual_order_without_bridging_runs() {
+        let fragment = |left, top, right, bottom| {
+            Bounds::from_corners(point(px(left), px(top)), point(px(right), px(bottom)))
+        };
+        let quads = merge_selection_fragments(vec![
+            fragment(80., 20., 100., 40.),
+            fragment(30., 20., 45., 40.),
+            fragment(10., 20., 30., 40.),
+            fragment(10., 40., 30., 60.),
+        ]);
 
         assert_eq!(
             quads,
             vec![
-                Bounds::from_corners(point(px(40.), px(20.)), point(px(110.), px(40.))),
-                Bounds::from_corners(point(px(10.), px(40.)), point(px(110.), px(80.))),
-                Bounds::from_corners(point(px(10.), px(80.)), point(px(30.), px(100.))),
+                fragment(10., 20., 45., 40.),
+                fragment(80., 20., 100., 40.),
+                fragment(10., 40., 30., 60.),
             ]
         );
     }
