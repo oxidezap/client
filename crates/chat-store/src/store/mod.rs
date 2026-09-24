@@ -198,6 +198,7 @@ impl EventHandler for ChatStoreHandler {
             EventKind::UndecryptableMessage,
             EventKind::HistorySync,
             EventKind::ContactUpdate,
+            EventKind::ContactRemoved,
             EventKind::PinUpdate,
             EventKind::MuteUpdate,
             EventKind::ArchiveUpdate,
@@ -893,8 +894,22 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // Revert the pending-alias queue first, then the classifier metadata
-        // and identity-repair state migrations above the older tested edges.
+        // Revert the newest chat-name provenance migration first, then the
+        // pending-alias queue, classifier metadata, and identity-repair state
+        // before the older tested migration edges.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("chat-name-provenance downgrade is reversible");
+        assert!(!has_column(&store, "chats", "name_from_address_book").await);
+        assert!(!has_column(&store, "chats", "address_book_fallback").await);
+        assert!(!has_table(&store, "contact_name_removals").await);
+
         store
             .shared()
             .run(|conn| {

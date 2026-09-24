@@ -118,6 +118,9 @@ pub async fn feed(chat_store: &ChatStore, events: impl IntoIterator<Item = Event
     chat_store.flush().await.expect("flush");
 }
 
+// The pinned waproto codec only centralizes `Message` encoding; history sync
+// fixtures have no corresponding helper and must use buffa's encoder directly.
+#[allow(clippy::disallowed_methods)]
 pub fn history_sync_event(history: wa::HistorySync) -> Event {
     use buffa::Message as _;
     use flate2::{Compression, write::ZlibEncoder};

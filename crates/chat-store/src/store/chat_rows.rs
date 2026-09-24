@@ -241,6 +241,8 @@ pub(crate) fn merge_chat_metadata(
         Option<String>,
         bool,
         bool,
+        bool,
+        Option<String>,
     );
     let prefs = |conn: &mut SqliteConnection, key: &str| -> QueryResult<Option<PrefRow>> {
         chat_row(device_id, key)
@@ -254,6 +256,8 @@ pub(crate) fn merge_chat_metadata(
                 dsl::name,
                 dsl::mute_appstate_seen,
                 dsl::archive_appstate_seen,
+                dsl::name_from_address_book,
+                dsl::address_book_fallback,
             ))
             .first(conn)
             .optional()
@@ -263,8 +267,9 @@ pub(crate) fn merge_chat_metadata(
     };
     let src_state = read_state(conn, device_id, src)?;
     ensure_chat(conn, device_id, dest)?;
-    let dest_row =
-        prefs(conn, dest)?.unwrap_or((0, 0, None, None, false, None, None, false, false));
+    let dest_row = prefs(conn, dest)?.unwrap_or((
+        0, 0, None, None, false, None, None, false, false, false, None,
+    ));
     let dest_state = read_state(conn, device_id, dest)?;
 
     let mut merged = ReadState {
@@ -303,6 +308,11 @@ pub(crate) fn merge_chat_metadata(
     } else {
         dest_row.4 || src_row.4
     };
+    let (name, name_from_address_book, address_book_fallback) = if dest_row.6.is_some() {
+        (dest_row.6.clone(), dest_row.9, dest_row.10.clone())
+    } else {
+        (src_row.6.clone(), src_row.9, src_row.10.clone())
+    };
     diesel::update(chat_row(device_id, dest))
         .set((
             dsl::last_message_ts.eq(src_row.0.max(dest_row.0)),
@@ -311,7 +321,9 @@ pub(crate) fn merge_chat_metadata(
             dsl::muted_until.eq(muted_until),
             dsl::archived.eq(archived),
             dsl::ephemeral_expiration.eq(dest_row.5.or(src_row.5)),
-            dsl::name.eq(dest_row.6.or(src_row.6)),
+            dsl::name.eq(name),
+            dsl::name_from_address_book.eq(name_from_address_book),
+            dsl::address_book_fallback.eq(address_book_fallback),
             dsl::mute_appstate_seen.eq(dest_row.7 || src_row.7),
             dsl::archive_appstate_seen.eq(dest_row.8 || src_row.8),
             dsl::read_boundary_ms.eq(merged.watermark_ms),
