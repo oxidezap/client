@@ -262,7 +262,7 @@ impl WhatsAppApp {
         // A selection that no longer names a chat is a selection of nothing:
         // the conversation pane resolves it every frame and would draw the
         // empty state with no way back on a phone.
-        self.forget_missing_selection();
+        self.forget_missing_selection(cx);
         // The merge above took the store's word for every row, and a merge
         // assembled before a view was written does not carry it.
         self.restore_watched_status(watched);

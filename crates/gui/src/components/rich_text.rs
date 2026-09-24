@@ -108,9 +108,14 @@ impl BubbleText {
 ///
 /// Returns an element either way: the caller styles size and colour on the
 /// parent, and both paths inherit it.
-pub fn render_rich_text(parsed: &BubbleText, document_order: u64, cx: &App) -> gpui::AnyElement {
+pub fn render_rich_text(
+    parsed: &BubbleText,
+    selection_key: &str,
+    document_order: u64,
+    cx: &App,
+) -> gpui::AnyElement {
     if !parsed.links.is_empty() {
-        return render_with_links(parsed, document_order, cx).into_any_element();
+        return render_with_links(parsed, selection_key, document_order, cx).into_any_element();
     }
     if parsed.runs.is_empty() {
         // Keep the cheap plain-text layout while registering the same visible
@@ -121,6 +126,7 @@ pub fn render_rich_text(parsed: &BubbleText, document_order: u64, cx: &App) -> g
             StyledText::new(parsed.text.clone()),
             Vec::new(),
             Arc::default(),
+            selection_key,
             document_order,
         )
         .into_any_element();
@@ -186,7 +192,12 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
 /// which is why this needs no platform split of its own: GPUI answers that
 /// on the desktop and in the page alike. Size and colour are inherited from
 /// the parent; only the link ink comes from the theme.
-fn render_with_links(parsed: &BubbleText, document_order: u64, cx: &App) -> SelectableRichText {
+fn render_with_links(
+    parsed: &BubbleText,
+    selection_key: &str,
+    document_order: u64,
+    cx: &App,
+) -> SelectableRichText {
     let metrics = cx.product().metrics;
     let ink = cx.theme().link;
     let mono = cx.theme().mono_font_family.clone();
@@ -259,6 +270,7 @@ fn render_with_links(parsed: &BubbleText, document_order: u64, cx: &App) -> Sele
         styled,
         ranges,
         targets,
+        selection_key,
         document_order,
     )
 }
@@ -465,7 +477,7 @@ mod tests {
                     .id("message-row")
                     .w(px(400.))
                     .h(px(40.))
-                    .child(render_rich_text(&text, 0, cx)),
+                    .child(render_rich_text(&text, "test-message", 0, cx)),
             )
         }
     }
@@ -505,11 +517,7 @@ mod tests {
                 window.draw(cx).clear(cx);
                 gpui_base::TextSelection::selected_text(window, cx)
             });
-            visual.simulate_keystrokes(if cfg!(target_os = "macos") {
-                "cmd-c"
-            } else {
-                "ctrl-c"
-            });
+            visual.dispatch_action(gpui_component::input::Copy);
             selected
         };
         (selected, cx.read_from_clipboard(), cx.opened_url())
@@ -536,6 +544,43 @@ mod tests {
             visual.update(|window, cx| window.draw(cx).clear(cx));
             visual.simulate_mouse_up(
                 point(px(x), px(12.)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+        }
+        cx.opened_url()
+    }
+
+    fn drag_link_away_and_back(cx: &mut TestAppContext) -> Option<String> {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        {
+            let (_, visual) = cx.add_window_view(|window, cx| {
+                let view = cx.new(|_| TextSelectionTestView {
+                    source: "alpha https://example.invalid",
+                });
+                gpui_component::Root::new(view, window, cx)
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.simulate_mouse_down(
+                point(px(80.), px(12.)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+            visual.simulate_mouse_move(
+                point(px(105.), px(12.)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            visual.simulate_mouse_move(
+                point(px(80.), px(12.)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            visual.simulate_mouse_up(
+                point(px(80.), px(12.)),
                 MouseButton::Left,
                 Modifiers::default(),
             );
@@ -586,6 +631,11 @@ mod tests {
             click_text("alpha https://example.invalid", 80., cx).as_deref(),
             Some("https://example.invalid")
         );
+    }
+
+    #[gpui::test]
+    fn dragging_a_link_away_and_back_does_not_open_it(cx: &mut TestAppContext) {
+        assert_eq!(drag_link_away_and_back(cx), None);
     }
 
     /// A stopwatch rather than an assertion: what a conversation pays to

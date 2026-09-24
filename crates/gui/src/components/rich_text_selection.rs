@@ -5,28 +5,97 @@
 //! layout and registers that same visible text with GPUI Kit's existing
 //! window selection model.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, GlobalElementId,
-    Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, SharedString, StyledText, Window, transparent_black,
+    App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, Global,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    SharedString, StyledText, Window, transparent_black,
 };
-use gpui_base::{TextSelection, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
+use gpui_base::{
+    TextSelection, TextSelectionHandle, TextSelectionProjection, TextSelectionRegistration,
+    TextSelectionRun,
+};
 use gpui_component::ActiveTheme as _;
 
 struct RetainedSelection {
     handle: TextSelectionHandle,
     text: SharedString,
-    pressed_link: Rc<Cell<Option<usize>>>,
+    pressed_link: Rc<Cell<Option<LinkPress>>>,
+    projection: Rc<RefCell<TextSelectionProjection>>,
 }
 
 pub(super) struct RichTextState {
     handle: TextSelectionHandle,
-    pressed_link: Rc<Cell<Option<usize>>>,
+    pressed_link: Rc<Cell<Option<LinkPress>>>,
+    projection: Rc<RefCell<TextSelectionProjection>>,
+}
+
+#[derive(Clone, Copy)]
+struct LinkPress {
+    index: usize,
+    origin: Point<Pixels>,
+    dragged: bool,
+}
+
+/// Keeps active participants reachable when virtualization drops their row.
+#[derive(Default)]
+struct RichTextSelectionRegistry(HashMap<(gpui::WindowId, String), TextSelectionHandle>);
+
+impl Global for RichTextSelectionRegistry {}
+
+fn track_selection_handle(
+    window_id: gpui::WindowId,
+    message_id: &str,
+    handle: &TextSelectionHandle,
+    cx: &mut App,
+) {
+    let key = (window_id, message_id.to_owned());
+    if handle.snapshot(cx).is_some() {
+        if !cx.has_global::<RichTextSelectionRegistry>() {
+            cx.set_global(RichTextSelectionRegistry::default());
+        }
+        cx.global_mut::<RichTextSelectionRegistry>()
+            .0
+            .insert(key, handle.clone());
+    } else if cx.has_global::<RichTextSelectionRegistry>() {
+        cx.global_mut::<RichTextSelectionRegistry>().0.remove(&key);
+    }
+}
+
+/// Clears a window's selection if it includes a message whose text element is
+/// about to disappear from the virtual timeline.
+pub(crate) fn clear_if_selected_message(
+    message_id: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let key = (window.window_handle().window_id(), message_id.to_owned());
+    let selected = cx.has_global::<RichTextSelectionRegistry>()
+        && cx
+            .global::<RichTextSelectionRegistry>()
+            .0
+            .get(&key)
+            .is_some_and(|handle| handle.snapshot(cx).is_some());
+    if selected {
+        TextSelection::clear(window, cx);
+        forget_window_selection_registry(key.0, cx);
+    }
+    selected
+}
+
+/// Releases retained participant handles after a window-level clear.
+pub(crate) fn forget_window_selection_registry(window_id: gpui::WindowId, cx: &mut App) {
+    if cx.has_global::<RichTextSelectionRegistry>() {
+        cx.global_mut::<RichTextSelectionRegistry>()
+            .0
+            .retain(|(id, _), _| *id != window_id);
+    }
 }
 
 /// One formatted message text run participating in GPUI's window selection.
@@ -36,6 +105,7 @@ pub(super) struct SelectableRichText {
     styled_text: StyledText,
     links: Vec<Range<usize>>,
     link_targets: Arc<[SharedString]>,
+    selection_key: String,
     document_order: u64,
 }
 
@@ -46,6 +116,7 @@ impl SelectableRichText {
         styled_text: StyledText,
         links: Vec<Range<usize>>,
         link_targets: Arc<[SharedString]>,
+        selection_key: impl Into<String>,
         document_order: u64,
     ) -> Self {
         Self {
@@ -54,6 +125,7 @@ impl SelectableRichText {
             styled_text,
             links,
             link_targets,
+            selection_key: selection_key.into(),
             document_order,
         }
     }
@@ -146,27 +218,42 @@ impl Element for SelectableRichText {
                 let retained = match retained {
                     Some(retained) if retained.text == self.text => retained,
                     Some(_) => {
-                        // A message edit/revocation must not project an old
-                        // selection onto new text or leave it copyable.
-                        TextSelection::clear(window, cx);
+                        // Only this participant's selection became stale;
+                        // edits to another bubble must not clear it.
+                        if retained.handle.snapshot(cx).is_some() {
+                            TextSelection::clear(window, cx);
+                            forget_window_selection_registry(
+                                window.window_handle().window_id(),
+                                cx,
+                            );
+                        }
                         RetainedSelection {
                             handle: TextSelectionHandle::new(self.text.to_string(), cx),
                             text: self.text.clone(),
                             pressed_link: Rc::new(Cell::new(None)),
+                            projection: Rc::new(RefCell::new(TextSelectionProjection::default())),
                         }
                     }
                     None => RetainedSelection {
                         handle: TextSelectionHandle::new(self.text.to_string(), cx),
                         text: self.text.clone(),
                         pressed_link: Rc::new(Cell::new(None)),
+                        projection: Rc::new(RefCell::new(TextSelectionProjection::default())),
                     },
                 };
                 let state = RichTextState {
                     handle: retained.handle.clone(),
                     pressed_link: Rc::clone(&retained.pressed_link),
+                    projection: Rc::clone(&retained.projection),
                 };
                 (state, retained)
             },
+        );
+        track_selection_handle(
+            window.window_handle().window_id(),
+            &self.selection_key,
+            &handle.handle,
+            cx,
         );
         let (layout_id, ()) = self
             .styled_text
@@ -207,7 +294,6 @@ impl Element for SelectableRichText {
         cx: &mut App,
     ) {
         let layout = self.styled_text.layout().clone();
-        let previous_selection = TextSelection::selected_text(window, cx);
         let projection = handle.handle.update_runs(
             &[
                 TextSelectionRun::new(self.text.clone(), layout.clone(), bounds)
@@ -215,8 +301,12 @@ impl Element for SelectableRichText {
             ],
             cx,
         );
-        if previous_selection != TextSelection::selected_text(window, cx) {
-            window.refresh();
+        {
+            let mut previous_projection = handle.projection.borrow_mut();
+            if *previous_projection != projection {
+                *previous_projection = projection.clone();
+                window.refresh();
+            }
         }
         let selection_color = cx.theme().selection;
         for range in projection.ranges().iter().flatten().cloned() {
@@ -243,21 +333,40 @@ impl Element for SelectableRichText {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
         let targets = self.link_targets.clone();
-        let down_index = Rc::clone(&handle.pressed_link);
-        let mouse_down_index = Rc::clone(&down_index);
+        let down_state = Rc::clone(&handle.pressed_link);
+        let mouse_down_state = Rc::clone(&down_state);
         let down_layout = layout.clone();
         let down_hitbox = hitbox.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _cx| {
             if phase.bubble() && event.button == MouseButton::Left {
-                let index = if down_hitbox.is_hovered(window) {
-                    down_layout.index_for_position(event.position).ok()
+                let press = if down_hitbox.is_hovered(window) {
+                    down_layout
+                        .index_for_position(event.position)
+                        .ok()
+                        .map(|index| LinkPress {
+                            index,
+                            origin: event.position,
+                            dragged: false,
+                        })
                 } else {
                     None
                 };
-                mouse_down_index.set(index);
-                if index.is_some() {
+                mouse_down_state.set(press);
+                if press.is_some() {
                     window.refresh();
                 }
+            }
+        });
+        let move_state = Rc::clone(&down_state);
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, _cx| {
+            if !phase.bubble() || event.pressed_button != Some(MouseButton::Left) {
+                return;
+            }
+            if let Some(mut press) = move_state.get()
+                && event.position != press.origin
+            {
+                press.dragged = true;
+                move_state.set(Some(press));
             }
         });
         let up_layout = layout;
@@ -266,10 +375,10 @@ impl Element for SelectableRichText {
             if !phase.bubble() || event.button != MouseButton::Left {
                 return;
             }
-            let Some(down) = down_index.replace(None) else {
+            let Some(press) = down_state.replace(None) else {
                 return;
             };
-            if !up_hitbox.is_hovered(window) {
+            if press.dragged || !up_hitbox.is_hovered(window) {
                 return;
             }
             let Ok(index) = up_layout.index_for_position(event.position) else {
@@ -280,7 +389,7 @@ impl Element for SelectableRichText {
             }
             let Some(link_ix) = links
                 .iter()
-                .position(|range| range.contains(&down) && range.contains(&index))
+                .position(|range| range.contains(&press.index) && range.contains(&index))
             else {
                 return;
             };

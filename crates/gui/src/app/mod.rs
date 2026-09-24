@@ -1051,6 +1051,18 @@ impl IncomingMessageMetadata {
     }
 }
 
+pub(super) fn clear_window_message_selection(window: &mut Window, cx: &mut App) {
+    gpui_base::TextSelection::clear(window, cx);
+    crate::components::rich_text_selection::forget_window_selection_registry(
+        window.window_handle().window_id(),
+        cx,
+    );
+}
+
+fn message_has_selectable_text(message: &ChatMessage) -> bool {
+    message.system.is_none() && message.poll.is_none() && !message.content.is_empty()
+}
+
 impl WhatsAppApp {
     pub fn media_cache(&self) -> Option<std::sync::Arc<dyn crate::session::MediaCache>> {
         self.client.as_ref().map(Session::media_cache)
@@ -1207,9 +1219,18 @@ impl WhatsAppApp {
                         // re-pair — its name under the sidebar, its number
                         // beneath, and its JID still reading as "(You)" —
                         // until some later `AccountUpdated` corrected it.
+                        let jid = account.as_ref().and_then(|a| a.jid.clone());
+                        let lid = account.as_ref().and_then(|a| a.lid.clone());
+                        if (app.account_jid != jid || app.account_lid != lid)
+                            && let Some(window) = app.modal_window
+                        {
+                            let _ = window.update(cx, |_, window, cx| {
+                                clear_window_message_selection(window, cx);
+                            });
+                        }
                         app.account_name = account.as_ref().and_then(|a| a.name.clone());
-                        app.account_jid = account.as_ref().and_then(|a| a.jid.clone());
-                        app.account_lid = account.and_then(|a| a.lid);
+                        app.account_jid = jid;
+                        app.account_lid = lid;
                         cx.notify();
                     }),
                     FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
@@ -1901,6 +1922,40 @@ impl WhatsAppApp {
     /// same messages: every caller here is announcing that the chat's history
     /// changed, which is exactly when the search's matches stop describing it.
     fn invalidate_message_cache(&mut self, chat_jid: &str, cx: &mut App) {
+        if self.selected_chat.as_deref() == Some(chat_jid) {
+            let removed_text_messages = self
+                .message_list_cache
+                .borrow()
+                .get(chat_jid)
+                .map(|previous| {
+                    let current = self.find_chat(chat_jid);
+                    previous
+                        .messages
+                        .iter()
+                        .filter(|old| message_has_selectable_text(old))
+                        .filter(|old| {
+                            current
+                                .and_then(|chat| chat.messages.iter().find(|new| new.id == old.id))
+                                .is_none_or(|new| !message_has_selectable_text(new))
+                        })
+                        .map(|message| message.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !removed_text_messages.is_empty()
+                && let Some(window) = self.modal_window
+            {
+                let _ = window.update(cx, |_, window, cx| {
+                    for message_id in &removed_text_messages {
+                        if crate::components::rich_text_selection::clear_if_selected_message(
+                            message_id, window, cx,
+                        ) {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
         self.message_list_cache.borrow_mut().remove(chat_jid);
         self.refresh_conversation_search(chat_jid, cx);
         self.refresh_media_viewer(chat_jid, cx);
@@ -2027,6 +2082,7 @@ impl WhatsAppApp {
         // epoch nothing had bumped, and send the old account's note from the
         // newly paired one.
         self.leave_connected_view(cx);
+        clear_window_message_selection(window, cx);
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.incoming_file_reading = false;
         self.paste_preview = None;
@@ -2393,7 +2449,7 @@ impl WhatsAppApp {
             // typed, let alone sent.
             self.drafts.remove(jid);
         }
-        self.forget_missing_selection();
+        self.forget_missing_selection(cx);
         // The viewer names a chat and a message in it, and resolves them every
         // frame: one left open over a chat that has just gone draws nothing,
         // keeps the keyboard, and swallows the Escape meant to close it.
@@ -2408,12 +2464,17 @@ impl WhatsAppApp {
     /// pointing at a deleted chat draws the empty state — and on a phone that
     /// is the whole screen, with the Back button belonging to a conversation
     /// that is not there.
-    fn forget_missing_selection(&mut self) {
+    fn forget_missing_selection(&mut self, cx: &mut App) {
         if self
             .selected_chat
             .as_deref()
             .is_some_and(|jid| !self.chats.iter().any(|chat| chat.jid == jid))
         {
+            if let Some(window) = self.modal_window {
+                let _ = window.update(cx, |_, window, cx| {
+                    clear_window_message_selection(window, cx);
+                });
+            }
             self.selected_chat = None;
         }
     }
@@ -2602,7 +2663,7 @@ impl WhatsAppApp {
         if self.selected_chat.as_deref() != Some(jid.as_str()) {
             // Message-text selection belongs to the conversation being left,
             // not to the next list reusing the window selection layer.
-            gpui_base::TextSelection::clear(window, cx);
+            clear_window_message_selection(window, cx);
         }
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,

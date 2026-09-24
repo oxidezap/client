@@ -322,7 +322,7 @@ impl WhatsAppApp {
                     && let Some(window) = self.modal_window
                 {
                     let _ = window.update(cx, |_, window, cx| {
-                        gpui_base::TextSelection::clear(window, cx);
+                        super::clear_window_message_selection(window, cx);
                     });
                 }
                 if self.account_name != name || self.account_jid != jid || self.account_lid != lid {

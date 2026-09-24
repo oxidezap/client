@@ -560,7 +560,7 @@ impl WhatsAppApp {
             return;
         }
         self.forget_chat_paging(&dropped, cx);
-        self.forget_missing_selection();
+        self.forget_missing_selection(cx);
         self.invalidate_chat_cache();
         cx.notify();
     }
