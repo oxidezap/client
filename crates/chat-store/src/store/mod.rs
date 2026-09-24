@@ -16,6 +16,7 @@ mod edit;
 mod event;
 mod history_sync;
 mod inbound;
+pub(crate) mod message_identity;
 mod message_rows;
 mod reaction;
 mod read_state;
@@ -95,6 +96,8 @@ pub(crate) enum WriterMsg {
         timestamp_ms: i64,
     },
     Reconcile(Jid),
+    ReconcileAll,
+    ReconcileMappings(Vec<(String, String)>),
     /// Display names resolved from server metadata (group subjects,
     /// channel names) for chats whose rows hold NULL. Written only when a
     /// name is news — like the group-subject arm — so a pass that learned
@@ -313,13 +316,26 @@ impl ChatStore {
     }
 
     /// Open the already-prepared database on the same file as `store`, bound to
-    /// its device id, and start the writer task.
+    /// its device id, repair proven legacy message duplicates when the mapping
+    /// ledger has advanced, and start the writer task.
     ///
+    /// The per-device mapping-revision marker avoids repeating the device-wide pass;
+    /// newly learned aliases use a scoped writer request. Repairs are
+    /// transactional; a tombstone wins, and previews/unread are re-derived.
     /// This is the entry point for a runtime after the registry has called
     /// [`Self::prepare`]. It does not launch another migration runner.
     pub async fn new_prepared(store: &SqliteStore) -> Result<Arc<Self>> {
         let db = store.shared();
         let device_id = store.device_id();
+        db.run(move |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                let mut changes = ChangeSet::default();
+                crate::store::message_identity::reconcile_startup(conn, device_id, &mut changes)?;
+                Ok(())
+            })
+            .map_err(crate::error::db_err)
+        })
+        .await?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
@@ -595,18 +611,37 @@ impl ChatStore {
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
-    /// Reconcile a 1:1 peer's PN- and LID-keyed rows into a single thread.
+    /// Reconcile proven duplicate authors in a chat and, for a 1:1 peer,
+    /// merge every PN- and LID-keyed thread in the known alias component.
     ///
-    /// Receipts dropped under the wrong identity (before this crate resolved
-    /// PN/LID aliases) left some stores with a split pair: a populated chat
-    /// under the phone-number key plus a stray `@lid` twin. Live traffic for
-    /// the peer now heals such a pair on its own; this makes the repair
-    /// on-demand for embedders that want it eagerly. Idempotent — a peer with
-    /// one thread (or no LID mapping yet) is a no-op. Goes through the writer
-    /// queue; use [`flush`](Self::flush) to await completion.
+    /// Receipts dropped under the wrong identity left some stores with a
+    /// split pair: a populated chat under the phone-number key plus a stray
+    /// `@lid` twin. Live traffic heals known pairs on its own; this makes the
+    /// repair on-demand for embedders that want it eagerly. Idempotent —
+    /// unknown aliases and distinct authors are never guessed together. Goes
+    /// through the writer queue; use [`flush`](Self::flush) to await completion.
     pub fn reconcile_chat(&self, chat: &Jid) -> Result<()> {
         self.tx
             .send(WriterMsg::Reconcile(chat.clone()))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Reconcile legacy message identities after the account learns new PN/LID
+    /// mappings. Use [`flush`](Self::flush) to await the transaction.
+    pub fn reconcile_message_mappings(&self, mappings: &[(String, String)]) -> Result<()> {
+        if mappings.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::ReconcileMappings(mappings.to_vec()))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Reconcile all stored message identities explicitly. Use [`flush`](Self::flush)
+    /// to await the transaction; startup and learned mappings use scoped repairs.
+    pub fn reconcile_all_messages(&self) -> Result<()> {
+        self.tx
+            .send(WriterMsg::ReconcileAll)
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
@@ -769,7 +804,32 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // The current top migration only tracks which source last supplied
+        // Revert the pending-alias queue before its repair-state table; both
+        // are newer than the older migration edges checked below.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("identity-repair queue downgrade is reversible");
+        assert!(!has_table(&store, "message_identity_repair_pending").await);
+        assert!(has_table(&store, "message_identity_repair_state").await);
+
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("identity-repair marker downgrade is reversible");
+        assert!(!has_table(&store, "message_identity_repair_state").await);
+
+        // The current top migration now tracks which source last supplied
         // mute/archive preferences. Revert it first so the historical
         // downgrade assertions below still start at account-cascade.
         store
@@ -939,6 +999,17 @@ mod migration_tests {
         store_a.create_new_device().await.expect("create device A");
         store_b.create_new_device().await.expect("create device B");
         ChatStore::new(&store_a).await.expect("run migrations");
+        use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+        store_a
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "111000011112222".into(),
+                phone_number: "559900000001".into(),
+                created_at: 1,
+                updated_at: 1,
+                learning_source: "test".into(),
+            })
+            .await
+            .expect("insert mapping with pending repair");
 
         store_a
             .shared()

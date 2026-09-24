@@ -74,6 +74,7 @@ pub(super) fn apply_inbound(
                     starred: false,
                     overwrite: true,
                 },
+                cs,
             )?;
             // A refreshed row (redelivery, PDO recovery of a placeholder that
             // already counted) must not inflate the unread badge again — and a
@@ -122,6 +123,7 @@ pub(super) fn apply_inbound(
                 new_kind,
                 &new_proto,
                 ts_ms,
+                cs,
             )? {
                 cs.chats = true;
             }
@@ -140,6 +142,7 @@ pub(super) fn apply_inbound(
                 target_participant.as_deref().unwrap_or(&sender),
                 target_from_me,
                 ts_ms,
+                cs,
             )? {
                 cs.chats = true;
             }
