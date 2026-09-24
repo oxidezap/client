@@ -21,6 +21,12 @@ use gpui_component::ActiveTheme as _;
 struct RetainedSelection {
     handle: TextSelectionHandle,
     text: SharedString,
+    pressed_link: Rc<Cell<Option<usize>>>,
+}
+
+struct RichTextState {
+    handle: TextSelectionHandle,
+    pressed_link: Rc<Cell<Option<usize>>>,
 }
 
 /// One formatted message text run participating in GPUI's window selection.
@@ -116,7 +122,7 @@ impl IntoElement for SelectableRichText {
 }
 
 impl Element for SelectableRichText {
-    type RequestLayoutState = TextSelectionHandle;
+    type RequestLayoutState = RichTextState;
     type PrepaintState = Hitbox;
 
     fn id(&self) -> Option<ElementId> {
@@ -146,14 +152,20 @@ impl Element for SelectableRichText {
                         RetainedSelection {
                             handle: TextSelectionHandle::new(self.text.to_string(), cx),
                             text: self.text.clone(),
+                            pressed_link: Rc::new(Cell::new(None)),
                         }
                     }
                     None => RetainedSelection {
                         handle: TextSelectionHandle::new(self.text.to_string(), cx),
                         text: self.text.clone(),
+                        pressed_link: Rc::new(Cell::new(None)),
                     },
                 };
-                (retained.handle.clone(), retained)
+                let state = RichTextState {
+                    handle: retained.handle.clone(),
+                    pressed_link: Rc::clone(&retained.pressed_link),
+                };
+                (state, retained)
             },
         );
         let (layout_id, ()) = self
@@ -174,7 +186,7 @@ impl Element for SelectableRichText {
         self.styled_text
             .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        handle.register(
+        handle.handle.register(
             TextSelectionRegistration::new(hitbox.clone(), bounds)
                 .with_document_order(self.document_order)
                 .with_text_bounds(vec![bounds]),
@@ -196,7 +208,7 @@ impl Element for SelectableRichText {
     ) {
         let layout = self.styled_text.layout().clone();
         let previous_selection = TextSelection::selected_text(window, cx);
-        let projection = handle.update_runs(
+        let projection = handle.handle.update_runs(
             &[
                 TextSelectionRun::new(self.text.clone(), layout.clone(), bounds)
                     .with_document_order(self.document_order),
@@ -231,8 +243,8 @@ impl Element for SelectableRichText {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
         let targets = self.link_targets.clone();
-        let down_index = Rc::new(Cell::new(None));
-        let mouse_down_index = down_index.clone();
+        let down_index = Rc::clone(&handle.pressed_link);
+        let mouse_down_index = Rc::clone(&down_index);
         let down_layout = layout.clone();
         let down_hitbox = hitbox.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _cx| {
@@ -251,13 +263,15 @@ impl Element for SelectableRichText {
         let up_layout = layout;
         let up_hitbox = hitbox.clone();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-            if !phase.bubble() || event.button != MouseButton::Left || !up_hitbox.is_hovered(window)
-            {
+            if !phase.bubble() || event.button != MouseButton::Left {
                 return;
             }
             let Some(down) = down_index.replace(None) else {
                 return;
             };
+            if !up_hitbox.is_hovered(window) {
+                return;
+            }
             let Ok(index) = up_layout.index_for_position(event.position) else {
                 return;
             };

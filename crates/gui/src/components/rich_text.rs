@@ -531,6 +531,9 @@ mod tests {
                 MouseButton::Left,
                 Modifiers::default(),
             );
+            // The press requests a repaint; link activation must survive the
+            // fresh element built before the release arrives.
+            visual.update(|window, cx| window.draw(cx).clear(cx));
             visual.simulate_mouse_up(
                 point(px(x), px(12.)),
                 MouseButton::Left,
