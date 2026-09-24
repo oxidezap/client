@@ -69,21 +69,6 @@ fn retained_selection(handle: TextSelectionHandle, text: &SharedString) -> Retai
     }
 }
 
-/// Active message identities in a window, used to limit timeline invalidation.
-pub(crate) fn active_selection_message_ids(window_id: gpui::WindowId, cx: &App) -> Vec<String> {
-    if !cx.has_global::<RichTextSelectionRegistry>() {
-        return Vec::new();
-    }
-    cx.global::<RichTextSelectionRegistry>()
-        .0
-        .iter()
-        .filter(|((id, _), participant)| {
-            *id == window_id && participant.handle.snapshot(cx).is_some()
-        })
-        .map(|((_, message_id), _)| message_id.to_string())
-        .collect()
-}
-
 /// Active message identities and their retained text and timeline order.
 pub(crate) fn active_selection_message_snapshots(
     window_id: gpui::WindowId,
@@ -225,7 +210,7 @@ impl SelectableRichText {
         color: gpui::Hsla,
         window: &mut Window,
     ) {
-        for bounds in selection_quad_bounds(text, range, layout, window) {
+        for bounds in selection_quad_bounds(text, range, layout) {
             window.paint_quad(PaintQuad {
                 bounds,
                 background: color.into(),
@@ -242,7 +227,6 @@ fn selection_quad_bounds(
     text: &str,
     range: Range<usize>,
     layout: &gpui::TextLayout,
-    window: &Window,
 ) -> Vec<Bounds<Pixels>> {
     let bounds = layout.bounds();
     let line_height = layout.line_height();
@@ -323,9 +307,11 @@ fn selection_quad_bounds(
                     (
                         *source_ix,
                         *x - visual_left,
-                        (*x == visual_right && Some(*source_ix) == trailing_source_ix)
-                            .then_some(trailing_advance)
-                            .unwrap_or(Pixels::ZERO),
+                        if *x == visual_right && Some(*source_ix) == trailing_source_ix {
+                            trailing_advance
+                        } else {
+                            Pixels::ZERO
+                        },
                     )
                 })
                 .collect();
@@ -425,13 +411,12 @@ fn link_at_position(
     text: &str,
     links: &[Range<usize>],
     position: Point<Pixels>,
-    window: &Window,
 ) -> Option<usize> {
     let index = match layout.index_for_position(position) {
         Ok(index) | Err(index) => index,
     };
     link_index_at_position(index, links, |range| {
-        selection_quad_bounds(text, range.clone(), layout, window)
+        selection_quad_bounds(text, range.clone(), layout)
             .iter()
             .any(|bounds| {
                 position.x >= bounds.left()
@@ -666,7 +651,7 @@ impl Element for SelectableRichText {
         }
         let links = self.links.clone();
         let mouse_position = window.mouse_position();
-        if link_at_position(&layout, &self.text, &links, mouse_position, window).is_some() {
+        if link_at_position(&layout, &self.text, &links, mouse_position).is_some() {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
         let targets = self.link_targets.clone();
@@ -680,18 +665,13 @@ impl Element for SelectableRichText {
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _cx| {
             if phase.bubble() && event.button == MouseButton::Left {
                 let press = if down_hitbox.is_hovered(window) {
-                    link_at_position(
-                        &down_layout,
-                        &down_text,
-                        &down_links,
-                        event.position,
-                        window,
+                    link_at_position(&down_layout, &down_text, &down_links, event.position).map(
+                        |link_ix| LinkPress {
+                            link_ix,
+                            origin: event.position,
+                            dragged: false,
+                        },
                     )
-                    .map(|link_ix| LinkPress {
-                        link_ix,
-                        origin: event.position,
-                        dragged: false,
-                    })
                 } else {
                     None
                 };
@@ -728,8 +708,7 @@ impl Element for SelectableRichText {
             if press.dragged || !up_hitbox.is_hovered(window) {
                 return;
             }
-            let Some(link_ix) =
-                link_at_position(&up_layout, &up_text, &links, event.position, window)
+            let Some(link_ix) = link_at_position(&up_layout, &up_text, &links, event.position)
             else {
                 return;
             };
