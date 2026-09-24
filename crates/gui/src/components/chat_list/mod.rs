@@ -406,6 +406,17 @@ mod tests {
     use super::*;
     use gpui::px;
 
+    #[test]
+    fn the_space_toggle_binding_excludes_the_search_input_context() {
+        let predicate = gpui::KeyBindingContextPredicate::parse("ChatList && !Input")
+            .expect("valid list-only key context");
+        let list = gpui::KeyContext::try_from("ChatList").expect("chat-list context");
+        let input = gpui::KeyContext::try_from("Input").expect("input context");
+
+        assert!(predicate.depth_of(std::slice::from_ref(&list)).is_some());
+        assert!(predicate.depth_of(&[list, input]).is_none());
+    }
+
     /// One entry per loaded conversation, rebuilt for every frame that draws
     /// a dozen rows. The sizes move when the geometry does and not otherwise.
     #[test]

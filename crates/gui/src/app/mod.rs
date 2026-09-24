@@ -587,7 +587,8 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
     cx.bind_keys([
         KeyBinding::new("up", SelectUp, Some(CHAT_LIST_CONTEXT)),
         KeyBinding::new("down", SelectDown, Some(CHAT_LIST_CONTEXT)),
-        KeyBinding::new("space", ToggleSelectedCommunity, Some(CHAT_LIST_CONTEXT)),
+        // Exclude the Input context so matched Space remains available to the editor.
+        KeyBinding::new("space", ToggleSelectedCommunity, Some("ChatList && !Input")),
         // Window-wide: reachable whatever owns focus, because both are ways
         // *out* of wherever the user currently is.
         KeyBinding::new("secondary-k", FocusSearch, None),
