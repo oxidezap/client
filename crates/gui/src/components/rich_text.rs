@@ -706,7 +706,10 @@ mod tests {
             Modifiers::default(),
         );
         assert_eq!(
-            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
             "alpha "
         );
 
@@ -725,7 +728,10 @@ mod tests {
             window.draw(cx).clear(cx);
         });
         assert_eq!(
-            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
             "alpha "
         );
     }
