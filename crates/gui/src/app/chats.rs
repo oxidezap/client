@@ -363,6 +363,14 @@ pub(super) fn hierarchical_group_rows(
     flattened
 }
 
+/// The keyboard disclosure action applies only when the selected cached row
+/// currently exposes a community toggle.
+pub(super) fn selected_community_toggle(rows: &[ChatRow], selected_jid: &str) -> Option<String> {
+    rows.iter()
+        .find(|row| row.jid == selected_jid && row.community_toggle_visible)
+        .map(|row| row.jid.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +514,29 @@ mod tests {
         assert!(!rows[0].community_expanded);
         assert!(rows[1].community_expanded);
         assert_eq!(rows[2].tree_depth, 1);
+    }
+
+    #[test]
+    fn keyboard_disclosure_targets_only_a_visible_community_row() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let rows = vec![
+            hierarchy_row("community@g.us", "Games", GroupHierarchy::Community),
+            hierarchy_row(
+                "subgroup@g.us",
+                "Chess",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "community@g.us".into(),
+                    kind: SubgroupKind::Regular,
+                },
+            ),
+        ];
+        let rows = hierarchical_group_rows(&rows, "", &Default::default());
+        assert_eq!(
+            selected_community_toggle(&rows, "community@g.us"),
+            Some("community@g.us".into())
+        );
+        assert_eq!(selected_community_toggle(&rows, "subgroup@g.us"), None);
     }
 
     #[test]

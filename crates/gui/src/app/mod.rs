@@ -308,7 +308,7 @@ use gpui_component::VirtualListScrollHandle;
 use gpui_component::input::InputState;
 
 // Define our own actions since gpui-component's actions module is private
-actions!(chat_list, [SelectUp, SelectDown]);
+actions!(chat_list, [SelectUp, SelectDown, ToggleSelectedCommunity]);
 actions!(
     oxidezap,
     [
@@ -587,6 +587,7 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
     cx.bind_keys([
         KeyBinding::new("up", SelectUp, Some(CHAT_LIST_CONTEXT)),
         KeyBinding::new("down", SelectDown, Some(CHAT_LIST_CONTEXT)),
+        KeyBinding::new("space", ToggleSelectedCommunity, Some(CHAT_LIST_CONTEXT)),
         // Window-wide: reachable whatever owns focus, because both are ways
         // *out* of wherever the user currently is.
         KeyBinding::new("secondary-k", FocusSearch, None),
@@ -1663,6 +1664,30 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    /// Toggle the selected community when the chat list (not its search
+    /// input) owns focus. This keeps the disclosure action keyboard reachable
+    /// without turning a typed space into a list command.
+    pub fn toggle_selected_community(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search_input = self.search.read(cx).list_input().cloned();
+        if search_input.is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window)) {
+            return;
+        }
+        let Some(selected) = self.selected_chat.as_deref() else {
+            return;
+        };
+        let jid = {
+            let cache = self.chat_list_cache.borrow();
+            let Some(cache) = cache.as_ref() else {
+                return;
+            };
+            let Some(jid) = chats::selected_community_toggle(&cache.rows, selected) else {
+                return;
+            };
+            jid
+        };
+        self.toggle_community(&jid, cx);
+    }
+
     /// Expand or collapse a community by its stable JID.
     pub fn toggle_community(&mut self, jid: &str, cx: &mut Context<Self>) {
         if !self.collapsed_communities.remove(jid) {
@@ -2181,6 +2206,7 @@ impl WhatsAppApp {
         // [`plugins_ctl::Plugins::forget`].
         self.plugins.update(cx, |plugins, cx| plugins.forget(cx));
         self.chats.clear();
+        self.collapsed_communities.clear();
         self.selected_chat = None;
         self.visible_chat = None;
         self.retained_chat = None;

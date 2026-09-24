@@ -31,6 +31,7 @@ pub enum SubgroupKind {
     Announcement,
     General,
     /// A newer engine role that this client does not yet render specially.
+    #[serde(other)]
     Other,
 }
 
@@ -42,5 +43,25 @@ impl GroupHierarchy {
             Self::Subgroup { parent_jid, .. } => Some(parent_jid),
             Self::Standalone | Self::Community => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GroupHierarchy, SubgroupKind};
+
+    #[test]
+    fn unknown_subgroup_kinds_deserialize_as_other_without_losing_parent_identity() {
+        let hierarchy: GroupHierarchy = serde_json::from_str(
+            r#"{"role":"subgroup","parent_jid":"community@g.us","kind":"future_kind"}"#,
+        )
+        .expect("unknown subgroup kind falls back");
+        assert_eq!(
+            hierarchy,
+            GroupHierarchy::Subgroup {
+                parent_jid: "community@g.us".into(),
+                kind: SubgroupKind::Other,
+            }
+        );
     }
 }
