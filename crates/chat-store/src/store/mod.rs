@@ -96,6 +96,7 @@ pub(crate) enum WriterMsg {
         timestamp_ms: i64,
     },
     Reconcile(Jid),
+    ReconcileAll,
     /// Display names resolved from server metadata (group subjects,
     /// channel names) for chats whose rows hold NULL. Written only when a
     /// name is news — like the group-subject arm — so a pass that learned
@@ -326,8 +327,8 @@ impl ChatStore {
         let device_id = store.device_id();
         db.run(move |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
-                crate::store::message_identity::reconcile_all(conn, device_id)?;
                 let mut changes = ChangeSet::default();
+                crate::store::message_identity::reconcile_all(conn, device_id, &mut changes)?;
                 crate::lid::reconcile_known_chats(conn, device_id, &mut changes)?;
                 Ok(())
             })
@@ -621,6 +622,14 @@ impl ChatStore {
     pub fn reconcile_chat(&self, chat: &Jid) -> Result<()> {
         self.tx
             .send(WriterMsg::Reconcile(chat.clone()))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Reconcile legacy message identities after the account learns new PN/LID
+    /// mappings. Use [`flush`](Self::flush) to await the transaction.
+    pub fn reconcile_all_messages(&self) -> Result<()> {
+        self.tx
+            .send(WriterMsg::ReconcileAll)
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 

@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use wacore_binary::Jid;
 
 use crate::schema;
+use crate::store::writer::ChangeSet;
 use crate::types::MessageStatus;
 
 #[derive(Debug, Clone)]
@@ -199,6 +200,13 @@ pub(crate) fn merge_rows(
         .max_by_key(|row| MessageStatus::from_raw(row.status).precedence())
         .map_or(survivor.status, |row| row.status);
     let starred = rows.iter().any(|row| row.starred);
+    // Activity and page order follow the newest copy's timestamp while the
+    // stable row id remains the oldest persisted id.
+    let timestamp_ms = rows
+        .iter()
+        .map(|row| row.timestamp_ms)
+        .max()
+        .unwrap_or(survivor.timestamp_ms);
     let edited_at_ms = if tombstone {
         rows.iter().filter_map(|row| row.edited_at_ms).max()
     } else {
@@ -220,7 +228,7 @@ pub(crate) fn merge_rows(
         .set((
             dsl::chat_jid.eq(destination_chat),
             dsl::sender_jid.eq(&sender_jid),
-            dsl::timestamp_ms.eq(survivor.timestamp_ms),
+            dsl::timestamp_ms.eq(timestamp_ms),
             dsl::kind.eq(content.map_or(survivor.kind.as_str(), |row| row.kind.as_str())),
             dsl::text_content.eq(if tombstone {
                 None
@@ -256,12 +264,17 @@ pub(crate) fn reconcile_chat(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
+    changes: &mut ChangeSet,
 ) -> QueryResult<()> {
-    reconcile_groups(conn, device_id, Some(chat))
+    reconcile_groups(conn, device_id, Some(chat), changes)
 }
 
-pub(crate) fn reconcile_all(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
-    reconcile_groups(conn, device_id, None)
+pub(crate) fn reconcile_all(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    changes: &mut ChangeSet,
+) -> QueryResult<()> {
+    reconcile_groups(conn, device_id, None, changes)
 }
 
 #[derive(QueryableByName)]
@@ -276,6 +289,7 @@ fn reconcile_groups(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: Option<&str>,
+    changes: &mut ChangeSet,
 ) -> QueryResult<()> {
     let groups: Vec<MessageGroup> = match chat {
         Some(chat) => diesel::sql_query(
@@ -363,6 +377,8 @@ fn reconcile_groups(
     }
     for chat in changed_chats {
         refresh_chat_after_merge(conn, device_id, &chat)?;
+        changes.chats = true;
+        changes.message_chats.insert(chat);
     }
     Ok(())
 }
@@ -393,6 +409,7 @@ pub(super) fn resolve_target(
     msg_id: &str,
     from_me: bool,
     sender: &str,
+    changes: &mut ChangeSet,
 ) -> QueryResult<Option<MessageOwner>> {
     use schema::messages::dsl;
     let rows = matching_rows(conn, device_id, chat, msg_id, from_me, sender)?;
@@ -405,6 +422,8 @@ pub(super) fn resolve_target(
     let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
     let owner = merge_rows(conn, device_id, msg_id, chat, &ids, from_me)?;
     refresh_chat_after_merge(conn, device_id, chat)?;
+    changes.chats = true;
+    changes.message_chats.insert(chat.to_string());
     if from_me && !owner.sender_jid.is_empty() {
         diesel::update(dsl::messages.filter(dsl::id.eq(owner.id)))
             .set(dsl::sender_jid.eq(""))

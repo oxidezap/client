@@ -324,8 +324,8 @@ pub(crate) fn merge_split_chat(
     // Fold only copies with the same proven author. A stanza id reused by a
     // different participant is a separate message and must survive the chat
     // merge as a separate row.
-    crate::store::message_identity::reconcile_chat(conn, device_id, src)?;
-    crate::store::message_identity::reconcile_chat(conn, device_id, dest)?;
+    crate::store::message_identity::reconcile_chat(conn, device_id, src, cs)?;
+    crate::store::message_identity::reconcile_chat(conn, device_id, dest, cs)?;
     use schema::messages::dsl;
     let source_rows: Vec<(i64, String, String, bool)> = dsl::messages
         .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(src)))

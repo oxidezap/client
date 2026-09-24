@@ -6,6 +6,7 @@ use diesel::prelude::*;
 use crate::schema;
 use crate::store::chat_rows::{ChatBump, bump_chat, refresh_preview_if_latest};
 use crate::store::message_identity::{resolve_target, stored_sender};
+use crate::store::writer::ChangeSet;
 
 /// Tombstone the target row. A revoke arriving before its content (offline
 /// drain reordering) inserts the tombstone up front, so the content's later
@@ -26,10 +27,18 @@ pub(super) fn apply_revoke(
     sender: &str,
     target_from_me: bool,
     ts_ms: i64,
+    changes: &mut ChangeSet,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
-    if let Some(target) = resolve_target(conn, device_id, chat, target_id, target_from_me, sender)?
-    {
+    if let Some(target) = resolve_target(
+        conn,
+        device_id,
+        chat,
+        target_id,
+        target_from_me,
+        sender,
+        changes,
+    )? {
         let updated = diesel::update(
             dsl::messages
                 .filter(dsl::id.eq(target.id))

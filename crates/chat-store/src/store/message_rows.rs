@@ -6,6 +6,7 @@ use diesel::prelude::*;
 
 use crate::schema;
 use crate::store::message_identity::{resolve_target, stored_sender};
+use crate::store::writer::ChangeSet;
 
 pub(super) struct NewMessage<'a> {
     pub(super) chat_jid: &'a str,
@@ -47,6 +48,7 @@ pub(super) fn insert_message(
     conn: &mut SqliteConnection,
     device_id: i32,
     new: NewMessage<'_>,
+    changes: &mut ChangeSet,
 ) -> QueryResult<StoredRow> {
     use schema::messages::dsl;
     let sender = stored_sender(new.sender_jid, new.from_me);
@@ -57,6 +59,7 @@ pub(super) fn insert_message(
         new.msg_id,
         new.from_me,
         &sender,
+        changes,
     )? {
         if !new.overwrite {
             // History is a stale copy: live rows and placeholders win.

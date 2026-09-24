@@ -68,6 +68,7 @@ pub(super) fn apply_event(
                     starred: false,
                     overwrite: false,
                 },
+                cs,
             )?;
             // A duplicate placeholder (or one for an id that was already
             // recovered/revoked) must neither recount nor blank the preview.

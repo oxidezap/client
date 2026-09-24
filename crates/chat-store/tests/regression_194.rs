@@ -665,3 +665,165 @@ async fn reopening_repairs_legacy_alias_duplicates_without_resurrecting_revoked_
         1
     );
 }
+
+#[tokio::test]
+async fn alias_read_folds_recovered_kind_and_keeps_pages_ordered_after_repair() {
+    let (store, chat_store) = test_store().await;
+    let group = jid(GROUP);
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("placeholder"),
+            incoming_info(GROUP, PEER, "MSG-194-ORDER", 1_700_000_000),
+        )],
+    )
+    .await;
+    store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query(
+                "UPDATE messages SET kind = 'unknown', text_content = NULL, proto = NULL \
+                 WHERE msg_id = 'MSG-194-ORDER' AND chat_jid = ? AND sender_jid = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(GROUP)
+            .bind::<diesel::sql_types::Text, _>(PEER)
+            .execute(conn)
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let other = "559900000002@s.whatsapp.net";
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("between the aliases"),
+            incoming_info(GROUP, other, "MSG-194-MIDDLE", 1_700_000_015),
+        )],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("recovered content"),
+            incoming_info(GROUP, PEER_LID, "MSG-194-ORDER", 1_700_000_015),
+        )],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+
+    let newest_first = chat_store.messages(&group, None, 10).await.unwrap();
+    assert_eq!(newest_first[0].id, "MSG-194-MIDDLE");
+    let recovered = newest_first
+        .iter()
+        .find(|message| message.id == "MSG-194-ORDER")
+        .unwrap();
+    assert_eq!(recovered.kind, MessageKind::Text);
+    assert_eq!(recovered.text.as_deref(), Some("recovered content"));
+    let stable_seq = recovered.seq;
+
+    let oldest_first = chat_store
+        .messages_after(
+            &group,
+            MessageCursor {
+                timestamp_ms: 0,
+                seq: 0,
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(oldest_first[0].id, "MSG-194-ORDER");
+    assert_eq!(oldest_first[1].id, "MSG-194-MIDDLE");
+
+    chat_store.reconcile_chat(&group).unwrap();
+    chat_store.flush().await.unwrap();
+    let repaired = chat_store
+        .message(&group, "MSG-194-ORDER")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.seq, stable_seq);
+    assert_eq!(repaired.timestamp, ts(1_700_000_015));
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_message_at,
+        Some(ts(1_700_000_015))
+    );
+}
+
+#[tokio::test]
+async fn skipped_redelivery_emits_invalidations_when_it_repairs_legacy_rows() {
+    let (store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("same body"),
+            incoming_info(GROUP, PEER, "MSG-194-INVALIDATE", 1_700_000_000),
+        )],
+    )
+    .await;
+    let device_id = store.device_id();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(
+                "INSERT INTO messages \
+                 (device_id, chat_jid, msg_id, sender_jid, from_me, timestamp_ms, kind, \
+                  text_content, proto, proto_codec, status, starred, edited_at_ms, revoked) \
+                 SELECT device_id, chat_jid, msg_id, ?, from_me, timestamp_ms, kind, \
+                        text_content, proto, proto_codec, status, starred, edited_at_ms, revoked \
+                 FROM messages WHERE device_id = ? AND chat_jid = ? AND msg_id = ? AND sender_jid = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(PEER_LID)
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>(GROUP)
+            .bind::<diesel::sql_types::Text, _>("MSG-194-INVALIDATE")
+            .bind::<diesel::sql_types::Text, _>(PEER)
+            .execute(conn)
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    add_lid_mapping(&store).await;
+    let mut changes = chat_store.subscribe();
+
+    // Existing bytes win, so the delivery itself is skipped after identity
+    // repair. The repair still changed persistent rows and chat aggregates.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("same body"),
+            incoming_info(GROUP, PEER, "MSG-194-INVALIDATE", 1_700_000_000),
+        )],
+    )
+    .await;
+    let mut chats = false;
+    let mut messages = false;
+    while !chats || !messages {
+        match tokio::time::timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .expect("reconciliation invalidation arrives")
+            .expect("change sender remains open")
+        {
+            StoreChange::Chats => chats = true,
+            StoreChange::Messages { chat } if chat == jid(GROUP) => messages = true,
+            other => panic!("unexpected invalidation: {other:?}"),
+        }
+    }
+    assert_eq!(
+        chat_store
+            .messages(&jid(GROUP), None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|message| message.id == "MSG-194-INVALIDATE")
+            .count(),
+        1
+    );
+}

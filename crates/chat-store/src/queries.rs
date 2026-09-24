@@ -261,7 +261,11 @@ fn fold_read_duplicate(held: MessageRow, incoming: MessageRow) -> MessageRow {
     survivor.revoked = revoked;
     survivor.status = status;
     survivor.starred = held.starred || incoming.starred;
+    survivor.timestamp_ms = held.timestamp_ms.max(incoming.timestamp_ms);
     survivor.edited_at_ms = edited.map(|row| row.edited_at_ms.unwrap_or_default());
+    if let Some(content) = content {
+        survivor.kind = content.kind.clone();
+    }
     survivor.text_content = content.and_then(|row| row.text_content.clone());
     survivor.proto = content.and_then(|row| row.proto.clone());
     survivor.proto_codec = if revoked {
@@ -814,6 +818,7 @@ fn fill_unique(
             break;
         }
     }
+    kept.sort_by(|left, right| (right.timestamp_ms, right.id).cmp(&(left.timestamp_ms, left.id)));
     Ok(kept)
 }
 
@@ -870,6 +875,7 @@ fn fill_unique_after(
             break;
         }
     }
+    kept.sort_by_key(|row| (row.timestamp_ms, row.id));
     Ok(kept)
 }
 

@@ -8,6 +8,7 @@ use waproto::whatsapp as wa;
 use crate::schema;
 use crate::store::chat_rows::{ChatBump, bump_chat, refresh_preview_if_latest};
 use crate::store::message_identity::{resolve_target, stored_sender};
+use crate::store::writer::ChangeSet;
 
 /// Apply an edit to its target row. Monotonic on `edited_at_ms` so a replayed
 /// or stale (e.g. history-sync) edit can't roll back a newer one. An edit
@@ -27,9 +28,12 @@ pub(super) fn apply_edit(
     new_kind: &str,
     new_proto: &[u8],
     ts_ms: i64,
+    changes: &mut ChangeSet,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
-    if let Some(target) = resolve_target(conn, device_id, chat, target_id, from_me, sender)? {
+    if let Some(target) =
+        resolve_target(conn, device_id, chat, target_id, from_me, sender, changes)?
+    {
         let updated = diesel::update(
             dsl::messages
                 .filter(dsl::id.eq(target.id))

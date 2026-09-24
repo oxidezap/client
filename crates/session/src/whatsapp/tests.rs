@@ -1926,17 +1926,60 @@ async fn a_contact_update_repairs_an_already_seen_lid_chat() {
     let (chat_store, client) = test_session("contact-update-lid-mapping").await;
     let lid = "111000011119999@lid";
     let pn = "559900000099@s.whatsapp.net";
+    let group = "120363000000000099@g.us";
     feed(
         &chat_store,
         incoming_in(lid, wa::Message::text("oi"), "MSG-LID", 1_700_000_000),
     )
     .await;
+    feed(
+        &chat_store,
+        from(
+            group,
+            pn,
+            None,
+            wa::Message::text("same group message"),
+            "MSG-GROUP-ALIAS",
+            1_700_000_010,
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        from(
+            group,
+            lid,
+            None,
+            wa::Message::text("same group message"),
+            "MSG-GROUP-ALIAS",
+            1_700_000_020,
+        ),
+    )
+    .await;
+    assert_eq!(
+        chat_store
+            .messages(&group.parse::<Jid>().unwrap(), None, 20)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|message| message.id == "MSG-GROUP-ALIAS")
+            .count(),
+        2
+    );
 
     let names = Arc::new(book_with(&chat_store));
     let before = WhatsAppClient::load_history(&chat_store, &client, &names)
         .await
         .expect("history loads before the contact pair");
-    assert_eq!(before.chats[0].name, "Unknown contact");
+    assert_eq!(
+        before
+            .chats
+            .iter()
+            .find(|chat| chat.jid == lid)
+            .unwrap()
+            .name,
+        "Unknown contact"
+    );
 
     let update = Event::ContactUpdate(
         ContactUpdate::builder()
@@ -1959,6 +2002,7 @@ async fn a_contact_update_repairs_an_already_seen_lid_chat() {
     WhatsAppClient::spawn_contact_identity_learner(
         client.clone(),
         identity_incoming,
+        chat_store.clone(),
         names.clone(),
         Arc::new(tokio::sync::Notify::new()),
         stopping,
@@ -1983,13 +2027,35 @@ async fn a_contact_update_repairs_an_already_seen_lid_chat() {
     )
     .await;
     assert!(learned.is_some(), "the identity worker drains the update");
+    chat_store
+        .flush()
+        .await
+        .expect("identity reconciliation flushes");
+    let group_messages = chat_store
+        .messages(&group.parse::<Jid>().unwrap(), None, 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        group_messages
+            .iter()
+            .filter(|message| message.id == "MSG-GROUP-ALIAS")
+            .count(),
+        1,
+        "learning a contact alias repairs already stored group copies"
+    );
+    let group_chat = chat_store
+        .chat(&group.parse::<Jid>().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(group_chat.unread_count, 1);
 
     let after = WhatsAppClient::load_history(&chat_store, &client, &names)
         .await
         .expect("history loads after the contact pair");
-    assert_eq!(after.chats.len(), 1);
-    assert_eq!(after.chats[0].jid, lid);
-    assert_eq!(after.chats[0].name, "Bia");
+    assert_eq!(after.chats.len(), 2);
+    let lid_chat = after.chats.iter().find(|chat| chat.jid == lid).unwrap();
+    assert_eq!(lid_chat.name, "Bia");
 }
 
 /// A cursor is this crate's to write and to read, and the only thing that

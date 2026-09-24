@@ -226,11 +226,15 @@ fn apply_writer_msg(
         }
         WriterMsg::Reconcile(chat) => {
             let wire = chat.to_string();
-            crate::store::message_identity::reconcile_chat(conn, device_id, &wire)?;
+            crate::store::message_identity::reconcile_chat(conn, device_id, &wire, cs)?;
             if let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &wire)? {
                 crate::lid::merge_split_chat(conn, device_id, &wire, &alt, cs)?;
             }
             Ok(())
+        }
+        WriterMsg::ReconcileAll => {
+            crate::store::message_identity::reconcile_all(conn, device_id, cs)?;
+            crate::lid::reconcile_known_chats(conn, device_id, cs)
         }
         WriterMsg::Outgoing {
             chat,
@@ -262,6 +266,7 @@ fn apply_writer_msg(
                     starred: false,
                     overwrite: true,
                 },
+                cs,
             )?;
             if stored != StoredRow::Skipped {
                 bump_chat(
@@ -317,6 +322,7 @@ fn apply_writer_msg(
                 kind,
                 proto,
                 *timestamp_ms,
+                cs,
             )? {
                 cs.chats = true;
             }
@@ -337,6 +343,7 @@ fn apply_writer_msg(
                 "",
                 true,
                 *timestamp_ms,
+                cs,
             )? {
                 cs.chats = true;
             }
