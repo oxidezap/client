@@ -684,6 +684,16 @@ async fn retry_after_store_failure(
     }
 }
 
+fn resolved_metadata_matches(
+    stored_name: Option<&str>,
+    learned_name: Option<&str>,
+    stored_hierarchy: Option<&oxidezap_core::GroupHierarchy>,
+    expected_hierarchy: Option<&oxidezap_core::GroupHierarchy>,
+) -> bool {
+    (learned_name.is_none() || stored_name == learned_name)
+        && expected_hierarchy.is_none_or(|expected| stored_hierarchy == Some(expected))
+}
+
 /// Run one pass: decide which chats need a lookup, fetch their names, and
 /// write back what was learned.
 ///
@@ -1221,6 +1231,11 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // per JID; if a later message recreates a row, its new name still has to
     // be looked up in this generation. The read races teardown like the
     // network and flushes above, so a large account cannot hold shutdown.
+    let hierarchy_expectations: HashMap<String, oxidezap_core::GroupHierarchy> =
+        resolved_hierarchies
+            .iter()
+            .map(|write| (write.jid.to_string(), write.hierarchy.clone()))
+            .collect();
     let confirmation_jids: Vec<Jid> = settled
         .iter()
         .filter_map(|(jid, _)| jid.parse::<Jid>().ok())
@@ -1254,8 +1269,12 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                         resolver.forget(&jid, generation);
                     }
                     Some(entry)
-                        if learned_name.is_none()
-                            || entry.name.as_deref() == learned_name.as_deref() =>
+                        if resolved_metadata_matches(
+                            entry.name.as_deref(),
+                            learned_name.as_deref(),
+                            entry.group_hierarchy.as_ref(),
+                            hierarchy_expectations.get(&jid),
+                        ) =>
                     {
                         resolver.mark(&jid, generation);
                     }
@@ -1362,6 +1381,29 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    #[test]
+    fn a_name_match_does_not_settle_when_the_requested_hierarchy_did_not_land() {
+        let expected = oxidezap_core::GroupHierarchy::Community;
+        assert!(!resolved_metadata_matches(
+            Some("same name"),
+            Some("same name"),
+            None,
+            Some(&expected),
+        ));
+        assert!(resolved_metadata_matches(
+            Some("same name"),
+            Some("same name"),
+            Some(&expected),
+            Some(&expected),
+        ));
+        assert!(resolved_metadata_matches(
+            Some("same name"),
+            Some("same name"),
+            None,
+            None,
+        ));
+    }
 
     /// A metadata source the test drives: names on cue, failures and delays
     /// included — none of which a live client can be asked for.

@@ -280,7 +280,9 @@ impl WhatsAppApp {
 /// Flatten the authoritative community relationships for the Groups filter.
 /// A child is nested only when its parent JID is present and explicitly marked
 /// as a community; absent/unknown parents leave the subgroup visible at the
-/// root instead of guessing from a matching name.
+/// root instead of guessing from a matching name. A pinned subgroup whose
+/// parent is unpinned stays at the root in the pinned block rather than being
+/// demoted below that parent.
 pub(super) fn hierarchical_group_rows(
     rows: &[ChatRow],
     query: &str,
@@ -299,14 +301,19 @@ pub(super) fn hierarchical_group_rows(
         let Some(GroupHierarchy::Subgroup { parent_jid, .. }) = &row.group_hierarchy else {
             continue;
         };
-        if parent_jid == &row.jid
-            || !by_jid.get(parent_jid.as_str()).is_some_and(|parent| {
-                parent
+        let Some(parent) = by_jid.get(parent_jid.as_str()).filter(|parent| {
+            parent_jid != &row.jid
+                && parent
                     .group_hierarchy
                     .as_ref()
                     .is_some_and(|hierarchy| matches!(hierarchy, GroupHierarchy::Community))
-            })
-        {
+        }) else {
+            continue;
+        };
+        // Input rows are sorted with pinned chats first. Nesting this child
+        // below an unpinned parent would move the pin out of that block, so
+        // leave it as a root row instead; the parent must not hide it either.
+        if row.pinned && !parent.pinned && !query_active {
             continue;
         }
         children.entry(parent_jid).or_default().push(row);
@@ -574,8 +581,11 @@ mod tests {
         );
         let collapsed_rows =
             hierarchical_group_rows(&source_rows, "", &HashSet::from(["community@g.us".into()]));
+        let visible_selection = visible_chat_list_selection(&collapsed_rows, &selected)
+            .expect("collapsed parent remains selected in the list");
+        assert_eq!(visible_selection, "community@g.us");
         assert_eq!(
-            visible_chat_list_selection(&collapsed_rows, &selected),
+            selected_community_toggle(&collapsed_rows, &visible_selection),
             Some("community@g.us".into())
         );
     }
@@ -601,6 +611,44 @@ mod tests {
             Some("community@g.us".into())
         );
         assert_eq!(selected_community_toggle(&rows, "subgroup@g.us"), None);
+    }
+
+    #[test]
+    fn a_pinned_subgroup_stays_in_the_pinned_block_when_its_parent_is_unpinned() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let mut pinned_child = hierarchy_row(
+            "pinned-child@g.us",
+            "Pinned subgroup",
+            GroupHierarchy::Subgroup {
+                parent_jid: "community@g.us".into(),
+                kind: SubgroupKind::Regular,
+            },
+        );
+        pinned_child.pinned = true;
+        let rows = vec![
+            pinned_child,
+            hierarchy_row("standalone@g.us", "Standalone", GroupHierarchy::Standalone),
+            hierarchy_row("community@g.us", "Community", GroupHierarchy::Community),
+        ];
+
+        let rows = hierarchical_group_rows(&rows, "", &Default::default());
+        assert_eq!(
+            rows.iter().map(|row| row.jid.as_str()).collect::<Vec<_>>(),
+            vec!["pinned-child@g.us", "standalone@g.us", "community@g.us",]
+        );
+        assert_eq!(rows[0].tree_depth, 0);
+        assert!(!rows[2].community_toggle_visible);
+
+        let searched = hierarchical_group_rows(&rows, "Pinned subgroup", &Default::default());
+        assert_eq!(
+            searched
+                .iter()
+                .map(|row| row.jid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["community@g.us", "pinned-child@g.us"]
+        );
+        assert!(searched[0].hierarchy_context);
     }
 
     #[test]

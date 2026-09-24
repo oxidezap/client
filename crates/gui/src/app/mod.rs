@@ -1673,15 +1673,15 @@ impl WhatsAppApp {
         if search_input.is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window)) {
             return;
         }
-        let Some(selected) = self.selected_chat.as_deref() else {
-            return;
-        };
         let jid = {
             let cache = self.chat_list_cache.borrow();
             let Some(cache) = cache.as_ref() else {
                 return;
             };
-            let Some(jid) = chats::selected_community_toggle(&cache.rows, selected) else {
+            let Some(selected) = self.chat_list_selection_jid(cache) else {
+                return;
+            };
+            let Some(jid) = chats::selected_community_toggle(&cache.rows, &selected) else {
                 return;
             };
             jid
