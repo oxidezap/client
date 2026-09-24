@@ -1425,19 +1425,19 @@ mod document_scope_tests {
     #[test]
     fn regression_193_delayed_old_account_download_is_not_handed_off_or_recorded() {
         futures_lite::future::block_on(async {
-            let expected_generation = 4;
+            let expected_generation = 4_u64;
             let expected_account = "account-a";
             let scope = document_scope_key(expected_account, "chat-a", "message-1");
-            let (download_tx, download_rx) = futures_channel::oneshot::channel();
-            let current_generation = expected_generation.wrapping_add(1);
+            let current_generation = std::future::poll_fn(|_| {
+                std::task::Poll::Ready(expected_generation.wrapping_add(1))
+            })
+            .await;
             let current_account = expected_account;
             let mut handed_off = false;
             let mut saved_documents = std::collections::HashMap::new();
 
-            // Hold the completion until after logout invalidates the generation;
-            // the account identity remains unchanged on this transition.
-            download_tx.send(vec![1, 2, 3]).unwrap();
-            let _bytes = download_rx.await.unwrap();
+            // The delayed completion crosses an async boundary after logout
+            // invalidates the generation; identity remains unchanged.
             let completion = handoff_if_current(
                 current_generation,
                 current_account,
