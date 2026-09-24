@@ -32,6 +32,7 @@ struct RetainedSelection {
 
 struct RetainedParticipant {
     handle: TextSelectionHandle,
+    text: SharedString,
     _selection_subscription: gpui::Subscription,
 }
 
@@ -43,20 +44,24 @@ pub(super) struct RichTextState {
 
 #[derive(Clone, Copy)]
 struct LinkPress {
-    index: usize,
+    link_ix: usize,
     origin: Point<Pixels>,
     dragged: bool,
 }
 
 /// Holds participants by message identity until their selection ends.
 #[derive(Default)]
-struct RichTextSelectionRegistry(HashMap<(gpui::WindowId, String), RetainedParticipant>);
+struct RichTextSelectionRegistry(HashMap<(gpui::WindowId, Arc<str>), RetainedParticipant>);
 
 impl Global for RichTextSelectionRegistry {}
 
 fn new_retained_selection(text: &SharedString, cx: &mut App) -> RetainedSelection {
+    retained_selection(TextSelectionHandle::new(text.to_string(), cx), text)
+}
+
+fn retained_selection(handle: TextSelectionHandle, text: &SharedString) -> RetainedSelection {
     RetainedSelection {
-        handle: TextSelectionHandle::new(text.to_string(), cx),
+        handle,
         text: text.clone(),
         pressed_link: Rc::new(Cell::new(None)),
         projection: Rc::new(RefCell::new(TextSelectionProjection::default())),
@@ -74,17 +79,18 @@ pub(crate) fn active_selection_message_ids(window_id: gpui::WindowId, cx: &App) 
         .filter(|((id, _), participant)| {
             *id == window_id && participant.handle.snapshot(cx).is_some()
         })
-        .map(|((_, message_id), _)| message_id.clone())
+        .map(|((_, message_id), _)| message_id.to_string())
         .collect()
 }
 
 fn track_selection_handle(
     window_id: gpui::WindowId,
-    message_id: &str,
+    message_id: &Arc<str>,
     handle: &TextSelectionHandle,
+    text: &SharedString,
     cx: &mut App,
 ) {
-    let key = (window_id, message_id.to_owned());
+    let key = (window_id, Arc::clone(message_id));
     if handle.snapshot(cx).is_some() {
         if !cx.has_global::<RichTextSelectionRegistry>() {
             cx.set_global(RichTextSelectionRegistry::default());
@@ -92,7 +98,10 @@ fn track_selection_handle(
         let already_retained = cx
             .global::<RichTextSelectionRegistry>()
             .0
-            .contains_key(&key);
+            .get(&key)
+            .is_some_and(|participant| {
+                participant.handle.entity_id() == handle.entity_id() && participant.text == *text
+            });
         if !already_retained {
             let registry_key = key.clone();
             let subscription = handle.subscribe(
@@ -126,6 +135,7 @@ fn track_selection_handle(
                 key,
                 RetainedParticipant {
                     handle: handle.clone(),
+                    text: text.clone(),
                     _selection_subscription: subscription,
                 },
             );
@@ -151,7 +161,7 @@ pub(super) struct SelectableRichText {
     styled_text: StyledText,
     links: Vec<Range<usize>>,
     link_targets: Arc<[SharedString]>,
-    selection_key: String,
+    selection_key: Arc<str>,
     document_order: u64,
 }
 
@@ -171,7 +181,7 @@ impl SelectableRichText {
             styled_text,
             links,
             link_targets,
-            selection_key: selection_key.into(),
+            selection_key: Arc::from(selection_key.into()),
             document_order,
         }
     }
@@ -303,21 +313,15 @@ fn selection_quad_bounds(
         let Some(start) = layout.position_for_index(start_ix) else {
             continue;
         };
-        let line_edge = if start.x - bounds.left() > bounds.right() - start.x {
-            bounds.right()
-        } else {
-            bounds.left()
+        let line_start_ix = text[..start_ix]
+            .rfind('\n')
+            .map_or(0, |previous_newline| previous_newline + 1);
+        let Some(line_start) = layout.position_for_index(line_start_ix) else {
+            continue;
         };
-        let (left, right) = if start.x <= line_edge {
-            (start.x, line_edge)
-        } else {
-            (line_edge, start.x)
-        };
-        if left < right {
-            fragments.push(Bounds::from_corners(
-                Point::new(left, start.y),
-                Point::new(right, start.y + line_height),
-            ));
+        if let Some(fragment) = hard_break_selection_bounds(line_start, start, bounds, line_height)
+        {
+            fragments.push(fragment);
         }
     }
 
@@ -367,6 +371,57 @@ fn selection_glyph_bounds(
         }
     }
     fragments
+}
+
+fn link_at_position(
+    layout: &gpui::TextLayout,
+    text: &str,
+    links: &[Range<usize>],
+    position: Point<Pixels>,
+    window: &Window,
+) -> Option<usize> {
+    let index = match layout.index_for_position(position) {
+        Ok(index) | Err(index) => index,
+    };
+    if let Some(link_ix) = links.iter().position(|range| {
+        range.end == index
+            && !range.is_empty()
+            && selection_quad_bounds(text, range.clone(), layout, window)
+                .iter()
+                .any(|bounds| {
+                    position.x >= bounds.left()
+                        && position.x <= bounds.right()
+                        && position.y >= bounds.top()
+                        && position.y <= bounds.bottom()
+                })
+    }) {
+        return Some(link_ix);
+    }
+    links.iter().position(|range| range.contains(&index))
+}
+
+fn hard_break_selection_bounds(
+    line_start: Point<Pixels>,
+    line_end: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    line_height: Pixels,
+) -> Option<Bounds<Pixels>> {
+    let trailing_edge = if line_end.x >= line_start.x {
+        bounds.right()
+    } else {
+        bounds.left()
+    };
+    let (left, right) = if line_end.x <= trailing_edge {
+        (line_end.x, trailing_edge)
+    } else {
+        (trailing_edge, line_end.x)
+    };
+    (left < right).then(|| {
+        Bounds::from_corners(
+            Point::new(left, line_end.y),
+            Point::new(right, line_end.y + line_height),
+        )
+    })
 }
 
 fn merge_selection_fragments(mut fragments: Vec<Bounds<Pixels>>) -> Vec<Bounds<Pixels>> {
@@ -426,6 +481,29 @@ impl Element for SelectableRichText {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let window_id = window.window_handle().window_id();
+        let registry_key = (window_id, Arc::clone(&self.selection_key));
+        let registry_participant = cx
+            .has_global::<RichTextSelectionRegistry>()
+            .then(|| {
+                cx.global::<RichTextSelectionRegistry>()
+                    .0
+                    .get(&registry_key)
+                    .map(|participant| (participant.handle.clone(), participant.text.clone()))
+            })
+            .flatten();
+        let registry_handle = match registry_participant {
+            Some((handle, text)) if text == self.text && handle.snapshot(cx).is_some() => {
+                Some(handle)
+            }
+            Some((handle, text)) if text != self.text && handle.snapshot(cx).is_some() => {
+                // The bubble changed while virtualized, so its retained
+                // participant must not keep exporting the previous text.
+                TextSelection::clear(window, cx);
+                forget_window_selection_registry(window_id, cx);
+                None
+            }
+            _ => None,
+        };
         let handle = window.with_element_state(
             global_id.expect("SelectableRichText must have a stable element id"),
             |retained: Option<RetainedSelection>, window| {
@@ -440,7 +518,10 @@ impl Element for SelectableRichText {
                         }
                         new_retained_selection(&self.text, cx)
                     }
-                    None => new_retained_selection(&self.text, cx),
+                    None => match registry_handle.clone() {
+                        Some(handle) => retained_selection(handle, &self.text),
+                        None => new_retained_selection(&self.text, cx),
+                    },
                 };
                 let state = RichTextState {
                     handle: retained.handle.clone(),
@@ -450,7 +531,13 @@ impl Element for SelectableRichText {
                 (state, retained)
             },
         );
-        track_selection_handle(window_id, &self.selection_key, &handle.handle, cx);
+        track_selection_handle(
+            window_id,
+            &self.selection_key,
+            &handle.handle,
+            &self.text,
+            cx,
+        );
         let (layout_id, ()) = self
             .styled_text
             .request_layout(global_id, inspector_id, window, cx);
@@ -523,27 +610,32 @@ impl Element for SelectableRichText {
         }
         let links = self.links.clone();
         let mouse_position = window.mouse_position();
-        if let Ok(index) = layout.index_for_position(mouse_position)
-            && links.iter().any(|range| range.contains(&index))
-        {
+        if link_at_position(&layout, &self.text, &links, mouse_position, window).is_some() {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
         let targets = self.link_targets.clone();
+        let link_text = self.text.clone();
         let down_state = Rc::clone(&handle.pressed_link);
         let mouse_down_state = Rc::clone(&down_state);
         let down_layout = layout.clone();
         let down_hitbox = hitbox.clone();
+        let down_links = links.clone();
+        let down_text = link_text.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _cx| {
             if phase.bubble() && event.button == MouseButton::Left {
                 let press = if down_hitbox.is_hovered(window) {
-                    down_layout
-                        .index_for_position(event.position)
-                        .ok()
-                        .map(|index| LinkPress {
-                            index,
-                            origin: event.position,
-                            dragged: false,
-                        })
+                    link_at_position(
+                        &down_layout,
+                        &down_text,
+                        &down_links,
+                        event.position,
+                        window,
+                    )
+                    .map(|link_ix| LinkPress {
+                        link_ix,
+                        origin: event.position,
+                        dragged: false,
+                    })
                 } else {
                     None
                 };
@@ -568,6 +660,7 @@ impl Element for SelectableRichText {
             }
         });
         let up_layout = layout;
+        let up_text = link_text;
         let up_hitbox = hitbox.clone();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
             if !phase.bubble() || event.button != MouseButton::Left {
@@ -579,21 +672,20 @@ impl Element for SelectableRichText {
             if press.dragged || !up_hitbox.is_hovered(window) {
                 return;
             }
-            let Ok(index) = up_layout.index_for_position(event.position) else {
+            let Some(link_ix) =
+                link_at_position(&up_layout, &up_text, &links, event.position, window)
+            else {
                 return;
             };
+            if link_ix != press.link_ix {
+                return;
+            }
             if TextSelection::has_selection(window, cx) {
                 // A click-sized pointer wiggle can create a transient local
                 // selection. It should not suppress link activation or leave
                 // a tiny selection behind after the click.
                 TextSelection::clear(window, cx);
             }
-            let Some(link_ix) = links
-                .iter()
-                .position(|range| range.contains(&press.index) && range.contains(&index))
-            else {
-                return;
-            };
             TextSelection::end(window, cx);
             cx.stop_propagation();
             cx.open_url(&targets[link_ix]);
@@ -605,7 +697,7 @@ impl Element for SelectableRichText {
 mod tests {
     use gpui::{Bounds, point, px};
 
-    use super::{merge_selection_fragments, selection_glyph_bounds};
+    use super::{hard_break_selection_bounds, merge_selection_fragments, selection_glyph_bounds};
 
     #[test]
     fn bidi_selection_fragments_merge_in_visual_order_without_bridging_runs() {
@@ -649,6 +741,23 @@ mod tests {
                 Bounds::from_corners(point(px(30.), px(20.)), point(px(40.), px(40.))),
                 Bounds::from_corners(point(px(60.), px(20.)), point(px(70.), px(40.))),
             ]
+        );
+    }
+
+    #[test]
+    fn short_ltr_newline_highlight_extends_to_the_trailing_edge() {
+        let bounds = Bounds::from_corners(point(px(0.), px(0.)), point(px(100.), px(20.)));
+        assert_eq!(
+            hard_break_selection_bounds(
+                point(px(0.), px(0.)),
+                point(px(10.), px(0.)),
+                bounds,
+                px(20.)
+            ),
+            Some(Bounds::from_corners(
+                point(px(10.), px(0.)),
+                point(px(100.), px(20.)),
+            ))
         );
     }
 

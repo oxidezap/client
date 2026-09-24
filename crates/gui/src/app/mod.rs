@@ -295,7 +295,7 @@ pub use status::{Destination, StatusPane};
 pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -1935,28 +1935,47 @@ impl WhatsAppApp {
                 let cache = self.message_list_cache.borrow();
                 match (cache.get(chat_jid), self.find_chat(chat_jid)) {
                     (Some(previous), Some(current)) => {
-                        let previous_by_id: HashMap<&str, &ChatMessage> = previous
+                        let previous_by_id: HashMap<&str, (usize, &ChatMessage)> = previous
                             .messages
                             .iter()
-                            .map(|message| (message.id.as_str(), message.as_ref()))
+                            .enumerate()
+                            .map(|(index, message)| {
+                                (message.id.as_str(), (index, message.as_ref()))
+                            })
                             .collect();
-                        let current_by_id: HashMap<&str, &ChatMessage> = current
+                        let current_by_id: HashMap<&str, (usize, &ChatMessage)> = current
                             .messages
                             .iter()
-                            .map(|message| (message.id.as_str(), message))
+                            .enumerate()
+                            .map(|(index, message)| (message.id.as_str(), (index, message)))
                             .collect();
                         selected_ids.iter().any(|message_id| {
-                            let (Some(old), Some(new)) = (
+                            let (Some((old_index, old)), Some((new_index, new))) = (
                                 previous_by_id.get(message_id.as_str()),
                                 current_by_id.get(message_id.as_str()),
                             ) else {
                                 return true;
                             };
-                            !message_has_selectable_text(old)
+                            old_index != new_index
+                                || !message_has_selectable_text(old)
                                 || !message_has_selectable_text(new)
                                 || old.content != new.content
                                 || old.revoked != new.revoked
                         })
+                    }
+                    (None, Some(current)) => {
+                        // A preceding invalidation already compared content
+                        // with the last rendered snapshot. Until it renders
+                        // again, retain selection if its rows still exist.
+                        let current_selectable_ids: HashSet<&str> = current
+                            .messages
+                            .iter()
+                            .filter(|message| message_has_selectable_text(message))
+                            .map(|message| message.id.as_str())
+                            .collect();
+                        selected_ids
+                            .iter()
+                            .any(|message_id| !current_selectable_ids.contains(message_id.as_str()))
                     }
                     _ => true,
                 }
