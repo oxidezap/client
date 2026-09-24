@@ -309,7 +309,7 @@ fn selection_quad_bounds(
                         .get(&cluster_end_ix)
                         .copied()
                         .unwrap_or(line.unwrapped_layout.width);
-                    Some((*end_x - *start_x).abs())
+                    Some((end_x - *start_x).abs())
                 })
                 .filter(|advance| *advance > Pixels::ZERO)
                 .unwrap_or(line_height.half());
