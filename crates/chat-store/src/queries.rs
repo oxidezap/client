@@ -1792,18 +1792,19 @@ impl ChatStore {
     pub async fn starred_messages(&self, limit: i64) -> Result<Vec<StoredMessage>> {
         use schema::messages::dsl;
         let device_id = self.device_id();
-        let rows: Vec<MessageRow> = self
+        let rows: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
-                dsl::messages
+                let rows: Vec<MessageRow> = dsl::messages
                     .filter(dsl::device_id.eq(device_id).and(dsl::starred.eq(true)))
                     .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
                     .limit(limit.max(0))
                     .load(conn)
-                    .map_err(db_err)
+                    .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// Poll creation messages, optionally scoped to one chat, newest first.
@@ -1818,7 +1819,7 @@ impl ChatStore {
         use schema::messages::dsl;
         let device_id = self.device_id();
         let chat = chat.map(ToString::to_string);
-        let rows: Vec<MessageRow> = self
+        let rows: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
                 let mut query = dsl::messages
@@ -1833,14 +1834,15 @@ impl ChatStore {
                         crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
                     query = query.filter(dsl::chat_jid.eq_any(keys));
                 }
-                query
+                let rows: Vec<MessageRow> = query
                     .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
                     .limit(limit.max(0))
                     .load(conn)
-                    .map_err(db_err)
+                    .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// How much history the store holds, per chat or account-wide.
@@ -1934,7 +1936,7 @@ impl ChatStore {
             MessageKind::Document.as_str(),
             MessageKind::Sticker.as_str(),
         ];
-        let rows: Vec<MessageRow> = self
+        let rows: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
                 let mut query = dsl::messages
@@ -1945,14 +1947,15 @@ impl ChatStore {
                         crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
                     query = query.filter(dsl::chat_jid.eq_any(keys));
                 }
-                query
+                let rows: Vec<MessageRow> = query
                     .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
                     .limit(limit.max(0))
                     .load(conn)
-                    .map_err(db_err)
+                    .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// Delete chat rows that hold no messages. Returns how many were removed.
