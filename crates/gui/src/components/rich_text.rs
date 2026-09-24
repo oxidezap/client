@@ -298,8 +298,9 @@ fn link_style(
 #[cfg(test)]
 mod tests {
     use gpui::{
-        AppContext as _, Context, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
-        ParentElement as _, Render, Styled as _, TestAppContext, Window, div, point, px,
+        AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement, Modifiers,
+        MouseButton, ParentElement as _, Render, Styled as _, TestAppContext, Window, div, point,
+        px,
     };
 
     use super::{BubbleText, render_rich_text};
@@ -468,12 +469,13 @@ mod tests {
 
     struct TextSelectionTestView {
         source: &'static str,
+        focus_handle: FocusHandle,
     }
 
     impl Render for TextSelectionTestView {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let text = BubbleText::of(self.source);
-            div().size_full().child(
+            div().track_focus(&self.focus_handle).size_full().child(
                 div()
                     .id("message-row")
                     .w(px(400.))
@@ -494,11 +496,22 @@ mod tests {
             crate::theme::init(cx);
         });
         let selected = {
+            let mut focus_handle = None;
             let (_, visual) = cx.add_window_view(|window, cx| {
-                let view = cx.new(|_| TextSelectionTestView { source });
+                let view = cx.new(|cx| {
+                    let handle = cx.focus_handle();
+                    focus_handle = Some(handle.clone());
+                    TextSelectionTestView {
+                        source,
+                        focus_handle: handle,
+                    }
+                });
                 gpui_component::Root::new(view, window, cx)
             });
-            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                focus_handle.as_ref().unwrap().focus(window, cx);
+            });
             visual.simulate_mouse_down(
                 point(px(start_x), px(12.)),
                 MouseButton::Left,
@@ -530,11 +543,22 @@ mod tests {
             crate::theme::init(cx);
         });
         {
+            let mut focus_handle = None;
             let (_, visual) = cx.add_window_view(|window, cx| {
-                let view = cx.new(|_| TextSelectionTestView { source });
+                let view = cx.new(|cx| {
+                    let handle = cx.focus_handle();
+                    focus_handle = Some(handle.clone());
+                    TextSelectionTestView {
+                        source,
+                        focus_handle: handle,
+                    }
+                });
                 gpui_component::Root::new(view, window, cx)
             });
-            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                focus_handle.as_ref().unwrap().focus(window, cx);
+            });
             visual.simulate_mouse_down(
                 point(px(x), px(12.)),
                 MouseButton::Left,
@@ -558,13 +582,22 @@ mod tests {
             crate::theme::init(cx);
         });
         {
+            let mut focus_handle = None;
             let (_, visual) = cx.add_window_view(|window, cx| {
-                let view = cx.new(|_| TextSelectionTestView {
-                    source: "alpha https://example.invalid",
+                let view = cx.new(|cx| {
+                    let handle = cx.focus_handle();
+                    focus_handle = Some(handle.clone());
+                    TextSelectionTestView {
+                        source: "alpha https://example.invalid",
+                        focus_handle: handle,
+                    }
                 });
                 gpui_component::Root::new(view, window, cx)
             });
-            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                focus_handle.as_ref().unwrap().focus(window, cx);
+            });
             visual.simulate_mouse_down(
                 point(px(80.), px(12.)),
                 MouseButton::Left,
