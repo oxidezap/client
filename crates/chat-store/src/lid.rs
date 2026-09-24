@@ -30,12 +30,11 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
+use diesel::sql_types::{Integer, Text};
 use wacore_binary::{Jid, Server};
 
 use crate::schema;
 use crate::store::ChangeSet;
-use crate::types::MessageStatus;
 
 /// Bare 1:1 user chat key — the only namespace with a PN/LID alias. Hosted
 /// and interop namespaces alias differently and are left alone.
@@ -232,6 +231,29 @@ pub(crate) fn route_chat_key(
     }
 }
 
+/// Repair known PN/LID chat splits when a prepared account is reopened.
+pub(crate) fn reconcile_known_chats(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    use schema::chats::dsl;
+    let chats: Vec<String> = dsl::chats
+        .filter(dsl::device_id.eq(device_id))
+        .select(dsl::jid)
+        .load(conn)?;
+    let existing: std::collections::HashSet<String> = chats.iter().cloned().collect();
+    for chat in chats {
+        let Some(alt) = counterpart_chat_key(conn, device_id, &chat)? else {
+            continue;
+        };
+        if chat < alt && existing.contains(&alt) {
+            merge_split_chat(conn, device_id, &chat, &alt, cs)?;
+        }
+    }
+    Ok(())
+}
+
 fn lid_side<'a>(a: &'a str, b: &'a str) -> &'a str {
     if a.ends_with("@lid") { a } else { b }
 }
@@ -248,26 +270,6 @@ fn newest_message_ts(
         .select(dsl::timestamp_ms)
         .first(conn)
         .optional()
-}
-
-#[derive(QueryableByName)]
-struct DupMessage {
-    #[diesel(sql_type = Text)]
-    id: String,
-    #[diesel(sql_type = Integer)]
-    status: i32,
-    #[diesel(sql_type = Bool)]
-    starred: bool,
-    #[diesel(sql_type = Nullable<BigInt>)]
-    edited_at_ms: Option<i64>,
-    #[diesel(sql_type = Bool)]
-    revoked: bool,
-    #[diesel(sql_type = Nullable<Text>)]
-    text_content: Option<String>,
-    #[diesel(sql_type = Text)]
-    kind: String,
-    #[diesel(sql_type = Nullable<Binary>)]
-    proto: Option<Vec<u8>>,
 }
 
 /// Fold a peer's split PN/LID pair into one thread and return the surviving
@@ -319,78 +321,49 @@ pub(crate) fn merge_split_chat(
         return Ok(dest.to_string());
     }
 
-    // A message duplicated across the pair folds by the live-path precedence
-    // rules — anything less loses receipts, stars, tombstones or edits that
-    // reached only the losing side before the split healed.
-    let dups: Vec<DupMessage> = diesel::sql_query(
-        "SELECT m.msg_id AS id, m.status AS status, m.starred AS starred, \
-                m.edited_at_ms AS edited_at_ms, m.revoked AS revoked, \
-                m.text_content AS text_content, m.kind AS kind, m.proto AS proto \
-         FROM messages m \
-         WHERE m.device_id = ? AND m.chat_jid = ? AND EXISTS \
-         (SELECT 1 FROM messages d WHERE d.device_id = m.device_id \
-          AND d.chat_jid = ? AND d.msg_id = m.msg_id)",
-    )
-    .bind::<Integer, _>(device_id)
-    .bind::<Text, _>(src)
-    .bind::<Text, _>(dest)
-    .load(conn)?;
-    for dup in &dups {
-        use schema::messages::dsl;
-        // By precedence, not by the raw number. `Error` sits below `Pending`
-        // on WhatsApp's own scale, so `<` promoted a send that had failed for
-        // good back to "sending", where nothing would ever move it again.
-        let held: Option<i32> = crate::store::message_row(device_id, dest, &dup.id)
-            .select(dsl::status)
-            .first(conn)
-            .optional()?;
-        if held.is_some_and(|held| {
-            MessageStatus::from_raw(dup.status).wins_over(MessageStatus::from_raw(held))
-        }) {
-            diesel::update(crate::store::message_row(device_id, dest, &dup.id))
-                .set(dsl::status.eq(dup.status))
-                .execute(conn)?;
-        }
-        if dup.starred {
-            diesel::update(crate::store::message_row(device_id, dest, &dup.id))
-                .set(dsl::starred.eq(true))
-                .execute(conn)?;
-        }
-        if dup.revoked {
-            diesel::update(crate::store::message_row(device_id, dest, &dup.id))
-                .set((
-                    dsl::revoked.eq(true),
-                    dsl::text_content.eq(None::<String>),
-                    dsl::proto.eq(None::<Vec<u8>>),
-                ))
-                .execute(conn)?;
-        } else if let Some(edited) = dup.edited_at_ms {
-            diesel::update(
-                crate::store::message_row(device_id, dest, &dup.id)
-                    .filter(dsl::revoked.eq(false))
-                    // Strictly newer: a tie may be two competing edits, and
-                    // keeping the destination's copy is the deterministic pick.
-                    .filter(dsl::edited_at_ms.is_null().or(dsl::edited_at_ms.lt(edited))),
+    // Fold only copies with the same proven author. A stanza id reused by a
+    // different participant is a separate message and must survive the chat
+    // merge as a separate row.
+    crate::store::message_identity::reconcile_chat(conn, device_id, src)?;
+    crate::store::message_identity::reconcile_chat(conn, device_id, dest)?;
+    use schema::messages::dsl;
+    let source_rows: Vec<(i64, String, String, bool)> = dsl::messages
+        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(src)))
+        .select((dsl::id, dsl::msg_id, dsl::sender_jid, dsl::from_me))
+        .load(conn)?;
+    for (source_id, msg_id, sender, from_me) in source_rows {
+        let destination_rows: Vec<(i64, String, bool)> = dsl::messages
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::chat_jid.eq(dest))
+                    .and(dsl::msg_id.eq(&msg_id)),
             )
-            .set((
-                dsl::text_content.eq(dup.text_content.as_deref()),
-                dsl::kind.eq(&dup.kind),
-                dsl::proto.eq(dup.proto.as_deref()),
-                dsl::edited_at_ms.eq(Some(edited)),
-            ))
-            .execute(conn)?;
+            .select((dsl::id, dsl::sender_jid, dsl::from_me))
+            .load(conn)?;
+        let mut ids = vec![source_id];
+        for (id, destination_sender, destination_from_me) in destination_rows {
+            if crate::store::message_identity::authors_match(
+                conn,
+                device_id,
+                from_me,
+                &sender,
+                destination_from_me,
+                &destination_sender,
+            )? {
+                ids.push(id);
+            }
         }
-        diesel::sql_query(
-            "DELETE FROM messages WHERE device_id = ? AND chat_jid = ? AND msg_id = ?",
-        )
-        .bind::<Integer, _>(device_id)
-        .bind::<Text, _>(src)
-        .bind::<Text, _>(&dup.id)
-        .execute(conn)?;
+        if ids.len() > 1 {
+            crate::store::message_identity::merge_rows(
+                conn, device_id, &msg_id, dest, &ids, from_me,
+            )?;
+        }
     }
-    // UPDATE OR IGNORE: identity collisions (the dups above) stay behind and
-    // are dropped after. Ids survive the UPDATE, so the FTS external-content
-    // index stays consistent; the leftover DELETE fires its cleanup trigger.
+    // Preserve unmatched rows if a pre-existing uniqueness conflict prevents
+    // movement; the alias-aware readers still see them, and a later identity
+    // resolution can safely repair them. IDs remain stable and the update
+    // keeps the FTS external-content index in step.
     diesel::sql_query(
         "UPDATE OR IGNORE messages SET chat_jid = ? WHERE device_id = ? AND chat_jid = ?",
     )
@@ -398,11 +371,6 @@ pub(crate) fn merge_split_chat(
     .bind::<Integer, _>(device_id)
     .bind::<Text, _>(src)
     .execute(conn)?;
-    diesel::sql_query("DELETE FROM messages WHERE device_id = ? AND chat_jid = ?")
-        .bind::<Integer, _>(device_id)
-        .bind::<Text, _>(src)
-        .execute(conn)?;
-
     // Satellites: the newest reaction per (msg, sender) and the highest
     // receipt per (msg, user) win across the pair, matching their live-path
     // monotonic rules — drop the losing destination rows, then move.

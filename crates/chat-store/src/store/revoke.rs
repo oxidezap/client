@@ -5,7 +5,7 @@ use diesel::prelude::*;
 
 use crate::schema;
 use crate::store::chat_rows::{ChatBump, bump_chat, refresh_preview_if_latest};
-use crate::store::message_rows::message_row;
+use crate::store::message_identity::{resolve_target, stored_sender};
 
 /// Tombstone the target row. A revoke arriving before its content (offline
 /// drain reordering) inserts the tombstone up front, so the content's later
@@ -28,62 +28,61 @@ pub(super) fn apply_revoke(
     ts_ms: i64,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
-    let updated = if target_from_me {
-        diesel::update(
-            message_row(device_id, chat, target_id)
-                .filter(dsl::from_me.eq(true))
-                .filter(dsl::sender_jid.eq("")),
+    if let Some(target) = resolve_target(conn, device_id, chat, target_id, target_from_me, sender)?
+    {
+        let updated = diesel::update(
+            dsl::messages
+                .filter(dsl::id.eq(target.id))
+                .filter(dsl::revoked.eq(false)),
         )
-    } else {
-        diesel::update(
-            message_row(device_id, chat, target_id)
-                .filter(dsl::from_me.eq(false))
-                .filter(dsl::sender_jid.eq(sender)),
-        )
-    }
-    .set((
-        dsl::revoked.eq(true),
-        dsl::text_content.eq(None::<String>),
-        dsl::proto.eq(None::<Vec<u8>>),
-        // No bytes left to decode; reset the representation so a `NULL`
-        // tombstone never claims a codec.
-        dsl::proto_codec.eq(crate::storage_proto::CODEC_RAW),
-    ))
-    .execute(conn)?;
-    if updated == 0 {
-        let inserted = diesel::insert_into(dsl::messages)
-            .values((
-                dsl::device_id.eq(device_id),
-                dsl::chat_jid.eq(chat),
-                dsl::msg_id.eq(target_id),
-                dsl::sender_jid.eq(sender),
-                dsl::from_me.eq(target_from_me),
-                dsl::timestamp_ms.eq(ts_ms),
-                dsl::kind.eq("unknown"),
-                dsl::revoked.eq(true),
-            ))
-            .on_conflict_do_nothing()
-            .execute(conn)?
-            > 0;
-        // The tombstone may be the chat's first/newest row: the chat must
-        // exist and order by it (the deleted message DID happen), and an
-        // unseen deletion still counts as unread like WA's own badge does.
-        if inserted {
-            bump_chat(
-                conn,
-                device_id,
-                chat,
-                ChatBump {
-                    msg_id: target_id,
-                    ts_ms,
-                    preview: None,
-                    kind: None,
-                    unread_delta: i32::from(!target_from_me),
-                },
-            )?;
-            return Ok(true);
+        .set((
+            dsl::revoked.eq(true),
+            dsl::text_content.eq(None::<String>),
+            dsl::proto.eq(None::<Vec<u8>>),
+            // No bytes left to decode; reset the representation so a `NULL`
+            // tombstone never claims a codec.
+            dsl::proto_codec.eq(crate::storage_proto::CODEC_RAW),
+        ))
+        .execute(conn)?;
+        if updated == 0 {
+            return Ok(false);
         }
+        return refresh_preview_if_latest(conn, device_id, chat, target_id, None, None);
+    }
+
+    let sender = stored_sender(sender, target_from_me);
+    let inserted = diesel::insert_into(dsl::messages)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::chat_jid.eq(chat),
+            dsl::msg_id.eq(target_id),
+            dsl::sender_jid.eq(&sender),
+            dsl::from_me.eq(target_from_me),
+            dsl::timestamp_ms.eq(ts_ms),
+            dsl::kind.eq("unknown"),
+            dsl::proto_codec.eq(crate::storage_proto::CODEC_RAW),
+            dsl::revoked.eq(true),
+        ))
+        .on_conflict_do_nothing()
+        .execute(conn)?
+        > 0;
+    // The tombstone may be the chat's first/newest row: the chat must exist
+    // and order by it (the deleted message DID happen), and an unseen deletion
+    // still counts as unread like WA's own badge does.
+    if !inserted {
         return Ok(false);
     }
-    refresh_preview_if_latest(conn, device_id, chat, target_id, None, None)
+    bump_chat(
+        conn,
+        device_id,
+        chat,
+        ChatBump {
+            msg_id: target_id,
+            ts_ms,
+            preview: None,
+            kind: None,
+            unread_delta: i32::from(!target_from_me),
+        },
+    )?;
+    Ok(true)
 }

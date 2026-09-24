@@ -220,6 +220,84 @@ pub(crate) struct MessageRow {
     revoked: bool,
 }
 
+/// Fold an author-equivalent legacy copy for a read without hiding a
+/// tombstone or treating a sender collision as the same message.
+fn fold_read_duplicate(held: MessageRow, incoming: MessageRow) -> MessageRow {
+    let held_is_survivor = held.id <= incoming.id;
+    let mut survivor = if held_is_survivor {
+        held.clone()
+    } else {
+        incoming.clone()
+    };
+    let revoked = held.revoked || incoming.revoked;
+    let edited = match (held.edited_at_ms, incoming.edited_at_ms) {
+        (Some(left), Some(right)) if right > left => Some(&incoming),
+        (Some(_), Some(_)) => Some(&held),
+        (Some(_), None) => Some(&held),
+        (None, Some(_)) => Some(&incoming),
+        (None, None) => None,
+    };
+    let content = if revoked {
+        None
+    } else {
+        edited.or_else(|| {
+            let stable = if held_is_survivor { &held } else { &incoming };
+            if stable.text_content.is_some() || stable.proto.is_some() {
+                Some(stable)
+            } else if held.text_content.is_some() || held.proto.is_some() {
+                Some(&held)
+            } else {
+                Some(&incoming)
+            }
+        })
+    };
+    let status = if MessageStatus::from_raw(incoming.status)
+        .wins_over(MessageStatus::from_raw(held.status))
+    {
+        incoming.status
+    } else {
+        held.status
+    };
+    survivor.revoked = revoked;
+    survivor.status = status;
+    survivor.starred = held.starred || incoming.starred;
+    survivor.edited_at_ms = edited.map(|row| row.edited_at_ms.unwrap_or_default());
+    survivor.text_content = content.and_then(|row| row.text_content.clone());
+    survivor.proto = content.and_then(|row| row.proto.clone());
+    survivor.proto_codec = if revoked {
+        crate::storage_proto::CODEC_RAW
+    } else {
+        content.map_or(survivor.proto_codec, |row| row.proto_codec)
+    };
+    survivor
+}
+
+fn push_unique_message(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    kept: &mut Vec<MessageRow>,
+    row: MessageRow,
+) -> std::result::Result<(), wacore::store::error::StoreError> {
+    for prior in kept.iter_mut() {
+        if prior.msg_id == row.msg_id
+            && crate::store::message_identity::authors_match(
+                conn,
+                device_id,
+                prior.from_me,
+                &prior.sender_jid,
+                row.from_me,
+                &row.sender_jid,
+            )
+            .map_err(db_err)?
+        {
+            *prior = fold_read_duplicate(prior.clone(), row);
+            return Ok(());
+        }
+    }
+    kept.push(row);
+    Ok(())
+}
+
 impl From<MessageRow> for StoredMessage {
     fn from(row: MessageRow) -> Self {
         let message = row.proto.as_deref().and_then(|bytes| {
@@ -596,11 +674,7 @@ impl ChatStore {
                 use schema::chats::dsl as chats;
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                let rows: Vec<MessageRow> = page_query(device_id, &keys, before.as_ref())
-                    .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
-                    .limit(limit)
-                    .load(conn)
-                    .map_err(db_err)?;
+                let rows = fill_unique(conn, device_id, &keys, before.clone(), limit)?;
                 let messages = finalize_messages(conn, device_id, rows)?;
 
                 let counts: Vec<i32> = chats::chats
@@ -709,9 +783,8 @@ impl ChatStore {
 /// something, which a merged pair never does.
 ///
 /// Both readers go through it: the single chat's page and the batch an attach
-/// load asks for. The batch is where this was missing, which is the shape of
-/// every other defect in this batch — the rule written once and not repeated on
-/// its twin.
+/// load asks for. Rows sharing an id collapse only when their authors are
+/// proven equivalent; sender collisions remain separate bubbles.
 fn fill_unique(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -721,12 +794,6 @@ fn fill_unique(
 ) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
-    // Alias candidates represent one PN/LID thread, where the same id is a
-    // duplicate even though the wire sender spelling differs. A single chat
-    // can legitimately contain that id from two group participants, so its
-    // sender remains part of the read identity.
-    let dedupe_by_sender = keys.len() == 1;
-    let mut ids = std::collections::HashSet::new();
     let mut before = before;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
@@ -741,14 +808,7 @@ fn fill_unique(
             seq: row.id,
         });
         for row in rows {
-            let identity = if dedupe_by_sender {
-                (row.msg_id.clone(), row.sender_jid.clone())
-            } else {
-                (row.msg_id.clone(), String::new())
-            };
-            if ids.insert(identity) {
-                kept.push(row);
-            }
+            push_unique_message(conn, device_id, &mut kept, row)?;
         }
         if exhausted {
             break;
@@ -774,11 +834,6 @@ fn fill_unique_after(
 ) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
-    // The same read identity [`fill_unique`] uses: alias candidates are one
-    // thread, so the id alone is the duplicate; a single chat may hold the
-    // same id from two group participants and keeps the sender in the key.
-    let dedupe_by_sender = keys.len() == 1;
-    let mut ids = std::collections::HashSet::new();
     let mut after = after;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
@@ -807,14 +862,7 @@ fn fill_unique_after(
             };
         }
         for row in rows {
-            let identity = if dedupe_by_sender {
-                (row.msg_id.clone(), row.sender_jid.clone())
-            } else {
-                (row.msg_id.clone(), String::new())
-            };
-            if ids.insert(identity) {
-                kept.push(row);
-            }
+            push_unique_message(conn, device_id, &mut kept, row)?;
         }
         // `rows` was empty: the store is exhausted and the cursor did not
         // move, so another pass would ask the same question forever.
@@ -1243,7 +1291,11 @@ impl ChatStore {
                     )
                     .load(conn)
                     .map_err(db_err)?;
-                finalize_messages(conn, device_id, rows)
+                let mut unique = Vec::new();
+                for row in rows {
+                    push_unique_message(conn, device_id, &mut unique, row)?;
+                }
+                finalize_messages(conn, device_id, unique)
             })
             .await?;
         // `message()` names no sender, so same-id rows from two group

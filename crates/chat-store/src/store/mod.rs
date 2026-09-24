@@ -16,6 +16,7 @@ mod edit;
 mod event;
 mod history_sync;
 mod inbound;
+pub(crate) mod message_identity;
 mod message_rows;
 mod reaction;
 mod read_state;
@@ -313,13 +314,26 @@ impl ChatStore {
     }
 
     /// Open the already-prepared database on the same file as `store`, bound to
-    /// its device id, and start the writer task.
+    /// its device id, repair proven legacy message duplicates, and start the
+    /// writer task.
     ///
+    /// Repair is one account-scoped transaction against the mapping ledger as
+    /// it stands now; a tombstone wins, and previews/unread are re-derived.
     /// This is the entry point for a runtime after the registry has called
     /// [`Self::prepare`]. It does not launch another migration runner.
     pub async fn new_prepared(store: &SqliteStore) -> Result<Arc<Self>> {
         let db = store.shared();
         let device_id = store.device_id();
+        db.run(move |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                crate::store::message_identity::reconcile_all(conn, device_id)?;
+                let mut changes = ChangeSet::default();
+                crate::lid::reconcile_known_chats(conn, device_id, &mut changes)?;
+                Ok(())
+            })
+            .map_err(crate::error::db_err)
+        })
+        .await?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
@@ -595,15 +609,15 @@ impl ChatStore {
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
-    /// Reconcile a 1:1 peer's PN- and LID-keyed rows into a single thread.
+    /// Reconcile proven duplicate authors in a chat and, for a 1:1 peer,
+    /// merge PN- and LID-keyed thread rows when the mapping is known.
     ///
-    /// Receipts dropped under the wrong identity (before this crate resolved
-    /// PN/LID aliases) left some stores with a split pair: a populated chat
-    /// under the phone-number key plus a stray `@lid` twin. Live traffic for
-    /// the peer now heals such a pair on its own; this makes the repair
-    /// on-demand for embedders that want it eagerly. Idempotent — a peer with
-    /// one thread (or no LID mapping yet) is a no-op. Goes through the writer
-    /// queue; use [`flush`](Self::flush) to await completion.
+    /// Receipts dropped under the wrong identity left some stores with a
+    /// split pair: a populated chat under the phone-number key plus a stray
+    /// `@lid` twin. Live traffic heals known pairs on its own; this makes the
+    /// repair on-demand for embedders that want it eagerly. Idempotent —
+    /// unknown aliases and distinct authors are never guessed together. Goes
+    /// through the writer queue; use [`flush`](Self::flush) to await completion.
     pub fn reconcile_chat(&self, chat: &Jid) -> Result<()> {
         self.tx
             .send(WriterMsg::Reconcile(chat.clone()))
