@@ -102,6 +102,12 @@ pub fn render_message_list(
         .relative()
         .overflow_hidden()
         .child(
+            div()
+                .absolute()
+                .size_0()
+                .child(crate::components::rich_text_selection::RetainedSelectionKeepalive),
+        )
+        .child(
             // The gutter is each row's, not the list's. `gpui::list` honours
             // the vertical half of its own padding and lays every row out at
             // the left edge of its bounds regardless of the horizontal half,

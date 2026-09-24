@@ -15,7 +15,7 @@ use gpui::{
     App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, Global,
     GlobalElementId, Half, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    SharedString, StyledText, Window, transparent_black,
+    SharedString, Style, StyledText, Window, transparent_black,
 };
 use gpui_base::{
     TextSelection, TextSelectionHandle, TextSelectionProjection, TextSelectionRegistration,
@@ -168,6 +168,99 @@ pub(crate) fn forget_window_selection_registry(window_id: gpui::WindowId, cx: &m
         cx.global_mut::<RichTextSelectionRegistry>()
             .0
             .retain(|(id, _), _| *id != window_id);
+    }
+}
+
+/// Keeps selected virtualized rows registered with GPUI's per-frame selection sweep.
+pub(crate) struct RetainedSelectionKeepalive;
+
+impl IntoElement for RetainedSelectionKeepalive {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for RetainedSelectionKeepalive {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(Style::default(), &[], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let window_id = window.window_handle().window_id();
+        let retained = cx
+            .has_global::<RichTextSelectionRegistry>()
+            .then(|| {
+                cx.global::<RichTextSelectionRegistry>()
+                    .0
+                    .iter()
+                    .filter(|((id, _), participant)| {
+                        *id == window_id && participant.handle.snapshot(cx).is_some()
+                    })
+                    .map(|(_, participant)| {
+                        (participant.handle.clone(), participant.document_order)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if retained.is_empty() {
+            return ();
+        }
+
+        // Keep the selection participants alive without presenting stale row
+        // geometry as a hit target. The hitbox still inherits the timeline's
+        // clipping mask, which is what GPUI uses for drag auto-scroll.
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let dormant_bounds = Bounds::new(
+            Point::new(bounds.left(), gpui::px(1_000_000.)),
+            gpui::Size::default(),
+        );
+        for (handle, document_order) in retained {
+            handle.register(
+                TextSelectionRegistration::new(hitbox.clone(), dormant_bounds)
+                    .with_document_order(document_order),
+                window,
+                cx,
+            );
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        _: &mut Window,
+        _: &mut App,
+    ) {
     }
 }
 

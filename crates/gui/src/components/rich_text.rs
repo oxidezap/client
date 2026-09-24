@@ -489,6 +489,12 @@ mod tests {
             div()
                 .track_focus(&self.focus_handle)
                 .size_full()
+                .child(
+                    div()
+                        .absolute()
+                        .size_0()
+                        .child(crate::components::rich_text_selection::RetainedSelectionKeepalive),
+                )
                 .when(self.show_text, |el| {
                     el.child(
                         div()
@@ -720,6 +726,13 @@ mod tests {
             });
             window.draw(cx).clear(cx);
         });
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
         visual.update(|window, cx| {
             selection_view.as_ref().unwrap().update(cx, |view, cx| {
                 view.show_text = true;
