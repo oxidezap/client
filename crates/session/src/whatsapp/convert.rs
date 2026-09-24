@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use oxidezap_core::{ChatMessage, MessageStatus, PollContent, UiEvent};
 use whatsapp_rust::client::Client;
-use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::waproto::whatsapp as wa;
 
 use super::media;
