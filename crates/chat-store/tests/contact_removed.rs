@@ -45,25 +45,6 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
         .await
         .expect("put second LID mapping");
     let older_lid = "111000011119999@lid";
-    feed(
-        &store,
-        [history_sync_event(wa::HistorySync {
-            conversations: vec![
-                wa::Conversation {
-                    id: PEER_LID.into(),
-                    name: Some("Saved Name".into()),
-                    ..Default::default()
-                },
-                wa::Conversation {
-                    id: "559900000099@s.whatsapp.net".into(),
-                    name: Some("Independent display name".into()),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        })],
-    )
-    .await;
     let mut changes = store.subscribe();
 
     // Verify the event is subscribed, then enqueue it through the same handler
@@ -74,16 +55,6 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
     let saved = store.contact(&jid(PEER)).await.unwrap().unwrap();
     assert_eq!(saved.full_name.as_deref(), Some("Saved Name"));
     assert_eq!(saved.first_name.as_deref(), Some("Saved"));
-    let before_chats = store.chats(false, 10).await.unwrap();
-    assert_eq!(
-        before_chats
-            .iter()
-            .find(|chat| chat.jid == jid(PEER_LID))
-            .unwrap()
-            .name
-            .as_deref(),
-        Some("Saved Name")
-    );
     assert!(matches!(
         timeout(Duration::from_secs(1), changes.recv())
             .await
@@ -91,9 +62,6 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
         Ok(StoreChange::Contacts)
     ));
 
-    // The conversation row can hold a history copy of a saved name. Follow a
-    // later contact rename only when it still matches the previous book value,
-    // so removal can retire that copy without touching independent names.
     feed(
         &store,
         [contact_update(PEER, "Renamed Saved Name", "Renamed")],
@@ -103,57 +71,24 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
         timeout(Duration::from_secs(1), changes.recv())
             .await
             .unwrap(),
-        Ok(StoreChange::Chats)
-    ));
-    assert!(matches!(
-        timeout(Duration::from_secs(1), changes.recv())
-            .await
-            .unwrap(),
         Ok(StoreChange::Contacts)
     ));
-    let renamed_chat = store
-        .chats(false, 10)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|chat| chat.jid == jid(PEER_LID))
-        .unwrap();
-    assert_eq!(renamed_chat.name.as_deref(), Some("Renamed Saved Name"));
 
+    store
+        .set_contact_alias(&jid(PEER), Some("Local Alias".into()))
+        .await
+        .unwrap();
     feed(&store, [contact_removed(PEER)]).await;
     let removed = store.contact(&jid(PEER)).await.unwrap().unwrap();
     assert_eq!(removed.full_name, None);
     assert_eq!(removed.first_name, None);
-    assert!(matches!(
-        timeout(Duration::from_secs(1), changes.recv())
-            .await
-            .unwrap(),
-        Ok(StoreChange::Chats)
-    ));
+    assert_eq!(removed.alias.as_deref(), Some("Local Alias"));
     assert!(matches!(
         timeout(Duration::from_secs(1), changes.recv())
             .await
             .unwrap(),
         Ok(StoreChange::Contacts)
     ));
-    let after_chats = store.chats(false, 10).await.unwrap();
-    assert_eq!(
-        after_chats
-            .iter()
-            .find(|chat| chat.jid == jid(PEER_LID))
-            .unwrap()
-            .name,
-        None
-    );
-    assert_eq!(
-        after_chats
-            .iter()
-            .find(|chat| chat.jid == jid("559900000099@s.whatsapp.net"))
-            .unwrap()
-            .name
-            .as_deref(),
-        Some("Independent display name")
-    );
 
     // A duplicate and an unknown contact are no-ops: no empty row and no
     // spurious invalidation. A later legitimate update can save the name again.

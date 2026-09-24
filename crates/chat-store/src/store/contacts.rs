@@ -122,19 +122,9 @@ pub(super) fn clear_contact_names(
     conn: &mut SqliteConnection,
     device_id: i32,
     jid: &str,
-) -> QueryResult<(bool, bool)> {
+) -> QueryResult<bool> {
     use schema::contacts::dsl as contacts;
     let keys = contact_keys(conn, device_id, jid)?;
-
-    let address_book_names: Vec<String> = contacts::contacts
-        .filter(contacts::device_id.eq(device_id))
-        .filter(contacts::jid.eq_any(&keys))
-        .select((contacts::full_name, contacts::first_name))
-        .load::<(Option<String>, Option<String>)>(conn)?
-        .into_iter()
-        .flat_map(|(full_name, first_name)| [full_name, first_name])
-        .flatten()
-        .collect();
     let contact_changed = diesel::update(
         contacts::contacts
             .filter(contacts::device_id.eq(device_id))
@@ -151,22 +141,7 @@ pub(super) fn clear_contact_names(
     ))
     .execute(conn)?;
 
-    // Direct-chat history may carry a copy of the address-book label in
-    // `chats.name`. Retire only an exact prior address-book value; a different
-    // server-provided display name is independent and must remain a fallback.
-    let chat_changed = if address_book_names.is_empty() {
-        0
-    } else {
-        diesel::update(
-            schema::chats::dsl::chats
-                .filter(schema::chats::dsl::device_id.eq(device_id))
-                .filter(schema::chats::dsl::jid.eq_any(&keys))
-                .filter(schema::chats::dsl::name.eq_any(address_book_names)),
-        )
-        .set(schema::chats::dsl::name.eq(None::<String>))
-        .execute(conn)?
-    };
-    Ok((contact_changed > 0, chat_changed > 0))
+    Ok(contact_changed > 0)
 }
 
 pub(super) fn upsert_contact_names(
@@ -175,18 +150,9 @@ pub(super) fn upsert_contact_names(
     jid: &str,
     full_name: Option<&str>,
     first_name: Option<&str>,
-) -> QueryResult<Vec<String>> {
+) -> QueryResult<()> {
     use schema::contacts::dsl;
     let jid = contact_key(jid);
-    let keys = contact_keys(conn, device_id, jid.as_ref())?;
-    let previous_names: Vec<String> = dsl::contacts
-        .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq_any(&keys)))
-        .select((dsl::full_name, dsl::first_name))
-        .load::<(Option<String>, Option<String>)>(conn)?
-        .into_iter()
-        .flat_map(|(full_name, first_name)| [full_name, first_name])
-        .flatten()
-        .collect();
     diesel::insert_into(dsl::contacts)
         .values((
             dsl::device_id.eq(device_id),
@@ -198,30 +164,5 @@ pub(super) fn upsert_contact_names(
         .do_update()
         .set((dsl::full_name.eq(full_name), dsl::first_name.eq(first_name)))
         .execute(conn)?;
-    Ok(previous_names)
-}
-
-/// Follow an address-book rename into a history chat-name copy, but only when
-/// that row still contains the previous address-book value.
-pub(super) fn update_chat_names_from_contact(
-    conn: &mut SqliteConnection,
-    device_id: i32,
-    jid: &str,
-    previous_names: Vec<String>,
-    new_name: Option<&str>,
-) -> QueryResult<bool> {
-    if previous_names.is_empty() {
-        return Ok(false);
-    }
-    use schema::chats::dsl;
-    let keys = contact_keys(conn, device_id, jid)?;
-    let changed = diesel::update(
-        dsl::chats
-            .filter(dsl::device_id.eq(device_id))
-            .filter(dsl::jid.eq_any(keys))
-            .filter(dsl::name.eq_any(previous_names)),
-    )
-    .set(dsl::name.eq(new_name))
-    .execute(conn)?;
-    Ok(changed > 0)
+    Ok(())
 }

@@ -14,9 +14,7 @@ use crate::store::chat_rows::{
     ChatBump, bump_chat, chat_row, delete_chat_rows, ensure_chat, recompute_chat_preview,
     remaining_messages,
 };
-use crate::store::contacts::{
-    clear_contact_names, update_chat_names_from_contact, upsert_contact_names,
-};
+use crate::store::contacts::{clear_contact_names, upsert_contact_names};
 use crate::store::history_sync::apply_history_sync;
 use crate::store::inbound::apply_inbound;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message, message_row};
@@ -93,33 +91,18 @@ pub(super) fn apply_event(
         }
         Event::HistorySync(lazy) => apply_history_sync(conn, device_id, lazy, cs),
         Event::ContactUpdate(update) => {
-            let jid = update.jid.to_string();
-            let previous_names = upsert_contact_names(
+            upsert_contact_names(
                 conn,
                 device_id,
-                &jid,
+                &update.jid.to_string(),
                 update.action.full_name.as_deref(),
                 update.action.first_name.as_deref(),
-            )?;
-            cs.chats |= update_chat_names_from_contact(
-                conn,
-                device_id,
-                &jid,
-                previous_names,
-                update
-                    .action
-                    .full_name
-                    .as_deref()
-                    .or(update.action.first_name.as_deref()),
             )?;
             cs.contacts = true;
             Ok(())
         }
         Event::ContactRemoved(removed) => {
-            let (contacts_changed, chats_changed) =
-                clear_contact_names(conn, device_id, &removed.jid.to_string())?;
-            cs.contacts |= contacts_changed;
-            cs.chats |= chats_changed;
+            cs.contacts |= clear_contact_names(conn, device_id, &removed.jid.to_string())?;
             Ok(())
         }
         // A group renamed is a fact about the chat row, not only a sentence
