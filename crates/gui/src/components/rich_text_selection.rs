@@ -65,18 +65,17 @@ fn new_retained_selection(text: &SharedString, cx: &mut App) -> RetainedSelectio
 
 /// Active message identities in a window, used to limit timeline invalidation.
 pub(crate) fn active_selection_message_ids(window_id: gpui::WindowId, cx: &App) -> Vec<String> {
-    cx.has_global::<RichTextSelectionRegistry>()
-        .then(|| {
-            cx.global::<RichTextSelectionRegistry>()
-                .0
-                .iter()
-                .filter_map(|((id, message_id), participant)| {
-                    (*id == window_id && participant.handle.snapshot(cx).is_some())
-                        .then(|| message_id.clone())
-                })
-                .collect()
+    if !cx.has_global::<RichTextSelectionRegistry>() {
+        return Vec::new();
+    }
+    cx.global::<RichTextSelectionRegistry>()
+        .0
+        .iter()
+        .filter(|((id, _), participant)| {
+            *id == window_id && participant.handle.snapshot(cx).is_some()
         })
-        .unwrap_or_default()
+        .map(|((_, message_id), _)| message_id.clone())
+        .collect()
 }
 
 fn track_selection_handle(
