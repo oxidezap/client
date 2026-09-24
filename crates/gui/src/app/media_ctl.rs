@@ -609,6 +609,14 @@ impl WhatsAppApp {
     fn finish_download(&mut self, message_id: &str) {
         self.downloads_in_flight.remove(message_id);
     }
+
+    /// Invalidate pending document completions when logout keeps the account
+    /// identity in memory but ends the session that authorized its downloads.
+    pub(super) fn invalidate_document_downloads(&mut self) {
+        self.document_state_generation = self.document_state_generation.wrapping_add(1);
+        self.saved_documents.clear();
+        self.document_downloads_in_flight.clear();
+    }
     /// Download a document and save it to the user's Downloads directory.
     /// Documents open in external apps, so bytes on disk beat cached bytes.
     pub fn download_document(
@@ -655,8 +663,10 @@ impl WhatsAppApp {
                             )
                         })
                         .unwrap_or(false);
-                    if is_current {
-                        match hand_to_user(cx, file_name, data).await {
+                    if let Some(result) =
+                        handoff_if_current(is_current, hand_to_user(cx, file_name, data)).await
+                    {
+                        match result {
                             Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
                                 let display = path.display().to_string();
                                 let _ = entity.update(cx, |app, cx| {
@@ -1300,6 +1310,17 @@ fn document_scope_key(account: &str, chat: &str, message_id: &str) -> (String, S
     (account.to_owned(), chat.to_owned(), message_id.to_owned())
 }
 
+async fn handoff_if_current<T>(
+    is_current: bool,
+    handoff: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if is_current {
+        Some(handoff.await)
+    } else {
+        None
+    }
+}
+
 fn document_state_matches(
     current_generation: u64,
     current_account: &str,
@@ -1342,7 +1363,7 @@ async fn hand_to_user(
 
 #[cfg(test)]
 mod document_scope_tests {
-    use super::{document_scope_key, document_state_matches};
+    use super::{document_scope_key, document_state_matches, handoff_if_current};
 
     #[test]
     fn regression_193_same_message_id_isolated_by_account_and_chat() {
@@ -1363,50 +1384,65 @@ mod document_scope_tests {
 
     #[test]
     fn regression_193_delayed_old_account_download_is_not_handed_off_or_recorded() {
-        // The download started under account-a, then reset rotates the state
-        // generation and installs account-b before the bytes arrive.
-        let expected_generation = 4;
-        let expected_account = "account-a";
-        let current_generation = 5;
-        let current_account = "account-b";
-        let scope = document_scope_key(expected_account, "chat-a", "message-1");
-        let mut handoffs = 0;
-        let mut saved_documents = std::collections::HashMap::new();
+        futures_lite::future::block_on(async {
+            let expected_generation = 4;
+            let expected_account = "account-a";
+            let scope = document_scope_key(expected_account, "chat-a", "message-1");
+            let (download_tx, download_rx) = futures_channel::oneshot::channel();
+            let current_generation = expected_generation.wrapping_add(1);
+            let current_account = expected_account;
+            let mut handed_off = false;
+            let mut saved_documents = std::collections::HashMap::new();
 
-        if document_state_matches(
-            current_generation,
-            current_account,
-            expected_generation,
-            expected_account,
-        ) {
-            handoffs += 1;
-            saved_documents.insert(scope.clone(), std::path::PathBuf::from("old-session.pdf"));
-        }
+            // Hold the completion until after logout invalidates the generation;
+            // the account identity remains unchanged on this transition.
+            download_tx.send(vec![1, 2, 3]).unwrap();
+            let _bytes = download_rx.await.unwrap();
+            let is_current = document_state_matches(
+                current_generation,
+                current_account,
+                expected_generation,
+                expected_account,
+            );
+            let completion = handoff_if_current(is_current, async {
+                handed_off = true;
+                std::path::PathBuf::from("old-session.pdf")
+            })
+            .await;
+            if let Some(path) = completion {
+                saved_documents.insert(scope.clone(), path);
+            }
 
-        assert_eq!(handoffs, 0);
-        assert!(!saved_documents.contains_key(&scope));
-        // Both parts of the guard matter independently: an account switch can
-        // occur without a reset generation change, and a reset may precede the
-        // replacement account becoming visible.
-        assert!(!document_state_matches(4, "account-b", 4, "account-a"));
-        assert!(!document_state_matches(5, "account-a", 4, "account-a"));
+            assert!(!handed_off);
+            assert!(!saved_documents.contains_key(&scope));
+            // Account switching without a generation change must also fail.
+            assert!(!document_state_matches(4, "account-b", 4, "account-a"));
+        });
     }
 
     #[test]
     fn regression_193_current_session_download_is_handed_off_and_recorded() {
-        let scope = document_scope_key("account-a", "chat-a", "message-1");
-        let mut handoffs = 0;
-        let mut saved_documents = std::collections::HashMap::new();
+        futures_lite::future::block_on(async {
+            let scope = document_scope_key("account-a", "chat-a", "message-1");
+            let mut handed_off = false;
+            let mut saved_documents = std::collections::HashMap::new();
+            let completion = handoff_if_current(
+                document_state_matches(4, "account-a", 4, "account-a"),
+                async {
+                    handed_off = true;
+                    std::path::PathBuf::from("document.pdf")
+                },
+            )
+            .await;
+            if let Some(path) = completion {
+                saved_documents.insert(scope.clone(), path);
+            }
 
-        if document_state_matches(4, "account-a", 4, "account-a") {
-            handoffs += 1;
-            saved_documents.insert(scope.clone(), std::path::PathBuf::from("document.pdf"));
-        }
-
-        assert_eq!(handoffs, 1);
-        assert_eq!(
-            saved_documents.get(&scope),
-            Some(&std::path::PathBuf::from("document.pdf"))
-        );
+            assert!(handed_off);
+            assert_eq!(
+                saved_documents.get(&scope),
+                Some(&std::path::PathBuf::from("document.pdf"))
+            );
+        });
     }
 }
