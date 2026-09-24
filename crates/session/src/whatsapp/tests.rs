@@ -1383,7 +1383,8 @@ async fn persisted_proto(store: &SqliteStore, id: &str) -> wa::Message {
         })
         .await
         .expect("read stored proto");
-    waproto::codec::message_decode(&row.proto.expect("stored payload")).expect("decode proto")
+    whatsapp_rust::waproto::codec::message_decode(&row.proto.expect("stored payload"))
+        .expect("decode proto")
 }
 
 fn has_quoted_snapshot(message: &wa::Message) -> bool {
@@ -1406,7 +1407,6 @@ async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
         SqliteStore::new("file:oxidezap-session-quote-secondary-reads?mode=memory&cache=shared")
             .await
             .expect("in-memory store");
-    use whatsapp_rust::wacore::store::traits::ProtocolStore as _;
     store.create_new_device().await.expect("seed device parent");
     let chat_store = ChatStore::new(&store).await.expect("chat store");
     let parent = wa::Message {
