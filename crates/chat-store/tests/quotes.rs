@@ -134,148 +134,110 @@ async fn reply_is_stored_without_snapshot_but_reads_with_parent() {
 }
 
 #[tokio::test]
-async fn starred_read_rehydrates_compacted_quote() {
+async fn quote_participant_matching_the_account_resolves_an_own_group_message() {
     let (store, chat_store) = test_store().await;
-    feed(
-        &chat_store,
-        [
-            live_chat(
-                PEER,
-                PEER,
-                "STAR-PARENT",
-                wa::Message::text("parent"),
-                1_700_000_000,
-            ),
-            live_chat(
-                PEER,
-                PEER,
-                "STAR-REPLY",
-                text_reply("reply", "STAR-PARENT", PEER, wa::Message::text("parent")),
-                1_700_000_060,
-            ),
-        ],
-    )
-    .await;
-    let (bytes, _) = stored_proto(&store, "STAR-REPLY").await;
-    let compacted = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
-    assert_eq!(quoted_text(&compacted), None, "test must reach compaction");
-
     let device_id = store.device_id();
+    let own_jid = "559900000099@s.whatsapp.net";
     store
         .shared()
         .run(move |conn| {
-            diesel::sql_query("UPDATE messages SET starred = 1 WHERE device_id = ? AND msg_id = ?")
+            diesel::sql_query("UPDATE device SET pn = ?, lid = ? WHERE id = ?")
+                .bind::<diesel::sql_types::Text, _>(own_jid)
+                .bind::<diesel::sql_types::Text, _>("111000099990000@lid")
                 .bind::<Integer, _>(device_id)
-                .bind::<diesel::sql_types::Text, _>("STAR-REPLY")
                 .execute(conn)
-                .map(|_| ())
-                .map_err(db_err)
+                .map_err(db_err)?;
+            Ok(())
         })
         .await
-        .expect("star reply");
+        .expect("set synthetic account identities");
+    let group = jid(GROUP);
+    chat_store
+        .record_outgoing(
+            &group,
+            "OWN-QUOTE-PARENT",
+            &wa::Message::text("our group message"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [live_chat(
+            GROUP,
+            PEER,
+            "OWN-QUOTE-REPLY",
+            text_reply(
+                "reply",
+                "OWN-QUOTE-PARENT",
+                own_jid,
+                wa::Message::text("stale own snapshot"),
+            ),
+            1_700_000_060,
+        )],
+    )
+    .await;
 
-    let control = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    let (bytes, _) = stored_proto(&store, "OWN-QUOTE-REPLY").await;
+    let stored = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
+    assert_eq!(quoted_text(&stored), None);
+    let page = chat_store.messages(&group, None, 10).await.unwrap();
+    let reply = page
+        .iter()
+        .find(|message| message.id == "OWN-QUOTE-REPLY")
+        .expect("reply");
     assert_eq!(
-        quoted_text(
-            control
-                .iter()
-                .find(|m| m.id == "STAR-REPLY")
-                .unwrap()
-                .message
-                .as_deref()
-                .unwrap()
-        )
-        .as_deref(),
-        Some("parent")
-    );
-    let starred = chat_store.starred_messages(10).await.unwrap();
-    assert_eq!(
-        quoted_text(
-            starred
-                .iter()
-                .find(|m| m.id == "STAR-REPLY")
-                .unwrap()
-                .message
-                .as_deref()
-                .unwrap()
-        )
-        .as_deref(),
-        Some("parent")
+        quoted_text(reply.message.as_deref().expect("decoded proto")).as_deref(),
+        Some("our group message")
     );
 }
 
 #[tokio::test]
-async fn pending_media_read_rehydrates_compacted_quote() {
+async fn quote_participant_device_suffix_matches_the_bare_stored_parent() {
     let (store, chat_store) = test_store().await;
+    let device_sender = format!("{}:7@s.whatsapp.net", jid(PEER).user);
+    feed(
+        &chat_store,
+        [live_chat(
+            PEER,
+            &device_sender,
+            "DEVICE-ORIG",
+            wa::Message::text("parent from companion"),
+            1_700_000_000,
+        )],
+    )
+    .await;
     feed(
         &chat_store,
         [live_chat(
             PEER,
             PEER,
-            "MEDIA-PARENT",
-            wa::Message::text("parent"),
-            1_700_000_000,
+            "DEVICE-REPLY",
+            text_reply(
+                "reply from phone",
+                "DEVICE-ORIG",
+                &device_sender,
+                wa::Message::text("stale quoted snapshot"),
+            ),
+            1_700_000_060,
         )],
     )
     .await;
-    let reply = wa::Message {
-        image_message: MessageField::some(wa::message::ImageMessage {
-            context_info: MessageField::some(wa::ContextInfo {
-                stanza_id: Some("MEDIA-PARENT".into()),
-                participant: Some(PEER.into()),
-                quoted_message: MessageField::some(wa::Message::text("parent")),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    feed(
-        &chat_store,
-        [live_chat(PEER, PEER, "MEDIA-REPLY", reply, 1_700_000_060)],
-    )
-    .await;
 
-    let (bytes, _) = stored_proto(&store, "MEDIA-REPLY").await;
-    let compacted = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
-    let context = compacted
-        .image_message
-        .as_option()
-        .unwrap()
-        .context_info
-        .as_option()
-        .unwrap();
-    assert_eq!(context.stanza_id.as_deref(), Some("MEDIA-PARENT"));
-    assert!(
-        context.quoted_message.as_option().is_none(),
-        "test must reach compaction"
-    );
-
-    let pending = chat_store
-        .pending_media_messages(Some(&jid(PEER)), 10)
-        .await
-        .unwrap();
-    let media = pending
-        .iter()
-        .find(|m| m.id == "MEDIA-REPLY")
-        .expect("pending media reply");
-    assert!(media.message.as_deref().unwrap().image_message.is_set());
-    let hydrated_context = media
-        .message
-        .as_deref()
-        .unwrap()
-        .image_message
-        .as_option()
-        .unwrap()
-        .context_info
-        .as_option()
-        .unwrap();
+    let (bytes, _) = stored_proto(&store, "DEVICE-REPLY").await;
+    let stored = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
     assert_eq!(
-        hydrated_context
-            .quoted_message
-            .as_option()
-            .and_then(|quoted| quoted.conversation.as_deref()),
-        Some("parent")
+        quoted_text(&stored),
+        None,
+        "the device-qualified participant resolves to the normalized parent"
+    );
+    let page = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    let reply = page
+        .iter()
+        .find(|message| message.id == "DEVICE-REPLY")
+        .expect("reply");
+    assert_eq!(
+        quoted_text(reply.message.as_deref().expect("decoded proto")).as_deref(),
+        Some("parent from companion")
     );
 }
 
@@ -359,6 +321,182 @@ async fn history_sync_strips_parent_later_in_same_batch() {
     assert_eq!(
         quoted_text(reply.message.as_deref().expect("decoded")).as_deref(),
         Some("ping")
+    );
+}
+
+#[tokio::test]
+async fn quote_uses_recovered_alias_copy_when_exact_parent_is_placeholder() {
+    let (store, chat_store) = test_store().await;
+    let parent_info = incoming_info(GROUP, PEER, "FOLD-QUOTE-PARENT", 1_700_000_000);
+    feed(
+        &chat_store,
+        [Event::UndecryptableMessage(
+            wacore::types::events::UndecryptableMessage::builder()
+                .info(Arc::new(parent_info))
+                .is_unavailable(false)
+                .unavailable_type(wacore::types::events::UnavailableType::Unknown)
+                .decrypt_fail_mode(wacore::types::events::DecryptFailMode::Show)
+                .build(),
+        )],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("recovered parent"),
+            incoming_info(GROUP, PEER_LID, "FOLD-QUOTE-PARENT", 1_700_000_001),
+        )],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+    feed(
+        &chat_store,
+        [live_chat(
+            GROUP,
+            "559900000002@s.whatsapp.net",
+            "FOLD-QUOTE-REPLY",
+            text_reply(
+                "reply",
+                "FOLD-QUOTE-PARENT",
+                PEER,
+                wa::Message::text("stale snapshot"),
+            ),
+            1_700_000_060,
+        )],
+    )
+    .await;
+
+    let (bytes, _) = stored_proto(&store, "FOLD-QUOTE-REPLY").await;
+    let stored = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
+    assert_eq!(quoted_text(&stored), None);
+    let page = chat_store.messages(&jid(GROUP), None, 10).await.unwrap();
+    let reply = page
+        .iter()
+        .find(|message| message.id == "FOLD-QUOTE-REPLY")
+        .expect("reply");
+    assert_eq!(
+        quoted_text(reply.message.as_deref().expect("decoded proto")).as_deref(),
+        Some("recovered parent")
+    );
+}
+
+#[tokio::test]
+async fn quote_resolves_across_historical_and_current_lids() {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+    let historical_lid = "999900000000001@lid";
+    store
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "999900000000001".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_699_999_999,
+            updated_at: 1_699_999_999,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("record historical LID");
+    feed(
+        &chat_store,
+        [live_chat(
+            GROUP,
+            PEER_LID,
+            "HISTORICAL-QUOTE-PARENT",
+            wa::Message::text("parent under current LID"),
+            1_700_000_000,
+        )],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [live_chat(
+            GROUP,
+            PEER,
+            "HISTORICAL-QUOTE-REPLY",
+            text_reply(
+                "reply",
+                "HISTORICAL-QUOTE-PARENT",
+                historical_lid,
+                wa::Message::text("stale historical snapshot"),
+            ),
+            1_700_000_060,
+        )],
+    )
+    .await;
+
+    let (bytes, _) = stored_proto(&store, "HISTORICAL-QUOTE-REPLY").await;
+    let stored = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
+    assert_eq!(quoted_text(&stored), None);
+    let page = chat_store.messages(&jid(GROUP), None, 10).await.unwrap();
+    let reply = page
+        .iter()
+        .find(|message| message.id == "HISTORICAL-QUOTE-REPLY")
+        .expect("reply");
+    assert_eq!(
+        quoted_text(reply.message.as_deref().expect("decoded proto")).as_deref(),
+        Some("parent under current LID")
+    );
+}
+
+#[tokio::test]
+async fn history_postpass_matches_device_qualified_pending_sender() {
+    let (store, chat_store) = test_store().await;
+    let device_sender = format!("{}:9@s.whatsapp.net", jid(PEER).user);
+    let wmi = |id: &str, message: wa::Message| wa::WebMessageInfo {
+        key: MessageField::some(wa::MessageKey {
+            remote_jid: Some(GROUP.into()),
+            from_me: Some(false),
+            id: Some(id.into()),
+            ..Default::default()
+        }),
+        participant: Some(device_sender.clone()),
+        message: MessageField::from_box(Box::new(message)),
+        message_timestamp: Some(1_700_000_000),
+        ..Default::default()
+    };
+    let history = wa::HistorySync {
+        sync_type: wa::history_sync::HistorySyncType::RECENT,
+        conversations: vec![wa::Conversation {
+            id: GROUP.to_string(),
+            messages: vec![
+                wa::HistorySyncMsg {
+                    message: MessageField::some(wmi(
+                        "H-DEVICE-REPLY",
+                        text_reply(
+                            "pong",
+                            "H-DEVICE-ORIG",
+                            &device_sender,
+                            wa::Message::text("parent snapshot"),
+                        ),
+                    )),
+                    ..Default::default()
+                },
+                wa::HistorySyncMsg {
+                    message: MessageField::some(wmi(
+                        "H-DEVICE-ORIG",
+                        wa::Message::text("parent from companion"),
+                    )),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    feed(&chat_store, [history_sync_event(history)]).await;
+
+    let (bytes, _) = stored_proto(&store, "H-DEVICE-REPLY").await;
+    let stored = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
+    assert_eq!(quoted_text(&stored), None);
+    let page = chat_store.messages(&jid(GROUP), None, 10).await.unwrap();
+    let reply = page
+        .iter()
+        .find(|message| message.id == "H-DEVICE-REPLY")
+        .expect("reply");
+    assert_eq!(
+        quoted_text(reply.message.as_deref().expect("decoded proto")).as_deref(),
+        Some("parent from companion")
     );
 }
 

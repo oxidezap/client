@@ -455,9 +455,9 @@ impl WhatsAppApp {
         if !moved {
             return;
         }
-        // The rows moved, and the timeline's own measurements are keyed to
-        // them: see `sync_timeline`, which is what turns this into a splice at
-        // the front rather than a reset to the bottom.
+        // Invalidation compares selected identities and order against either
+        // the render cache or retained snapshots: a prepend clears stale order,
+        // while a receipt-only update to an existing row preserves selection.
         self.invalidate_message_cache(&jid, cx);
         self.invalidate_chat_cache();
         cx.notify();
@@ -560,7 +560,7 @@ impl WhatsAppApp {
             return;
         }
         self.forget_chat_paging(&dropped, cx);
-        self.forget_missing_selection();
+        self.forget_missing_selection(cx);
         self.invalidate_chat_cache();
         cx.notify();
     }

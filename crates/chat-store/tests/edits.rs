@@ -210,15 +210,20 @@ async fn local_amendments_do_not_mutate_a_colliding_peer_message() {
         .unwrap();
     chat_store.flush().await.unwrap();
 
-    let msg = chat_store
-        .message(&chat, "COLLIDING-ID")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(msg.sender_jid, jid(PEER));
-    assert!(!msg.from_me);
-    assert_eq!(msg.text.as_deref(), Some("peer content"));
-    assert!(!msg.revoked);
+    assert!(matches!(
+        chat_store.message(&chat, "COLLIDING-ID").await,
+        Err(oxidezap_chat_store::ChatStoreError::AmbiguousMessageId)
+    ));
+    let rows = chat_store.messages(&chat, None, 100).await.unwrap();
+    let copies: Vec<_> = rows.iter().filter(|row| row.id == "COLLIDING-ID").collect();
+    assert_eq!(copies.len(), 2);
+    let peer = copies.iter().find(|row| !row.from_me).unwrap();
+    assert_eq!(peer.sender_jid, jid(PEER));
+    assert_eq!(peer.text.as_deref(), Some("peer content"));
+    assert!(!peer.revoked);
+    let own = copies.iter().find(|row| row.from_me).unwrap();
+    assert!(own.revoked);
+    assert!(own.text.is_none());
 }
 
 #[tokio::test]
