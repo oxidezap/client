@@ -301,6 +301,7 @@ pub(crate) fn needs_storage_compaction(msg: &wa::Message) -> bool {
 pub(crate) struct ParentRow {
     pub msg_id: String,
     pub sender: String,
+    pub from_me: bool,
     pub proto: Option<Vec<u8>>,
     pub codec: i32,
 }
@@ -324,13 +325,20 @@ pub(crate) fn quote_parent_rows(
         )
         .order(dsl::id.asc())
         .limit(4)
-        .select((dsl::msg_id, dsl::sender_jid, dsl::proto, dsl::proto_codec))
-        .load::<(String, String, Option<Vec<u8>>, i32)>(conn)
+        .select((
+            dsl::msg_id,
+            dsl::sender_jid,
+            dsl::from_me,
+            dsl::proto,
+            dsl::proto_codec,
+        ))
+        .load::<(String, String, bool, Option<Vec<u8>>, i32)>(conn)
         .map(|rows| {
             rows.into_iter()
-                .map(|(msg_id, sender, proto, codec)| ParentRow {
+                .map(|(msg_id, sender, from_me, proto, codec)| ParentRow {
                     msg_id,
                     sender,
+                    from_me,
                     proto,
                     codec,
                 })
@@ -353,8 +361,17 @@ pub(crate) fn pick_quote_parent<'a>(
     rows: &'a [ParentRow],
     participant: &str,
     alias: Option<&str>,
+    own_participants: &[String],
 ) -> Option<&'a ParentRow> {
     let participant = crate::store::message_identity::stored_sender(participant, false);
+    if own_participants
+        .iter()
+        .any(|own| crate::store::message_identity::stored_sender(own, false) == participant)
+    {
+        let mut own_rows = rows.iter().filter(|row| row.from_me);
+        let own = own_rows.next()?;
+        return own_rows.next().is_none().then_some(own);
+    }
     if let Some(row) = rows.iter().find(|row| {
         crate::store::message_identity::stored_sender(&row.sender, false) == participant
     }) {
@@ -391,7 +408,18 @@ pub(crate) fn quote_parent_exists(
     } else {
         crate::lid::counterpart_chat_key(conn, device_id, &target.participant).unwrap_or(None)
     };
-    Ok(pick_quote_parent(&rows, &target.participant, alias.as_deref()).is_some())
+    let own_participants = if rows.iter().any(|row| row.from_me) {
+        crate::store::message_identity::own_participant_jids(conn, device_id)?
+    } else {
+        Vec::new()
+    };
+    Ok(pick_quote_parent(
+        &rows,
+        &target.participant,
+        alias.as_deref(),
+        &own_participants,
+    )
+    .is_some())
 }
 
 /// What to persist for one message: the bytes, their representation, and —
@@ -789,33 +817,40 @@ mod tests {
             ParentRow {
                 msg_id: "X".into(),
                 sender: "a@s.whatsapp.net".into(),
+                from_me: false,
                 proto: None,
                 codec: CODEC_RAW,
             },
             ParentRow {
                 msg_id: "X".into(),
                 sender: "b@s.whatsapp.net".into(),
+                from_me: false,
                 proto: None,
                 codec: CODEC_RAW,
             },
         ];
         assert_eq!(
-            pick_quote_parent(&rows, "b@s.whatsapp.net", None)
+            pick_quote_parent(&rows, "b@s.whatsapp.net", None, &[])
                 .expect("exact")
                 .sender,
             "b@s.whatsapp.net"
         );
         assert_eq!(
-            pick_quote_parent(&rows, "c@lid", Some("a@s.whatsapp.net"))
+            pick_quote_parent(&rows, "c@lid", Some("a@s.whatsapp.net"), &[])
                 .expect("alias")
                 .sender,
             "a@s.whatsapp.net"
         );
-        assert!(pick_quote_parent(&rows, "nobody", None).is_none());
-        assert!(pick_quote_parent(&rows, "", None).is_none(), "ambiguous");
+        assert!(pick_quote_parent(&rows, "nobody", None, &[]).is_none());
+        assert!(
+            pick_quote_parent(&rows, "", None, &[]).is_none(),
+            "ambiguous"
+        );
         let solo = &rows[..1];
         assert_eq!(
-            pick_quote_parent(solo, "", None).expect("lone row").sender,
+            pick_quote_parent(solo, "", None, &[])
+                .expect("lone row")
+                .sender,
             "a@s.whatsapp.net"
         );
     }

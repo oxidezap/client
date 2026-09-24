@@ -238,7 +238,7 @@ fn apply_history_message(
                 {
                     pending_quotes.push(PendingQuote {
                         msg_id: msg_id.to_string(),
-                        sender: sender.to_string(),
+                        sender: crate::store::message_identity::stored_sender(sender, from_me),
                         target,
                     });
                 }

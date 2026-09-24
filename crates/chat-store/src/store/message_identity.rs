@@ -331,6 +331,34 @@ pub(crate) fn reconcile_startup(
     store_mapping_watermark_value(conn, device_id, current)
 }
 
+/// This account's known JIDs, normalized like peer senders. Quote matching
+/// needs them only when a candidate parent is an own-message sentinel.
+pub(crate) fn own_participant_jids(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+) -> QueryResult<Vec<String>> {
+    #[derive(QueryableByName)]
+    struct OwnJids {
+        #[diesel(sql_type = Nullable<Text>)]
+        pn: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        lid: Option<String>,
+    }
+    let rows: Vec<OwnJids> = diesel::sql_query("SELECT pn, lid FROM device WHERE id = ?")
+        .bind::<Integer, _>(device_id)
+        .load(conn)?;
+    let mut jids = Vec::new();
+    if let Some(row) = rows.into_iter().next() {
+        for jid in [row.pn, row.lid].into_iter().flatten() {
+            let normalized = stored_sender(&jid, false);
+            if !normalized.is_empty() && !jids.contains(&normalized) {
+                jids.push(normalized);
+            }
+        }
+    }
+    Ok(jids)
+}
+
 pub(crate) fn mark_mapping_repair_current(
     conn: &mut SqliteConnection,
     device_id: i32,

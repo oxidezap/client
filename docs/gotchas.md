@@ -1672,7 +1672,8 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   Alias reads use the same author-aware fold, while `message()` stays ambiguous
   when distinct authors really reused an id. A reply's embedded
   `quotedMessage` is dropped when the parent is materialized (same chat, stanza
-  id, author — exact or PN/LID counterpart, never a bare id match), kept inline
+  id, author — device-normalized, own-account sentinel, or proven PN/LID
+  counterpart, never a bare id match), kept inline
   otherwise, and rehydrated
   in batch on read: one identity resolution per chat on the page plus one
   parent lookup per chat, never one per reply, and the injected copy is never

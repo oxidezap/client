@@ -977,6 +977,7 @@ fn hydrate_quotes(
     // when the exact author misses (the common case never gets here).
     let mut aliases: std::collections::HashMap<String, Option<String>> =
         std::collections::HashMap::new();
+    let mut own_participants: Option<Vec<String>> = None;
     for (chat, chat_needs) in by_chat {
         let keys = candidates
             .get(chat)
@@ -995,6 +996,13 @@ fn hydrate_quotes(
                 parents.entry(row.msg_id.clone()).or_default().push(row);
             }
         }
+        if parents.values().flatten().any(|row| row.from_me) && own_participants.is_none() {
+            own_participants = Some(
+                crate::store::message_identity::own_participant_jids(conn, device_id)
+                    .map_err(db_err)?,
+            );
+        }
+        let own_participant_keys = own_participants.as_deref().unwrap_or(&[]);
         for need in chat_needs {
             let rows: &[crate::storage_proto::ParentRow] =
                 parents.get(&need.stanza).map(Vec::as_slice).unwrap_or(&[]);
@@ -1012,7 +1020,9 @@ fn hydrate_quotes(
                 aliases.insert(need.participant.clone(), alias);
             }
             let alias = aliases.get(&need.participant).and_then(|a| a.as_deref());
-            let Some(parent) = pick_quote_parent(rows, &need.participant, alias) else {
+            let Some(parent) =
+                pick_quote_parent(rows, &need.participant, alias, own_participant_keys)
+            else {
                 continue;
             };
             let Some(bytes) = parent.proto.as_deref() else {
@@ -1032,8 +1042,8 @@ fn hydrate_quotes(
     Ok(())
 }
 
-/// One page of parent rows: `(msg_id, sender, proto, codec)` for a chunk of
-/// stanza ids under either storage identity of one chat.
+/// One page of parent rows: `(msg_id, sender, from_me, proto, codec)` for a
+/// chunk of stanza ids under either storage identity of one chat.
 fn parent_chunk(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -1049,13 +1059,20 @@ fn parent_chunk(
                 .and(dsl::chat_jid.eq_any(keys.to_vec()))
                 .and(dsl::msg_id.eq_any(stanzas.to_vec())),
         )
-        .select((dsl::msg_id, dsl::sender_jid, dsl::proto, dsl::proto_codec))
-        .load::<(String, String, Option<Vec<u8>>, i32)>(conn)
+        .select((
+            dsl::msg_id,
+            dsl::sender_jid,
+            dsl::from_me,
+            dsl::proto,
+            dsl::proto_codec,
+        ))
+        .load::<(String, String, bool, Option<Vec<u8>>, i32)>(conn)
         .map(|rows| {
             rows.into_iter()
-                .map(|(msg_id, sender, proto, codec)| ParentRow {
+                .map(|(msg_id, sender, from_me, proto, codec)| ParentRow {
                     msg_id,
                     sender,
+                    from_me,
                     proto,
                     codec,
                 })
