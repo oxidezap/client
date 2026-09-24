@@ -285,15 +285,33 @@ pub(crate) fn reconcile_mappings(
     mappings: &[(String, String)],
     changes: &mut ChangeSet,
 ) -> QueryResult<()> {
-    let mut senders: Vec<String> = mappings
+    use schema::lid_pn_mapping::dsl;
+    let mut phone_numbers: Vec<String> = mappings.iter().map(|(_, pn)| pn.clone()).collect();
+    phone_numbers.sort();
+    phone_numbers.dedup();
+    let mut senders: Vec<String> = phone_numbers
         .iter()
-        .flat_map(|(lid, pn)| {
-            [
-                Jid::new(pn.clone(), Server::Pn).to_string(),
-                Jid::new(lid.clone(), Server::Lid).to_string(),
-            ]
-        })
+        .map(|pn| Jid::new(pn.clone(), Server::Pn).to_string())
+        .chain(
+            mappings
+                .iter()
+                .map(|(lid, _)| Jid::new(lid.clone(), Server::Lid).to_string()),
+        )
         .collect();
+    for page in phone_numbers.chunks(crate::queries::BIND_CHUNK) {
+        let lids: Vec<String> = dsl::lid_pn_mapping
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::phone_number.eq_any(page)),
+            )
+            .select(dsl::lid)
+            .load(conn)?;
+        senders.extend(
+            lids.into_iter()
+                .map(|lid| Jid::new(lid, Server::Lid).to_string()),
+        );
+    }
     senders.sort();
     senders.dedup();
     if senders.is_empty() {
@@ -460,13 +478,27 @@ fn reconcile_groups(
         .load(conn)?,
         (None, Some(senders)) => {
             let mut groups = Vec::new();
-            for page in senders.chunks(crate::queries::BIND_CHUNK - 1) {
+            for page in senders.chunks((crate::queries::BIND_CHUNK - 1) / 2) {
+                let mut sender_filter: Box<
+                    dyn diesel::expression::BoxableExpression<
+                            schema::messages::table,
+                            diesel::sqlite::Sqlite,
+                            SqlType = Bool,
+                        >,
+                > = Box::new(dsl::sender_jid.eq_any(page.to_vec()));
+                for pattern in page.iter().filter_map(|sender| {
+                    sender
+                        .split_once('@')
+                        .map(|(user, server)| format!("{user}:%@{server}"))
+                }) {
+                    sender_filter = Box::new(sender_filter.or(dsl::sender_jid.like(pattern)));
+                }
                 let rows: Vec<(String, String)> = dsl::messages
                     .filter(
                         dsl::device_id
                             .eq(device_id)
                             .and(dsl::from_me.eq(false))
-                            .and(dsl::sender_jid.eq_any(page)),
+                            .and(sender_filter),
                     )
                     .group_by((dsl::chat_jid, dsl::msg_id))
                     .having(diesel::dsl::count_star().gt(1))

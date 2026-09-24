@@ -973,9 +973,9 @@ fn hydrate_quotes(
     for need in &needs {
         by_chat.entry(need.chat.as_str()).or_default().push(need);
     }
-    // Counterpart identities, resolved once per distinct participant and only
-    // when the exact author misses (the common case never gets here).
-    let mut aliases: std::collections::HashMap<String, Option<String>> =
+    // Complete alias components, resolved once per distinct participant and
+    // only when its normalized exact author misses.
+    let mut aliases: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut own_participants: Option<Vec<String>> = None;
     for (chat, chat_needs) in by_chat {
@@ -1006,23 +1006,32 @@ fn hydrate_quotes(
         for need in chat_needs {
             let rows: &[crate::storage_proto::ParentRow] =
                 parents.get(&need.stanza).map(Vec::as_slice).unwrap_or(&[]);
-            if rows.iter().all(|row| row.sender != need.participant)
-                && !aliases.contains_key(&need.participant)
+            let normalized =
+                crate::store::message_identity::stored_sender(&need.participant, false);
+            if rows.iter().all(|row| {
+                crate::store::message_identity::stored_sender(&row.sender, false) != normalized
+            }) && !aliases.contains_key(&need.participant)
             {
                 // A mapping read that fails is not a read failure: without
-                // the alias the quote resolves by exact author only.
-                let alias = if need.participant.is_empty() {
-                    None
+                // aliases the quote resolves by normalized author only.
+                let aliases_for_participant = if need.participant.is_empty() {
+                    Vec::new()
                 } else {
-                    crate::lid::counterpart_chat_key(conn, device_id, &need.participant)
-                        .unwrap_or(None)
+                    crate::lid::chat_key_candidates(conn, device_id, &need.participant)
+                        .unwrap_or_default()
                 };
-                aliases.insert(need.participant.clone(), alias);
+                aliases.insert(need.participant.clone(), aliases_for_participant);
             }
-            let alias = aliases.get(&need.participant).and_then(|a| a.as_deref());
-            let Some(parent) =
-                pick_quote_parent(rows, &need.participant, alias, own_participant_keys)
-            else {
+            let aliases_for_participant = aliases
+                .get(&need.participant)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let Some(parent) = pick_quote_parent(
+                rows,
+                &need.participant,
+                aliases_for_participant,
+                own_participant_keys,
+            ) else {
                 continue;
             };
             let Some(bytes) = parent.proto.as_deref() else {

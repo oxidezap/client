@@ -360,7 +360,7 @@ pub(crate) fn quote_parent_rows(
 pub(crate) fn pick_quote_parent<'a>(
     rows: &'a [ParentRow],
     participant: &str,
-    alias: Option<&str>,
+    aliases: &[String],
     own_participants: &[String],
 ) -> Option<&'a ParentRow> {
     let participant = crate::store::message_identity::stored_sender(participant, false);
@@ -377,13 +377,14 @@ pub(crate) fn pick_quote_parent<'a>(
     }) {
         return Some(row);
     }
-    if let Some(alias) =
-        alias.map(|alias| crate::store::message_identity::stored_sender(alias, false))
-        && let Some(row) = rows
+    for alias in aliases {
+        let alias = crate::store::message_identity::stored_sender(alias, false);
+        if let Some(row) = rows
             .iter()
             .find(|row| crate::store::message_identity::stored_sender(&row.sender, false) == alias)
-    {
-        return Some(row);
+        {
+            return Some(row);
+        }
     }
     if participant.is_empty() && rows.len() == 1 {
         return rows.first();
@@ -401,25 +402,19 @@ pub(crate) fn quote_parent_exists(
 ) -> QueryResult<bool> {
     let keys = crate::lid::chat_key_candidates(conn, device_id, chat)?;
     let rows = quote_parent_rows(conn, device_id, &keys, &target.stanza_id)?;
-    // A mapping read that fails is not a write failure: without the alias
-    // the quote resolves by exact author only, and the snapshot stays.
-    let alias: Option<String> = if target.participant.is_empty() {
-        None
+    // A mapping read that fails is not a write failure: without aliases the
+    // quote resolves by exact author only, and the snapshot stays.
+    let aliases = if target.participant.is_empty() {
+        Vec::new()
     } else {
-        crate::lid::counterpart_chat_key(conn, device_id, &target.participant).unwrap_or(None)
+        crate::lid::chat_key_candidates(conn, device_id, &target.participant).unwrap_or_default()
     };
     let own_participants = if rows.iter().any(|row| row.from_me) {
         crate::store::message_identity::own_participant_jids(conn, device_id)?
     } else {
         Vec::new()
     };
-    Ok(pick_quote_parent(
-        &rows,
-        &target.participant,
-        alias.as_deref(),
-        &own_participants,
-    )
-    .is_some())
+    Ok(pick_quote_parent(&rows, &target.participant, &aliases, &own_participants).is_some())
 }
 
 /// What to persist for one message: the bytes, their representation, and —
@@ -830,25 +825,25 @@ mod tests {
             },
         ];
         assert_eq!(
-            pick_quote_parent(&rows, "b@s.whatsapp.net", None, &[])
+            pick_quote_parent(&rows, "b@s.whatsapp.net", &[], &[])
                 .expect("exact")
                 .sender,
             "b@s.whatsapp.net"
         );
         assert_eq!(
-            pick_quote_parent(&rows, "c@lid", Some("a@s.whatsapp.net"), &[])
+            pick_quote_parent(&rows, "c@lid", &["a@s.whatsapp.net".into()], &[],)
                 .expect("alias")
                 .sender,
             "a@s.whatsapp.net"
         );
-        assert!(pick_quote_parent(&rows, "nobody", None, &[]).is_none());
+        assert!(pick_quote_parent(&rows, "nobody", &[], &[]).is_none());
         assert!(
-            pick_quote_parent(&rows, "", None, &[]).is_none(),
+            pick_quote_parent(&rows, "", &[], &[]).is_none(),
             "ambiguous"
         );
         let solo = &rows[..1];
         assert_eq!(
-            pick_quote_parent(solo, "", None, &[])
+            pick_quote_parent(solo, "", &[], &[])
                 .expect("lone row")
                 .sender,
             "a@s.whatsapp.net"

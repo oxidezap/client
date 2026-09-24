@@ -930,6 +930,84 @@ async fn delete_for_me_normalizes_device_qualified_participants_without_hitting_
 }
 
 #[tokio::test]
+async fn late_mapping_repair_includes_historical_and_device_qualified_senders() {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    let (store, chat_store) = test_store().await;
+    let old_lid = "999900000000001@lid";
+    let rows = [
+        (old_lid, "old LID author", 1_700_000_000),
+        (PEER_LID, "current LID author", 1_700_000_001),
+        (PEER, "PN author", 1_700_000_002),
+    ];
+    for (sender, text, timestamp) in rows {
+        feed(
+            &chat_store,
+            [message_event(
+                wa::Message::text(text),
+                incoming_info(GROUP, sender, "MSG-194-LATE-ALIASES", timestamp),
+            )],
+        )
+        .await;
+    }
+    assert_eq!(
+        chat_store
+            .messages(&jid(GROUP), None, 10)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // Restore a legacy device-qualified spelling that current writers already
+    // normalize, then learn a second historical LID for the peer.
+    let device_id = store.device_id();
+    let old_lid_key = old_lid.to_string();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(
+                "UPDATE messages SET sender_jid = ? \
+                 WHERE device_id = ? AND chat_jid = ? AND msg_id = ? AND sender_jid = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>("999900000000001:7@lid")
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>(GROUP)
+            .bind::<diesel::sql_types::Text, _>("MSG-194-LATE-ALIASES")
+            .bind::<diesel::sql_types::Text, _>(old_lid_key)
+            .execute(conn)
+            .map(|_| ())
+            .map_err(db_err)
+        })
+        .await
+        .expect("restore legacy device-qualified author");
+    add_lid_mapping(&store).await;
+    store
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "999900000000001".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_699_999_999,
+            updated_at: 1_699_999_999,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("record historical mapping");
+    chat_store
+        .reconcile_message_mappings(&[("999900000000001".into(), "559900000001".into())])
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let messages = chat_store.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "MSG-194-LATE-ALIASES");
+    assert_eq!(
+        chat_store.chats(false, 10).await.unwrap()[0].unread_count,
+        1,
+        "merging the mapped copies recalculates unread count"
+    );
+}
+
+#[tokio::test]
 async fn startup_reconciles_chats_under_historical_lids_on_both_read_keys() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 

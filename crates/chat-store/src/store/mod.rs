@@ -804,7 +804,20 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // The current top migration only tracks which source last supplied
+        // The repair marker is newer than the older migration edges checked
+        // below; prove its table drops before testing those historical edges.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("identity-repair marker downgrade is reversible");
+        assert!(!has_table(&store, "message_identity_repair_state").await);
+
+        // The current top migration now tracks which source last supplied
         // mute/archive preferences. Revert it first so the historical
         // downgrade assertions below still start at account-cascade.
         store

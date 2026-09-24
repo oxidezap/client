@@ -325,6 +325,65 @@ async fn history_sync_strips_parent_later_in_same_batch() {
 }
 
 #[tokio::test]
+async fn quote_resolves_across_historical_and_current_lids() {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+    let historical_lid = "999900000000001@lid";
+    store
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "999900000000001".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_699_999_999,
+            updated_at: 1_699_999_999,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("record historical LID");
+    feed(
+        &chat_store,
+        [live_chat(
+            GROUP,
+            PEER_LID,
+            "HISTORICAL-QUOTE-PARENT",
+            wa::Message::text("parent under current LID"),
+            1_700_000_000,
+        )],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [live_chat(
+            GROUP,
+            PEER,
+            "HISTORICAL-QUOTE-REPLY",
+            text_reply(
+                "reply",
+                "HISTORICAL-QUOTE-PARENT",
+                historical_lid,
+                wa::Message::text("stale historical snapshot"),
+            ),
+            1_700_000_060,
+        )],
+    )
+    .await;
+
+    let (bytes, _) = stored_proto(&store, "HISTORICAL-QUOTE-REPLY").await;
+    let stored = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
+    assert_eq!(quoted_text(&stored), None);
+    let page = chat_store.messages(&jid(GROUP), None, 10).await.unwrap();
+    let reply = page
+        .iter()
+        .find(|message| message.id == "HISTORICAL-QUOTE-REPLY")
+        .expect("reply");
+    assert_eq!(
+        quoted_text(reply.message.as_deref().expect("decoded proto")).as_deref(),
+        Some("parent under current LID")
+    );
+}
+
+#[tokio::test]
 async fn history_postpass_matches_device_qualified_pending_sender() {
     let (store, chat_store) = test_store().await;
     let device_sender = format!("{}:9@s.whatsapp.net", jid(PEER).user);
