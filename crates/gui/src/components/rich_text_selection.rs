@@ -189,7 +189,7 @@ impl SelectableRichText {
         styled_text: StyledText,
         links: Vec<Range<usize>>,
         link_targets: Arc<[SharedString]>,
-        selection_key: impl Into<String>,
+        selection_key: Arc<str>,
         document_order: u64,
     ) -> Self {
         Self {
@@ -198,7 +198,7 @@ impl SelectableRichText {
             styled_text,
             links,
             link_targets,
-            selection_key: Arc::from(selection_key.into()),
+            selection_key,
             document_order,
         }
     }

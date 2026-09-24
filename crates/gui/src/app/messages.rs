@@ -108,6 +108,9 @@ pub struct BubbleIds {
     pub group: SharedString,
     /// The bubble itself.
     pub bubble: SharedString,
+    /// Shared selection identity, built with the row cache rather than on each
+    /// bubble repaint.
+    pub selection_key: Arc<str>,
     /// The three controls in the action bar beside it, which is built on
     /// every frame whether or not the pointer is over the row: it is
     /// `invisible()` until a hover reveals it, not absent.
@@ -125,6 +128,7 @@ impl BubbleIds {
             row: format!("row-{id}").into(),
             group: format!("bubble-{id}").into(),
             bubble: format!("msg-{id}").into(),
+            selection_key: Arc::from(id.as_str()),
             react: format!("react-{id}").into(),
             reply: format!("reply-{id}").into(),
             copy: format!("copy-{id}").into(),
@@ -277,6 +281,16 @@ mod tests {
         // about is where the day dividers fall.
         msg.timestamp = when;
         msg
+    }
+
+    #[test]
+    fn bubble_clones_share_the_precomputed_selection_identity() {
+        let message = message("peer", false, at(13, 9));
+        let ids = BubbleIds::of(&message);
+        let cloned_ids = ids.clone();
+
+        assert_eq!(ids.selection_key.as_ref(), message.id.as_str());
+        assert!(Arc::ptr_eq(&ids.selection_key, &cloned_ids.selection_key));
     }
 
     fn kinds(items: &[TimelineItem]) -> Vec<&'static str> {

@@ -2139,8 +2139,7 @@ impl WhatsAppApp {
         // controls to stop it, and an encode that could still finish, pass an
         // epoch nothing had bumped, and send the old account's note from the
         // newly paired one.
-        self.leave_connected_view(cx);
-        clear_window_message_selection(window, cx);
+        self.leave_connected_view(Some(window), cx);
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.incoming_file_reading = false;
         self.paste_preview = None;
@@ -2237,7 +2236,18 @@ impl WhatsAppApp {
     ///
     /// Not [`AppState::Offline`]: that keeps the conversation on screen and
     /// only refuses to send.
-    fn leave_connected_view(&mut self, cx: &mut Context<Self>) {
+    fn leave_connected_view(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        // The window-scoped text selection outlives the conversation's rows.
+        // Clear it with the rest of the connected view so Copy cannot expose
+        // hidden message text after a disconnect, error, or logout. Account
+        // teardown already has the Window; other transitions use its handle.
+        if let Some(window) = window {
+            clear_window_message_selection(window, cx);
+        } else if let Some(window) = self.modal_window {
+            let _ = window.update(cx, |_, window, cx| {
+                clear_window_message_selection(window, cx);
+            });
+        }
         if self.recorder.read(cx).state() != RecordingState::Idle {
             self.cancel_recording(cx);
         }
@@ -4313,6 +4323,84 @@ fn timeline_may_page(visible: Option<&str>, anchored: Option<&str>, chat_jid: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SelectionExitTestView {
+        focus_handle: FocusHandle,
+        selection_key: Arc<str>,
+    }
+
+    impl Render for SelectionExitTestView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let text = crate::components::BubbleText::of("alpha beta");
+            div().track_focus(&self.focus_handle).size_full().child(
+                div()
+                    .id("message-row")
+                    .w(gpui::px(400.))
+                    .h(gpui::px(40.))
+                    .child(crate::components::render_rich_text(
+                        &text,
+                        self.selection_key.clone(),
+                        0,
+                        cx,
+                    )),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn leaving_connected_view_clears_selected_message_text(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut focus_handle = None;
+        let mut app_entity = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| WhatsAppApp::new(cx));
+            app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+            app_entity = Some(app);
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                SelectionExitTestView {
+                    focus_handle: handle,
+                    selection_key: Arc::from("test-message"),
+                }
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            gpui::point(gpui::px(1.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+            "alpha "
+        );
+
+        app_entity
+            .unwrap()
+            .update(cx, |app, cx| app.leave_connected_view(None, cx));
+        assert_eq!(
+            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+            ""
+        );
+    }
 
     #[test]
     fn a_sent_receipt_replaces_only_the_outgoing_pending_clock() {

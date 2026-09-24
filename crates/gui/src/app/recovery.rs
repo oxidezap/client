@@ -154,7 +154,7 @@ impl WhatsAppApp {
     /// fail the same way forever, so arming a retry is a promise this cannot
     /// keep.
     pub(super) fn connection_ended(&mut self, fault: Fault, cx: &mut Context<Self>) {
-        self.leave_connected_view(cx);
+        self.leave_connected_view(None, cx);
         let recovery = fault.recovery;
         // A new fault is a new sentence, and the fold under it belongs to the
         // one it replaces. See `Recovering::close_detail`.

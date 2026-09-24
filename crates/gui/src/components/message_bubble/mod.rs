@@ -315,7 +315,7 @@ pub fn render_message_bubble(
                                                     .text_color(cx.theme().foreground)
                                                     .child(render_rich_text(
                                                         content,
-                                                        &message_id,
+                                                        ids.selection_key.clone(),
                                                         props.selection_order,
                                                         cx,
                                                     )),

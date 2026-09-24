@@ -115,7 +115,7 @@ impl BubbleText {
 /// parent, and both paths inherit it.
 pub fn render_rich_text(
     parsed: &BubbleText,
-    selection_key: &str,
+    selection_key: Arc<str>,
     document_order: u64,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -200,7 +200,7 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
 /// the parent; only the link ink comes from the theme.
 fn render_with_links(
     parsed: &BubbleText,
-    selection_key: &str,
+    selection_key: Arc<str>,
     document_order: u64,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -302,6 +302,8 @@ fn link_style(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use gpui::{
         AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement, Modifiers,
         MouseButton, ParentElement as _, Render, Styled as _, TestAppContext, Window, div, point,
@@ -474,19 +476,26 @@ mod tests {
 
     struct TextSelectionTestView {
         source: &'static str,
+        selection_key: Arc<str>,
         focus_handle: FocusHandle,
+        show_text: bool,
     }
 
     impl Render for TextSelectionTestView {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let text = BubbleText::of(self.source);
-            div().track_focus(&self.focus_handle).size_full().child(
-                div()
-                    .id("message-row")
-                    .w(px(400.))
-                    .h(px(40.))
-                    .child(render_rich_text(&text, "test-message", 0, cx)),
-            )
+            div()
+                .track_focus(&self.focus_handle)
+                .size_full()
+                .when(self.show_text, |el| {
+                    el.child(
+                        div()
+                            .id("message-row")
+                            .w(px(400.))
+                            .h(px(40.))
+                            .child(render_rich_text(&text, self.selection_key.clone(), 0, cx)),
+                    )
+                })
         }
     }
 
@@ -508,7 +517,9 @@ mod tests {
                     focus_handle = Some(handle.clone());
                     TextSelectionTestView {
                         source,
+                        selection_key: Arc::from("test-message"),
                         focus_handle: handle,
+                        show_text: true,
                     }
                 });
                 gpui_component::Root::new(view, window, cx)
@@ -555,7 +566,9 @@ mod tests {
                     focus_handle = Some(handle.clone());
                     TextSelectionTestView {
                         source,
+                        selection_key: Arc::from("test-message"),
                         focus_handle: handle,
+                        show_text: true,
                     }
                 });
                 gpui_component::Root::new(view, window, cx)
@@ -599,7 +612,9 @@ mod tests {
                     focus_handle = Some(handle.clone());
                     TextSelectionTestView {
                         source: "alpha https://example.invalid",
+                        selection_key: Arc::from("test-message"),
                         focus_handle: handle,
+                        show_text: true,
                     }
                 });
                 gpui_component::Root::new(view, window, cx)
@@ -645,6 +660,72 @@ mod tests {
         assert_eq!(selected, "alpha ");
         // GPUI's root copy action trims the selection's outer whitespace.
         assert_eq!(clipboard_text(clipboard).as_deref(), Some("alpha"));
+    }
+
+    #[gpui::test]
+    fn selected_text_survives_a_virtualized_row_remount(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut focus_handle = None;
+        let mut selection_view = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                TextSelectionTestView {
+                    source: "alpha beta",
+                    selection_key: Arc::from("test-message"),
+                    focus_handle: handle,
+                    show_text: true,
+                }
+            });
+            selection_view = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            point(px(1.), px(12.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            point(px(58.), px(12.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            point(px(58.), px(12.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+            "alpha "
+        );
+
+        visual.update(|window, cx| {
+            selection_view.as_ref().unwrap().update(cx, |view, cx| {
+                view.show_text = false;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        visual.update(|window, cx| {
+            selection_view.as_ref().unwrap().update(cx, |view, cx| {
+                view.show_text = true;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+            "alpha "
+        );
     }
 
     #[gpui::test]
