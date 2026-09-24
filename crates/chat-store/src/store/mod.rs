@@ -858,9 +858,22 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // The current top migration only tracks which source last supplied
-        // mute/archive preferences. Revert it first so the historical
-        // downgrade assertions below still start at account-cascade.
+        // Revert the classifier-repair metadata migration before the older
+        // preference and account-cascade downgrades it stacks above.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("message-kind repair metadata downgrade is reversible");
+        assert!(!has_table(&store, "chat_store_meta").await);
+
+        // The next migration tracks which source last supplied mute/archive
+        // preferences. Revert it so the historical assertions start at
+        // account-cascade.
         store
             .shared()
             .run(|conn| {
