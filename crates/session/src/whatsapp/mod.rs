@@ -84,6 +84,7 @@ use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::PresencePolicy;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
+use whatsapp_rust::wacore::proto_helpers::MessageExt;
 // The same type either way; only the road to it differs. On a desktop the
 // library re-exports it, and in a browser that re-export is behind a default
 // feature the wasm build drops — so it is named at its own crate there.
