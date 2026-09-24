@@ -354,11 +354,17 @@ pub(crate) fn pick_quote_parent<'a>(
     participant: &str,
     alias: Option<&str>,
 ) -> Option<&'a ParentRow> {
-    if let Some(row) = rows.iter().find(|row| row.sender == participant) {
+    let participant = crate::store::message_identity::stored_sender(participant, false);
+    if let Some(row) = rows.iter().find(|row| {
+        crate::store::message_identity::stored_sender(&row.sender, false) == participant
+    }) {
         return Some(row);
     }
-    if let Some(alias) = alias
-        && let Some(row) = rows.iter().find(|row| row.sender == alias)
+    if let Some(alias) =
+        alias.map(|alias| crate::store::message_identity::stored_sender(alias, false))
+        && let Some(row) = rows
+            .iter()
+            .find(|row| crate::store::message_identity::stored_sender(&row.sender, false) == alias)
     {
         return Some(row);
     }

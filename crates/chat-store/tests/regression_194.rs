@@ -827,3 +827,161 @@ async fn skipped_redelivery_emits_invalidations_when_it_repairs_legacy_rows() {
         1
     );
 }
+
+#[tokio::test]
+async fn equal_edit_timestamps_choose_the_same_stable_row_in_both_page_directions() {
+    let (store, chat_store) = test_store().await;
+    let group = jid(GROUP);
+    let target = "MSG-194-EDIT-TIE";
+    let edited_at = 1_700_000_010;
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("pn original"),
+                incoming_info(GROUP, PEER, target, 1_700_000_000),
+            ),
+            message_event(
+                edit(target, "pn edit wins"),
+                incoming_info(GROUP, PEER, "PN-EDIT", edited_at),
+            ),
+            message_event(
+                wa::Message::text("lid original"),
+                incoming_info(GROUP, PEER_LID, target, 1_700_000_002),
+            ),
+            message_event(
+                edit(target, "lid edit loses tie"),
+                incoming_info(GROUP, PEER_LID, "LID-EDIT", edited_at),
+            ),
+        ],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+
+    let newest_first = chat_store.messages(&group, None, 10).await.unwrap();
+    let oldest_first = chat_store
+        .messages_after(
+            &group,
+            MessageCursor {
+                timestamp_ms: 0,
+                seq: 0,
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(newest_first[0].text.as_deref(), Some("pn edit wins"));
+    assert_eq!(oldest_first[0].text.as_deref(), Some("pn edit wins"));
+
+    chat_store.reconcile_chat(&group).unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store
+            .message(&group, target)
+            .await
+            .unwrap()
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("pn edit wins")
+    );
+}
+
+#[tokio::test]
+async fn delete_for_me_normalizes_device_qualified_participants_without_hitting_collisions() {
+    let (_store, chat_store) = test_store().await;
+    let device_sender = format!("{}:7@s.whatsapp.net", jid(PEER).user);
+    let other_sender = "559900000002@s.whatsapp.net";
+    let id = "MSG-194-DELETE-DEVICE";
+    let delete = Event::DeleteMessageForMeUpdate(
+        wacore::types::events::DeleteMessageForMeUpdate::builder()
+            .chat_jid(jid(GROUP))
+            .maybe_participant_jid(Some(jid(&device_sender)))
+            .message_id(id.into())
+            .from_me(false)
+            .timestamp(ts(1_700_000_020))
+            .action(Box::new(
+                wa::sync_action_value::DeleteMessageForMeAction::default(),
+            ))
+            .from_full_sync(false)
+            .build(),
+    );
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("delete this author"),
+                incoming_info(GROUP, &device_sender, id, 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("keep the other author"),
+                incoming_info(GROUP, other_sender, id, 1_700_000_001),
+            ),
+            delete,
+        ],
+    )
+    .await;
+
+    let rows = chat_store.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].sender_jid, jid(other_sender));
+    assert_eq!(rows[0].text.as_deref(), Some("keep the other author"));
+}
+
+#[tokio::test]
+async fn startup_reconciles_chats_under_historical_lids_on_both_read_keys() {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    let (store, chat_store) = test_store().await;
+    let historical_lid = "999900000000001@lid";
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("current PN thread"),
+                incoming_info(PEER, PEER, "MSG-194-CURRENT", 1_700_000_100),
+            ),
+            message_event(
+                wa::Message::text("historical LID thread"),
+                incoming_info(
+                    historical_lid,
+                    historical_lid,
+                    "MSG-194-HISTORICAL",
+                    1_700_000_000,
+                ),
+            ),
+        ],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+    store
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "999900000000001".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_699_999_999,
+            updated_at: 1_699_999_999,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("record the older LID mapping");
+    drop(chat_store);
+
+    let reopened = ChatStore::new(&store).await.unwrap();
+    assert_eq!(
+        reopened.chats(false, 10).await.unwrap().len(),
+        1,
+        "startup merges every mapped LID into the account's one thread"
+    );
+    for key in [jid(PEER), jid(PEER_LID)] {
+        let mut ids: Vec<String> = reopened
+            .messages(&key, None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["MSG-194-CURRENT", "MSG-194-HISTORICAL"]);
+    }
+}

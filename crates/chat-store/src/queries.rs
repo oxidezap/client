@@ -232,6 +232,8 @@ fn fold_read_duplicate(held: MessageRow, incoming: MessageRow) -> MessageRow {
     let revoked = held.revoked || incoming.revoked;
     let edited = match (held.edited_at_ms, incoming.edited_at_ms) {
         (Some(left), Some(right)) if right > left => Some(&incoming),
+        (Some(left), Some(right)) if left > right => Some(&held),
+        (Some(_), Some(_)) if incoming.id < held.id => Some(&incoming),
         (Some(_), Some(_)) => Some(&held),
         (Some(_), None) => Some(&held),
         (None, Some(_)) => Some(&incoming),

@@ -134,6 +134,56 @@ async fn reply_is_stored_without_snapshot_but_reads_with_parent() {
 }
 
 #[tokio::test]
+async fn quote_participant_device_suffix_matches_the_bare_stored_parent() {
+    let (store, chat_store) = test_store().await;
+    let device_sender = format!("{}:7@s.whatsapp.net", jid(PEER).user);
+    feed(
+        &chat_store,
+        [live_chat(
+            PEER,
+            &device_sender,
+            "DEVICE-ORIG",
+            wa::Message::text("parent from companion"),
+            1_700_000_000,
+        )],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [live_chat(
+            PEER,
+            PEER,
+            "DEVICE-REPLY",
+            text_reply(
+                "reply from phone",
+                "DEVICE-ORIG",
+                &device_sender,
+                wa::Message::text("stale quoted snapshot"),
+            ),
+            1_700_000_060,
+        )],
+    )
+    .await;
+
+    let (bytes, _) = stored_proto(&store, "DEVICE-REPLY").await;
+    let stored = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
+    assert_eq!(
+        quoted_text(&stored),
+        None,
+        "the device-qualified participant resolves to the normalized parent"
+    );
+    let page = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    let reply = page
+        .iter()
+        .find(|message| message.id == "DEVICE-REPLY")
+        .expect("reply");
+    assert_eq!(
+        quoted_text(reply.message.as_deref().expect("decoded proto")).as_deref(),
+        Some("parent from companion")
+    );
+}
+
+#[tokio::test]
 async fn reply_without_local_parent_keeps_inline_snapshot() {
     let (store, chat_store) = test_store().await;
 

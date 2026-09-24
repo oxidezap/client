@@ -22,7 +22,7 @@ pub(crate) struct MessageOwner {
 
 /// Store the stable representation used by new rows. A peer's device suffix
 /// is transport detail, not authorship; own messages use the account sentinel.
-pub(super) fn stored_sender(sender: &str, from_me: bool) -> String {
+pub(crate) fn stored_sender(sender: &str, from_me: bool) -> String {
     if from_me {
         return String::new();
     }
