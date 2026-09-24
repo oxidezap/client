@@ -34,6 +34,7 @@ pub(super) struct MediaProps {
     pub audio: Option<super::AudioProgress>,
     pub playback_speed: f32,
     pub is_downloading: bool,
+    pub saved_document_path: Option<std::path::PathBuf>,
     pub max_media_size: f32,
 }
 
@@ -53,6 +54,7 @@ pub(super) fn render_media_content(
         audio,
         playback_speed,
         is_downloading,
+        saved_document_path,
         max_media_size,
     } = props;
     match media_content.media_type {
@@ -267,6 +269,7 @@ pub(super) fn render_media_content(
             message_id,
             entity,
             is_downloading,
+            saved_document_path,
             cx,
         )),
     }
@@ -527,6 +530,7 @@ fn render_document_placeholder(
     message_id: String,
     entity: Entity<WhatsAppApp>,
     is_downloading: bool,
+    saved_document_path: Option<std::path::PathBuf>,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
@@ -607,7 +611,9 @@ fn render_document_placeholder(
             let file_name = media_content
                 .file_name
                 .unwrap_or_else(|| "document".to_string());
-            row.child(
+            let save_entity = entity.clone();
+            let save_id = message_id.clone();
+            let row = row.child(
                 parts::icon_button(
                     SharedString::from(format!("save-{message_id}")),
                     Icon::new(IconName::ArrowDown).size(metrics.icon_small()),
@@ -617,15 +623,51 @@ fn render_document_placeholder(
                 .disabled(is_downloading)
                 .when(!is_downloading, |button| button.cursor_pointer())
                 .on_click(move |_, _window, cx| {
-                    let msg_id = message_id.clone();
+                    let msg_id = save_id.clone();
                     let name = file_name.clone();
                     let dl = dl.clone();
-                    entity.update(cx, |app, cx| {
+                    save_entity.update(cx, |app, cx| {
                         app.download_document(msg_id, name, dl, cx);
                     });
                 }),
-            )
-            .into_any_element()
+            );
+            let row = if crate::platform::download::SUPPORTS_SAVED_FILE_ACTIONS {
+                if saved_document_path.is_some() {
+                    let id = message_id.clone();
+                    let open_entity = entity.clone();
+                    let open = parts::icon_button(
+                        SharedString::from(format!("open-{id}")),
+                        Icon::new(IconName::ArrowRight).size(metrics.icon_small()),
+                        "Open",
+                        metrics.icon_button(),
+                    )
+                    .cursor_pointer()
+                    .on_click({
+                        let id = id.clone();
+                        move |_, _, cx| {
+                            let id = id.clone();
+                            open_entity.update(cx, |app, cx| app.open_saved_document(&id, cx));
+                        }
+                    });
+                    let reveal = parts::icon_button(
+                        SharedString::from(format!("reveal-{id}")),
+                        Icon::new(IconName::Folder).size(metrics.icon_small()),
+                        "Show in folder",
+                        metrics.icon_button(),
+                    )
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        let id = id.clone();
+                        entity.update(cx, |app, cx| app.reveal_saved_document(&id, cx));
+                    });
+                    row.child(open).child(reveal)
+                } else {
+                    row
+                }
+            } else {
+                row
+            };
+            row.into_any_element()
         }
         None => row.into_any_element(),
     }

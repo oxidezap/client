@@ -622,21 +622,43 @@ impl WhatsAppApp {
             warn!("Cannot download document: client is unavailable");
             return;
         }
-        // The same slot an image claims, so the card can say "Saving…" and a
-        // second tap does not start a second download.
-        if !self.begin_download(&message_id, cx) {
+        // Deduplicate within this account/chat/message, without blocking a
+        // different conversation that happens to reuse the same message id.
+        let Some(scope) = self.document_scope(&message_id) else {
+            return;
+        };
+        if !self.document_downloads_in_flight.insert(scope.clone()) {
             return;
         }
+        cx.notify();
         let Some(client) = &self.client else {
-            self.finish_download(&message_id);
+            self.document_downloads_in_flight.remove(&scope);
             return;
         };
         let download_rx = client.download_downloadable_media(downloadable);
+        let expected_scope = scope.clone();
+        let expected_generation = self.document_state_generation;
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
                 Ok(data) => match hand_to_user(cx, file_name, data).await {
-                    Ok(where_it_went) => info!("Document {message_id} saved to {where_it_went}"),
+                    Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
+                        let display = path.display().to_string();
+                        let _ = entity.update(cx, |app, cx| {
+                            if app.document_state_generation == expected_generation
+                                && app.account_scope() == expected_scope.0.as_str()
+                            {
+                                app.saved_documents.insert(expected_scope.clone(), path);
+                                cx.notify();
+                            }
+                        });
+                        info!("Document {message_id} saved to {display}");
+                    }
+                    Ok(crate::platform::download::DownloadOutcome::BrowserDownloadRequested(
+                        where_it_went,
+                    )) => {
+                        info!("Document {message_id} handed to {where_it_went}");
+                    }
                     Err(e) => {
                         warn!("Failed to save document {message_id}: {e}");
                         say(&entity, cx, e);
@@ -652,12 +674,81 @@ impl WhatsAppApp {
                 }
             }
             let _ = entity.update(cx, |app, cx| {
-                app.finish_download(&message_id);
+                if app.document_state_generation == expected_generation {
+                    app.document_downloads_in_flight.remove(&scope);
+                }
                 cx.notify();
             });
         })
         .detach();
     }
+    /// Identity tuple for a document operation; a message id alone is not
+    /// unique across accounts or conversations.
+    fn account_scope(&self) -> String {
+        format!(
+            "{}|{}",
+            self.account_jid.as_deref().unwrap_or(""),
+            self.account_lid.as_deref().unwrap_or("")
+        )
+    }
+
+    fn document_scope(&self, message_id: &str) -> Option<(String, String, String)> {
+        Some(document_scope_key(
+            &self.account_scope(),
+            self.selected_chat.as_deref()?,
+            message_id,
+        ))
+    }
+
+    /// Whether this document is being saved in the current account/chat.
+    pub fn is_document_downloading(&self, message_id: &str) -> bool {
+        self.document_scope(message_id)
+            .is_some_and(|scope| self.document_downloads_in_flight.contains(&scope))
+    }
+
+    /// The saved native destination for this message in the current chat.
+    pub fn saved_document_path(&self, message_id: &str) -> Option<std::path::PathBuf> {
+        self.saved_documents
+            .get(&self.document_scope(message_id)?)
+            .cloned()
+    }
+
+    /// Open the exact file produced by the save operation, if it still exists.
+    pub fn open_saved_document(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(path) = self.saved_document_path(message_id) else {
+            return;
+        };
+        if path.is_file() {
+            cx.open_with_system(&path);
+        } else if let Some(scope) = self.document_scope(message_id) {
+            self.saved_documents.remove(&scope);
+            cx.notify();
+            self.notify_user(
+                "That file is no longer in Downloads. Save it again to open it.",
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+        }
+    }
+
+    /// Reveal the exact saved file in its containing folder.
+    pub fn reveal_saved_document(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(path) = self.saved_document_path(message_id) else {
+            return;
+        };
+        if path.is_file() {
+            cx.reveal_path(&path);
+        } else if let Some(scope) = self.document_scope(message_id) {
+            self.saved_documents.remove(&scope);
+            cx.notify();
+            self.notify_user(
+                "That file is no longer in Downloads. Save it again to show it.",
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+        }
+    }
+
     /// Save a picture already in hand to the Downloads directory.
     ///
     /// Distinct from `download_document`, which fetches first: by the time
@@ -688,7 +779,12 @@ impl WhatsAppApp {
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match hand_to_user(cx, file_name, data).await {
-                Ok(where_it_went) => info!("Saved {id} to {where_it_went}"),
+                Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
+                    info!("Saved {id} to {}", path.display())
+                }
+                Ok(crate::platform::download::DownloadOutcome::BrowserDownloadRequested(
+                    description,
+                )) => info!("Saved {id} to {description}"),
                 Err(e) => {
                     warn!("Failed to save {id}: {e}");
                     say(&entity, cx, e);
@@ -1180,6 +1276,10 @@ impl WhatsAppApp {
     }
 }
 
+fn document_scope_key(account: &str, chat: &str, message_id: &str) -> (String, String, String) {
+    (account.to_owned(), chat.to_owned(), message_id.to_owned())
+}
+
 /// Put a failure in front of the person who asked for it.
 ///
 /// These paths ran to `warn!` and stopped, which on a desktop is a save that
@@ -1202,11 +1302,33 @@ async fn hand_to_user(
     cx: &mut gpui::AsyncApp,
     file_name: String,
     data: std::sync::Arc<Vec<u8>>,
-) -> Result<String, String> {
+) -> Result<crate::platform::download::DownloadOutcome, String> {
     if crate::platform::download::SAVES_OFF_THREAD {
         cx.background_spawn(async move { crate::platform::download::save(&file_name, &data) })
             .await
     } else {
         crate::platform::download::save(&file_name, &data)
+    }
+}
+
+#[cfg(test)]
+mod document_scope_tests {
+    use super::document_scope_key;
+
+    #[test]
+    fn regression_193_same_message_id_isolated_by_account_and_chat() {
+        let first = document_scope_key("account-a", "chat-a", "message-1");
+        assert_ne!(
+            first,
+            document_scope_key("account-b", "chat-a", "message-1")
+        );
+        assert_ne!(
+            first,
+            document_scope_key("account-a", "chat-b", "message-1")
+        );
+        assert_eq!(
+            first,
+            document_scope_key("account-a", "chat-a", "message-1")
+        );
     }
 }
