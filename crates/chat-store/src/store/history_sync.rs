@@ -10,7 +10,7 @@ use crate::materialize::{MessageOp, classify};
 use crate::schema;
 use crate::storage_proto::{PendingQuote, strip_pending_quotes};
 use crate::store::chat_rows::recompute_chat_preview;
-use crate::store::contacts::upsert_contact_push_name;
+use crate::store::contacts::{apply_removal_tombstone_to_history, upsert_contact_push_name};
 use crate::store::edit::apply_edit;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message};
 use crate::store::reaction::apply_reaction;
@@ -66,6 +66,7 @@ fn apply_history_conversation(
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
     let chat = &crate::lid::route_chat_key(conn, device_id, conv.id.as_str(), cs)?;
+    let removed = apply_removal_tombstone_to_history(conn, device_id, conv.id.as_str())?;
     let last_ts_ms = conv
         .conversation_timestamp
         .map(crate::types::wire_secs_to_ms)
@@ -73,16 +74,23 @@ fn apply_history_conversation(
 
     {
         use schema::chats::dsl;
-        let address_book_name = conv.name.as_deref().filter(|name| !name.trim().is_empty());
-        let name = address_book_name
-            .or(conv.display_name.as_deref())
-            .or(conv.username.as_deref());
+        let independent_name = conv
+            .display_name
+            .as_deref()
+            .or(conv.username.as_deref())
+            .filter(|name| !name.trim().is_empty());
+        let address_book_name = (!removed)
+            .then(|| conv.name.as_deref())
+            .flatten()
+            .filter(|name| !name.trim().is_empty());
+        let name = address_book_name.or(independent_name);
         // History is the stale copy: a nameless chunk must not erase a name
         // live traffic (or an earlier metadata pass) already stored. An
         // incoming `Some` still updates; an incoming `None` leaves the row
         // it would otherwise clobber alone.
         let persist_name = name.filter(|n| !n.trim().is_empty());
         let name_from_address_book = persist_name.is_some() && address_book_name.is_some();
+        let address_book_fallback = address_book_name.and(independent_name);
         let unread_count = match conv.unread_count {
             _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
             Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
@@ -94,6 +102,7 @@ fn apply_history_conversation(
                 dsl::jid.eq(chat),
                 dsl::name.eq(persist_name),
                 dsl::name_from_address_book.eq(name_from_address_book),
+                dsl::address_book_fallback.eq(address_book_fallback),
                 dsl::last_message_ts.eq(last_ts_ms),
                 dsl::unread_count.eq(unread_count),
                 // Wire values are unix SECONDS; the columns (and the live
@@ -124,6 +133,11 @@ fn apply_history_conversation(
                 >("COALESCE(excluded.name, name)")),
                 dsl::name_from_address_book.eq(diesel::dsl::sql::<diesel::sql_types::Bool>(
                     "CASE WHEN excluded.name IS NOT NULL THEN excluded.name_from_address_book ELSE name_from_address_book END",
+                )),
+                dsl::address_book_fallback.eq(diesel::dsl::sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                >(
+                    "CASE WHEN excluded.name IS NOT NULL THEN excluded.address_book_fallback ELSE address_book_fallback END",
                 )),
                 dsl::last_message_ts.eq(diesel::dsl::sql::<diesel::sql_types::BigInt>(
                     "MAX(last_message_ts, excluded.last_message_ts)",

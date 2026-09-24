@@ -16,6 +16,7 @@ diesel::table! {
         mute_appstate_seen -> Bool,
         archive_appstate_seen -> Bool,
         name_from_address_book -> Bool,
+        address_book_fallback -> Nullable<Text>,
     }
 }
 
@@ -130,6 +131,13 @@ diesel::table! {
 }
 
 diesel::table! {
+    contact_name_removals (device_id, jid) {
+        device_id -> Integer,
+        jid -> Text,
+    }
+}
+
+diesel::table! {
     avatar_descriptors (device_id, jid) {
         device_id -> Integer,
         jid -> Text,
@@ -148,5 +156,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     contact_labels,
     message_receipts,
     message_identity_repair_state,
-    message_identity_repair_pending
+    message_identity_repair_pending,
+    contact_name_removals
 );

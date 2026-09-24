@@ -818,6 +818,8 @@ mod migration_tests {
             .await
             .expect("chat-name-provenance downgrade is reversible");
         assert!(!has_column(&store, "chats", "name_from_address_book").await);
+        assert!(!has_column(&store, "chats", "address_book_fallback").await);
+        assert!(!has_table(&store, "contact_name_removals").await);
 
         store
             .shared()

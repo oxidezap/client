@@ -118,6 +118,58 @@ fn contact_keys(
     Ok(keys)
 }
 
+pub(super) fn clear_contact_removal_tombstones(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &str,
+) -> QueryResult<()> {
+    use schema::contact_name_removals::dsl as removals;
+    let keys = contact_keys(conn, device_id, jid)?;
+    diesel::delete(
+        removals::contact_name_removals
+            .filter(removals::device_id.eq(device_id))
+            .filter(removals::jid.eq_any(keys)),
+    )
+    .execute(conn)?;
+    Ok(())
+}
+
+/// If a removal was observed, retire any address-book fallback before history
+/// can re-materialize that stale value. Independent fallback names are retained.
+pub(super) fn apply_removal_tombstone_to_history(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &str,
+) -> QueryResult<bool> {
+    use schema::contact_name_removals::dsl as removals;
+    let keys = contact_keys(conn, device_id, jid)?;
+    let removed = removals::contact_name_removals
+        .filter(removals::device_id.eq(device_id))
+        .filter(removals::jid.eq_any(&keys))
+        .select(removals::jid)
+        .first::<String>(conn)
+        .optional()?
+        .is_some();
+    if !removed {
+        return Ok(false);
+    }
+
+    use schema::chats::dsl as chats;
+    diesel::update(
+        chats::chats
+            .filter(chats::device_id.eq(device_id))
+            .filter(chats::jid.eq_any(keys))
+            .filter(chats::name_from_address_book.eq(true)),
+    )
+    .set((
+        chats::name.eq(chats::address_book_fallback),
+        chats::address_book_fallback.eq(None::<String>),
+        chats::name_from_address_book.eq(false),
+    ))
+    .execute(conn)?;
+    Ok(true)
+}
+
 pub(super) fn update_address_book_chat_names(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -163,6 +215,20 @@ pub(super) fn clear_contact_names(
 ) -> QueryResult<(bool, bool)> {
     use schema::contacts::dsl as contacts;
     let keys = contact_keys(conn, device_id, jid)?;
+    for key in &keys {
+        diesel::insert_into(schema::contact_name_removals::dsl::contact_name_removals)
+            .values((
+                schema::contact_name_removals::dsl::device_id.eq(device_id),
+                schema::contact_name_removals::dsl::jid.eq(key),
+            ))
+            .on_conflict((
+                schema::contact_name_removals::dsl::device_id,
+                schema::contact_name_removals::dsl::jid,
+            ))
+            .do_nothing()
+            .execute(conn)?;
+    }
+
     let contact_changed = diesel::update(
         contacts::contacts
             .filter(contacts::device_id.eq(device_id))
@@ -186,7 +252,8 @@ pub(super) fn clear_contact_names(
             .filter(schema::chats::dsl::name_from_address_book.eq(true)),
     )
     .set((
-        schema::chats::dsl::name.eq(None::<String>),
+        schema::chats::dsl::name.eq(schema::chats::dsl::address_book_fallback),
+        schema::chats::dsl::address_book_fallback.eq(None::<String>),
         schema::chats::dsl::name_from_address_book.eq(false),
     ))
     .execute(conn)?;

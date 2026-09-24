@@ -40,6 +40,7 @@ async fn removal_retires_history_address_book_names_but_keeps_independent_server
                 wa::Conversation {
                     id: PEER.into(),
                     name: Some("Saved Name".into()),
+                    display_name: Some("Independent Fallback".into()),
                     ..Default::default()
                 },
                 wa::Conversation {
@@ -97,8 +98,9 @@ async fn removal_retires_history_address_book_names_but_keeps_independent_server
             .iter()
             .find(|chat| chat.jid == jid(PEER))
             .unwrap()
-            .name,
-        None
+            .name
+            .as_deref(),
+        Some("Independent Fallback")
     );
     assert_eq!(
         after
@@ -108,6 +110,33 @@ async fn removal_retires_history_address_book_names_but_keeps_independent_server
             .name
             .as_deref(),
         Some("Independent Server Name")
+    );
+
+    // A delayed history chunk cannot restore the removed primary name, and
+    // the independent fallback survives because its provenance was retained.
+    feed(
+        &store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                name: Some("Saved Name".into()),
+                display_name: Some("Independent Fallback".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    let after_delayed_history = store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        after_delayed_history
+            .iter()
+            .find(|chat| chat.jid == jid(PEER))
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Independent Fallback")
     );
 
     // A server-provided display name can coincidentally equal the contact
@@ -140,6 +169,45 @@ async fn removal_retires_history_address_book_names_but_keeps_independent_server
             .name
             .as_deref(),
         Some("Coincident Name")
+    );
+}
+
+#[tokio::test]
+async fn removal_tombstone_blocks_delayed_history_until_contact_is_added_again() {
+    let (_device, store) = test_store().await;
+    feed(&store, [contact_removed(PEER)]).await;
+    feed(
+        &store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                name: Some("Stale Saved Name".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(store.chats(false, 10).await.unwrap()[0].name, None);
+
+    feed(&store, [contact_update(PEER, "New Saved Name", "New")]).await;
+    feed(
+        &store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                name: Some("New Saved Name".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(
+        store.chats(false, 10).await.unwrap()[0].name.as_deref(),
+        Some("New Saved Name")
     );
 }
 

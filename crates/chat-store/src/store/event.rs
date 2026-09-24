@@ -15,7 +15,8 @@ use crate::store::chat_rows::{
     remaining_messages,
 };
 use crate::store::contacts::{
-    clear_contact_names, update_address_book_chat_names, upsert_contact_names,
+    clear_contact_names, clear_contact_removal_tombstones, update_address_book_chat_names,
+    upsert_contact_names,
 };
 use crate::store::history_sync::apply_history_sync;
 use crate::store::inbound::apply_inbound;
@@ -95,6 +96,7 @@ pub(super) fn apply_event(
         }
         Event::HistorySync(lazy) => apply_history_sync(conn, device_id, lazy, cs),
         Event::ContactUpdate(update) => {
+            clear_contact_removal_tombstones(conn, device_id, &update.jid.to_string())?;
             upsert_contact_names(
                 conn,
                 device_id,
@@ -147,6 +149,7 @@ pub(super) fn apply_event(
                 .set((
                     schema::chats::name.eq(subject),
                     schema::chats::name_from_address_book.eq(false),
+                    schema::chats::address_book_fallback.eq(None::<String>),
                 ))
                 .execute(conn)?;
             cs.chats = true;
