@@ -247,14 +247,26 @@ fn selection_quad_bounds(
             .windows(2)
             .map(|pair| (pair[0], pair[1]))
             .collect();
-        // Preserve the first shaped caret position per source boundary; all
-        // positioned glyph extrema remain represented by `segments`.
+        // Preserve caret positions and all glyph extrema per source boundary.
         let mut shaped_x_by_index = HashMap::new();
+        let mut glyph_x_extents: HashMap<usize, (Pixels, Pixels)> = HashMap::new();
         for run in runs {
             for glyph in &run.glyphs {
+                let source_ix = line_start_ix + glyph.index;
                 shaped_x_by_index
-                    .entry(line_start_ix + glyph.index)
+                    .entry(source_ix)
                     .or_insert(glyph.position.x);
+                glyph_x_extents
+                    .entry(source_ix)
+                    .and_modify(|(left, right)| {
+                        if glyph.position.x < *left {
+                            *left = glyph.position.x;
+                        }
+                        if glyph.position.x > *right {
+                            *right = glyph.position.x;
+                        }
+                    })
+                    .or_insert((glyph.position.x, glyph.position.x));
             }
         }
         let mut segments = vec![Vec::new(); wrap_boundaries.len() + 1];
@@ -311,7 +323,13 @@ fn selection_quad_bounds(
                         .get(&cluster_end_ix)
                         .copied()
                         .unwrap_or(line.unwrapped_layout.width);
-                    Some(trailing_cluster_extension(visual_right, *start_x, end_x))
+                    let (glyph_left, glyph_right) = glyph_x_extents.get(&source_ix)?;
+                    Some(trailing_cluster_extension(
+                        *start_x,
+                        end_x,
+                        *glyph_left,
+                        *glyph_right,
+                    ))
                 })
                 .unwrap_or(line_height.half());
             let visual_glyphs: Vec<_> = glyphs
@@ -417,17 +435,15 @@ fn selection_glyph_bounds(
 }
 
 fn trailing_cluster_extension(
-    visual_right: Pixels,
     source_start: Pixels,
     source_end: Pixels,
+    glyph_left: Pixels,
+    glyph_right: Pixels,
 ) -> Pixels {
-    let caret_right = if source_end > source_start {
-        source_end
-    } else {
-        source_start
-    };
-    if caret_right > visual_right {
-        caret_right - visual_right
+    let shaped_advance = (source_end - source_start).abs();
+    let positioned_span = glyph_right - glyph_left;
+    if shaped_advance > positioned_span {
+        shaped_advance - positioned_span
     } else {
         Pixels::ZERO
     }
@@ -811,7 +827,14 @@ mod tests {
 
     #[test]
     fn trailing_cluster_extension_keeps_all_positioned_glyphs() {
-        assert_eq!(trailing_cluster_extension(px(10.), px(0.), px(15.)), px(5.));
+        assert_eq!(
+            trailing_cluster_extension(px(0.), px(15.), px(0.), px(10.)),
+            px(5.)
+        );
+        assert_eq!(
+            trailing_cluster_extension(px(15.), px(5.), px(15.), px(15.)),
+            px(10.)
+        );
     }
 
     #[test]
