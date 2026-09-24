@@ -229,6 +229,7 @@ fn render_row(
                 text: text.clone(),
                 message: Arc::clone(msg),
                 chat_jid: chat_jid.clone(),
+                selection_order: *ix as u64,
                 attempted_vote: app.attempted_poll_vote(chat_jid, message_id),
                 playing_message_id: app.playing_message_id().map(|s| s.to_string()),
                 is_group,

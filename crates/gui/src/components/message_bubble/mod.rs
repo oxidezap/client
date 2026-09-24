@@ -60,6 +60,8 @@ pub struct BubbleProps {
     /// Which conversation this row is drawn in. A bubble does not carry it
     /// — the vote names the chat, so it travels in beside the message.
     pub chat_jid: SharedString,
+    /// Stable message sequence position used when text spans multiple bubbles.
+    pub selection_order: u64,
     /// Last vote requested here, not a confirmed vote.
     pub attempted_vote: Option<u32>,
     pub playing_message_id: Option<String>,
@@ -311,7 +313,11 @@ pub fn render_message_bubble(
                                                     .min_w_0()
                                                     .text_size(metrics.text_body())
                                                     .text_color(cx.theme().foreground)
-                                                    .child(render_rich_text(content, cx)),
+                                                    .child(render_rich_text(
+                                                        content,
+                                                        props.selection_order,
+                                                        cx,
+                                                    )),
                                             )
                                         })
                                         .child(render_meta(time, status, is_from_me, metrics, cx)),

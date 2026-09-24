@@ -319,6 +319,11 @@ impl WhatsAppApp {
             }
             UiEvent::AccountUpdated { name, jid, lid } => {
                 if self.account_name != name || self.account_jid != jid || self.account_lid != lid {
+                    if let Some(window) = self.modal_window.clone() {
+                        let _ = window.update(cx, |_, window, cx| {
+                            gpui_base::TextSelection::clear(window, cx);
+                        });
+                    }
                     self.account_name = name;
                     self.account_jid = jid;
                     self.account_lid = lid;

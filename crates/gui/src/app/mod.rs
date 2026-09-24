@@ -2599,6 +2599,11 @@ impl WhatsAppApp {
         // on this target, where the prompt is the browser's rather than the
         // operating system's.
         crate::platform::request_gesture_authorization();
+        if self.selected_chat.as_deref() != Some(jid.as_str()) {
+            // Message-text selection belongs to the conversation being left,
+            // not to the next list reusing the window selection layer.
+            gpui_base::TextSelection::clear(window, cx);
+        }
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on
