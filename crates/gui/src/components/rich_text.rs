@@ -310,6 +310,8 @@ mod tests {
         px,
     };
 
+    use gpui::prelude::FluentBuilder as _;
+
     use super::{BubbleText, render_rich_text};
 
     /// Links are resolved where the rows are built, beside the markup — so a
