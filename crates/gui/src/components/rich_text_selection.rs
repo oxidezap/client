@@ -204,51 +204,120 @@ fn selection_quad_bounds(
     let bounds = layout.bounds();
     let line_height = layout.line_height();
     let mut fragments = Vec::new();
+    let mut line_start_ix = 0;
+    let mut line_top = bounds.top();
+
+    for line in layout.line_layouts() {
+        let runs = line.runs();
+        let wrap_boundaries = line.wrap_boundaries();
+        let mut segment_starts = vec![Pixels::ZERO];
+        for boundary in wrap_boundaries {
+            segment_starts.push(runs[boundary.run_ix].glyphs[boundary.glyph_ix].position.x);
+        }
+
+        let mut segments = vec![Vec::new(); segment_starts.len()];
+        let mut segment_ix = 0;
+        let mut next_boundary_ix = 0;
+        for (run_ix, run) in runs.iter().enumerate() {
+            for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+                if wrap_boundaries
+                    .get(next_boundary_ix)
+                    .is_some_and(|boundary| {
+                        boundary.run_ix == run_ix && boundary.glyph_ix == glyph_ix
+                    })
+                {
+                    segment_ix += 1;
+                    next_boundary_ix += 1;
+                }
+                segments[segment_ix].push((
+                    line_start_ix + glyph.index,
+                    glyph.position.x - segment_starts[segment_ix],
+                ));
+            }
+        }
+
+        for (segment_ix, glyphs) in segments.iter().enumerate() {
+            let segment_end_x = wrap_boundaries
+                .get(segment_ix)
+                .map(|boundary| runs[boundary.run_ix].glyphs[boundary.glyph_ix].position.x)
+                .unwrap_or(line.unwrapped_layout.width);
+            let segment_width = segment_end_x - segment_starts[segment_ix];
+            if segment_width <= Pixels::ZERO {
+                continue;
+            }
+            let segment_bounds = Bounds::from_corners(
+                Point::new(bounds.left(), line_top + line_height * segment_ix as f32),
+                Point::new(
+                    bounds.left() + segment_width,
+                    line_top + line_height * (segment_ix + 1) as f32,
+                ),
+            );
+            fragments.extend(selection_glyph_bounds(glyphs, &range, segment_bounds));
+        }
+
+        line_top += line.size(line_height).height;
+        line_start_ix += line.len() + 1;
+    }
+
     for (offset, character) in text[range.clone()].char_indices() {
+        if character != '\n' {
+            continue;
+        }
         let start_ix = range.start + offset;
-        let end_ix = start_ix + character.len_utf8();
-        let (Some(start), Some(end)) = (
-            layout.position_for_index(start_ix),
-            layout.position_for_index(end_ix),
-        ) else {
+        let Some(start) = layout.position_for_index(start_ix) else {
             continue;
         };
-        if start.y == end.y {
-            let (left, right) = if start.x <= end.x {
-                (start.x, end.x)
-            } else {
-                (end.x, start.x)
-            };
-            if left < right {
-                fragments.push(Bounds::from_corners(
-                    Point::new(left, start.y),
-                    Point::new(right, start.y + line_height),
-                ));
-            }
+        let line_edge = if start.x - bounds.left() > bounds.right() - start.x {
+            bounds.right()
         } else {
-            // A hard line break has no glyph on the next line. Extend its
-            // selection to the visual end of the line, which is the nearer
-            // edge for both LTR and RTL paragraphs.
-            let line_edge = if start.x - bounds.left() > bounds.right() - start.x {
-                bounds.right()
-            } else {
-                bounds.left()
-            };
-            let (left, right) = if start.x <= line_edge {
-                (start.x, line_edge)
-            } else {
-                (line_edge, start.x)
-            };
-            if left < right {
-                fragments.push(Bounds::from_corners(
-                    Point::new(left, start.y),
-                    Point::new(right, start.y + line_height),
-                ));
-            }
+            bounds.left()
+        };
+        let (left, right) = if start.x <= line_edge {
+            (start.x, line_edge)
+        } else {
+            (line_edge, start.x)
+        };
+        if left < right {
+            fragments.push(Bounds::from_corners(
+                Point::new(left, start.y),
+                Point::new(right, start.y + line_height),
+            ));
         }
     }
 
     merge_selection_fragments(fragments)
+}
+
+fn selection_glyph_bounds(
+    glyphs: &[(usize, Pixels)],
+    range: &Range<usize>,
+    segment_bounds: Bounds<Pixels>,
+) -> Vec<Bounds<Pixels>> {
+    let mut visual_glyphs = glyphs.to_vec();
+    visual_glyphs.sort_by(|left, right| {
+        left.1
+            .partial_cmp(&right.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut fragments = Vec::new();
+    for (glyph_ix, (source_ix, x)) in visual_glyphs.iter().enumerate() {
+        if !range.contains(source_ix) {
+            continue;
+        }
+        let right = visual_glyphs[glyph_ix + 1..]
+            .iter()
+            .map(|(_, next_x)| *next_x)
+            .find(|next_x| next_x > x)
+            .unwrap_or(segment_bounds.right() - segment_bounds.left());
+        if right > *x {
+            fragments.push(Bounds::from_corners(
+                Point::new(segment_bounds.left() + *x, segment_bounds.top()),
+                Point::new(segment_bounds.left() + right, segment_bounds.bottom()),
+            ));
+        }
+    }
+    fragments
 }
 
 fn merge_selection_fragments(mut fragments: Vec<Bounds<Pixels>>) -> Vec<Bounds<Pixels>> {
@@ -487,7 +556,7 @@ impl Element for SelectableRichText {
 mod tests {
     use gpui::{Bounds, point, px};
 
-    use super::merge_selection_fragments;
+    use super::{merge_selection_fragments, selection_glyph_bounds};
 
     #[test]
     fn bidi_selection_fragments_merge_in_visual_order_without_bridging_runs() {
@@ -507,6 +576,29 @@ mod tests {
                 fragment(10., 20., 45., 40.),
                 fragment(80., 20., 100., 40.),
                 fragment(10., 40., 30., 60.),
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_direction_selection_uses_glyph_clusters_at_run_boundaries() {
+        let glyphs = [
+            (0, px(0.)),
+            (1, px(10.)),
+            (2, px(20.)),
+            (3, px(30.)),
+            (4, px(60.)),
+            (6, px(50.)),
+            (8, px(40.)),
+        ];
+        let line = Bounds::from_corners(point(px(0.), px(20.)), point(px(70.), px(40.)));
+        let fragments = merge_selection_fragments(selection_glyph_bounds(&glyphs, &(3..6), line));
+
+        assert_eq!(
+            fragments,
+            vec![
+                Bounds::from_corners(point(px(30.), px(20.)), point(px(40.), px(40.))),
+                Bounds::from_corners(point(px(60.), px(20.)), point(px(70.), px(40.))),
             ]
         );
     }
