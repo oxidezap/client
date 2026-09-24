@@ -127,6 +127,10 @@ async fn prepare_repairs_recoverable_unknown_kind_idempotently() {
     oxidezap_chat_store::ChatStore::prepare(&store)
         .await
         .expect("repeat repair safely");
+    chat_store.close().await.unwrap();
+    let chat_store = oxidezap_chat_store::ChatStore::new_prepared(&store)
+        .await
+        .expect("reopen repaired store");
     let repaired_poll = chat_store
         .message(&chat, "OUT-REPAIR-POLL")
         .await
