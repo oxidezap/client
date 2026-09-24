@@ -641,29 +641,49 @@ impl WhatsAppApp {
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
-                Ok(data) => match hand_to_user(cx, file_name, data).await {
-                    Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
-                        let display = path.display().to_string();
-                        let _ = entity.update(cx, |app, cx| {
-                            if app.document_state_generation == expected_generation
-                                && app.account_scope() == expected_scope.0.as_str()
-                            {
-                                app.saved_documents.insert(expected_scope.clone(), path);
-                                cx.notify();
+                Ok(data) => {
+                    // The download can outlive its account. Check on the app
+                    // thread immediately before starting any native or browser
+                    // handoff; a stale completion must not write to Downloads.
+                    let is_current = entity
+                        .update(cx, |app, _| {
+                            document_state_matches(
+                                app.document_state_generation,
+                                &app.account_scope(),
+                                expected_generation,
+                                &expected_scope.0,
+                            )
+                        })
+                        .unwrap_or(false);
+                    if is_current {
+                        match hand_to_user(cx, file_name, data).await {
+                            Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
+                                let display = path.display().to_string();
+                                let _ = entity.update(cx, |app, cx| {
+                                    if document_state_matches(
+                                        app.document_state_generation,
+                                        &app.account_scope(),
+                                        expected_generation,
+                                        &expected_scope.0,
+                                    ) {
+                                        app.saved_documents.insert(expected_scope.clone(), path);
+                                        cx.notify();
+                                    }
+                                });
+                                info!("Document {message_id} saved to {display}");
                             }
-                        });
-                        info!("Document {message_id} saved to {display}");
+                            Ok(crate::platform::download::DownloadOutcome::BrowserDownloadRequested(
+                                where_it_went,
+                            )) => {
+                                info!("Document {message_id} handed to {where_it_went}");
+                            }
+                            Err(e) => {
+                                warn!("Failed to save document {message_id}: {e}");
+                                say(&entity, cx, e);
+                            }
+                        }
                     }
-                    Ok(crate::platform::download::DownloadOutcome::BrowserDownloadRequested(
-                        where_it_went,
-                    )) => {
-                        info!("Document {message_id} handed to {where_it_went}");
-                    }
-                    Err(e) => {
-                        warn!("Failed to save document {message_id}: {e}");
-                        say(&entity, cx, e);
-                    }
-                },
+                }
                 Err(e) => {
                     error!("Failed to download document {}: {}", message_id, e);
                     say(
@@ -1280,6 +1300,15 @@ fn document_scope_key(account: &str, chat: &str, message_id: &str) -> (String, S
     (account.to_owned(), chat.to_owned(), message_id.to_owned())
 }
 
+fn document_state_matches(
+    current_generation: u64,
+    current_account: &str,
+    expected_generation: u64,
+    expected_account: &str,
+) -> bool {
+    current_generation == expected_generation && current_account == expected_account
+}
+
 /// Put a failure in front of the person who asked for it.
 ///
 /// These paths ran to `warn!` and stopped, which on a desktop is a save that
@@ -1313,7 +1342,7 @@ async fn hand_to_user(
 
 #[cfg(test)]
 mod document_scope_tests {
-    use super::document_scope_key;
+    use super::{document_scope_key, document_state_matches};
 
     #[test]
     fn regression_193_same_message_id_isolated_by_account_and_chat() {
@@ -1329,6 +1358,55 @@ mod document_scope_tests {
         assert_eq!(
             first,
             document_scope_key("account-a", "chat-a", "message-1")
+        );
+    }
+
+    #[test]
+    fn regression_193_delayed_old_account_download_is_not_handed_off_or_recorded() {
+        // The download started under account-a, then reset rotates the state
+        // generation and installs account-b before the bytes arrive.
+        let expected_generation = 4;
+        let expected_account = "account-a";
+        let current_generation = 5;
+        let current_account = "account-b";
+        let scope = document_scope_key(expected_account, "chat-a", "message-1");
+        let mut handoffs = 0;
+        let mut saved_documents = std::collections::HashMap::new();
+
+        if document_state_matches(
+            current_generation,
+            current_account,
+            expected_generation,
+            expected_account,
+        ) {
+            handoffs += 1;
+            saved_documents.insert(scope.clone(), std::path::PathBuf::from("old-session.pdf"));
+        }
+
+        assert_eq!(handoffs, 0);
+        assert!(!saved_documents.contains_key(&scope));
+        // Both parts of the guard matter independently: an account switch can
+        // occur without a reset generation change, and a reset may precede the
+        // replacement account becoming visible.
+        assert!(!document_state_matches(4, "account-b", 4, "account-a"));
+        assert!(!document_state_matches(5, "account-a", 4, "account-a"));
+    }
+
+    #[test]
+    fn regression_193_current_session_download_is_handed_off_and_recorded() {
+        let scope = document_scope_key("account-a", "chat-a", "message-1");
+        let mut handoffs = 0;
+        let mut saved_documents = std::collections::HashMap::new();
+
+        if document_state_matches(4, "account-a", 4, "account-a") {
+            handoffs += 1;
+            saved_documents.insert(scope.clone(), std::path::PathBuf::from("document.pdf"));
+        }
+
+        assert_eq!(handoffs, 1);
+        assert_eq!(
+            saved_documents.get(&scope),
+            Some(&std::path::PathBuf::from("document.pdf"))
         );
     }
 }
