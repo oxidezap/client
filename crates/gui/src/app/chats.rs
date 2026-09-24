@@ -296,6 +296,7 @@ pub(super) fn hierarchical_group_rows(
     };
     let by_jid: HashMap<&str, &ChatRow> = rows.iter().map(|row| (row.jid.as_str(), row)).collect();
     let mut children: HashMap<&str, Vec<&ChatRow>> = HashMap::new();
+    let mut linked_children: HashMap<&str, Vec<&ChatRow>> = HashMap::new();
     let mut nested = std::collections::HashSet::new();
     for row in rows {
         let Some(GroupHierarchy::Subgroup { parent_jid, .. }) = &row.group_hierarchy else {
@@ -310,10 +311,12 @@ pub(super) fn hierarchical_group_rows(
         }) else {
             continue;
         };
-        // Input rows are sorted with pinned chats first. Nesting this child
-        // below an unpinned parent would move the pin out of that block, so
-        // leave it as a root row instead; the parent must not hide it either.
-        if row.pinned && !parent.pinned && !query_active {
+        linked_children.entry(parent_jid).or_default().push(row);
+        // Input rows are sorted with pinned chats first. Never nest across
+        // that boundary: an unpinned child under a pinned parent can otherwise
+        // jump ahead of later pinned rows. Keep the relationship for search
+        // context, while rendering cross-boundary children as roots.
+        if row.pinned != parent.pinned {
             continue;
         }
         children.entry(parent_jid).or_default().push(row);
@@ -334,7 +337,9 @@ pub(super) fn hierarchical_group_rows(
                 .get(row.jid.as_str())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let matching_child = members.iter().any(|child| matches(child));
+            let matching_child = linked_children
+                .get(row.jid.as_str())
+                .is_some_and(|children| children.iter().any(|child| matches(child)));
             let row_matches = matches(row);
             if !row_matches && !matching_child {
                 continue;
@@ -640,15 +645,41 @@ mod tests {
         assert_eq!(rows[0].tree_depth, 0);
         assert!(!rows[2].community_toggle_visible);
 
-        let searched = hierarchical_group_rows(&rows, "Pinned subgroup", &Default::default());
+        let searched = hierarchical_group_rows(&rows, "pinned subgroup", &Default::default());
         assert_eq!(
             searched
                 .iter()
                 .map(|row| row.jid.as_str())
                 .collect::<Vec<_>>(),
-            vec!["community@g.us", "pinned-child@g.us"]
+            vec!["pinned-child@g.us", "community@g.us"]
         );
-        assert!(searched[0].hierarchy_context);
+        assert!(searched[1].hierarchy_context);
+    }
+
+    #[test]
+    fn an_unpinned_subgroup_does_not_interrupt_the_pinned_block() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let mut community = hierarchy_row("community@g.us", "Community", GroupHierarchy::Community);
+        community.pinned = true;
+        let mut other_pinned = hierarchy_row("pinned@g.us", "Pinned", GroupHierarchy::Standalone);
+        other_pinned.pinned = true;
+        let child = hierarchy_row(
+            "child@g.us",
+            "Child",
+            GroupHierarchy::Subgroup {
+                parent_jid: "community@g.us".into(),
+                kind: SubgroupKind::Regular,
+            },
+        );
+        let rows =
+            hierarchical_group_rows(&[community, other_pinned, child], "", &Default::default());
+
+        assert_eq!(
+            rows.iter().map(|row| row.jid.as_str()).collect::<Vec<_>>(),
+            vec!["community@g.us", "pinned@g.us", "child@g.us"]
+        );
+        assert!(rows.iter().all(|row| row.tree_depth == 0));
     }
 
     #[test]
