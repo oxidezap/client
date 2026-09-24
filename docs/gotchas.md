@@ -263,8 +263,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   been resolved, not that WhatsApp declared the group standalone, so history,
   live message summaries and reconnect snapshots preserve the last known
   hierarchy until another typed overview changes it. The store updates this
-  metadata by compare-and-swap against the value a lookup started from, just
-  like resolved names, so a late pass cannot replace newer server state. On
+  metadata by compare-and-swap against the exact stored JSON a lookup started
+  from, just like resolved names, so a late pass cannot replace newer server
+  state. The raw value is retained even if this client cannot decode a newer
+  role, allowing a fresh overview to replace it after a downgrade. On
   the Groups filter, a subgroup is nested only when its parent JID is present
   and explicitly a community. Otherwise it remains a visible subgroup at the
   root; no string comparison repairs missing metadata. Search matches both

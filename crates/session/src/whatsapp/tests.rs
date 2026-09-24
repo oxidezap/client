@@ -1910,6 +1910,7 @@ async fn history_hydration_carries_persisted_group_hierarchy_to_core_chat() {
         archived: false,
         ephemeral_expiration: None,
         group_hierarchy: Some(hierarchy.clone()),
+        group_hierarchy_json: None,
     };
 
     let chats = WhatsAppClient::hydrate_entries(&chat_store, &client, &book(), vec![entry], |_| 0)
@@ -1945,6 +1946,7 @@ async fn alias_hydration_is_archived_only_when_both_rows_are_archived() {
         archived,
         ephemeral_expiration: None,
         group_hierarchy: None,
+        group_hierarchy_json: None,
     };
     for (first, second, expected) in [
         (true, false, false),
@@ -2237,6 +2239,7 @@ fn a_chat_cursor_keeps_an_address_with_a_colon_in_it() {
         archived: false,
         ephemeral_expiration: None,
         group_hierarchy: None,
+        group_hierarchy_json: None,
     };
     let token = chat_cursor(&entry);
     assert_eq!(

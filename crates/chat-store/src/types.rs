@@ -246,8 +246,11 @@ pub struct ChatEntry {
     pub muted_until: Option<DateTime<Utc>>,
     pub archived: bool,
     pub ephemeral_expiration: Option<u32>,
-    /// Server-reported community relationship; `None` is unknown.
+    /// Server-reported community relationship; `None` is unknown or unreadable.
     pub group_hierarchy: Option<oxidezap_core::GroupHierarchy>,
+    /// Original database value retained so an older client can CAS-replace an
+    /// unrecognized future role after fetching a fresh authoritative overview.
+    pub group_hierarchy_json: Option<String>,
 }
 
 /// The durable chat metadata a live message needs before it can alert.
@@ -530,7 +533,8 @@ pub enum ChatNameExpected {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupHierarchyWrite {
     pub jid: Jid,
-    pub expected: Option<oxidezap_core::GroupHierarchy>,
+    /// Exact JSON read before the lookup; `None` means the SQL column was NULL.
+    pub expected_json: Option<String>,
     pub hierarchy: oxidezap_core::GroupHierarchy,
 }
 
@@ -541,9 +545,25 @@ impl GroupHierarchyWrite {
         expected: Option<oxidezap_core::GroupHierarchy>,
         hierarchy: oxidezap_core::GroupHierarchy,
     ) -> Self {
+        Self::checked_json(
+            jid,
+            expected
+                .map(|expected| serde_json::to_string(&expected).expect("hierarchy serializes")),
+            hierarchy,
+        )
+    }
+
+    /// A typed overview captured against the exact stored JSON, including a
+    /// value this client cannot deserialize. The CAS can then recover rather
+    /// than leaving future metadata permanently stuck in storage.
+    pub fn checked_json(
+        jid: Jid,
+        expected_json: Option<String>,
+        hierarchy: oxidezap_core::GroupHierarchy,
+    ) -> Self {
         Self {
             jid,
-            expected,
+            expected_json,
             hierarchy,
         }
     }

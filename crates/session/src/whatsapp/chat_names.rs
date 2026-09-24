@@ -653,7 +653,7 @@ fn is_generated_group_placeholder(jid: &Jid, name: &str) -> bool {
 /// get revalidated.
 async fn stored_special_chats(
     chat_store: &Arc<ChatStore>,
-) -> Result<Vec<(Jid, Option<String>, Option<oxidezap_core::GroupHierarchy>)>, String> {
+) -> Result<Vec<(Jid, Option<String>, Option<String>)>, String> {
     chat_store
         .special_chat_names()
         .await
@@ -748,7 +748,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // a chat created after this snapshot is simply not in this pass
     // (its sighting queues its own ask).
     let mut pre: HashMap<String, Option<String>> = HashMap::new();
-    let mut pre_hierarchy: HashMap<String, Option<oxidezap_core::GroupHierarchy>> = HashMap::new();
+    let mut pre_hierarchy_json: HashMap<String, Option<String>> = HashMap::new();
     let mut groups: Vec<Jid> = Vec::new();
     let mut channels: Vec<Jid> = Vec::new();
     {
@@ -757,25 +757,22 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         // loop below needs `seen` back for its contains-check, so it is
         // scoped to the full-pass fill and the sightings push inline.
         {
-            let mut push =
-                |jid: Jid,
-                 stored: Option<String>,
-                 hierarchy: Option<oxidezap_core::GroupHierarchy>| {
-                    if !seen.insert(jid.to_string()) {
-                        return;
-                    }
-                    if !resolver.needs(&jid.to_string(), generation) {
-                        return;
-                    }
-                    let key = jid.to_string();
-                    pre.insert(key.clone(), stored);
-                    pre_hierarchy.insert(key, hierarchy);
-                    if jid.is_group() {
-                        groups.push(jid);
-                    } else if jid.is_newsletter() {
-                        channels.push(jid);
-                    }
-                };
+            let mut push = |jid: Jid, stored: Option<String>, hierarchy_json: Option<String>| {
+                if !seen.insert(jid.to_string()) {
+                    return;
+                }
+                if !resolver.needs(&jid.to_string(), generation) {
+                    return;
+                }
+                let key = jid.to_string();
+                pre.insert(key.clone(), stored);
+                pre_hierarchy_json.insert(key, hierarchy_json);
+                if jid.is_group() {
+                    groups.push(jid);
+                } else if jid.is_newsletter() {
+                    channels.push(jid);
+                }
+            };
             if request.full {
                 let stored = match stored_special_chats(chat_store).await {
                     Ok(stored) => stored,
@@ -785,8 +782,8 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                         return;
                     }
                 };
-                for (jid, stored, hierarchy) in stored {
-                    push(jid, stored, hierarchy);
+                for (jid, stored, hierarchy_json) in stored {
+                    push(jid, stored, hierarchy_json);
                 }
             }
         }
@@ -804,8 +801,8 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             if seen.contains(&jid.to_string()) {
                 continue;
             }
-            let (exists, stored, hierarchy) = match chat_store.chat(&jid).await {
-                Ok(Some(entry)) => (true, entry.name, entry.group_hierarchy),
+            let (exists, stored, hierarchy_json) = match chat_store.chat(&jid).await {
+                Ok(Some(entry)) => (true, entry.name, entry.group_hierarchy_json),
                 Ok(None) => (false, None, None),
                 Err(e) => {
                     retry_after_store_failure(resolver, signal, &request, stop).await;
@@ -851,7 +848,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             }
             let key = jid.to_string();
             pre.insert(key.clone(), stored);
-            pre_hierarchy.insert(key, hierarchy);
+            pre_hierarchy_json.insert(key, hierarchy_json);
             if jid.is_group() {
                 groups.push(jid);
             } else if jid.is_newsletter() {
@@ -898,9 +895,9 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                             let key = jid.to_string();
                             if let Some(hierarchy) = meta.hierarchy.clone() {
                                 resolved_hierarchies.push(
-                                    oxidezap_chat_store::GroupHierarchyWrite::checked(
+                                    oxidezap_chat_store::GroupHierarchyWrite::checked_json(
                                         jid.clone(),
-                                        pre_hierarchy.get(&key).cloned().flatten(),
+                                        pre_hierarchy_json.get(&key).cloned().flatten(),
                                         hierarchy,
                                     ),
                                 );
@@ -987,9 +984,9 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                         // writes against the same pre-pass observation.
                         resolved_hierarchies.retain(|write| write.jid != jid);
                         resolved_hierarchies.push(
-                            oxidezap_chat_store::GroupHierarchyWrite::checked(
+                            oxidezap_chat_store::GroupHierarchyWrite::checked_json(
                                 jid.clone(),
-                                pre_hierarchy.get(&key).cloned().flatten(),
+                                pre_hierarchy_json.get(&key).cloned().flatten(),
                                 hierarchy,
                             ),
                         );

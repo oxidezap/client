@@ -767,7 +767,7 @@ async fn group_hierarchy_is_persisted_and_compare_and_swap_protected() {
     use oxidezap_chat_store::GroupHierarchyWrite;
     use oxidezap_core::{GroupHierarchy, SubgroupKind};
 
-    let (_store, chat_store) = test_store().await;
+    let (store, chat_store) = test_store().await;
     feed(
         &chat_store,
         [message_event(
@@ -805,9 +805,9 @@ async fn group_hierarchy_is_persisted_and_compare_and_swap_protected() {
             .expect("read resolver snapshot")
             .into_iter()
             .find(|(jid, _, _)| jid == &group)
-            .and_then(|(_, _, hierarchy)| hierarchy),
-        Some(subgroup.clone()),
-        "the resolver snapshot carries the typed hierarchy too"
+            .and_then(|(_, _, hierarchy_json)| hierarchy_json),
+        Some(serde_json::to_string(&subgroup).expect("hierarchy serializes")),
+        "the resolver snapshot carries the exact stored hierarchy JSON"
     );
 
     let standalone = GroupHierarchy::Standalone;
@@ -835,6 +835,48 @@ async fn group_hierarchy_is_persisted_and_compare_and_swap_protected() {
             .expect("group exists")
             .group_hierarchy,
         Some(standalone)
+    );
+
+    // A newer client may have persisted a role this binary cannot deserialize.
+    // Keep those exact bytes as the compare-and-swap expectation so a fresh
+    // authoritative answer can repair the row instead of being stuck on NULL.
+    let future_json = r#"{"role":"future_role","future_field":"kept until refresh"}"#;
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("UPDATE chats SET group_hierarchy = ? WHERE jid = ?")
+                .bind::<diesel::sql_types::Text, _>(future_json)
+                .bind::<diesel::sql_types::Text, _>(GROUP)
+                .execute(conn)
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .expect("write future hierarchy fixture");
+    let unknown = chat_store
+        .chat(&group)
+        .await
+        .expect("read future hierarchy")
+        .expect("group exists");
+    assert_eq!(unknown.group_hierarchy, None);
+    assert_eq!(unknown.group_hierarchy_json.as_deref(), Some(future_json));
+
+    chat_store
+        .apply_group_hierarchies(vec![GroupHierarchyWrite::checked_json(
+            group.clone(),
+            Some(future_json.into()),
+            GroupHierarchy::Community,
+        )])
+        .expect("queue recovery");
+    chat_store.flush().await.expect("commit recovery");
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .expect("read recovered group")
+            .expect("group exists")
+            .group_hierarchy,
+        Some(GroupHierarchy::Community)
     );
 }
 
