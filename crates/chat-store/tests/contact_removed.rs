@@ -89,8 +89,7 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
             .await
             .unwrap()
             .unwrap()
-            .display_name()
-            .as_deref(),
+            .display_name(),
         Some("New Saved Name")
     );
 
