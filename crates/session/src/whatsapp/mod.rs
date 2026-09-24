@@ -89,7 +89,6 @@ use whatsapp_rust::client::Client;
 // feature the wasm build drops — so it is named at its own crate there.
 #[cfg(all(test, not(target_family = "wasm")))]
 use whatsapp_rust::store::SqliteStore;
-use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use whatsapp_rust::wacore::types::events::{
     ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
@@ -2074,8 +2073,9 @@ impl WhatsAppClient {
         names: &NameBook,
         eager: bool,
     ) {
-        // Use MessageExt to unwrap ephemeral/device_sent/view_once wrappers
-        let base_msg = msg.get_base_message();
+        // Use the shared store normalization for both ordinary envelopes and
+        // the nested wrappers it peels, so live and hydrated paths agree.
+        let base_msg = oxidezap_chat_store::normalized_message(msg);
 
         // Check if this is a reaction message
         if let Some(reaction) = base_msg.reaction_message.as_option() {
