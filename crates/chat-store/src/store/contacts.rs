@@ -115,6 +115,15 @@ pub(super) fn clear_contact_names(
         }
     }
 
+    let address_book_names: Vec<String> = contacts::contacts
+        .filter(contacts::device_id.eq(device_id))
+        .filter(contacts::jid.eq_any(&keys))
+        .select((contacts::full_name, contacts::first_name))
+        .load::<(Option<String>, Option<String>)>(conn)?
+        .into_iter()
+        .flat_map(|(full_name, first_name)| [full_name, first_name])
+        .flatten()
+        .collect();
     let contact_changed = diesel::update(
         contacts::contacts
             .filter(contacts::device_id.eq(device_id))
@@ -131,17 +140,21 @@ pub(super) fn clear_contact_names(
     ))
     .execute(conn)?;
 
-    // Direct-chat history carries a copy of the address-book label in
-    // `chats.name`. Retire that copy too or the normal list reload will use it
-    // as the fallback after the address-book lookup correctly returns none.
-    let chat_changed = diesel::update(
-        schema::chats::dsl::chats
-            .filter(schema::chats::dsl::device_id.eq(device_id))
-            .filter(schema::chats::dsl::jid.eq_any(keys))
-            .filter(schema::chats::dsl::name.is_not_null()),
-    )
-    .set(schema::chats::dsl::name.eq(None::<String>))
-    .execute(conn)?;
+    // Direct-chat history may carry a copy of the address-book label in
+    // `chats.name`. Retire only an exact prior address-book value; a different
+    // server-provided display name is independent and must remain a fallback.
+    let chat_changed = if address_book_names.is_empty() {
+        0
+    } else {
+        diesel::update(
+            schema::chats::dsl::chats
+                .filter(schema::chats::dsl::device_id.eq(device_id))
+                .filter(schema::chats::dsl::jid.eq_any(&keys))
+                .filter(schema::chats::dsl::name.eq_any(address_book_names)),
+        )
+        .set(schema::chats::dsl::name.eq(None::<String>))
+        .execute(conn)?
+    };
     Ok((contact_changed > 0, chat_changed > 0))
 }
 

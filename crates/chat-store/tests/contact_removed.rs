@@ -35,11 +35,18 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
     feed(
         &store,
         [history_sync_event(wa::HistorySync {
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                name: Some("Stale synced contact name".into()),
-                ..Default::default()
-            }],
+            conversations: vec![
+                wa::Conversation {
+                    id: PEER.into(),
+                    name: Some("Saved Name".into()),
+                    ..Default::default()
+                },
+                wa::Conversation {
+                    id: "559900000099@s.whatsapp.net".into(),
+                    name: Some("Independent display name".into()),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         })],
     )
@@ -60,9 +67,15 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
     let saved = store.contact(&jid(PEER)).await.unwrap().unwrap();
     assert_eq!(saved.full_name.as_deref(), Some("Saved Name"));
     assert_eq!(saved.first_name.as_deref(), Some("Saved"));
+    let before_chats = store.chats(false, 10).await.unwrap();
     assert_eq!(
-        store.chats(false, 10).await.unwrap()[0].name.as_deref(),
-        Some("Stale synced contact name")
+        before_chats
+            .iter()
+            .find(|chat| chat.jid == jid(PEER))
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Saved Name")
     );
     assert!(matches!(
         timeout(Duration::from_secs(1), changes.recv())
@@ -87,7 +100,24 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
             .unwrap(),
         Ok(StoreChange::Contacts)
     ));
-    assert_eq!(store.chats(false, 10).await.unwrap()[0].name, None);
+    let after_chats = store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        after_chats
+            .iter()
+            .find(|chat| chat.jid == jid(PEER))
+            .unwrap()
+            .name,
+        None
+    );
+    assert_eq!(
+        after_chats
+            .iter()
+            .find(|chat| chat.jid == jid("559900000099@s.whatsapp.net"))
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Independent display name")
+    );
 
     // A duplicate and an unknown contact are no-ops: no empty row and no
     // spurious invalidation. A later legitimate update can save the name again.
