@@ -13,7 +13,7 @@ use gpui::{
     Styled, div,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::Icon;
+use gpui_component::{Icon, IconName};
 
 use crate::app::{ChatOpen, ChatRow, Preview, PreviewGlyph, Unread, WhatsAppApp};
 use crate::components::parts;
@@ -38,6 +38,8 @@ pub fn render_chat_item(
     let jid = row.jid.clone();
     let name: SharedString = row.name.clone().into();
     let has_unread = row.has_unread();
+    let toggle_jid = row.jid.clone();
+    let toggle_entity = entity.clone();
 
     // The row's own ground, which the avatar's badge rings itself in.
     let ground = if is_selected {
@@ -62,6 +64,9 @@ pub fn render_chat_item(
             let hover = cx.theme().list_hover;
             el.hover(move |s| s.bg(hover))
         })
+        .when(row.tree_depth > 0, |el| {
+            el.pl(metrics.chat_row_padding_x() + metrics.space_xl())
+        })
         // Selection is a bar as well as a fill. A fill alone is a small
         // lightness step on a dark palette, and it disappears entirely next
         // to a hovered neighbour.
@@ -82,6 +87,35 @@ pub fn render_chat_item(
             entity.update(cx, |this, cx| {
                 this.select_chat(jid.clone(), ChatOpen::ToCompose, window, cx)
             });
+        })
+        .when(row.community_toggle_visible, |el| {
+            let hover = cx.theme().list_hover;
+            el.child(
+                div()
+                    .id(SharedString::from(format!("community-toggle-{}", row.jid)))
+                    .w(metrics.icon_small())
+                    .h(metrics.icon_small())
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .rounded(metrics.radius_sm())
+                    .hover(move |style| style.bg(hover))
+                    .child(
+                        Icon::new(if row.community_expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(metrics.icon_small())
+                        .text_color(parts::subtle(cx)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        toggle_entity.update(cx, |this, cx| this.toggle_community(&toggle_jid, cx));
+                    }),
+            )
         })
         .child(
             Avatar::new(row.jid.clone(), &row.name, layout.avatar_size())
@@ -115,7 +149,11 @@ fn render_name_row(
                 .flex_1()
                 .min_w_0()
                 .text_size(metrics.text_body())
-                .text_color(cx.theme().foreground)
+                .text_color(if row.hierarchy_context {
+                    cx.theme().muted_foreground
+                } else {
+                    cx.theme().foreground
+                })
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .children(row.disambiguator.as_ref().map(|ordinal| {
                     div()
@@ -123,7 +161,18 @@ fn render_name_row(
                         .text_color(cx.theme().primary)
                         .child(format!("#{ordinal}"))
                 }))
-                .child(name),
+                .child(name)
+                .children(row.hierarchy_label.map(|label| {
+                    div()
+                        .flex_shrink_0()
+                        .rounded(metrics.radius_sm())
+                        .bg(cx.theme().secondary)
+                        .px(metrics.space_xs())
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(metrics.text_micro())
+                        .text_color(cx.theme().secondary_foreground)
+                        .child(label)
+                })),
         )
         .children(row.pinned.then(|| {
             div()

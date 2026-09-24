@@ -15,8 +15,9 @@
 //! when a live message is first sighted in an unnamed `@g.us`/`@newsletter`
 //! (so no restart is needed). A receipt or an ack starts nothing.
 //!
-//! Only the *name* is resolved here; rendering stays the front end's. What a
-//! pass writes goes through the store's writer queue like every other write,
+//! The name and typed group hierarchy are resolved together from the same
+//! authoritative overview; rendering stays the front end's. What a pass writes
+//! goes through the store's writer queue like every other write,
 //! and a real change emits `StoreChange::Chats` — which is what re-renders
 //! the list, with no extra publish step.
 //!
@@ -73,15 +74,25 @@ pub(crate) struct NameRetry {
 /// What one metadata lookup told us.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NameLookup {
-    /// The server named the chat (possibly blank, which settles the
-    /// question for this generation without writing anything).
-    Found(String),
+    /// The server answered. For groups, the typed hierarchy is part of the
+    /// same overview; for channels it is absent.
+    Found {
+        name: String,
+        hierarchy: Option<oxidezap_core::GroupHierarchy>,
+    },
     /// The request failed. A global failure is a server-directed throttle;
     /// other failures cool only this chat.
     Failed {
         retry_after: std::time::Duration,
         scope: RetryScope,
     },
+}
+
+/// The group fields the resolver needs from an authoritative engine overview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedGroupOverview {
+    subject: Option<String>,
+    hierarchy: Option<oxidezap_core::GroupHierarchy>,
 }
 
 /// Fallback cooldown when the server named no delay: transport hiccups and
@@ -114,7 +125,7 @@ pub(crate) trait MetadataSource {
     fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend;
     fn participating_groups(
         &self,
-    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend;
+    ) -> impl Future<Output = Result<HashMap<String, ResolvedGroupOverview>, NameRetry>> + MaybeSend;
     fn subscribed_channels(
         &self,
     ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend;
@@ -135,7 +146,10 @@ impl MetadataSource for Client {
             {
                 Ok(mut overviews) => match overviews.pop() {
                     Some(whatsapp_rust::features::GroupOverviewResult::Found(meta)) => {
-                        NameLookup::Found(meta.subject.unwrap_or_default())
+                        NameLookup::Found {
+                            name: meta.subject.unwrap_or_default(),
+                            hierarchy: group_hierarchy(&meta.hierarchy, &meta.id),
+                        }
                     }
                     Some(_) | None => NameLookup::Failed {
                         retry_after: NAME_RETRY_COOLDOWN,
@@ -156,12 +170,21 @@ impl MetadataSource for Client {
     #[allow(clippy::manual_async_fn)]
     fn participating_groups(
         &self,
-    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
+    ) -> impl Future<Output = Result<HashMap<String, ResolvedGroupOverview>, NameRetry>> + MaybeSend
+    {
         async move {
             match self.groups().list_participating().await {
                 Ok(groups) => Ok(groups
                     .into_iter()
-                    .map(|meta| (meta.id.to_string(), meta.subject.unwrap_or_default()))
+                    .map(|meta| {
+                        (
+                            meta.id.to_string(),
+                            ResolvedGroupOverview {
+                                subject: meta.subject,
+                                hierarchy: group_hierarchy(&meta.hierarchy, &meta.id),
+                            },
+                        )
+                    })
                     .collect()),
                 Err(e) => Err(name_retry_after(&e)),
             }
@@ -187,7 +210,10 @@ impl MetadataSource for Client {
     fn channel_name(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
         async move {
             match self.newsletter().get_metadata(jid).await {
-                Ok(meta) => NameLookup::Found(meta.name),
+                Ok(meta) => NameLookup::Found {
+                    name: meta.name,
+                    hierarchy: None,
+                },
                 Err(e) => {
                     let retry = name_retry_after(&e);
                     NameLookup::Failed {
@@ -197,6 +223,34 @@ impl MetadataSource for Client {
                 }
             }
         }
+    }
+}
+
+/// Convert the engine's typed hierarchy without deriving a relationship from
+/// names or addresses. Invalid/self parents remain unknown, never standalone.
+fn group_hierarchy(
+    hierarchy: &whatsapp_rust::features::GroupHierarchy,
+    child: &Jid,
+) -> Option<oxidezap_core::GroupHierarchy> {
+    use oxidezap_core::{GroupHierarchy as DomainHierarchy, SubgroupKind as DomainKind};
+    use whatsapp_rust::features::{GroupHierarchy as EngineHierarchy, SubgroupKind as EngineKind};
+
+    match hierarchy {
+        EngineHierarchy::Standalone => Some(DomainHierarchy::Standalone),
+        EngineHierarchy::Community => Some(DomainHierarchy::Community),
+        EngineHierarchy::Subgroup { parent, kind } if parent.is_group() && parent != child => {
+            let kind = match kind {
+                EngineKind::Regular => DomainKind::Regular,
+                EngineKind::Announcement => DomainKind::Announcement,
+                EngineKind::General => DomainKind::General,
+                _ => DomainKind::Other,
+            };
+            Some(DomainHierarchy::Subgroup {
+                parent_jid: parent.to_string(),
+                kind,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -258,7 +312,8 @@ impl<T: MetadataSource + ?Sized> MetadataSource for Arc<T> {
 
     fn participating_groups(
         &self,
-    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
+    ) -> impl Future<Output = Result<HashMap<String, ResolvedGroupOverview>, NameRetry>> + MaybeSend
+    {
         (**self).participating_groups()
     }
 
@@ -598,7 +653,7 @@ fn is_generated_group_placeholder(jid: &Jid, name: &str) -> bool {
 /// get revalidated.
 async fn stored_special_chats(
     chat_store: &Arc<ChatStore>,
-) -> Result<Vec<(Jid, Option<String>)>, String> {
+) -> Result<Vec<(Jid, Option<String>, Option<oxidezap_core::GroupHierarchy>)>, String> {
     chat_store
         .special_chat_names()
         .await
@@ -693,6 +748,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // a chat created after this snapshot is simply not in this pass
     // (its sighting queues its own ask).
     let mut pre: HashMap<String, Option<String>> = HashMap::new();
+    let mut pre_hierarchy: HashMap<String, Option<oxidezap_core::GroupHierarchy>> = HashMap::new();
     let mut groups: Vec<Jid> = Vec::new();
     let mut channels: Vec<Jid> = Vec::new();
     {
@@ -701,20 +757,25 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         // loop below needs `seen` back for its contains-check, so it is
         // scoped to the full-pass fill and the sightings push inline.
         {
-            let mut push = |jid: Jid, stored: Option<String>| {
-                if !seen.insert(jid.to_string()) {
-                    return;
-                }
-                if !resolver.needs(&jid.to_string(), generation) {
-                    return;
-                }
-                pre.insert(jid.to_string(), stored);
-                if jid.is_group() {
-                    groups.push(jid);
-                } else if jid.is_newsletter() {
-                    channels.push(jid);
-                }
-            };
+            let mut push =
+                |jid: Jid,
+                 stored: Option<String>,
+                 hierarchy: Option<oxidezap_core::GroupHierarchy>| {
+                    if !seen.insert(jid.to_string()) {
+                        return;
+                    }
+                    if !resolver.needs(&jid.to_string(), generation) {
+                        return;
+                    }
+                    let key = jid.to_string();
+                    pre.insert(key.clone(), stored);
+                    pre_hierarchy.insert(key, hierarchy);
+                    if jid.is_group() {
+                        groups.push(jid);
+                    } else if jid.is_newsletter() {
+                        channels.push(jid);
+                    }
+                };
             if request.full {
                 let stored = match stored_special_chats(chat_store).await {
                     Ok(stored) => stored,
@@ -724,8 +785,8 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                         return;
                     }
                 };
-                for (jid, stored) in stored {
-                    push(jid, stored);
+                for (jid, stored, hierarchy) in stored {
+                    push(jid, stored, hierarchy);
                 }
             }
         }
@@ -743,9 +804,9 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             if seen.contains(&jid.to_string()) {
                 continue;
             }
-            let (exists, stored) = match chat_store.chat(&jid).await {
-                Ok(Some(entry)) => (true, entry.name),
-                Ok(None) => (false, None),
+            let (exists, stored, hierarchy) = match chat_store.chat(&jid).await {
+                Ok(Some(entry)) => (true, entry.name, entry.group_hierarchy),
+                Ok(None) => (false, None, None),
                 Err(e) => {
                     retry_after_store_failure(resolver, signal, &request, stop).await;
                     warn!(
@@ -788,7 +849,9 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             if !forced && !resolver.needs(&jid.to_string(), generation) {
                 continue;
             }
-            pre.insert(jid.to_string(), stored);
+            let key = jid.to_string();
+            pre.insert(key.clone(), stored);
+            pre_hierarchy.insert(key, hierarchy);
             if jid.is_group() {
                 groups.push(jid);
             } else if jid.is_newsletter() {
@@ -812,6 +875,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // retries after the delay rather than on the next message.
     let mut settled: Vec<(String, Option<String>)> = Vec::new();
     let mut resolved: Vec<oxidezap_chat_store::ChatNameWrite> = Vec::new();
+    let mut resolved_hierarchies: Vec<oxidezap_chat_store::GroupHierarchyWrite> = Vec::new();
     let mut failed: Vec<(String, std::time::Duration)> = Vec::new();
     let mut global_backoff: Option<std::time::Duration> = None;
     // A full pass has enough scope to use the participating projection once
@@ -830,17 +894,36 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 let mut fallback = Vec::new();
                 for jid in selective_groups {
                     match participating.get(&jid.to_string()) {
-                        Some(name) if usable_name(name) => {
-                            let name = name.trim().to_owned();
+                        Some(meta) => {
                             let key = jid.to_string();
-                            settled.push((key.clone(), Some(name.clone())));
-                            resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
-                                jid,
-                                pre.get(&key).cloned().flatten(),
-                                name,
-                            ));
+                            if let Some(hierarchy) = meta.hierarchy.clone() {
+                                resolved_hierarchies.push(
+                                    oxidezap_chat_store::GroupHierarchyWrite::checked(
+                                        jid.clone(),
+                                        pre_hierarchy.get(&key).cloned().flatten(),
+                                        hierarchy,
+                                    ),
+                                );
+                            }
+                            match meta
+                                .subject
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|name| usable_name(name))
+                            {
+                                Some(name) => {
+                                    let name = name.to_owned();
+                                    settled.push((key.clone(), Some(name.clone())));
+                                    resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
+                                        jid,
+                                        pre.get(&key).cloned().flatten(),
+                                        name,
+                                    ));
+                                }
+                                None => fallback.push(jid),
+                            }
                         }
-                        _ => fallback.push(jid),
+                        None => fallback.push(jid),
                     }
                 }
                 // The overview is authoritative for participating groups it
@@ -893,10 +976,24 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         }
         for (jid, name) in answered {
             match name {
-                NameLookup::Found(name) => {
+                NameLookup::Found { name, hierarchy } => {
                     let name = name.trim().to_owned();
                     let key = jid.to_string();
                     settled.push((key.clone(), usable_name(&name).then(|| name.clone())));
+                    if let Some(hierarchy) = hierarchy {
+                        // A full bulk overview with no usable subject still
+                        // receives a selective fallback. Keep the later
+                        // authoritative answer rather than queuing two CAS
+                        // writes against the same pre-pass observation.
+                        resolved_hierarchies.retain(|write| write.jid != jid);
+                        resolved_hierarchies.push(
+                            oxidezap_chat_store::GroupHierarchyWrite::checked(
+                                jid.clone(),
+                                pre_hierarchy.get(&key).cloned().flatten(),
+                                hierarchy,
+                            ),
+                        );
+                    }
                     if usable_name(&name) {
                         resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
                             jid,
@@ -1000,7 +1097,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                     }
                     for (jid, name) in answered {
                         match name {
-                            NameLookup::Found(name) => {
+                            NameLookup::Found { name, .. } => {
                                 let name = name.trim().to_owned();
                                 let key = jid.to_string();
                                 settled
@@ -1081,6 +1178,12 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         {
             queue_error = Some(e);
         }
+        if queue_error.is_none()
+            && !resolved_hierarchies.is_empty()
+            && let Err(e) = chat_store.apply_group_hierarchies(resolved_hierarchies.clone())
+        {
+            queue_error = Some(e);
+        }
     }
     if let Some(e) = queue_error {
         for (jid, retry_after) in &failed {
@@ -1095,7 +1198,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         warn!("chat-name resolver could not queue resolved names: {e}");
         return;
     }
-    if !resolved.is_empty() {
+    if !resolved.is_empty() || !resolved_hierarchies.is_empty() {
         let flushed = chat_store.flush();
         tokio::pin!(flushed);
         let flushed = tokio::select! {
@@ -1175,7 +1278,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     }
     resolver.clear_store_failures();
     debug!(
-        "chat-name resolver: {} chat(s) learned a name",
+        "chat-name resolver: {} chat(s) learned metadata",
         resolved.len()
     );
 }
@@ -1267,9 +1370,10 @@ mod tests {
     /// included — none of which a live client can be asked for.
     struct FakeMeta {
         groups: StdMutex<HashMap<String, String>>,
+        group_hierarchies: StdMutex<HashMap<String, oxidezap_core::GroupHierarchy>>,
         channels: StdMutex<HashMap<String, String>>,
         listed: StdMutex<Option<HashMap<String, String>>>,
-        participating_groups: StdMutex<Option<HashMap<String, String>>>,
+        participating_groups: StdMutex<Option<HashMap<String, ResolvedGroupOverview>>>,
         group_list_calls: AtomicUsize,
         group_lookup_calls: AtomicUsize,
         fail_groups: portable_atomic::AtomicBool,
@@ -1281,6 +1385,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 groups: StdMutex::new(HashMap::new()),
+                group_hierarchies: StdMutex::new(HashMap::new()),
                 channels: StdMutex::new(HashMap::new()),
                 listed: StdMutex::new(Some(HashMap::new())),
                 participating_groups: StdMutex::new(Some(HashMap::new())),
@@ -1313,7 +1418,13 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert((*jid).to_string(), (*subject).to_string());
-                participating.insert((*jid).to_string(), (*subject).to_string());
+                participating.insert(
+                    (*jid).to_string(),
+                    ResolvedGroupOverview {
+                        subject: Some((*subject).to_string()),
+                        hierarchy: Some(oxidezap_core::GroupHierarchy::Standalone),
+                    },
+                );
             }
             drop(all);
             fake
@@ -1361,7 +1472,15 @@ mod tests {
                     .get(&jid.to_string())
                     .cloned()
                 {
-                    Some(name) => NameLookup::Found(name),
+                    Some(name) => NameLookup::Found {
+                        name,
+                        hierarchy: self
+                            .group_hierarchies
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .get(&jid.to_string())
+                            .cloned(),
+                    },
                     // Unknown to the fake = network failure, not a blank
                     // subject: a blank settles, a failure cools. Tests that
                     // want a blank answer insert one explicitly.
@@ -1377,7 +1496,8 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn participating_groups(
             &self,
-        ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
+        ) -> impl Future<Output = Result<HashMap<String, ResolvedGroupOverview>, NameRetry>> + MaybeSend
+        {
             self.group_list_calls.fetch_add(1, Ordering::Relaxed);
             let listed = self
                 .participating_groups
@@ -1428,7 +1548,10 @@ mod tests {
                     .get(&jid.to_string())
                     .cloned()
                 {
-                    Some(name) => NameLookup::Found(name),
+                    Some(name) => NameLookup::Found {
+                        name,
+                        hierarchy: None,
+                    },
                     None => NameLookup::Failed {
                         retry_after: NAME_RETRY_COOLDOWN,
                         scope: RetryScope::Chat,
@@ -1442,6 +1565,33 @@ mod tests {
     const GROUP: &str = "120363000000000001@g.us";
     const GROUP_TWO: &str = "120363000000000002@g.us";
     const CHANNEL: &str = "120363400000000001@newsletter";
+
+    #[test]
+    fn the_engine_overview_converts_parent_jids_without_guessing() {
+        let child: Jid = GROUP.parse().expect("child JID");
+        let parent: Jid = GROUP_TWO.parse().expect("parent JID");
+        let hierarchy = whatsapp_rust::features::GroupHierarchy::Subgroup {
+            parent: parent.clone(),
+            kind: whatsapp_rust::features::SubgroupKind::General,
+        };
+        assert_eq!(
+            group_hierarchy(&hierarchy, &child),
+            Some(oxidezap_core::GroupHierarchy::Subgroup {
+                parent_jid: GROUP_TWO.into(),
+                kind: oxidezap_core::SubgroupKind::General,
+            })
+        );
+
+        let self_parent = whatsapp_rust::features::GroupHierarchy::Subgroup {
+            parent: child.clone(),
+            kind: whatsapp_rust::features::SubgroupKind::Regular,
+        };
+        assert_eq!(group_hierarchy(&self_parent, &child), None);
+        assert_eq!(
+            group_hierarchy(&whatsapp_rust::features::GroupHierarchy::Standalone, &child,),
+            Some(oxidezap_core::GroupHierarchy::Standalone)
+        );
+    }
 
     async fn test_store(name: &str) -> Arc<ChatStore> {
         let backend = whatsapp_rust::store::SqliteStore::new(&format!(
@@ -1580,6 +1730,92 @@ mod tests {
         assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 0);
     }
 
+    /// Typed overview data reaches durable storage, reconnect refreshes it,
+    /// and a later selective answer without hierarchy does not erase it.
+    #[tokio::test]
+    async fn group_hierarchy_survives_partial_answers_and_refreshes_on_reconnect() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+        let store = test_store("group-hierarchy-reconnect").await;
+        feed(&store, group_message(GROUP, "MSG-GH1")).await;
+        feed(&store, group_message(GROUP_TWO, "MSG-GH2")).await;
+
+        let source = FakeMeta::with_participating_groups(&[
+            (GROUP, "Announcements"),
+            (GROUP_TWO, "Community"),
+        ]);
+        let subgroup = GroupHierarchy::Subgroup {
+            parent_jid: GROUP_TWO.into(),
+            kind: SubgroupKind::Announcement,
+        };
+        {
+            let mut participating = source
+                .participating_groups
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let participating = participating.as_mut().expect("group list is present");
+            participating
+                .get_mut(GROUP)
+                .expect("subgroup overview")
+                .hierarchy = Some(subgroup.clone());
+            participating
+                .get_mut(GROUP_TWO)
+                .expect("community overview")
+                .hierarchy = Some(GroupHierarchy::Community);
+        }
+        let signal = ChatNameResolveSignal::new();
+        signal.request_full();
+        let mut resolver = NameResolver::new();
+        drive(&source, &store, &signal, &mut resolver, signal.next().await).await;
+
+        let stored = store
+            .chat(&GROUP.parse().expect("group JID"))
+            .await
+            .expect("read subgroup")
+            .expect("subgroup row");
+        assert_eq!(stored.group_hierarchy, Some(subgroup.clone()));
+
+        // WhatsApp reports the group as standalone on a later connection; the
+        // explicit new value wins over its previous community link.
+        source
+            .participating_groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+            .expect("group list is present")
+            .get_mut(GROUP)
+            .expect("subgroup overview")
+            .hierarchy = Some(GroupHierarchy::Standalone);
+        signal.new_connection();
+        drive(&source, &store, &signal, &mut resolver, signal.next().await).await;
+        assert_eq!(
+            store
+                .chat(&GROUP.parse().expect("group JID"))
+                .await
+                .expect("read refreshed subgroup")
+                .expect("subgroup row")
+                .group_hierarchy,
+            Some(GroupHierarchy::Standalone)
+        );
+
+        // A successful name lookup can still be partial (hierarchy=None).
+        // It must not be interpreted as an unlink.
+        signal.new_connection();
+        let mut request = signal.next().await;
+        request.full = false;
+        request.named.push(GROUP.into());
+        drive(&source, &store, &signal, &mut resolver, request).await;
+        assert_eq!(
+            store
+                .chat(&GROUP.parse().expect("group JID"))
+                .await
+                .expect("read partial update")
+                .expect("subgroup row")
+                .group_hierarchy,
+            Some(GroupHierarchy::Standalone)
+        );
+    }
+
     /// The server is authoritative for subjects: a person may intentionally
     /// choose the same text as our fallback, and that custom name must not be
     /// filtered merely because it matches a sentinel.
@@ -1667,6 +1903,11 @@ mod tests {
 
         let source = FakeMeta::with_participating_groups(&[(GROUP, "")]);
         source.rename_group(GROUP, "Trip planning");
+        source
+            .group_hierarchies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(GROUP.into(), oxidezap_core::GroupHierarchy::Community);
         let signal = ChatNameResolveSignal::new();
         signal.request_full();
         let request = signal.next().await;
@@ -1679,6 +1920,16 @@ mod tests {
         );
         assert_eq!(source.group_list_calls.load(Ordering::Relaxed), 1);
         assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            store
+                .chat(&GROUP.parse().expect("group JID"))
+                .await
+                .expect("read resolved hierarchy")
+                .expect("group exists")
+                .group_hierarchy,
+            Some(oxidezap_core::GroupHierarchy::Community),
+            "the selective hierarchy answer supersedes the blank-subject overview"
+        );
     }
 
     /// A generated label already persisted by an older build must not be
@@ -2079,8 +2330,9 @@ mod tests {
             #[allow(clippy::manual_async_fn)]
             fn participating_groups(
                 &self,
-            ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend
-            {
+            ) -> impl Future<
+                Output = Result<HashMap<String, ResolvedGroupOverview>, NameRetry>,
+            > + MaybeSend {
                 async move { Ok(HashMap::new()) }
             }
             #[allow(clippy::manual_async_fn)]

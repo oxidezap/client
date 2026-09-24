@@ -354,7 +354,15 @@ impl StateStore {
                 match inner.chats.entry(summary.jid.clone()) {
                     std::collections::hash_map::Entry::Occupied(mut slot) => {
                         let entry = slot.get_mut();
-                        entry.summary = summary.clone();
+                        let mut updated = summary.clone();
+                        // A live message summary knows nothing about community
+                        // membership. Preserve the last authoritative overview
+                        // rather than turning an incomplete update into an
+                        // implicit unlink.
+                        if updated.group_hierarchy.is_none() {
+                            updated.group_hierarchy = entry.summary.group_hierarchy.clone();
+                        }
+                        entry.summary = updated;
                         // Sticky: a live update to a chat the store has already
                         // published must not make it live-only again, or a
                         // deletion elsewhere would stop being prunable the moment
@@ -492,6 +500,7 @@ mod tests {
             manually_unread: false,
             last_message: None,
             pinned_at_ms: None,
+            group_hierarchy: None,
         }))
     }
 
@@ -502,6 +511,7 @@ mod tests {
             unread: 0,
             manually_unread: false,
             pinned_at_ms: Some(pinned_at_ms),
+            group_hierarchy: None,
             last_message: Some(oxidezap_ipc::MessagePreview {
                 id: None,
                 text: "t".into(),
@@ -518,6 +528,7 @@ mod tests {
             unread: 0,
             manually_unread: false,
             pinned_at_ms: None,
+            group_hierarchy: None,
             last_message: Some(oxidezap_ipc::MessagePreview {
                 id: None,
                 text: "t".into(),
@@ -525,6 +536,52 @@ mod tests {
                 timestamp_ms: last_ms,
             }),
         }))
+    }
+
+    #[test]
+    fn a_partial_chat_update_keeps_its_resolved_group_hierarchy() {
+        let store = store();
+        let jid = "120363000000000001@g.us";
+        let hierarchy = oxidezap_core::GroupHierarchy::Subgroup {
+            parent_jid: "120363000000000009@g.us".into(),
+            kind: oxidezap_core::SubgroupKind::General,
+        };
+        store.apply_unless_stale(
+            Change::live(DaemonEvent::ChatUpdated(ChatSummary {
+                jid: jid.into(),
+                name: "General".into(),
+                unread: 0,
+                manually_unread: false,
+                last_message: None,
+                pinned_at_ms: None,
+                group_hierarchy: Some(hierarchy.clone()),
+            })),
+            None,
+            || (),
+        );
+
+        store.apply_unless_stale(chat(jid, 1), None, || ());
+        assert_eq!(
+            store.snapshot().chats[0].group_hierarchy,
+            Some(hierarchy),
+            "message summaries do not know community membership"
+        );
+
+        let explicit = oxidezap_core::GroupHierarchy::Standalone;
+        store.apply_unless_stale(
+            Change::live(DaemonEvent::ChatUpdated(ChatSummary {
+                jid: jid.into(),
+                name: "Independent".into(),
+                unread: 0,
+                manually_unread: false,
+                last_message: None,
+                pinned_at_ms: None,
+                group_hierarchy: Some(explicit.clone()),
+            })),
+            None,
+            || (),
+        );
+        assert_eq!(store.snapshot().chats[0].group_hierarchy, Some(explicit));
     }
 
     /// Pinned chats lead the snapshot, most recently pinned first, whatever

@@ -6,8 +6,8 @@
 
 use chrono::{DateTime, Utc};
 use oxidezap_core::{
-    Chat, ChatMessage, MediaType, MessageStatus, SystemNotice, TypingSummary, format_duration,
-    plain_message_text,
+    Chat, ChatMessage, GroupHierarchy, MediaType, MessageStatus, SubgroupKind, SystemNotice,
+    TypingSummary, format_duration, plain_message_text,
 };
 use std::collections::HashMap;
 
@@ -111,6 +111,14 @@ pub struct ChatRow {
     pub kind: ChatKind,
     pub disambiguator: Option<String>,
     pub is_group: bool,
+    pub group_hierarchy: Option<GroupHierarchy>,
+    /// The visual role label for a community or subgroup.
+    pub hierarchy_label: Option<&'static str>,
+    /// Tree presentation assigned by the chat-list projection.
+    pub tree_depth: u8,
+    pub community_toggle_visible: bool,
+    pub community_expanded: bool,
+    pub hierarchy_context: bool,
     pub avatar_key: Option<String>,
     pub timestamp: Option<DateTime<Utc>>,
     pub unread: Unread,
@@ -135,6 +143,12 @@ impl ChatRow {
             kind: ChatKind::of(chat),
             disambiguator: None,
             is_group: chat.is_group,
+            group_hierarchy: chat.group_hierarchy.clone(),
+            hierarchy_label: hierarchy_label(chat.group_hierarchy.as_ref()),
+            tree_depth: 0,
+            community_toggle_visible: false,
+            community_expanded: false,
+            hierarchy_context: false,
             avatar_key: chat.avatar_cache_key.clone(),
             timestamp: chat.last_message_time,
             unread: if chat.unread_count > 0 {
@@ -153,6 +167,18 @@ impl ChatRow {
     /// here for you".
     pub fn has_unread(&self) -> bool {
         !matches!(self.unread, Unread::None)
+    }
+}
+
+fn hierarchy_label(hierarchy: Option<&GroupHierarchy>) -> Option<&'static str> {
+    match hierarchy? {
+        GroupHierarchy::Community => Some("Community"),
+        GroupHierarchy::Subgroup { kind, .. } => Some(match kind {
+            SubgroupKind::Announcement => "Announcement",
+            SubgroupKind::General => "General",
+            SubgroupKind::Regular | SubgroupKind::Other => "Subgroup",
+        }),
+        GroupHierarchy::Standalone => None,
     }
 }
 

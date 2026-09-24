@@ -760,6 +760,84 @@ async fn a_stale_metadata_answer_does_not_clobber_a_live_rename() {
     }
 }
 
+/// Hierarchy snapshots survive store reads/reconnects, while a lookup that
+/// started from older metadata cannot overwrite the newer stored relationship.
+#[tokio::test]
+async fn group_hierarchy_is_persisted_and_compare_and_swap_protected() {
+    use oxidezap_chat_store::GroupHierarchyWrite;
+    use oxidezap_core::{GroupHierarchy, SubgroupKind};
+
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(GROUP, GROUP, "MSG-GH", 1_700_000_000),
+        )],
+    )
+    .await;
+    let group = jid(GROUP);
+    let subgroup = GroupHierarchy::Subgroup {
+        parent_jid: "120363000000000009@g.us".into(),
+        kind: SubgroupKind::Announcement,
+    };
+    chat_store
+        .apply_group_hierarchies(vec![GroupHierarchyWrite::checked(
+            group.clone(),
+            None,
+            subgroup.clone(),
+        )])
+        .expect("queue hierarchy");
+    chat_store.flush().await.expect("commit hierarchy");
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .expect("read group")
+            .expect("group exists")
+            .group_hierarchy,
+        Some(subgroup.clone())
+    );
+    assert_eq!(
+        chat_store
+            .special_chat_names()
+            .await
+            .expect("read resolver snapshot")
+            .into_iter()
+            .find(|(jid, _, _)| jid == &group)
+            .and_then(|(_, _, hierarchy)| hierarchy),
+        Some(subgroup.clone()),
+        "the resolver snapshot carries the typed hierarchy too"
+    );
+
+    let standalone = GroupHierarchy::Standalone;
+    chat_store
+        .apply_group_hierarchies(vec![GroupHierarchyWrite::checked(
+            group.clone(),
+            Some(subgroup.clone()),
+            standalone.clone(),
+        )])
+        .expect("queue reconnect refresh");
+    chat_store.flush().await.expect("commit refresh");
+    chat_store
+        .apply_group_hierarchies(vec![GroupHierarchyWrite::checked(
+            group.clone(),
+            Some(subgroup),
+            GroupHierarchy::Community,
+        )])
+        .expect("queue stale result");
+    chat_store.flush().await.expect("discard stale result");
+    assert_eq!(
+        chat_store
+            .chat(&group)
+            .await
+            .expect("read refreshed group")
+            .expect("group exists")
+            .group_hierarchy,
+        Some(standalone)
+    );
+}
+
 /// A metadata answer for a chat deleted mid-lookup resurrects nothing: the
 /// write has no insert, so a gone row simply does not match.
 #[tokio::test]

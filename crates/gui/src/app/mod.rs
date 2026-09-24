@@ -955,6 +955,8 @@ pub struct WhatsAppApp {
     mobile_panel: MobilePanel,
     /// Which conversations the sidebar is showing.
     chat_filter: ChatFilter,
+    /// JIDs of community rows the Groups list has collapsed.
+    collapsed_communities: std::collections::HashSet<String>,
     /// The message being replied to, mirrored here so the send path can
     /// attach it and the composer can show it.
     reply_to: Option<ReplyDraft>,
@@ -1429,6 +1431,7 @@ impl WhatsAppApp {
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
             chat_filter: ChatFilter::default(),
+            collapsed_communities: std::collections::HashSet::new(),
             reply_to: None,
             reaction_picker_for: None,
             presence: PresenceRegistry::new(),
@@ -1582,13 +1585,10 @@ impl WhatsAppApp {
         }
 
         let query = self.search.read(cx).list_query();
-        let matches = |chat: &Chat| {
-            self.chat_filter.matches(chat)
-                && (contains_ignore_case(&chat.name, query)
-                    || contains_ignore_case(&chat.jid, query))
-        };
-
-        let filtered: Vec<&Chat> = self.conversations().filter(|c| matches(c)).collect();
+        let filtered: Vec<&Chat> = self
+            .conversations()
+            .filter(|chat| self.chat_filter.matches(chat))
+            .collect();
 
         let mut rows: Vec<ChatRow> = filtered
             .into_iter()
@@ -1605,6 +1605,14 @@ impl WhatsAppApp {
                 )
             })
             .collect();
+        let mut rows = if self.chat_filter == ChatFilter::Groups {
+            chats::hierarchical_group_rows(&rows, query, &self.collapsed_communities)
+        } else {
+            rows.retain(|row| {
+                contains_ignore_case(&row.name, query) || contains_ignore_case(&row.jid, query)
+            });
+            rows
+        };
         chat_row::disambiguate_names(&mut rows);
         let rows: Arc<[ChatRow]> = rows.into();
 
@@ -1651,6 +1659,15 @@ impl WhatsAppApp {
             return;
         }
         self.chat_filter = filter;
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
+    /// Expand or collapse a community by its stable JID.
+    pub fn toggle_community(&mut self, jid: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_communities.remove(jid) {
+            self.collapsed_communities.insert(jid.to_string());
+        }
         self.invalidate_chat_cache();
         cx.notify();
     }

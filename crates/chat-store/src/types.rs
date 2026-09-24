@@ -246,6 +246,8 @@ pub struct ChatEntry {
     pub muted_until: Option<DateTime<Utc>>,
     pub archived: bool,
     pub ephemeral_expiration: Option<u32>,
+    /// Server-reported community relationship; `None` is unknown.
+    pub group_hierarchy: Option<oxidezap_core::GroupHierarchy>,
 }
 
 /// The durable chat metadata a live message needs before it can alert.
@@ -520,6 +522,31 @@ pub enum ChatNameExpected {
     /// unconditionally (a same-value write is still a no-op broadcast).
     /// For direct setters, not for passes racing live renames.
     Any,
+}
+
+/// One authoritative group overview and the hierarchy observed before its
+/// network request. The CAS prevents an older answer from replacing metadata
+/// written by a newer lookup; no row is created by this enrichment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupHierarchyWrite {
+    pub jid: Jid,
+    pub expected: Option<oxidezap_core::GroupHierarchy>,
+    pub hierarchy: oxidezap_core::GroupHierarchy,
+}
+
+impl GroupHierarchyWrite {
+    /// A typed overview captured against the hierarchy currently in storage.
+    pub fn checked(
+        jid: Jid,
+        expected: Option<oxidezap_core::GroupHierarchy>,
+        hierarchy: oxidezap_core::GroupHierarchy,
+    ) -> Self {
+        Self {
+            jid,
+            expected,
+            hierarchy,
+        }
+    }
 }
 
 impl ChatNameWrite {

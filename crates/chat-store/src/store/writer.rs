@@ -406,6 +406,9 @@ fn apply_writer_msg(
         WriterMsg::ChatNames(names) => {
             crate::store::chat_names::apply_chat_names(conn, device_id, names, cs)
         }
+        WriterMsg::GroupHierarchies(writes) => {
+            crate::store::group_hierarchy::apply_group_hierarchies(conn, device_id, writes, cs)
+        }
         WriterMsg::StatusWatched { chat, msg_ids } => {
             // Routed like every other write that targets a row. The broadcast
             // this is called with today routes to itself, but the method is

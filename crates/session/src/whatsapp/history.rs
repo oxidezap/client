@@ -608,6 +608,9 @@ impl WhatsAppClient {
                 // An active alias keeps the logical conversation active,
                 // regardless of which PN/LID row leads display order.
                 existing.archived &= entry.archived;
+                if entry.group_hierarchy.is_some() {
+                    existing.group_hierarchy = entry.group_hierarchy.clone();
+                }
                 existing.set_name_if_better(name, name_priority);
                 continue;
             }
@@ -617,6 +620,7 @@ impl WhatsAppClient {
             chat.pinned_at = entry.pinned_at;
             chat.muted_until = entry.muted_until;
             chat.archived = entry.archived;
+            chat.group_hierarchy = entry.group_hierarchy.clone();
             chat.unread_count = entry.unread_count.max(0) as u32;
             // -1 = manually marked unread (WA Web convention); .max(0) above
             // must not silently eat the flag.

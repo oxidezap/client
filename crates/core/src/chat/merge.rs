@@ -78,6 +78,12 @@ impl Chat {
         // store owns it from here on.
         self.from_store |= hydrated.from_store;
         self.set_name_if_not_worse(hydrated.name, hydrated.name_priority);
+        // Missing metadata is not a statement about hierarchy. Only a
+        // server-resolved value (including explicit Standalone) may replace
+        // the relationship already held by live state.
+        if hydrated.group_hierarchy.is_some() {
+            self.group_hierarchy = hydrated.group_hierarchy;
+        }
         // A hydrated avatar is the one identity a restart can restore without
         // the network: a durable descriptor read back from the store says which
         // picture belongs here and under which cache key. A load that carries
@@ -357,6 +363,37 @@ mod tests {
         assert_eq!(chat.avatar_picture_id.as_deref(), Some("stored"));
         assert_eq!(chat.avatar_cache_key.as_deref(), Some("a-stored"));
         assert!(chat.avatar_loaded);
+    }
+
+    #[test]
+    fn unknown_hierarchy_preserves_resolved_metadata_but_authoritative_changes_win() {
+        use super::super::{GroupHierarchy, SubgroupKind};
+
+        let jid = "120363000000000001@g.us".to_string();
+        let mut chat = Chat::new(jid.clone());
+        chat.group_hierarchy = Some(GroupHierarchy::Community);
+
+        chat.merge_history(Chat::new(jid.clone()));
+        assert_eq!(chat.group_hierarchy, Some(GroupHierarchy::Community));
+
+        let mut subgroup = Chat::from_store(jid.clone(), "Community chat".into(), 0);
+        subgroup.group_hierarchy = Some(GroupHierarchy::Subgroup {
+            parent_jid: "120363000000000002@g.us".into(),
+            kind: SubgroupKind::Announcement,
+        });
+        chat.merge_history(subgroup);
+        assert_eq!(
+            chat.group_hierarchy,
+            Some(GroupHierarchy::Subgroup {
+                parent_jid: "120363000000000002@g.us".into(),
+                kind: SubgroupKind::Announcement,
+            })
+        );
+
+        let mut standalone = Chat::from_store(jid, "Independent group".into(), 0);
+        standalone.group_hierarchy = Some(GroupHierarchy::Standalone);
+        chat.merge_history(standalone);
+        assert_eq!(chat.group_hierarchy, Some(GroupHierarchy::Standalone));
     }
 
     #[test]

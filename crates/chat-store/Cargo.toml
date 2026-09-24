@@ -27,6 +27,7 @@ chrono = { workspace = true, features = ["now"] }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
 log = { workspace = true }
+oxidezap-core = { workspace = true }
 # The one executor this crate names, on both targets: `tokio::spawn` inside
 # the session's runtime, the page's own loop in a browser. See `src/spawn.rs`.
 oxidezap-platform = { workspace = true }

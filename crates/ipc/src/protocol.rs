@@ -1,8 +1,8 @@
 //! Messages exchanged over the socket.
 
 use oxidezap_core::{
-    AccountId, CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, GroupRoster,
-    LogLevel, OutgoingMedia, PluginAction, PluginSurface, QuotedMessage, UiEvent,
+    AccountId, CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, GroupHierarchy,
+    GroupRoster, LogLevel, OutgoingMedia, PluginAction, PluginSurface, QuotedMessage, UiEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -157,6 +157,9 @@ pub struct ChatSummary {
     /// about every chat — skipped when absent so those frames stay small.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_at_ms: Option<i64>,
+    /// Server-reported community relationship, omitted until known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_hierarchy: Option<GroupHierarchy>,
 }
 
 impl ChatSummary {
@@ -1453,6 +1456,7 @@ mod tests {
             manually_unread: false,
             last_message: None,
             pinned_at_ms: None,
+            group_hierarchy: None,
         };
         let snapshot = StateSnapshot {
             version: StateVersion::INITIAL,
@@ -1513,6 +1517,7 @@ mod tests {
                 manually_unread: false,
                 last_message: None,
                 pinned_at_ms: None,
+                group_hierarchy: None,
             }),
             DaemonEvent::ChatRemoved {
                 jid: "559900000001@s.whatsapp.net".into(),
@@ -1635,6 +1640,7 @@ mod tests {
             manually_unread: false,
             last_message: None,
             pinned_at_ms: None,
+            group_hierarchy: None,
         };
         let snapshot = StateSnapshot {
             version: StateVersion::INITIAL,
@@ -1659,6 +1665,7 @@ mod tests {
             manually_unread: true,
             last_message: None,
             pinned_at_ms: None,
+            group_hierarchy: None,
         };
         assert!(chat.has_unread(), "it carries a badge");
 
@@ -1770,6 +1777,36 @@ mod tests {
     }
 
     #[test]
+    fn subgroup_summary_wire_preserves_typed_parent_identity() {
+        let hierarchy = GroupHierarchy::Subgroup {
+            parent_jid: "120363000000000009@g.us".into(),
+            kind: oxidezap_core::SubgroupKind::Announcement,
+        };
+        let summary = ChatSummary {
+            jid: "120363000000000001@g.us".into(),
+            name: "Announcements".into(),
+            unread: 0,
+            manually_unread: false,
+            last_message: None,
+            pinned_at_ms: None,
+            group_hierarchy: Some(hierarchy.clone()),
+        };
+        let json = serde_json::to_value(&summary).expect("serialize summary");
+        assert_eq!(
+            json["group_hierarchy"]["parent_jid"],
+            "120363000000000009@g.us"
+        );
+        assert_eq!(
+            json["group_hierarchy"]["kind"], "announcement",
+            "role labels remain typed rather than encoded in display names"
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatSummary>(json).expect("deserialize summary"),
+            summary
+        );
+    }
+
+    #[test]
     fn frames_round_trip_through_json() {
         let msg = DaemonMessage::Update {
             version: StateVersion::INITIAL.next(),
@@ -1779,6 +1816,7 @@ mod tests {
                 unread: 2,
                 manually_unread: false,
                 pinned_at_ms: None,
+                group_hierarchy: None,
                 last_message: Some(MessagePreview {
                     id: Some("3EB0".into()),
                     text: "hi".into(),

@@ -5,6 +5,11 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 37: `ChatSummary.group_hierarchy` carries the authoritative community role
+/// and parent JID into the daemon snapshot. A v36 window would accept the JSON
+/// but silently render subgroups as unrelated flat groups, so both ends must
+/// agree before claiming to show the hierarchy.
+///
 /// 36: `ClientRequest::VotePoll`, which carries a poll ballot to the daemon
 /// the way the sends above it carry their payloads. A v35 daemon does not
 /// know the request and refuses it as malformed — and the daemon is the
@@ -272,7 +277,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 36;
+pub const PROTOCOL_VERSION: u32 = 37;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///
