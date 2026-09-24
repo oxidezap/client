@@ -134,6 +134,152 @@ async fn reply_is_stored_without_snapshot_but_reads_with_parent() {
 }
 
 #[tokio::test]
+async fn starred_read_rehydrates_compacted_quote() {
+    let (store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [
+            live_chat(
+                PEER,
+                PEER,
+                "STAR-PARENT",
+                wa::Message::text("parent"),
+                1_700_000_000,
+            ),
+            live_chat(
+                PEER,
+                PEER,
+                "STAR-REPLY",
+                text_reply("reply", "STAR-PARENT", PEER, wa::Message::text("parent")),
+                1_700_000_060,
+            ),
+        ],
+    )
+    .await;
+    let (bytes, _) = stored_proto(&store, "STAR-REPLY").await;
+    let compacted = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
+    assert_eq!(quoted_text(&compacted), None, "test must reach compaction");
+
+    let device_id = store.device_id();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("UPDATE messages SET starred = 1 WHERE device_id = ? AND msg_id = ?")
+                .bind::<Integer, _>(device_id)
+                .bind::<diesel::sql_types::Text, _>("STAR-REPLY")
+                .execute(conn)
+                .map(|_| ())
+                .map_err(db_err)
+        })
+        .await
+        .expect("star reply");
+
+    let control = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    assert_eq!(
+        quoted_text(
+            control
+                .iter()
+                .find(|m| m.id == "STAR-REPLY")
+                .unwrap()
+                .message
+                .as_deref()
+                .unwrap()
+        )
+        .as_deref(),
+        Some("parent")
+    );
+    let starred = chat_store.starred_messages(10).await.unwrap();
+    assert_eq!(
+        quoted_text(
+            starred
+                .iter()
+                .find(|m| m.id == "STAR-REPLY")
+                .unwrap()
+                .message
+                .as_deref()
+                .unwrap()
+        )
+        .as_deref(),
+        Some("parent")
+    );
+}
+
+#[tokio::test]
+async fn pending_media_read_rehydrates_compacted_quote() {
+    let (store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [live_chat(
+            PEER,
+            PEER,
+            "MEDIA-PARENT",
+            wa::Message::text("parent"),
+            1_700_000_000,
+        )],
+    )
+    .await;
+    let reply = wa::Message {
+        image_message: MessageField::some(wa::message::ImageMessage {
+            context_info: MessageField::some(wa::ContextInfo {
+                stanza_id: Some("MEDIA-PARENT".into()),
+                participant: Some(PEER.into()),
+                quoted_message: MessageField::some(wa::Message::text("parent")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [live_chat(PEER, PEER, "MEDIA-REPLY", reply, 1_700_000_060)],
+    )
+    .await;
+
+    let (bytes, _) = stored_proto(&store, "MEDIA-REPLY").await;
+    let compacted = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
+    let context = compacted
+        .image_message
+        .as_option()
+        .unwrap()
+        .context_info
+        .as_option()
+        .unwrap();
+    assert_eq!(context.stanza_id.as_deref(), Some("MEDIA-PARENT"));
+    assert!(
+        context.quoted_message.as_option().is_none(),
+        "test must reach compaction"
+    );
+
+    let pending = chat_store
+        .pending_media_messages(Some(&jid(PEER)), 10)
+        .await
+        .unwrap();
+    let media = pending
+        .iter()
+        .find(|m| m.id == "MEDIA-REPLY")
+        .expect("pending media reply");
+    assert!(media.message.as_deref().unwrap().image_message.is_set());
+    let hydrated_context = media
+        .message
+        .as_deref()
+        .unwrap()
+        .image_message
+        .as_option()
+        .unwrap()
+        .context_info
+        .as_option()
+        .unwrap();
+    assert_eq!(
+        hydrated_context
+            .quoted_message
+            .as_option()
+            .and_then(|quoted| quoted.conversation.as_deref()),
+        Some("parent")
+    );
+}
+
+#[tokio::test]
 async fn reply_without_local_parent_keeps_inline_snapshot() {
     let (store, chat_store) = test_store().await;
 
