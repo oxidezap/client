@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, Global,
-    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    GlobalElementId, Half, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     SharedString, StyledText, Window, transparent_black,
 };
