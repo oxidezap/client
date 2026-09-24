@@ -118,11 +118,49 @@ fn contact_keys(
     Ok(keys)
 }
 
+pub(super) fn update_address_book_chat_names(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &str,
+    full_name: Option<&str>,
+    first_name: Option<&str>,
+) -> QueryResult<bool> {
+    use schema::chats::dsl as chats;
+    let keys = contact_keys(conn, device_id, jid)?;
+    let name = full_name
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| first_name.filter(|name| !name.trim().is_empty()));
+    let rows = chats::chats
+        .filter(chats::device_id.eq(device_id))
+        .filter(chats::jid.eq_any(&keys))
+        .filter(chats::name_from_address_book.eq(true))
+        .select((chats::jid, chats::name))
+        .load::<(String, Option<String>)>(conn)?;
+    let mut changed = false;
+    for (chat_jid, current) in rows {
+        if current.as_deref() == name {
+            continue;
+        }
+        diesel::update(
+            chats::chats
+                .filter(chats::device_id.eq(device_id))
+                .filter(chats::jid.eq(chat_jid)),
+        )
+        .set((
+            chats::name.eq(name),
+            chats::name_from_address_book.eq(name.is_some()),
+        ))
+        .execute(conn)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 pub(super) fn clear_contact_names(
     conn: &mut SqliteConnection,
     device_id: i32,
     jid: &str,
-) -> QueryResult<bool> {
+) -> QueryResult<(bool, bool)> {
     use schema::contacts::dsl as contacts;
     let keys = contact_keys(conn, device_id, jid)?;
     let contact_changed = diesel::update(
@@ -141,7 +179,19 @@ pub(super) fn clear_contact_names(
     ))
     .execute(conn)?;
 
-    Ok(contact_changed > 0)
+    let chat_changed = diesel::update(
+        schema::chats::dsl::chats
+            .filter(schema::chats::dsl::device_id.eq(device_id))
+            .filter(schema::chats::dsl::jid.eq_any(&keys))
+            .filter(schema::chats::dsl::name_from_address_book.eq(true)),
+    )
+    .set((
+        schema::chats::dsl::name.eq(None::<String>),
+        schema::chats::dsl::name_from_address_book.eq(false),
+    ))
+    .execute(conn)?;
+
+    Ok((contact_changed > 0, chat_changed > 0))
 }
 
 pub(super) fn upsert_contact_names(

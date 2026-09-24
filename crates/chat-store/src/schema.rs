@@ -15,6 +15,7 @@ diesel::table! {
         read_boundary_ids -> Nullable<Text>,
         mute_appstate_seen -> Bool,
         archive_appstate_seen -> Bool,
+        name_from_address_book -> Bool,
     }
 }
 

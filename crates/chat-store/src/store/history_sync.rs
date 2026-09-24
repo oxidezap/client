@@ -73,9 +73,8 @@ fn apply_history_conversation(
 
     {
         use schema::chats::dsl;
-        let name = conv
-            .name
-            .as_deref()
+        let address_book_name = conv.name.as_deref().filter(|name| !name.trim().is_empty());
+        let name = address_book_name
             .or(conv.display_name.as_deref())
             .or(conv.username.as_deref());
         // History is the stale copy: a nameless chunk must not erase a name
@@ -83,6 +82,7 @@ fn apply_history_conversation(
         // incoming `Some` still updates; an incoming `None` leaves the row
         // it would otherwise clobber alone.
         let persist_name = name.filter(|n| !n.trim().is_empty());
+        let name_from_address_book = persist_name.is_some() && address_book_name.is_some();
         let unread_count = match conv.unread_count {
             _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
             Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
@@ -93,6 +93,7 @@ fn apply_history_conversation(
                 dsl::device_id.eq(device_id),
                 dsl::jid.eq(chat),
                 dsl::name.eq(persist_name),
+                dsl::name_from_address_book.eq(name_from_address_book),
                 dsl::last_message_ts.eq(last_ts_ms),
                 dsl::unread_count.eq(unread_count),
                 // Wire values are unix SECONDS; the columns (and the live
@@ -121,6 +122,9 @@ fn apply_history_conversation(
                 dsl::name.eq(diesel::dsl::sql::<
                     diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 >("COALESCE(excluded.name, name)")),
+                dsl::name_from_address_book.eq(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "CASE WHEN excluded.name IS NOT NULL THEN excluded.name_from_address_book ELSE name_from_address_book END",
+                )),
                 dsl::last_message_ts.eq(diesel::dsl::sql::<diesel::sql_types::BigInt>(
                     "MAX(last_message_ts, excluded.last_message_ts)",
                 )),

@@ -63,10 +63,10 @@ pub(super) fn apply_chat_names(
                 // named special chat per reconnect) for nothing.
                 ChatNameExpected::Was(was) if was == name => 0,
                 ChatNameExpected::Was(was) => diesel::update(scope().filter(dsl::name.eq(was)))
-                    .set(dsl::name.eq(name))
+                    .set((dsl::name.eq(name), dsl::name_from_address_book.eq(false)))
                     .execute(conn)?,
                 ChatNameExpected::WasUnnamed => diesel::update(scope().filter(dsl::name.is_null()))
-                    .set(dsl::name.eq(name))
+                    .set((dsl::name.eq(name), dsl::name_from_address_book.eq(false)))
                     .execute(conn)?,
                 ChatNameExpected::Any => {
                     // Read-then-write under the same transaction: a
@@ -78,7 +78,7 @@ pub(super) fn apply_chat_names(
                         None => 0,
                         Some(current) if current.as_deref() == Some(name) => 0,
                         Some(_) => diesel::update(scope())
-                            .set(dsl::name.eq(name))
+                            .set((dsl::name.eq(name), dsl::name_from_address_book.eq(false)))
                             .execute(conn)?,
                     }
                 }

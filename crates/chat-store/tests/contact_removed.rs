@@ -30,6 +30,120 @@ fn contact_removed(jid: &str) -> Event {
 }
 
 #[tokio::test]
+async fn removal_retires_history_address_book_names_but_keeps_independent_server_names() {
+    let (_device, store) = test_store().await;
+    feed(
+        &store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![
+                wa::Conversation {
+                    id: PEER.into(),
+                    name: Some("Saved Name".into()),
+                    ..Default::default()
+                },
+                wa::Conversation {
+                    id: "559900000099@s.whatsapp.net".into(),
+                    display_name: Some("Independent Server Name".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })],
+    )
+    .await;
+
+    let before = store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        before
+            .iter()
+            .find(|chat| chat.jid == jid(PEER))
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Saved Name")
+    );
+    assert_eq!(
+        before
+            .iter()
+            .find(|chat| chat.jid == jid("559900000099@s.whatsapp.net"))
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Independent Server Name")
+    );
+
+    feed(&store, [contact_update(PEER, "Saved Name", "Saved")]).await;
+    feed(
+        &store,
+        [contact_update(PEER, "Renamed Saved Name", "Renamed")],
+    )
+    .await;
+    let renamed = store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        renamed
+            .iter()
+            .find(|chat| chat.jid == jid(PEER))
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Renamed Saved Name")
+    );
+
+    feed(&store, [contact_removed(PEER)]).await;
+    let after = store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        after
+            .iter()
+            .find(|chat| chat.jid == jid(PEER))
+            .unwrap()
+            .name,
+        None
+    );
+    assert_eq!(
+        after
+            .iter()
+            .find(|chat| chat.jid == jid("559900000099@s.whatsapp.net"))
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Independent Server Name")
+    );
+
+    // A server-provided display name can coincidentally equal the contact
+    // name; provenance, not string equality, decides what removal clears.
+    feed(
+        &store,
+        [contact_update(PEER, "Coincident Name", "Coincident")],
+    )
+    .await;
+    feed(
+        &store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                display_name: Some("Coincident Name".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    feed(&store, [contact_removed(PEER)]).await;
+    let after_independent = store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        after_independent
+            .iter()
+            .find(|chat| chat.jid == jid(PEER))
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Coincident Name")
+    );
+}
+
+#[tokio::test]
 async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_change() {
     let (device, store) = test_store().await;
     add_lid_mapping(&device).await;
