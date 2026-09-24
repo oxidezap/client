@@ -1963,6 +1963,7 @@ async fn a_contact_update_repairs_an_already_seen_lid_chat() {
     WhatsAppClient::spawn_contact_identity_learner(
         client.clone(),
         identity_incoming,
+        chat_store.handler(),
         names.clone(),
         Arc::new(tokio::sync::Notify::new()),
         stopping,
