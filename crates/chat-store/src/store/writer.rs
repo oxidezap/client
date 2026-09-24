@@ -230,12 +230,14 @@ fn apply_writer_msg(
             let Some(mut survivor) = aliases.first().cloned() else {
                 return Ok(());
             };
-            if aliases.len() == 1 {
-                crate::store::message_identity::reconcile_chat(conn, device_id, &survivor, cs)?;
-            } else {
-                for alias in aliases.iter().skip(1) {
-                    survivor = crate::lid::merge_split_chat(conn, device_id, &survivor, alias, cs)?;
-                }
+            // Reconcile populated keys even when every other alias is empty:
+            // merge_split_chat is intentionally a no-op for an empty source,
+            // and must not be the only path that cleans one-key legacy rows.
+            for alias in &aliases {
+                crate::store::message_identity::reconcile_chat(conn, device_id, alias, cs)?;
+            }
+            for alias in aliases.iter().skip(1) {
+                survivor = crate::lid::merge_split_chat(conn, device_id, &survivor, alias, cs)?;
             }
             Ok(())
         }

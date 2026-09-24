@@ -310,7 +310,7 @@ fn page_rows_with_copies(
     device_id: i32,
     keys: &[String],
     rows: &[MessageRow],
-) -> std::result::Result<Vec<(MessageRow, Option<i64>)>, wacore::store::error::StoreError> {
+) -> std::result::Result<Vec<(MessageRow, Option<i64>, bool)>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
     let mut msg_ids: Vec<String> = rows.iter().map(|row| row.msg_id.clone()).collect();
     msg_ids.sort();
@@ -356,9 +356,30 @@ fn page_rows_with_copies(
         if copies.is_empty() {
             copies.push(row.clone());
         }
-        folded_rows.push(fold_read_copies(copies));
+        let has_alias_copies = copies.len() > 1;
+        let (folded, edit_source_id) = fold_read_copies(copies);
+        folded_rows.push((folded, edit_source_id, has_alias_copies));
     }
     Ok(folded_rows)
+}
+
+fn rows_at_timestamp(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    keys: &[String],
+    timestamp_ms: i64,
+) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
+    use schema::messages::dsl;
+    dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq_any(keys.to_vec()))
+                .and(dsl::timestamp_ms.eq(timestamp_ms)),
+        )
+        .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
+        .load(conn)
+        .map_err(db_err)
 }
 
 fn key_is_before_page(row: &MessageRow, cursor: Option<&MessageCursor>) -> bool {
@@ -914,6 +935,7 @@ fn fill_unique(
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
     let mut edit_source_ids = std::collections::HashMap::new();
+    let mut saw_alias_copies = false;
     let page_cursor = before.clone();
     let mut before = before;
     while (kept.len() as i64) < limit {
@@ -928,7 +950,10 @@ fn fill_unique(
             timestamp_ms: row.timestamp_ms,
             seq: row.id,
         });
-        for (row, edit_source_id) in page_rows_with_copies(conn, device_id, keys, &rows)? {
+        for (row, edit_source_id, has_alias_copies) in
+            page_rows_with_copies(conn, device_id, keys, &rows)?
+        {
+            saw_alias_copies |= has_alias_copies;
             if key_is_before_page(&row, page_cursor.as_ref()) {
                 push_unique_message(
                     conn,
@@ -940,11 +965,31 @@ fn fill_unique(
                 )?;
             }
         }
+        if !exhausted && limit > 0 && (kept.len() as i64) >= limit && saw_alias_copies {
+            kept.sort_by_key(|row| std::cmp::Reverse((row.timestamp_ms, row.id)));
+            let cutoff = kept[(limit - 1) as usize].timestamp_ms;
+            let tied_rows = rows_at_timestamp(conn, device_id, keys, cutoff)?;
+            for (row, edit_source_id, _) in
+                page_rows_with_copies(conn, device_id, keys, &tied_rows)?
+            {
+                if key_is_before_page(&row, page_cursor.as_ref()) {
+                    push_unique_message(
+                        conn,
+                        device_id,
+                        &mut kept,
+                        &mut edit_source_ids,
+                        row,
+                        edit_source_id,
+                    )?;
+                }
+            }
+        }
         if exhausted {
             break;
         }
     }
     kept.sort_by_key(|row| std::cmp::Reverse((row.timestamp_ms, row.id)));
+    kept.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(kept)
 }
 
@@ -966,6 +1011,7 @@ fn fill_unique_after(
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
     let mut edit_source_ids = std::collections::HashMap::new();
+    let mut saw_alias_copies = false;
     let page_cursor = after.clone();
     let mut after = after;
     while (kept.len() as i64) < limit {
@@ -994,7 +1040,10 @@ fn fill_unique_after(
                 seq: last.id,
             };
         }
-        for (row, edit_source_id) in page_rows_with_copies(conn, device_id, keys, &rows)? {
+        for (row, edit_source_id, has_alias_copies) in
+            page_rows_with_copies(conn, device_id, keys, &rows)?
+        {
+            saw_alias_copies |= has_alias_copies;
             if key_is_after_page(&row, &page_cursor) {
                 push_unique_message(
                     conn,
@@ -1006,6 +1055,25 @@ fn fill_unique_after(
                 )?;
             }
         }
+        if !exhausted && limit > 0 && (kept.len() as i64) >= limit && saw_alias_copies {
+            kept.sort_by_key(|row| (row.timestamp_ms, row.id));
+            let cutoff = kept[(limit - 1) as usize].timestamp_ms;
+            let tied_rows = rows_at_timestamp(conn, device_id, keys, cutoff)?;
+            for (row, edit_source_id, _) in
+                page_rows_with_copies(conn, device_id, keys, &tied_rows)?
+            {
+                if key_is_after_page(&row, &page_cursor) {
+                    push_unique_message(
+                        conn,
+                        device_id,
+                        &mut kept,
+                        &mut edit_source_ids,
+                        row,
+                        edit_source_id,
+                    )?;
+                }
+            }
+        }
         // `rows` was empty: the store is exhausted and the cursor did not
         // move, so another pass would ask the same question forever.
         if exhausted {
@@ -1013,6 +1081,7 @@ fn fill_unique_after(
         }
     }
     kept.sort_by_key(|row| (row.timestamp_ms, row.id));
+    kept.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(kept)
 }
 

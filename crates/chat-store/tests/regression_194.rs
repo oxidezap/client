@@ -1339,6 +1339,68 @@ async fn scoped_mapping_repair_does_not_ack_an_unprocessed_mapping() {
 }
 
 #[tokio::test]
+async fn explicit_reconcile_cleans_a_populated_key_when_aliases_are_empty() {
+    #[derive(diesel::QueryableByName)]
+    struct RowCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    let (store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("PN copy"),
+                incoming_info(PEER, PEER, "MSG-194-POPULATED-KEY", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("LID copy"),
+                incoming_info(PEER, PEER_LID, "MSG-194-POPULATED-KEY", 1_700_000_001),
+            ),
+        ],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+    let device_id = store.device_id();
+    let count_rows = || {
+        let store = store.clone();
+        async move {
+            store
+                .shared()
+                .run(move |conn| {
+                    diesel::sql_query(
+                        "SELECT COUNT(*) AS count FROM messages \
+                         WHERE device_id = ? AND chat_jid = ? AND msg_id = ?",
+                    )
+                    .bind::<diesel::sql_types::Integer, _>(device_id)
+                    .bind::<diesel::sql_types::Text, _>(PEER)
+                    .bind::<diesel::sql_types::Text, _>("MSG-194-POPULATED-KEY")
+                    .get_result::<RowCount>(conn)
+                    .map(|row| row.count)
+                    .map_err(db_err)
+                })
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count_rows().await, 2);
+
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(count_rows().await, 1);
+    assert_eq!(
+        chat_store
+            .chat(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .unread_count,
+        1
+    );
+}
+
+#[tokio::test]
 async fn explicit_chat_reconcile_merges_the_complete_alias_component() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 
