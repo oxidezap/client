@@ -201,7 +201,7 @@ impl Element for RetainedSelectionKeepalive {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        (window.request_layout(Style::default(), &[], cx), ())
+        (window.request_layout(Style::default(), [], cx), ())
     }
 
     fn prepaint(
