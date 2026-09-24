@@ -243,7 +243,7 @@ impl Element for RetainedSelectionKeepalive {
                     (
                         participant.handle.clone(),
                         participant.document_order,
-                        participant.last_bounds.clone(),
+                        participant.last_bounds,
                     )
                 })
                 .filter_map(|(handle, document_order, bounds)| {
@@ -765,9 +765,9 @@ impl Element for SelectableRichText {
             .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         handle.handle.register(
-            TextSelectionRegistration::new(hitbox.clone(), bounds.clone())
+            TextSelectionRegistration::new(hitbox.clone(), bounds)
                 .with_document_order(self.document_order)
-                .with_text_bounds(vec![bounds.clone()]),
+                .with_text_bounds(vec![bounds]),
             window,
             cx,
         );
