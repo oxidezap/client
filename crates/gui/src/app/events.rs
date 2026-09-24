@@ -232,6 +232,7 @@ impl WhatsAppApp {
             }
             UiEvent::LoggedOut(message) => {
                 self.leave_connected_view(None, cx);
+                self.invalidate_document_downloads();
                 self.app_state = AppState::LoggedOut { message };
                 cx.notify();
             }
