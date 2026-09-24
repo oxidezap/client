@@ -231,7 +231,7 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::LoggedOut(message) => {
-                self.leave_connected_view(cx);
+                self.leave_connected_view(None, cx);
                 self.app_state = AppState::LoggedOut { message };
                 cx.notify();
             }
@@ -318,6 +318,13 @@ impl WhatsAppApp {
                 self.handle_chat_presence(chat_jid, sender_jid, sender_name, composing, cx);
             }
             UiEvent::AccountUpdated { name, jid, lid } => {
+                if (self.account_jid != jid || self.account_lid != lid)
+                    && let Some(window) = self.modal_window
+                {
+                    let _ = window.update(cx, |_, window, cx| {
+                        super::clear_window_message_selection(window, cx);
+                    });
+                }
                 if self.account_name != name || self.account_jid != jid || self.account_lid != lid {
                     self.account_name = name;
                     self.account_jid = jid;

@@ -24,6 +24,7 @@ use crate::store::ack::{AckApplied, DeferredAcks, apply_server_ack, lock_deferre
 use crate::store::chat_rows::{ChatBump, bump_chat};
 use crate::store::edit::apply_edit;
 use crate::store::event::apply_event;
+use crate::store::message_identity::authors_match;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message, message_row};
 use crate::store::reaction::apply_reaction;
 use crate::store::revoke::apply_revoke;
@@ -225,10 +226,28 @@ fn apply_writer_msg(
         }
         WriterMsg::Reconcile(chat) => {
             let wire = chat.to_string();
-            if let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &wire)? {
-                crate::lid::merge_split_chat(conn, device_id, &wire, &alt, cs)?;
+            let aliases = crate::lid::chat_key_candidates(conn, device_id, &wire)?;
+            let Some(mut survivor) = aliases.first().cloned() else {
+                return Ok(());
+            };
+            // Reconcile populated keys even when every other alias is empty:
+            // merge_split_chat is intentionally a no-op for an empty source,
+            // and must not be the only path that cleans one-key legacy rows.
+            for alias in &aliases {
+                crate::store::message_identity::reconcile_chat(conn, device_id, alias, cs)?;
+            }
+            for alias in aliases.iter().skip(1) {
+                survivor = crate::lid::merge_split_chat(conn, device_id, &survivor, alias, cs)?;
             }
             Ok(())
+        }
+        WriterMsg::ReconcileAll => {
+            crate::store::message_identity::reconcile_all(conn, device_id, cs)?;
+            crate::lid::reconcile_known_chats(conn, device_id, cs)?;
+            crate::store::message_identity::mark_mapping_repair_current(conn, device_id)
+        }
+        WriterMsg::ReconcileMappings(mappings) => {
+            crate::store::message_identity::reconcile_mappings(conn, device_id, mappings, cs)
         }
         WriterMsg::Outgoing {
             chat,
@@ -260,6 +279,7 @@ fn apply_writer_msg(
                     starred: false,
                     overwrite: true,
                 },
+                cs,
             )?;
             if stored != StoredRow::Skipped {
                 bump_chat(
@@ -304,20 +324,19 @@ fn apply_writer_msg(
             timestamp_ms,
         } => {
             let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
-            if !local_target_collides_with_peer(conn, device_id, &chat_str, target_id)?
-                && apply_edit(
-                    conn,
-                    device_id,
-                    &chat_str,
-                    target_id,
-                    "",
-                    true,
-                    text.as_deref(),
-                    kind,
-                    proto,
-                    *timestamp_ms,
-                )?
-            {
+            if apply_edit(
+                conn,
+                device_id,
+                &chat_str,
+                target_id,
+                "",
+                true,
+                text.as_deref(),
+                kind,
+                proto,
+                *timestamp_ms,
+                cs,
+            )? {
                 cs.chats = true;
             }
             cs.message_chats.insert(chat_str);
@@ -329,17 +348,16 @@ fn apply_writer_msg(
             timestamp_ms,
         } => {
             let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
-            if !local_target_collides_with_peer(conn, device_id, &chat_str, target_id)?
-                && apply_revoke(
-                    conn,
-                    device_id,
-                    &chat_str,
-                    target_id,
-                    "",
-                    true,
-                    *timestamp_ms,
-                )?
-            {
+            if apply_revoke(
+                conn,
+                device_id,
+                &chat_str,
+                target_id,
+                "",
+                true,
+                *timestamp_ms,
+                cs,
+            )? {
                 cs.chats = true;
             }
             cs.message_chats.insert(chat_str);
@@ -484,21 +502,6 @@ pub(super) fn route_chat(
     Ok(routed)
 }
 
-/// A local amendment may create an own-message placeholder when its target is
-/// absent, but an existing peer row with the same sender-chosen id belongs to
-/// a different message and must remain untouched.
-fn local_target_collides_with_peer(
-    conn: &mut SqliteConnection,
-    device_id: i32,
-    chat: &str,
-    target_id: &str,
-) -> QueryResult<bool> {
-    diesel::select(diesel::dsl::exists(
-        message_row(device_id, chat, target_id).filter(schema::messages::from_me.eq(false)),
-    ))
-    .get_result(conn)
-}
-
 /// Match the full target identity, not just its sender-chosen id. Device
 /// suffixes and known PN/LID aliases normalize before participant comparison.
 fn local_reaction_target_matches(
@@ -516,29 +519,21 @@ fn local_reaction_target_matches(
     let Some((stored_from_me, stored_sender)) = target else {
         return Ok(false);
     };
-    if stored_from_me != target_from_me {
-        return Ok(false);
-    }
-    if target_from_me {
-        return Ok(true);
-    }
     let Some(participant) = target_participant else {
+        if target_from_me {
+            return Ok(stored_from_me);
+        }
         let needs_participant = Jid::from_str(chat).is_ok_and(|jid| {
             jid.is_group() || jid.is_status_broadcast() || jid.is_broadcast_list()
         });
-        return Ok(!needs_participant);
+        return Ok(stored_from_me == target_from_me && !needs_participant);
     };
-    let (Ok(stored), Ok(target)) = (Jid::from_str(&stored_sender), Jid::from_str(participant))
-    else {
-        return Ok(stored_sender == participant);
-    };
-    let stored = stored.to_non_ad_string();
-    let target = target.to_non_ad_string();
-    if stored == target {
-        return Ok(true);
-    }
-    Ok(
-        crate::lid::counterpart_chat_key(conn, device_id, &stored)?.as_deref()
-            == Some(target.as_str()),
+    authors_match(
+        conn,
+        device_id,
+        stored_from_me,
+        &stored_sender,
+        target_from_me,
+        participant,
     )
 }

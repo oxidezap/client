@@ -34,6 +34,7 @@ chrono = { workspace = true, features = ["std", "clock"] }
 
 # Match GPUI Kit's published GPUI family so entities share one implementation.
 gpui = { package = "gpui-pre", version = "0.3.4" }
+gpui-base = { git = "https://github.com/longbridge/gpui-kit.git" }
 gpui-component = { git = "https://github.com/longbridge/gpui-kit.git" }
 gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit.git" }
 

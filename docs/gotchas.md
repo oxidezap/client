@@ -1657,9 +1657,25 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   partial (`WHERE from_me = TRUE`) because the only device-wide
   `(device_id, msg_id)` lookup is the chatless server-ack path, which always
   filters outbound; everything else is chat-scoped and rides the identity
-  UNIQUE autoindex. A reply's embedded `quotedMessage` is dropped when the
-  parent is materialized (same chat, stanza id, author — exact or PN/LID
-  counterpart, never a bare id match), kept inline otherwise, and rehydrated
+  UNIQUE autoindex. That index enforces stored spellings, not author identity:
+  `store::message_identity` treats every `from_me` spelling as this account,
+  strips a peer's device suffix, and accepts PN/LID aliases only when this
+  account's mapping ledger proves the pair. Live, history, local sends, edits,
+  revokes and placeholders all resolve through that rule; an unknown alias or
+  a different author never matches. A per-device mapping-generation marker
+  gates the device-wide legacy repair: the first prepared open runs it, later
+  startups repeat it after any durable ledger mutation (including same-second
+  replacements), while a newly learned pair
+  repairs only rows whose sender is one of those aliases and their known chat
+  component. Repairs keep the oldest stable `messages.id`, retain the newest
+  copy's timestamp, fold status and stars, and let a tombstone beat every copy
+  (including its FTS text).
+  Alias reads use the same author-aware fold, while `message()` stays ambiguous
+  when distinct authors really reused an id. A reply's embedded
+  `quotedMessage` is dropped when the parent is materialized (same chat, stanza
+  id, author — device-normalized, own-account sentinel, or proven PN/LID
+  counterpart, never a bare id match), kept inline
+  otherwise, and rehydrated
   in batch on read: one identity resolution per chat on the page plus one
   parent lookup per chat, never one per reply, and the injected copy is never
   written back. A `MessageContextInfo` holding only the `messageSecret` is

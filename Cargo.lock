@@ -6446,6 +6446,7 @@ dependencies = [
  "futures-channel",
  "futures-lite",
  "getrandom 0.4.3",
+ "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",

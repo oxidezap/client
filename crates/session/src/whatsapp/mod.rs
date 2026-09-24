@@ -1312,6 +1312,7 @@ impl WhatsAppClient {
         Self::spawn_contact_identity_learner(
             bot.client(),
             identity_incoming,
+            chat_store.clone(),
             names.clone(),
             reload.clone(),
             stopping.clone(),
@@ -1527,6 +1528,7 @@ impl WhatsAppClient {
     fn spawn_contact_identity_learner(
         client: Arc<Client>,
         incoming: async_channel::Receiver<Arc<Event>>,
+        chat_store: Arc<ChatStore>,
         names: Arc<NameBook>,
         reload: Arc<tokio::sync::Notify>,
         mut stopping: tokio::sync::watch::Receiver<()>,
@@ -1580,6 +1582,15 @@ impl WhatsAppClient {
                             }
                         }
                     }
+                }
+
+                // The writer may have already materialized the same author
+                // under both keys before this mapping became durable. Fold
+                // those legacy rows before consumers re-read the affected chats.
+                if let Err(error) = chat_store.reconcile_message_mappings(&mappings) {
+                    warn!("could not queue message identity reconciliation: {error}");
+                } else if let Err(error) = chat_store.flush().await {
+                    warn!("could not reconcile message identities after learning aliases: {error}");
                 }
 
                 // A previous read may have cached an honest mapping miss.
