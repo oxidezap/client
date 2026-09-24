@@ -12,10 +12,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, Global,
+    App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, FontId, Global,
     GlobalElementId, Half, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    SharedString, StyledText, Window, transparent_black,
+    SharedString, StyledText, TextRun, Window, transparent_black,
 };
 use gpui_base::{
     TextSelection, TextSelectionHandle, TextSelectionProjection, TextSelectionRegistration,
@@ -80,6 +80,24 @@ pub(crate) fn active_selection_message_ids(window_id: gpui::WindowId, cx: &App) 
             *id == window_id && participant.handle.snapshot(cx).is_some()
         })
         .map(|((_, message_id), _)| message_id.to_string())
+        .collect()
+}
+
+/// Active message identities and their retained visible text.
+pub(crate) fn active_selection_message_texts(
+    window_id: gpui::WindowId,
+    cx: &App,
+) -> Vec<(String, SharedString)> {
+    if !cx.has_global::<RichTextSelectionRegistry>() {
+        return Vec::new();
+    }
+    cx.global::<RichTextSelectionRegistry>()
+        .0
+        .iter()
+        .filter(|((id, _), participant)| {
+            *id == window_id && participant.handle.snapshot(cx).is_some()
+        })
+        .map(|((_, message_id), participant)| (message_id.to_string(), participant.text.clone()))
         .collect()
 }
 
@@ -221,6 +239,10 @@ fn selection_quad_bounds(
     for line in layout.line_layouts() {
         let runs = line.runs();
         let wrap_boundaries = line.wrap_boundaries();
+        let source_indices: Vec<usize> = runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| line_start_ix + glyph.index))
+            .collect();
         let mut segments = vec![Vec::new(); wrap_boundaries.len() + 1];
         let mut segment_ix = 0;
         let mut next_boundary_ix = 0;
@@ -262,15 +284,21 @@ fn selection_quad_bounds(
             let mut trailing_advance = Pixels::ZERO;
             for (source_ix, x, font_id) in glyphs {
                 let advance = if *x == visual_right {
-                    let character = text
-                        .get(*source_ix..)
-                        .and_then(|remaining| remaining.chars().next())
-                        .unwrap_or(' ');
-                    window
-                        .text_system()
-                        .advance(*font_id, line.font_size(), character)
-                        .map(|size| size.width)
-                        .unwrap_or(line_height.half())
+                    let cluster_end_ix = source_indices
+                        .iter()
+                        .copied()
+                        .filter(|candidate| candidate > source_ix)
+                        .min()
+                        .unwrap_or(line_start_ix + line.len());
+                    shaped_cluster_advance(
+                        text,
+                        *source_ix,
+                        cluster_end_ix,
+                        *font_id,
+                        line.font_size(),
+                        window,
+                    )
+                    .unwrap_or(line_height.half())
                 } else {
                     Pixels::ZERO
                 };
@@ -371,6 +399,32 @@ fn selection_glyph_bounds(
         }
     }
     fragments
+}
+
+fn shaped_cluster_advance(
+    text: &str,
+    source_ix: usize,
+    cluster_end_ix: usize,
+    font_id: FontId,
+    font_size: Pixels,
+    window: &Window,
+) -> Option<Pixels> {
+    let cluster = text.get(source_ix..cluster_end_ix)?;
+    if cluster.is_empty() {
+        return None;
+    }
+    let text_system = window.text_system();
+    let font = text_system.get_font_for_id(font_id)?;
+    let run = TextRun {
+        len: cluster.len(),
+        font,
+        ..Default::default()
+    };
+    Some(
+        text_system
+            .shape_line(SharedString::from(cluster), font_size, &[run], None)
+            .width(),
+    )
 }
 
 fn link_at_position(

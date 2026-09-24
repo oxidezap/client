@@ -295,7 +295,7 @@ pub use status::{Destination, StatusPane};
 pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -1925,10 +1925,15 @@ impl WhatsAppApp {
         if self.selected_chat.as_deref() == Some(chat_jid)
             && let Some(window) = self.modal_window
         {
-            let selected_ids = crate::components::rich_text_selection::active_selection_message_ids(
-                window.window_id(),
-                cx,
-            );
+            let selected_messages =
+                crate::components::rich_text_selection::active_selection_message_texts(
+                    window.window_id(),
+                    cx,
+                );
+            let selected_ids: Vec<String> = selected_messages
+                .iter()
+                .map(|(message_id, _)| message_id.clone())
+                .collect();
             let selection_is_stale = if selected_ids.is_empty() {
                 false
             } else {
@@ -1964,18 +1969,21 @@ impl WhatsAppApp {
                         })
                     }
                     (None, Some(current)) => {
-                        // A preceding invalidation already compared content
-                        // with the last rendered snapshot. Until it renders
-                        // again, retain selection if its rows still exist.
-                        let current_selectable_ids: HashSet<&str> = current
+                        // The render cache may already be gone, but retained
+                        // participants keep the visible text to compare against.
+                        let current_by_id: HashMap<&str, &ChatMessage> = current
                             .messages
                             .iter()
-                            .filter(|message| message_has_selectable_text(message))
-                            .map(|message| message.id.as_str())
+                            .map(|message| (message.id.as_str(), message))
                             .collect();
-                        selected_ids
-                            .iter()
-                            .any(|message_id| !current_selectable_ids.contains(message_id.as_str()))
+                        selected_messages.iter().any(|(message_id, selected_text)| {
+                            let Some(message) = current_by_id.get(message_id.as_str()) else {
+                                return true;
+                            };
+                            !message_has_selectable_text(message)
+                                || crate::components::BubbleText::of(&message.content).text()
+                                    != selected_text.as_ref()
+                        })
                     }
                     _ => true,
                 }

@@ -96,6 +96,11 @@ impl BubbleText {
         self.text.is_empty()
     }
 
+    /// The parsed text shown in the bubble, with formatting markers removed.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
     /// What each link opens, in link order. The message menu lists these, so
     /// every address has an equivalent activation route beside the inline
     /// pointer one.
@@ -113,7 +118,7 @@ pub fn render_rich_text(
     selection_key: &str,
     document_order: u64,
     cx: &App,
-) -> gpui::AnyElement {
+) -> impl IntoElement + use<> {
     if !parsed.links.is_empty() {
         return render_with_links(parsed, selection_key, document_order, cx).into_any_element();
     }
@@ -198,7 +203,7 @@ fn render_with_links(
     selection_key: &str,
     document_order: u64,
     cx: &App,
-) -> SelectableRichText {
+) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
     let ink = cx.theme().link;
     let mono = cx.theme().mono_font_family.clone();
