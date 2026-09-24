@@ -285,10 +285,21 @@ pub(crate) fn reconcile_mappings(
     mappings: &[(String, String)],
     changes: &mut ChangeSet,
 ) -> QueryResult<()> {
+    if full_repair_pending(conn, device_id)? {
+        reconcile_all(conn, device_id, changes)?;
+        crate::lid::reconcile_known_chats(conn, device_id, changes)?;
+        mark_mapping_repair_current(conn, device_id)?;
+        return Ok(());
+    }
+    if mappings.is_empty() {
+        return Ok(());
+    }
+
     use schema::lid_pn_mapping::dsl;
     let mut phone_numbers: Vec<String> = mappings.iter().map(|(_, pn)| pn.clone()).collect();
     phone_numbers.sort();
     phone_numbers.dedup();
+    let mut repair_pairs = mappings.to_vec();
     let mut senders: Vec<String> = phone_numbers
         .iter()
         .map(|pn| Jid::new(pn.clone(), Server::Pn).to_string())
@@ -299,27 +310,31 @@ pub(crate) fn reconcile_mappings(
         )
         .collect();
     for page in phone_numbers.chunks(crate::queries::BIND_CHUNK) {
-        let lids: Vec<String> = dsl::lid_pn_mapping
+        let aliases: Vec<(String, String)> = dsl::lid_pn_mapping
             .filter(
                 dsl::device_id
                     .eq(device_id)
                     .and(dsl::phone_number.eq_any(page)),
             )
-            .select(dsl::lid)
+            .select((dsl::lid, dsl::phone_number))
             .load(conn)?;
         senders.extend(
-            lids.into_iter()
-                .map(|lid| Jid::new(lid, Server::Lid).to_string()),
+            aliases
+                .iter()
+                .map(|(lid, _)| Jid::new(lid.clone(), Server::Lid).to_string()),
         );
+        repair_pairs.extend(aliases);
     }
     senders.sort();
     senders.dedup();
+    repair_pairs.sort();
+    repair_pairs.dedup();
     if senders.is_empty() {
         return Ok(());
     }
     reconcile_groups(conn, device_id, None, Some(&senders), changes)?;
-    crate::lid::reconcile_known_chats_for(conn, device_id, mappings, changes)?;
-    store_mapping_watermark(conn, device_id)
+    crate::lid::reconcile_known_chats_for(conn, device_id, &repair_pairs, changes)?;
+    mark_scoped_mapping_repair_current(conn, device_id, &repair_pairs)
 }
 
 /// Run the expensive legacy sweep only when the mapping ledger has advanced
@@ -337,15 +352,21 @@ pub(crate) fn reconcile_startup(
         .select((
             schema::message_identity_repair_state::mapping_revision,
             schema::message_identity_repair_state::repaired_revision,
+            schema::message_identity_repair_state::full_repair_pending,
         ))
-        .first::<(i64, i64)>(conn)
+        .first::<(i64, i64, bool)>(conn)
         .optional()?;
-    if stored.is_some_and(|(mapping, repaired)| mapping == repaired) {
+    let pending: i64 = schema::message_identity_repair_pending::table
+        .filter(schema::message_identity_repair_pending::device_id.eq(device_id))
+        .count()
+        .get_result(conn)?;
+    if stored.is_some_and(|(mapping, repaired, full)| mapping == repaired && !full && pending == 0)
+    {
         return Ok(());
     }
     reconcile_all(conn, device_id, changes)?;
     crate::lid::reconcile_known_chats(conn, device_id, changes)?;
-    store_mapping_watermark(conn, device_id)
+    mark_mapping_repair_current(conn, device_id)
 }
 
 /// This account's known JIDs, normalized like peer senders. Quote matching
@@ -380,7 +401,29 @@ pub(crate) fn mark_mapping_repair_current(
     conn: &mut SqliteConnection,
     device_id: i32,
 ) -> QueryResult<()> {
-    store_mapping_watermark(conn, device_id)
+    if !device_exists(conn, device_id)? {
+        return Ok(());
+    }
+    diesel::sql_query(
+        "INSERT INTO message_identity_repair_state \
+         (device_id, mapping_revision, repaired_revision, full_repair_pending) \
+         VALUES (?, 0, -1, FALSE) ON CONFLICT(device_id) DO NOTHING",
+    )
+    .bind::<Integer, _>(device_id)
+    .execute(conn)?;
+    diesel::delete(
+        schema::message_identity_repair_pending::table
+            .filter(schema::message_identity_repair_pending::device_id.eq(device_id)),
+    )
+    .execute(conn)?;
+    diesel::sql_query(
+        "UPDATE message_identity_repair_state \
+         SET repaired_revision = mapping_revision, full_repair_pending = FALSE \
+         WHERE device_id = ?",
+    )
+    .bind::<Integer, _>(device_id)
+    .execute(conn)?;
+    Ok(())
 }
 
 #[derive(QueryableByName)]
@@ -398,47 +441,50 @@ fn device_exists(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<boo
 }
 
 #[derive(QueryableByName)]
-struct MappingRevision {
-    #[diesel(sql_type = BigInt)]
-    mapping_revision: i64,
+struct FullRepairPending {
+    #[diesel(sql_type = Bool)]
+    pending: bool,
 }
 
-/// The mapping-table triggers advance this generation for every durable change,
-/// including same-timestamp replacements and deletions.
-fn mapping_revision(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<i64> {
-    let revision: Option<MappingRevision> = diesel::sql_query(
-        "SELECT mapping_revision FROM message_identity_repair_state WHERE device_id = ?",
+fn full_repair_pending(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<bool> {
+    let pending: Option<FullRepairPending> = diesel::sql_query(
+        "SELECT full_repair_pending AS pending \
+         FROM message_identity_repair_state WHERE device_id = ?",
     )
     .bind::<Integer, _>(device_id)
     .get_result(conn)
     .optional()?;
-    Ok(revision.map_or(0, |row| row.mapping_revision))
+    Ok(pending.is_some_and(|row| row.pending))
 }
 
-fn store_mapping_watermark(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
-    if !device_exists(conn, device_id)? {
-        return Ok(());
-    }
-    let revision = mapping_revision(conn, device_id)?;
-    store_mapping_watermark_value(conn, device_id, revision)
-}
-
-fn store_mapping_watermark_value(
+fn mark_scoped_mapping_repair_current(
     conn: &mut SqliteConnection,
     device_id: i32,
-    mapping_revision: i64,
+    mappings: &[(String, String)],
 ) -> QueryResult<()> {
-    use schema::message_identity_repair_state::dsl;
-    diesel::insert_into(dsl::message_identity_repair_state)
-        .values((
-            dsl::device_id.eq(device_id),
-            dsl::mapping_revision.eq(mapping_revision),
-            dsl::repaired_revision.eq(mapping_revision),
-        ))
-        .on_conflict(dsl::device_id)
-        .do_update()
-        .set(dsl::repaired_revision.eq(mapping_revision))
+    let mut lids: Vec<String> = mappings.iter().map(|(lid, _)| lid.clone()).collect();
+    lids.sort();
+    lids.dedup();
+    for page in lids.chunks(crate::queries::BIND_CHUNK) {
+        diesel::delete(
+            schema::message_identity_repair_pending::table.filter(
+                schema::message_identity_repair_pending::device_id
+                    .eq(device_id)
+                    .and(schema::message_identity_repair_pending::lid.eq_any(page.to_vec())),
+            ),
+        )
         .execute(conn)?;
+    }
+    diesel::sql_query(
+        "UPDATE message_identity_repair_state \
+         SET repaired_revision = mapping_revision \
+         WHERE device_id = ? AND full_repair_pending = FALSE \
+           AND NOT EXISTS (SELECT 1 FROM message_identity_repair_pending \
+                           WHERE device_id = ?)",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Integer, _>(device_id)
+    .execute(conn)?;
     Ok(())
 }
 

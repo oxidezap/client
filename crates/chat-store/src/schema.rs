@@ -117,6 +117,14 @@ diesel::table! {
         device_id -> Integer,
         mapping_revision -> BigInt,
         repaired_revision -> BigInt,
+        full_repair_pending -> Bool,
+    }
+}
+
+diesel::table! {
+    message_identity_repair_pending (device_id, lid) {
+        device_id -> Integer,
+        lid -> Text,
     }
 }
 
@@ -138,5 +146,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     contacts,
     contact_labels,
     message_receipts,
-    message_identity_repair_state
+    message_identity_repair_state,
+    message_identity_repair_pending
 );

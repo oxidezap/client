@@ -1166,6 +1166,131 @@ async fn late_mapping_repair_includes_historical_and_device_qualified_senders() 
 }
 
 #[tokio::test]
+async fn scoped_mapping_repair_does_not_ack_an_unprocessed_mapping() {
+    use diesel::QueryableByName;
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    #[derive(QueryableByName)]
+    struct RepairState {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        mapping_revision: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        repaired_revision: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        pending: i64,
+    }
+    #[derive(QueryableByName)]
+    struct MessageCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    let (store, chat_store) = test_store().await;
+    let other_lid = "222000022223333@lid";
+    let other_pn = "559900000002@s.whatsapp.net";
+    for (sender, id, timestamp) in [
+        (PEER_LID, "MSG-194-SCOPED-A", 1_700_000_000),
+        (PEER, "MSG-194-SCOPED-A", 1_700_000_001),
+        (other_lid, "MSG-194-SCOPED-B", 1_700_000_002),
+        (other_pn, "MSG-194-SCOPED-B", 1_700_000_003),
+    ] {
+        feed(
+            &chat_store,
+            [message_event(
+                wa::Message::text("duplicate"),
+                incoming_info(GROUP, sender, id, timestamp),
+            )],
+        )
+        .await;
+    }
+
+    for (lid, phone_number) in [
+        ("111000011112222", "559900000001"),
+        ("222000022223333", "559900000002"),
+    ] {
+        store
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: lid.into(),
+                phone_number: phone_number.into(),
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_000,
+                learning_source: "usync".into(),
+            })
+            .await
+            .expect("record mapping");
+    }
+
+    chat_store
+        .reconcile_message_mappings(&[("111000011112222".into(), "559900000001".into())])
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let device_id = store.device_id();
+    let state = store
+        .shared()
+        .run(move |conn| {
+            let state: RepairState = diesel::sql_query(
+                "SELECT mapping_revision, repaired_revision, \
+                 (SELECT COUNT(*) FROM message_identity_repair_pending WHERE device_id = ?) AS pending \
+                 FROM message_identity_repair_state WHERE device_id = ?",
+            )
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .get_result(conn)
+            .map_err(db_err)?;
+            Ok((
+                state.mapping_revision,
+                state.repaired_revision,
+                state.pending,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(state, (2, 0, 1), "the unrelated mapping is still pending");
+
+    drop(chat_store);
+    let restarted = ChatStore::new(&store).await.unwrap();
+    let remaining: i64 = store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(
+                "SELECT COUNT(*) AS count FROM messages \
+                 WHERE device_id = ? AND chat_jid = ? AND msg_id = ?",
+            )
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>(GROUP)
+            .bind::<diesel::sql_types::Text, _>("MSG-194-SCOPED-B")
+            .get_result::<MessageCount>(conn)
+            .map(|row| row.count)
+            .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    assert_eq!(remaining, 1, "startup repairs the still-pending alias");
+    let final_state = store
+        .shared()
+        .run(move |conn| {
+            let state: RepairState = diesel::sql_query(
+                "SELECT mapping_revision, repaired_revision, \
+                 (SELECT COUNT(*) FROM message_identity_repair_pending WHERE device_id = ?) AS pending \
+                 FROM message_identity_repair_state WHERE device_id = ?",
+            )
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .get_result(conn)
+            .map_err(db_err)?;
+            Ok((
+                state.mapping_revision,
+                state.repaired_revision,
+                state.pending,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(final_state, (2, 2, 0));
+    drop(restarted);
+}
+
+#[tokio::test]
 async fn explicit_chat_reconcile_merges_the_complete_alias_component() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 

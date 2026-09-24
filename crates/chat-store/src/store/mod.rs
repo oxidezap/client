@@ -804,8 +804,20 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // The repair marker is newer than the older migration edges checked
-        // below; prove its table drops before testing those historical edges.
+        // Revert the pending-alias queue before its repair-state table; both
+        // are newer than the older migration edges checked below.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("identity-repair queue downgrade is reversible");
+        assert!(!has_table(&store, "message_identity_repair_pending").await);
+        assert!(has_table(&store, "message_identity_repair_state").await);
+
         store
             .shared()
             .run(|conn| {
@@ -987,6 +999,17 @@ mod migration_tests {
         store_a.create_new_device().await.expect("create device A");
         store_b.create_new_device().await.expect("create device B");
         ChatStore::new(&store_a).await.expect("run migrations");
+        use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+        store_a
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "111000011112222".into(),
+                phone_number: "559900000001".into(),
+                created_at: 1,
+                updated_at: 1,
+                learning_source: "test".into(),
+            })
+            .await
+            .expect("insert mapping with pending repair");
 
         store_a
             .shared()

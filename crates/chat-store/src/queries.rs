@@ -291,12 +291,95 @@ fn fold_read_duplicate(
     (survivor, edited.map(|(_, source_id)| source_id))
 }
 
+fn fold_read_copies(mut copies: Vec<MessageRow>) -> (MessageRow, Option<i64>) {
+    copies.sort_by_key(|row| row.id);
+    let mut folded = copies.remove(0);
+    let mut edit_source_id = folded.edited_at_ms.map(|_| folded.id);
+    for incoming in copies {
+        let incoming_edit_source_id = incoming.edited_at_ms.map(|_| incoming.id);
+        (folded, edit_source_id) =
+            fold_read_duplicate(folded, incoming, edit_source_id, incoming_edit_source_id);
+    }
+    (folded, edit_source_id)
+}
+
+/// Fold every author-equivalent copy of the stanza ids in one raw page. The
+/// page query remains timestamp-indexed; this bounded follow-up lets a copy
+/// outside its raw slice contribute content and be suppressed on later pages.
+fn page_rows_with_copies(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    keys: &[String],
+    rows: &[MessageRow],
+) -> std::result::Result<Vec<(MessageRow, Option<i64>)>, wacore::store::error::StoreError> {
+    use schema::messages::dsl;
+    let mut msg_ids: Vec<String> = rows.iter().map(|row| row.msg_id.clone()).collect();
+    msg_ids.sort();
+    msg_ids.dedup();
+    let mut candidates = Vec::new();
+    for key_page in keys.chunks(BIND_CHUNK / 2) {
+        let id_chunk_size = BIND_CHUNK - key_page.len() - 1;
+        for id_page in msg_ids.chunks(id_chunk_size) {
+            candidates.extend(
+                dsl::messages
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::chat_jid.eq_any(key_page.to_vec()))
+                            .and(dsl::msg_id.eq_any(id_page.to_vec())),
+                    )
+                    .load::<MessageRow>(conn)
+                    .map_err(db_err)?,
+            );
+        }
+    }
+
+    let mut folded_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut copies = Vec::new();
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.msg_id == row.msg_id && candidate.from_me == row.from_me)
+        {
+            if crate::store::message_identity::authors_match(
+                conn,
+                device_id,
+                row.from_me,
+                &row.sender_jid,
+                candidate.from_me,
+                &candidate.sender_jid,
+            )
+            .map_err(db_err)?
+            {
+                copies.push(candidate.clone());
+            }
+        }
+        if copies.is_empty() {
+            copies.push(row.clone());
+        }
+        folded_rows.push(fold_read_copies(copies));
+    }
+    Ok(folded_rows)
+}
+
+fn key_is_before_page(row: &MessageRow, cursor: Option<&MessageCursor>) -> bool {
+    match cursor {
+        Some(cursor) => (row.timestamp_ms, row.id) < (cursor.timestamp_ms, cursor.seq),
+        None => true,
+    }
+}
+
+fn key_is_after_page(row: &MessageRow, cursor: &MessageCursor) -> bool {
+    (row.timestamp_ms, row.id) > (cursor.timestamp_ms, cursor.seq)
+}
+
 fn push_unique_message(
     conn: &mut diesel::SqliteConnection,
     device_id: i32,
     kept: &mut Vec<MessageRow>,
     edit_source_ids: &mut std::collections::HashMap<i64, i64>,
     row: MessageRow,
+    incoming_edit_source_id: Option<i64>,
 ) -> std::result::Result<(), wacore::store::error::StoreError> {
     for prior in kept.iter_mut() {
         if prior.msg_id == row.msg_id
@@ -313,9 +396,8 @@ fn push_unique_message(
             let held_id = prior.id;
             let incoming_id = row.id;
             let held_source_id = edit_source_ids.get(&held_id).copied();
-            let incoming_source_id = row.edited_at_ms.map(|_| incoming_id);
             let (folded, edit_source_id) =
-                fold_read_duplicate(prior.clone(), row, held_source_id, incoming_source_id);
+                fold_read_duplicate(prior.clone(), row, held_source_id, incoming_edit_source_id);
             edit_source_ids.remove(&held_id);
             edit_source_ids.remove(&incoming_id);
             if let Some(edit_source_id) = edit_source_id {
@@ -327,8 +409,8 @@ fn push_unique_message(
             return Ok(());
         }
     }
-    if row.edited_at_ms.is_some() {
-        edit_source_ids.insert(row.id, row.id);
+    if let Some(edit_source_id) = incoming_edit_source_id {
+        edit_source_ids.insert(row.id, edit_source_id);
     }
     kept.push(row);
     Ok(())
@@ -815,8 +897,10 @@ impl ChatStore {
 /// asking, so a duplicate collapsed inside the page would end the history at
 /// the split rather than at its beginning — and a page that serves the unread
 /// tail would leave the messages it dropped out of `ReadTracker`, where their
-/// receipts are owed. Each pass costs a query only when the last one collapsed
-/// something, which a merged pair never does.
+/// receipts are owed. Each raw batch makes one indexed lookup for its stanza
+/// ids across the chat's alias keys; that lets a
+/// copy outside the raw limit contribute its folded timestamp and keeps it
+/// from reappearing on a later page.
 ///
 /// Both readers go through it: the single chat's page and the batch an attach
 /// load asks for. Rows sharing an id collapse only when their authors are
@@ -831,6 +915,7 @@ fn fill_unique(
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
     let mut edit_source_ids = std::collections::HashMap::new();
+    let page_cursor = before.clone();
     let mut before = before;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
@@ -844,8 +929,17 @@ fn fill_unique(
             timestamp_ms: row.timestamp_ms,
             seq: row.id,
         });
-        for row in rows {
-            push_unique_message(conn, device_id, &mut kept, &mut edit_source_ids, row)?;
+        for (row, edit_source_id) in page_rows_with_copies(conn, device_id, keys, &rows)? {
+            if key_is_before_page(&row, page_cursor.as_ref()) {
+                push_unique_message(
+                    conn,
+                    device_id,
+                    &mut kept,
+                    &mut edit_source_ids,
+                    row,
+                    edit_source_id,
+                )?;
+            }
         }
         if exhausted {
             break;
@@ -873,6 +967,7 @@ fn fill_unique_after(
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
     let mut edit_source_ids = std::collections::HashMap::new();
+    let page_cursor = after.clone();
     let mut after = after;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
@@ -900,8 +995,17 @@ fn fill_unique_after(
                 seq: last.id,
             };
         }
-        for row in rows {
-            push_unique_message(conn, device_id, &mut kept, &mut edit_source_ids, row)?;
+        for (row, edit_source_id) in page_rows_with_copies(conn, device_id, keys, &rows)? {
+            if key_is_after_page(&row, &page_cursor) {
+                push_unique_message(
+                    conn,
+                    device_id,
+                    &mut kept,
+                    &mut edit_source_ids,
+                    row,
+                    edit_source_id,
+                )?;
+            }
         }
         // `rows` was empty: the store is exhausted and the cursor did not
         // move, so another pass would ask the same question forever.
@@ -1390,7 +1494,15 @@ impl ChatStore {
                 let mut unique = Vec::new();
                 let mut edit_source_ids = std::collections::HashMap::new();
                 for row in rows {
-                    push_unique_message(conn, device_id, &mut unique, &mut edit_source_ids, row)?;
+                    let edit_source_id = row.edited_at_ms.map(|_| row.id);
+                    push_unique_message(
+                        conn,
+                        device_id,
+                        &mut unique,
+                        &mut edit_source_ids,
+                        row,
+                        edit_source_id,
+                    )?;
                 }
                 finalize_messages(conn, device_id, unique)
             })

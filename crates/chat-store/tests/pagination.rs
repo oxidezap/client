@@ -46,6 +46,68 @@ async fn keyset_pagination_covers_all_pages_in_order() {
 /// The forward twin: walking *after* a cursor yields what came later, oldest
 /// first, with the same rows the backward walk sees.
 #[tokio::test]
+async fn alias_copies_beyond_a_raw_page_are_folded_without_repeating() {
+    let (store, chat_store) = test_store().await;
+    let group = jid(GROUP);
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("new alias copy"),
+                incoming_info(GROUP, PEER_LID, "MSG-ALIAS-PAGE", 1_700_000_003),
+            ),
+            message_event(
+                wa::Message::text("intervening message"),
+                incoming_info(
+                    GROUP,
+                    "559900000002@s.whatsapp.net",
+                    "MSG-INTERVENING",
+                    1_700_000_002,
+                ),
+            ),
+            message_event(
+                wa::Message::text("old alias copy"),
+                incoming_info(GROUP, PEER, "MSG-ALIAS-PAGE", 1_700_000_001),
+            ),
+        ],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+
+    let newest = chat_store.messages(&group, None, 2).await.unwrap();
+    assert_eq!(
+        newest.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["MSG-ALIAS-PAGE", "MSG-INTERVENING"]
+    );
+    let next_newest = chat_store
+        .messages(&group, newest.last().map(Into::into), 2)
+        .await
+        .unwrap();
+    assert!(next_newest.is_empty(), "the older copy is already folded");
+
+    let oldest = chat_store
+        .messages_after(
+            &group,
+            MessageCursor {
+                timestamp_ms: 0,
+                seq: 0,
+            },
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        oldest.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["MSG-INTERVENING", "MSG-ALIAS-PAGE"]
+    );
+    let next_oldest = chat_store
+        .messages_after(&group, oldest.last().unwrap().into(), 2)
+        .await
+        .unwrap();
+    assert!(next_oldest.is_empty(), "the newer copy is already folded");
+}
+
+#[tokio::test]
 async fn forward_pages_continue_from_a_row_in_arrival_order() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
