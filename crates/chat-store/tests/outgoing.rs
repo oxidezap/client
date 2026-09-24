@@ -23,7 +23,6 @@ async fn wrapped_and_new_poll_kinds_are_classified_on_outgoing_write() {
                             poll_creation_message_v3: buffa::MessageField::some(Default::default()),
                             ..Default::default()
                         }),
-                        ..Default::default()
                     },
                 ),
                 ..Default::default()

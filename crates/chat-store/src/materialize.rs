@@ -610,11 +610,9 @@ mod tests {
                 message: MessageField::some(wa::Message {
                     group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
                         message: MessageField::some(album),
-                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
-                ..Default::default()
             }),
             ..Default::default()
         };
