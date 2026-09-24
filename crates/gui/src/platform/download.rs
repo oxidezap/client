@@ -112,7 +112,11 @@ mod imp {
         write_in(&dir, file_name, data)
     }
 
-    fn write_in(dir: &std::path::Path, file_name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+    pub(super) fn write_in(
+        dir: &std::path::Path,
+        file_name: &str,
+        data: &[u8],
+    ) -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(dir)?;
         let name = safe_name(file_name);
 

@@ -637,6 +637,7 @@ impl WhatsAppApp {
         };
         let download_rx = client.download_downloadable_media(downloadable);
         let expected_scope = scope.clone();
+        let expected_generation = self.document_state_generation;
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
@@ -644,7 +645,9 @@ impl WhatsAppApp {
                     Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
                         let display = path.display().to_string();
                         let _ = entity.update(cx, |app, cx| {
-                            if app.account_scope() == expected_scope.0.as_str() {
+                            if app.document_state_generation == expected_generation
+                                && app.account_scope() == expected_scope.0.as_str()
+                            {
                                 app.saved_documents.insert(expected_scope.clone(), path);
                                 cx.notify();
                             }
@@ -671,7 +674,9 @@ impl WhatsAppApp {
                 }
             }
             let _ = entity.update(cx, |app, cx| {
-                app.document_downloads_in_flight.remove(&scope);
+                if app.document_state_generation == expected_generation {
+                    app.document_downloads_in_flight.remove(&scope);
+                }
                 cx.notify();
             });
         })
@@ -719,7 +724,7 @@ impl WhatsAppApp {
             self.saved_documents.remove(&scope);
             cx.notify();
             self.notify_user(
-                "That file is no longer in Downloads. Save it again to open it.".into(),
+                "That file is no longer in Downloads. Save it again to open it.",
                 crate::app::notices::Tone::Problem,
                 cx,
             );
@@ -737,7 +742,7 @@ impl WhatsAppApp {
             self.saved_documents.remove(&scope);
             cx.notify();
             self.notify_user(
-                "That file is no longer in Downloads. Save it again to show it.".into(),
+                "That file is no longer in Downloads. Save it again to show it.",
                 crate::app::notices::Tone::Problem,
                 cx,
             );

@@ -907,6 +907,8 @@ pub struct WhatsAppApp {
     saved_documents: HashMap<(String, String, String), std::path::PathBuf>,
     /// Document saves use the same account/chat/message identity as results.
     document_downloads_in_flight: std::collections::HashSet<(String, String, String)>,
+    /// Invalidates detached saves when the active account/session is reset.
+    document_state_generation: u64,
     /// What call is happening, where this window draws it, and what it has
     /// asked the devices for that has not come back yet. See [`calls_ctl`].
     calls: Entity<calls_ctl::Calls>,
@@ -1417,6 +1419,7 @@ impl WhatsAppApp {
             downloads_in_flight: std::collections::HashSet::new(),
             saved_documents: HashMap::new(),
             document_downloads_in_flight: std::collections::HashSet::new(),
+            document_state_generation: 0,
             calls: cx.new(|_| calls_ctl::Calls::new()),
             plugins: cx.new(|_| plugins_ctl::Plugins::new()),
             search: cx.new(|_| search::Search::new()),
@@ -2225,6 +2228,7 @@ impl WhatsAppApp {
         self.downloads_in_flight.clear();
         self.saved_documents.clear();
         self.document_downloads_in_flight.clear();
+        self.document_state_generation = self.document_state_generation.wrapping_add(1);
         // The viewer names a chat and a message in it, both of which have
         // just gone; and both searches were typed against a list and a
         // conversation this account no longer has.
