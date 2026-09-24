@@ -2156,10 +2156,10 @@ impl WhatsAppClient {
         let poll = poll_of(base_msg);
 
         // Extract text content
-        let content = msg
+        let content = base_msg
             .text_content()
             .map(|s| s.to_string())
-            .or_else(|| msg.get_caption().map(|s| s.to_string()))
+            .or_else(|| base_msg.get_caption().map(|s| s.to_string()))
             .or_else(|| poll.as_ref().map(|poll| poll.question.clone()))
             .unwrap_or_else(|| {
                 if media_result.is_some() {
