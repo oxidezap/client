@@ -28,14 +28,13 @@ struct RetainedSelection {
     text: SharedString,
     pressed_link: Rc<Cell<Option<LinkPress>>>,
     projection: Rc<RefCell<TextSelectionProjection>>,
-    copy_text: Rc<RefCell<String>>,
 }
 
 struct RetainedParticipant {
     handle: TextSelectionHandle,
     text: SharedString,
     document_order: u64,
-    copy_text: Rc<RefCell<String>>,
+    last_bounds: Option<Bounds<Pixels>>,
     _selection_subscription: gpui::Subscription,
 }
 
@@ -43,7 +42,6 @@ pub(super) struct RichTextState {
     handle: TextSelectionHandle,
     pressed_link: Rc<Cell<Option<LinkPress>>>,
     projection: Rc<RefCell<TextSelectionProjection>>,
-    copy_text: Rc<RefCell<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -60,24 +58,15 @@ struct RichTextSelectionRegistry(HashMap<(gpui::WindowId, Arc<str>), RetainedPar
 impl Global for RichTextSelectionRegistry {}
 
 fn new_retained_selection(text: &SharedString, cx: &mut App) -> RetainedSelection {
-    let handle = TextSelectionHandle::new(text.to_string(), cx);
-    let copy_text = Rc::new(RefCell::new(String::new()));
-    let retained_copy_text = Rc::clone(&copy_text);
-    handle.copy_with(move |_| retained_copy_text.borrow().clone(), cx);
-    retained_selection(handle, text, copy_text)
+    retained_selection(TextSelectionHandle::new(text.to_string(), cx), text)
 }
 
-fn retained_selection(
-    handle: TextSelectionHandle,
-    text: &SharedString,
-    copy_text: Rc<RefCell<String>>,
-) -> RetainedSelection {
+fn retained_selection(handle: TextSelectionHandle, text: &SharedString) -> RetainedSelection {
     RetainedSelection {
         handle,
         text: text.clone(),
         pressed_link: Rc::new(Cell::new(None)),
         projection: Rc::new(RefCell::new(TextSelectionProjection::default())),
-        copy_text,
     }
 }
 
@@ -105,12 +94,27 @@ pub(crate) fn active_selection_message_snapshots(
         .collect()
 }
 
+fn record_selection_bounds(
+    window_id: gpui::WindowId,
+    message_id: &Arc<str>,
+    bounds: Bounds<Pixels>,
+    cx: &mut App,
+) {
+    if cx.has_global::<RichTextSelectionRegistry>()
+        && let Some(participant) = cx
+            .global_mut::<RichTextSelectionRegistry>()
+            .0
+            .get_mut(&(window_id, Arc::clone(message_id)))
+    {
+        participant.last_bounds = Some(bounds);
+    }
+}
+
 fn track_selection_handle(
     window_id: gpui::WindowId,
     message_id: &Arc<str>,
     handle: &TextSelectionHandle,
     text: &SharedString,
-    copy_text: &Rc<RefCell<String>>,
     document_order: u64,
     cx: &mut App,
 ) {
@@ -166,7 +170,7 @@ fn track_selection_handle(
                     handle: handle.clone(),
                     text: text.clone(),
                     document_order,
-                    copy_text: Rc::clone(copy_text),
+                    last_bounds: None,
                     _selection_subscription: subscription,
                 },
             );
@@ -235,7 +239,16 @@ impl Element for RetainedSelectionKeepalive {
                 .filter(|((id, _), participant)| {
                     *id == window_id && participant.handle.snapshot(cx).is_some()
                 })
-                .map(|(_, participant)| (participant.handle.clone(), participant.document_order))
+                .map(|(_, participant)| {
+                    (
+                        participant.handle.clone(),
+                        participant.document_order,
+                        participant.last_bounds.clone(),
+                    )
+                })
+                .filter_map(|(handle, document_order, bounds)| {
+                    bounds.map(|bounds| (handle, document_order, bounds))
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -249,12 +262,20 @@ impl Element for RetainedSelectionKeepalive {
         // clipping mask, which is what GPUI uses for drag auto-scroll.
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let dormant_y = bounds.bottom() + window.viewport_size().height + window.rem_size();
-        let dormant_bounds =
-            Bounds::new(Point::new(bounds.left(), dormant_y), gpui::Size::default());
-        for (handle, document_order) in retained {
+        for (handle, document_order, last_bounds) in retained {
+            let dormant_bounds = Bounds::new(
+                Point::new(last_bounds.left(), dormant_y),
+                gpui::Size::default(),
+            );
+            let scroll_offset = Point::new(
+                last_bounds.origin.x - dormant_bounds.origin.x,
+                last_bounds.origin.y - dormant_bounds.origin.y,
+            );
             handle.register(
                 TextSelectionRegistration::new(hitbox.clone(), dormant_bounds)
-                    .with_document_order(document_order),
+                    .with_scroll_offset(scroll_offset)
+                    .with_document_order(document_order)
+                    .with_text_bounds(vec![last_bounds]),
                 window,
                 cx,
             );
@@ -674,22 +695,14 @@ impl Element for SelectableRichText {
                 cx.global::<RichTextSelectionRegistry>()
                     .0
                     .get(&registry_key)
-                    .map(|participant| {
-                        (
-                            participant.handle.clone(),
-                            participant.text.clone(),
-                            Rc::clone(&participant.copy_text),
-                        )
-                    })
+                    .map(|participant| (participant.handle.clone(), participant.text.clone()))
             })
             .flatten();
         let registry_handle = match registry_participant {
-            Some((handle, text, copy_text))
-                if text == self.text && handle.snapshot(cx).is_some() =>
-            {
-                Some((handle, copy_text))
+            Some((handle, text)) if text == self.text && handle.snapshot(cx).is_some() => {
+                Some(handle)
             }
-            Some((handle, text, _)) if text != self.text && handle.snapshot(cx).is_some() => {
+            Some((handle, text)) if text != self.text && handle.snapshot(cx).is_some() => {
                 // The bubble changed while virtualized, so its retained
                 // participant must not keep exporting the previous text.
                 TextSelection::clear(window, cx);
@@ -713,9 +726,7 @@ impl Element for SelectableRichText {
                         new_retained_selection(&self.text, cx)
                     }
                     None => match registry_handle.clone() {
-                        Some((handle, copy_text)) => {
-                            retained_selection(handle, &self.text, copy_text)
-                        }
+                        Some(handle) => retained_selection(handle, &self.text),
                         None => new_retained_selection(&self.text, cx),
                     },
                 };
@@ -723,7 +734,6 @@ impl Element for SelectableRichText {
                     handle: retained.handle.clone(),
                     pressed_link: Rc::clone(&retained.pressed_link),
                     projection: Rc::clone(&retained.projection),
-                    copy_text: Rc::clone(&retained.copy_text),
                 };
                 (state, retained)
             },
@@ -733,7 +743,6 @@ impl Element for SelectableRichText {
             &self.selection_key,
             &handle.handle,
             &self.text,
-            &handle.copy_text,
             self.document_order,
             cx,
         );
@@ -756,10 +765,16 @@ impl Element for SelectableRichText {
             .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         handle.handle.register(
-            TextSelectionRegistration::new(hitbox.clone(), bounds)
+            TextSelectionRegistration::new(hitbox.clone(), bounds.clone())
                 .with_document_order(self.document_order)
-                .with_text_bounds(vec![bounds]),
+                .with_text_bounds(vec![bounds.clone()]),
             window,
+            cx,
+        );
+        record_selection_bounds(
+            window.window_handle().window_id(),
+            &self.selection_key,
+            bounds,
             cx,
         );
         hitbox
@@ -790,12 +805,6 @@ impl Element for SelectableRichText {
                 window.refresh();
             }
         }
-        *handle.copy_text.borrow_mut() = projection
-            .ranges()
-            .iter()
-            .flatten()
-            .filter_map(|range| self.text.get(range.clone()))
-            .collect();
         let selection_color = cx.theme().selection;
         for range in projection.ranges().iter().flatten().cloned() {
             Self::paint_selection(&layout, &self.text, range, selection_color, window);
