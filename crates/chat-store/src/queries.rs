@@ -222,7 +222,12 @@ pub(crate) struct MessageRow {
 
 /// Fold an author-equivalent legacy copy for a read without hiding a
 /// tombstone or treating a sender collision as the same message.
-fn fold_read_duplicate(held: MessageRow, incoming: MessageRow) -> MessageRow {
+fn fold_read_duplicate(
+    held: MessageRow,
+    incoming: MessageRow,
+    held_edit_source_id: Option<i64>,
+    incoming_edit_source_id: Option<i64>,
+) -> (MessageRow, Option<i64>) {
     let held_is_survivor = held.id <= incoming.id;
     let mut survivor = if held_is_survivor {
         held.clone()
@@ -230,19 +235,27 @@ fn fold_read_duplicate(held: MessageRow, incoming: MessageRow) -> MessageRow {
         incoming.clone()
     };
     let revoked = held.revoked || incoming.revoked;
-    let edited = match (held.edited_at_ms, incoming.edited_at_ms) {
-        (Some(left), Some(right)) if right > left => Some(&incoming),
-        (Some(left), Some(right)) if left > right => Some(&held),
-        (Some(_), Some(_)) if incoming.id < held.id => Some(&incoming),
-        (Some(_), Some(_)) => Some(&held),
-        (Some(_), None) => Some(&held),
-        (None, Some(_)) => Some(&incoming),
+    let edited = match (
+        held.edited_at_ms
+            .map(|timestamp| (timestamp, held_edit_source_id.unwrap_or(held.id))),
+        incoming
+            .edited_at_ms
+            .map(|timestamp| (timestamp, incoming_edit_source_id.unwrap_or(incoming.id))),
+    ) {
+        (Some((left, left_id)), Some((right, right_id)))
+            if right > left || (right == left && right_id < left_id) =>
+        {
+            Some((&incoming, right_id))
+        }
+        (Some(_), Some(_)) => Some((&held, held_edit_source_id.unwrap_or(held.id))),
+        (Some((_, left_id)), None) => Some((&held, left_id)),
+        (None, Some((_, right_id))) => Some((&incoming, right_id)),
         (None, None) => None,
     };
     let content = if revoked {
         None
     } else {
-        edited.or_else(|| {
+        edited.map(|(row, _)| row).or_else(|| {
             let stable = if held_is_survivor { &held } else { &incoming };
             if stable.text_content.is_some() || stable.proto.is_some() {
                 Some(stable)
@@ -264,7 +277,7 @@ fn fold_read_duplicate(held: MessageRow, incoming: MessageRow) -> MessageRow {
     survivor.status = status;
     survivor.starred = held.starred || incoming.starred;
     survivor.timestamp_ms = held.timestamp_ms.max(incoming.timestamp_ms);
-    survivor.edited_at_ms = edited.map(|row| row.edited_at_ms.unwrap_or_default());
+    survivor.edited_at_ms = edited.map(|(row, _)| row.edited_at_ms.unwrap_or_default());
     if let Some(content) = content {
         survivor.kind = content.kind.clone();
     }
@@ -275,13 +288,14 @@ fn fold_read_duplicate(held: MessageRow, incoming: MessageRow) -> MessageRow {
     } else {
         content.map_or(survivor.proto_codec, |row| row.proto_codec)
     };
-    survivor
+    (survivor, edited.map(|(_, source_id)| source_id))
 }
 
 fn push_unique_message(
     conn: &mut diesel::SqliteConnection,
     device_id: i32,
     kept: &mut Vec<MessageRow>,
+    edit_source_ids: &mut std::collections::HashMap<i64, i64>,
     row: MessageRow,
 ) -> std::result::Result<(), wacore::store::error::StoreError> {
     for prior in kept.iter_mut() {
@@ -296,9 +310,25 @@ fn push_unique_message(
             )
             .map_err(db_err)?
         {
-            *prior = fold_read_duplicate(prior.clone(), row);
+            let held_id = prior.id;
+            let incoming_id = row.id;
+            let held_source_id = edit_source_ids.get(&held_id).copied();
+            let incoming_source_id = row.edited_at_ms.map(|_| incoming_id);
+            let (folded, edit_source_id) =
+                fold_read_duplicate(prior.clone(), row, held_source_id, incoming_source_id);
+            edit_source_ids.remove(&held_id);
+            edit_source_ids.remove(&incoming_id);
+            if let Some(edit_source_id) = edit_source_id {
+                edit_source_ids.insert(folded.id, edit_source_id);
+            } else {
+                edit_source_ids.remove(&folded.id);
+            }
+            *prior = folded;
             return Ok(());
         }
+    }
+    if row.edited_at_ms.is_some() {
+        edit_source_ids.insert(row.id, row.id);
     }
     kept.push(row);
     Ok(())
@@ -800,6 +830,7 @@ fn fill_unique(
 ) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
+    let mut edit_source_ids = std::collections::HashMap::new();
     let mut before = before;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
@@ -814,7 +845,7 @@ fn fill_unique(
             seq: row.id,
         });
         for row in rows {
-            push_unique_message(conn, device_id, &mut kept, row)?;
+            push_unique_message(conn, device_id, &mut kept, &mut edit_source_ids, row)?;
         }
         if exhausted {
             break;
@@ -841,6 +872,7 @@ fn fill_unique_after(
 ) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
+    let mut edit_source_ids = std::collections::HashMap::new();
     let mut after = after;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
@@ -869,7 +901,7 @@ fn fill_unique_after(
             };
         }
         for row in rows {
-            push_unique_message(conn, device_id, &mut kept, row)?;
+            push_unique_message(conn, device_id, &mut kept, &mut edit_source_ids, row)?;
         }
         // `rows` was empty: the store is exhausted and the cursor did not
         // move, so another pass would ask the same question forever.
@@ -1356,8 +1388,9 @@ impl ChatStore {
                     .load(conn)
                     .map_err(db_err)?;
                 let mut unique = Vec::new();
+                let mut edit_source_ids = std::collections::HashMap::new();
                 for row in rows {
-                    push_unique_message(conn, device_id, &mut unique, row)?;
+                    push_unique_message(conn, device_id, &mut unique, &mut edit_source_ids, row)?;
                 }
                 finalize_messages(conn, device_id, unique)
             })

@@ -965,6 +965,87 @@ async fn equal_edit_timestamps_choose_the_same_stable_row_in_both_page_direction
 }
 
 #[tokio::test]
+async fn three_alias_edit_ties_keep_the_original_edit_source_id() {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    let (store, chat_store) = test_store().await;
+    let group = jid(GROUP);
+    let historical_lid = "999900000000001@lid";
+    let target = "MSG-194-THREE-WAY-EDIT-TIE";
+    let edited_at = 1_700_000_010;
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("pn original"),
+                incoming_info(GROUP, PEER, target, 1_700_000_002),
+            ),
+            message_event(
+                wa::Message::text("historical original"),
+                incoming_info(GROUP, historical_lid, target, 1_700_000_000),
+            ),
+            message_event(
+                edit(target, "historical edit wins"),
+                incoming_info(GROUP, historical_lid, "HISTORICAL-EDIT", edited_at),
+            ),
+            message_event(
+                wa::Message::text("current original"),
+                incoming_info(GROUP, PEER_LID, target, 1_700_000_003),
+            ),
+            message_event(
+                edit(target, "current edit loses tie"),
+                incoming_info(GROUP, PEER_LID, "CURRENT-EDIT", edited_at),
+            ),
+        ],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+    store
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "999900000000001".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_699_999_999,
+            updated_at: 1_699_999_999,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("record historical mapping");
+
+    let newest_first = chat_store.messages(&group, None, 10).await.unwrap();
+    let oldest_first = chat_store
+        .messages_after(
+            &group,
+            MessageCursor {
+                timestamp_ms: 0,
+                seq: 0,
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        newest_first[0].text.as_deref(),
+        Some("historical edit wins")
+    );
+    assert_eq!(
+        oldest_first[0].text.as_deref(),
+        Some("historical edit wins")
+    );
+    chat_store.reconcile_chat(&group).unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store
+            .message(&group, target)
+            .await
+            .unwrap()
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("historical edit wins")
+    );
+}
+
+#[tokio::test]
 async fn delete_for_me_normalizes_device_qualified_participants_without_hitting_collisions() {
     let (_store, chat_store) = test_store().await;
     let device_sender = format!("{}:7@s.whatsapp.net", jid(PEER).user);
