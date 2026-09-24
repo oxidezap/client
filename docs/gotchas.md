@@ -274,7 +274,9 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   reveals that path with the parent as context. The open/closed state is keyed
   by community JID, not name, so renames and duplicate titles cannot move it.
   With the chat list focused, Space toggles the selected community; while the
-  search field is focused, Space remains ordinary input.
+  search field is focused, Space remains ordinary input. If that hides the open
+  subgroup, the parent remains the visible list-selection anchor and arrow-key
+  navigation continues there without closing the conversation.
 - **What a file is sent as is decided in the front end; what it looks like is
   worked out where the bytes land.** Two questions, and they are answered in
   two places because they have two different pieces of evidence. The *kind* —

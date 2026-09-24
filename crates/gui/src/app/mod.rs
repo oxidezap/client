@@ -2695,10 +2695,10 @@ impl WhatsAppApp {
             return;
         }
 
-        let current_index = self
-            .selected_chat
-            .as_ref()
-            .and_then(|jid| cache.rows.iter().position(|row| &row.jid == jid));
+        let selected_row = self.chat_list_selection_jid(&cache);
+        let current_index = selected_row
+            .as_deref()
+            .and_then(|jid| cache.rows.iter().position(|row| row.jid == jid));
 
         let next_index = match current_index {
             Some(idx) if idx + 1 < cache.rows.len() => idx + 1,
@@ -2719,10 +2719,10 @@ impl WhatsAppApp {
             return;
         }
 
-        let current_index = self
-            .selected_chat
-            .as_ref()
-            .and_then(|jid| cache.rows.iter().position(|row| &row.jid == jid));
+        let selected_row = self.chat_list_selection_jid(&cache);
+        let current_index = selected_row
+            .as_deref()
+            .and_then(|jid| cache.rows.iter().position(|row| row.jid == jid));
 
         let prev_index = match current_index {
             Some(idx) if idx > 0 => idx - 1,

@@ -371,6 +371,36 @@ pub(super) fn selected_community_toggle(rows: &[ChatRow], selected_jid: &str) ->
         .map(|row| row.jid.clone())
 }
 
+/// A selected subgroup hidden by its collapsed parent keeps that parent as the
+/// list's visible selection anchor without changing the open conversation.
+fn visible_chat_list_selection(rows: &[ChatRow], selected: &Chat) -> Option<String> {
+    if rows.iter().any(|row| row.jid == selected.jid) {
+        return Some(selected.jid.clone());
+    }
+    let oxidezap_core::GroupHierarchy::Subgroup { parent_jid, .. } =
+        selected.group_hierarchy.as_ref()?
+    else {
+        return None;
+    };
+    rows.iter()
+        .find(|row| {
+            row.jid == *parent_jid && row.community_toggle_visible && !row.community_expanded
+        })
+        .map(|row| row.jid.clone())
+}
+
+impl WhatsAppApp {
+    /// The row the chat list can visibly highlight for the current
+    /// conversation, including a collapsed subgroup's community parent.
+    pub(crate) fn chat_list_selection_jid(&self, cache: &ChatListCache) -> Option<String> {
+        let selected = self
+            .selected_chat
+            .as_deref()
+            .and_then(|jid| self.find_chat(jid))?;
+        visible_chat_list_selection(&cache.rows, selected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +544,40 @@ mod tests {
         assert!(!rows[0].community_expanded);
         assert!(rows[1].community_expanded);
         assert_eq!(rows[2].tree_depth, 1);
+    }
+
+    #[test]
+    fn a_collapsed_selected_subgroup_uses_its_parent_as_list_selection_anchor() {
+        use oxidezap_core::{GroupHierarchy, SubgroupKind};
+        use std::collections::HashSet;
+
+        let source_rows = vec![
+            hierarchy_row("community@g.us", "Community", GroupHierarchy::Community),
+            hierarchy_row(
+                "subgroup@g.us",
+                "Subgroup",
+                GroupHierarchy::Subgroup {
+                    parent_jid: "community@g.us".into(),
+                    kind: SubgroupKind::Regular,
+                },
+            ),
+        ];
+        let mut selected = chat("subgroup@g.us", true, 0, false);
+        selected.group_hierarchy = Some(GroupHierarchy::Subgroup {
+            parent_jid: "community@g.us".into(),
+            kind: SubgroupKind::Regular,
+        });
+        let expanded_rows = hierarchical_group_rows(&source_rows, "", &HashSet::new());
+        assert_eq!(
+            visible_chat_list_selection(&expanded_rows, &selected),
+            Some("subgroup@g.us".into())
+        );
+        let collapsed_rows =
+            hierarchical_group_rows(&source_rows, "", &HashSet::from(["community@g.us".into()]));
+        assert_eq!(
+            visible_chat_list_selection(&collapsed_rows, &selected),
+            Some("community@g.us".into())
+        );
     }
 
     #[test]
