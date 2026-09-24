@@ -284,6 +284,7 @@ fn selection_quad_bounds(
                 }
             }
 
+            let segment_top = line_top + line_height * segment_ix as f32;
             let trailing_source_ix = glyphs
                 .iter()
                 .filter(|(_, x, _)| *x == visual_right)
@@ -297,6 +298,7 @@ fn selection_quad_bounds(
                         .unwrap_or(line_start_ix + line.len());
                     layout
                         .position_for_index(cluster_end_ix)
+                        .filter(|caret| caret.y == segment_top)
                         .map(|caret| (caret.x - bounds.left() - visual_right).abs())
                 })
                 .filter(|advance| *advance > Pixels::ZERO)
@@ -321,11 +323,8 @@ fn selection_quad_bounds(
                 continue;
             }
             let segment_bounds = Bounds::from_corners(
-                Point::new(bounds.left(), line_top + line_height * segment_ix as f32),
-                Point::new(
-                    bounds.left() + segment_width,
-                    line_top + line_height * (segment_ix + 1) as f32,
-                ),
+                Point::new(bounds.left(), segment_top),
+                Point::new(bounds.left() + segment_width, segment_top + line_height),
             );
             fragments.extend(selection_glyph_bounds(
                 &visual_glyphs,
