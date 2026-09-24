@@ -2132,6 +2132,9 @@ mod tests {
         diesel::sql_query("CREATE TABLE device (id INTEGER PRIMARY KEY)")
             .execute(&mut conn)
             .expect("device parent");
+        diesel::sql_query("CREATE TABLE lid_pn_mapping (device_id INTEGER NOT NULL)")
+            .execute(&mut conn)
+            .expect("mapping parent for the repair-generation triggers");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
         let rows: Vec<PlanRow> = diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
             .load(&mut conn)
@@ -2151,10 +2154,14 @@ mod tests {
         use diesel::sql_types::{BigInt, Bool, Integer, Text};
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
         // See `plan`'s comment: the cascade migration's FK needs this parent
-        // to exist before it runs.
+        // to exist before it runs. The repair triggers also need its mapping
+        // table.
         diesel::sql_query("CREATE TABLE device (id INTEGER PRIMARY KEY)")
             .execute(&mut conn)
             .expect("device parent");
+        diesel::sql_query("CREATE TABLE lid_pn_mapping (device_id INTEGER NOT NULL)")
+            .execute(&mut conn)
+            .expect("mapping parent for the repair-generation triggers");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
         // Placeholder order is the filter order diesel renders:
         // `device_id = ? AND msg_id = ? AND from_me = ? ... LIMIT ?`.

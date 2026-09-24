@@ -382,6 +382,9 @@ mod tests {
         diesel::sql_query("INSERT INTO device (id) VALUES (1)")
             .execute(&mut conn)
             .expect("seed the device row the fixture below references");
+        diesel::sql_query("CREATE TABLE lid_pn_mapping (device_id INTEGER NOT NULL)")
+            .execute(&mut conn)
+            .expect("mapping parent for the repair-generation triggers");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
         ensure_fts(&mut conn).expect("create the index");
 

@@ -332,21 +332,20 @@ pub(crate) fn reconcile_startup(
     if !device_exists(conn, device_id)? {
         return Ok(());
     }
-    let current = mapping_watermark(conn, device_id)?;
     let stored = schema::message_identity_repair_state::table
         .filter(schema::message_identity_repair_state::device_id.eq(device_id))
         .select((
-            schema::message_identity_repair_state::mapping_high_water,
-            schema::message_identity_repair_state::mapping_count,
+            schema::message_identity_repair_state::mapping_revision,
+            schema::message_identity_repair_state::repaired_revision,
         ))
         .first::<(i64, i64)>(conn)
         .optional()?;
-    if stored == Some(current) {
+    if stored.is_some_and(|(mapping, repaired)| mapping == repaired) {
         return Ok(());
     }
     reconcile_all(conn, device_id, changes)?;
     crate::lid::reconcile_known_chats(conn, device_id, changes)?;
-    store_mapping_watermark_value(conn, device_id, current)
+    store_mapping_watermark(conn, device_id)
 }
 
 /// This account's known JIDs, normalized like peer senders. Quote matching
@@ -399,51 +398,46 @@ fn device_exists(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<boo
 }
 
 #[derive(QueryableByName)]
-struct MappingWatermark {
+struct MappingRevision {
     #[diesel(sql_type = BigInt)]
-    mapping_high_water: i64,
-    #[diesel(sql_type = BigInt)]
-    mapping_count: i64,
+    mapping_revision: i64,
 }
 
-/// The updated-at high-water detects mapping refreshes; the row count also
-/// catches newly learned aliases whose source timestamp ties the high-water.
-fn mapping_watermark(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<(i64, i64)> {
-    let state: MappingWatermark = diesel::sql_query(
-        "SELECT COALESCE(MAX(updated_at), 0) AS mapping_high_water, COUNT(*) AS mapping_count \
-         FROM lid_pn_mapping WHERE device_id = ?",
+/// The mapping-table triggers advance this generation for every durable change,
+/// including same-timestamp replacements and deletions.
+fn mapping_revision(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<i64> {
+    let revision: Option<MappingRevision> = diesel::sql_query(
+        "SELECT mapping_revision FROM message_identity_repair_state WHERE device_id = ?",
     )
     .bind::<Integer, _>(device_id)
-    .get_result(conn)?;
-    Ok((state.mapping_high_water, state.mapping_count))
+    .get_result(conn)
+    .optional()?;
+    Ok(revision.map_or(0, |row| row.mapping_revision))
 }
 
 fn store_mapping_watermark(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
     if !device_exists(conn, device_id)? {
         return Ok(());
     }
-    let state = mapping_watermark(conn, device_id)?;
-    store_mapping_watermark_value(conn, device_id, state)
+    let revision = mapping_revision(conn, device_id)?;
+    store_mapping_watermark_value(conn, device_id, revision)
 }
 
 fn store_mapping_watermark_value(
     conn: &mut SqliteConnection,
     device_id: i32,
-    (mapping_high_water, mapping_count): (i64, i64),
+    mapping_revision: i64,
 ) -> QueryResult<()> {
     use schema::message_identity_repair_state::dsl;
     diesel::insert_into(dsl::message_identity_repair_state)
         .values((
             dsl::device_id.eq(device_id),
-            dsl::mapping_high_water.eq(mapping_high_water),
-            dsl::mapping_count.eq(mapping_count),
+            dsl::mapping_revision.eq(mapping_revision),
+            dsl::repaired_revision.eq(mapping_revision),
         ))
         .on_conflict(dsl::device_id)
         .do_update()
-        .set((
-            dsl::mapping_high_water.eq(mapping_high_water),
-            dsl::mapping_count.eq(mapping_count),
-        ))
+        .set(dsl::repaired_revision.eq(mapping_revision))
         .execute(conn)?;
     Ok(())
 }

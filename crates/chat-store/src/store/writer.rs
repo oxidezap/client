@@ -226,9 +226,16 @@ fn apply_writer_msg(
         }
         WriterMsg::Reconcile(chat) => {
             let wire = chat.to_string();
-            crate::store::message_identity::reconcile_chat(conn, device_id, &wire, cs)?;
-            if let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &wire)? {
-                crate::lid::merge_split_chat(conn, device_id, &wire, &alt, cs)?;
+            let aliases = crate::lid::chat_key_candidates(conn, device_id, &wire)?;
+            let Some(mut survivor) = aliases.first().cloned() else {
+                return Ok(());
+            };
+            if aliases.len() == 1 {
+                crate::store::message_identity::reconcile_chat(conn, device_id, &survivor, cs)?;
+            } else {
+                for alias in aliases.iter().skip(1) {
+                    survivor = crate::lid::merge_split_chat(conn, device_id, &survivor, alias, cs)?;
+                }
             }
             Ok(())
         }

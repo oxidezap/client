@@ -1662,9 +1662,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   strips a peer's device suffix, and accepts PN/LID aliases only when this
   account's mapping ledger proves the pair. Live, history, local sends, edits,
   revokes and placeholders all resolve through that rule; an unknown alias or
-  a different author never matches. A per-device mapping high-water marker
+  a different author never matches. A per-device mapping-generation marker
   gates the device-wide legacy repair: the first prepared open runs it, later
-  startups repeat it only when the ledger advances, while a newly learned pair
+  startups repeat it after any durable ledger mutation (including same-second
+  replacements), while a newly learned pair
   repairs only rows whose sender is one of those aliases and their known chat
   component. Repairs keep the oldest stable `messages.id`, retain the newest
   copy's timestamp, fold status and stars, and let a tombstone beat every copy

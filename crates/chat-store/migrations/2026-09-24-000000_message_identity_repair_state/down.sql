@@ -1,1 +1,4 @@
+DROP TRIGGER message_identity_mapping_delete;
+DROP TRIGGER message_identity_mapping_update;
+DROP TRIGGER message_identity_mapping_insert;
 DROP TABLE message_identity_repair_state;

@@ -115,8 +115,8 @@ diesel::table! {
 diesel::table! {
     message_identity_repair_state (device_id) {
         device_id -> Integer,
-        mapping_high_water -> BigInt,
-        mapping_count -> BigInt,
+        mapping_revision -> BigInt,
+        repaired_revision -> BigInt,
     }
 }
 

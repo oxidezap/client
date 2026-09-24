@@ -478,6 +478,83 @@ async fn same_id_from_distinct_authors_remains_ambiguous_and_unmodified() {
 }
 
 #[tokio::test]
+async fn same_timestamp_mapping_replacement_is_seen_on_restart() {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    let (store, chat_store) = test_store().await;
+    let replacement_pn = "559900000002@s.whatsapp.net";
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("LID copy"),
+                incoming_info(GROUP, PEER_LID, "MSG-194-MAPPING-REVISION", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("replacement PN copy"),
+                incoming_info(
+                    GROUP,
+                    replacement_pn,
+                    "MSG-194-MAPPING-REVISION",
+                    1_700_000_001,
+                ),
+            ),
+        ],
+    )
+    .await;
+    store
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "111000011112222".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("seed initial mapping");
+    chat_store
+        .reconcile_message_mappings(&[("111000011112222".into(), "559900000001".into())])
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store
+            .messages(&jid(GROUP), None, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Replace the existing ledger row without changing its count or maximum
+    // timestamp, then simulate a crash before the incremental writer runs.
+    let device_id = store.device_id();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(
+                "UPDATE lid_pn_mapping SET phone_number = ?, updated_at = ? \
+                 WHERE device_id = ? AND lid = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>("559900000002")
+            .bind::<diesel::sql_types::BigInt, _>(1_700_000_000_i64)
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>("111000011112222")
+            .execute(conn)
+            .map(|_| ())
+            .map_err(db_err)
+        })
+        .await
+        .expect("replace mapping at same high-water");
+    drop(chat_store);
+
+    let reopened = ChatStore::new(&store).await.unwrap();
+    let messages = reopened.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "MSG-194-MAPPING-REVISION");
+    assert_eq!(reopened.chats(false, 10).await.unwrap()[0].unread_count, 1);
+}
+
+#[tokio::test]
 async fn reopen_repairs_known_author_duplicates_in_one_group_and_recounts_unread() {
     let (store, chat_store) = test_store().await;
     feed(
@@ -1004,6 +1081,64 @@ async fn late_mapping_repair_includes_historical_and_device_qualified_senders() 
         chat_store.chats(false, 10).await.unwrap()[0].unread_count,
         1,
         "merging the mapped copies recalculates unread count"
+    );
+}
+
+#[tokio::test]
+async fn explicit_chat_reconcile_merges_the_complete_alias_component() {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    let (store, chat_store) = test_store().await;
+    let historical_lid = "999900000000001@lid";
+    for (chat, id, text) in [
+        (PEER, "MSG-194-EXPLICIT-PN", "PN thread"),
+        (PEER_LID, "MSG-194-EXPLICIT-CURRENT", "current LID thread"),
+        (
+            historical_lid,
+            "MSG-194-EXPLICIT-HISTORICAL",
+            "historical LID thread",
+        ),
+    ] {
+        feed(
+            &chat_store,
+            [message_event(
+                wa::Message::text(text),
+                incoming_info(chat, chat, id, 1_700_000_000),
+            )],
+        )
+        .await;
+    }
+    add_lid_mapping(&store).await;
+    store
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "999900000000001".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_699_999_999,
+            updated_at: 1_699_999_999,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("record historical mapping");
+
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    let mut ids: Vec<String> = chat_store
+        .messages(&jid(PEER), None, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|message| message.id)
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        [
+            "MSG-194-EXPLICIT-CURRENT",
+            "MSG-194-EXPLICIT-HISTORICAL",
+            "MSG-194-EXPLICIT-PN",
+        ]
     );
 }
 

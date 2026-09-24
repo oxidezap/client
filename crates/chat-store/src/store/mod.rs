@@ -319,7 +319,7 @@ impl ChatStore {
     /// its device id, repair proven legacy message duplicates when the mapping
     /// ledger has advanced, and start the writer task.
     ///
-    /// The per-device high-water marker avoids repeating the device-wide pass;
+    /// The per-device mapping-revision marker avoids repeating the device-wide pass;
     /// newly learned aliases use a scoped writer request. Repairs are
     /// transactional; a tombstone wins, and previews/unread are re-derived.
     /// This is the entry point for a runtime after the registry has called
@@ -612,7 +612,7 @@ impl ChatStore {
     }
 
     /// Reconcile proven duplicate authors in a chat and, for a 1:1 peer,
-    /// merge PN- and LID-keyed thread rows when the mapping is known.
+    /// merge every PN- and LID-keyed thread in the known alias component.
     ///
     /// Receipts dropped under the wrong identity left some stores with a
     /// split pair: a populated chat under the phone-number key plus a stray
