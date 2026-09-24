@@ -247,6 +247,8 @@ fn selection_quad_bounds(
             .windows(2)
             .map(|pair| (pair[0], pair[1]))
             .collect();
+        // Preserve the first shaped caret position per source boundary; all
+        // positioned glyph extrema remain represented by `segments`.
         let mut shaped_x_by_index = HashMap::new();
         for run in runs {
             for glyph in &run.glyphs {
@@ -309,9 +311,8 @@ fn selection_quad_bounds(
                         .get(&cluster_end_ix)
                         .copied()
                         .unwrap_or(line.unwrapped_layout.width);
-                    Some((end_x - *start_x).abs())
+                    Some(trailing_cluster_extension(visual_right, *start_x, end_x))
                 })
-                .filter(|advance| *advance > Pixels::ZERO)
                 .unwrap_or(line_height.half());
             let visual_glyphs: Vec<_> = glyphs
                 .iter()
@@ -413,6 +414,23 @@ fn selection_glyph_bounds(
         }
     }
     fragments
+}
+
+fn trailing_cluster_extension(
+    visual_right: Pixels,
+    source_start: Pixels,
+    source_end: Pixels,
+) -> Pixels {
+    let caret_right = if source_end > source_start {
+        source_end
+    } else {
+        source_start
+    };
+    if caret_right > visual_right {
+        caret_right - visual_right
+    } else {
+        Pixels::ZERO
+    }
 }
 
 fn link_at_position(
@@ -743,7 +761,7 @@ mod tests {
 
     use super::{
         hard_break_selection_bounds, link_index_at_position, merge_selection_fragments,
-        selection_glyph_bounds,
+        selection_glyph_bounds, trailing_cluster_extension,
     };
 
     #[test]
@@ -789,6 +807,11 @@ mod tests {
                 Bounds::from_corners(point(px(60.), px(20.)), point(px(70.), px(40.))),
             ]
         );
+    }
+
+    #[test]
+    fn trailing_cluster_extension_keeps_all_positioned_glyphs() {
+        assert_eq!(trailing_cluster_extension(px(10.), px(0.), px(15.)), px(5.));
     }
 
     #[test]
