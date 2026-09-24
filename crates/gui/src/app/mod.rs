@@ -1922,37 +1922,48 @@ impl WhatsAppApp {
     /// same messages: every caller here is announcing that the chat's history
     /// changed, which is exactly when the search's matches stop describing it.
     fn invalidate_message_cache(&mut self, chat_jid: &str, cx: &mut App) {
-        if self.selected_chat.as_deref() == Some(chat_jid) {
-            let removed_text_messages = self
-                .message_list_cache
-                .borrow()
-                .get(chat_jid)
-                .map(|previous| {
-                    let current = self.find_chat(chat_jid);
-                    previous
-                        .messages
-                        .iter()
-                        .filter(|old| message_has_selectable_text(old))
-                        .filter(|old| {
-                            current
-                                .and_then(|chat| chat.messages.iter().find(|new| new.id == old.id))
-                                .is_none_or(|new| !message_has_selectable_text(new))
+        if self.selected_chat.as_deref() == Some(chat_jid)
+            && let Some(window) = self.modal_window
+        {
+            let selected_ids = crate::components::rich_text_selection::active_selection_message_ids(
+                window.window_id(),
+                cx,
+            );
+            let selection_is_stale = if selected_ids.is_empty() {
+                false
+            } else {
+                let cache = self.message_list_cache.borrow();
+                match (cache.get(chat_jid), self.find_chat(chat_jid)) {
+                    (Some(previous), Some(current)) => {
+                        let previous_by_id: HashMap<&str, &ChatMessage> = previous
+                            .messages
+                            .iter()
+                            .map(|message| (message.id.as_str(), message.as_ref()))
+                            .collect();
+                        let current_by_id: HashMap<&str, &ChatMessage> = current
+                            .messages
+                            .iter()
+                            .map(|message| (message.id.as_str(), message))
+                            .collect();
+                        selected_ids.iter().any(|message_id| {
+                            let (Some(old), Some(new)) = (
+                                previous_by_id.get(message_id.as_str()),
+                                current_by_id.get(message_id.as_str()),
+                            ) else {
+                                return true;
+                            };
+                            !message_has_selectable_text(old)
+                                || !message_has_selectable_text(new)
+                                || old.content != new.content
+                                || old.revoked != new.revoked
                         })
-                        .map(|message| message.id.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if !removed_text_messages.is_empty()
-                && let Some(window) = self.modal_window
-            {
-                let _ = window.update(cx, |_, window, cx| {
-                    for message_id in &removed_text_messages {
-                        if crate::components::rich_text_selection::clear_if_selected_message(
-                            message_id, window, cx,
-                        ) {
-                            break;
-                        }
                     }
+                    _ => true,
+                }
+            };
+            if selection_is_stale {
+                let _ = window.update(cx, |_, window, cx| {
+                    clear_window_message_selection(window, cx);
                 });
             }
         }
@@ -1973,8 +1984,22 @@ impl WhatsAppApp {
     /// exactly when its timeline needs filling, and the frame that draws it
     /// is the one place that knows which chat that is — the selection can
     /// name a chat the window is not showing (Settings is up, the reader is
-    /// in Status).
-    pub fn note_visible_conversation(&mut self, jid: Option<String>, cx: &mut App) {
+    /// in Status). Leaving that visible conversation clears its message-text
+    /// selection so the hidden pane cannot keep answering Copy.
+    pub fn note_visible_conversation(
+        &mut self,
+        jid: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .retained_chat
+            .as_deref()
+            .is_some_and(|previous| jid.as_deref() != Some(previous))
+            && gpui_base::TextSelection::has_selection(window, cx)
+        {
+            clear_window_message_selection(window, cx);
+        }
         if let Some(jid) = &jid {
             self.ensure_timeline_page(jid, cx);
         }

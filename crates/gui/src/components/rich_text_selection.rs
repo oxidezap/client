@@ -30,6 +30,11 @@ struct RetainedSelection {
     projection: Rc<RefCell<TextSelectionProjection>>,
 }
 
+struct RetainedParticipant {
+    handle: TextSelectionHandle,
+    _selection_subscription: gpui::Subscription,
+}
+
 pub(super) struct RichTextState {
     handle: TextSelectionHandle,
     pressed_link: Rc<Cell<Option<LinkPress>>>,
@@ -43,11 +48,36 @@ struct LinkPress {
     dragged: bool,
 }
 
-/// Keeps active participants reachable when virtualization drops their row.
+/// Holds participants by message identity until their selection ends.
 #[derive(Default)]
-struct RichTextSelectionRegistry(HashMap<(gpui::WindowId, String), TextSelectionHandle>);
+struct RichTextSelectionRegistry(HashMap<(gpui::WindowId, String), RetainedParticipant>);
 
 impl Global for RichTextSelectionRegistry {}
+
+fn new_retained_selection(text: &SharedString, cx: &mut App) -> RetainedSelection {
+    RetainedSelection {
+        handle: TextSelectionHandle::new(text.to_string(), cx),
+        text: text.clone(),
+        pressed_link: Rc::new(Cell::new(None)),
+        projection: Rc::new(RefCell::new(TextSelectionProjection::default())),
+    }
+}
+
+/// Active message identities in a window, used to limit timeline invalidation.
+pub(crate) fn active_selection_message_ids(window_id: gpui::WindowId, cx: &App) -> Vec<String> {
+    cx.has_global::<RichTextSelectionRegistry>()
+        .then(|| {
+            cx.global::<RichTextSelectionRegistry>()
+                .0
+                .iter()
+                .filter_map(|((id, message_id), participant)| {
+                    (*id == window_id && participant.handle.snapshot(cx).is_some())
+                        .then(|| message_id.clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 fn track_selection_handle(
     window_id: gpui::WindowId,
@@ -60,33 +90,50 @@ fn track_selection_handle(
         if !cx.has_global::<RichTextSelectionRegistry>() {
             cx.set_global(RichTextSelectionRegistry::default());
         }
-        cx.global_mut::<RichTextSelectionRegistry>()
+        let already_retained = cx
+            .global::<RichTextSelectionRegistry>()
             .0
-            .insert(key, handle.clone());
+            .contains_key(&key);
+        if !already_retained {
+            let registry_key = key.clone();
+            let subscription = handle.subscribe(
+                move |event, cx| {
+                    if matches!(
+                        event,
+                        gpui_base::TextSelectionEvent::Cleared
+                            | gpui_base::TextSelectionEvent::SelectionChanged(None)
+                    ) {
+                        let registry_key = registry_key.clone();
+                        cx.defer(move |cx| {
+                            let inactive = cx.has_global::<RichTextSelectionRegistry>()
+                                && cx
+                                    .global::<RichTextSelectionRegistry>()
+                                    .0
+                                    .get(&registry_key)
+                                    .is_some_and(|participant| {
+                                        participant.handle.snapshot(cx).is_none()
+                                    });
+                            if inactive {
+                                cx.global_mut::<RichTextSelectionRegistry>()
+                                    .0
+                                    .remove(&registry_key);
+                            }
+                        });
+                    }
+                },
+                cx,
+            );
+            cx.global_mut::<RichTextSelectionRegistry>().0.insert(
+                key,
+                RetainedParticipant {
+                    handle: handle.clone(),
+                    _selection_subscription: subscription,
+                },
+            );
+        }
     } else if cx.has_global::<RichTextSelectionRegistry>() {
         cx.global_mut::<RichTextSelectionRegistry>().0.remove(&key);
     }
-}
-
-/// Clears a window's selection if it includes a message whose text element is
-/// about to disappear from the virtual timeline.
-pub(crate) fn clear_if_selected_message(
-    message_id: &str,
-    window: &mut Window,
-    cx: &mut App,
-) -> bool {
-    let key = (window.window_handle().window_id(), message_id.to_owned());
-    let selected = cx.has_global::<RichTextSelectionRegistry>()
-        && cx
-            .global::<RichTextSelectionRegistry>()
-            .0
-            .get(&key)
-            .is_some_and(|handle| handle.snapshot(cx).is_some());
-    if selected {
-        TextSelection::clear(window, cx);
-        forget_window_selection_registry(key.0, cx);
-    }
-    selected
 }
 
 /// Releases retained participant handles after a window-level clear.
@@ -212,6 +259,7 @@ impl Element for SelectableRichText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let window_id = window.window_handle().window_id();
         let handle = window.with_element_state(
             global_id.expect("SelectableRichText must have a stable element id"),
             |retained: Option<RetainedSelection>, window| {
@@ -222,24 +270,11 @@ impl Element for SelectableRichText {
                         // edits to another bubble must not clear it.
                         if retained.handle.snapshot(cx).is_some() {
                             TextSelection::clear(window, cx);
-                            forget_window_selection_registry(
-                                window.window_handle().window_id(),
-                                cx,
-                            );
+                            forget_window_selection_registry(window_id, cx);
                         }
-                        RetainedSelection {
-                            handle: TextSelectionHandle::new(self.text.to_string(), cx),
-                            text: self.text.clone(),
-                            pressed_link: Rc::new(Cell::new(None)),
-                            projection: Rc::new(RefCell::new(TextSelectionProjection::default())),
-                        }
+                        new_retained_selection(&self.text, cx)
                     }
-                    None => RetainedSelection {
-                        handle: TextSelectionHandle::new(self.text.to_string(), cx),
-                        text: self.text.clone(),
-                        pressed_link: Rc::new(Cell::new(None)),
-                        projection: Rc::new(RefCell::new(TextSelectionProjection::default())),
-                    },
+                    None => new_retained_selection(&self.text, cx),
                 };
                 let state = RichTextState {
                     handle: retained.handle.clone(),
@@ -249,12 +284,7 @@ impl Element for SelectableRichText {
                 (state, retained)
             },
         );
-        track_selection_handle(
-            window.window_handle().window_id(),
-            &self.selection_key,
-            &handle.handle,
-            cx,
-        );
+        track_selection_handle(window_id, &self.selection_key, &handle.handle, cx);
         let (layout_id, ()) = self
             .styled_text
             .request_layout(global_id, inspector_id, window, cx);
