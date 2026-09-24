@@ -16,6 +16,10 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DownloadOutcome {
     NativeFile(std::path::PathBuf),
+    #[cfg_attr(
+        not(target_family = "wasm"),
+        expect(dead_code, reason = "constructed by the browser implementation")
+    )]
     BrowserDownloadRequested(String),
 }
 
@@ -159,7 +163,7 @@ mod imp {
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::imp::{safe_name, write_in};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use portable_atomic::{AtomicU64, Ordering};
 
     fn scratch() -> std::path::PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);

@@ -1280,28 +1280,6 @@ fn document_scope_key(account: &str, chat: &str, message_id: &str) -> (String, S
     (account.to_owned(), chat.to_owned(), message_id.to_owned())
 }
 
-#[cfg(test)]
-mod document_scope_tests {
-    use super::document_scope_key;
-
-    #[test]
-    fn regression_193_same_message_id_isolated_by_account_and_chat() {
-        let first = document_scope_key("account-a", "chat-a", "message-1");
-        assert_ne!(
-            first,
-            document_scope_key("account-b", "chat-a", "message-1")
-        );
-        assert_ne!(
-            first,
-            document_scope_key("account-a", "chat-b", "message-1")
-        );
-        assert_eq!(
-            first,
-            document_scope_key("account-a", "chat-a", "message-1")
-        );
-    }
-}
-
 /// Put a failure in front of the person who asked for it.
 ///
 /// These paths ran to `warn!` and stopped, which on a desktop is a save that
@@ -1330,5 +1308,27 @@ async fn hand_to_user(
             .await
     } else {
         crate::platform::download::save(&file_name, &data)
+    }
+}
+
+#[cfg(test)]
+mod document_scope_tests {
+    use super::document_scope_key;
+
+    #[test]
+    fn regression_193_same_message_id_isolated_by_account_and_chat() {
+        let first = document_scope_key("account-a", "chat-a", "message-1");
+        assert_ne!(
+            first,
+            document_scope_key("account-b", "chat-a", "message-1")
+        );
+        assert_ne!(
+            first,
+            document_scope_key("account-a", "chat-b", "message-1")
+        );
+        assert_eq!(
+            first,
+            document_scope_key("account-a", "chat-a", "message-1")
+        );
     }
 }
