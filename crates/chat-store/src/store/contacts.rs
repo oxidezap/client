@@ -72,12 +72,11 @@ pub(super) fn upsert_contact_business_name(
     Ok(())
 }
 
-pub(super) fn clear_contact_names(
+fn contact_keys(
     conn: &mut SqliteConnection,
     device_id: i32,
     jid: &str,
-) -> QueryResult<(bool, bool)> {
-    use schema::contacts::dsl as contacts;
+) -> QueryResult<Vec<String>> {
     let key = contact_key(jid).into_owned();
     let mut keys = vec![key.clone()];
     if let Ok(parsed) = key.parse::<Jid>()
@@ -114,6 +113,18 @@ pub(super) fn clear_contact_names(
             );
         }
     }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+pub(super) fn clear_contact_names(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &str,
+) -> QueryResult<(bool, bool)> {
+    use schema::contacts::dsl as contacts;
+    let keys = contact_keys(conn, device_id, jid)?;
 
     let address_book_names: Vec<String> = contacts::contacts
         .filter(contacts::device_id.eq(device_id))
@@ -167,12 +178,11 @@ pub(super) fn upsert_contact_names(
 ) -> QueryResult<Vec<String>> {
     use schema::contacts::dsl;
     let jid = contact_key(jid);
-    let previous: Option<(Option<String>, Option<String>)> = dsl::contacts
-        .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid.as_ref())))
+    let keys = contact_keys(conn, device_id, jid.as_ref())?;
+    let previous_names: Vec<String> = dsl::contacts
+        .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq_any(&keys)))
         .select((dsl::full_name, dsl::first_name))
-        .first(conn)
-        .optional()?;
-    let previous_names = previous
+        .load::<(Option<String>, Option<String>)>(conn)?
         .into_iter()
         .flat_map(|(full_name, first_name)| [full_name, first_name])
         .flatten()
@@ -204,11 +214,11 @@ pub(super) fn update_chat_names_from_contact(
         return Ok(false);
     }
     use schema::chats::dsl;
-    let jid = contact_key(jid);
+    let keys = contact_keys(conn, device_id, jid)?;
     let changed = diesel::update(
         dsl::chats
             .filter(dsl::device_id.eq(device_id))
-            .filter(dsl::jid.eq(jid.as_ref()))
+            .filter(dsl::jid.eq_any(keys))
             .filter(dsl::name.eq_any(previous_names)),
     )
     .set(dsl::name.eq(new_name))

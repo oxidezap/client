@@ -31,13 +31,26 @@ fn contact_removed(jid: &str) -> Event {
 
 #[tokio::test]
 async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_change() {
-    let (_device, store) = test_store().await;
+    let (device, store) = test_store().await;
+    add_lid_mapping(&device).await;
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+    device
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "111000011119999".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_001,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("put second LID mapping");
+    let older_lid = "111000011119999@lid";
     feed(
         &store,
         [history_sync_event(wa::HistorySync {
             conversations: vec![
                 wa::Conversation {
-                    id: PEER.into(),
+                    id: PEER_LID.into(),
                     name: Some("Saved Name".into()),
                     ..Default::default()
                 },
@@ -71,7 +84,7 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
     assert_eq!(
         before_chats
             .iter()
-            .find(|chat| chat.jid == jid(PEER))
+            .find(|chat| chat.jid == jid(PEER_LID))
             .unwrap()
             .name
             .as_deref(),
@@ -109,7 +122,7 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
         .await
         .unwrap()
         .into_iter()
-        .find(|chat| chat.jid == jid(PEER))
+        .find(|chat| chat.jid == jid(PEER_LID))
         .unwrap();
     assert_eq!(renamed_chat.name.as_deref(), Some("Renamed Saved Name"));
 
@@ -133,7 +146,7 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
     assert_eq!(
         after_chats
             .iter()
-            .find(|chat| chat.jid == jid(PEER))
+            .find(|chat| chat.jid == jid(PEER_LID))
             .unwrap()
             .name,
         None
@@ -181,21 +194,8 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
         Some("New Saved Name")
     );
 
-    // A removal under the mapped LID also clears a legacy address-book row
-    // stored under the PN identity, using only this account's mapping.
-    add_lid_mapping(&_device).await;
-    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
-    _device
-        .put_lid_mapping(&LidPnMappingEntry {
-            lid: "111000011119999".into(),
-            phone_number: "559900000001".into(),
-            created_at: 1_700_000_000,
-            updated_at: 1_700_000_001,
-            learning_source: "usync".into(),
-        })
-        .await
-        .expect("put second LID mapping");
-    let older_lid = "111000011119999@lid";
+    // A removal under one LID also clears the PN row and every other LID
+    // address-book row proven by this account's mapping table.
     feed(
         &store,
         [
