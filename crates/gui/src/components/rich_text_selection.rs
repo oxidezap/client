@@ -24,7 +24,7 @@ struct RetainedSelection {
     pressed_link: Rc<Cell<Option<usize>>>,
 }
 
-struct RichTextState {
+pub(super) struct RichTextState {
     handle: TextSelectionHandle,
     pressed_link: Rc<Cell<Option<usize>>>,
 }
