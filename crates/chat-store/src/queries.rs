@@ -1815,6 +1815,18 @@ impl ChatStore {
         chat: Option<&Jid>,
         limit: i64,
     ) -> Result<Vec<StoredMessage>> {
+        self.poll_messages_page(chat, None, limit).await
+    }
+
+    /// One page of poll creations, newest first. The cursor is the oldest
+    /// row already scanned, allowing callers to skip unsupported poll variants
+    /// without letting them consume a supported-results limit.
+    pub async fn poll_messages_page(
+        &self,
+        chat: Option<&Jid>,
+        before: Option<MessageCursor>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
         use schema::messages::dsl;
         let device_id = self.device_id();
         let chat = chat.map(ToString::to_string);
@@ -1832,6 +1844,15 @@ impl ChatStore {
                     let keys =
                         crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
                     query = query.filter(dsl::chat_jid.eq_any(keys));
+                }
+                if let Some(cursor) = before {
+                    query = query.filter(
+                        dsl::timestamp_ms
+                            .lt(cursor.timestamp_ms)
+                            .or(dsl::timestamp_ms
+                                .eq(cursor.timestamp_ms)
+                                .and(dsl::id.lt(cursor.seq))),
+                    );
                 }
                 query
                     .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
