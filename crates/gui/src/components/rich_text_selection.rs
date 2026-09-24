@@ -248,10 +248,9 @@ impl Element for RetainedSelectionKeepalive {
         // geometry as a hit target. The hitbox still inherits the timeline's
         // clipping mask, which is what GPUI uses for drag auto-scroll.
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        let dormant_bounds = Bounds::new(
-            Point::new(bounds.left(), gpui::px(1_000_000.)),
-            gpui::Size::default(),
-        );
+        let dormant_y = bounds.bottom() + window.viewport_size().height + window.rem_size();
+        let dormant_bounds =
+            Bounds::new(Point::new(bounds.left(), dormant_y), gpui::Size::default());
         for (handle, document_order) in retained {
             handle.register(
                 TextSelectionRegistration::new(hitbox.clone(), dormant_bounds)
