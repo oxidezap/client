@@ -455,27 +455,9 @@ impl WhatsAppApp {
         if !moved {
             return;
         }
-        // The rows moved, and the timeline's own measurements are keyed to
-        // them: see `sync_timeline`, which is what turns this into a splice at
-        // the front rather than a reset to the bottom. A prepend shifts the
-        // visible slice indices used as selection document order; clear an
-        // active bubble selection rather than leave virtualized participants
-        // with inconsistent ordering.
-        if self.selected_chat.as_deref() == Some(jid.as_str())
-            && let Some(window_handle) = self.modal_window
-        {
-            let _ = window_handle.update(cx, |_, window, cx| {
-                let selected =
-                    !crate::components::rich_text_selection::active_selection_message_ids(
-                        window.window_handle().window_id(),
-                        cx,
-                    )
-                    .is_empty();
-                if selected {
-                    super::clear_window_message_selection(window, cx);
-                }
-            });
-        }
+        // Invalidation compares selected identities and order against either
+        // the render cache or retained snapshots: a prepend clears stale order,
+        // while a receipt-only update to an existing row preserves selection.
         self.invalidate_message_cache(&jid, cx);
         self.invalidate_chat_cache();
         cx.notify();

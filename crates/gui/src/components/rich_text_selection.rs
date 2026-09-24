@@ -12,10 +12,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, FontId, Global,
+    App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, Global,
     GlobalElementId, Half, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    SharedString, StyledText, TextRun, Window, transparent_black,
+    SharedString, StyledText, Window, transparent_black,
 };
 use gpui_base::{
     TextSelection, TextSelectionHandle, TextSelectionProjection, TextSelectionRegistration,
@@ -263,7 +263,6 @@ fn selection_quad_bounds(
             .windows(2)
             .map(|pair| (pair[0], pair[1]))
             .collect();
-        let mut cluster_advances: HashMap<(usize, FontId), Pixels> = HashMap::new();
         let mut segments = vec![Vec::new(); wrap_boundaries.len() + 1];
         let mut segment_ix = 0;
         let mut next_boundary_ix = 0;
@@ -301,38 +300,35 @@ fn selection_quad_bounds(
                 }
             }
 
-            let mut visual_glyphs = Vec::with_capacity(glyphs.len());
-            let mut trailing_advance = Pixels::ZERO;
-            for (source_ix, x, font_id) in glyphs {
-                let advance = if *x == visual_right {
-                    *cluster_advances
-                        .entry((*source_ix, *font_id))
-                        .or_insert_with(|| {
-                            let cluster_end_ix = cluster_ends
-                                .get(source_ix)
-                                .copied()
-                                .unwrap_or(line_start_ix + line.len());
-                            shaped_cluster_advance(
-                                text,
-                                *source_ix,
-                                cluster_end_ix,
-                                *font_id,
-                                line.font_size(),
-                                window,
-                            )
-                            .unwrap_or(line_height.half())
-                        })
-                } else {
-                    Pixels::ZERO
-                };
-                if advance > trailing_advance {
-                    trailing_advance = advance;
-                }
-                visual_glyphs.push((*source_ix, *x - visual_left, advance));
-            }
-            if trailing_advance <= Pixels::ZERO {
-                trailing_advance = line_height.half();
-            }
+            let trailing_source_ix = glyphs
+                .iter()
+                .filter(|(_, x, _)| *x == visual_right)
+                .map(|(source_ix, _, _)| *source_ix)
+                .max();
+            let trailing_advance = trailing_source_ix
+                .and_then(|source_ix| {
+                    let cluster_end_ix = cluster_ends
+                        .get(&source_ix)
+                        .copied()
+                        .unwrap_or(line_start_ix + line.len());
+                    layout
+                        .position_for_index(cluster_end_ix)
+                        .map(|caret| (caret.x - bounds.left() - visual_right).abs())
+                })
+                .filter(|advance| *advance > Pixels::ZERO)
+                .unwrap_or(line_height.half());
+            let visual_glyphs: Vec<_> = glyphs
+                .iter()
+                .map(|(source_ix, x, _)| {
+                    (
+                        *source_ix,
+                        *x - visual_left,
+                        (*x == visual_right && Some(*source_ix) == trailing_source_ix)
+                            .then_some(trailing_advance)
+                            .unwrap_or(Pixels::ZERO),
+                    )
+                })
+                .collect();
 
             let segment_width = visual_right - visual_left + trailing_advance;
             if segment_width <= Pixels::ZERO {
@@ -422,32 +418,6 @@ fn selection_glyph_bounds(
         }
     }
     fragments
-}
-
-fn shaped_cluster_advance(
-    text: &str,
-    source_ix: usize,
-    cluster_end_ix: usize,
-    font_id: FontId,
-    font_size: Pixels,
-    window: &Window,
-) -> Option<Pixels> {
-    let cluster = text.get(source_ix..cluster_end_ix)?;
-    if cluster.is_empty() {
-        return None;
-    }
-    let text_system = window.text_system();
-    let font = text_system.get_font_for_id(font_id)?;
-    let run = TextRun {
-        len: cluster.len(),
-        font,
-        ..Default::default()
-    };
-    Some(
-        text_system
-            .shape_line(SharedString::from(cluster), font_size, &[run], None)
-            .width(),
-    )
 }
 
 fn link_at_position(
