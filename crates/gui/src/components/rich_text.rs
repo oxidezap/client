@@ -157,6 +157,7 @@ pub fn render_rich_text(
             .with_font_family_overrides(code),
         Vec::new(),
         Arc::default(),
+        selection_key,
         document_order,
     )
     .into_any_element()

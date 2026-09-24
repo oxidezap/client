@@ -217,7 +217,7 @@ impl Element for SelectableRichText {
             |retained: Option<RetainedSelection>, window| {
                 let retained = match retained {
                     Some(retained) if retained.text == self.text => retained,
-                    Some(_) => {
+                    Some(retained) => {
                         // Only this participant's selection became stale;
                         // edits to another bubble must not clear it.
                         if retained.handle.snapshot(cx).is_some() {
