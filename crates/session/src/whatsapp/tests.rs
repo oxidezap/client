@@ -2027,14 +2027,41 @@ async fn a_contact_update_repairs_an_already_seen_lid_chat() {
     )
     .await;
     assert!(learned.is_some(), "the identity worker drains the update");
-    chat_store
-        .flush()
-        .await
-        .expect("identity reconciliation flushes");
-    let group_messages = chat_store
-        .messages(&group.parse::<Jid>().unwrap(), None, 20)
-        .await
-        .unwrap();
+    let (group_messages, group_chat) = crate::exec::with_timeout(
+        async {
+            loop {
+                // The in-memory LID cache becomes visible before its mapping
+                // transaction and queued reconciliation finish. Flush may win
+                // that race, so wait for the durable unread repair as well.
+                chat_store
+                    .flush()
+                    .await
+                    .expect("identity reconciliation flushes");
+                let group_messages = chat_store
+                    .messages(&group.parse::<Jid>().unwrap(), None, 20)
+                    .await
+                    .unwrap();
+                let group_chat = chat_store
+                    .chat(&group.parse::<Jid>().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if group_messages
+                    .iter()
+                    .filter(|message| message.id == "MSG-GROUP-ALIAS")
+                    .count()
+                    == 1
+                    && group_chat.unread_count == 1
+                {
+                    break (group_messages, group_chat);
+                }
+                crate::exec::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .expect("mapping reconciliation completes");
     assert_eq!(
         group_messages
             .iter()
@@ -2043,11 +2070,6 @@ async fn a_contact_update_repairs_an_already_seen_lid_chat() {
         1,
         "learning a contact alias repairs already stored group copies"
     );
-    let group_chat = chat_store
-        .chat(&group.parse::<Jid>().unwrap())
-        .await
-        .unwrap()
-        .unwrap();
     assert_eq!(group_chat.unread_count, 1);
 
     let after = WhatsAppClient::load_history(&chat_store, &client, &names)
