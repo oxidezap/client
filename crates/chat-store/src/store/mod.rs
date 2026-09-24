@@ -195,6 +195,7 @@ impl EventHandler for ChatStoreHandler {
             EventKind::UndecryptableMessage,
             EventKind::HistorySync,
             EventKind::ContactUpdate,
+            EventKind::ContactRemoved,
             EventKind::PinUpdate,
             EventKind::MuteUpdate,
             EventKind::ArchiveUpdate,

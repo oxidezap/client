@@ -14,7 +14,7 @@ use crate::store::chat_rows::{
     ChatBump, bump_chat, chat_row, delete_chat_rows, ensure_chat, recompute_chat_preview,
     remaining_messages,
 };
-use crate::store::contacts::upsert_contact_names;
+use crate::store::contacts::{clear_contact_names, upsert_contact_names};
 use crate::store::history_sync::apply_history_sync;
 use crate::store::inbound::apply_inbound;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message, message_row};
@@ -99,6 +99,10 @@ pub(super) fn apply_event(
                 update.action.first_name.as_deref(),
             )?;
             cs.contacts = true;
+            Ok(())
+        }
+        Event::ContactRemoved(removed) => {
+            cs.contacts |= clear_contact_names(conn, device_id, &removed.jid.to_string())?;
             Ok(())
         }
         // A group renamed is a fact about the chat row, not only a sentence
