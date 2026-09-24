@@ -85,7 +85,7 @@ pub(super) fn clear_contact_names(
         && (parsed.is_pn() || parsed.is_lid())
     {
         use schema::lid_pn_mapping::dsl as mapping;
-        let mapped = if parsed.is_lid() {
+        let phone_number = if parsed.is_lid() {
             mapping::lid_pn_mapping
                 .filter(
                     mapping::device_id
@@ -95,22 +95,23 @@ pub(super) fn clear_contact_names(
                 .select(mapping::phone_number)
                 .first::<String>(conn)
                 .optional()?
-                .map(|user| Jid::new(user, wacore_binary::Server::Pn).to_string())
         } else {
-            mapping::lid_pn_mapping
+            Some(parsed.user.to_string())
+        };
+        if let Some(phone_number) = phone_number {
+            keys.push(Jid::new(&phone_number, wacore_binary::Server::Pn).to_string());
+            let lids = mapping::lid_pn_mapping
                 .filter(
                     mapping::device_id
                         .eq(device_id)
-                        .and(mapping::phone_number.eq(parsed.user.as_str())),
+                        .and(mapping::phone_number.eq(phone_number)),
                 )
-                .order((mapping::updated_at.desc(), mapping::lid.desc()))
                 .select(mapping::lid)
-                .first::<String>(conn)
-                .optional()?
-                .map(|user| Jid::new(user, wacore_binary::Server::Lid).to_string())
-        };
-        if let Some(mapped) = mapped {
-            keys.push(mapped);
+                .load::<String>(conn)?;
+            keys.extend(
+                lids.into_iter()
+                    .map(|user| Jid::new(user, wacore_binary::Server::Lid).to_string()),
+            );
         }
     }
 
