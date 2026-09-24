@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use oxidezap_core::{ChatMessage, MessageStatus, PollContent, UiEvent};
 use whatsapp_rust::client::Client;
-use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::waproto::whatsapp as wa;
 
 use super::media;
@@ -48,14 +47,12 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
     // The stored proto still carries the media envelope: hydrate thumbnails +
     // download info so historical media renders and stays fetchable, instead
     // of degrading to a [kind] text row until a live redelivery.
-    let media = (!stored.revoked)
+    let base_message = (!stored.revoked)
         .then_some(stored.message.as_deref())
         .flatten()
-        .and_then(|m| media::media_of(m.get_base_message(), None));
-    let poll = (!stored.revoked)
-        .then_some(stored.message.as_deref())
-        .flatten()
-        .and_then(|m| poll_of(m.get_base_message()));
+        .map(oxidezap_chat_store::normalized_message);
+    let media = base_message.and_then(|message| media::media_of(message, None));
+    let poll = base_message.and_then(poll_of);
     let content = match (&stored.text, stored.revoked) {
         (_, true) => "[Message deleted]".to_string(),
         (Some(text), _) => text.clone(),
@@ -77,10 +74,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
     } else {
         true
     };
-    let quoted = (!stored.revoked)
-        .then_some(stored.message.as_deref())
-        .flatten()
-        .and_then(|m| quoted_from(m.get_base_message()));
+    let quoted = base_message.and_then(quoted_from);
     ChatMessage {
         id: stored.id,
         sender: stored.sender_jid.to_string(),
@@ -143,20 +137,7 @@ pub(super) fn poll_of(message: &wa::Message) -> Option<PollContent> {
 /// and teaching the bubble to draw one while the vote refuses it would be
 /// the disagreement this sharing exists to prevent.
 pub(super) fn poll_creation_of(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
-    let base = message.get_base_message();
-    let base = [
-        &base.group_mentioned_message,
-        &base.associated_child_message,
-        &base.poll_creation_message_v4,
-    ]
-    .into_iter()
-    .find_map(|wrapper| wrapper.as_option().and_then(|w| w.message.as_option()))
-    .map(|inner| inner.get_base_message())
-    .unwrap_or(base);
-    base.poll_creation_message_v3
-        .as_option()
-        .or_else(|| base.poll_creation_message_v2.as_option())
-        .or_else(|| base.poll_creation_message.as_option())
+    oxidezap_chat_store::supported_poll_creation_message(message)
 }
 
 /// Map the store's durable delivery state onto the one the UI draws.
@@ -365,5 +346,45 @@ mod tests {
         let poll = message.poll.expect("a v4 creation hydrates a poll");
         assert_eq!(poll.question, "Onde jantamos?");
         assert_eq!(poll.options.len(), 2);
+    }
+
+    #[test]
+    fn nested_wrappers_hydrate_media_and_quote_from_the_inner_message() {
+        let image = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                jpeg_thumbnail: Some(vec![1, 2, 3]),
+                context_info: MessageField::some(wa::ContextInfo {
+                    stanza_id: Some("quoted-message".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let associated = wa::Message {
+            associated_child_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(image),
+            }),
+            ..Default::default()
+        };
+        let mut stored = stored_poll_creation();
+        stored.kind = oxidezap_chat_store::MessageKind::Image;
+        stored.text = None;
+        stored.message = Some(Box::new(wa::Message {
+            group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(associated),
+            }),
+            ..Default::default()
+        }));
+
+        let message = stored_to_chat_message(stored);
+        assert!(
+            message.media.is_some(),
+            "wrapped image media should hydrate"
+        );
+        assert_eq!(
+            message.quoted.expect("wrapped reply quote").message_id,
+            "quoted-message"
+        );
     }
 }

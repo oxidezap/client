@@ -22,6 +22,10 @@ pub enum MessageKind {
     Contact,
     Location,
     Poll,
+    /// Parent for a grouped album; child media rows carry their own kinds.
+    Album,
+    /// WhatsApp product/catalog message.
+    Product,
     Event,
     GroupInvite,
     /// Hydrated business template (WABA notification).
@@ -56,6 +60,11 @@ pub enum MessageKind {
 }
 
 impl MessageKind {
+    /// Classify a WhatsApp message with the chat store's persisted vocabulary.
+    pub fn of(message: &wa::Message) -> Self {
+        Self::from_db(crate::materialize::message_kind(message).to_owned())
+    }
+
     /// The database label. Stable: these are on-disk values.
     pub fn as_str(&self) -> &str {
         match self {
@@ -70,6 +79,8 @@ impl MessageKind {
             Self::Contact => "contact",
             Self::Location => "location",
             Self::Poll => "poll",
+            Self::Album => "album",
+            Self::Product => "product",
             Self::Event => "event",
             Self::GroupInvite => "group_invite",
             Self::Template => "template",
@@ -113,6 +124,8 @@ impl MessageKind {
             "contact" => Self::Contact,
             "location" => Self::Location,
             "poll" => Self::Poll,
+            "album" => Self::Album,
+            "product" => Self::Product,
             "event" => Self::Event,
             "group_invite" => Self::GroupInvite,
             "template" => Self::Template,

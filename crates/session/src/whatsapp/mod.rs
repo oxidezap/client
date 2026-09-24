@@ -84,12 +84,12 @@ use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::PresencePolicy;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
+use whatsapp_rust::wacore::proto_helpers::MessageExt;
 // The same type either way; only the road to it differs. On a desktop the
 // library re-exports it, and in a browser that re-export is behind a default
 // feature the wasm build drops — so it is named at its own crate there.
 #[cfg(all(test, not(target_family = "wasm")))]
 use whatsapp_rust::store::SqliteStore;
-use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use whatsapp_rust::wacore::types::events::{
     ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
@@ -746,6 +746,19 @@ pub struct WhatsAppClient {
     /// while the process is offline); a live message in an unnamed special
     /// chat asks for just that chat.
     resolve_chat_names: chat_names::ChatNameResolveSignal,
+}
+
+fn live_content_fallback(message: &wa::Message, has_media: bool) -> String {
+    if has_media {
+        return String::new();
+    }
+
+    match oxidezap_chat_store::MessageKind::of(message) {
+        oxidezap_chat_store::MessageKind::Poll => "[poll]".to_string(),
+        oxidezap_chat_store::MessageKind::Album => "[album]".to_string(),
+        oxidezap_chat_store::MessageKind::Product => "[product]".to_string(),
+        _ => "[Media]".to_string(),
+    }
 }
 
 impl WhatsAppClient {
@@ -2085,8 +2098,9 @@ impl WhatsAppClient {
         names: &NameBook,
         eager: bool,
     ) {
-        // Use MessageExt to unwrap ephemeral/device_sent/view_once wrappers
-        let base_msg = msg.get_base_message();
+        // Use the shared store normalization for both ordinary envelopes and
+        // the nested wrappers it peels, so live and hydrated paths agree.
+        let base_msg = oxidezap_chat_store::normalized_message(msg);
 
         // Check if this is a reaction message
         if let Some(reaction) = base_msg.reaction_message.as_option() {
@@ -2166,18 +2180,12 @@ impl WhatsAppClient {
         let poll = poll_of(base_msg);
 
         // Extract text content
-        let content = msg
+        let content = base_msg
             .text_content()
             .map(|s| s.to_string())
-            .or_else(|| msg.get_caption().map(|s| s.to_string()))
+            .or_else(|| base_msg.get_caption().map(|s| s.to_string()))
             .or_else(|| poll.as_ref().map(|poll| poll.question.clone()))
-            .unwrap_or_else(|| {
-                if media_result.is_some() {
-                    String::new() // Empty for media-only messages
-                } else {
-                    "[Media]".to_string()
-                }
-            });
+            .unwrap_or_else(|| live_content_fallback(base_msg, media_result.is_some()));
 
         // A mention arrives as `@` plus the user part — the digits of a LID
         // where the peer is LID-addressed — and a phone draws the contact's

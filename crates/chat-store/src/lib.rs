@@ -41,7 +41,10 @@ mod store;
 pub mod types;
 
 pub use error::{ChatStoreError, Result, db_err};
-pub use materialize::is_control_only;
+pub use materialize::{
+    is_control_only, message_kind, normalized_message, poll_creation_message,
+    supported_poll_creation_message,
+};
 pub use store::ChatStore;
 pub use types::{
     ArrivalCursor, AvatarDescriptor, ChatCursor, ChatEntry, ChatNameExpected, ChatNameWrite,

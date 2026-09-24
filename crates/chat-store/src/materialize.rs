@@ -41,7 +41,8 @@ pub(crate) enum MessageOp {
 /// read-model view is [`MessageKind`](crate::types::MessageKind)). Coarser
 /// than the proto (one label per renderable bubble type), finer than WA's
 /// stanza `type` attribute (which collapses everything to text/media).
-pub(crate) fn message_kind(base: &wa::Message) -> &'static str {
+pub fn message_kind(message: &wa::Message) -> &'static str {
+    let base = normalized_message(message);
     if base.conversation.is_some() || base.extended_text_message.is_set() {
         "text"
     } else if base.image_message.is_set() {
@@ -64,11 +65,12 @@ pub(crate) fn message_kind(base: &wa::Message) -> &'static str {
         "contact"
     } else if base.location_message.is_set() || base.live_location_message.is_set() {
         "location"
-    } else if base.poll_creation_message.is_set()
-        || base.poll_creation_message_v2.is_set()
-        || base.poll_creation_message_v3.is_set()
-    {
+    } else if poll_creation_message(message).is_some() {
         "poll"
+    } else if base.album_message.is_set() {
+        "album"
+    } else if base.product_message.is_set() {
+        "product"
     } else if base.event_message.is_set() {
         "event"
     } else if base.group_invite_message.is_set() {
@@ -119,24 +121,61 @@ pub(crate) fn unavailable_kind(unavailable_type: UnavailableType) -> Option<&'st
     }
 }
 
-/// Wrappers `get_base_message` does not peel.
-///
-/// It knows the envelopes that change how a message is *shown* — ephemeral,
-/// view-once, edited. These change who or what it is attached to, and the
-/// payload inside is an ordinary message: left wrapped, every one of them
-/// classifies as "unknown" and lands as a blank bubble with an unread badge
-/// on it.
-fn peel_extra_wrappers(base: &wa::Message) -> &wa::Message {
-    for wrapper in [
-        &base.group_mentioned_message,
-        &base.associated_child_message,
-        &base.poll_creation_message_v4,
-    ] {
-        if let Some(inner) = wrapper.as_option().and_then(|w| w.message.as_option()) {
-            return inner.get_base_message();
+/// Unwrap message containers using the same precedence for every consumer.
+/// Repeating the pass handles valid nested combinations (for example a group
+/// mention around an associated child around a future-proof poll).
+pub fn normalized_message(message: &wa::Message) -> &wa::Message {
+    let mut base = message.get_base_message();
+    loop {
+        let inner = [
+            &base.group_mentioned_message,
+            &base.associated_child_message,
+            &base.poll_creation_message_v4,
+        ]
+        .into_iter()
+        .find_map(|wrapper| wrapper.as_option().and_then(|w| w.message.as_option()));
+        match inner {
+            Some(inner) if !std::ptr::eq(inner, base) => base = inner.get_base_message(),
+            _ => return base,
         }
     }
-    base
+}
+
+/// Shared poll-creation detector for classification and storage compaction.
+pub fn poll_creation_message(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
+    let base = normalized_message(message);
+    base.poll_creation_message_v6
+        .as_option()
+        .or_else(|| base.poll_creation_message_v5.as_option())
+        .or_else(|| {
+            base.poll_creation_message_v4
+                .as_option()
+                .and_then(|v| v.message.as_option())
+                .and_then(|m| {
+                    let normalized = normalized_message(m);
+                    normalized
+                        .poll_creation_message
+                        .as_option()
+                        .or_else(|| normalized.poll_creation_message_v2.as_option())
+                        .or_else(|| normalized.poll_creation_message_v3.as_option())
+                })
+        })
+        .or_else(|| base.poll_creation_message_v3.as_option())
+        .or_else(|| base.poll_creation_message_v2.as_option())
+        .or_else(|| base.poll_creation_message.as_option())
+}
+
+/// Legacy textual poll formats currently supported by session voting. V5/V6
+/// are still classified and retained, but intentionally do not become votable
+/// until their extended option/capability semantics are implemented.
+pub fn supported_poll_creation_message(
+    message: &wa::Message,
+) -> Option<&wa::message::PollCreationMessage> {
+    let base = normalized_message(message);
+    base.poll_creation_message_v3
+        .as_option()
+        .or_else(|| base.poll_creation_message_v2.as_option())
+        .or_else(|| base.poll_creation_message.as_option())
 }
 
 /// Payloads that are bookkeeping for something else, not a message.
@@ -160,7 +199,7 @@ pub(crate) fn is_control_carrier(base: &wa::Message) -> bool {
 
 /// Classify one decrypted message into its materialization op.
 pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
-    let base = peel_extra_wrappers(msg.get_base_message());
+    let base = normalized_message(msg);
 
     if let Some(reaction) = base.reaction_message.as_option() {
         let Some(target_id) = reaction.key.as_option().and_then(|k| k.id.clone()) else {
@@ -186,7 +225,7 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
             }
             (Some(ProtocolType::MESSAGE_EDIT), Some(target_id)) => {
                 if let Some(edited) = pm.edited_message.as_option() {
-                    let edited_base = edited.get_base_message();
+                    let edited_base = normalized_message(edited);
                     return MessageOp::Edit {
                         target_id,
                         new_text: extract_text(edited_base),
@@ -295,7 +334,7 @@ fn has_any_content(base: &wa::Message) -> bool {
 /// a carrier.
 #[must_use]
 pub fn is_control_only(msg: &wa::Message) -> bool {
-    is_control_carrier(peel_extra_wrappers(msg.get_base_message()))
+    is_control_carrier(normalized_message(msg))
 }
 
 #[cfg(test)]
@@ -540,6 +579,47 @@ mod tests {
     }
 
     #[test]
+    fn poll_album_and_product_kinds_share_wrapper_normalization() {
+        let v5 = wa::Message {
+            poll_creation_message_v5: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        let v6 = wa::Message {
+            poll_creation_message_v6: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        for poll in [&v5, &v6] {
+            assert_eq!(message_kind(poll), "poll");
+            assert_eq!(MessageKind::of(poll), MessageKind::Poll);
+            assert!(supported_poll_creation_message(poll).is_none());
+        }
+
+        let album = wa::Message {
+            album_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(message_kind(&album), "album");
+        let product = wa::Message {
+            product_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(message_kind(&product), "product");
+
+        let nested = wa::Message {
+            associated_child_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message {
+                    group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
+                        message: MessageField::some(album),
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(message_kind(&nested), "album");
+    }
+
+    #[test]
     fn classifies_reaction_add_and_remove() {
         let add = wa::Message {
             reaction_message: MessageField::some(wa::message::ReactionMessage {
@@ -603,7 +683,12 @@ mod tests {
             protocol_message: MessageField::some(wa::message::ProtocolMessage {
                 key: key_for("MSG3"),
                 r#type: Some(ProtocolType::MESSAGE_EDIT),
-                edited_message: MessageField::from_box(Box::new(wa::Message::text("fixed"))),
+                edited_message: MessageField::from_box(Box::new(wa::Message {
+                    group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
+                        message: MessageField::some(wa::Message::text("fixed")),
+                    }),
+                    ..Default::default()
+                })),
                 ..Default::default()
             }),
             ..Default::default()

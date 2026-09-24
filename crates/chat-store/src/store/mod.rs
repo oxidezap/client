@@ -292,6 +292,94 @@ struct MigrationCount {
     count: i64,
 }
 
+#[derive(diesel::QueryableByName)]
+struct UnknownKindRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    device_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    chat_jid: String,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    proto: Vec<u8>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    proto_codec: i32,
+}
+
+#[derive(diesel::QueryableByName)]
+struct MetadataValue {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
+}
+
+/// One-time, classifier-versioned repair. Candidate rows are loaded in bounded
+/// id pages, and the marker is committed with the updates so an interrupted
+/// pass rolls back rather than leaving a half-repaired database.
+fn repair_unknown_message_kinds(conn: &mut diesel::SqliteConnection) -> QueryResult<()> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    const KEY: &str = "message_kind_classifier";
+    const VERSION: &str = "2026-09-24-v1";
+    conn.transaction(|conn| {
+        let version = diesel::sql_query("SELECT value FROM chat_store_meta WHERE key = ?")
+            .bind::<Text, _>(KEY)
+            .get_result::<MetadataValue>(conn)
+            .optional()?;
+        if version.is_some_and(|v| v.value == VERSION) {
+            return Ok(());
+        }
+
+        let mut after_id = 0_i64;
+        loop {
+            let rows = diesel::sql_query(
+                "SELECT id, device_id, chat_jid, proto, proto_codec FROM messages \
+                 WHERE id > ? AND kind = 'unknown' AND revoked = 0 AND proto IS NOT NULL \
+                 ORDER BY id LIMIT 256",
+            )
+            .bind::<BigInt, _>(after_id)
+            .load::<UnknownKindRow>(conn)?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut affected_chats = std::collections::HashSet::new();
+            for row in rows {
+                after_id = row.id;
+                let Ok(message) =
+                    crate::storage_proto::decode_storage_proto(&row.proto, row.proto_codec)
+                else {
+                    continue;
+                };
+                let kind = crate::materialize::message_kind(&message);
+                if kind == "unknown" {
+                    continue;
+                }
+                let text = crate::materialize::extract_text(
+                    crate::materialize::normalized_message(&message),
+                );
+                diesel::sql_query(
+                    "UPDATE messages SET kind = ?, text_content = ? \
+                     WHERE id = ? AND kind = 'unknown' AND revoked = 0",
+                )
+                .bind::<Text, _>(kind)
+                .bind::<Nullable<Text>, _>(text)
+                .bind::<BigInt, _>(row.id)
+                .execute(conn)?;
+                affected_chats.insert((row.device_id, row.chat_jid));
+            }
+            for (device_id, chat) in affected_chats {
+                chat_rows::recompute_chat_preview(conn, device_id, &chat)?;
+            }
+        }
+        diesel::sql_query(
+            "INSERT INTO chat_store_meta (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind::<Text, _>(KEY)
+        .bind::<Text, _>(VERSION)
+        .execute(conn)?;
+        Ok(())
+    })
+}
+
 impl ChatStore {
     /// Prepare the shared chat schema once before account runtimes start.
     ///
@@ -308,6 +396,7 @@ impl ChatStore {
             conn.run_pending_migrations(MIGRATIONS)
                 .map(|_| ())
                 .map_err(StoreError::Migration)?;
+            repair_unknown_message_kinds(conn).map_err(crate::error::db_err)?;
             #[cfg(feature = "search")]
             crate::fts::ensure_fts(conn).map_err(db_err)?;
             Ok(())
@@ -437,13 +526,13 @@ impl ChatStore {
         message: &wa::Message,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
-        let base = wacore::proto_helpers::MessageExt::get_base_message(message);
+        let base = crate::materialize::normalized_message(message);
         self.tx
             .send(WriterMsg::Outgoing {
                 chat: chat.clone(),
                 msg_id: msg_id.into(),
                 proto: waproto::codec::message_to_vec(message),
-                kind: message_kind(base),
+                kind: message_kind(message),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
@@ -464,13 +553,13 @@ impl ChatStore {
         new_content: &wa::Message,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
-        let base = wacore::proto_helpers::MessageExt::get_base_message(new_content);
+        let base = crate::materialize::normalized_message(new_content);
         self.tx
             .send(WriterMsg::Edit {
                 chat: chat.clone(),
                 target_id: target_id.to_owned(),
                 proto: waproto::codec::message_to_vec(new_content),
-                kind: message_kind(base),
+                kind: message_kind(new_content),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
@@ -805,9 +894,9 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // Revert the newest chat-name provenance migration, then the newer
-        // identity-repair migrations before stepping back through preference
-        // provenance to the historical account-cascade assertions.
+        // Revert the newest chat-name provenance migration first, then the
+        // pending-alias queue, classifier metadata, and identity-repair state
+        // before the older tested migration edges.
         store
             .shared()
             .run(|conn| {
@@ -841,9 +930,23 @@ mod migration_tests {
                     .map_err(StoreError::Migration)
             })
             .await
+            .expect("message-kind repair metadata downgrade is reversible");
+        assert!(!has_table(&store, "chat_store_meta").await);
+
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
             .expect("identity-repair marker downgrade is reversible");
         assert!(!has_table(&store, "message_identity_repair_state").await);
 
+        // The next migration tracks which source last supplied mute/archive
+        // preferences. Revert it so the historical assertions start at
+        // account-cascade.
         store
             .shared()
             .run(|conn| {

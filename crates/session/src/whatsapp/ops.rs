@@ -250,12 +250,30 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let rows = live
-                .chat_store
-                .poll_messages(chat.as_ref(), limit.clamp(1, 100))
-                .await
-                .map_err(|e| format!("database query failed: {e}"))?;
-            Ok(rows.into_iter().filter_map(poll_view_of).collect())
+            let limit = limit.clamp(1, 100) as usize;
+            let mut polls = Vec::with_capacity(limit);
+            let mut before = None;
+            while polls.len() < limit {
+                let rows = live
+                    .chat_store
+                    .poll_messages_page(chat.as_ref(), before, limit as i64)
+                    .await
+                    .map_err(|e| format!("database query failed: {e}"))?;
+                if rows.is_empty() {
+                    break;
+                }
+                let page_is_short = rows.len() < limit;
+                before = rows.last().map(oxidezap_chat_store::MessageCursor::from);
+                polls.extend(
+                    rows.into_iter()
+                        .filter_map(poll_view_of)
+                        .take(limit - polls.len()),
+                );
+                if page_is_short {
+                    break;
+                }
+            }
+            Ok(polls)
         })
     }
 
