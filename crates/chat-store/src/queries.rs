@@ -1006,14 +1006,10 @@ fn hydrate_quotes(
         for need in chat_needs {
             let rows: &[crate::storage_proto::ParentRow] =
                 parents.get(&need.stanza).map(Vec::as_slice).unwrap_or(&[]);
-            let normalized =
-                crate::store::message_identity::stored_sender(&need.participant, false);
-            if rows.iter().all(|row| {
-                crate::store::message_identity::stored_sender(&row.sender, false) != normalized
-            }) && !aliases.contains_key(&need.participant)
-            {
-                // A mapping read that fails is not a read failure: without
-                // aliases the quote resolves by normalized author only.
+            if !aliases.contains_key(&need.participant) {
+                // Resolve the full component even when an exact row exists:
+                // an equivalent copy may carry the tombstone, edit, or
+                // recovered content that wins the storage merge.
                 let aliases_for_participant = if need.participant.is_empty() {
                     Vec::new()
                 } else {
@@ -1069,22 +1065,56 @@ fn parent_chunk(
                 .and(dsl::msg_id.eq_any(stanzas.to_vec())),
         )
         .select((
+            dsl::id,
             dsl::msg_id,
             dsl::sender_jid,
             dsl::from_me,
+            dsl::text_content.is_not_null(),
             dsl::proto,
             dsl::proto_codec,
+            dsl::edited_at_ms,
+            dsl::revoked,
         ))
-        .load::<(String, String, bool, Option<Vec<u8>>, i32)>(conn)
+        .load::<(
+            i64,
+            String,
+            String,
+            bool,
+            bool,
+            Option<Vec<u8>>,
+            i32,
+            Option<i64>,
+            bool,
+        )>(conn)
         .map(|rows| {
             rows.into_iter()
-                .map(|(msg_id, sender, from_me, proto, codec)| ParentRow {
-                    msg_id,
-                    sender,
-                    from_me,
-                    proto,
-                    codec,
-                })
+                .map(
+                    |(
+                        id,
+                        msg_id,
+                        sender,
+                        from_me,
+                        text_present,
+                        proto,
+                        codec,
+                        edited_at_ms,
+                        revoked,
+                    )| {
+                        let proto_present = proto.is_some();
+                        ParentRow {
+                            id,
+                            msg_id,
+                            sender,
+                            from_me,
+                            text_present,
+                            proto_present,
+                            proto,
+                            codec,
+                            edited_at_ms,
+                            revoked,
+                        }
+                    },
+                )
                 .collect()
         })
 }

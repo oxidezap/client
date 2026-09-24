@@ -296,19 +296,24 @@ pub(crate) fn needs_storage_compaction(msg: &wa::Message) -> bool {
         .is_some_and(is_secret_only)
 }
 
-/// A candidate parent row for a quote: who stored it and the bytes to
-/// rehydrate from (still in their storage representation).
+/// A candidate parent row for a quote: identity/fold metadata and, on reads,
+/// bytes to rehydrate from (still in their storage representation).
 pub(crate) struct ParentRow {
+    pub id: i64,
     pub msg_id: String,
     pub sender: String,
     pub from_me: bool,
+    pub text_present: bool,
+    pub proto_present: bool,
     pub proto: Option<Vec<u8>>,
     pub codec: i32,
+    pub edited_at_ms: Option<i64>,
+    pub revoked: bool,
 }
 
-/// Every row under one stanza id in `chat` (either storage identity), oldest
-/// first. Capped: ids repeat across group participants, but past a handful
-/// of same-id rows the quote is ambiguous anyway and keeps its snapshot.
+/// Every row under one stanza id in `chat` (either storage identity), as
+/// lightweight metadata. This needs the full set to choose tombstone/edit and
+/// recovered-content precedence without reading every colliding proto blob.
 pub(crate) fn quote_parent_rows(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -324,24 +329,44 @@ pub(crate) fn quote_parent_rows(
                 .and(dsl::msg_id.eq(stanza_id)),
         )
         .order(dsl::id.asc())
-        .limit(4)
         .select((
+            dsl::id,
             dsl::msg_id,
             dsl::sender_jid,
             dsl::from_me,
-            dsl::proto,
-            dsl::proto_codec,
+            dsl::text_content.is_not_null(),
+            dsl::proto.is_not_null(),
+            dsl::edited_at_ms,
+            dsl::revoked,
         ))
-        .load::<(String, String, bool, Option<Vec<u8>>, i32)>(conn)
+        .load::<(i64, String, String, bool, bool, bool, Option<i64>, bool)>(conn)
         .map(|rows| {
             rows.into_iter()
-                .map(|(msg_id, sender, from_me, proto, codec)| ParentRow {
-                    msg_id,
-                    sender,
-                    from_me,
-                    proto,
-                    codec,
-                })
+                .map(
+                    |(
+                        id,
+                        msg_id,
+                        sender,
+                        from_me,
+                        text_present,
+                        proto_present,
+                        edited_at_ms,
+                        revoked,
+                    )| {
+                        ParentRow {
+                            id,
+                            msg_id,
+                            sender,
+                            from_me,
+                            text_present,
+                            proto_present,
+                            proto: None,
+                            codec: CODEC_RAW,
+                            edited_at_ms,
+                            revoked,
+                        }
+                    },
+                )
                 .collect()
         })
 }
@@ -364,32 +389,54 @@ pub(crate) fn pick_quote_parent<'a>(
     own_participants: &[String],
 ) -> Option<&'a ParentRow> {
     let participant = crate::store::message_identity::stored_sender(participant, false);
-    if own_participants
+    let own = own_participants
         .iter()
-        .any(|own| crate::store::message_identity::stored_sender(own, false) == participant)
+        .any(|own| crate::store::message_identity::stored_sender(own, false) == participant);
+    let aliases: Vec<String> = aliases
+        .iter()
+        .map(|alias| crate::store::message_identity::stored_sender(alias, false))
+        .collect();
+    let matching: Vec<&ParentRow> = rows
+        .iter()
+        .filter(|row| {
+            if own {
+                row.from_me
+            } else if participant.is_empty() {
+                row.from_me && row.sender.is_empty()
+            } else {
+                let sender = crate::store::message_identity::stored_sender(&row.sender, false);
+                sender == participant || aliases.contains(&sender)
+            }
+        })
+        .collect();
+    if matching.is_empty() {
+        return (participant.is_empty() && rows.len() == 1).then(|| &rows[0]);
+    }
+    // Match merge_rows: tombstones dominate, then the newest edit (ties go to
+    // the oldest stable id), then the best recovered representation.
+    if let Some(tombstone) = matching
+        .iter()
+        .copied()
+        .filter(|row| row.revoked)
+        .min_by_key(|row| row.id)
     {
-        let mut own_rows = rows.iter().filter(|row| row.from_me);
-        let own = own_rows.next()?;
-        return own_rows.next().is_none().then_some(own);
+        return Some(tombstone);
     }
-    if let Some(row) = rows.iter().find(|row| {
-        crate::store::message_identity::stored_sender(&row.sender, false) == participant
-    }) {
-        return Some(row);
+    if let Some(edited) = matching
+        .iter()
+        .copied()
+        .filter(|row| row.edited_at_ms.is_some())
+        .max_by_key(|row| (row.edited_at_ms, std::cmp::Reverse(row.id)))
+    {
+        return Some(edited);
     }
-    for alias in aliases {
-        let alias = crate::store::message_identity::stored_sender(alias, false);
-        if let Some(row) = rows
-            .iter()
-            .find(|row| crate::store::message_identity::stored_sender(&row.sender, false) == alias)
-        {
-            return Some(row);
-        }
-    }
-    if participant.is_empty() && rows.len() == 1 {
-        return rows.first();
-    }
-    None
+    matching.into_iter().max_by_key(|row| {
+        (
+            row.text_present,
+            row.proto_present,
+            std::cmp::Reverse(row.id),
+        )
+    })
 }
 
 /// Whether a row for the quoted parent exists: same chat (either storage
@@ -807,21 +854,98 @@ mod tests {
     }
 
     #[test]
+    fn parent_pick_uses_message_fold_precedence_across_aliases() {
+        let row = |id: i64,
+                   sender: &str,
+                   text_present: bool,
+                   proto: Option<Vec<u8>>,
+                   edited_at_ms: Option<i64>,
+                   revoked: bool| {
+            let proto_present = proto.is_some();
+            ParentRow {
+                id,
+                msg_id: "X".into(),
+                sender: sender.into(),
+                from_me: false,
+                text_present,
+                proto_present,
+                proto,
+                codec: CODEC_RAW,
+                edited_at_ms,
+                revoked,
+            }
+        };
+        let aliases = ["111000011112222@lid".into()];
+        let mut rows = vec![
+            row(1, "559900000001@s.whatsapp.net", false, None, None, false),
+            row(2, "111000011112222@lid", true, Some(vec![1]), None, false),
+        ];
+        assert_eq!(
+            pick_quote_parent(&rows, "559900000001@s.whatsapp.net", &aliases, &[])
+                .expect("recovered copy")
+                .id,
+            2,
+            "prefer recovered content over the exact-author placeholder"
+        );
+        rows.push(row(
+            3,
+            "111000011112222@lid",
+            true,
+            Some(vec![3]),
+            Some(100),
+            false,
+        ));
+        rows.push(row(
+            4,
+            "559900000001@s.whatsapp.net",
+            true,
+            Some(vec![4]),
+            Some(100),
+            false,
+        ));
+        assert_eq!(
+            pick_quote_parent(&rows, "559900000001@s.whatsapp.net", &aliases, &[])
+                .expect("latest edit")
+                .id,
+            3,
+            "equal edit times use the oldest stable row"
+        );
+        rows.push(row(5, "111000011112222@lid", false, None, Some(90), true));
+        assert_eq!(
+            pick_quote_parent(&rows, "559900000001@s.whatsapp.net", &aliases, &[])
+                .expect("tombstone")
+                .id,
+            5,
+            "tombstones dominate edits and recovered content"
+        );
+    }
+
+    #[test]
     fn parent_pick_prefers_exact_author_then_alias() {
         let rows = vec![
             ParentRow {
+                id: 1,
                 msg_id: "X".into(),
                 sender: "a@s.whatsapp.net".into(),
                 from_me: false,
+                text_present: false,
+                proto_present: false,
                 proto: None,
                 codec: CODEC_RAW,
+                edited_at_ms: None,
+                revoked: false,
             },
             ParentRow {
+                id: 2,
                 msg_id: "X".into(),
                 sender: "b@s.whatsapp.net".into(),
                 from_me: false,
+                text_present: false,
+                proto_present: false,
                 proto: None,
                 codec: CODEC_RAW,
+                edited_at_ms: None,
+                revoked: false,
             },
         ];
         assert_eq!(

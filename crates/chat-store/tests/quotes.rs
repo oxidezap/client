@@ -325,6 +325,62 @@ async fn history_sync_strips_parent_later_in_same_batch() {
 }
 
 #[tokio::test]
+async fn quote_uses_recovered_alias_copy_when_exact_parent_is_placeholder() {
+    let (store, chat_store) = test_store().await;
+    let parent_info = incoming_info(GROUP, PEER, "FOLD-QUOTE-PARENT", 1_700_000_000);
+    feed(
+        &chat_store,
+        [Event::UndecryptableMessage(
+            wacore::types::events::UndecryptableMessage::builder()
+                .info(Arc::new(parent_info))
+                .is_unavailable(false)
+                .unavailable_type(wacore::types::events::UnavailableType::Unknown)
+                .decrypt_fail_mode(wacore::types::events::DecryptFailMode::Show)
+                .build(),
+        )],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("recovered parent"),
+            incoming_info(GROUP, PEER_LID, "FOLD-QUOTE-PARENT", 1_700_000_001),
+        )],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+    feed(
+        &chat_store,
+        [live_chat(
+            GROUP,
+            "559900000002@s.whatsapp.net",
+            "FOLD-QUOTE-REPLY",
+            text_reply(
+                "reply",
+                "FOLD-QUOTE-PARENT",
+                PEER,
+                wa::Message::text("stale snapshot"),
+            ),
+            1_700_000_060,
+        )],
+    )
+    .await;
+
+    let (bytes, _) = stored_proto(&store, "FOLD-QUOTE-REPLY").await;
+    let stored = waproto::codec::message_decode(&bytes.expect("stored proto")).unwrap();
+    assert_eq!(quoted_text(&stored), None);
+    let page = chat_store.messages(&jid(GROUP), None, 10).await.unwrap();
+    let reply = page
+        .iter()
+        .find(|message| message.id == "FOLD-QUOTE-REPLY")
+        .expect("reply");
+    assert_eq!(
+        quoted_text(reply.message.as_deref().expect("decoded proto")).as_deref(),
+        Some("recovered parent")
+    );
+}
+
+#[tokio::test]
 async fn quote_resolves_across_historical_and_current_lids() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 
