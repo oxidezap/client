@@ -465,7 +465,10 @@ impl Element for SelectableRichText {
                 return;
             };
             if TextSelection::has_selection(window, cx) {
-                return;
+                // A click-sized pointer wiggle can create a transient local
+                // selection. It should not suppress link activation or leave
+                // a tiny selection behind after the click.
+                TextSelection::clear(window, cx);
             }
             let Some(link_ix) = links
                 .iter()
