@@ -748,6 +748,19 @@ pub struct WhatsAppClient {
     resolve_chat_names: chat_names::ChatNameResolveSignal,
 }
 
+fn live_content_fallback(message: &wa::Message, has_media: bool) -> String {
+    if has_media {
+        return String::new();
+    }
+
+    match oxidezap_chat_store::MessageKind::of(message) {
+        oxidezap_chat_store::MessageKind::Poll => "[poll]".to_string(),
+        oxidezap_chat_store::MessageKind::Album => "[album]".to_string(),
+        oxidezap_chat_store::MessageKind::Product => "[product]".to_string(),
+        _ => "[Media]".to_string(),
+    }
+}
+
 impl WhatsAppClient {
     /// Create a new WhatsApp client wrapper. Errors when the executor cannot
     /// be built — a desktop builds a runtime, which resource exhaustion can
@@ -2172,13 +2185,7 @@ impl WhatsAppClient {
             .map(|s| s.to_string())
             .or_else(|| base_msg.get_caption().map(|s| s.to_string()))
             .or_else(|| poll.as_ref().map(|poll| poll.question.clone()))
-            .unwrap_or_else(|| {
-                if media_result.is_some() {
-                    String::new() // Empty for media-only messages
-                } else {
-                    "[Media]".to_string()
-                }
-            });
+            .unwrap_or_else(|| live_content_fallback(base_msg, media_result.is_some()));
 
         // A mention arrives as `@` plus the user part — the digits of a LID
         // where the peer is LID-addressed — and a phone draws the contact's

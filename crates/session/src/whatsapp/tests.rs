@@ -22,6 +22,31 @@ use whatsapp_rust::wacore::types::events::{Event, ServerAck};
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+#[test]
+fn live_nonrenderable_fallback_uses_the_shared_message_kind() {
+    let poll = wa::Message {
+        poll_creation_message_v5: MessageField::some(Default::default()),
+        ..Default::default()
+    };
+    let album = wa::Message {
+        album_message: MessageField::some(Default::default()),
+        ..Default::default()
+    };
+    let product = wa::Message {
+        product_message: MessageField::some(Default::default()),
+        ..Default::default()
+    };
+
+    assert_eq!(super::live_content_fallback(&poll, false), "[poll]");
+    assert_eq!(super::live_content_fallback(&album, false), "[album]");
+    assert_eq!(super::live_content_fallback(&product, false), "[product]");
+    assert_eq!(
+        super::live_content_fallback(&wa::Message::default(), false),
+        "[Media]"
+    );
+    assert_eq!(super::live_content_fallback(&product, true), "");
+}
+
 /// A name book with nothing behind its handle: the history paths hand the
 /// store in with every call, and only the live paths read it from there.
 fn book() -> NameBook {
