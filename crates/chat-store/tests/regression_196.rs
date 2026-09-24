@@ -1,4 +1,7 @@
 //! Regression coverage for quote hydration in secondary message reads.
+// The shared event builders exercise raw protocol serialization as test input.
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use common::*;
