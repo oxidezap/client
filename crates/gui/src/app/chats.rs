@@ -504,7 +504,8 @@ mod tests {
             vec!["community1@g.us", "community2@g.us", "child2@g.us"]
         );
         assert!(!rows[0].community_expanded);
-        assert!(rows[2].community_expanded);
+        assert!(rows[1].community_expanded);
+        assert_eq!(rows[2].tree_depth, 1);
     }
 
     #[test]
