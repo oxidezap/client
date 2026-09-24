@@ -78,7 +78,7 @@ pub fn render_connected_view(
         && app.media_viewer(cx).is_none())
     .then(|| selected_jid.clone())
     .flatten();
-    app.note_visible_conversation(visible, cx);
+    app.note_visible_conversation(visible, window, cx);
     // Against what this frame is about to draw, and before anything reads the
     // chat list: a chat a complete load said was gone is kept only while it is
     // on screen, and this is where looking away is noticed.

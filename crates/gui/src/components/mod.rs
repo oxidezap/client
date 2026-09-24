@@ -18,6 +18,7 @@ pub mod parts;
 mod paste_preview;
 pub mod plugin_ui;
 mod rich_text;
+pub(crate) mod rich_text_selection;
 mod status;
 mod status_ticks;
 
