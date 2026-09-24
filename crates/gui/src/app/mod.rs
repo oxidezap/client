@@ -4405,11 +4405,14 @@ mod tests {
             "alpha "
         );
 
-        app_entity.unwrap().update(cx, |app, cx| {
-            // Model the call-history path: two updates before another list
-            // frame leaves the render cache absent both times.
-            app.invalidate_message_cache(jid, cx);
-            app.invalidate_message_cache(jid, cx);
+        visual.update(|window, cx| {
+            app_entity.as_ref().unwrap().update(cx, |app, cx| {
+                // Model the call-history path: two updates before another list
+                // frame leaves the render cache absent both times.
+                app.invalidate_message_cache(jid, cx);
+                app.invalidate_message_cache(jid, cx);
+            });
+            window.draw(cx).clear(cx);
         });
         assert_eq!(
             visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
@@ -4463,9 +4466,12 @@ mod tests {
             "alpha "
         );
 
-        app_entity
-            .unwrap()
-            .update(cx, |app, cx| app.leave_connected_view(None, cx));
+        visual.update(|window, cx| {
+            app_entity
+                .as_ref()
+                .unwrap()
+                .update(cx, |app, cx| app.leave_connected_view(Some(window), cx));
+        });
         assert_eq!(
             visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
             ""
