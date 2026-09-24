@@ -247,6 +247,14 @@ fn selection_quad_bounds(
             .windows(2)
             .map(|pair| (pair[0], pair[1]))
             .collect();
+        let mut shaped_x_by_index = HashMap::new();
+        for run in runs {
+            for glyph in &run.glyphs {
+                shaped_x_by_index
+                    .entry(line_start_ix + glyph.index)
+                    .or_insert(glyph.position.x);
+            }
+        }
         let mut segments = vec![Vec::new(); wrap_boundaries.len() + 1];
         let mut segment_ix = 0;
         let mut next_boundary_ix = 0;
@@ -292,14 +300,16 @@ fn selection_quad_bounds(
                 .max();
             let trailing_advance = trailing_source_ix
                 .and_then(|source_ix| {
+                    let start_x = shaped_x_by_index.get(&source_ix)?;
                     let cluster_end_ix = cluster_ends
                         .get(&source_ix)
                         .copied()
                         .unwrap_or(line_start_ix + line.len());
-                    layout
-                        .position_for_index(cluster_end_ix)
-                        .filter(|caret| caret.y == segment_top)
-                        .map(|caret| (caret.x - bounds.left() - visual_right).abs())
+                    let end_x = shaped_x_by_index
+                        .get(&cluster_end_ix)
+                        .copied()
+                        .unwrap_or(line.unwrapped_layout.width);
+                    Some((*end_x - *start_x).abs())
                 })
                 .filter(|advance| *advance > Pixels::ZERO)
                 .unwrap_or(line_height.half());
