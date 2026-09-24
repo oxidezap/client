@@ -568,9 +568,9 @@ impl ChatStore {
             .into_iter()
             .filter_map(|(_, _, name)| name)
             .find(|name| {
-                !name.trim().is_empty()
-                    && !(is_group
-                        && matches!(name.trim(), "Unnamed group" | "Group name unavailable"))
+                let name = name.trim();
+                !(name.is_empty()
+                    || is_group && matches!(name, "Unnamed group" | "Group name unavailable"))
             });
         Ok(Some(ChatNotificationMetadata {
             muted,
@@ -818,7 +818,7 @@ fn fill_unique(
             break;
         }
     }
-    kept.sort_by(|left, right| (right.timestamp_ms, right.id).cmp(&(left.timestamp_ms, left.id)));
+    kept.sort_by_key(|row| std::cmp::Reverse((row.timestamp_ms, row.id)));
     Ok(kept)
 }
 

@@ -19,6 +19,7 @@ use crate::store::writer::ChangeSet;
 /// placeholder's `status` to the column default where the edit picks one by
 /// authorship, and previews as nothing rather than as new text. What is left
 /// to share is the `bump_chat` call, which is already a function.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_revoke(
     conn: &mut SqliteConnection,
     device_id: i32,
