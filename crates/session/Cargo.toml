@@ -163,6 +163,7 @@ wasm-bindgen-test = "0.3"
 # runs on the host, where `cargo test` already is. Only the test needs these
 # here; the page's build gets them from the wasm section above.
 [dev-dependencies]
+diesel = { workspace = true }
 futures-channel = "0.3"
 futures-lite = "2"
 

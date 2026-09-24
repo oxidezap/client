@@ -1361,6 +1361,155 @@ async fn a_stored_avatar_descriptor_reaches_the_chat_without_a_lookup() {
     );
 }
 
+#[derive(diesel::QueryableByName)]
+struct StoredProtoRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+    proto: Option<Vec<u8>>,
+}
+
+/// Read a message's durable protobuf without applying quote hydration.
+async fn persisted_proto(store: &SqliteStore, id: &str) -> wa::Message {
+    use diesel::RunQueryDsl as _;
+
+    let device = store.device_id();
+    let id = id.to_owned();
+    let row: StoredProtoRow = store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("SELECT proto FROM messages WHERE device_id = ? AND msg_id = ?")
+                .bind::<diesel::sql_types::Integer, _>(device)
+                .bind::<diesel::sql_types::Text, _>(id)
+                .get_result(conn)
+                .map_err(oxidezap_chat_store::db_err)
+        })
+        .await
+        .expect("read stored proto");
+    whatsapp_rust::waproto::codec::message_decode(&row.proto.expect("stored payload"))
+        .expect("decode proto")
+}
+
+/// Whether a stored reply still embeds its original quoted-message payload.
+fn has_quoted_snapshot(message: &wa::Message) -> bool {
+    let context = message
+        .extended_text_message
+        .as_option()
+        .and_then(|body| body.context_info.as_option())
+        .or_else(|| {
+            message
+                .image_message
+                .as_option()
+                .and_then(|body| body.context_info.as_option())
+        });
+    context.is_some_and(|context| context.quoted_message.as_option().is_some())
+}
+
+/// Starred and media-candidate reads retain quote content after reopening.
+#[tokio::test]
+async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
+    let store =
+        SqliteStore::new("file:oxidezap-session-quote-secondary-reads?mode=memory&cache=shared")
+            .await
+            .expect("in-memory store");
+    store.create_new_device().await.expect("seed device parent");
+    let chat_store = ChatStore::new(&store).await.expect("chat store");
+    let parent = wa::Message {
+        image_message: MessageField::some(wa::message::ImageMessage {
+            mimetype: Some("image/jpeg".into()),
+            caption: Some("original photo".into()),
+            jpeg_thumbnail: Some(vec![1, 2, 3]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    chat_store
+        .handler()
+        .handle_event(Arc::new(incoming(parent.clone(), "P", 1_700_000_000)));
+    chat_store.flush().await.expect("store parent");
+
+    let quoted_photo = || wa::ContextInfo {
+        stanza_id: Some("P".into()),
+        participant: Some(TEST_PEER.into()),
+        quoted_message: MessageField::some(parent.clone()),
+        ..Default::default()
+    };
+    let text_reply = wa::Message {
+        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+            text: Some("reply".into()),
+            context_info: MessageField::some(quoted_photo()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    chat_store
+        .handler()
+        .handle_event(Arc::new(incoming(text_reply, "R", 1_700_000_060)));
+    chat_store.flush().await.expect("store text reply");
+    chat_store
+        .handler()
+        .handle_event(Arc::new(Event::StarUpdate(
+            whatsapp_rust::wacore::types::events::StarUpdate::builder()
+                .chat_jid(TEST_PEER.parse().expect("test JID"))
+                .message_id("R".to_string())
+                .from_me(false)
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_120).unwrap())
+                .action(Box::new(wa::sync_action_value::StarAction {
+                    starred: Some(true),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )));
+    chat_store.flush().await.expect("star text reply");
+    let media_reply = wa::Message {
+        image_message: MessageField::some(wa::message::ImageMessage {
+            mimetype: Some("image/jpeg".into()),
+            context_info: MessageField::some(quoted_photo()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    chat_store
+        .handler()
+        .handle_event(Arc::new(incoming(media_reply, "M", 1_700_000_180)));
+    chat_store.flush().await.expect("store media reply");
+    assert!(
+        !has_quoted_snapshot(&persisted_proto(&store, "R").await),
+        "text reply must be compacted before reading"
+    );
+    assert!(
+        !has_quoted_snapshot(&persisted_proto(&store, "M").await),
+        "media reply must be compacted before reading"
+    );
+
+    // Reopen the chat-store handle over the same SQLite database before the
+    // secondary reads, as the session does after a process restart.
+    drop(chat_store);
+    let chat_store = ChatStore::new(&store).await.expect("reopened chat store");
+    let starred = chat_store.starred_messages(10).await.expect("starred read");
+    let projected = super::convert::stored_to_chat_message(
+        starred
+            .into_iter()
+            .find(|row| row.id == "R")
+            .expect("reply"),
+    );
+    let quote = projected.quoted.expect("projected quote");
+    assert_eq!(quote.preview, "original photo");
+    assert_eq!(quote.kind, Some(oxidezap_core::QuotedKind::Image));
+
+    let pending = chat_store
+        .pending_media_messages(Some(&TEST_PEER.parse().expect("test JID")), 10)
+        .await
+        .expect("pending media read");
+    let projected = super::convert::stored_to_chat_message(
+        pending
+            .into_iter()
+            .find(|row| row.id == "M")
+            .expect("media reply"),
+    );
+    let quote = projected.quoted.expect("projected media quote");
+    assert_eq!(quote.preview, "original photo");
+    assert_eq!(quote.kind, Some(oxidezap_core::QuotedKind::Image));
+}
+
 async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
     let store = SqliteStore::new(&format!(
         "file:oxidezap-session-{name}?mode=memory&cache=shared"
