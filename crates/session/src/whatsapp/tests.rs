@@ -1367,6 +1367,7 @@ struct StoredProtoRow {
     proto: Option<Vec<u8>>,
 }
 
+/// Read a message's durable protobuf without applying quote hydration.
 async fn persisted_proto(store: &SqliteStore, id: &str) -> wa::Message {
     use diesel::RunQueryDsl as _;
 
@@ -1387,6 +1388,7 @@ async fn persisted_proto(store: &SqliteStore, id: &str) -> wa::Message {
         .expect("decode proto")
 }
 
+/// Whether a stored reply still embeds its original quoted-message payload.
 fn has_quoted_snapshot(message: &wa::Message) -> bool {
     let context = message
         .extended_text_message
@@ -1401,6 +1403,7 @@ fn has_quoted_snapshot(message: &wa::Message) -> bool {
     context.is_some_and(|context| context.quoted_message.as_option().is_some())
 }
 
+/// Starred and media-candidate reads retain quote content after reopening.
 #[tokio::test]
 async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
     let store =
