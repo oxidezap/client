@@ -76,7 +76,7 @@ pub(super) fn clear_contact_names(
     conn: &mut SqliteConnection,
     device_id: i32,
     jid: &str,
-) -> QueryResult<bool> {
+) -> QueryResult<(bool, bool)> {
     use schema::contacts::dsl as contacts;
     let key = contact_key(jid).into_owned();
     let mut keys = vec![key.clone()];
@@ -115,10 +115,10 @@ pub(super) fn clear_contact_names(
         }
     }
 
-    let changed = diesel::update(
+    let contact_changed = diesel::update(
         contacts::contacts
             .filter(contacts::device_id.eq(device_id))
-            .filter(contacts::jid.eq_any(keys))
+            .filter(contacts::jid.eq_any(&keys))
             .filter(
                 contacts::full_name
                     .is_not_null()
@@ -130,7 +130,19 @@ pub(super) fn clear_contact_names(
         contacts::first_name.eq(None::<String>),
     ))
     .execute(conn)?;
-    Ok(changed > 0)
+
+    // Direct-chat history carries a copy of the address-book label in
+    // `chats.name`. Retire that copy too or the normal list reload will use it
+    // as the fallback after the address-book lookup correctly returns none.
+    let chat_changed = diesel::update(
+        schema::chats::dsl::chats
+            .filter(schema::chats::dsl::device_id.eq(device_id))
+            .filter(schema::chats::dsl::jid.eq_any(keys))
+            .filter(schema::chats::dsl::name.is_not_null()),
+    )
+    .set(schema::chats::dsl::name.eq(None::<String>))
+    .execute(conn)?;
+    Ok((contact_changed > 0, chat_changed > 0))
 }
 
 pub(super) fn upsert_contact_names(

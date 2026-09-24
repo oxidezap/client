@@ -102,7 +102,10 @@ pub(super) fn apply_event(
             Ok(())
         }
         Event::ContactRemoved(removed) => {
-            cs.contacts |= clear_contact_names(conn, device_id, &removed.jid.to_string())?;
+            let (contacts_changed, chats_changed) =
+                clear_contact_names(conn, device_id, &removed.jid.to_string())?;
+            cs.contacts |= contacts_changed;
+            cs.chats |= chats_changed;
             Ok(())
         }
         // A group renamed is a fact about the chat row, not only a sentence

@@ -32,6 +32,18 @@ fn contact_removed(jid: &str) -> Event {
 #[tokio::test]
 async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_change() {
     let (_device, store) = test_store().await;
+    feed(
+        &store,
+        [history_sync_event(wa::HistorySync {
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                name: Some("Stale synced contact name".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
     let mut changes = store.subscribe();
 
     // Verify the event is subscribed, then enqueue it through the same handler
@@ -42,6 +54,10 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
     let saved = store.contact(&jid(PEER)).await.unwrap().unwrap();
     assert_eq!(saved.full_name.as_deref(), Some("Saved Name"));
     assert_eq!(saved.first_name.as_deref(), Some("Saved"));
+    assert_eq!(
+        store.chats(false, 10).await.unwrap()[0].name.as_deref(),
+        Some("Stale synced contact name")
+    );
     assert!(matches!(
         timeout(Duration::from_secs(1), changes.recv())
             .await
@@ -57,8 +73,15 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
         timeout(Duration::from_secs(1), changes.recv())
             .await
             .unwrap(),
+        Ok(StoreChange::Chats)
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap(),
         Ok(StoreChange::Contacts)
     ));
+    assert_eq!(store.chats(false, 10).await.unwrap()[0].name, None);
 
     // A duplicate and an unknown contact are no-ops: no empty row and no
     // spurious invalidation. A later legitimate update can save the name again.
