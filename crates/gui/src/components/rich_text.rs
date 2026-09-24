@@ -544,7 +544,7 @@ mod tests {
         });
         {
             let mut focus_handle = None;
-            let (_, mut visual) = cx.add_window_view(|window, cx| {
+            let (_, visual) = cx.add_window_view(|window, cx| {
                 let view = cx.new(|cx| {
                     let handle = cx.focus_handle();
                     focus_handle = Some(handle.clone());
