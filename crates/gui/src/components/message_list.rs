@@ -246,7 +246,9 @@ fn render_row(
                 decoded_image,
                 audio,
                 playback_speed: app.playback_speed(),
-                is_downloading: app.is_downloading(message_id),
+                is_downloading: app.is_downloading(message_id)
+                    || app.is_document_downloading(message_id),
+                saved_document_path: app.saved_document_path(message_id),
                 reaction_picker_open: app.reaction_picker_for() == Some(message_id.as_str()),
             };
 

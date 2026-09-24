@@ -902,6 +902,11 @@ pub struct WhatsAppApp {
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
+    /// Native document destinations, scoped to the account, chat and message
+    /// that initiated the save. Browser handoffs never enter this map.
+    saved_documents: HashMap<(String, String, String), std::path::PathBuf>,
+    /// Document saves use the same account/chat/message identity as results.
+    document_downloads_in_flight: std::collections::HashSet<(String, String, String)>,
     /// What call is happening, where this window draws it, and what it has
     /// asked the devices for that has not come back yet. See [`calls_ctl`].
     calls: Entity<calls_ctl::Calls>,
@@ -1410,6 +1415,8 @@ impl WhatsAppApp {
             recovery: cx.new(|_| recovery::Recovering::new()),
             notices: cx.new(|_| notices::Notices::new()),
             downloads_in_flight: std::collections::HashSet::new(),
+            saved_documents: HashMap::new(),
+            document_downloads_in_flight: std::collections::HashSet::new(),
             calls: cx.new(|_| calls_ctl::Calls::new()),
             plugins: cx.new(|_| plugins_ctl::Plugins::new()),
             search: cx.new(|_| search::Search::new()),
@@ -2216,6 +2223,8 @@ impl WhatsAppApp {
         // Playback itself is already stopped, above.
         self.video_players.clear();
         self.downloads_in_flight.clear();
+        self.saved_documents.clear();
+        self.document_downloads_in_flight.clear();
         // The viewer names a chat and a message in it, both of which have
         // just gone; and both searches were typed against a list and a
         // conversation this account no longer has.

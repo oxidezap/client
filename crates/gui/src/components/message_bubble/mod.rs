@@ -85,6 +85,8 @@ pub struct BubbleProps {
     pub playback_speed: f32,
     /// Whether this message's media is being fetched right now.
     pub is_downloading: bool,
+    /// Exact native file produced by this message's download, if still known.
+    pub saved_document_path: Option<std::path::PathBuf>,
     /// Whether the quick-react strip is open under this bubble. Travels
     /// with the row for the reason the ids do: reading the app here would
     /// re-enter the entity the virtual list already leased to build it.
@@ -281,6 +283,7 @@ pub fn render_message_bubble(
                                             audio: props.audio,
                                             playback_speed: props.playback_speed,
                                             is_downloading: props.is_downloading,
+                                            saved_document_path: props.saved_document_path.clone(),
                                             max_media_size: layout.max_media_size(),
                                         },
                                         cx,

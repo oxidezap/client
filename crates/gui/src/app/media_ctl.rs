@@ -622,21 +622,40 @@ impl WhatsAppApp {
             warn!("Cannot download document: client is unavailable");
             return;
         }
-        // The same slot an image claims, so the card can say "Saving…" and a
-        // second tap does not start a second download.
-        if !self.begin_download(&message_id, cx) {
+        // Deduplicate within this account/chat/message, without blocking a
+        // different conversation that happens to reuse the same message id.
+        let Some(scope) = self.document_scope(&message_id) else {
+            return;
+        };
+        if !self.document_downloads_in_flight.insert(scope.clone()) {
             return;
         }
+        cx.notify();
         let Some(client) = &self.client else {
-            self.finish_download(&message_id);
+            self.document_downloads_in_flight.remove(&scope);
             return;
         };
         let download_rx = client.download_downloadable_media(downloadable);
+        let expected_scope = scope.clone();
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
                 Ok(data) => match hand_to_user(cx, file_name, data).await {
-                    Ok(where_it_went) => info!("Document {message_id} saved to {where_it_went}"),
+                    Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
+                        let display = path.display().to_string();
+                        let _ = entity.update(cx, |app, cx| {
+                            if app.document_scope(&message_id).as_ref() == Some(&expected_scope) {
+                                app.saved_documents.insert(expected_scope, path);
+                                cx.notify();
+                            }
+                        });
+                        info!("Document {message_id} saved to {display}");
+                    }
+                    Ok(crate::platform::download::DownloadOutcome::BrowserDownloadRequested(
+                        where_it_went,
+                    )) => {
+                        info!("Document {message_id} handed to {where_it_went}");
+                    }
                     Err(e) => {
                         warn!("Failed to save document {message_id}: {e}");
                         say(&entity, cx, e);
@@ -652,12 +671,72 @@ impl WhatsAppApp {
                 }
             }
             let _ = entity.update(cx, |app, cx| {
-                app.finish_download(&message_id);
+                app.document_downloads_in_flight.remove(&scope);
                 cx.notify();
             });
         })
         .detach();
     }
+    /// Identity tuple for a document operation; a message id alone is not
+    /// unique across accounts or conversations.
+    fn document_scope(&self, message_id: &str) -> Option<(String, String, String)> {
+        let account = format!(
+            "{}|{}",
+            self.account_jid.as_deref().unwrap_or(""),
+            self.account_lid.as_deref().unwrap_or("")
+        );
+        Some((account, self.selected_chat.clone()?, message_id.to_owned()))
+    }
+
+    /// Whether this document is being saved in the current account/chat.
+    pub fn is_document_downloading(&self, message_id: &str) -> bool {
+        self.document_scope(message_id)
+            .is_some_and(|scope| self.document_downloads_in_flight.contains(&scope))
+    }
+
+    /// The saved native destination for this message in the current chat.
+    pub fn saved_document_path(&self, message_id: &str) -> Option<std::path::PathBuf> {
+        self.saved_documents
+            .get(&self.document_scope(message_id)?)
+            .cloned()
+    }
+
+    /// Open the exact file produced by the save operation, if it still exists.
+    pub fn open_saved_document(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(path) = self.saved_document_path(message_id) else {
+            return;
+        };
+        if path.is_file() {
+            cx.open_with_system(&path);
+        } else if let Some(scope) = self.document_scope(message_id) {
+            self.saved_documents.remove(&scope);
+            cx.notify();
+            self.notify_user(
+                "That file is no longer in Downloads. Save it again to open it.".into(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+        }
+    }
+
+    /// Reveal the exact saved file in its containing folder.
+    pub fn reveal_saved_document(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(path) = self.saved_document_path(message_id) else {
+            return;
+        };
+        if path.is_file() {
+            cx.reveal_path(&path);
+        } else if let Some(scope) = self.document_scope(message_id) {
+            self.saved_documents.remove(&scope);
+            cx.notify();
+            self.notify_user(
+                "That file is no longer in Downloads. Save it again to show it.".into(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+        }
+    }
+
     /// Save a picture already in hand to the Downloads directory.
     ///
     /// Distinct from `download_document`, which fetches first: by the time
@@ -688,7 +767,12 @@ impl WhatsAppApp {
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match hand_to_user(cx, file_name, data).await {
-                Ok(where_it_went) => info!("Saved {id} to {where_it_went}"),
+                Ok(crate::platform::download::DownloadOutcome::NativeFile(path)) => {
+                    info!("Saved {id} to {}", path.display())
+                }
+                Ok(crate::platform::download::DownloadOutcome::BrowserDownloadRequested(
+                    description,
+                )) => info!("Saved {id} to {description}"),
                 Err(e) => {
                     warn!("Failed to save {id}: {e}");
                     say(&entity, cx, e);
@@ -1202,7 +1286,7 @@ async fn hand_to_user(
     cx: &mut gpui::AsyncApp,
     file_name: String,
     data: std::sync::Arc<Vec<u8>>,
-) -> Result<String, String> {
+) -> Result<crate::platform::download::DownloadOutcome, String> {
     if crate::platform::download::SAVES_OFF_THREAD {
         cx.background_spawn(async move { crate::platform::download::save(&file_name, &data) })
             .await
