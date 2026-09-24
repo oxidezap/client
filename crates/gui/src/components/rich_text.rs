@@ -244,7 +244,7 @@ fn render_with_links(parsed: &BubbleText, document_order: u64, cx: &App) -> Sele
             code.push((start..end, mono.clone()));
         }
     }
-    let styled = StyledText::new(text)
+    let styled = StyledText::new(text.clone())
         .with_highlights(highlights)
         .with_font_family_overrides(code);
     let ranges: Vec<Range<usize>> = parsed.links.iter().map(|link| link.range.clone()).collect();
@@ -285,8 +285,8 @@ fn link_style(
 #[cfg(test)]
 mod tests {
     use gpui::{
-        Context, IntoElement, Modifiers, MouseButton, ParentElement as _, Render, Styled as _,
-        TestAppContext, Window, div, point, px,
+        AppContext as _, Context, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
+        ParentElement as _, Render, Styled as _, TestAppContext, Window, div, point, px,
     };
 
     use super::{BubbleText, render_rich_text};
