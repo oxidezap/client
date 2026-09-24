@@ -212,11 +212,10 @@ pub(crate) fn merge_rows(
     } else {
         content.and_then(|row| row.edited_at_ms)
     };
-    let sender_jid = if from_me {
-        String::new()
-    } else {
-        survivor.sender_jid.clone()
-    };
+    // The oldest row keeps the stable id, not its legacy transport-specific
+    // author spelling. In particular, an old device-qualified peer JID must
+    // not remain device-qualified after the aliases have been proven equal.
+    let sender_jid = stored_sender(&survivor.sender_jid, from_me);
     let duplicates: Vec<i64> = rows
         .iter()
         .filter_map(|row| (row.id != survivor_id).then_some(row.id))

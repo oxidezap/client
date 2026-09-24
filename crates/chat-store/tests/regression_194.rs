@@ -1207,6 +1207,11 @@ async fn late_mapping_repair_includes_historical_and_device_qualified_senders() 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].id, "MSG-194-LATE-ALIASES");
     assert_eq!(
+        messages[0].sender_jid,
+        jid(old_lid),
+        "alias repair strips the device suffix from the oldest surviving row"
+    );
+    assert_eq!(
         chat_store.chats(false, 10).await.unwrap()[0].unread_count,
         1,
         "merging the mapped copies recalculates unread count"
