@@ -7,7 +7,7 @@
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
 use std::collections::HashSet;
-use wacore_binary::Jid;
+use wacore_binary::{Jid, Server};
 
 use crate::schema;
 use crate::store::writer::ChangeSet;
@@ -266,7 +266,7 @@ pub(crate) fn reconcile_chat(
     chat: &str,
     changes: &mut ChangeSet,
 ) -> QueryResult<()> {
-    reconcile_groups(conn, device_id, Some(chat), changes)
+    reconcile_groups(conn, device_id, Some(chat), None, changes)
 }
 
 pub(crate) fn reconcile_all(
@@ -274,7 +274,132 @@ pub(crate) fn reconcile_all(
     device_id: i32,
     changes: &mut ChangeSet,
 ) -> QueryResult<()> {
-    reconcile_groups(conn, device_id, None, changes)
+    reconcile_groups(conn, device_id, None, None, changes)
+}
+
+/// Repair only authors whose aliases were just learned. This avoids grouping
+/// the whole message index on each contact-sync batch.
+pub(crate) fn reconcile_mappings(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    mappings: &[(String, String)],
+    changes: &mut ChangeSet,
+) -> QueryResult<()> {
+    let mut senders: Vec<String> = mappings
+        .iter()
+        .flat_map(|(lid, pn)| {
+            [
+                Jid::new(pn.clone(), Server::Pn).to_string(),
+                Jid::new(lid.clone(), Server::Lid).to_string(),
+            ]
+        })
+        .collect();
+    senders.sort();
+    senders.dedup();
+    if senders.is_empty() {
+        return Ok(());
+    }
+    reconcile_groups(conn, device_id, None, Some(&senders), changes)?;
+    crate::lid::reconcile_known_chats_for(conn, device_id, mappings, changes)?;
+    store_mapping_watermark(conn, device_id)
+}
+
+/// Run the expensive legacy sweep only when the mapping ledger has advanced
+/// since the last complete repair. New mappings are reconciled incrementally.
+pub(crate) fn reconcile_startup(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    changes: &mut ChangeSet,
+) -> QueryResult<()> {
+    if !device_exists(conn, device_id)? {
+        return Ok(());
+    }
+    let current = mapping_watermark(conn, device_id)?;
+    let stored = schema::message_identity_repair_state::table
+        .filter(schema::message_identity_repair_state::device_id.eq(device_id))
+        .select((
+            schema::message_identity_repair_state::mapping_high_water,
+            schema::message_identity_repair_state::mapping_count,
+        ))
+        .first::<(i64, i64)>(conn)
+        .optional()?;
+    if stored == Some(current) {
+        return Ok(());
+    }
+    reconcile_all(conn, device_id, changes)?;
+    crate::lid::reconcile_known_chats(conn, device_id, changes)?;
+    store_mapping_watermark_value(conn, device_id, current)
+}
+
+pub(crate) fn mark_mapping_repair_current(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+) -> QueryResult<()> {
+    store_mapping_watermark(conn, device_id)
+}
+
+#[derive(QueryableByName)]
+struct DeviceExists {
+    #[diesel(sql_type = Bool)]
+    found: bool,
+}
+
+fn device_exists(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<bool> {
+    let result: DeviceExists =
+        diesel::sql_query("SELECT EXISTS(SELECT 1 FROM device WHERE id = ?) AS found")
+            .bind::<Integer, _>(device_id)
+            .get_result(conn)?;
+    Ok(result.found)
+}
+
+#[derive(QueryableByName)]
+struct MappingWatermark {
+    #[diesel(sql_type = BigInt)]
+    mapping_high_water: i64,
+    #[diesel(sql_type = BigInt)]
+    mapping_count: i64,
+}
+
+/// The updated-at high-water detects mapping refreshes; the row count also
+/// catches newly learned aliases whose source timestamp ties the high-water.
+fn mapping_watermark(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<(i64, i64)> {
+    let state: MappingWatermark = diesel::sql_query(
+        "SELECT COALESCE(MAX(updated_at), 0) AS mapping_high_water, COUNT(*) AS mapping_count \
+         FROM lid_pn_mapping WHERE device_id = ?",
+    )
+    .bind::<Integer, _>(device_id)
+    .get_result(conn)?;
+    Ok((state.mapping_high_water, state.mapping_count))
+}
+
+fn store_mapping_watermark(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
+    if !device_exists(conn, device_id)? {
+        return Ok(());
+    }
+    let state = mapping_watermark(conn, device_id)?;
+    store_mapping_watermark_value(conn, device_id, state)
+}
+
+fn store_mapping_watermark_value(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    (mapping_high_water, mapping_count): (i64, i64),
+) -> QueryResult<()> {
+    use schema::message_identity_repair_state::dsl;
+    diesel::insert_into(dsl::message_identity_repair_state)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::mapping_high_water.eq(mapping_high_water),
+            dsl::mapping_count.eq(mapping_count),
+        ))
+        .on_conflict(dsl::device_id)
+        .do_update()
+        .set((
+            dsl::mapping_high_water.eq(mapping_high_water),
+            dsl::mapping_count.eq(mapping_count),
+        ))
+        .execute(conn)?;
+    Ok(())
 }
 
 #[derive(QueryableByName)]
@@ -289,10 +414,12 @@ fn reconcile_groups(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: Option<&str>,
+    senders: Option<&[String]>,
     changes: &mut ChangeSet,
 ) -> QueryResult<()> {
-    let groups: Vec<MessageGroup> = match chat {
-        Some(chat) => diesel::sql_query(
+    use schema::messages::dsl;
+    let groups: Vec<MessageGroup> = match (chat, senders) {
+        (Some(chat), None) => diesel::sql_query(
             "SELECT chat_jid, msg_id FROM messages WHERE device_id = ? AND chat_jid = ? \
              GROUP BY chat_jid, msg_id HAVING COUNT(*) > 1 \
              UNION SELECT DISTINCT chat_jid, msg_id FROM messages \
@@ -303,7 +430,34 @@ fn reconcile_groups(
         .bind::<Integer, _>(device_id)
         .bind::<Text, _>(chat)
         .load(conn)?,
-        None => diesel::sql_query(
+        (None, Some(senders)) => {
+            let mut groups = Vec::new();
+            for page in senders.chunks(crate::queries::BIND_CHUNK - 1) {
+                let rows: Vec<(String, String)> = dsl::messages
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::from_me.eq(false))
+                            .and(dsl::sender_jid.eq_any(page)),
+                    )
+                    .group_by((dsl::chat_jid, dsl::msg_id))
+                    .having(diesel::dsl::count_star().gt(1))
+                    .select((dsl::chat_jid, dsl::msg_id))
+                    .load(conn)?;
+                groups.extend(
+                    rows.into_iter()
+                        .map(|(chat_jid, msg_id)| MessageGroup { chat_jid, msg_id }),
+                );
+            }
+            groups.sort_by(|left, right| {
+                (&left.chat_jid, &left.msg_id).cmp(&(&right.chat_jid, &right.msg_id))
+            });
+            groups.dedup_by(|left, right| {
+                left.chat_jid == right.chat_jid && left.msg_id == right.msg_id
+            });
+            groups
+        }
+        (None, None) => diesel::sql_query(
             "SELECT chat_jid, msg_id FROM messages WHERE device_id = ? \
              GROUP BY chat_jid, msg_id HAVING COUNT(*) > 1 \
              UNION SELECT DISTINCT chat_jid, msg_id FROM messages \
@@ -312,9 +466,9 @@ fn reconcile_groups(
         .bind::<Integer, _>(device_id)
         .bind::<Integer, _>(device_id)
         .load(conn)?,
+        (Some(_), Some(_)) => unreachable!("select either a chat or mapped authors"),
     };
 
-    use schema::messages::dsl;
     let mut changed_chats = HashSet::new();
     for group in groups {
         let candidates: Vec<MessageOwner> = dsl::messages

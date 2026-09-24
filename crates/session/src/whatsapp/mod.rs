@@ -1587,7 +1587,7 @@ impl WhatsAppClient {
                 // The writer may have already materialized the same author
                 // under both keys before this mapping became durable. Fold
                 // those legacy rows before consumers re-read the affected chats.
-                if let Err(error) = chat_store.reconcile_all_messages() {
+                if let Err(error) = chat_store.reconcile_message_mappings(&mappings) {
                     warn!("could not queue message identity reconciliation: {error}");
                 } else if let Err(error) = chat_store.flush().await {
                     warn!("could not reconcile message identities after learning aliases: {error}");

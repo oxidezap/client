@@ -97,6 +97,7 @@ pub(crate) enum WriterMsg {
     },
     Reconcile(Jid),
     ReconcileAll,
+    ReconcileMappings(Vec<(String, String)>),
     /// Display names resolved from server metadata (group subjects,
     /// channel names) for chats whose rows hold NULL. Written only when a
     /// name is news — like the group-subject arm — so a pass that learned
@@ -315,11 +316,12 @@ impl ChatStore {
     }
 
     /// Open the already-prepared database on the same file as `store`, bound to
-    /// its device id, repair proven legacy message duplicates, and start the
-    /// writer task.
+    /// its device id, repair proven legacy message duplicates when the mapping
+    /// ledger has advanced, and start the writer task.
     ///
-    /// Repair is one account-scoped transaction against the mapping ledger as
-    /// it stands now; a tombstone wins, and previews/unread are re-derived.
+    /// The per-device high-water marker avoids repeating the device-wide pass;
+    /// newly learned aliases use a scoped writer request. Repairs are
+    /// transactional; a tombstone wins, and previews/unread are re-derived.
     /// This is the entry point for a runtime after the registry has called
     /// [`Self::prepare`]. It does not launch another migration runner.
     pub async fn new_prepared(store: &SqliteStore) -> Result<Arc<Self>> {
@@ -328,8 +330,7 @@ impl ChatStore {
         db.run(move |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
                 let mut changes = ChangeSet::default();
-                crate::store::message_identity::reconcile_all(conn, device_id, &mut changes)?;
-                crate::lid::reconcile_known_chats(conn, device_id, &mut changes)?;
+                crate::store::message_identity::reconcile_startup(conn, device_id, &mut changes)?;
                 Ok(())
             })
             .map_err(crate::error::db_err)
@@ -627,6 +628,17 @@ impl ChatStore {
 
     /// Reconcile legacy message identities after the account learns new PN/LID
     /// mappings. Use [`flush`](Self::flush) to await the transaction.
+    pub fn reconcile_message_mappings(&self, mappings: &[(String, String)]) -> Result<()> {
+        if mappings.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::ReconcileMappings(mappings.to_vec()))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Reconcile all stored message identities explicitly. Use [`flush`](Self::flush)
+    /// to await the transaction; startup and learned mappings use scoped repairs.
     pub fn reconcile_all_messages(&self) -> Result<()> {
         self.tx
             .send(WriterMsg::ReconcileAll)

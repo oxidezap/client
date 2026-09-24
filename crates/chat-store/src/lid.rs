@@ -352,6 +352,80 @@ pub(crate) fn reconcile_known_chats(
     Ok(())
 }
 
+/// Reconcile the alias components touched by a newly persisted mapping batch.
+/// Historical LIDs for each PN are included, but unrelated chats are never
+/// visited.
+pub(crate) fn reconcile_known_chats_for(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    mappings: &[(String, String)],
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    use schema::chats::dsl as chats;
+    use schema::lid_pn_mapping::dsl as ledger;
+
+    let mut phone_numbers: Vec<String> = mappings.iter().map(|(_, pn)| pn.clone()).collect();
+    phone_numbers.sort();
+    phone_numbers.dedup();
+    let mut aliases_by_pn: HashMap<String, Vec<String>> = phone_numbers
+        .into_iter()
+        .map(|pn| {
+            let key = Jid::new(pn.clone(), Server::Pn).to_string();
+            (pn, vec![key])
+        })
+        .collect();
+    let mut phone_numbers: Vec<String> = aliases_by_pn.keys().cloned().collect();
+    phone_numbers.sort();
+    for page in phone_numbers.chunks(crate::queries::BIND_CHUNK) {
+        let rows: Vec<(String, String)> = ledger::lid_pn_mapping
+            .filter(
+                ledger::device_id
+                    .eq(device_id)
+                    .and(ledger::phone_number.eq_any(page)),
+            )
+            .select((ledger::lid, ledger::phone_number))
+            .load(conn)?;
+        for (lid, pn) in rows {
+            aliases_by_pn
+                .entry(pn)
+                .or_default()
+                .push(Jid::new(lid, Server::Lid).to_string());
+        }
+    }
+    let mut all_keys = Vec::new();
+    for aliases in aliases_by_pn.values_mut() {
+        aliases.sort();
+        aliases.dedup();
+        all_keys.extend(aliases.iter().cloned());
+    }
+    all_keys.sort();
+    all_keys.dedup();
+    let mut present = std::collections::HashSet::new();
+    for page in all_keys.chunks(crate::queries::BIND_CHUNK) {
+        present.extend(
+            chats::chats
+                .filter(chats::device_id.eq(device_id).and(chats::jid.eq_any(page)))
+                .select(chats::jid)
+                .load::<String>(conn)?,
+        );
+    }
+    for aliases in aliases_by_pn.values() {
+        let existing: Vec<String> = aliases
+            .iter()
+            .filter(|key| present.contains(*key))
+            .cloned()
+            .collect();
+        if existing.len() < 2 {
+            continue;
+        }
+        let mut destination = existing[0].clone();
+        for source in existing.iter().skip(1) {
+            destination = merge_split_chat(conn, device_id, &destination, source, cs)?;
+        }
+    }
+    Ok(())
+}
+
 fn lid_side<'a>(a: &'a str, b: &'a str) -> &'a str {
     if a.ends_with("@lid") { a } else { b }
 }

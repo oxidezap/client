@@ -1,0 +1,1 @@
+DROP TABLE message_identity_repair_state;

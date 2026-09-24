@@ -234,7 +234,11 @@ fn apply_writer_msg(
         }
         WriterMsg::ReconcileAll => {
             crate::store::message_identity::reconcile_all(conn, device_id, cs)?;
-            crate::lid::reconcile_known_chats(conn, device_id, cs)
+            crate::lid::reconcile_known_chats(conn, device_id, cs)?;
+            crate::store::message_identity::mark_mapping_repair_current(conn, device_id)
+        }
+        WriterMsg::ReconcileMappings(mappings) => {
+            crate::store::message_identity::reconcile_mappings(conn, device_id, mappings, cs)
         }
         WriterMsg::Outgoing {
             chat,
@@ -507,6 +511,9 @@ fn local_reaction_target_matches(
         return Ok(false);
     };
     let Some(participant) = target_participant else {
+        if target_from_me {
+            return Ok(stored_from_me);
+        }
         let needs_participant = Jid::from_str(chat).is_ok_and(|jid| {
             jid.is_group() || jid.is_status_broadcast() || jid.is_broadcast_list()
         });

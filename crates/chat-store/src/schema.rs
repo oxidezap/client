@@ -113,6 +113,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    message_identity_repair_state (device_id) {
+        device_id -> Integer,
+        mapping_high_water -> BigInt,
+        mapping_count -> BigInt,
+    }
+}
+
+diesel::table! {
     avatar_descriptors (device_id, jid) {
         device_id -> Integer,
         jid -> Text,
@@ -129,5 +137,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     reactions,
     contacts,
     contact_labels,
-    message_receipts
+    message_receipts,
+    message_identity_repair_state
 );
