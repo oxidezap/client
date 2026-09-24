@@ -50,6 +50,12 @@ async fn subscribed_removal_clears_only_address_book_names_and_notifies_on_chang
     // registered on the client (not apply_event/SQL).
     let handler = store.handler();
     assert!(handler.interest().wants(EventKind::ContactRemoved));
+    assert!(
+        !store
+            .handler_without_contact_events()
+            .interest()
+            .wants(EventKind::ContactRemoved)
+    );
     feed(&store, [contact_update(PEER, "Saved Name", "Saved")]).await;
     let saved = store.contact(&jid(PEER)).await.unwrap().unwrap();
     assert_eq!(saved.full_name.as_deref(), Some("Saved Name"));

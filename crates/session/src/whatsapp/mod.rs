@@ -218,7 +218,7 @@ const CONTROL_EVENT_KINDS: &[EventKind] = &[
 /// its embedder. They have their own lossless ingress and batched worker: a
 /// full contact sync can be much larger than the latency-sensitive control
 /// mailbox, while these durable identity facts must not be dropped.
-const IDENTITY_EVENT_KINDS: &[EventKind] = &[EventKind::ContactUpdate];
+const IDENTITY_EVENT_KINDS: &[EventKind] = &[EventKind::ContactUpdate, EventKind::ContactRemoved];
 
 fn contact_identity_pair(
     update: &whatsapp_rust::wacore::types::events::ContactUpdate,
@@ -1274,9 +1274,7 @@ impl WhatsAppClient {
         // The chat store materializes history straight off the event bus.
         // detach: the store materializes for the whole session, so the
         // subscription must outlive this scope rather than unregister on drop.
-        bot.client()
-            .subscribe_handler(chat_store.handler())
-            .detach();
+        // Contact events are routed through the ordered identity lane below.
 
         // The UI observes only the event kinds handled below. Two bounded
         // mailboxes reserve space for session and call control; committed
@@ -1309,9 +1307,13 @@ impl WhatsAppClient {
         bot.client().subscribe_handler(control_events).detach();
         bot.client().subscribe_handler(data_events).detach();
         bot.client().subscribe_handler(identity_events).detach();
+        bot.client()
+            .subscribe_handler(chat_store.handler_without_contact_events())
+            .detach();
         Self::spawn_contact_identity_learner(
             bot.client(),
             identity_incoming,
+            chat_store.handler(),
             names.clone(),
             reload.clone(),
             stopping.clone(),
@@ -1527,6 +1529,7 @@ impl WhatsAppClient {
     fn spawn_contact_identity_learner(
         client: Arc<Client>,
         incoming: async_channel::Receiver<Arc<Event>>,
+        chat_store_handler: Arc<dyn EventHandler>,
         names: Arc<NameBook>,
         reload: Arc<tokio::sync::Notify>,
         mut stopping: tokio::sync::watch::Receiver<()>,
@@ -1541,53 +1544,57 @@ impl WhatsAppClient {
                     _ = stopping.changed() => return,
                 };
                 let mut mappings = Vec::new();
-                if let Event::ContactUpdate(update) = &*first
-                    && let Some(pair) = contact_identity_pair(update)
-                {
-                    mappings.push(pair);
-                }
-                // Drain the already queued portion of a full sync into the
-                // client's durable batch API. New arrivals remain queued for
-                // the next pass; no fixed batch limit is needed because the
-                // event bus has already materialized this finite burst.
+                let mut contact_events = vec![first];
+                // Drain the already queued portion of a full sync. These
+                // contact events are applied to the chat store only after the
+                // aliases in the same ordered batch are durable; otherwise a
+                // removal could outrun the independent identity learner.
                 while let Ok(event) = incoming.try_recv() {
-                    if let Event::ContactUpdate(update) = &*event
+                    contact_events.push(event);
+                }
+                for event in &contact_events {
+                    if let Event::ContactUpdate(update) = &**event
                         && let Some(pair) = contact_identity_pair(update)
                     {
                         mappings.push(pair);
                     }
                 }
-                if mappings.is_empty() {
-                    continue;
-                }
 
-                loop {
-                    let learned = client.add_lid_pn_mappings(
-                        mappings.clone(),
-                        whatsapp_rust::lid_pn_cache::LearningSource::Other,
-                    );
-                    let result = tokio::select! {
-                        result = learned => result,
-                        _ = stopping.changed() => return,
-                    };
-                    match result {
-                        Ok(_) => break,
-                        Err(error) => {
-                            warn!("could not persist a batch of contact LID/PN mappings: {error}");
-                            tokio::select! {
-                                _ = crate::exec::sleep(std::time::Duration::from_secs(1)) => {}
-                                _ = stopping.changed() => return,
+                if !mappings.is_empty() {
+                    loop {
+                        let learned = client.add_lid_pn_mappings(
+                            mappings.clone(),
+                            whatsapp_rust::lid_pn_cache::LearningSource::Other,
+                        );
+                        let result = tokio::select! {
+                            result = learned => result,
+                            _ = stopping.changed() => return,
+                        };
+                        match result {
+                            Ok(_) => break,
+                            Err(error) => {
+                                warn!(
+                                    "could not persist a batch of contact LID/PN mappings: {error}"
+                                );
+                                tokio::select! {
+                                    _ = crate::exec::sleep(std::time::Duration::from_secs(1)) => {}
+                                    _ = stopping.changed() => return,
+                                }
                             }
                         }
                     }
+
+                    // A previous read may have cached an honest mapping miss.
+                    // Invalidate only after the batch is durable.
+                    names.forget();
+                    reload.notify_one();
                 }
 
-                // A previous read may have cached an honest mapping miss.
-                // Invalidate only after the batch is durable; the generation
-                // in NameBook prevents an older in-flight lookup from putting
-                // that miss back after this point.
-                names.forget();
-                reload.notify_one();
+                // Keep ContactUpdate/ContactRemoved ordered for the writer,
+                // after every mapped alias from this sync is available.
+                for event in contact_events {
+                    chat_store_handler.handle_event(event);
+                }
             }
         });
     }

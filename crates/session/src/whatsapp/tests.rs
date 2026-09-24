@@ -83,10 +83,14 @@ fn the_live_data_lane_subscribes_to_server_acks() {
 }
 
 #[test]
-fn the_identity_lane_subscribes_to_contact_updates() {
+fn the_identity_lane_subscribes_to_contact_events() {
     assert!(
         super::IDENTITY_EVENT_KINDS
             .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactUpdate)
+    );
+    assert!(
+        super::IDENTITY_EVENT_KINDS
+            .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactRemoved)
     );
     assert!(
         !super::CONTROL_EVENT_KINDS
