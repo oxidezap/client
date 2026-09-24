@@ -1926,13 +1926,13 @@ impl WhatsAppApp {
             && let Some(window) = self.modal_window
         {
             let selected_messages =
-                crate::components::rich_text_selection::active_selection_message_texts(
+                crate::components::rich_text_selection::active_selection_message_snapshots(
                     window.window_id(),
                     cx,
                 );
             let selected_ids: Vec<String> = selected_messages
                 .iter()
-                .map(|(message_id, _)| message_id.clone())
+                .map(|(message_id, _, _)| message_id.clone())
                 .collect();
             let selection_is_stale = if selected_ids.is_empty() {
                 false
@@ -1971,19 +1971,25 @@ impl WhatsAppApp {
                     (None, Some(current)) => {
                         // The render cache may already be gone, but retained
                         // participants keep the visible text to compare against.
-                        let current_by_id: HashMap<&str, &ChatMessage> = current
+                        let current_by_id: HashMap<&str, (usize, &ChatMessage)> = current
                             .messages
                             .iter()
-                            .map(|message| (message.id.as_str(), message))
+                            .enumerate()
+                            .map(|(index, message)| (message.id.as_str(), (index, message)))
                             .collect();
-                        selected_messages.iter().any(|(message_id, selected_text)| {
-                            let Some(message) = current_by_id.get(message_id.as_str()) else {
-                                return true;
-                            };
-                            !message_has_selectable_text(message)
-                                || crate::components::BubbleText::of(&message.content).text()
-                                    != selected_text.as_ref()
-                        })
+                        selected_messages.iter().any(
+                            |(message_id, selected_text, selected_order)| {
+                                let Some((current_order, message)) =
+                                    current_by_id.get(message_id.as_str())
+                                else {
+                                    return true;
+                                };
+                                *current_order as u64 != *selected_order
+                                    || !message_has_selectable_text(message)
+                                    || crate::components::BubbleText::of(&message.content).text()
+                                        != selected_text.as_ref()
+                            },
+                        )
                     }
                     _ => true,
                 }

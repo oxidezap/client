@@ -33,6 +33,7 @@ struct RetainedSelection {
 struct RetainedParticipant {
     handle: TextSelectionHandle,
     text: SharedString,
+    document_order: u64,
     _selection_subscription: gpui::Subscription,
 }
 
@@ -83,11 +84,11 @@ pub(crate) fn active_selection_message_ids(window_id: gpui::WindowId, cx: &App) 
         .collect()
 }
 
-/// Active message identities and their retained visible text.
-pub(crate) fn active_selection_message_texts(
+/// Active message identities and their retained text and timeline order.
+pub(crate) fn active_selection_message_snapshots(
     window_id: gpui::WindowId,
     cx: &App,
-) -> Vec<(String, SharedString)> {
+) -> Vec<(String, SharedString, u64)> {
     if !cx.has_global::<RichTextSelectionRegistry>() {
         return Vec::new();
     }
@@ -97,7 +98,13 @@ pub(crate) fn active_selection_message_texts(
         .filter(|((id, _), participant)| {
             *id == window_id && participant.handle.snapshot(cx).is_some()
         })
-        .map(|((_, message_id), participant)| (message_id.to_string(), participant.text.clone()))
+        .map(|((_, message_id), participant)| {
+            (
+                message_id.to_string(),
+                participant.text.clone(),
+                participant.document_order,
+            )
+        })
         .collect()
 }
 
@@ -106,6 +113,7 @@ fn track_selection_handle(
     message_id: &Arc<str>,
     handle: &TextSelectionHandle,
     text: &SharedString,
+    document_order: u64,
     cx: &mut App,
 ) {
     let key = (window_id, Arc::clone(message_id));
@@ -120,7 +128,12 @@ fn track_selection_handle(
             .is_some_and(|participant| {
                 participant.handle.entity_id() == handle.entity_id() && participant.text == *text
             });
-        if !already_retained {
+        if already_retained {
+            if let Some(participant) = cx.global_mut::<RichTextSelectionRegistry>().0.get_mut(&key)
+            {
+                participant.document_order = document_order;
+            }
+        } else {
             let registry_key = key.clone();
             let subscription = handle.subscribe(
                 move |event, cx| {
@@ -154,6 +167,7 @@ fn track_selection_handle(
                 RetainedParticipant {
                     handle: handle.clone(),
                     text: text.clone(),
+                    document_order,
                     _selection_subscription: subscription,
                 },
             );
@@ -239,10 +253,17 @@ fn selection_quad_bounds(
     for line in layout.line_layouts() {
         let runs = line.runs();
         let wrap_boundaries = line.wrap_boundaries();
-        let source_indices: Vec<usize> = runs
+        let mut source_boundaries: Vec<usize> = runs
             .iter()
             .flat_map(|run| run.glyphs.iter().map(|glyph| line_start_ix + glyph.index))
             .collect();
+        source_boundaries.sort_unstable();
+        source_boundaries.dedup();
+        let cluster_ends: HashMap<usize, usize> = source_boundaries
+            .windows(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect();
+        let mut cluster_advances: HashMap<(usize, FontId), Pixels> = HashMap::new();
         let mut segments = vec![Vec::new(); wrap_boundaries.len() + 1];
         let mut segment_ix = 0;
         let mut next_boundary_ix = 0;
@@ -284,21 +305,23 @@ fn selection_quad_bounds(
             let mut trailing_advance = Pixels::ZERO;
             for (source_ix, x, font_id) in glyphs {
                 let advance = if *x == visual_right {
-                    let cluster_end_ix = source_indices
-                        .iter()
-                        .copied()
-                        .filter(|candidate| candidate > source_ix)
-                        .min()
-                        .unwrap_or(line_start_ix + line.len());
-                    shaped_cluster_advance(
-                        text,
-                        *source_ix,
-                        cluster_end_ix,
-                        *font_id,
-                        line.font_size(),
-                        window,
-                    )
-                    .unwrap_or(line_height.half())
+                    *cluster_advances
+                        .entry((*source_ix, *font_id))
+                        .or_insert_with(|| {
+                            let cluster_end_ix = cluster_ends
+                                .get(source_ix)
+                                .copied()
+                                .unwrap_or(line_start_ix + line.len());
+                            shaped_cluster_advance(
+                                text,
+                                *source_ix,
+                                cluster_end_ix,
+                                *font_id,
+                                line.font_size(),
+                                window,
+                            )
+                            .unwrap_or(line_height.half())
+                        })
                 } else {
                     Pixels::ZERO
                 };
@@ -598,6 +621,7 @@ impl Element for SelectableRichText {
             &self.selection_key,
             &handle.handle,
             &self.text,
+            self.document_order,
             cx,
         );
         let (layout_id, ()) = self
