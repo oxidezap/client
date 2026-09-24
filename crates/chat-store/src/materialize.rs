@@ -225,7 +225,7 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
             }
             (Some(ProtocolType::MESSAGE_EDIT), Some(target_id)) => {
                 if let Some(edited) = pm.edited_message.as_option() {
-                    let edited_base = edited.get_base_message();
+                    let edited_base = normalized_message(edited);
                     return MessageOp::Edit {
                         target_id,
                         new_text: extract_text(edited_base),
@@ -683,7 +683,12 @@ mod tests {
             protocol_message: MessageField::some(wa::message::ProtocolMessage {
                 key: key_for("MSG3"),
                 r#type: Some(ProtocolType::MESSAGE_EDIT),
-                edited_message: MessageField::from_box(Box::new(wa::Message::text("fixed"))),
+                edited_message: MessageField::from_box(Box::new(wa::Message {
+                    group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
+                        message: MessageField::some(wa::Message::text("fixed")),
+                    }),
+                    ..Default::default()
+                })),
                 ..Default::default()
             }),
             ..Default::default()
