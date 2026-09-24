@@ -214,23 +214,20 @@ impl Element for RetainedSelectionKeepalive {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let window_id = window.window_handle().window_id();
-        let retained = cx
-            .has_global::<RichTextSelectionRegistry>()
-            .then(|| {
-                cx.global::<RichTextSelectionRegistry>()
-                    .0
-                    .iter()
-                    .filter(|((id, _), participant)| {
-                        *id == window_id && participant.handle.snapshot(cx).is_some()
-                    })
-                    .map(|(_, participant)| {
-                        (participant.handle.clone(), participant.document_order)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let retained = if cx.has_global::<RichTextSelectionRegistry>() {
+            cx.global::<RichTextSelectionRegistry>()
+                .0
+                .iter()
+                .filter(|((id, _), participant)| {
+                    *id == window_id && participant.handle.snapshot(cx).is_some()
+                })
+                .map(|(_, participant)| (participant.handle.clone(), participant.document_order))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if retained.is_empty() {
-            return ();
+            return;
         }
 
         // Keep the selection participants alive without presenting stale row
