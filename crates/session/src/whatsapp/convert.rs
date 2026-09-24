@@ -143,20 +143,7 @@ pub(super) fn poll_of(message: &wa::Message) -> Option<PollContent> {
 /// and teaching the bubble to draw one while the vote refuses it would be
 /// the disagreement this sharing exists to prevent.
 pub(super) fn poll_creation_of(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
-    let base = message.get_base_message();
-    let base = [
-        &base.group_mentioned_message,
-        &base.associated_child_message,
-        &base.poll_creation_message_v4,
-    ]
-    .into_iter()
-    .find_map(|wrapper| wrapper.as_option().and_then(|w| w.message.as_option()))
-    .map(|inner| inner.get_base_message())
-    .unwrap_or(base);
-    base.poll_creation_message_v3
-        .as_option()
-        .or_else(|| base.poll_creation_message_v2.as_option())
-        .or_else(|| base.poll_creation_message.as_option())
+    oxidezap_chat_store::supported_poll_creation_message(message)
 }
 
 /// Map the store's durable delivery state onto the one the UI draws.

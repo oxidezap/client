@@ -10,6 +10,97 @@ mod common;
 use common::*;
 
 #[tokio::test]
+async fn wrapped_and_new_poll_kinds_are_classified_on_outgoing_write() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    for (id, message) in [
+        (
+            "OUT-V4",
+            wa::Message {
+                poll_creation_message_v4: buffa::MessageField::some(
+                    wa::message::FutureProofMessage {
+                        message: buffa::MessageField::some(wa::Message {
+                            poll_creation_message_v3: buffa::MessageField::some(Default::default()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+        ),
+        (
+            "OUT-V5",
+            wa::Message {
+                poll_creation_message_v5: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            },
+        ),
+        (
+            "OUT-V6",
+            wa::Message {
+                poll_creation_message_v6: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            },
+        ),
+    ] {
+        chat_store
+            .record_outgoing(&chat, id, &message, ts(1_700_000_100))
+            .unwrap();
+    }
+    chat_store.flush().await.unwrap();
+    for id in ["OUT-V4", "OUT-V5", "OUT-V6"] {
+        let stored = chat_store.message(&chat, id).await.unwrap().unwrap();
+        assert_eq!(stored.kind, MessageKind::Poll, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn prepare_repairs_recoverable_unknown_kind_idempotently() {
+    let (store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let poll = wa::Message {
+        poll_creation_message_v5: buffa::MessageField::some(Default::default()),
+        ..Default::default()
+    };
+    chat_store
+        .record_outgoing(&chat, "OUT-REPAIR", &poll, ts(1_700_000_100))
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let chat_key = chat.to_string();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("UPDATE messages SET kind = 'unknown' WHERE msg_id = 'OUT-REPAIR'")
+                .execute(conn)
+                .map_err(oxidezap_chat_store::db_err)?;
+            diesel::sql_query("UPDATE chats SET last_message_kind = 'unknown' WHERE jid = ?")
+                .bind::<diesel::sql_types::Text, _>(chat_key)
+                .execute(conn)
+                .map_err(oxidezap_chat_store::db_err)?;
+            Ok(())
+        })
+        .await
+        .expect("mark historical kind unknown");
+
+    oxidezap_chat_store::ChatStore::prepare(&store)
+        .await
+        .expect("repair old row");
+    oxidezap_chat_store::ChatStore::prepare(&store)
+        .await
+        .expect("repeat repair safely");
+    let repaired = chat_store
+        .message(&chat, "OUT-REPAIR")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.kind, MessageKind::Poll);
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_kind, Some(MessageKind::Poll));
+}
+
+#[tokio::test]
 async fn outgoing_status_advances_monotonically() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);

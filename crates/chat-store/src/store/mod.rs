@@ -288,6 +288,66 @@ struct MigrationCount {
     count: i64,
 }
 
+#[derive(diesel::QueryableByName)]
+struct UnknownKindRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    device_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    chat_jid: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    timestamp_ms: i64,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    proto: Vec<u8>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    proto_codec: i32,
+}
+
+/// Repair only live rows whose old `unknown` label can be disproved from a
+/// valid stored protobuf. Invalid/compressed-unreadable protos and tombstones
+/// are left untouched. Re-running is harmless because repaired rows leave the
+/// candidate set.
+fn repair_unknown_message_kinds(conn: &mut diesel::SqliteConnection) -> QueryResult<()> {
+    use diesel::sql_types::{BigInt, Integer, Text};
+    let rows = diesel::sql_query(
+        "SELECT id, device_id, chat_jid, timestamp_ms, proto, proto_codec FROM messages \
+         WHERE kind = 'unknown' AND revoked = 0 AND proto IS NOT NULL",
+    )
+    .load::<UnknownKindRow>(conn)?;
+    for row in rows {
+        let Ok(message) = crate::storage_proto::decode_storage_proto(&row.proto, row.proto_codec)
+        else {
+            continue;
+        };
+        let kind = crate::materialize::message_kind(&message);
+        if kind == "unknown" {
+            continue;
+        }
+        diesel::sql_query(
+            "UPDATE messages SET kind = ? WHERE id = ? AND kind = 'unknown' AND revoked = 0",
+        )
+        .bind::<Text, _>(kind)
+        .bind::<BigInt, _>(row.id)
+        .execute(conn)?;
+        // Timestamp alone is ambiguous when a chat has simultaneous messages;
+        // update the preview label only when this row is the unique head-time row.
+        diesel::sql_query(
+            "UPDATE chats SET last_message_kind = ? WHERE device_id = ? AND jid = ? AND last_message_ts = ? AND last_message_kind = 'unknown' \
+             AND (SELECT count(*) FROM messages WHERE device_id = ? AND chat_jid = ? AND timestamp_ms = ? AND revoked = 0) = 1",
+        )
+        .bind::<Text, _>(kind)
+        .bind::<Integer, _>(row.device_id)
+        .bind::<Text, _>(row.chat_jid.clone())
+        .bind::<BigInt, _>(row.timestamp_ms)
+        .bind::<Integer, _>(row.device_id)
+        .bind::<Text, _>(row.chat_jid)
+        .bind::<BigInt, _>(row.timestamp_ms)
+        .execute(conn)?;
+    }
+    Ok(())
+}
+
 impl ChatStore {
     /// Prepare the shared chat schema once before account runtimes start.
     ///
@@ -304,6 +364,7 @@ impl ChatStore {
             conn.run_pending_migrations(MIGRATIONS)
                 .map(|_| ())
                 .map_err(StoreError::Migration)?;
+            repair_unknown_message_kinds(conn).map_err(crate::error::db_err)?;
             #[cfg(feature = "search")]
             crate::fts::ensure_fts(conn).map_err(db_err)?;
             Ok(())
@@ -420,13 +481,13 @@ impl ChatStore {
         message: &wa::Message,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
-        let base = wacore::proto_helpers::MessageExt::get_base_message(message);
+        let base = crate::materialize::normalized_message(message);
         self.tx
             .send(WriterMsg::Outgoing {
                 chat: chat.clone(),
                 msg_id: msg_id.into(),
                 proto: waproto::codec::message_to_vec(message),
-                kind: message_kind(base),
+                kind: message_kind(message),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
@@ -447,13 +508,13 @@ impl ChatStore {
         new_content: &wa::Message,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
-        let base = wacore::proto_helpers::MessageExt::get_base_message(new_content);
+        let base = crate::materialize::normalized_message(new_content);
         self.tx
             .send(WriterMsg::Edit {
                 chat: chat.clone(),
                 target_id: target_id.to_owned(),
                 proto: waproto::codec::message_to_vec(new_content),
-                kind: message_kind(base),
+                kind: message_kind(new_content),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
             })

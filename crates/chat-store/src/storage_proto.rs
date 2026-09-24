@@ -267,21 +267,7 @@ pub(crate) fn strip_redundant_secret(msg: &mut wa::Message) -> bool {
 /// envelope `get_base_message` does not open is still the ballot whose
 /// secret the store has to keep.
 fn is_poll_creation(msg: &wa::Message) -> bool {
-    use wacore::proto_helpers::MessageExt as _;
-    let base = msg.get_base_message();
-    let base = [
-        &base.group_mentioned_message,
-        &base.associated_child_message,
-        &base.poll_creation_message_v4,
-    ]
-    .into_iter()
-    .find_map(|wrapper| wrapper.as_option().and_then(|w| w.message.as_option()))
-    .map(|inner| inner.get_base_message())
-    .unwrap_or(base);
-    base.poll_creation_message.is_set()
-        || base.poll_creation_message_v2.is_set()
-        || base.poll_creation_message_v3.is_set()
-        || base.poll_creation_message_v4.is_set()
+    crate::materialize::poll_creation_message(msg).is_some()
 }
 
 /// Whether `msg` holds anything the storage copy would compact: a quoted
@@ -694,6 +680,38 @@ mod tests {
         assert!(!strip_redundant_secret(&mut msg));
         let ctx = msg.message_context_info.as_option().expect("kept");
         assert_eq!(ctx.message_secret.as_deref(), Some([7u8; 32].as_slice()));
+    }
+
+    #[test]
+    fn v5_v6_poll_secrets_survive_storage_compaction() {
+        let v5 = wa::Message {
+            poll_creation_message_v5: buffa::MessageField::some(Default::default()),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![9; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let v6 = wa::Message {
+            poll_creation_message_v6: buffa::MessageField::some(Default::default()),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![8; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (mut message, expected) in [(v5, 9), (v6, 8)] {
+            assert!(!strip_redundant_secret(&mut message));
+            let (bytes, codec) = encode_storage_proto(&message);
+            let reopened = decode_storage_proto(&bytes, codec).expect("decode poll");
+            assert_eq!(
+                reopened
+                    .message_context_info
+                    .as_option()
+                    .and_then(|ctx| ctx.message_secret.as_deref()),
+                Some([expected; 32].as_slice())
+            );
+        }
     }
 
     #[test]
