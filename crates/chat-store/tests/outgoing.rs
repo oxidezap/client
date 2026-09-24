@@ -63,7 +63,23 @@ async fn prepare_repairs_recoverable_unknown_kind_idempotently() {
         ..Default::default()
     };
     chat_store
-        .record_outgoing(&chat, "OUT-REPAIR", &poll, ts(1_700_000_100))
+        .record_outgoing(&chat, "OUT-REPAIR-POLL", &poll, ts(1_700_000_100))
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-REPAIR-TOMBSTONE",
+            &wa::Message::text("do not restore me"),
+            ts(1_700_000_125),
+        )
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-REPAIR-TEXT",
+            &wa::Message::text("recovered preview"),
+            ts(1_700_000_150),
+        )
         .unwrap();
     chat_store.flush().await.unwrap();
 
@@ -71,11 +87,33 @@ async fn prepare_repairs_recoverable_unknown_kind_idempotently() {
     store
         .shared()
         .run(move |conn| {
-            diesel::sql_query("UPDATE messages SET kind = 'unknown' WHERE msg_id = 'OUT-REPAIR'")
-                .execute(conn)
-                .map_err(oxidezap_chat_store::db_err)?;
-            diesel::sql_query("UPDATE chats SET last_message_kind = 'unknown' WHERE jid = ?")
-                .bind::<diesel::sql_types::Text, _>(chat_key)
+            diesel::sql_query(
+                "UPDATE messages SET kind = 'unknown' WHERE msg_id = 'OUT-REPAIR-POLL'",
+            )
+            .execute(conn)
+            .map_err(oxidezap_chat_store::db_err)?;
+            diesel::sql_query(
+                "UPDATE messages SET kind = 'unknown', text_content = NULL WHERE msg_id = 'OUT-REPAIR-TEXT'",
+            )
+            .execute(conn)
+            .map_err(oxidezap_chat_store::db_err)?;
+            diesel::sql_query(
+                "UPDATE messages SET kind = 'unknown', revoked = 1 WHERE msg_id = 'OUT-REPAIR-TOMBSTONE'",
+            )
+            .execute(conn)
+            .map_err(oxidezap_chat_store::db_err)?;
+            // A delete-for-me preserves the activity timestamp, which may be
+            // newer than the remaining preview head; the next prepare must
+            // derive preview from the surviving messages rather than this time.
+            diesel::sql_query(
+                "UPDATE chats SET last_message_ts = ?, last_message_preview = 'deleted preview' WHERE jid = ?",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(ts(1_700_000_200).timestamp_millis())
+            .bind::<diesel::sql_types::Text, _>(chat_key)
+            .execute(conn)
+            .map_err(oxidezap_chat_store::db_err)?;
+            // Simulate a database created before this versioned repair marker.
+            diesel::sql_query("DELETE FROM chat_store_meta WHERE key = 'message_kind_classifier'")
                 .execute(conn)
                 .map_err(oxidezap_chat_store::db_err)?;
             Ok(())
@@ -89,14 +127,33 @@ async fn prepare_repairs_recoverable_unknown_kind_idempotently() {
     oxidezap_chat_store::ChatStore::prepare(&store)
         .await
         .expect("repeat repair safely");
-    let repaired = chat_store
-        .message(&chat, "OUT-REPAIR")
+    let repaired_poll = chat_store
+        .message(&chat, "OUT-REPAIR-POLL")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(repaired.kind, MessageKind::Poll);
+    assert_eq!(repaired_poll.kind, MessageKind::Poll);
+    let repaired_text = chat_store
+        .message(&chat, "OUT-REPAIR-TEXT")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired_text.kind, MessageKind::Text);
+    assert_eq!(repaired_text.text.as_deref(), Some("recovered preview"));
+    let tombstone = chat_store
+        .message(&chat, "OUT-REPAIR-TOMBSTONE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tombstone.revoked);
+    assert_eq!(tombstone.kind, MessageKind::Unknown);
     let chats = chat_store.chats(false, 10).await.unwrap();
-    assert_eq!(chats[0].last_message_kind, Some(MessageKind::Poll));
+    assert_eq!(chats[0].last_message_kind, Some(MessageKind::Text));
+    assert_eq!(
+        chats[0].last_message_preview.as_deref(),
+        Some("recovered preview")
+    );
+    assert_eq!(chats[0].last_message_at, Some(ts(1_700_000_200)));
 }
 
 #[tokio::test]

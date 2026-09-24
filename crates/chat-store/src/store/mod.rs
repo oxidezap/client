@@ -296,56 +296,84 @@ struct UnknownKindRow {
     device_id: i32,
     #[diesel(sql_type = diesel::sql_types::Text)]
     chat_jid: String,
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    timestamp_ms: i64,
     #[diesel(sql_type = diesel::sql_types::Binary)]
     proto: Vec<u8>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     proto_codec: i32,
 }
 
-/// Repair only live rows whose old `unknown` label can be disproved from a
-/// valid stored protobuf. Invalid/compressed-unreadable protos and tombstones
-/// are left untouched. Re-running is harmless because repaired rows leave the
-/// candidate set.
+#[derive(diesel::QueryableByName)]
+struct MetadataValue {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
+}
+
+/// One-time, classifier-versioned repair. Candidate rows are loaded in bounded
+/// id pages, and the marker is committed with the updates so an interrupted
+/// pass rolls back rather than leaving a half-repaired database.
 fn repair_unknown_message_kinds(conn: &mut diesel::SqliteConnection) -> QueryResult<()> {
-    use diesel::sql_types::{BigInt, Integer, Text};
-    let rows = diesel::sql_query(
-        "SELECT id, device_id, chat_jid, timestamp_ms, proto, proto_codec FROM messages \
-         WHERE kind = 'unknown' AND revoked = 0 AND proto IS NOT NULL",
-    )
-    .load::<UnknownKindRow>(conn)?;
-    for row in rows {
-        let Ok(message) = crate::storage_proto::decode_storage_proto(&row.proto, row.proto_codec)
-        else {
-            continue;
-        };
-        let kind = crate::materialize::message_kind(&message);
-        if kind == "unknown" {
-            continue;
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    const KEY: &str = "message_kind_classifier";
+    const VERSION: &str = "2026-09-24-v1";
+    conn.transaction(|conn| {
+        let version = diesel::sql_query("SELECT value FROM chat_store_meta WHERE key = ?")
+            .bind::<Text, _>(KEY)
+            .get_result::<MetadataValue>(conn)
+            .optional()?;
+        if version.is_some_and(|v| v.value == VERSION) {
+            return Ok(());
+        }
+
+        let mut after_id = 0_i64;
+        loop {
+            let rows = diesel::sql_query(
+                "SELECT id, device_id, chat_jid, proto, proto_codec FROM messages \
+                 WHERE id > ? AND kind = 'unknown' AND revoked = 0 AND proto IS NOT NULL \
+                 ORDER BY id LIMIT 256",
+            )
+            .bind::<BigInt, _>(after_id)
+            .load::<UnknownKindRow>(conn)?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut affected_chats = std::collections::HashSet::new();
+            for row in rows {
+                after_id = row.id;
+                let Ok(message) =
+                    crate::storage_proto::decode_storage_proto(&row.proto, row.proto_codec)
+                else {
+                    continue;
+                };
+                let kind = crate::materialize::message_kind(&message);
+                if kind == "unknown" {
+                    continue;
+                }
+                let text = crate::materialize::extract_text(
+                    crate::materialize::normalized_message(&message),
+                );
+                diesel::sql_query(
+                    "UPDATE messages SET kind = ?, text_content = ? \
+                     WHERE id = ? AND kind = 'unknown' AND revoked = 0",
+                )
+                .bind::<Text, _>(kind)
+                .bind::<Nullable<Text>, _>(text)
+                .bind::<BigInt, _>(row.id)
+                .execute(conn)?;
+                affected_chats.insert((row.device_id, row.chat_jid));
+            }
+            for (device_id, chat) in affected_chats {
+                chat_rows::recompute_chat_preview(conn, device_id, &chat)?;
+            }
         }
         diesel::sql_query(
-            "UPDATE messages SET kind = ? WHERE id = ? AND kind = 'unknown' AND revoked = 0",
+            "INSERT INTO chat_store_meta (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
-        .bind::<Text, _>(kind)
-        .bind::<BigInt, _>(row.id)
+        .bind::<Text, _>(KEY)
+        .bind::<Text, _>(VERSION)
         .execute(conn)?;
-        // Timestamp alone is ambiguous when a chat has simultaneous messages;
-        // update the preview label only when this row is the unique head-time row.
-        diesel::sql_query(
-            "UPDATE chats SET last_message_kind = ? WHERE device_id = ? AND jid = ? AND last_message_ts = ? AND last_message_kind = 'unknown' \
-             AND (SELECT count(*) FROM messages WHERE device_id = ? AND chat_jid = ? AND timestamp_ms = ? AND revoked = 0) = 1",
-        )
-        .bind::<Text, _>(kind)
-        .bind::<Integer, _>(row.device_id)
-        .bind::<Text, _>(row.chat_jid.clone())
-        .bind::<BigInt, _>(row.timestamp_ms)
-        .bind::<Integer, _>(row.device_id)
-        .bind::<Text, _>(row.chat_jid)
-        .bind::<BigInt, _>(row.timestamp_ms)
-        .execute(conn)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 impl ChatStore {
