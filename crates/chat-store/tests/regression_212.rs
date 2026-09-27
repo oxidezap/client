@@ -211,45 +211,33 @@ async fn clear_read_marker(store: &SqliteStore) {
 }
 
 #[tokio::test]
-async fn upgrade_repair_keeps_phone_read_chat_at_zero_unread() {
+async fn author_only_repair_skips_refresh_on_unset_marker() {
     let (store, chat_store) = test_store().await;
     feed(&chat_store, [read_history_chat()]).await;
     assert_eq!(unread_of(&chat_store, PEER).await, 0);
-    assert_eq!(
-        chat_store
-            .chat(&jid(PEER))
-            .await
-            .unwrap()
-            .unwrap()
-            .last_message_preview
-            .as_deref(),
-        Some("mine")
-    );
-    // The phone reported the chat read, so history sync seeds the watermark
-    // the recount reads back.
-    assert!(
-        read_boundary_ms(&store, PEER).await > 0,
-        "a history-synced read chat carries a read marker"
-    );
 
+    // Legacy shape, repaired through the writer only: no reopen runs, so no
+    // startup sweep can backfill the marker first. With a genuinely unset
+    // marker even the old recount returns zero for nothing — the author-only
+    // path must not recount at all.
     reopen_through_upgrade_repair(&store, &chat_store).await;
     clear_read_marker(&store).await;
-    drop(chat_store);
-    let reopened = ChatStore::new(&store).await.unwrap();
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
 
     assert_eq!(
-        read_boundary_ms(&store, PEER).await,
-        0,
-        "an author-only rewrite leaves the (unset) read marker alone"
-    );
-    assert_eq!(
-        unread_of(&reopened, PEER).await,
+        unread_of(&chat_store, PEER).await,
         0,
         "rewriting the legacy own-row author must not recount unread from an unset marker"
     );
-    let chat = reopened.chat(&jid(PEER)).await.unwrap().unwrap();
+    assert_eq!(
+        read_boundary_ms(&store, PEER).await,
+        0,
+        "an author-only rewrite persists no read state either"
+    );
+    let chat = chat_store.chat(&jid(PEER)).await.unwrap().unwrap();
     assert_eq!(chat.last_message_preview.as_deref(), Some("mine"));
-    let own = reopened
+    let own = chat_store
         .message(&jid(PEER), "MSG-212-OWN")
         .await
         .unwrap()
@@ -260,13 +248,98 @@ async fn upgrade_repair_keeps_phone_read_chat_at_zero_unread() {
         Jid::default(),
         "the repair still normalizes the legacy own author"
     );
+}
+
+/// The full upgrade story on a chat the repair has no rows to touch: the
+/// startup sweep backfills the baseline first, so genuine live traffic
+/// afterwards badges exactly once and a later duplicate merge recounts
+/// against the baseline instead of the unset boundary.
+#[tokio::test]
+async fn startup_sweep_backfills_baseline_before_first_repair() {
+    let (store, chat_store) = test_store().await;
+    // Incoming rows only: the repair finds no duplicate group and no legacy
+    // own author here, so nothing below may rewrite this chat's aggregates.
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_010),
+                unread_count: Some(0),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(PEER),
+                            false,
+                            "MSG-212-H1",
+                            "hello",
+                            1_700_000_000,
+                        )),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(PEER),
+                            false,
+                            "MSG-212-H2",
+                            "world",
+                            1_700_000_010,
+                        )),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    // Pre-patch shape on a store the upgrade is about to open.
+    clear_read_marker(&store).await;
+    set_full_repair_pending(&store).await;
+    chat_store.flush().await.unwrap();
+    drop(chat_store);
+
+    let reopened = ChatStore::new(&store).await.unwrap();
     assert_eq!(
-        reopened
-            .messages(&jid(PEER), None, 100)
-            .await
-            .unwrap()
-            .len(),
-        3
+        read_boundary_ms(&store, PEER).await,
+        1_700_000_010_000,
+        "the sweep backfills the newest materialized incoming row"
+    );
+    assert_eq!(unread_of(&reopened, PEER).await, 0);
+
+    // Genuine live traffic badges exactly once per delivery, twin included.
+    feed(
+        &reopened,
+        [
+            message_event(
+                wa::Message::text("live"),
+                incoming_info(PEER, PEER, "MSG-212-H3", 1_700_000_100),
+            ),
+            message_event(
+                wa::Message::text("live"),
+                incoming_info(PEER, PEER_LID, "MSG-212-H3", 1_700_000_101),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(unread_of(&reopened, PEER).await, 2);
+    add_lid_mapping(&store).await;
+    set_full_repair_pending(&store).await;
+    reopened.flush().await.unwrap();
+    drop(reopened);
+
+    let repaired = ChatStore::new(&store).await.unwrap();
+    let rows = repaired.messages(&jid(PEER), None, 100).await.unwrap();
+    assert_eq!(rows.iter().filter(|row| row.id == "MSG-212-H3").count(), 1);
+    assert_eq!(
+        unread_of(&repaired, PEER).await,
+        1,
+        "the merge recounts the live duplicate against the backfilled baseline, not the unset boundary"
     );
 }
 

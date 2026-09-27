@@ -364,9 +364,46 @@ pub(crate) fn reconcile_startup(
     {
         return Ok(());
     }
+    backfill_legacy_read_state(conn, device_id)?;
     reconcile_all(conn, device_id, changes)?;
     crate::lid::reconcile_known_chats(conn, device_id, changes)?;
     mark_mapping_repair_current(conn, device_id)
+}
+
+/// Give every phone-read chat predating the read marker a baseline before
+/// the repair recounts anything. A stored zero with no marker means every
+/// incoming row is history-materialized (live arrivals always badge), so
+/// the zero is the phone's read state — but without a durable marker the
+/// first merge keeps it only transiently, and a later merge after genuine
+/// live traffic recounts the old history rows as unread. Seeding the
+/// watermark to the newest materialized incoming row (capped at now, like
+/// the history-sync seed) makes that zero durable across later repairs.
+/// Runs exactly on the dirty startups that precede a full repair.
+fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
+    let now_ms = wacore::time::now_utc().timestamp_millis();
+    diesel::sql_query(
+        "UPDATE chats
+         SET read_boundary_ms = (
+             SELECT MIN(MAX(timestamp_ms), ?) FROM messages
+             WHERE messages.device_id = chats.device_id
+               AND messages.chat_jid = chats.jid
+               AND messages.from_me = FALSE
+         )
+         WHERE chats.device_id = ?
+           AND chats.unread_count = 0
+           AND chats.read_boundary_ms = 0
+           AND chats.read_boundary_ids IS NULL
+           AND EXISTS (
+             SELECT 1 FROM messages
+             WHERE messages.device_id = chats.device_id
+               AND messages.chat_jid = chats.jid
+               AND messages.from_me = FALSE
+           )",
+    )
+    .bind::<BigInt, _>(now_ms)
+    .bind::<Integer, _>(device_id)
+    .execute(conn)?;
+    Ok(())
 }
 
 /// This account's known JIDs, normalized like peer senders. Quote matching
@@ -678,6 +715,31 @@ fn refresh_chat_after_merge(
             .optional()?;
         let marker_unset = state.watermark_ms == 0 && state.extra_ids.is_empty();
         if marker_unset && stored == Some(0) {
+            // Make the preserved zero durable: backfill the same baseline
+            // the startup sweep would have written, so a later merge after
+            // genuine live traffic recounts against it instead of the
+            // still-unset boundary.
+            let max_ts: Option<i64> = schema::messages::table
+                .filter(
+                    schema::messages::device_id
+                        .eq(device_id)
+                        .and(schema::messages::chat_jid.eq(chat))
+                        .and(schema::messages::from_me.eq(false)),
+                )
+                .select(diesel::dsl::max(schema::messages::timestamp_ms))
+                .first(conn)?;
+            if let Some(max_ts) = max_ts.filter(|&ts| ts > 0) {
+                let baseline = max_ts.min(wacore::time::now_utc().timestamp_millis());
+                if baseline > 0 {
+                    crate::store::read_state::advance_read_state(
+                        conn,
+                        device_id,
+                        chat,
+                        baseline,
+                        &[],
+                    )?;
+                }
+            }
             return Ok(());
         }
         let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
