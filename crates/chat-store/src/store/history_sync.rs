@@ -18,12 +18,6 @@ use crate::store::read_state::UNREAD_MARKER;
 use crate::store::revoke::apply_revoke;
 use crate::store::writer::ChangeSet;
 
-/// How far ahead of the local clock a history timestamp may be before it
-/// stops being skew and starts being corruption. The seeded read frontier
-/// is clamped to this, so a corrupt snapshot cannot park the cursor in the
-/// far future and suppress every later unread badge.
-const FUTURE_SKEW_MS: i64 = 86_400_000;
-
 pub(super) fn apply_history_sync(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -184,14 +178,16 @@ fn apply_history_conversation(
     // Backfill the denormalized preview from the newest materialized row, so a
     // freshly-paired client's chat list isn't blank until live traffic.
     recompute_chat_preview(conn, device_id, chat)?;
-    // The phone reports this chat read, and the stored count is the only
-    // record of that: seed the read watermark so a later recount does not
-    // treat the unset marker as "nothing read" and resurrect every incoming
-    // row as unread. Only when nothing live-owned disagrees — a positive
-    // stored count (or a manual-unread marker) belongs to live state, and a
-    // stale snapshot must not move its cursor. The advance itself is
-    // monotonic, so a newer live read is never moved backwards either.
-    if unread_count == 0 && stored_unread.is_none_or(|stored| stored == 0) {
+    // The phone explicitly reports this chat read (`unreadCount: 0`), and the
+    // stored count is the only record of that: seed the read watermark so a
+    // later recount does not treat the unset marker as "nothing read" and
+    // resurrect every incoming row as unread. An omitted count is not a read
+    // report — a metadata-only snapshot must not create durable read state.
+    // Only when nothing live-owned disagrees either: a positive stored count
+    // (or a manual-unread marker) belongs to live state, and a stale snapshot
+    // must not move its cursor. The advance itself is monotonic, so a newer
+    // live read is never moved backwards either.
+    if conv.unread_count == Some(0) && stored_unread.is_none_or(|stored| stored == 0) {
         let synced_max_ms = conv
             .messages
             .iter()
@@ -204,16 +200,29 @@ fn apply_history_conversation(
             })
             .max()
             .unwrap_or(0);
-        // Sender clocks skew and wire timestamps can be corrupt (u64::MAX
-        // clamps to a far-future cursor that would suppress every later
-        // badge), so the frontier never outruns the local clock by more
-        // than that skew.
+        // Wire timestamps can be corrupt (u64::MAX clamps to a far-future
+        // cursor, and `bump_chat` consults this watermark before badging),
+        // so the frontier never outruns the local clock: a past cursor may
+        // overcount until the next read, but a future one would silently
+        // swallow every later badge.
         let now_ms = wacore::time::now_utc().timestamp_millis();
-        let frontier_ms = last_ts_ms
-            .max(synced_max_ms)
-            .min(now_ms.saturating_add(FUTURE_SKEW_MS));
-        if frontier_ms > 0 {
-            crate::store::read_state::advance_read_state(conn, device_id, chat, frontier_ms, &[])?;
+        let frontier_ms = last_ts_ms.max(synced_max_ms).min(now_ms);
+        if frontier_ms > 0
+            && crate::store::read_state::advance_read_state(
+                conn,
+                device_id,
+                chat,
+                frontier_ms,
+                &[],
+            )?
+            .is_some()
+        {
+            // Rows materialized above may have merged (and recounted against
+            // the old boundary) on their way in; settle the badge against
+            // the frontier just written so cursor and count agree.
+            let state = crate::store::read_state::read_state(conn, device_id, chat)?;
+            let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
+            crate::store::read_state::set_unread_count(conn, device_id, chat, unread, cs)?;
         }
     }
     cs.chats = true;

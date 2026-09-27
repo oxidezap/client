@@ -571,6 +571,10 @@ fn reconcile_groups(
 
     let mut changed_chats = HashSet::new();
     let mut merged_chats = HashSet::new();
+    // Chats whose merge folded incoming rows; only those recount unread.
+    // Own rows are never unread, so an own-only merge refreshes the preview
+    // but must not recount from a read marker history sync never set.
+    let mut incoming_merges = HashSet::new();
     for group in groups {
         let candidates: Vec<MessageOwner> = dsl::messages
             .filter(
@@ -614,6 +618,7 @@ fn reconcile_groups(
         for cluster in clusters {
             if cluster.len() > 1 {
                 let ids: Vec<i64> = cluster.iter().map(|row| row.id).collect();
+                let incoming = cluster.iter().any(|row| !row.from_me);
                 merge_rows(
                     conn,
                     device_id,
@@ -624,6 +629,9 @@ fn reconcile_groups(
                 )?;
                 changed_chats.insert(group.chat_jid.clone());
                 merged_chats.insert(group.chat_jid.clone());
+                if incoming {
+                    incoming_merges.insert(group.chat_jid.clone());
+                }
             } else if cluster[0].from_me && !cluster[0].sender_jid.is_empty() {
                 diesel::update(dsl::messages.filter(dsl::id.eq(cluster[0].id)))
                     .set(dsl::sender_jid.eq(""))
@@ -637,9 +645,10 @@ fn reconcile_groups(
         // are never unread, so it leaves the preview and the stored count
         // alone: recounting here would derive unread from a read marker
         // history sync never set and overwrite the phone's read state. Only
-        // chats whose rows were actually merged or removed refresh.
+        // chats whose rows were actually merged or removed refresh, and only
+        // those whose merge folded incoming rows recount.
         if merged_chats.contains(&chat) {
-            refresh_chat_after_merge(conn, device_id, &chat)?;
+            refresh_chat_after_merge(conn, device_id, &chat, incoming_merges.contains(&chat))?;
         }
         changes.chats = true;
         changes.message_chats.insert(chat);
@@ -651,17 +660,20 @@ fn refresh_chat_after_merge(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
+    recount_unread: bool,
 ) -> QueryResult<()> {
     use schema::chats::dsl;
     crate::store::chat_rows::recompute_chat_preview(conn, device_id, chat)?;
-    let state = crate::store::read_state::read_state(conn, device_id, chat)?;
-    let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
-    diesel::update(
-        crate::store::chat_rows::chat_row(device_id, chat)
-            .filter(dsl::unread_count.ne(crate::store::read_state::UNREAD_MARKER)),
-    )
-    .set(dsl::unread_count.eq(unread))
-    .execute(conn)?;
+    if recount_unread {
+        let state = crate::store::read_state::read_state(conn, device_id, chat)?;
+        let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
+        diesel::update(
+            crate::store::chat_rows::chat_row(device_id, chat)
+                .filter(dsl::unread_count.ne(crate::store::read_state::UNREAD_MARKER)),
+        )
+        .set(dsl::unread_count.eq(unread))
+        .execute(conn)?;
+    }
     Ok(())
 }
 
@@ -688,9 +700,10 @@ pub(super) fn resolve_target(
     let owner = merge_rows(conn, device_id, msg_id, chat, &ids, from_me)?;
     // A lone own row only has its legacy author normalized; like the repair
     // pass above, that rewrite removes nothing and must not recount unread
-    // from an unset read marker.
+    // from an unset read marker. An own-only merge still refreshes the
+    // preview, but likewise leaves the count alone.
     if merged {
-        refresh_chat_after_merge(conn, device_id, chat)?;
+        refresh_chat_after_merge(conn, device_id, chat, !from_me)?;
     }
     changes.chats = true;
     changes.message_chats.insert(chat.to_string());

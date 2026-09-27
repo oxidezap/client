@@ -249,6 +249,55 @@ async fn zero_unread_history_does_not_seed_over_live_unread() {
 }
 
 #[tokio::test]
+async fn upgrade_repair_merging_only_own_duplicates_keeps_zero_unread() {
+    let (store, chat_store) = test_store().await;
+    feed(&chat_store, [read_history_chat()]).await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+
+    // A second legacy copy of the same own message: the repair really merges
+    // here, but every merged row is own, so the recount must still not run.
+    reopen_through_upgrade_repair(&store, &chat_store).await;
+    let device_id = store.device_id();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(
+                "INSERT INTO messages \
+                 (device_id, chat_jid, msg_id, sender_jid, from_me, timestamp_ms, \
+                  kind, text_content, proto, proto_codec, status, starred, \
+                  edited_at_ms, revoked) \
+                 SELECT device_id, chat_jid, msg_id, ?, from_me, timestamp_ms, \
+                        kind, text_content, proto, proto_codec, status, starred, \
+                        edited_at_ms, revoked \
+                 FROM messages WHERE device_id = ? AND msg_id = 'MSG-212-OWN'",
+            )
+            .bind::<diesel::sql_types::Text, _>("559900000999:9@s.whatsapp.net")
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .execute(conn)
+            .map(|_| ())
+            .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    clear_read_marker(&store).await;
+    drop(chat_store);
+
+    let reopened = ChatStore::new(&store).await.unwrap();
+    let rows = reopened.messages(&jid(PEER), None, 100).await.unwrap();
+    assert_eq!(
+        rows.iter().filter(|row| row.id == "MSG-212-OWN").count(),
+        1,
+        "the full repair merges the legacy own duplicates"
+    );
+    assert_eq!(
+        unread_of(&reopened, PEER).await,
+        0,
+        "merging only own rows must not recount unread from an unset marker"
+    );
+}
+
+#[tokio::test]
 async fn deleted_lid_full_repair_merges_duplicate_without_losing_phone_read_count() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 
