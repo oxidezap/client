@@ -49,7 +49,7 @@ pub(super) fn range_bound(
 }
 
 /// Extra read-boundary ids kept per chat; overflow drops the oldest entries.
-const READ_EXTRA_IDS_CAP: usize = 256;
+pub(super) const READ_EXTRA_IDS_CAP: usize = 256;
 
 /// Bound the kept ids, dropping the oldest first. The list is unbounded on the
 /// wire — a chat read a keyed second at a time accumulates one entry per

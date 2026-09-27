@@ -235,6 +235,10 @@ fn apply_history_conversation(
                 &future_ids,
             )?
             .is_some()
+            // The covered-id list overflows past its cap; ids that fall off
+            // would recount as unread, so an oversized snapshot keeps the
+            // stored count the snapshot agrees with instead of settling.
+            && future_ids.len() <= crate::store::read_state::READ_EXTRA_IDS_CAP
         {
             // Rows materialized above may have merged (and recounted against
             // the old boundary) on their way in; settle the badge against

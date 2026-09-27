@@ -505,6 +505,44 @@ async fn upgrade_repair_merging_incoming_duplicates_without_marker_keeps_zero() 
 }
 
 #[tokio::test]
+async fn oversized_future_snapshot_keeps_phone_read_zero() {
+    let (_store, chat_store) = test_store().await;
+    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let messages: Vec<wa::HistorySyncMsg> = (0..300)
+        .map(|n| wa::HistorySyncMsg {
+            message: MessageField::some(history_wmi(
+                PEER,
+                Some(PEER),
+                false,
+                &format!("MSG-212-FLOOD-{n}"),
+                "skewed",
+                future_secs,
+            )),
+            ..Default::default()
+        })
+        .collect();
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(future_secs),
+                unread_count: Some(0),
+                messages,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    // More covered ids than the read state retains: settling the badge
+    // would count the ids that fell off, so the snapshot keeps the stored
+    // zero instead.
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+}
+
+#[tokio::test]
 async fn deleted_lid_full_repair_merges_duplicate_without_losing_phone_read_count() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 
