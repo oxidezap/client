@@ -232,8 +232,17 @@ fn apply_history_conversation(
                 .distinct()
                 .load(conn)?
         };
+        // Appending past the retained-id cap would evict older explicitly
+        // covered ids — possibly for rows not yet materialized — so only
+        // bring what fits beside what is already kept. Anything more (or
+        // an oversized snapshot on a fresh row) seeds nothing at all.
+        let room = crate::store::read_state::READ_EXTRA_IDS_CAP.saturating_sub(
+            crate::store::read_state::read_state(conn, device_id, chat)?
+                .extra_ids
+                .len(),
+        );
         if frontier_ms > 0
-            && future_ids.len() <= crate::store::read_state::READ_EXTRA_IDS_CAP
+            && future_ids.len() <= room
             && crate::store::read_state::advance_read_state(
                 conn,
                 device_id,

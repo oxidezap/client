@@ -166,6 +166,28 @@ async fn set_full_repair_pending(store: &SqliteStore) {
         .unwrap();
 }
 
+async fn read_boundary_ids(store: &SqliteStore, chat: &str) -> Option<String> {
+    #[derive(diesel::QueryableByName)]
+    struct Ids {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        read_boundary_ids: Option<String>,
+    }
+    let device_id = store.device_id();
+    let chat = chat.to_string();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("SELECT read_boundary_ids FROM chats WHERE device_id = ? AND jid = ?")
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .bind::<diesel::sql_types::Text, _>(chat)
+                .get_result::<Ids>(conn)
+                .map(|row| row.read_boundary_ids)
+                .map_err(db_err)
+        })
+        .await
+        .unwrap()
+}
+
 /// Drop the seeded read marker while keeping the stored count, restoring the
 /// pre-fix shape where history sync never wrote one. With a seeded boundary
 /// even the old recount returns zero, which would leave the author-only
@@ -541,6 +563,68 @@ async fn oversized_future_snapshot_keeps_phone_read_zero() {
     // persists for a later recount to trip over.
     assert_eq!(unread_of(&chat_store, PEER).await, 0);
     assert_eq!(read_boundary_ms(&store, PEER).await, 0);
+}
+
+#[tokio::test]
+async fn seed_does_not_evict_existing_keyed_coverage() {
+    let (store, chat_store) = test_store().await;
+    feed(&chat_store, [read_history_chat()]).await;
+    // Fill the retained-id list to its cap with explicit keyed coverage.
+    let kept: Vec<String> = (0..256).map(|n| format!("MSG-212-KEPT-{n}")).collect();
+    let kept_json = format!(
+        "[{}]",
+        kept.iter()
+            .map(|id| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let device_id = store.device_id();
+    let kept_json_write = kept_json.clone();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("UPDATE chats SET read_boundary_ids = ? WHERE device_id = ?")
+                .bind::<diesel::sql_types::Text, _>(kept_json_write)
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .execute(conn)
+                .map(|_| ())
+                .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    // Another phone-read snapshot with one future row: no room beside the
+    // kept ids, so the seed refuses rather than evicting them.
+    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(future_secs),
+                unread_count: Some(0),
+                messages: vec![wa::HistorySyncMsg {
+                    message: MessageField::some(history_wmi(
+                        PEER,
+                        Some(PEER),
+                        false,
+                        "MSG-212-EVICT-NEW",
+                        "no room",
+                        future_secs,
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    assert_eq!(
+        read_boundary_ids(&store, PEER).await.as_deref(),
+        Some(kept_json.as_str())
+    );
 }
 
 #[tokio::test]
