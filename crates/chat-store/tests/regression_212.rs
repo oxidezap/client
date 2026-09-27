@@ -146,6 +146,28 @@ async fn reopen_through_upgrade_repair(store: &SqliteStore, chat_store: &ChatSto
     chat_store.flush().await.unwrap();
 }
 
+/// Drop the seeded read marker while keeping the stored count, restoring the
+/// pre-fix shape where history sync never wrote one. With a seeded boundary
+/// even the old recount returns zero, which would leave the author-only
+/// repair path unexercised.
+async fn clear_read_marker(store: &SqliteStore) {
+    let device_id = store.device_id();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(
+                "UPDATE chats SET read_boundary_ms = 0, read_boundary_ids = NULL \
+                 WHERE device_id = ?",
+            )
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .execute(conn)
+            .map(|_| ())
+            .map_err(db_err)
+        })
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn upgrade_repair_keeps_phone_read_chat_at_zero_unread() {
     let (store, chat_store) = test_store().await;
@@ -169,9 +191,15 @@ async fn upgrade_repair_keeps_phone_read_chat_at_zero_unread() {
     );
 
     reopen_through_upgrade_repair(&store, &chat_store).await;
+    clear_read_marker(&store).await;
     drop(chat_store);
     let reopened = ChatStore::new(&store).await.unwrap();
 
+    assert_eq!(
+        read_boundary_ms(&store, PEER).await,
+        0,
+        "an author-only rewrite leaves the (unset) read marker alone"
+    );
     assert_eq!(
         unread_of(&reopened, PEER).await,
         0,
@@ -198,6 +226,26 @@ async fn upgrade_repair_keeps_phone_read_chat_at_zero_unread() {
             .len(),
         3
     );
+}
+
+#[tokio::test]
+async fn zero_unread_history_does_not_seed_over_live_unread() {
+    let (store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("live and unread"),
+            incoming_info(PEER, PEER, "MSG-212-LIVE", 1_700_000_100),
+        )],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 1);
+
+    // A stale snapshot reporting zero must not move the cursor under the
+    // live-owned badge: the count stays and no marker is seeded.
+    feed(&chat_store, [read_history_chat()]).await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 1);
+    assert_eq!(read_boundary_ms(&store, PEER).await, 0);
 }
 
 #[tokio::test]

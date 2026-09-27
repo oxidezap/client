@@ -9,7 +9,7 @@ use waproto::whatsapp as wa;
 use crate::materialize::{MessageOp, classify};
 use crate::schema;
 use crate::storage_proto::{PendingQuote, strip_pending_quotes};
-use crate::store::chat_rows::recompute_chat_preview;
+use crate::store::chat_rows::{chat_row, recompute_chat_preview};
 use crate::store::contacts::{apply_removal_tombstone_to_history, upsert_contact_push_name};
 use crate::store::edit::apply_edit;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message};
@@ -17,6 +17,12 @@ use crate::store::reaction::apply_reaction;
 use crate::store::read_state::UNREAD_MARKER;
 use crate::store::revoke::apply_revoke;
 use crate::store::writer::ChangeSet;
+
+/// How far ahead of the local clock a history timestamp may be before it
+/// stops being skew and starts being corruption. The seeded read frontier
+/// is clamped to this, so a corrupt snapshot cannot park the cursor in the
+/// far future and suppress every later unread badge.
+const FUTURE_SKEW_MS: i64 = 86_400_000;
 
 pub(super) fn apply_history_sync(
     conn: &mut SqliteConnection,
@@ -76,6 +82,12 @@ fn apply_history_conversation(
         Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
         _ => 0,
     };
+    // The conflict update below keeps a live-owned count, so read the row
+    // first: the seed must agree with the count the sync leaves behind.
+    let stored_unread: Option<i32> = chat_row(device_id, chat)
+        .select(schema::chats::unread_count)
+        .first(conn)
+        .optional()?;
 
     {
         use schema::chats::dsl;
@@ -172,12 +184,14 @@ fn apply_history_conversation(
     // Backfill the denormalized preview from the newest materialized row, so a
     // freshly-paired client's chat list isn't blank until live traffic.
     recompute_chat_preview(conn, device_id, chat)?;
-    if unread_count == 0 {
-        // The phone reports this chat read, and the stored count is the only
-        // record of that: seed the read watermark so a later recount does not
-        // treat the unset marker as "nothing read" and resurrect every
-        // incoming row as unread. The advance is monotonic, so a newer live
-        // read is never moved backwards by a stale snapshot.
+    // The phone reports this chat read, and the stored count is the only
+    // record of that: seed the read watermark so a later recount does not
+    // treat the unset marker as "nothing read" and resurrect every incoming
+    // row as unread. Only when nothing live-owned disagrees — a positive
+    // stored count (or a manual-unread marker) belongs to live state, and a
+    // stale snapshot must not move its cursor. The advance itself is
+    // monotonic, so a newer live read is never moved backwards either.
+    if unread_count == 0 && stored_unread.is_none_or(|stored| stored == 0) {
         let synced_max_ms = conv
             .messages
             .iter()
@@ -190,7 +204,14 @@ fn apply_history_conversation(
             })
             .max()
             .unwrap_or(0);
-        let frontier_ms = last_ts_ms.max(synced_max_ms);
+        // Sender clocks skew and wire timestamps can be corrupt (u64::MAX
+        // clamps to a far-future cursor that would suppress every later
+        // badge), so the frontier never outruns the local clock by more
+        // than that skew.
+        let now_ms = wacore::time::now_utc().timestamp_millis();
+        let frontier_ms = last_ts_ms
+            .max(synced_max_ms)
+            .min(now_ms.saturating_add(FUTURE_SKEW_MS));
         if frontier_ms > 0 {
             crate::store::read_state::advance_read_state(conn, device_id, chat, frontier_ms, &[])?;
         }
