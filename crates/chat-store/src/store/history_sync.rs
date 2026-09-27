@@ -182,12 +182,16 @@ fn apply_history_conversation(
     // stored count is the only record of that: seed the read watermark so a
     // later recount does not treat the unset marker as "nothing read" and
     // resurrect every incoming row as unread. An omitted count is not a read
-    // report — a metadata-only snapshot must not create durable read state.
-    // Only when nothing live-owned disagrees either: a positive stored count
-    // (or a manual-unread marker) belongs to live state, and a stale snapshot
-    // must not move its cursor. The advance itself is monotonic, so a newer
-    // live read is never moved backwards either.
-    if conv.unread_count == Some(0) && stored_unread.is_none_or(|stored| stored == 0) {
+    // report — a metadata-only snapshot must not create durable read state —
+    // and neither is a manual-unread marker, which the computed count (but
+    // not the wire field) already excludes. Only when nothing live-owned
+    // disagrees either: a positive stored count belongs to live state, and a
+    // stale snapshot must not move its cursor. The advance itself is
+    // monotonic, so a newer live read is never moved backwards either.
+    if unread_count == 0
+        && conv.unread_count == Some(0)
+        && stored_unread.is_none_or(|stored| stored == 0)
+    {
         let synced_max_ms = conv
             .messages
             .iter()
@@ -216,6 +220,11 @@ fn apply_history_conversation(
                 &[],
             )?
             .is_some()
+            // A row timestamped ahead of the capped frontier (sender-clock
+            // skew) is not covered by it; recounting would badge a message
+            // the phone reported read, so the badge keeps the stored count
+            // the snapshot agrees with instead.
+            && synced_max_ms <= frontier_ms
         {
             // Rows materialized above may have merged (and recounted against
             // the old boundary) on their way in; settle the badge against

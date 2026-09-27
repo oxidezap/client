@@ -298,6 +298,78 @@ async fn upgrade_repair_merging_only_own_duplicates_keeps_zero_unread() {
 }
 
 #[tokio::test]
+async fn marked_unread_history_keeps_marker_through_seed() {
+    let (store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_000),
+                unread_count: Some(0),
+                marked_as_unread: Some(true),
+                messages: vec![wa::HistorySyncMsg {
+                    message: MessageField::some(history_wmi(
+                        PEER,
+                        Some(PEER),
+                        false,
+                        "MSG-212-MARKED",
+                        "pinned unread",
+                        1_700_000_000,
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(
+        unread_of(&chat_store, PEER).await,
+        -1,
+        "a manual-unread marker is not a read report and survives the seed"
+    );
+    assert_eq!(read_boundary_ms(&store, PEER).await, 0);
+}
+
+#[tokio::test]
+async fn future_dated_history_row_does_not_reopen_phone_read_chat() {
+    let (store, chat_store) = test_store().await;
+    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(future_secs),
+                unread_count: Some(0),
+                messages: vec![wa::HistorySyncMsg {
+                    message: MessageField::some(history_wmi(
+                        PEER,
+                        Some(PEER),
+                        false,
+                        "MSG-212-SKEWED",
+                        "ahead of the clock",
+                        future_secs,
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    // The frontier caps at now, so the skewed row stays uncovered; settling
+    // the badge anyway would reopen a chat the phone reported read.
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    assert!(read_boundary_ms(&store, PEER).await > 0);
+}
+
+#[tokio::test]
 async fn deleted_lid_full_repair_merges_duplicate_without_losing_phone_read_count() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 
