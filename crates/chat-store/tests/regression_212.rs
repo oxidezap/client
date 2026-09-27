@@ -933,6 +933,110 @@ async fn seed_counts_capacity_after_pruning_implied_ids() {
 }
 
 #[tokio::test]
+async fn seed_frees_only_ids_without_a_newer_row() {
+    let (store, chat_store) = test_store().await;
+    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    // One id in two rows straddling any frontier: an old copy and a future
+    // one, side by side before any mapping proves them one message.
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_010),
+                unread_count: Some(0),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(PEER),
+                            false,
+                            "MSG-212-STRADDLE",
+                            "old copy",
+                            1_700_000_005,
+                        )),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(PEER_LID),
+                            false,
+                            "MSG-212-STRADDLE",
+                            "future copy",
+                            future_secs,
+                        )),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    // Fill the retained list around the straddling id with explicit cover.
+    let mut kept = vec!["MSG-212-STRADDLE".to_string()];
+    kept.extend((0..255).map(|n| format!("MSG-212-KEEP-{n}")));
+    let kept_json = format!(
+        "[{}]",
+        kept.iter()
+            .map(|id| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let device_id = store.device_id();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("UPDATE chats SET read_boundary_ids = ? WHERE device_id = ?")
+                .bind::<diesel::sql_types::Text, _>(kept_json)
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .execute(conn)
+                .map(|_| ())
+                .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    // Exactly one brand-new future row: the straddling id still has a row
+    // above the new frontier, so it frees no room and must survive the seed
+    // while the newcomer is refused rather than evicting it.
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(future_secs),
+                unread_count: Some(0),
+                messages: vec![wa::HistorySyncMsg {
+                    message: MessageField::some(history_wmi(
+                        PEER,
+                        Some(PEER),
+                        false,
+                        "MSG-212-STRADDLE-NEW",
+                        "no room",
+                        future_secs,
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    let ids = read_boundary_ids(&store, PEER).await.unwrap();
+    assert!(
+        ids.contains("MSG-212-STRADDLE\"") && !ids.contains("MSG-212-STRADDLE-NEW"),
+        "the straddling id survives; the newcomer is refused rather than evicting"
+    );
+}
+
+#[tokio::test]
 async fn deleted_lid_full_repair_merges_duplicate_without_losing_phone_read_count() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 

@@ -162,7 +162,10 @@ pub(super) fn advance_read_state(
         }
     }
     if !state.extra_ids.is_empty() {
-        let implied: Vec<String> = dsl::messages
+        // An id is implied only when every row under it sits at or below
+        // the watermark. Twins can straddle it — an older covered copy must
+        // not drop the id a newer copy still needs.
+        let below: std::collections::HashSet<String> = dsl::messages
             .filter(
                 dsl::device_id
                     .eq(device_id)
@@ -171,9 +174,27 @@ pub(super) fn advance_read_state(
                     .and(dsl::timestamp_ms.le(state.watermark_ms)),
             )
             .select(dsl::msg_id)
-            .load(conn)?;
-        if !implied.is_empty() {
-            state.extra_ids.retain(|id| !implied.contains(id));
+            .distinct()
+            .load::<String>(conn)?
+            .into_iter()
+            .collect();
+        if !below.is_empty() {
+            let above: std::collections::HashSet<String> = dsl::messages
+                .filter(
+                    dsl::device_id
+                        .eq(device_id)
+                        .and(dsl::chat_jid.eq(chat))
+                        .and(dsl::msg_id.eq_any(&state.extra_ids))
+                        .and(dsl::timestamp_ms.gt(state.watermark_ms)),
+                )
+                .select(dsl::msg_id)
+                .distinct()
+                .load::<String>(conn)?
+                .into_iter()
+                .collect();
+            state
+                .extra_ids
+                .retain(|id| !below.contains(id) || above.contains(id));
         }
     }
     cap_read_ids(&mut state.extra_ids);

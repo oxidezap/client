@@ -784,11 +784,16 @@ fn refresh_chat_after_merge(
                 .first(conn)?;
             if let Some(max_ts) = max_ts.filter(|&ts| ts > 0) {
                 let baseline = max_ts.min(wacore::time::now_utc().timestamp_millis());
-                if baseline > 0 {
-                    let ids = crate::store::read_state::coverable_future_ids(
+                // Past more coverable ids than the retained list holds, a
+                // committed scalar without its ids would leave the next
+                // merge recounting the uncovered rows — so an overflowing
+                // baseline persists nothing at all and the stored zero
+                // carries on.
+                if baseline > 0
+                    && let Some(ids) = crate::store::read_state::coverable_future_ids(
                         conn, device_id, chat, baseline,
                     )?
-                    .unwrap_or_default();
+                {
                     crate::store::read_state::advance_read_state(
                         conn, device_id, chat, baseline, &ids,
                     )?;

@@ -225,7 +225,10 @@ fn apply_history_conversation(
         // the new frontier already implies do not occupy room: the advance
         // prunes them first.
         let before = crate::store::read_state::read_state(conn, device_id, chat)?;
-        let implied: std::collections::HashSet<String> = if before.extra_ids.is_empty() {
+        // Ids the new frontier implies free their slots — but only when no
+        // row under the same id outruns it: twins can straddle the frontier,
+        // and freeing the id for the older row would uncover the newer one.
+        let below: std::collections::HashSet<String> = if before.extra_ids.is_empty() {
             std::collections::HashSet::new()
         } else {
             use schema::messages::dsl as msgs;
@@ -234,7 +237,6 @@ fn apply_history_conversation(
                     msgs::device_id
                         .eq(device_id)
                         .and(msgs::chat_jid.eq(chat.as_str()))
-                        .and(msgs::msg_id.eq_any(&before.extra_ids))
                         .and(msgs::timestamp_ms.le(frontier_ms)),
                 )
                 .select(msgs::msg_id)
@@ -243,27 +245,57 @@ fn apply_history_conversation(
                 .into_iter()
                 .collect()
         };
+        let above: std::collections::HashSet<String> = if before.extra_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            use schema::messages::dsl as msgs;
+            msgs::messages
+                .filter(
+                    msgs::device_id
+                        .eq(device_id)
+                        .and(msgs::chat_jid.eq(chat.as_str()))
+                        .and(msgs::timestamp_ms.gt(frontier_ms)),
+                )
+                .select(msgs::msg_id)
+                .distinct()
+                .load::<String>(conn)?
+                .into_iter()
+                .collect()
+        };
+        let freed = before
+            .extra_ids
+            .iter()
+            .filter(|id| below.contains(*id) && !above.contains(*id))
+            .count();
         let room = crate::store::read_state::READ_EXTRA_IDS_CAP
-            .saturating_sub(before.extra_ids.len().saturating_sub(implied.len()));
-        if let Some(future_ids) =
+            .saturating_sub(before.extra_ids.len().saturating_sub(freed));
+        // Ids already retained occupy their slots without needing a write;
+        // only genuinely new coverage counts against the room above. Past
+        // the cap (`None`), or with no room beside what is kept, nothing
+        // seeds at all rather than evicting older coverage.
+        if let Some(mut future_ids) =
             crate::store::read_state::coverable_future_ids(conn, device_id, chat, frontier_ms)?
-            && future_ids.len() <= room
-            && frontier_ms > 0
-            && crate::store::read_state::advance_read_state(
-                conn,
-                device_id,
-                chat,
-                frontier_ms,
-                &future_ids,
-            )?
-            .is_some()
         {
-            // Rows materialized above may have merged (and recounted against
-            // the old boundary) on their way in; settle the badge against
-            // the frontier just written so cursor and count agree.
-            let state = crate::store::read_state::read_state(conn, device_id, chat)?;
-            let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
-            crate::store::read_state::set_unread_count(conn, device_id, chat, unread, cs)?;
+            future_ids.retain(|id| !before.extra_ids.contains(id));
+            if future_ids.len() <= room
+                && frontier_ms > 0
+                && crate::store::read_state::advance_read_state(
+                    conn,
+                    device_id,
+                    chat,
+                    frontier_ms,
+                    &future_ids,
+                )?
+                .is_some()
+            {
+                // Rows materialized above may have merged (and recounted
+                // against the old boundary) on their way in; settle the
+                // badge against the frontier just written so cursor and
+                // count agree.
+                let state = crate::store::read_state::read_state(conn, device_id, chat)?;
+                let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
+                crate::store::read_state::set_unread_count(conn, device_id, chat, unread, cs)?;
+            }
         }
     }
     cs.chats = true;
