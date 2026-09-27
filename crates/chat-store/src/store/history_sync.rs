@@ -218,20 +218,6 @@ fn apply_history_conversation(
         // which keep a stored zero over an unset marker) alone.
         let now_ms = wacore::time::now_utc().timestamp_millis();
         let frontier_ms = last_ts_ms.max(synced_max_ms).min(now_ms);
-        let future_ids: Vec<String> = {
-            use schema::messages::dsl as msgs;
-            msgs::messages
-                .filter(
-                    msgs::device_id
-                        .eq(device_id)
-                        .and(msgs::chat_jid.eq(chat.as_str()))
-                        .and(msgs::from_me.eq(false))
-                        .and(msgs::timestamp_ms.gt(frontier_ms)),
-                )
-                .select(msgs::msg_id)
-                .distinct()
-                .load(conn)?
-        };
         // Appending past the retained-id cap would evict older explicitly
         // covered ids — possibly for rows not yet materialized — so only
         // bring what fits beside what is already kept. Anything more (or
@@ -241,8 +227,10 @@ fn apply_history_conversation(
                 .extra_ids
                 .len(),
         );
-        if frontier_ms > 0
+        if let Some(future_ids) =
+            crate::store::read_state::coverable_future_ids(conn, device_id, chat, frontier_ms)?
             && future_ids.len() <= room
+            && frontier_ms > 0
             && crate::store::read_state::advance_read_state(
                 conn,
                 device_id,

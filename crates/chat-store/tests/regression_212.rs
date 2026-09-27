@@ -700,6 +700,101 @@ async fn seed_does_not_evict_existing_keyed_coverage() {
     );
 }
 
+/// A legacy chat with a future-dated row: the sweep caps the scalar but
+/// must still cover the row's id, or the immediate repair merge recounts it.
+#[tokio::test]
+async fn sweep_covers_future_rows_for_later_merges() {
+    let (store, chat_store) = test_store().await;
+    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_010),
+                unread_count: Some(0),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(PEER),
+                            false,
+                            "MSG-212-SWEEP-HIST",
+                            "history",
+                            1_700_000_000,
+                        )),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(PEER),
+                            false,
+                            "MSG-212-SWEEP-FUT",
+                            "ahead of the clock",
+                            future_secs,
+                        )),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    // Pre-patch shape on a store the upgrade is about to open.
+    clear_read_marker(&store).await;
+    set_full_repair_pending(&store).await;
+    chat_store.flush().await.unwrap();
+    drop(chat_store);
+
+    let reopened = ChatStore::new(&store).await.unwrap();
+    let watermark = read_boundary_ms(&store, PEER).await;
+    assert!(watermark > 0, "the sweep backfills a baseline");
+    assert!(
+        watermark <= wacore::time::now_utc().timestamp_millis(),
+        "the baseline never outruns the local clock"
+    );
+    assert!(
+        read_boundary_ids(&store, PEER)
+            .await
+            .is_some_and(|ids| ids.contains("MSG-212-SWEEP-FUT")),
+        "the future row rides along covered"
+    );
+    assert_eq!(unread_of(&reopened, PEER).await, 0);
+
+    // A twin of the future row merges down without reopening the chat.
+    feed(
+        &reopened,
+        [message_event(
+            wa::Message::text("ahead of the clock"),
+            incoming_info(PEER, PEER_LID, "MSG-212-SWEEP-FUT", future_secs as i64),
+        )],
+    )
+    .await;
+    assert_eq!(unread_of(&reopened, PEER).await, 0);
+    add_lid_mapping(&store).await;
+    set_full_repair_pending(&store).await;
+    reopened.flush().await.unwrap();
+    drop(reopened);
+
+    let repaired = ChatStore::new(&store).await.unwrap();
+    assert_eq!(
+        repaired
+            .messages(&jid(PEER), None, 100)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.id == "MSG-212-SWEEP-FUT")
+            .count(),
+        1
+    );
+    assert_eq!(unread_of(&repaired, PEER).await, 0);
+}
+
 #[tokio::test]
 async fn deleted_lid_full_repair_merges_duplicate_without_losing_phone_read_count() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};

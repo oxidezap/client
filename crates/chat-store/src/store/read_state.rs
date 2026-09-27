@@ -51,6 +51,33 @@ pub(super) fn range_bound(
 /// Extra read-boundary ids kept per chat; overflow drops the oldest entries.
 pub(super) const READ_EXTRA_IDS_CAP: usize = 256;
 
+/// Distinct incoming ids timestamped above `frontier_ms`: rows a capped
+/// scalar frontier cannot cover but an explicit read verdict still reaches.
+/// Returns `None` when more exist than the retained list can durably hold —
+/// persisting a truncated set would leave the dropped ids to a later
+/// recount — so the caller seeds nothing id-based instead.
+pub(super) fn coverable_future_ids(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    frontier_ms: i64,
+) -> QueryResult<Option<Vec<String>>> {
+    use schema::messages::dsl as msgs;
+    let ids: Vec<String> = msgs::messages
+        .filter(
+            msgs::device_id
+                .eq(device_id)
+                .and(msgs::chat_jid.eq(chat))
+                .and(msgs::from_me.eq(false))
+                .and(msgs::timestamp_ms.gt(frontier_ms)),
+        )
+        .select(msgs::msg_id)
+        .distinct()
+        .limit((READ_EXTRA_IDS_CAP + 1) as i64)
+        .load(conn)?;
+    Ok((ids.len() <= READ_EXTRA_IDS_CAP).then_some(ids))
+}
+
 /// Bound the kept ids, dropping the oldest first. The list is unbounded on the
 /// wire — a chat read a keyed second at a time accumulates one entry per
 /// boundary — and the oldest are the safest to lose: they sit furthest below

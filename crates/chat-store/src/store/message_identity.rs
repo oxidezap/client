@@ -381,6 +381,32 @@ pub(crate) fn reconcile_startup(
 /// Runs exactly on the dirty startups that precede a full repair.
 fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
     let now_ms = wacore::time::now_utc().timestamp_millis();
+    // Chats the scalar sweep cannot fully cover: rows timestamped ahead of
+    // the capped frontier need explicit ids or the repair below recounts
+    // them. Selected up front, while the sweep predicate still identifies
+    // them — and only them, so appending never evicts a seeded chat's
+    // existing coverage.
+    #[derive(QueryableByName)]
+    struct FutureChat {
+        #[diesel(sql_type = Text)]
+        chat_jid: String,
+    }
+    let future_chats: Vec<String> = diesel::sql_query(
+        "SELECT DISTINCT m.chat_jid AS chat_jid FROM messages m
+         JOIN chats c ON c.device_id = m.device_id AND c.jid = m.chat_jid
+         WHERE m.device_id = ?
+           AND c.unread_count = 0
+           AND c.read_boundary_ms = 0
+           AND c.read_boundary_ids IS NULL
+           AND m.from_me = FALSE
+           AND m.timestamp_ms > ?",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<BigInt, _>(now_ms)
+    .load::<FutureChat>(conn)?
+    .into_iter()
+    .map(|row| row.chat_jid)
+    .collect();
     diesel::sql_query(
         "UPDATE chats
          SET read_boundary_ms = (
@@ -403,6 +429,20 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
     .bind::<BigInt, _>(now_ms)
     .bind::<Integer, _>(device_id)
     .execute(conn)?;
+    for chat in &future_chats {
+        let frontier: Option<i64> = crate::store::chat_rows::chat_row(device_id, chat)
+            .select(schema::chats::read_boundary_ms)
+            .first(conn)
+            .optional()?;
+        let Some(frontier) = frontier.filter(|&ms| ms > 0) else {
+            continue;
+        };
+        if let Some(ids) =
+            crate::store::read_state::coverable_future_ids(conn, device_id, chat, frontier)?
+        {
+            crate::store::read_state::advance_read_state(conn, device_id, chat, frontier, &ids)?;
+        }
+    }
     Ok(())
 }
 
@@ -731,12 +771,12 @@ fn refresh_chat_after_merge(
             if let Some(max_ts) = max_ts.filter(|&ts| ts > 0) {
                 let baseline = max_ts.min(wacore::time::now_utc().timestamp_millis());
                 if baseline > 0 {
+                    let ids = crate::store::read_state::coverable_future_ids(
+                        conn, device_id, chat, baseline,
+                    )?
+                    .unwrap_or_default();
                     crate::store::read_state::advance_read_state(
-                        conn,
-                        device_id,
-                        chat,
-                        baseline,
-                        &[],
+                        conn, device_id, chat, baseline, &ids,
                     )?;
                 }
             }
