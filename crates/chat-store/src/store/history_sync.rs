@@ -71,6 +71,11 @@ fn apply_history_conversation(
         .conversation_timestamp
         .map(crate::types::wire_secs_to_ms)
         .unwrap_or(0);
+    let unread_count = match conv.unread_count {
+        _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
+        Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
+        _ => 0,
+    };
 
     {
         use schema::chats::dsl;
@@ -91,11 +96,6 @@ fn apply_history_conversation(
         let persist_name = name.filter(|n| !n.trim().is_empty());
         let name_from_address_book = persist_name.is_some() && address_book_name.is_some();
         let address_book_fallback = address_book_name.and(independent_name);
-        let unread_count = match conv.unread_count {
-            _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
-            Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
-            _ => 0,
-        };
         diesel::insert_into(dsl::chats)
             .values((
                 dsl::device_id.eq(device_id),
@@ -172,6 +172,29 @@ fn apply_history_conversation(
     // Backfill the denormalized preview from the newest materialized row, so a
     // freshly-paired client's chat list isn't blank until live traffic.
     recompute_chat_preview(conn, device_id, chat)?;
+    if unread_count == 0 {
+        // The phone reports this chat read, and the stored count is the only
+        // record of that: seed the read watermark so a later recount does not
+        // treat the unset marker as "nothing read" and resurrect every
+        // incoming row as unread. The advance is monotonic, so a newer live
+        // read is never moved backwards by a stale snapshot.
+        let synced_max_ms = conv
+            .messages
+            .iter()
+            .filter_map(|hist_msg| {
+                hist_msg
+                    .message
+                    .as_option()?
+                    .message_timestamp
+                    .map(crate::types::wire_secs_to_ms)
+            })
+            .max()
+            .unwrap_or(0);
+        let frontier_ms = last_ts_ms.max(synced_max_ms);
+        if frontier_ms > 0 {
+            crate::store::read_state::advance_read_state(conn, device_id, chat, frontier_ms, &[])?;
+        }
+    }
     cs.chats = true;
     cs.message_chats.insert(chat.to_string());
     Ok(())

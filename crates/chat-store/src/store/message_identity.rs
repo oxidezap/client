@@ -570,6 +570,7 @@ fn reconcile_groups(
     };
 
     let mut changed_chats = HashSet::new();
+    let mut merged_chats = HashSet::new();
     for group in groups {
         let candidates: Vec<MessageOwner> = dsl::messages
             .filter(
@@ -622,6 +623,7 @@ fn reconcile_groups(
                     cluster[0].from_me,
                 )?;
                 changed_chats.insert(group.chat_jid.clone());
+                merged_chats.insert(group.chat_jid.clone());
             } else if cluster[0].from_me && !cluster[0].sender_jid.is_empty() {
                 diesel::update(dsl::messages.filter(dsl::id.eq(cluster[0].id)))
                     .set(dsl::sender_jid.eq(""))
@@ -631,7 +633,14 @@ fn reconcile_groups(
         }
     }
     for chat in changed_chats {
-        refresh_chat_after_merge(conn, device_id, &chat)?;
+        // An author-only rewrite on own rows removes no rows and own rows
+        // are never unread, so it leaves the preview and the stored count
+        // alone: recounting here would derive unread from a read marker
+        // history sync never set and overwrite the phone's read state. Only
+        // chats whose rows were actually merged or removed refresh.
+        if merged_chats.contains(&chat) {
+            refresh_chat_after_merge(conn, device_id, &chat)?;
+        }
         changes.chats = true;
         changes.message_chats.insert(chat);
     }
@@ -675,8 +684,14 @@ pub(super) fn resolve_target(
         return Ok(Some(first.clone()));
     }
     let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+    let merged = ids.len() > 1;
     let owner = merge_rows(conn, device_id, msg_id, chat, &ids, from_me)?;
-    refresh_chat_after_merge(conn, device_id, chat)?;
+    // A lone own row only has its legacy author normalized; like the repair
+    // pass above, that rewrite removes nothing and must not recount unread
+    // from an unset read marker.
+    if merged {
+        refresh_chat_after_merge(conn, device_id, chat)?;
+    }
     changes.chats = true;
     changes.message_chats.insert(chat.to_string());
     if from_me && !owner.sender_jid.is_empty() {
