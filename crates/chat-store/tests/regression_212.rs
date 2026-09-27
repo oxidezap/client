@@ -506,7 +506,7 @@ async fn upgrade_repair_merging_incoming_duplicates_without_marker_keeps_zero() 
 
 #[tokio::test]
 async fn oversized_future_snapshot_keeps_phone_read_zero() {
-    let (_store, chat_store) = test_store().await;
+    let (store, chat_store) = test_store().await;
     let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
     let messages: Vec<wa::HistorySyncMsg> = (0..300)
         .map(|n| wa::HistorySyncMsg {
@@ -536,10 +536,11 @@ async fn oversized_future_snapshot_keeps_phone_read_zero() {
         })],
     )
     .await;
-    // More covered ids than the read state retains: settling the badge
-    // would count the ids that fell off, so the snapshot keeps the stored
-    // zero instead.
+    // More coverable ids than the read state retains: the snapshot seeds
+    // nothing at all, so the stored zero stands and no truncated id list
+    // persists for a later recount to trip over.
     assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    assert_eq!(read_boundary_ms(&store, PEER).await, 0);
 }
 
 #[tokio::test]

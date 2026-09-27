@@ -208,25 +208,32 @@ fn apply_history_conversation(
         // cursor, and `bump_chat` consults this watermark before badging),
         // so the frontier never outruns the local clock: a past cursor may
         // overcount until the next read, but a future one would silently
-        // swallow every later badge. Synced incoming rows timestamped ahead
-        // of the capped frontier ride along as explicitly covered ids, so a
-        // later merge recount still sees the phone's read state for them.
+        // swallow every later badge. Incoming rows timestamped ahead of the
+        // capped frontier ride along as explicitly covered ids, so a later
+        // merge recount still sees the phone's read state for them — read
+        // back from the rows, so whatever an edit or revoke materialized
+        // under its target id is covered too. Past the id list's cap no
+        // cover is durable for every row, so an oversized snapshot seeds
+        // nothing at all and leaves the stored count (and later merges,
+        // which keep a stored zero over an unset marker) alone.
         let now_ms = wacore::time::now_utc().timestamp_millis();
         let frontier_ms = last_ts_ms.max(synced_max_ms).min(now_ms);
-        let future_ids: Vec<String> = conv
-            .messages
-            .iter()
-            .filter_map(|hist_msg| {
-                let wmi = hist_msg.message.as_option()?;
-                let key = wmi.key.as_option()?;
-                if key.from_me.unwrap_or(false) {
-                    return None;
-                }
-                let ts_ms = wmi.message_timestamp.map(crate::types::wire_secs_to_ms)?;
-                (ts_ms > frontier_ms).then(|| key.id.clone()).flatten()
-            })
-            .collect();
+        let future_ids: Vec<String> = {
+            use schema::messages::dsl as msgs;
+            msgs::messages
+                .filter(
+                    msgs::device_id
+                        .eq(device_id)
+                        .and(msgs::chat_jid.eq(chat.as_str()))
+                        .and(msgs::from_me.eq(false))
+                        .and(msgs::timestamp_ms.gt(frontier_ms)),
+                )
+                .select(msgs::msg_id)
+                .distinct()
+                .load(conn)?
+        };
         if frontier_ms > 0
+            && future_ids.len() <= crate::store::read_state::READ_EXTRA_IDS_CAP
             && crate::store::read_state::advance_read_state(
                 conn,
                 device_id,
@@ -235,10 +242,6 @@ fn apply_history_conversation(
                 &future_ids,
             )?
             .is_some()
-            // The covered-id list overflows past its cap; ids that fall off
-            // would recount as unread, so an oversized snapshot keeps the
-            // stored count the snapshot agrees with instead of settling.
-            && future_ids.len() <= crate::store::read_state::READ_EXTRA_IDS_CAP
         {
             // Rows materialized above may have merged (and recounted against
             // the old boundary) on their way in; settle the badge against
