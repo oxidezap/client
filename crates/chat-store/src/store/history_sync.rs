@@ -221,12 +221,30 @@ fn apply_history_conversation(
         // Appending past the retained-id cap would evict older explicitly
         // covered ids — possibly for rows not yet materialized — so only
         // bring what fits beside what is already kept. Anything more (or
-        // an oversized snapshot on a fresh row) seeds nothing at all.
-        let room = crate::store::read_state::READ_EXTRA_IDS_CAP.saturating_sub(
-            crate::store::read_state::read_state(conn, device_id, chat)?
-                .extra_ids
-                .len(),
-        );
+        // an oversized snapshot on a fresh row) seeds nothing at all. Ids
+        // the new frontier already implies do not occupy room: the advance
+        // prunes them first.
+        let before = crate::store::read_state::read_state(conn, device_id, chat)?;
+        let implied: std::collections::HashSet<String> = if before.extra_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            use schema::messages::dsl as msgs;
+            msgs::messages
+                .filter(
+                    msgs::device_id
+                        .eq(device_id)
+                        .and(msgs::chat_jid.eq(chat.as_str()))
+                        .and(msgs::msg_id.eq_any(&before.extra_ids))
+                        .and(msgs::timestamp_ms.le(frontier_ms)),
+                )
+                .select(msgs::msg_id)
+                .distinct()
+                .load::<String>(conn)?
+                .into_iter()
+                .collect()
+        };
+        let room = crate::store::read_state::READ_EXTRA_IDS_CAP
+            .saturating_sub(before.extra_ids.len().saturating_sub(implied.len()));
         if let Some(future_ids) =
             crate::store::read_state::coverable_future_ids(conn, device_id, chat, frontier_ms)?
             && future_ids.len() <= room

@@ -796,6 +796,143 @@ async fn sweep_covers_future_rows_for_later_merges() {
 }
 
 #[tokio::test]
+async fn oversized_legacy_snapshot_seeds_nothing_at_all() {
+    let (store, chat_store) = test_store().await;
+    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let messages: Vec<wa::HistorySyncMsg> = (0..300)
+        .map(|n| wa::HistorySyncMsg {
+            message: MessageField::some(history_wmi(
+                PEER,
+                Some(PEER),
+                false,
+                &format!("MSG-212-LEGACYFLOOD-{n}"),
+                "skewed",
+                future_secs,
+            )),
+            ..Default::default()
+        })
+        .collect();
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(future_secs),
+                unread_count: Some(0),
+                messages,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    // Pre-patch shape on a store the upgrade is about to open: more
+    // coverable ids than the retained list holds, so the sweep must skip
+    // the scalar too rather than commit a marker its ids cannot back.
+    clear_read_marker(&store).await;
+    set_full_repair_pending(&store).await;
+    chat_store.flush().await.unwrap();
+    drop(chat_store);
+
+    let reopened = ChatStore::new(&store).await.unwrap();
+    assert_eq!(read_boundary_ms(&store, PEER).await, 0);
+    assert_eq!(unread_of(&reopened, PEER).await, 0);
+}
+
+#[tokio::test]
+async fn seed_counts_capacity_after_pruning_implied_ids() {
+    let (store, chat_store) = test_store().await;
+    // A full retained list whose rows the next frontier already implies.
+    let messages: Vec<wa::HistorySyncMsg> = (0..256)
+        .map(|n| wa::HistorySyncMsg {
+            message: MessageField::some(history_wmi(
+                PEER,
+                Some(PEER),
+                false,
+                &format!("MSG-212-PRUNE-{n}"),
+                "history",
+                1_700_000_000 + n as u64,
+            )),
+            ..Default::default()
+        })
+        .collect();
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_300),
+                unread_count: Some(0),
+                messages,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    let kept_json = format!(
+        "[{}]",
+        (0..256)
+            .map(|n| format!("\"MSG-212-PRUNE-{n}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let device_id = store.device_id();
+    let kept_json_write = kept_json.clone();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("UPDATE chats SET read_boundary_ids = ? WHERE device_id = ?")
+                .bind::<diesel::sql_types::Text, _>(kept_json_write)
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .execute(conn)
+                .map(|_| ())
+                .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    // One more future row: every kept id falls below the new frontier, so
+    // the advance prunes them and room remains for the new coverage.
+    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(future_secs),
+                unread_count: Some(0),
+                messages: vec![wa::HistorySyncMsg {
+                    message: MessageField::some(history_wmi(
+                        PEER,
+                        Some(PEER),
+                        false,
+                        "MSG-212-PRUNE-NEW",
+                        "room after pruning",
+                        future_secs,
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    assert!(
+        read_boundary_ids(&store, PEER)
+            .await
+            .is_some_and(|ids| ids.contains("MSG-212-PRUNE-NEW")),
+        "ids the new frontier implies free their room first"
+    );
+}
+
+#[tokio::test]
 async fn deleted_lid_full_repair_merges_duplicate_without_losing_phone_read_count() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 

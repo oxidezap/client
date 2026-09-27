@@ -407,6 +407,11 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
     .into_iter()
     .map(|row| row.chat_jid)
     .collect();
+    // Past more coverable future ids than the retained list holds, no cover
+    // is durable for every row, so those chats seed nothing at all — scalar
+    // included, atomically: a committed scalar without its ids would leave
+    // the next merge recounting the uncovered rows. Their stored zero (and
+    // the unset-marker preservation below) carries them instead.
     diesel::sql_query(
         "UPDATE chats
          SET read_boundary_ms = (
@@ -424,10 +429,19 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-           )",
+           )
+           AND (
+             SELECT COUNT(DISTINCT msg_id) FROM messages
+             WHERE messages.device_id = chats.device_id
+               AND messages.chat_jid = chats.jid
+               AND messages.from_me = FALSE
+               AND messages.timestamp_ms > ?
+           ) <= ?",
     )
     .bind::<BigInt, _>(now_ms)
     .bind::<Integer, _>(device_id)
+    .bind::<BigInt, _>(now_ms)
+    .bind::<Integer, _>(crate::store::read_state::READ_EXTRA_IDS_CAP as i32)
     .execute(conn)?;
     for chat in &future_chats {
         let frontier: Option<i64> = crate::store::chat_rows::chat_row(device_id, chat)
