@@ -666,6 +666,20 @@ fn refresh_chat_after_merge(
     crate::store::chat_rows::recompute_chat_preview(conn, device_id, chat)?;
     if recount_unread {
         let state = crate::store::read_state::read_state(conn, device_id, chat)?;
+        // No marker was ever written and the stored count is already zero:
+        // every incoming row is history-materialized and the zero is the
+        // phone's read state (live arrivals always badge, so a zero here
+        // cannot be hiding unread live traffic). Recounting from the unset
+        // boundary would only resurrect it — the legacy first-repair shape
+        // the seed never ran for — so the stored count stands.
+        let stored: Option<i32> = crate::store::chat_rows::chat_row(device_id, chat)
+            .select(dsl::unread_count)
+            .first(conn)
+            .optional()?;
+        let marker_unset = state.watermark_ms == 0 && state.extra_ids.is_empty();
+        if marker_unset && stored == Some(0) {
+            return Ok(());
+        }
         let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
         diesel::update(
             crate::store::chat_rows::chat_row(device_id, chat)

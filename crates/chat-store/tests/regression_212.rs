@@ -146,6 +146,26 @@ async fn reopen_through_upgrade_repair(store: &SqliteStore, chat_store: &ChatSto
     chat_store.flush().await.unwrap();
 }
 
+/// Queue a full repair the way the upgrade migration (or a remapped or
+/// deleted LID pair) does.
+async fn set_full_repair_pending(store: &SqliteStore) {
+    let device_id = store.device_id();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(
+                "UPDATE message_identity_repair_state \
+                 SET full_repair_pending = TRUE WHERE device_id = ?",
+            )
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .execute(conn)
+            .map(|_| ())
+            .map_err(db_err)
+        })
+        .await
+        .unwrap();
+}
+
 /// Drop the seeded read marker while keeping the stored count, restoring the
 /// pre-fix shape where history sync never wrote one. With a seeded boundary
 /// even the old recount returns zero, which would leave the author-only
@@ -363,10 +383,125 @@ async fn future_dated_history_row_does_not_reopen_phone_read_chat() {
         })],
     )
     .await;
-    // The frontier caps at now, so the skewed row stays uncovered; settling
-    // the badge anyway would reopen a chat the phone reported read.
+    // The frontier caps at now while the skewed row rides along covered;
+    // settling the badge anyway would reopen a chat the phone reported read.
     assert_eq!(unread_of(&chat_store, PEER).await, 0);
     assert!(read_boundary_ms(&store, PEER).await > 0);
+
+    // And that coverage survives a later incoming-duplicate merge: the twin
+    // lands as a second row (no mapping yet) without badging — its id is
+    // already covered — then the learned mapping plus a queued full repair
+    // merges it back down.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("ahead of the clock"),
+            incoming_info(PEER, PEER_LID, "MSG-212-SKEWED", future_secs as i64),
+        )],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    add_lid_mapping(&store).await;
+    set_full_repair_pending(&store).await;
+    chat_store.flush().await.unwrap();
+    drop(chat_store);
+
+    let reopened = ChatStore::new(&store).await.unwrap();
+    assert_eq!(
+        reopened
+            .messages(&jid(PEER), None, 100)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.id == "MSG-212-SKEWED")
+            .count(),
+        1
+    );
+    assert_eq!(unread_of(&reopened, PEER).await, 0);
+}
+
+/// The legacy first-repair shape: history synced before any marker existed,
+/// so the upgrade's full repair meets incoming duplicates with an unset
+/// boundary. The stored zero is the phone's read state and must stand.
+#[tokio::test]
+async fn upgrade_repair_merging_incoming_duplicates_without_marker_keeps_zero() {
+    let (store, chat_store) = test_store().await;
+    // Both copies arrive as history (no mapping yet), so neither badges and
+    // the stored count stays the phone's zero.
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_010),
+                unread_count: Some(0),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(PEER),
+                            false,
+                            "MSG-212-LEGACYDUP",
+                            "two copies",
+                            1_700_000_005,
+                        )),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(PEER_LID),
+                            false,
+                            "MSG-212-LEGACYDUP",
+                            "two copies",
+                            1_700_000_006,
+                        )),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    assert_eq!(
+        chat_store
+            .messages(&jid(PEER), None, 100)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.id == "MSG-212-LEGACYDUP")
+            .count(),
+        2
+    );
+    // Pre-patch shape: the seed never ran, and the upgrade queues the full
+    // repair with the mapping now known.
+    clear_read_marker(&store).await;
+    add_lid_mapping(&store).await;
+    set_full_repair_pending(&store).await;
+    chat_store.flush().await.unwrap();
+    drop(chat_store);
+
+    let reopened = ChatStore::new(&store).await.unwrap();
+    assert_eq!(
+        reopened
+            .messages(&jid(PEER), None, 100)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.id == "MSG-212-LEGACYDUP")
+            .count(),
+        1,
+        "the full repair merges the proven duplicate"
+    );
+    assert_eq!(
+        unread_of(&reopened, PEER).await,
+        0,
+        "with no marker ever written, the stored zero stands"
+    );
 }
 
 #[tokio::test]

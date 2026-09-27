@@ -208,23 +208,33 @@ fn apply_history_conversation(
         // cursor, and `bump_chat` consults this watermark before badging),
         // so the frontier never outruns the local clock: a past cursor may
         // overcount until the next read, but a future one would silently
-        // swallow every later badge.
+        // swallow every later badge. Synced incoming rows timestamped ahead
+        // of the capped frontier ride along as explicitly covered ids, so a
+        // later merge recount still sees the phone's read state for them.
         let now_ms = wacore::time::now_utc().timestamp_millis();
         let frontier_ms = last_ts_ms.max(synced_max_ms).min(now_ms);
+        let future_ids: Vec<String> = conv
+            .messages
+            .iter()
+            .filter_map(|hist_msg| {
+                let wmi = hist_msg.message.as_option()?;
+                let key = wmi.key.as_option()?;
+                if key.from_me.unwrap_or(false) {
+                    return None;
+                }
+                let ts_ms = wmi.message_timestamp.map(crate::types::wire_secs_to_ms)?;
+                (ts_ms > frontier_ms).then(|| key.id.clone()).flatten()
+            })
+            .collect();
         if frontier_ms > 0
             && crate::store::read_state::advance_read_state(
                 conn,
                 device_id,
                 chat,
                 frontier_ms,
-                &[],
+                &future_ids,
             )?
             .is_some()
-            // A row timestamped ahead of the capped frontier (sender-clock
-            // skew) is not covered by it; recounting would badge a message
-            // the phone reported read, so the badge keeps the stored count
-            // the snapshot agrees with instead.
-            && synced_max_ms <= frontier_ms
         {
             // Rows materialized above may have merged (and recounted against
             // the old boundary) on their way in; settle the badge against
