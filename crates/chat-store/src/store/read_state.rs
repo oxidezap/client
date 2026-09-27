@@ -162,15 +162,17 @@ pub(super) fn advance_read_state(
         }
     }
     if !state.extra_ids.is_empty() {
-        // An id is implied only when every row under it sits at or below
-        // the watermark. Twins can straddle it — an older covered copy must
-        // not drop the id a newer copy still needs.
+        // An id is implied only when every incoming row under it sits at or
+        // below the watermark. Twins can straddle it — an older covered
+        // copy must not drop the id a newer copy still needs — and outgoing
+        // rows never badge, so only incoming rows decide either way.
         let below: std::collections::HashSet<String> = dsl::messages
             .filter(
                 dsl::device_id
                     .eq(device_id)
                     .and(dsl::chat_jid.eq(chat))
                     .and(dsl::msg_id.eq_any(&state.extra_ids))
+                    .and(dsl::from_me.eq(false))
                     .and(dsl::timestamp_ms.le(state.watermark_ms)),
             )
             .select(dsl::msg_id)
@@ -185,6 +187,7 @@ pub(super) fn advance_read_state(
                         .eq(device_id)
                         .and(dsl::chat_jid.eq(chat))
                         .and(dsl::msg_id.eq_any(&state.extra_ids))
+                        .and(dsl::from_me.eq(false))
                         .and(dsl::timestamp_ms.gt(state.watermark_ms)),
                 )
                 .select(dsl::msg_id)

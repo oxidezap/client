@@ -228,6 +228,9 @@ fn apply_history_conversation(
         // Ids the new frontier implies free their slots — but only when no
         // row under the same id outruns it: twins can straddle the frontier,
         // and freeing the id for the older row would uncover the newer one.
+        // Scoped to the retained ids (bounded work) and to incoming rows:
+        // coverage only ever badges incoming traffic, so an outgoing twin
+        // above the frontier must not keep its id occupying room.
         let below: std::collections::HashSet<String> = if before.extra_ids.is_empty() {
             std::collections::HashSet::new()
         } else {
@@ -237,6 +240,8 @@ fn apply_history_conversation(
                     msgs::device_id
                         .eq(device_id)
                         .and(msgs::chat_jid.eq(chat.as_str()))
+                        .and(msgs::msg_id.eq_any(&before.extra_ids))
+                        .and(msgs::from_me.eq(false))
                         .and(msgs::timestamp_ms.le(frontier_ms)),
                 )
                 .select(msgs::msg_id)
@@ -254,6 +259,8 @@ fn apply_history_conversation(
                     msgs::device_id
                         .eq(device_id)
                         .and(msgs::chat_jid.eq(chat.as_str()))
+                        .and(msgs::msg_id.eq_any(&before.extra_ids))
+                        .and(msgs::from_me.eq(false))
                         .and(msgs::timestamp_ms.gt(frontier_ms)),
                 )
                 .select(msgs::msg_id)

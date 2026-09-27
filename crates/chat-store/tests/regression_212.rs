@@ -1037,6 +1037,110 @@ async fn seed_frees_only_ids_without_a_newer_row() {
 }
 
 #[tokio::test]
+async fn outgoing_twins_do_not_occupy_read_coverage_room() {
+    let (store, chat_store) = test_store().await;
+    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    // One id in two directions: an incoming copy below any frontier and an
+    // own copy above it. Coverage only ever badges incoming traffic, so the
+    // outgoing twin must not keep the id occupying room.
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_010),
+                unread_count: Some(0),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(PEER),
+                            false,
+                            "MSG-212-DIRECTION",
+                            "incoming copy",
+                            1_700_000_005,
+                        )),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(history_wmi(
+                            PEER,
+                            Some(OWN_LEGACY_SENDER),
+                            true,
+                            "MSG-212-DIRECTION",
+                            "own copy",
+                            future_secs,
+                        )),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    // Fill the retained list around the shared id with explicit cover.
+    let mut kept = vec!["MSG-212-DIRECTION".to_string()];
+    kept.extend((0..255).map(|n| format!("MSG-212-DKEEP-{n}")));
+    let kept_json = format!(
+        "[{}]",
+        kept.iter()
+            .map(|id| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let device_id = store.device_id();
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("UPDATE chats SET read_boundary_ids = ? WHERE device_id = ?")
+                .bind::<diesel::sql_types::Text, _>(kept_json)
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .execute(conn)
+                .map(|_| ())
+                .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    // One brand-new future incoming row: the shared id's only incoming row
+    // already sits below the new frontier, so it frees its room.
+    feed(
+        &chat_store,
+        [history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(future_secs),
+                unread_count: Some(0),
+                messages: vec![wa::HistorySyncMsg {
+                    message: MessageField::some(history_wmi(
+                        PEER,
+                        Some(PEER),
+                        false,
+                        "MSG-212-DIRECTION-NEW",
+                        "room after pruning",
+                        future_secs,
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    let ids = read_boundary_ids(&store, PEER).await.unwrap();
+    assert!(
+        ids.contains("MSG-212-DIRECTION-NEW"),
+        "the outgoing twin above the frontier keeps no room occupied"
+    );
+}
+
+#[tokio::test]
 async fn deleted_lid_full_repair_merges_duplicate_without_losing_phone_read_count() {
     use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
 
