@@ -364,9 +364,100 @@ pub(crate) fn reconcile_startup(
     {
         return Ok(());
     }
+    backfill_legacy_read_state(conn, device_id)?;
     reconcile_all(conn, device_id, changes)?;
     crate::lid::reconcile_known_chats(conn, device_id, changes)?;
     mark_mapping_repair_current(conn, device_id)
+}
+
+/// Give every phone-read chat predating the read marker a baseline before
+/// the repair recounts anything. A stored zero with no marker means every
+/// incoming row is history-materialized (live arrivals always badge), so
+/// the zero is the phone's read state — but without a durable marker the
+/// first merge keeps it only transiently, and a later merge after genuine
+/// live traffic recounts the old history rows as unread. Seeding the
+/// watermark to the newest materialized incoming row (capped at now, like
+/// the history-sync seed) makes that zero durable across later repairs.
+/// Runs exactly on the dirty startups that precede a full repair.
+fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
+    let now_ms = wacore::time::now_utc().timestamp_millis();
+    // Chats the scalar sweep cannot fully cover: rows timestamped ahead of
+    // the capped frontier need explicit ids or the repair below recounts
+    // them. Selected up front, while the sweep predicate still identifies
+    // them — and only them, so appending never evicts a seeded chat's
+    // existing coverage.
+    #[derive(QueryableByName)]
+    struct FutureChat {
+        #[diesel(sql_type = Text)]
+        chat_jid: String,
+    }
+    let future_chats: Vec<String> = diesel::sql_query(
+        "SELECT DISTINCT m.chat_jid AS chat_jid FROM messages m
+         JOIN chats c ON c.device_id = m.device_id AND c.jid = m.chat_jid
+         WHERE m.device_id = ?
+           AND c.unread_count = 0
+           AND c.read_boundary_ms = 0
+           AND c.read_boundary_ids IS NULL
+           AND m.from_me = FALSE
+           AND m.timestamp_ms > ?",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<BigInt, _>(now_ms)
+    .load::<FutureChat>(conn)?
+    .into_iter()
+    .map(|row| row.chat_jid)
+    .collect();
+    // Past more coverable future ids than the retained list holds, no cover
+    // is durable for every row, so those chats seed nothing at all — scalar
+    // included, atomically: a committed scalar without its ids would leave
+    // the next merge recounting the uncovered rows. Their stored zero (and
+    // the unset-marker preservation below) carries them instead.
+    diesel::sql_query(
+        "UPDATE chats
+         SET read_boundary_ms = (
+             SELECT MIN(MAX(timestamp_ms), ?) FROM messages
+             WHERE messages.device_id = chats.device_id
+               AND messages.chat_jid = chats.jid
+               AND messages.from_me = FALSE
+         )
+         WHERE chats.device_id = ?
+           AND chats.unread_count = 0
+           AND chats.read_boundary_ms = 0
+           AND chats.read_boundary_ids IS NULL
+           AND EXISTS (
+             SELECT 1 FROM messages
+             WHERE messages.device_id = chats.device_id
+               AND messages.chat_jid = chats.jid
+               AND messages.from_me = FALSE
+           )
+           AND (
+             SELECT COUNT(DISTINCT msg_id) FROM messages
+             WHERE messages.device_id = chats.device_id
+               AND messages.chat_jid = chats.jid
+               AND messages.from_me = FALSE
+               AND messages.timestamp_ms > ?
+           ) <= ?",
+    )
+    .bind::<BigInt, _>(now_ms)
+    .bind::<Integer, _>(device_id)
+    .bind::<BigInt, _>(now_ms)
+    .bind::<Integer, _>(crate::store::read_state::READ_EXTRA_IDS_CAP as i32)
+    .execute(conn)?;
+    for chat in &future_chats {
+        let frontier: Option<i64> = crate::store::chat_rows::chat_row(device_id, chat)
+            .select(schema::chats::read_boundary_ms)
+            .first(conn)
+            .optional()?;
+        let Some(frontier) = frontier.filter(|&ms| ms > 0) else {
+            continue;
+        };
+        if let Some(ids) =
+            crate::store::read_state::coverable_future_ids(conn, device_id, chat, frontier)?
+        {
+            crate::store::read_state::advance_read_state(conn, device_id, chat, frontier, &ids)?;
+        }
+    }
+    Ok(())
 }
 
 /// This account's known JIDs, normalized like peer senders. Quote matching
@@ -570,6 +661,11 @@ fn reconcile_groups(
     };
 
     let mut changed_chats = HashSet::new();
+    let mut merged_chats = HashSet::new();
+    // Chats whose merge folded incoming rows; only those recount unread.
+    // Own rows are never unread, so an own-only merge refreshes the preview
+    // but must not recount from a read marker history sync never set.
+    let mut incoming_merges = HashSet::new();
     for group in groups {
         let candidates: Vec<MessageOwner> = dsl::messages
             .filter(
@@ -613,6 +709,7 @@ fn reconcile_groups(
         for cluster in clusters {
             if cluster.len() > 1 {
                 let ids: Vec<i64> = cluster.iter().map(|row| row.id).collect();
+                let incoming = cluster.iter().any(|row| !row.from_me);
                 merge_rows(
                     conn,
                     device_id,
@@ -622,6 +719,10 @@ fn reconcile_groups(
                     cluster[0].from_me,
                 )?;
                 changed_chats.insert(group.chat_jid.clone());
+                merged_chats.insert(group.chat_jid.clone());
+                if incoming {
+                    incoming_merges.insert(group.chat_jid.clone());
+                }
             } else if cluster[0].from_me && !cluster[0].sender_jid.is_empty() {
                 diesel::update(dsl::messages.filter(dsl::id.eq(cluster[0].id)))
                     .set(dsl::sender_jid.eq(""))
@@ -631,7 +732,15 @@ fn reconcile_groups(
         }
     }
     for chat in changed_chats {
-        refresh_chat_after_merge(conn, device_id, &chat)?;
+        // An author-only rewrite on own rows removes no rows and own rows
+        // are never unread, so it leaves the preview and the stored count
+        // alone: recounting here would derive unread from a read marker
+        // history sync never set and overwrite the phone's read state. Only
+        // chats whose rows were actually merged or removed refresh, and only
+        // those whose merge folded incoming rows recount.
+        if merged_chats.contains(&chat) {
+            refresh_chat_after_merge(conn, device_id, &chat, incoming_merges.contains(&chat))?;
+        }
         changes.chats = true;
         changes.message_chats.insert(chat);
     }
@@ -642,17 +751,64 @@ fn refresh_chat_after_merge(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
+    recount_unread: bool,
 ) -> QueryResult<()> {
     use schema::chats::dsl;
     crate::store::chat_rows::recompute_chat_preview(conn, device_id, chat)?;
-    let state = crate::store::read_state::read_state(conn, device_id, chat)?;
-    let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
-    diesel::update(
-        crate::store::chat_rows::chat_row(device_id, chat)
-            .filter(dsl::unread_count.ne(crate::store::read_state::UNREAD_MARKER)),
-    )
-    .set(dsl::unread_count.eq(unread))
-    .execute(conn)?;
+    if recount_unread {
+        let state = crate::store::read_state::read_state(conn, device_id, chat)?;
+        // No marker was ever written and the stored count is already zero:
+        // every incoming row is history-materialized and the zero is the
+        // phone's read state (live arrivals always badge, so a zero here
+        // cannot be hiding unread live traffic). Recounting from the unset
+        // boundary would only resurrect it — the legacy first-repair shape
+        // the seed never ran for — so the stored count stands.
+        let stored: Option<i32> = crate::store::chat_rows::chat_row(device_id, chat)
+            .select(dsl::unread_count)
+            .first(conn)
+            .optional()?;
+        let marker_unset = state.watermark_ms == 0 && state.extra_ids.is_empty();
+        if marker_unset && stored == Some(0) {
+            // Make the preserved zero durable: backfill the same baseline
+            // the startup sweep would have written, so a later merge after
+            // genuine live traffic recounts against it instead of the
+            // still-unset boundary.
+            let max_ts: Option<i64> = schema::messages::table
+                .filter(
+                    schema::messages::device_id
+                        .eq(device_id)
+                        .and(schema::messages::chat_jid.eq(chat))
+                        .and(schema::messages::from_me.eq(false)),
+                )
+                .select(diesel::dsl::max(schema::messages::timestamp_ms))
+                .first(conn)?;
+            if let Some(max_ts) = max_ts.filter(|&ts| ts > 0) {
+                let baseline = max_ts.min(wacore::time::now_utc().timestamp_millis());
+                // Past more coverable ids than the retained list holds, a
+                // committed scalar without its ids would leave the next
+                // merge recounting the uncovered rows — so an overflowing
+                // baseline persists nothing at all and the stored zero
+                // carries on.
+                if baseline > 0
+                    && let Some(ids) = crate::store::read_state::coverable_future_ids(
+                        conn, device_id, chat, baseline,
+                    )?
+                {
+                    crate::store::read_state::advance_read_state(
+                        conn, device_id, chat, baseline, &ids,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
+        diesel::update(
+            crate::store::chat_rows::chat_row(device_id, chat)
+                .filter(dsl::unread_count.ne(crate::store::read_state::UNREAD_MARKER)),
+        )
+        .set(dsl::unread_count.eq(unread))
+        .execute(conn)?;
+    }
     Ok(())
 }
 
@@ -675,8 +831,15 @@ pub(super) fn resolve_target(
         return Ok(Some(first.clone()));
     }
     let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+    let merged = ids.len() > 1;
     let owner = merge_rows(conn, device_id, msg_id, chat, &ids, from_me)?;
-    refresh_chat_after_merge(conn, device_id, chat)?;
+    // A lone own row only has its legacy author normalized; like the repair
+    // pass above, that rewrite removes nothing and must not recount unread
+    // from an unset read marker. An own-only merge still refreshes the
+    // preview, but likewise leaves the count alone.
+    if merged {
+        refresh_chat_after_merge(conn, device_id, chat, !from_me)?;
+    }
     changes.chats = true;
     changes.message_chats.insert(chat.to_string());
     if from_me && !owner.sender_jid.is_empty() {

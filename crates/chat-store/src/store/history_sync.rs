@@ -9,7 +9,7 @@ use waproto::whatsapp as wa;
 use crate::materialize::{MessageOp, classify};
 use crate::schema;
 use crate::storage_proto::{PendingQuote, strip_pending_quotes};
-use crate::store::chat_rows::recompute_chat_preview;
+use crate::store::chat_rows::{chat_row, recompute_chat_preview};
 use crate::store::contacts::{apply_removal_tombstone_to_history, upsert_contact_push_name};
 use crate::store::edit::apply_edit;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message};
@@ -71,6 +71,17 @@ fn apply_history_conversation(
         .conversation_timestamp
         .map(crate::types::wire_secs_to_ms)
         .unwrap_or(0);
+    let unread_count = match conv.unread_count {
+        _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
+        Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
+        _ => 0,
+    };
+    // The conflict update below keeps a live-owned count, so read the row
+    // first: the seed must agree with the count the sync leaves behind.
+    let stored_unread: Option<i32> = chat_row(device_id, chat)
+        .select(schema::chats::unread_count)
+        .first(conn)
+        .optional()?;
 
     {
         use schema::chats::dsl;
@@ -91,11 +102,6 @@ fn apply_history_conversation(
         let persist_name = name.filter(|n| !n.trim().is_empty());
         let name_from_address_book = persist_name.is_some() && address_book_name.is_some();
         let address_book_fallback = address_book_name.and(independent_name);
-        let unread_count = match conv.unread_count {
-            _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
-            Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
-            _ => 0,
-        };
         diesel::insert_into(dsl::chats)
             .values((
                 dsl::device_id.eq(device_id),
@@ -172,6 +178,133 @@ fn apply_history_conversation(
     // Backfill the denormalized preview from the newest materialized row, so a
     // freshly-paired client's chat list isn't blank until live traffic.
     recompute_chat_preview(conn, device_id, chat)?;
+    // The phone explicitly reports this chat read (`unreadCount: 0`), and the
+    // stored count is the only record of that: seed the read watermark so a
+    // later recount does not treat the unset marker as "nothing read" and
+    // resurrect every incoming row as unread. An omitted count is not a read
+    // report — a metadata-only snapshot must not create durable read state —
+    // and neither is a manual-unread marker, which the computed count (but
+    // not the wire field) already excludes. Only when nothing live-owned
+    // disagrees either: a positive stored count belongs to live state, and a
+    // stale snapshot must not move its cursor. The advance itself is
+    // monotonic, so a newer live read is never moved backwards either.
+    if unread_count == 0
+        && conv.unread_count == Some(0)
+        && stored_unread.is_none_or(|stored| stored == 0)
+    {
+        let synced_max_ms = conv
+            .messages
+            .iter()
+            .filter_map(|hist_msg| {
+                hist_msg
+                    .message
+                    .as_option()?
+                    .message_timestamp
+                    .map(crate::types::wire_secs_to_ms)
+            })
+            .max()
+            .unwrap_or(0);
+        // Wire timestamps can be corrupt (u64::MAX clamps to a far-future
+        // cursor, and `bump_chat` consults this watermark before badging),
+        // so the frontier never outruns the local clock: a past cursor may
+        // overcount until the next read, but a future one would silently
+        // swallow every later badge. Incoming rows timestamped ahead of the
+        // capped frontier ride along as explicitly covered ids, so a later
+        // merge recount still sees the phone's read state for them — read
+        // back from the rows, so whatever an edit or revoke materialized
+        // under its target id is covered too. Past the id list's cap no
+        // cover is durable for every row, so an oversized snapshot seeds
+        // nothing at all and leaves the stored count (and later merges,
+        // which keep a stored zero over an unset marker) alone.
+        let now_ms = wacore::time::now_utc().timestamp_millis();
+        let frontier_ms = last_ts_ms.max(synced_max_ms).min(now_ms);
+        // Appending past the retained-id cap would evict older explicitly
+        // covered ids — possibly for rows not yet materialized — so only
+        // bring what fits beside what is already kept. Anything more (or
+        // an oversized snapshot on a fresh row) seeds nothing at all. Ids
+        // the new frontier already implies do not occupy room: the advance
+        // prunes them first.
+        let before = crate::store::read_state::read_state(conn, device_id, chat)?;
+        // Ids the new frontier implies free their slots — but only when no
+        // row under the same id outruns it: twins can straddle the frontier,
+        // and freeing the id for the older row would uncover the newer one.
+        // Scoped to the retained ids (bounded work) and to incoming rows:
+        // coverage only ever badges incoming traffic, so an outgoing twin
+        // above the frontier must not keep its id occupying room.
+        let below: std::collections::HashSet<String> = if before.extra_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            use schema::messages::dsl as msgs;
+            msgs::messages
+                .filter(
+                    msgs::device_id
+                        .eq(device_id)
+                        .and(msgs::chat_jid.eq(chat.as_str()))
+                        .and(msgs::msg_id.eq_any(&before.extra_ids))
+                        .and(msgs::from_me.eq(false))
+                        .and(msgs::timestamp_ms.le(frontier_ms)),
+                )
+                .select(msgs::msg_id)
+                .distinct()
+                .load::<String>(conn)?
+                .into_iter()
+                .collect()
+        };
+        let above: std::collections::HashSet<String> = if before.extra_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            use schema::messages::dsl as msgs;
+            msgs::messages
+                .filter(
+                    msgs::device_id
+                        .eq(device_id)
+                        .and(msgs::chat_jid.eq(chat.as_str()))
+                        .and(msgs::msg_id.eq_any(&before.extra_ids))
+                        .and(msgs::from_me.eq(false))
+                        .and(msgs::timestamp_ms.gt(frontier_ms)),
+                )
+                .select(msgs::msg_id)
+                .distinct()
+                .load::<String>(conn)?
+                .into_iter()
+                .collect()
+        };
+        let freed = before
+            .extra_ids
+            .iter()
+            .filter(|id| below.contains(*id) && !above.contains(*id))
+            .count();
+        let room = crate::store::read_state::READ_EXTRA_IDS_CAP
+            .saturating_sub(before.extra_ids.len().saturating_sub(freed));
+        // Ids already retained occupy their slots without needing a write;
+        // only genuinely new coverage counts against the room above. Past
+        // the cap (`None`), or with no room beside what is kept, nothing
+        // seeds at all rather than evicting older coverage.
+        if let Some(mut future_ids) =
+            crate::store::read_state::coverable_future_ids(conn, device_id, chat, frontier_ms)?
+        {
+            future_ids.retain(|id| !before.extra_ids.contains(id));
+            if future_ids.len() <= room
+                && frontier_ms > 0
+                && crate::store::read_state::advance_read_state(
+                    conn,
+                    device_id,
+                    chat,
+                    frontier_ms,
+                    &future_ids,
+                )?
+                .is_some()
+            {
+                // Rows materialized above may have merged (and recounted
+                // against the old boundary) on their way in; settle the
+                // badge against the frontier just written so cursor and
+                // count agree.
+                let state = crate::store::read_state::read_state(conn, device_id, chat)?;
+                let unread = crate::store::read_state::count_unread(conn, device_id, chat, &state)?;
+                crate::store::read_state::set_unread_count(conn, device_id, chat, unread, cs)?;
+            }
+        }
+    }
     cs.chats = true;
     cs.message_chats.insert(chat.to_string());
     Ok(())
