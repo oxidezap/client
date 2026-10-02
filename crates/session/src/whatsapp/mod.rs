@@ -1501,9 +1501,9 @@ impl WhatsAppClient {
         // Notify UI that init is complete
         let _ = ui_tx.send(UiEvent::InitComplete);
 
-        // bot.run() reconnects internally, so on its own it only returns after
-        // a logout; the shutdown signal is how a replaced client's thread gets
-        // to exit (letting block_on return drops the runtime + SQLite pool).
+        // bot.run() supervises reconnects and returns its classified completion.
+        // The shutdown signal also lets a replaced client's thread exit
+        // (letting block_on return drops the runtime + SQLite pool).
         let client = bot.client();
         tokio::select! {
             // Said out loud, because this is a session ending. `run`
@@ -1511,7 +1511,7 @@ impl WhatsAppClient {
             // left to try — and returning quietly left a window sitting on
             // "Connecting to WhatsApp" with a console that had stopped saying
             // anything at all, which reads as a hang rather than as a stop.
-            () = bot.run() => info!("the WhatsApp session ended"),
+            reason = bot.run() => info!("the WhatsApp session ended: {reason:?}"),
             _ = shutdown.notified() => {
                 // Graceful stop: flushes state and closes the transport. The
                 // dropped run future is not awaited out instead, because a

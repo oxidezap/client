@@ -371,8 +371,10 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
     } else {
         None
     };
+    let call_events = handle.take_events().expect("the fixture owns the receiver");
     let watcher = crate::exec::spawn(WhatsAppClient::run_call_events(
         handle.clone(),
+        call_events.clone(),
         calls.clone(),
         ui.clone(),
     ));
@@ -447,7 +449,7 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
     }
     fixture.inject(accept).await.unwrap();
     dispatch(&fixture, &mut cursor, &calls, &ui).await;
-    handle.events().close();
+    call_events.close();
     tokio::time::timeout(std::time::Duration::from_secs(3), watcher)
         .await
         .unwrap()
@@ -618,7 +620,7 @@ mod tests {
                         .build()])
                     .build()
             };
-            let queue = handle.events();
+            let queue = handle.take_events().expect("the fixture owns the receiver");
             if pressure {
                 for index in 0..queue.capacity().unwrap() {
                     fixture
@@ -654,6 +656,7 @@ mod tests {
             }
             let mut watching = Box::pin(WhatsAppClient::run_call_events(
                 handle.clone(),
+                queue.clone(),
                 calls.clone(),
                 ui.clone(),
             ));
