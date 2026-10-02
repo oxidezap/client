@@ -105,14 +105,14 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d" }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d" }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d" }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 
-# Keep every whatsapp-rust crate on one revision.
+# Keep every whatsapp-rust crate on one git source and branch.
 
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d", default-features = false }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "38b98180e987dfa565274343d5facd144d74eb5d", default-features = false }
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and

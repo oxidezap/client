@@ -901,6 +901,42 @@ mod migration_tests {
         assert!(has_column(&store, "messages", "id").await);
     }
 
+    /// The backend and chat store share a ledger. A newer backend migration
+    /// must neither prevent a chat-store downgrade nor be reverted by it.
+    fn revert_last_chat_migration(
+        conn: &mut diesel::SqliteConnection,
+    ) -> std::result::Result<(), StoreError> {
+        use diesel::migration::{Migration, MigrationSource};
+        use diesel::sqlite::Sqlite;
+
+        let migrations: Vec<Box<dyn Migration<Sqlite>>> =
+            MIGRATIONS.migrations().map_err(StoreError::Migration)?;
+        let applied = conn.applied_migrations().map_err(StoreError::Migration)?;
+        let backend_versions = |versions: &[diesel::migration::MigrationVersion<'_>]| {
+            versions
+                .iter()
+                .filter(|version| !migrations.iter().any(|m| m.name().version() == **version))
+                .map(|version| version.as_owned())
+                .collect::<Vec<_>>()
+        };
+        let backend_before = backend_versions(&applied);
+        let migration = migrations
+            .iter()
+            .filter(|migration| applied.contains(&migration.name().version()))
+            .max_by(|a, b| a.name().version().cmp(&b.name().version()))
+            .expect("an applied chat-store migration remains");
+        let result = conn
+            .revert_migration(migration.as_ref())
+            .map(|_| ())
+            .map_err(StoreError::Migration);
+        assert_eq!(
+            backend_versions(&conn.applied_migrations().map_err(StoreError::Migration)?),
+            backend_before,
+            "a chat-store downgrade must preserve every backend migration"
+        );
+        result
+    }
+
     #[tokio::test]
     async fn stable_id_downgrade_round_trips_then_sender_identity_refuses() {
         let store = SqliteStore::new(&format!(
@@ -916,22 +952,14 @@ mod migration_tests {
         // repair state before the older tested migration edges.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("community-hierarchy downgrade is reversible");
         assert!(!has_column(&store, "chats", "group_hierarchy").await);
 
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("chat-name-provenance downgrade is reversible");
         assert!(!has_column(&store, "chats", "name_from_address_book").await);
@@ -940,11 +968,7 @@ mod migration_tests {
 
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("identity-repair queue downgrade is reversible");
         assert!(!has_table(&store, "message_identity_repair_pending").await);
@@ -952,22 +976,14 @@ mod migration_tests {
 
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("message-kind repair metadata downgrade is reversible");
         assert!(!has_table(&store, "chat_store_meta").await);
 
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("identity-repair marker downgrade is reversible");
         assert!(!has_table(&store, "message_identity_repair_state").await);
@@ -977,11 +993,7 @@ mod migration_tests {
         // account-cascade.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("preference-provenance downgrade is reversible");
         assert!(!has_column(&store, "chats", "mute_appstate_seen").await);
@@ -993,11 +1005,7 @@ mod migration_tests {
         // the constraint, which loses nothing durable.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("account-cascade follow-up downgrade is reversible");
         assert!(
@@ -1011,11 +1019,7 @@ mod migration_tests {
         // honest answer rather than a failed revert.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("revert the reversible labels migration");
         assert!(!has_table(&store, "contact_labels").await);
@@ -1025,11 +1029,7 @@ mod migration_tests {
         // refetches.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("avatar-descriptor downgrade is reversible");
         assert!(!has_table(&store, "avatar_descriptors").await);
@@ -1038,11 +1038,7 @@ mod migration_tests {
         // (without the `id`/`proto_codec` columns) rather than failing.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("stable-id downgrade is reversible");
         assert_eq!(table_count(&store).await, 1);
@@ -1054,11 +1050,7 @@ mod migration_tests {
         // still refuses.
         let error = store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect_err("irreversible migration must reject downgrade");
         assert!(error.to_string().contains("migration"));
