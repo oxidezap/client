@@ -22,32 +22,14 @@ pub(super) fn refresh_preview_if_latest(
     preview: Option<&str>,
     kind: Option<&str>,
 ) -> QueryResult<bool> {
-    use schema::messages::dsl;
-    // Both halves of the pair, which is what `messages()` reads. Parity of
-    // order is not parity of rows: with a split still standing, the newest row
-    // of the union can sit under the key this write does not look at, and the
-    // preview then names a message the conversation does not end with.
-    let keys = crate::lid::chat_key_candidates(conn, device_id, chat)?;
-    let newest: Option<String> = dsl::messages
-        .filter(
-            dsl::device_id
-                .eq(device_id)
-                .and(dsl::chat_jid.eq_any(&keys)),
-        )
-        .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
-        .select(dsl::msg_id)
-        .first(conn)
-        .optional()?;
-    if newest.as_deref() != Some(msg_id) {
-        return Ok(false);
-    }
-    diesel::update(chat_row(device_id, chat))
-        .set((
-            schema::chats::last_message_preview.eq(preview),
-            schema::chats::last_message_kind.eq(kind),
-        ))
-        .execute(conn)?;
-    Ok(true)
+    refresh_preview(
+        conn,
+        device_id,
+        chat,
+        LatestTarget::MessageId(msg_id),
+        preview,
+        kind,
+    )
 }
 
 /// Refresh only when this stable row, including its author, is the newest.
@@ -59,23 +41,46 @@ pub(super) fn refresh_preview_if_latest_row(
     preview: Option<&str>,
     kind: Option<&str>,
 ) -> QueryResult<bool> {
+    refresh_preview(
+        conn,
+        device_id,
+        chat,
+        LatestTarget::RowId(row_id),
+        preview,
+        kind,
+    )
+}
+
+enum LatestTarget<'a> {
+    MessageId(&'a str),
+    RowId(i64),
+}
+
+fn refresh_preview(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    target: LatestTarget<'_>,
+    preview: Option<&str>,
+    kind: Option<&str>,
+) -> QueryResult<bool> {
     use schema::messages::dsl;
-    // Both halves of the pair, which is what `messages()` reads. Parity of
-    // order is not parity of rows: with a split still standing, the newest row
-    // of the union can sit under the key this write does not look at, and the
-    // preview then names a message the conversation does not end with.
     let keys = crate::lid::chat_key_candidates(conn, device_id, chat)?;
-    let newest: Option<i64> = dsl::messages
+    let newest: Option<(i64, String)> = dsl::messages
         .filter(
             dsl::device_id
                 .eq(device_id)
                 .and(dsl::chat_jid.eq_any(&keys)),
         )
         .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
-        .select(dsl::id)
+        .select((dsl::id, dsl::msg_id))
         .first(conn)
         .optional()?;
-    if newest != Some(row_id) {
+    let matches = newest.is_some_and(|(row_id, msg_id)| match target {
+        LatestTarget::MessageId(id) => msg_id == id,
+        LatestTarget::RowId(id) => row_id == id,
+    });
+    if !matches {
         return Ok(false);
     }
     diesel::update(chat_row(device_id, chat))

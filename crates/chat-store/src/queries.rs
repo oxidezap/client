@@ -228,6 +228,7 @@ pub(crate) struct MessageRow {
     starred: bool,
     edited_at_ms: Option<i64>,
     revoked: bool,
+    #[allow(dead_code)] // Writer-only origin; retained to match table column order.
     local_revoke_placeholder: bool,
 }
 
@@ -284,8 +285,6 @@ fn fold_read_duplicate(
         held.status
     };
     survivor.revoked = revoked;
-    survivor.local_revoke_placeholder =
-        held.local_revoke_placeholder || incoming.local_revoke_placeholder;
     survivor.status = status;
     survivor.starred = held.starred || incoming.starred;
     survivor.timestamp_ms = held.timestamp_ms.max(incoming.timestamp_ms);

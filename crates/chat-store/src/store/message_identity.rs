@@ -403,6 +403,7 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
            AND c.read_boundary_ms = 0
            AND c.read_boundary_ids IS NULL
            AND m.from_me = FALSE
+           AND m.local_revoke_placeholder = FALSE
            AND m.timestamp_ms > ?",
     )
     .bind::<Integer, _>(device_id)
@@ -423,6 +424,7 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
+               AND messages.local_revoke_placeholder = FALSE
          )
          WHERE chats.device_id = ?
            AND chats.unread_count = 0
@@ -433,12 +435,14 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
+               AND messages.local_revoke_placeholder = FALSE
            )
            AND (
              SELECT COUNT(DISTINCT msg_id) FROM messages
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
+               AND messages.local_revoke_placeholder = FALSE
                AND messages.timestamp_ms > ?
            ) <= ?",
     )
@@ -782,7 +786,8 @@ fn refresh_chat_after_merge(
                     schema::messages::device_id
                         .eq(device_id)
                         .and(schema::messages::chat_jid.eq(chat))
-                        .and(schema::messages::from_me.eq(false)),
+                        .and(schema::messages::from_me.eq(false))
+                        .and(schema::messages::local_revoke_placeholder.eq(false)),
                 )
                 .select(diesel::dsl::max(schema::messages::timestamp_ms))
                 .first(conn)?;

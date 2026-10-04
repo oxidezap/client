@@ -261,6 +261,7 @@ fn apply_history_conversation(
                         .and(msgs::chat_jid.eq(chat.as_str()))
                         .and(msgs::msg_id.eq_any(&before.extra_ids))
                         .and(msgs::from_me.eq(false))
+                        .and(msgs::local_revoke_placeholder.eq(false))
                         .and(msgs::timestamp_ms.gt(frontier_ms)),
                 )
                 .select(msgs::msg_id)

@@ -1233,3 +1233,117 @@ async fn deleted_lid_full_repair_merges_duplicate_without_losing_phone_read_coun
         Some("mine")
     );
 }
+
+#[tokio::test]
+async fn local_revoke_placeholders_do_not_exhaust_history_read_coverage() {
+    let (store, chat_store) = test_store().await;
+    let future = wacore::time::now_utc() + chrono::Duration::hours(1);
+    for n in 0..257 {
+        chat_store
+            .record_revoke_target(
+                &jid(PEER),
+                &wa::MessageKey {
+                    id: Some(format!("LOCAL-FUTURE-{n}")),
+                    from_me: Some(false),
+                    ..Default::default()
+                },
+                future,
+            )
+            .unwrap();
+    }
+    chat_store.flush().await.unwrap();
+    feed(&chat_store, [read_history_chat()]).await;
+    assert!(read_boundary_ms(&store, PEER).await > 0);
+    assert!(read_boundary_ids(&store, PEER).await.is_none());
+    assert_eq!(unread_of(&chat_store, PEER).await, 0);
+    set_full_repair_pending(&store).await;
+    drop(chat_store);
+    let reopened = ChatStore::new(&store).await.unwrap();
+    assert_eq!(unread_of(&reopened, PEER).await, 0);
+}
+
+#[tokio::test]
+async fn local_placeholder_only_chat_does_not_seed_a_read_frontier_on_repair() {
+    let (store, chat_store) = test_store().await;
+    chat_store
+        .record_revoke_target(
+            &jid(PEER),
+            &wa::MessageKey {
+                id: Some("LOCAL-ONLY".into()),
+                from_me: Some(false),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    set_full_repair_pending(&store).await;
+    drop(chat_store);
+    let reopened = ChatStore::new(&store).await.unwrap();
+    assert_eq!(read_boundary_ms(&store, PEER).await, 0);
+    feed(
+        &reopened,
+        [message_event(
+            wa::Message::text("arrived after the repair"),
+            incoming_info(PEER, PEER, "UNRELATED-OLDER", 1_700_000_005),
+        )],
+    )
+    .await;
+    assert_eq!(unread_of(&reopened, PEER).await, 1);
+}
+
+#[tokio::test]
+async fn advancing_past_local_placeholder_releases_its_explicit_read_id() {
+    let (store, chat_store) = test_store().await;
+    chat_store
+        .record_revoke_target(
+            &jid(GROUP),
+            &wa::MessageKey {
+                id: Some("LOCAL-KEYED".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let mut keyed = mark_read_event(GROUP, true, 1_700_000_010);
+    if let Event::MarkChatAsReadUpdate(update) = &mut keyed {
+        update.action.message_range =
+            MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+                last_message_timestamp: Some(1_700_000_010),
+                messages: vec![wa::sync_action_value::SyncActionMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("LOCAL-KEYED".into()),
+                        from_me: Some(false),
+                        participant: Some(PEER.into()),
+                        ..Default::default()
+                    }),
+                    timestamp: Some(1_700_000_010),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+    }
+    feed(
+        &chat_store,
+        [keyed, mark_read_event(GROUP, true, 1_700_000_020)],
+    )
+    .await;
+    assert!(read_boundary_ids(&store, GROUP).await.is_none());
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("another member's later message"),
+            incoming_info(
+                GROUP,
+                "559900000002@s.whatsapp.net",
+                "LOCAL-KEYED",
+                1_700_000_021,
+            ),
+        )],
+    )
+    .await;
+    assert_eq!(unread_of(&chat_store, GROUP).await, 1);
+}
