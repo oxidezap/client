@@ -619,3 +619,96 @@ async fn edit_before_target_materializes_edited_content() {
     assert_eq!(chats[0].last_message_preview.as_deref(), Some("fixed"));
     assert_eq!(chats[0].unread_count, 1);
 }
+
+#[tokio::test]
+async fn local_admin_revoke_targets_the_member_and_survives_redelivery() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    for content_first in [true, false] {
+        let id = if content_first {
+            "ADMIN-AFTER"
+        } else {
+            "ADMIN-BEFORE"
+        };
+        let content = || {
+            message_event(
+                wa::Message::text("member content"),
+                incoming_info(GROUP, PEER, id, 1_700_000_000),
+            )
+        };
+        if content_first {
+            feed(&chat_store, [content()]).await;
+        }
+        chat_store
+            .record_revoke_target(
+                &chat,
+                &wa::MessageKey {
+                    id: Some(id.into()),
+                    from_me: Some(false),
+                    // Device-qualified keys must resolve the same author as delivery.
+                    participant: Some("559900000001:7@s.whatsapp.net".into()),
+                    ..Default::default()
+                },
+                ts(1_700_000_010),
+            )
+            .unwrap();
+        chat_store.flush().await.unwrap();
+        feed(&chat_store, [content()]).await;
+        let row = chat_store.message(&chat, id).await.unwrap().unwrap();
+        assert!(!row.from_me);
+        assert_eq!(row.sender_jid, jid(PEER));
+        assert!(row.revoked);
+        assert!(row.text.is_none());
+        assert!(row.message.is_none());
+        let rows = chat_store.messages(&chat, None, 100).await.unwrap();
+        assert_eq!(rows.iter().filter(|m| m.id == id).count(), 1);
+    }
+    #[cfg(feature = "search")]
+    assert!(
+        chat_store
+            .search_messages("member", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert!(chats[0].last_message_preview.is_none());
+}
+
+#[tokio::test]
+async fn local_revoke_key_requires_group_authorship_and_defaults_direct_peer() {
+    let (_store, chat_store) = test_store().await;
+    let target = wa::MessageKey {
+        id: Some("PEER-REVOKE".into()),
+        ..Default::default()
+    };
+    assert!(
+        chat_store
+            .record_revoke_target(&jid(GROUP), &target, ts(1_700_000_010))
+            .is_err()
+    );
+    assert!(
+        chat_store
+            .record_revoke_target(&jid(PEER), &wa::MessageKey::default(), ts(1_700_000_010))
+            .is_err()
+    );
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("peer content"),
+            incoming_info(PEER, PEER, "PEER-REVOKE", 1_700_000_000),
+        )],
+    )
+    .await;
+    chat_store
+        .record_revoke_target(&jid(PEER), &target, ts(1_700_000_010))
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let row = chat_store
+        .message(&jid(PEER), "PEER-REVOKE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.revoked);
+    assert!(!row.from_me);
+}

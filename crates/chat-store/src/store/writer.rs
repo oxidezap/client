@@ -345,6 +345,8 @@ fn apply_writer_msg(
         WriterMsg::Revoke {
             chat,
             target_id,
+            target_from_me,
+            target_participant,
             timestamp_ms,
         } => {
             let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
@@ -353,8 +355,8 @@ fn apply_writer_msg(
                 device_id,
                 &chat_str,
                 target_id,
-                "",
-                true,
+                target_participant,
+                *target_from_me,
                 *timestamp_ms,
                 cs,
             )? {

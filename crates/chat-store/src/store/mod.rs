@@ -35,7 +35,7 @@ use wacore::store::error::StoreError;
 use wacore::types::events::{
     BatchOrigin, Event, EventHandler, EventInterest, EventKind, InboundMessage, MessageBatch,
 };
-use wacore_binary::Jid;
+use wacore_binary::{Jid, JidExt as _};
 use waproto::whatsapp as wa;
 use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
 
@@ -86,6 +86,8 @@ pub(crate) enum WriterMsg {
     Revoke {
         chat: Jid,
         target_id: String,
+        target_from_me: bool,
+        target_participant: String,
         timestamp_ms: i64,
     },
     Reaction {
@@ -664,10 +666,58 @@ impl ChatStore {
         target_id: &str,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
+        self.record_revoke_target(
+            chat,
+            &wa::MessageKey {
+                id: Some(target_id.to_owned()),
+                from_me: Some(true),
+                ..Default::default()
+            },
+            timestamp,
+        )
+    }
+
+    /// Record a revoke this client sent, including an administrator deleting
+    /// another group member's message. `target` names the original message's
+    /// author, not the administrator who sent the revoke.
+    ///
+    /// A target id is required. A received group message also requires its
+    /// participant; a received direct message defaults to the chat's peer.
+    /// Goes through the writer queue; use [`flush`](Self::flush) to await
+    /// completion. Delayed content cannot resurrect the tombstone.
+    pub fn record_revoke_target(
+        &self,
+        chat: &Jid,
+        target: &wa::MessageKey,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        let target_id = target
+            .id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ChatStoreError::Store(StoreError::Validation(
+                    "revoke target key missing id".into(),
+                ))
+            })?;
+        let target_from_me = target.from_me.unwrap_or(false);
+        let target_participant = if target_from_me {
+            String::new()
+        } else if let Some(participant) = target.participant.as_ref().filter(|p| !p.is_empty()) {
+            participant.clone()
+        } else if chat.is_group() {
+            return Err(ChatStoreError::Store(StoreError::Validation(
+                "received group revoke target key missing participant".into(),
+            )));
+        } else {
+            chat.to_string()
+        };
         self.tx
             .send(WriterMsg::Revoke {
                 chat: chat.clone(),
-                target_id: target_id.to_owned(),
+                target_id: target_id.clone(),
+                target_from_me,
+                target_participant,
                 timestamp_ms: timestamp.timestamp_millis(),
             })
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
