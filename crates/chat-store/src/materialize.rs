@@ -262,6 +262,7 @@ pub(crate) fn extract_text(base: &wa::Message) -> Option<String> {
         .or_else(|| base.get_caption())
         .or_else(|| business_text(base))
         .map(str::to_owned)
+        .or_else(|| crate::shared_contacts_text(base))
 }
 
 /// Body text of the business content carriers. Extraction mirrors WA Web's
