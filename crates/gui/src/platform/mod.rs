@@ -43,6 +43,7 @@ pub mod picker;
 pub mod plugins;
 pub mod prefs;
 pub mod startup;
+pub mod window_identity;
 
 pub use activity::application_is_active;
 pub use capabilities::{calls_belong_to_another_tab, calls_unavailable, video_decode_unavailable};
