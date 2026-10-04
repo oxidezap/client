@@ -9,6 +9,7 @@ esac
 archive_dir=$(CDPATH= cd -P -- "$script_dir" && printf '%s.' "$PWD")
 archive_dir=${archive_dir%.}
 case "$archive_dir" in
+    *%*) printf 'Archive path cannot contain a percent sign\n' >&2; exit 1 ;;
     *=*) printf 'Archive path cannot contain an equals sign\n' >&2; exit 1 ;;
     *'
 '* | *"$(printf '\r')"*) printf 'Archive path cannot contain a newline\n' >&2; exit 1 ;;
@@ -26,9 +27,8 @@ case "$data_dir" in
     *) printf 'XDG_DATA_HOME must be an absolute path\n' >&2; exit 1 ;;
 esac
 # Desktop entries have two escaping layers: entry values, then Exec quoting.
-# Percent is escaped separately because it introduces a desktop field code.
 exec_path=$(printf '%s' "$archive_dir/oxidezap" | sed \
-    -e 's/\\/\\\\\\\\/g' -e 's/"/\\\\"/g' -e 's/`/\\\\`/g' -e 's/\$/\\\\$/g' -e 's/%/%%/g')
+    -e 's/\\/\\\\\\\\/g' -e 's/"/\\\\"/g' -e 's/`/\\\\`/g' -e 's/\$/\\\\$/g')
 
 mkdir -p "$data_dir/applications" "$data_dir/icons/hicolor/scalable/apps"
 cp "$archive_dir/$app_id.svg" "$data_dir/icons/hicolor/scalable/apps/$app_id.svg"
