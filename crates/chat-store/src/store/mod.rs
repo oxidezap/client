@@ -681,8 +681,8 @@ impl ChatStore {
     /// another group member's message. `target` names the original message's
     /// author, not the administrator who sent the revoke.
     ///
-    /// A target id is required. A received group message also requires its
-    /// participant; a received direct message defaults to the chat's peer.
+    /// A target id is required. Received group and broadcast messages require
+    /// their participant; a received direct message defaults to the chat's peer.
     /// Goes through the writer queue; use [`flush`](Self::flush) to await
     /// completion. Delayed content cannot resurrect the tombstone.
     pub fn record_revoke_target(
@@ -705,9 +705,9 @@ impl ChatStore {
             String::new()
         } else if let Some(participant) = target.participant.as_ref().filter(|p| !p.is_empty()) {
             participant.clone()
-        } else if chat.is_group() {
+        } else if chat.is_group() || chat.is_status_broadcast() || chat.is_broadcast_list() {
             return Err(ChatStoreError::Store(StoreError::Validation(
-                "received group revoke target key missing participant".into(),
+                "received multi-author revoke target key missing participant".into(),
             )));
         } else {
             chat.to_string()
@@ -996,6 +996,14 @@ mod migration_tests {
         .await
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
+
+        assert!(has_column(&store, "messages", "local_revoke_placeholder").await);
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("local-revoke-placeholder downgrade is reversible");
+        assert!(!has_column(&store, "messages", "local_revoke_placeholder").await);
 
         // The typed hierarchy column is followed by chat-name provenance,
         // then the pending-alias queue, classifier metadata, and identity-

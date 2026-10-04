@@ -4,7 +4,7 @@
 use diesel::prelude::*;
 
 use crate::schema;
-use crate::store::chat_rows::{ChatBump, bump_chat, refresh_preview_if_latest};
+use crate::store::chat_rows::{ChatBump, bump_chat, refresh_preview_if_latest_row};
 use crate::store::message_identity::{resolve_target, stored_sender};
 use crate::store::writer::ChangeSet;
 
@@ -28,6 +28,7 @@ pub(super) fn apply_revoke(
     sender: &str,
     target_from_me: bool,
     ts_ms: i64,
+    locally_sent: bool,
     changes: &mut ChangeSet,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
@@ -57,7 +58,7 @@ pub(super) fn apply_revoke(
         if updated == 0 {
             return Ok(false);
         }
-        return refresh_preview_if_latest(conn, device_id, chat, target_id, None, None);
+        return refresh_preview_if_latest_row(conn, device_id, chat, target.id, None, None);
     }
 
     let sender = stored_sender(sender, target_from_me);
@@ -72,13 +73,17 @@ pub(super) fn apply_revoke(
             dsl::kind.eq("unknown"),
             dsl::proto_codec.eq(crate::storage_proto::CODEC_RAW),
             dsl::revoked.eq(true),
+            // The user just performed this deletion. If its content has not
+            // arrived, retain that origin separately from the target author
+            // so future badge recounts cannot turn it into unread attention.
+            dsl::local_revoke_placeholder.eq(locally_sent),
         ))
         .on_conflict_do_nothing()
         .execute(conn)?
         > 0;
     // The tombstone may be the chat's first/newest row: the chat must exist
     // and order by it (the deleted message DID happen), and an unseen deletion
-    // still counts as unread like WA's own badge does.
+    // still counts as unread. A deletion sent here adds no attention.
     if !inserted {
         return Ok(false);
     }
@@ -91,7 +96,7 @@ pub(super) fn apply_revoke(
             ts_ms,
             preview: None,
             kind: None,
-            unread_delta: i32::from(!target_from_me),
+            unread_delta: i32::from(!target_from_me && !locally_sent),
         },
     )?;
     Ok(true)

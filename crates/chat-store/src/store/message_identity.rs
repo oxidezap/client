@@ -132,6 +132,8 @@ struct StoredMessage {
     edited_at_ms: Option<i64>,
     #[diesel(sql_type = Bool)]
     revoked: bool,
+    #[diesel(sql_type = Bool)]
+    local_revoke_placeholder: bool,
 }
 
 /// Fold rows already proven to be one author/message. Keep the oldest stable
@@ -166,6 +168,7 @@ pub(crate) fn merge_rows(
             dsl::starred,
             dsl::edited_at_ms,
             dsl::revoked,
+            dsl::local_revoke_placeholder,
         ))
         .load(conn)?;
     rows.sort_by_key(|row| row.id);
@@ -249,6 +252,7 @@ pub(crate) fn merge_rows(
             dsl::starred.eq(starred),
             dsl::edited_at_ms.eq(edited_at_ms),
             dsl::revoked.eq(tombstone),
+            dsl::local_revoke_placeholder.eq(rows.iter().any(|row| row.local_revoke_placeholder)),
         ))
         .execute(conn)?;
     Ok(MessageOwner {

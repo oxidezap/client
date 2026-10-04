@@ -358,6 +358,7 @@ fn apply_writer_msg(
                 target_participant,
                 *target_from_me,
                 *timestamp_ms,
+                true,
                 cs,
             )? {
                 cs.chats = true;

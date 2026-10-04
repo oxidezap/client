@@ -432,6 +432,7 @@ fn apply_history_message(
                     target_participant.as_deref().unwrap_or(sender),
                     target_from_me,
                     ts_ms,
+                    false,
                     cs,
                 )? {
                     cs.chats = true;

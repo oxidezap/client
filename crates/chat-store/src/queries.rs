@@ -228,6 +228,7 @@ pub(crate) struct MessageRow {
     starred: bool,
     edited_at_ms: Option<i64>,
     revoked: bool,
+    local_revoke_placeholder: bool,
 }
 
 /// Fold an author-equivalent legacy copy for a read without hiding a
@@ -283,6 +284,8 @@ fn fold_read_duplicate(
         held.status
     };
     survivor.revoked = revoked;
+    survivor.local_revoke_placeholder =
+        held.local_revoke_placeholder || incoming.local_revoke_placeholder;
     survivor.status = status;
     survivor.starred = held.starred || incoming.starred;
     survivor.timestamp_ms = held.timestamp_ms.max(incoming.timestamp_ms);
