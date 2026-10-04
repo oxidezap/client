@@ -1,6 +1,7 @@
 //! The readable part of a shared contact, reused by live rendering, history,
 //! previews and search. The original vCard stays in the stored protobuf.
 
+use std::{borrow::Cow, collections::HashSet};
 use waproto::whatsapp as wa;
 
 /// Project single and multiple shared contacts to names and phone numbers.
@@ -25,11 +26,68 @@ pub fn shared_contacts_text(message: &wa::Message) -> Option<String> {
     )
 }
 
+fn is_quoted_printable(property: &str) -> bool {
+    property.split(';').skip(1).any(|parameter| {
+        parameter.split_once('=').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("ENCODING")
+                && value
+                    .trim_matches('"')
+                    .eq_ignore_ascii_case("QUOTED-PRINTABLE")
+        })
+    })
+}
+
+fn decoded_value<'a>(property: &str, value: &'a str) -> Cow<'a, str> {
+    if !is_quoted_printable(property) {
+        return Cow::Borrowed(value);
+    }
+    let charset = property.split(';').skip(1).find_map(|parameter| {
+        parameter
+            .split_once('=')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("CHARSET"))
+            .map(|(_, value)| value.trim_matches('"'))
+    });
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut input = value.as_bytes();
+    while let Some((&first, rest)) = input.split_first() {
+        if first == b'='
+            && rest.len() >= 2
+            && let (Some(high), Some(low)) = (
+                (rest[0] as char).to_digit(16),
+                (rest[1] as char).to_digit(16),
+            )
+        {
+            bytes.push((high * 16 + low) as u8);
+            input = &rest[2..];
+        } else {
+            // Preserve malformed sequences as readable text instead of dropping data.
+            bytes.push(first);
+            input = rest;
+        }
+    }
+    let encoding = charset
+        .and_then(|charset| encoding_rs::Encoding::for_label(charset.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    Cow::Owned(encoding.decode_without_bom_handling(&bytes).0.into_owned())
+}
+
 fn contact_text(contact: &wa::message::ContactMessage) -> String {
     let mut lines: Vec<String> = Vec::new();
     // RFC 2425/6350 folding removes exactly the first space or tab of a
     // continuation line, before property parsing and vCard text unescaping.
     for line in contact.vcard.as_deref().unwrap_or_default().lines() {
+        if let Some(last) = lines.last_mut()
+            && last.ends_with('=')
+            && last
+                .split_once(':')
+                .is_some_and(|(property, _)| is_quoted_printable(property))
+        {
+            // vCard 2.1 quoted-printable soft line breaks are distinct from
+            // the ordinary whitespace folding used by newer vCards.
+            last.pop();
+            last.push_str(line.strip_prefix([' ', '\t']).unwrap_or(line));
+            continue;
+        }
         if let Some(tail) = line.strip_prefix([' ', '\t'])
             && let Some(last) = lines.last_mut()
         {
@@ -41,10 +99,13 @@ fn contact_text(contact: &wa::message::ContactMessage) -> String {
     let mut formatted_name = None;
     let mut structured_name = None;
     let mut phones = Vec::new();
+    let mut seen_phones = HashSet::new();
     for line in lines {
         let Some((property, value)) = line.split_once(':') else {
             continue;
         };
+        let decoded = decoded_value(property, value);
+        let value = decoded.as_ref();
         // iOS commonly groups properties as item1.TEL / item1.X-ABLabel.
         let property = property.split(';').next().unwrap_or_default();
         let property = property.rsplit('.').next().unwrap_or_default();
@@ -74,7 +135,7 @@ fn contact_text(contact: &wa::message::ContactMessage) -> String {
                     &value
                 };
                 if let Some(phone) = label(Some(value))
-                    && !phones.contains(&phone)
+                    && seen_phones.insert(phone.clone())
                 {
                     phones.push(phone);
                 }
@@ -134,6 +195,37 @@ fn split_name(value: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use buffa::MessageField;
+
+    #[test]
+    fn quoted_printable_names_decode_utf8_soft_breaks_and_legacy_charsets() {
+        for (vcard, expected) in [
+            (
+                "FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:Jos=C3=A9",
+                "José",
+            ),
+            (
+                "FN;encoding=quoted-printable;charset=utf-8:Jos=C3=\r\n=A9",
+                "José",
+            ),
+            (
+                "FN;CHARSET=ISO-8859-1;ENCODING=QUOTED-PRINTABLE:Andr=E9",
+                "André",
+            ),
+            (
+                "N;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:Example;Jos=C3=A9;;;",
+                "José Example",
+            ),
+            ("FN;ENCODING=QUOTED-PRINTABLE:Malformed=ZZ", "Malformed=ZZ"),
+        ] {
+            assert_eq!(
+                contact_text(&wa::message::ContactMessage {
+                    vcard: Some(vcard.into()),
+                    ..Default::default()
+                }),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn contact_names_phones_folding_and_vcard_escapes_are_readable() {

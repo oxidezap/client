@@ -6353,6 +6353,7 @@ dependencies = [
  "chrono",
  "diesel",
  "diesel_migrations",
+ "encoding_rs",
  "flate2",
  "getrandom 0.2.17",
  "getrandom 0.4.3",
