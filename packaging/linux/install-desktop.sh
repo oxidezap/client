@@ -9,6 +9,7 @@ esac
 archive_dir=$(CDPATH= cd -P -- "$script_dir" && printf '%s.' "$PWD")
 archive_dir=${archive_dir%.}
 case "$archive_dir" in
+    *=*) printf 'Archive path cannot contain an equals sign\n' >&2; exit 1 ;;
     *'
 '* | *"$(printf '\r')"*) printf 'Archive path cannot contain a newline\n' >&2; exit 1 ;;
 esac
