@@ -51,6 +51,7 @@ impl WhatsAppApp {
 
     /// Start composing a reply to `message_id`.
     pub fn begin_reply(&mut self, message_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_message_edit(window, cx);
         let Some(chat) = self.selected_chat_data() else {
             return;
         };

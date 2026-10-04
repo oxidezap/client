@@ -59,7 +59,7 @@ impl WhatsAppApp {
 
     /// Whether accepting another dropped or pasted file would waste a read.
     pub(crate) fn incoming_files_busy(&self) -> bool {
-        self.paste_preview.is_some() || self.incoming_file_reading
+        self.edit_draft.is_some() || self.paste_preview.is_some() || self.incoming_file_reading
     }
 
     /// Complete the read only for the account that began it. An old read

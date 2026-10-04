@@ -344,6 +344,9 @@ impl WhatsAppApp {
             self.clear_search(window, cx);
             return;
         }
+        if self.cancel_message_edit(window, cx) {
+            return;
+        }
         let composer_focused = self
             .input_area
             .as_ref()

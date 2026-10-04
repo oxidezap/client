@@ -6,6 +6,8 @@
 //! synchronous constructor returning a [`Task`] that resolves once the network
 //! answered, with failures as strings a front end can display.
 
+use oxidezap_chat_store::{MessageKind, MessageStatus};
+
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _, observe_str};
 use whatsapp_rust::waproto::whatsapp as wa;
 
@@ -74,21 +76,46 @@ impl WhatsAppClient {
             let chat: Jid = chat_jid
                 .parse()
                 .map_err(|_| "not a chat address".to_string())?;
-            if new_text.is_empty() {
+            if new_text.trim().is_empty() {
                 return Err("new text must not be empty".to_string());
             }
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let stored = live
+                .chat_store
+                .message(&chat, &message_id)
+                .await
+                .map_err(|e| format!("database query failed: {e}"))?
+                .ok_or_else(|| "message not found".to_string())?;
+            if !stored.from_me || stored.revoked || stored.kind != MessageKind::Text {
+                return Err("only our own non-deleted text messages can be edited".to_string());
+            }
+            if matches!(stored.status, MessageStatus::Pending | MessageStatus::Error) {
+                return Err("message has not been sent".to_string());
+            }
+            if wacore::time::now_millis().saturating_sub(stored.timestamp.timestamp_millis())
+                >= 15 * 60 * 1_000
+            {
+                return Err("messages can be edited for 15 minutes after sending".to_string());
+            }
             let content = wa::Message {
                 conversation: Some(new_text),
                 ..Default::default()
             };
-            live.client
-                .edit_message(chat, message_id, content)
+            let result = live
+                .client
+                .edit_message(chat.clone(), message_id.clone(), content.clone())
                 .await
-                .map(|result| result.message_id.clone())
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            live.chat_store
+                .record_edit(&chat, &message_id, &content, wacore::time::now_utc())
+                .map_err(|e| format!("edit was sent but could not be saved locally: {e}"))?;
+            live.chat_store
+                .flush()
+                .await
+                .map_err(|e| format!("edit was sent but could not be saved locally: {e}"))?;
+            Ok(result.message_id)
         })
     }
 

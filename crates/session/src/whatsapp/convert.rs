@@ -82,6 +82,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         sender: stored.sender_jid.to_string(),
         sender_name: None,
         content,
+        is_text: stored.kind == oxidezap_chat_store::MessageKind::Text,
         timestamp: stored.timestamp,
         is_from_me: stored.from_me,
         is_read,
@@ -97,6 +98,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         },
         quoted,
         revoked: stored.revoked,
+        edited: stored.edited_at.is_some(),
         system: None,
         poll,
     }

@@ -769,6 +769,15 @@ pub struct SendMedia {
     pub quoted: Option<QuotedMessage>,
 }
 
+/// Edit a sent text message. The acknowledgement is sent after the network
+/// accepts the edit and the local store durably records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditMessage {
+    pub jid: String,
+    pub message_id: String,
+    pub new_text: String,
+}
+
 /// React to a message with an emoji. See [`ClientRequest::SendReaction`].
 ///
 /// Small enough for the socket, unlike the sends above it: an emoji is a
@@ -974,6 +983,7 @@ pub enum ClientRequest {
     /// is unchanged — `Box` is transparent to serde — and the round-trip
     /// test pins the bytes.
     SendReaction(Box<SendReaction>),
+    EditMessage(EditMessage),
     /// Tell the peer whether we are typing. One request rather than two,
     /// because it is one piece of state with two values.
     Typing(Typing),

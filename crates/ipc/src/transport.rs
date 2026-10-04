@@ -277,7 +277,8 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 37;
+/// v38: typed GUI EditMessage and durable edited markers on message frames.
+pub const PROTOCOL_VERSION: u32 = 38;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

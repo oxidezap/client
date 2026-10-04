@@ -91,8 +91,8 @@ use oxidezap_ipc::{CallAction, ClientRequest, Link, PageCursor, Request, Request
 // so `Typing` and `Download` read at the call site as what they are: the
 // request's own payload, built here and moved onto the wire unchanged.
 use oxidezap_ipc::{
-    Download, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, SendAudio, SendMedia,
-    SendReaction, SendText, Typing, VotePoll,
+    Download, EditMessage, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, SendAudio,
+    SendMedia, SendReaction, SendText, Typing, VotePoll,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
@@ -296,6 +296,7 @@ impl From<&oxidezap_ipc::ProtocolError> for Failure {
 /// is waiting, and a send that was refused becomes the failure the message it
 /// drew is already able to render.
 enum Awaiting {
+    Mutation(oneshot::Sender<Result<(), Failure>>),
     Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, Failure>>),
     /// What this account occupies on disk, for the Storage pane.
     Storage(oneshot::Sender<StorageUsage>),
@@ -372,6 +373,7 @@ impl Awaiting {
             Self::Acted(tx) => tx.is_closed(),
             Self::Installed { tell, .. } => tell.is_closed(),
             Self::Removed(tx) => tx.is_closed(),
+            Self::Mutation(tx) => tx.is_closed(),
             Self::Installable(tx) => tx.is_closed(),
             // Nor is a ring that has already been taken down: the window is
             // showing the update as watched and only an answer can correct it.
@@ -399,6 +401,9 @@ impl Awaiting {
     fn failed(self, failure: &Failure, events: Option<&ReaderSink>) {
         let detail = failure.detail.as_str();
         match self {
+            Self::Mutation(tx) => {
+                let _ = tx.send(Err(failure.clone()));
+            }
             // The only caller that reads more than the sentence: whether
             // asking again could work decides what the person is told to do
             // about it. See [`Failure`].
@@ -1276,6 +1281,24 @@ impl SessionHandle {
     /// bubble drawn ahead of it to rename or fail, and the network echo
     /// arriving as `ReactionReceived` is the confirmation. The optimistic
     /// row the timeline paints is reverted only by the next history load.
+    pub fn edit_message(
+        &self,
+        jid: String,
+        message_id: String,
+        new_text: String,
+    ) -> oneshot::Receiver<Result<(), Failure>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::EditMessage(EditMessage {
+                jid,
+                message_id,
+                new_text,
+            }),
+            Awaiting::Mutation(tx),
+        );
+        rx
+    }
+
     pub fn send_reaction(&self, chat_jid: &str, message_id: &str, emoji: &str) {
         self.tell(ClientRequest::SendReaction(Box::new(SendReaction {
             chat_jid: chat_jid.to_string(),

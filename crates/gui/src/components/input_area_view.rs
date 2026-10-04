@@ -44,6 +44,7 @@ pub enum InputAreaEvent {
     CancelRecording,
     /// User dropped the reply they were composing.
     CancelReply,
+    CancelEdit,
 }
 
 /// Typing indicator state with debouncing.
@@ -108,6 +109,8 @@ pub struct InputAreaView {
     input: Entity<TextareaState>,
     /// Whether PTT recording is active
     is_recording: bool,
+    editing: bool,
+    edit_pending: bool,
     /// When the current recording started, for the elapsed counter.
     recording_started_at: Option<Instant>,
     /// Most recent input level, 0..=1, for the live meter.
@@ -168,6 +171,8 @@ impl InputAreaView {
         Self {
             input,
             is_recording: false,
+            editing: false,
+            edit_pending: false,
             recording_started_at: None,
             level: 0.0,
             reply: None,
@@ -303,6 +308,9 @@ impl InputAreaView {
     /// Read, trim-check, clear and emit the composed message (Enter and the
     /// send button share this path).
     fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit_pending {
+            return;
+        }
         let text = self.input.read(cx).text().to_string();
         if text.trim().is_empty() {
             return;
@@ -362,6 +370,12 @@ impl InputAreaView {
         cx.notify();
     }
 
+    pub fn set_edit_state(&mut self, editing: bool, pending: bool, cx: &mut Context<Self>) {
+        self.editing = editing;
+        self.edit_pending = pending;
+        cx.notify();
+    }
+
     pub fn set_reply(&mut self, reply: Option<ReplyDraft>, cx: &mut Context<Self>) {
         self.reply = reply;
         cx.notify();
@@ -407,9 +421,27 @@ impl Render for InputAreaView {
             .bg(cx.theme().background)
             .border_t_1()
             .border_color(cx.theme().border)
+            .children(self.editing.then(|| {
+                let entity = entity.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(if self.edit_pending {
+                        "Saving edit..."
+                    } else {
+                        "Editing message"
+                    })
+                    .child(Button::new("cancel-edit").ghost().label("Cancel").on_click(
+                        move |_, _, cx| {
+                            entity.update(cx, |_, cx| cx.emit(InputAreaEvent::CancelEdit));
+                        },
+                    ))
+            }))
             .children(
                 self.reply
                     .clone()
+                    .filter(|_| !self.editing)
                     .map(|reply| render_reply_bar(reply, entity.clone(), metrics, cx)),
             )
             .child(if is_recording {
@@ -463,6 +495,7 @@ impl InputAreaView {
                     "Attach a photo, a video or a document",
                     control,
                 )
+                .disabled(self.editing)
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     attach_entity.update(cx, |_view, cx| cx.emit(InputAreaEvent::AttachFiles));
@@ -475,7 +508,11 @@ impl InputAreaView {
                     .capture_action::<Paste>(
                         cx.listener(|view, _: &Paste, _window, cx| view.paste_image(cx)),
                     )
-                    .child(Textarea::new(&self.input).w_full()),
+                    .child(
+                        Textarea::new(&self.input)
+                            .readonly(self.edit_pending)
+                            .w_full(),
+                    ),
             )
             .child(
                 parts::icon_button(
@@ -489,11 +526,12 @@ impl InputAreaView {
             // Record or send, never both: which one is available follows
             // whether there is anything to send, the way every messaging
             // client behaves.
-            .child(if has_text {
+            .child(if has_text || self.editing {
                 Button::new("send")
                     .icon(IconName::ArrowRight)
                     .primary()
-                    .tooltip("Send")
+                    .tooltip(if self.editing { "Save edit" } else { "Send" })
+                    .disabled(self.edit_pending)
                     .w(control)
                     .h(control)
                     .cursor_pointer()
@@ -511,7 +549,7 @@ impl InputAreaView {
                 Button::new("ptt")
                     .icon(ProductIcon::Mic)
                     .ghost()
-                    .disabled(!can_record)
+                    .disabled(!can_record || self.editing)
                     .tooltip(if can_record {
                         "Hold to record a voice message"
                     } else {
