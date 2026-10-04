@@ -11,7 +11,7 @@ use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, 
 use gpui_component::{
     ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants},
-    input::{InputEvent, Paste, Textarea, TextareaState},
+    input::{Enter, InputEvent, Paste, Textarea, TextareaState},
 };
 
 use crate::components::{ProductIcon, parts};
@@ -136,6 +136,19 @@ pub struct InputAreaView {
 impl EventEmitter<InputAreaEvent> for InputAreaView {}
 
 impl InputAreaView {
+    pub fn init_bindings(cx: &mut App) {
+        // Only this textarea treats Control+Enter as a newline. Other fields
+        // retain the component library's secondary-confirm shortcut.
+        cx.bind_keys([gpui::KeyBinding::new(
+            "ctrl-enter",
+            Enter {
+                secondary: false,
+                shift: true,
+            },
+            Some("MessageComposer > Input"),
+        )]);
+    }
+
     /// Create a new input area view
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Enter sends and Shift+Enter breaks the line, which is what
@@ -180,7 +193,7 @@ impl InputAreaView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            InputEvent::PressEnter { .. } => {
+            InputEvent::PressEnter { shift: false, .. } => {
                 self.submit_input(window, cx);
             }
             InputEvent::Change => {
@@ -432,6 +445,14 @@ impl InputAreaView {
             .any(|c| !c.is_whitespace());
 
         div()
+            .key_context("MessageComposer")
+            .on_action(|action: &Enter, _, cx| {
+                if !action.shift {
+                    // The textarea propagates submission. Consume it here so
+                    // GPUI cannot also insert the key's newline as text input.
+                    cx.stop_propagation();
+                }
+            })
             .flex()
             .items_center()
             .gap(metrics.space_md())
@@ -702,6 +723,7 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
+            crate::app::init_app_bindings(cx);
         });
         let window = cx
             .open_window(size(px(640.), px(120.)), |window, cx| {
@@ -750,6 +772,97 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[test]
+    fn modified_enter_inserts_newlines_without_sending_and_plain_enter_sends_once() {
+        let ComposerFixture {
+            mut cx,
+            window,
+            input,
+            ..
+        } = setup();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let observed = sent.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
+                if let InputAreaEvent::SendMessage(text) = event {
+                    observed.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        cx.update_window(*window, |_, window, cx| {
+            input.update(cx, |view, cx| {
+                view.input.update(cx, |field, cx| {
+                    field.set_value("hello", window, cx);
+                    field.set_cursor_position(
+                        gpui_component::input::Position::new(0, 5),
+                        window,
+                        cx,
+                    );
+                })
+            });
+        })
+        .unwrap();
+        for key in ["ctrl-enter", "shift-enter"] {
+            cx.update_window(*window, |_, window, cx| {
+                window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert!(sent.borrow().is_empty(), "{key} submitted the message");
+        }
+        cx.update(|cx| {
+            assert_eq!(
+                input.read(cx).input.read(cx).text().to_string(),
+                "hello\n\n"
+            )
+        });
+        cx.update_window(*window, |_, window, cx| {
+            window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(&*sent.borrow(), &["hello\n\n"]);
+        cx.update(|cx| assert!(input.read(cx).input.read(cx).text().to_string().is_empty()));
+    }
+
+    #[test]
+    fn secondary_confirmation_still_submits_without_a_newline() {
+        let ComposerFixture {
+            mut cx,
+            window,
+            input,
+            ..
+        } = setup();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let observed = sent.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
+                if let InputAreaEvent::SendMessage(text) = event {
+                    observed.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        cx.update_window(*window, |_, window, cx| {
+            input.update(cx, |view, cx| {
+                view.swap_text("command send", window, cx);
+            });
+            if cfg!(target_os = "macos") {
+                window.dispatch_keystroke(Keystroke::parse("cmd-enter").unwrap(), cx);
+            } else {
+                window.dispatch_action(
+                    Box::new(gpui_component::input::Enter {
+                        secondary: true,
+                        shift: false,
+                    }),
+                    cx,
+                );
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(&*sent.borrow(), &["command send"]);
     }
 
     #[test]
