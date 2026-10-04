@@ -1,7 +1,17 @@
 #!/bin/sh
 # Register the extracted archive for this user. Keep its three binaries together.
 set -eu
-archive_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+case "$0" in
+    */*) script_dir=${0%/*}; script_dir=${script_dir:-/} ;;
+    *) script_dir=. ;;
+esac
+# The delimiter preserves newline bytes that belong to a directory name.
+archive_dir=$(CDPATH= cd -P -- "$script_dir" && printf '%s.' "$PWD")
+archive_dir=${archive_dir%.}
+case "$archive_dir" in
+    *'
+'* | *"$(printf '\r')"*) printf 'Archive path cannot contain a newline\n' >&2; exit 1 ;;
+esac
 for binary in oxidezap oxidezapd oxidezap-cli; do
     if [ ! -x "$archive_dir/$binary" ]; then
         printf 'Missing executable beside this installer: %s\n' "$binary" >&2
@@ -18,10 +28,7 @@ esac
 # Percent is escaped separately because it introduces a desktop field code.
 exec_path=$(printf '%s' "$archive_dir/oxidezap" | sed \
     -e 's/\\/\\\\\\\\/g' -e 's/"/\\\\"/g' -e 's/`/\\\\`/g' -e 's/\$/\\\\$/g' -e 's/%/%%/g')
-case "$archive_dir" in
-    *'
-'* | *"$(printf '\r')"*) printf 'Archive path cannot contain a newline\n' >&2; exit 1 ;;
-esac
+
 mkdir -p "$data_dir/applications" "$data_dir/icons/hicolor/scalable/apps"
 cp "$archive_dir/$app_id.svg" "$data_dir/icons/hicolor/scalable/apps/$app_id.svg"
 {
