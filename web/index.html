@@ -12,6 +12,14 @@
     <meta name="color-scheme" content="dark light" />
     <title>oxidezap</title>
 
+    <!-- ICO contains native 16/32/48 px frames. Trunk hashes its URL and
+         applies the deployment prefix; copied PNGs stay document-relative. -->
+    <link data-trunk rel="copy-file" href="icons/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png" />
+    <link data-trunk rel="icon" href="icons/favicon.ico" />
+    <link data-trunk rel="copy-file" href="icons/apple-touch-icon.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png" />
+
     <!-- Cross-origin isolation, which GitHub Pages cannot give us.
          `gpui_web` runs its background executor on real workers, and workers
          share memory through a `SharedArrayBuffer` — which a browser only

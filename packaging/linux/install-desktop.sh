@@ -31,7 +31,7 @@ exec_path=$(printf '%s' "$archive_dir/oxidezap" | sed \
     -e 's/\\/\\\\\\\\/g' -e 's/"/\\\\"/g' -e 's/`/\\\\`/g' -e 's/\$/\\\\$/g')
 
 mkdir -p "$data_dir/applications" "$data_dir/icons"
-# Install the original PNG in the unthemed icon search directory.
+# Install the organization PNG in the unthemed icon search directory.
 cp "$archive_dir/$app_id.png" "$data_dir/icons/$app_id.png"
 {
     printf '[Desktop Entry]\nType=Application\nName=OxideZap\nComment=WhatsApp client\n'
