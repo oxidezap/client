@@ -14,6 +14,16 @@ case "$archive_dir" in
     *'
 '* | *"$(printf '\r')"*) printf 'Archive path cannot contain a newline\n' >&2; exit 1 ;;
 esac
+if ! command -v iconv >/dev/null 2>&1; then
+    printf 'iconv is required to validate the launcher path\n' >&2
+    exit 1
+fi
+# UTF-16 conversion also rejects non-Unicode code points that glibc's UTF-8
+# decoder otherwise accepts, such as historical five-byte encodings.
+if ! printf '%s' "$archive_dir" | iconv -f UTF-8 -t UTF-16BE >/dev/null 2>&1; then
+    printf 'Archive path must be valid UTF-8\n' >&2
+    exit 1
+fi
 for binary in oxidezap oxidezapd oxidezap-cli; do
     if [ ! -x "$archive_dir/$binary" ]; then
         printf 'Missing executable beside this installer: %s\n' "$binary" >&2
