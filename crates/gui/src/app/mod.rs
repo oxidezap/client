@@ -582,6 +582,7 @@ actions!(calls, [AcceptCall, DeclineCall]);
 
 /// Initialize chat list and call popup key bindings
 pub fn init_app_bindings(cx: &mut gpui::App) {
+    crate::components::InputAreaView::init_bindings(cx);
     // `secondary` is Command on macOS and Control elsewhere, which is what
     // makes one binding table correct on every platform.
     cx.bind_keys([
