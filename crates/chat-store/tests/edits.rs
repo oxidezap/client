@@ -939,3 +939,40 @@ async fn deleting_a_local_placeholder_keeps_another_members_unread_badge() {
     assert_eq!(rows[0].sender_jid, jid("559900000002@s.whatsapp.net"));
     assert_eq!(rows[0].text.as_deref(), Some("unread member"));
 }
+
+#[tokio::test]
+async fn local_placeholder_does_not_spend_the_previous_pages_unread_budget() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("unread"),
+            incoming_info(GROUP, PEER, "REAL-UNREAD", 1_700_000_000),
+        )],
+    )
+    .await;
+    chat_store
+        .record_revoke_target(
+            &chat,
+            &wa::MessageKey {
+                id: Some("LOCAL-NEWER".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let (first, unread) = chat_store.page_with_unread(&chat, None, 1).await.unwrap();
+    assert_eq!(unread, 1);
+    assert!(first[0].local_revoke_placeholder);
+    let (previous, unread) = chat_store
+        .page_with_unread(&chat, Some((&first[0]).into()), 1)
+        .await
+        .unwrap();
+    assert_eq!(previous[0].id, "REAL-UNREAD");
+    assert!(!previous[0].local_revoke_placeholder);
+    assert_eq!(unread, 1);
+}

@@ -4,7 +4,7 @@
 //! bubble, the store's durable delivery state into the ticks the UI draws, a
 //! quote the front end composed into the context info that threads the reply,
 //! and the device store into who this device is linked as.
-//! [`mark_unread_tail`] is here because it is the correction the first of them
+//! [`stored_with_unread_tail`] is here because it is the correction the first of them
 //! owes every caller that hydrates a page.
 
 use std::sync::Arc;
@@ -16,29 +16,29 @@ use whatsapp_rust::waproto::whatsapp as wa;
 use super::media;
 use crate::quoting::quoted_from;
 
-/// Un-read the newest `unread` incoming rows of a hydrated page.
-///
-/// [`stored_to_chat_message`] reads an incoming row back as read, because the
-/// store keeps read state on the chat's counter and not on the row — so every
-/// caller that hydrates stored rows owes this correction. Skipping it hands a
-/// front end a page in which nothing is unread: the read it then asks for
-/// names messages the daemon was told were already seen, no receipt goes out,
-/// and the badge comes back on the next hydration.
-///
-/// Returns whatever budget the page did not spend, for a caller walking a
-/// PN/LID pair a page at a time.
-pub(super) fn mark_unread_tail(messages: &mut [ChatMessage], unread: u32) -> u32 {
+/// Hydrate an oldest-first page, assigning unread slots only to incoming
+/// rows that contributed to the durable counter. Local revoke placeholders
+/// stay read and cannot displace a real unread message or its receipt.
+pub(super) fn stored_with_unread_tail(
+    rows: Vec<oxidezap_chat_store::StoredMessage>,
+    unread: u32,
+) -> Vec<ChatMessage> {
     let mut remaining = unread;
-    for msg in messages.iter_mut().rev() {
-        if remaining == 0 {
-            break;
-        }
-        if !msg.is_from_me {
-            msg.is_read = false;
-            remaining -= 1;
-        }
-    }
-    remaining
+    let mut messages: Vec<_> = rows
+        .into_iter()
+        .rev()
+        .map(|row| {
+            let eligible = !row.from_me && !row.local_revoke_placeholder;
+            let mut message = stored_to_chat_message(row);
+            if eligible && remaining > 0 {
+                message.is_read = false;
+                remaining -= 1;
+            }
+            message
+        })
+        .collect();
+    messages.reverse();
+    messages
 }
 
 /// Convert a durable store row into the UI message model. Media stays
@@ -260,8 +260,23 @@ mod tests {
             starred: false,
             edited_at: None,
             revoked: false,
+            local_revoke_placeholder: false,
             seq: 1,
         }
+    }
+
+    #[test]
+    fn local_placeholder_does_not_consume_the_hydrated_unread_tail() {
+        let mut incoming = stored_poll_creation();
+        incoming.id = "REAL-UNREAD".into();
+        let mut placeholder = stored_poll_creation();
+        placeholder.id = "LOCAL-REVOKE".into();
+        placeholder.local_revoke_placeholder = true;
+        placeholder.revoked = true;
+        let messages = stored_with_unread_tail(vec![incoming, placeholder], 1);
+        assert!(!messages[0].is_read);
+        assert!(messages[1].is_read);
+        assert!(!messages[1].is_from_me);
     }
 
     /// A stored poll creation hydrates as a votable poll, with the question
