@@ -53,9 +53,11 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         .map(oxidezap_chat_store::normalized_message);
     let media = base_message.and_then(|message| media::media_of(message, None));
     let poll = base_message.and_then(poll_of);
+    let contacts = base_message.and_then(oxidezap_chat_store::shared_contacts_text);
     let content = match (&stored.text, stored.revoked) {
         (_, true) => "[Message deleted]".to_string(),
         (Some(text), _) => text.clone(),
+        (None, _) if contacts.is_some() => contacts.unwrap_or_default(),
         (None, _) if poll.is_some() => poll
             .as_ref()
             .map(|p| p.question.clone())
@@ -277,6 +279,26 @@ mod tests {
         assert!(!messages[0].is_read);
         assert!(messages[1].is_read);
         assert!(!messages[1].is_from_me);
+    }
+
+    #[test]
+    fn legacy_contact_rows_project_the_proto_without_a_stored_text_column() {
+        let mut stored = stored_poll_creation();
+        stored.kind = oxidezap_chat_store::MessageKind::Contact;
+        stored.message = Some(Box::new(wa::Message {
+            contact_message: MessageField::some(wa::message::ContactMessage {
+                display_name: Some("Example Alpha".into()),
+                vcard: Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            stored_to_chat_message(stored.clone()).content,
+            "Example Alpha\n+55 99 0000-0001"
+        );
+        stored.revoked = true;
+        assert_eq!(stored_to_chat_message(stored).content, "[Message deleted]");
     }
 
     /// A stored poll creation hydrates as a votable poll, with the question

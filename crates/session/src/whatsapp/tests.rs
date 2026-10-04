@@ -2814,3 +2814,63 @@ async fn offline_replays_keep_phone_read_flags_without_alerting() {
         assert!(!notification_allowed);
     }
 }
+
+#[tokio::test]
+async fn live_and_reloaded_shared_contacts_show_the_same_details() {
+    use whatsapp_rust::waproto::buffa::MessageField;
+    let (store, client) = test_session("shared-contact-details").await;
+    let proto = wa::Message {
+        contact_message: MessageField::some(wa::message::ContactMessage {
+            display_name: Some("Example Alpha".into()),
+            vcard: Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Example"),
+            proto.clone(),
+            "SHARED-CARD",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let info = live_info(
+        TEST_GROUP,
+        TEST_PEER,
+        Some("Example"),
+        "SHARED-CARD",
+        1_700_000_000,
+    );
+    WhatsAppClient::handle_inbound_message(
+        &proto,
+        &info,
+        &client,
+        &ui_tx,
+        &book_with(&store),
+        false,
+    )
+    .await;
+    let oxidezap_core::UiEvent::MessageReceived { message, .. } = ui_rx.recv().await.unwrap()
+    else {
+        panic!("contact message event");
+    };
+    assert_eq!(message.content, "Example Alpha\n+55 99 0000-0001");
+    let stored = store
+        .message(&TEST_GROUP.parse().unwrap(), "SHARED-CARD")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        super::convert::stored_to_chat_message(stored).content,
+        message.content
+    );
+}

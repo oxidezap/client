@@ -2233,6 +2233,7 @@ impl WhatsAppClient {
             .text_content()
             .map(|s| s.to_string())
             .or_else(|| base_msg.get_caption().map(|s| s.to_string()))
+            .or_else(|| oxidezap_chat_store::shared_contacts_text(base_msg))
             .or_else(|| poll.as_ref().map(|poll| poll.question.clone()))
             .unwrap_or_else(|| live_content_fallback(base_msg, media_result.is_some()));
 

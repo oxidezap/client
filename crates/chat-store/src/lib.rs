@@ -28,6 +28,7 @@
 //! let mut changes = chat_store.subscribe();
 //! ```
 
+mod contacts_text;
 mod error;
 #[cfg(feature = "search")]
 mod fts;
@@ -40,6 +41,7 @@ mod storage_proto;
 mod store;
 pub mod types;
 
+pub use contacts_text::shared_contacts_text;
 pub use error::{ChatStoreError, Result, db_err};
 pub use materialize::{
     is_control_only, message_kind, normalized_message, poll_creation_message,
