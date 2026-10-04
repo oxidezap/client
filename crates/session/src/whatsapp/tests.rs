@@ -2300,6 +2300,7 @@ fn a_message_cursor_survives_the_round_trip() {
         message: None,
         status: oxidezap_chat_store::MessageStatus::Delivered,
         revoked: false,
+        local_revoke_placeholder: false,
         edited_at: None,
         starred: false,
         seq: 4242,

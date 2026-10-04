@@ -18,7 +18,7 @@ use whatsapp_rust::waproto::whatsapp as wa;
 use oxidezap_core::{Chat, ChatMessage};
 
 use super::WhatsAppClient;
-use super::convert::{mark_unread_tail, stored_to_chat_message};
+use super::convert::{stored_to_chat_message, stored_with_unread_tail};
 use crate::exec::Task;
 use crate::names::NameBook;
 
@@ -432,7 +432,8 @@ impl WhatsAppClient {
     ) -> Vec<ChatMessage> {
         let mention_lists = crate::mentions::mention_lists_of(&page);
         let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
-        let mut messages: Vec<ChatMessage> = page.into_iter().map(stored_to_chat_message).collect();
+        let mut messages: Vec<ChatMessage> =
+            stored_with_unread_tail(page, unread.clamp(0, u32::MAX as i64) as u32);
         crate::mentions::hydrate_mention_lists(client, names, &mention_lists, &mut messages).await;
         crate::mentions::hydrate_quoted_mention_lists(client, names, &quoted_lists, &mut messages)
             .await;
@@ -451,7 +452,6 @@ impl WhatsAppClient {
         // Exactly what the attach load does to its rows, which is what the
         // paragraph above promises: a page hydrated any other way is one whose
         // unread tail nobody ever sends a receipt for.
-        mark_unread_tail(&mut messages, unread.clamp(0, u32::MAX as i64) as u32);
         messages
     }
 

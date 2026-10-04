@@ -69,6 +69,7 @@ pub(super) fn coverable_future_ids(
                 .eq(device_id)
                 .and(msgs::chat_jid.eq(chat))
                 .and(msgs::from_me.eq(false))
+                .and(msgs::local_revoke_placeholder.eq(false))
                 .and(msgs::timestamp_ms.gt(frontier_ms)),
         )
         .select(msgs::msg_id)
@@ -188,6 +189,7 @@ pub(super) fn advance_read_state(
                         .and(dsl::chat_jid.eq(chat))
                         .and(dsl::msg_id.eq_any(&state.extra_ids))
                         .and(dsl::from_me.eq(false))
+                        .and(dsl::local_revoke_placeholder.eq(false))
                         .and(dsl::timestamp_ms.gt(state.watermark_ms)),
                 )
                 .select(dsl::msg_id)
@@ -258,6 +260,7 @@ pub(super) fn count_unread(
                 .eq(device_id)
                 .and(dsl::chat_jid.eq(chat))
                 .and(dsl::from_me.eq(false))
+                .and(dsl::local_revoke_placeholder.eq(false))
                 .and(dsl::timestamp_ms.gt(state.watermark_ms)),
         )
         .into_boxed();
@@ -286,6 +289,7 @@ pub(super) fn count_uncovered_incoming(
                 .eq(device_id)
                 .and(dsl::chat_jid.eq(chat))
                 .and(dsl::from_me.eq(false))
+                .and(dsl::local_revoke_placeholder.eq(false))
                 .and(dsl::timestamp_ms.gt(state.watermark_ms)),
         )
         .into_boxed();

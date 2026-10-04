@@ -284,6 +284,8 @@ pub struct StoredMessage {
     pub starred: bool,
     pub edited_at: Option<DateTime<Utc>>,
     pub revoked: bool,
+    /// A locally created tombstone that never contributed to unread counts.
+    pub local_revoke_placeholder: bool,
     /// Arrival order within this store, ascending. Opaque: compare it, don't
     /// interpret it. It exists because the server's `t` is whole seconds, so
     /// two messages exchanged in the same second carry the same `timestamp`

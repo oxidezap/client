@@ -619,3 +619,360 @@ async fn edit_before_target_materializes_edited_content() {
     assert_eq!(chats[0].last_message_preview.as_deref(), Some("fixed"));
     assert_eq!(chats[0].unread_count, 1);
 }
+
+#[tokio::test]
+async fn local_admin_revoke_targets_the_member_and_survives_redelivery() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    for content_first in [true, false] {
+        let id = if content_first {
+            "ADMIN-AFTER"
+        } else {
+            "ADMIN-BEFORE"
+        };
+        let content = || {
+            message_event(
+                wa::Message::text("member content"),
+                incoming_info(GROUP, PEER, id, 1_700_000_000),
+            )
+        };
+        if content_first {
+            feed(&chat_store, [content()]).await;
+        }
+        chat_store
+            .record_revoke_target(
+                &chat,
+                &wa::MessageKey {
+                    id: Some(id.into()),
+                    from_me: Some(false),
+                    // Device-qualified keys must resolve the same author as delivery.
+                    participant: Some("559900000001:7@s.whatsapp.net".into()),
+                    ..Default::default()
+                },
+                ts(1_700_000_010),
+            )
+            .unwrap();
+        chat_store.flush().await.unwrap();
+        feed(&chat_store, [content()]).await;
+        let row = chat_store.message(&chat, id).await.unwrap().unwrap();
+        assert!(!row.from_me);
+        assert_eq!(row.sender_jid, jid(PEER));
+        assert!(row.revoked);
+        assert!(row.text.is_none());
+        assert!(row.message.is_none());
+        let rows = chat_store.messages(&chat, None, 100).await.unwrap();
+        assert_eq!(rows.iter().filter(|m| m.id == id).count(), 1);
+    }
+    #[cfg(feature = "search")]
+    assert!(
+        chat_store
+            .search_messages("member", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert!(chats[0].last_message_preview.is_none());
+}
+
+#[tokio::test]
+async fn local_revoke_key_requires_multi_author_authorship_and_defaults_direct_peer() {
+    let (_store, chat_store) = test_store().await;
+    let target = wa::MessageKey {
+        id: Some("PEER-REVOKE".into()),
+        ..Default::default()
+    };
+    for multi_author_chat in [GROUP, "status@broadcast", "1700000000@broadcast"] {
+        assert!(
+            chat_store
+                .record_revoke_target(&jid(multi_author_chat), &target, ts(1_700_000_010))
+                .is_err()
+        );
+    }
+    assert!(
+        chat_store
+            .record_revoke_target(&jid(PEER), &wa::MessageKey::default(), ts(1_700_000_010))
+            .is_err()
+    );
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("peer content"),
+            incoming_info(PEER, PEER, "PEER-REVOKE", 1_700_000_000),
+        )],
+    )
+    .await;
+    chat_store
+        .record_revoke_target(&jid(PEER), &target, ts(1_700_000_010))
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let row = chat_store
+        .message(&jid(PEER), "PEER-REVOKE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.revoked);
+    assert!(!row.from_me);
+}
+
+#[tokio::test]
+async fn local_admin_revoke_leaves_a_colliding_member_message_intact() {
+    let (_store, chat_store) = test_store().await;
+    const OTHER: &str = "559900000002@s.whatsapp.net";
+    let chat = jid(GROUP);
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("target content"),
+                incoming_info(GROUP, PEER, "MEMBER-COLLISION", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("other member"),
+                incoming_info(GROUP, OTHER, "MEMBER-COLLISION", 1_700_000_001),
+            ),
+        ],
+    )
+    .await;
+    chat_store
+        .record_revoke_target(
+            &chat,
+            &wa::MessageKey {
+                id: Some("MEMBER-COLLISION".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let rows = chat_store.messages(&chat, None, 100).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| !row.from_me));
+    let target = rows.iter().find(|row| row.sender_jid == jid(PEER)).unwrap();
+    assert!(target.revoked);
+    assert!(target.text.is_none());
+    let other = rows
+        .iter()
+        .find(|row| row.sender_jid == jid(OTHER))
+        .unwrap();
+    assert!(!other.revoked);
+    assert_eq!(other.text.as_deref(), Some("other member"));
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        chats[0].last_message_preview.as_deref(),
+        Some("other member")
+    );
+    assert_eq!(
+        chats[0].last_message_kind,
+        Some(oxidezap_chat_store::MessageKind::Text)
+    );
+    assert!(matches!(
+        chat_store.message(&chat, "MEMBER-COLLISION").await,
+        Err(oxidezap_chat_store::ChatStoreError::AmbiguousMessageId)
+    ));
+}
+
+#[tokio::test]
+async fn local_admin_placeholder_never_adds_unread_attention_on_recount() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    chat_store
+        .record_revoke_target(
+            &chat,
+            &wa::MessageKey {
+                id: Some("LOCAL-PLACEHOLDER".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+    // A different author's colliding ID must still be unread. Marking the
+    // target ID read globally would incorrectly cover this member as well.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("unrelated unread"),
+            incoming_info(
+                GROUP,
+                "559900000002@s.whatsapp.net",
+                "LOCAL-PLACEHOLDER",
+                1_700_000_011,
+            ),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+    let mut read = mark_read_event(GROUP, true, 1_700_000_009);
+    if let Event::MarkChatAsReadUpdate(update) = &mut read {
+        update.action.message_range =
+            MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+                last_message_timestamp: Some(1_700_000_009),
+                ..Default::default()
+            });
+    }
+    feed(&chat_store, [read]).await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("late original"),
+            incoming_info(GROUP, PEER, "LOCAL-PLACEHOLDER", 1_700_000_000),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+    assert_eq!(chat_store.messages(&chat, None, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn inserting_a_local_revoke_preserves_a_newer_colliding_members_preview() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("newer member"),
+            incoming_info(
+                GROUP,
+                "559900000002@s.whatsapp.net",
+                "MISSING-COLLISION",
+                1_700_000_020,
+            ),
+        )],
+    )
+    .await;
+    chat_store
+        .record_revoke_target(
+            &chat,
+            &wa::MessageKey {
+                id: Some("MISSING-COLLISION".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let head = chat_store.chat(&chat).await.unwrap().unwrap();
+    assert_eq!(head.last_message_preview.as_deref(), Some("newer member"));
+    assert_eq!(head.last_message_kind, Some(MessageKind::Text));
+    assert_eq!(head.unread_count, 1);
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("late original"),
+            incoming_info(GROUP, PEER, "MISSING-COLLISION", 1_700_000_000),
+        )],
+    )
+    .await;
+    let rows = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .find(|row| row.sender_jid == jid(PEER))
+            .unwrap()
+            .revoked
+    );
+    assert_eq!(
+        chat_store
+            .chat(&chat)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_message_preview
+            .as_deref(),
+        Some("newer member")
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_local_placeholder_keeps_another_members_unread_badge() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    chat_store
+        .record_revoke_target(
+            &chat,
+            &wa::MessageKey {
+                id: Some("LOCAL-DELETE-COLLISION".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("unread member"),
+            incoming_info(
+                GROUP,
+                "559900000002@s.whatsapp.net",
+                "LOCAL-DELETE-COLLISION",
+                1_700_000_011,
+            ),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+    let mut delete = delete_for_me(
+        chat.clone(),
+        "LOCAL-DELETE-COLLISION",
+        false,
+        ts(1_700_000_020),
+    );
+    if let Event::DeleteMessageForMeUpdate(update) = &mut delete {
+        update.participant_jid = Some(jid(PEER));
+    }
+    feed(&chat_store, [delete]).await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+    let rows = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sender_jid, jid("559900000002@s.whatsapp.net"));
+    assert_eq!(rows[0].text.as_deref(), Some("unread member"));
+}
+
+#[tokio::test]
+async fn local_placeholder_does_not_spend_the_previous_pages_unread_budget() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("unread"),
+            incoming_info(GROUP, PEER, "REAL-UNREAD", 1_700_000_000),
+        )],
+    )
+    .await;
+    chat_store
+        .record_revoke_target(
+            &chat,
+            &wa::MessageKey {
+                id: Some("LOCAL-NEWER".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let (first, unread) = chat_store.page_with_unread(&chat, None, 1).await.unwrap();
+    assert_eq!(unread, 1);
+    assert!(first[0].local_revoke_placeholder);
+    let (previous, unread) = chat_store
+        .page_with_unread(&chat, Some((&first[0]).into()), 1)
+        .await
+        .unwrap();
+    assert_eq!(previous[0].id, "REAL-UNREAD");
+    assert!(!previous[0].local_revoke_placeholder);
+    assert_eq!(unread, 1);
+}
