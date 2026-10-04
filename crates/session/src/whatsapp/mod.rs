@@ -1865,14 +1865,50 @@ impl WhatsAppClient {
                         })
                         .collect::<Vec<_>>()
                 });
+                // Cache read frontiers per conversation for this offline batch.
+                // Already-read replays must keep their read flag even though
+                // offline batches cannot trigger alerts.
+                let mut offline_reads = HashMap::new();
+                if !eager {
+                    for inbound in batch
+                        .iter()
+                        .filter(|inbound| !inbound.info.source.is_from_me)
+                    {
+                        let key = inbound.info.source.chat.to_non_ad_string();
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            offline_reads.entry(key)
+                        {
+                            let state = if let Some(store) = names.chat_store() {
+                                match store.message_read_state(&inbound.info.source.chat).await {
+                                    Ok(state) => Some(state),
+                                    Err(error) => {
+                                        warn!("could not read offline attention state: {error}");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            entry.insert(state);
+                        }
+                    }
+                }
                 for inbound in batch.iter() {
-                    Self::handle_inbound_message(
+                    let cached_read = offline_reads
+                        .get(&inbound.info.source.chat.to_non_ad_string())
+                        .map(|state| {
+                            state
+                                .as_ref()
+                                .map(|state| state.covers(&inbound.info.id, inbound.info.timestamp))
+                        });
+                    Self::handle_inbound_message_with_read(
                         &inbound.message,
                         &inbound.info,
                         &client,
                         &ui_tx,
                         &names,
                         eager,
+                        cached_read,
                     )
                     .await;
                 }
@@ -2089,7 +2125,7 @@ impl WhatsAppClient {
         }
     }
 
-    /// One decrypted inbound message -> UiEvent (reaction or chat message).
+    #[cfg(test)]
     async fn handle_inbound_message(
         msg: &wa::Message,
         info: &whatsapp_rust::wacore::types::message::MessageInfo,
@@ -2097,6 +2133,19 @@ impl WhatsAppClient {
         ui_tx: &UiEventSender,
         names: &NameBook,
         eager: bool,
+    ) {
+        Self::handle_inbound_message_with_read(msg, info, client, ui_tx, names, eager, None).await;
+    }
+
+    /// One decrypted inbound message -> UiEvent (reaction or chat message).
+    async fn handle_inbound_message_with_read(
+        msg: &wa::Message,
+        info: &whatsapp_rust::wacore::types::message::MessageInfo,
+        client: &Arc<Client>,
+        ui_tx: &UiEventSender,
+        names: &NameBook,
+        eager: bool,
+        cached_read: Option<Option<bool>>,
     ) {
         // Use the shared store normalization for both ordinary envelopes and
         // the nested wrappers it peels, so live and hydrated paths agree.
@@ -2370,8 +2419,12 @@ impl WhatsAppClient {
         // message on another device. A live replay may already be covered by
         // a durable self-read verdict even though it is not an offline batch.
         // Resolve this after all notification/name I/O, immediately before
-        // publication. Offline drains cannot alert and skip this extra read.
-        let already_read = if eager && !info.source.is_from_me {
+        // publication. Offline drains reuse their per-chat batch snapshot.
+        let already_read = if info.source.is_from_me {
+            None
+        } else if let Some(read) = cached_read {
+            read
+        } else {
             if let Some(store) = names.chat_store() {
                 match store
                     .message_is_read(&info.source.chat, &info.id, info.timestamp)
@@ -2386,8 +2439,6 @@ impl WhatsAppClient {
             } else {
                 None
             }
-        } else {
-            None
         };
         chat_message.is_read = already_read == Some(true);
 
