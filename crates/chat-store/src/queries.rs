@@ -19,6 +19,20 @@ use crate::types::{
     ReceiptEntry, StoredMessage,
 };
 
+/// A conversation's durable read verdicts at one point in time.
+/// Reuse within an offline batch; live arrivals should request fresh state.
+pub struct MessageReadState {
+    states: Vec<crate::store::read_state::ReadState>,
+}
+
+impl MessageReadState {
+    pub fn covers(&self, message_id: &str, timestamp: DateTime<Utc>) -> bool {
+        self.states
+            .iter()
+            .any(|state| state.covers(timestamp.timestamp_millis(), message_id))
+    }
+}
+
 /// How many keys one batched lookup may bind at a time.
 ///
 /// SQLite's compiled-in parameter ceiling is 999 on older builds; a page well
@@ -674,6 +688,41 @@ impl ChatStore {
             })
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    /// Whether a phone or companion read verdict already covers this incoming
+    /// message. Check every proven chat alias, using the same watermark and
+    /// explicit boundary ids that drive unread recounts. This does not infer
+    /// read state from the message's delivery status or the chat's badge.
+    pub async fn message_is_read(
+        &self,
+        jid: &Jid,
+        message_id: &str,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        Ok(self
+            .message_read_state(jid)
+            .await?
+            .covers(message_id, timestamp))
+    }
+
+    /// Read all proven aliases once for a batch of incoming messages.
+    pub async fn message_read_state(&self, jid: &Jid) -> Result<MessageReadState> {
+        let device_id = self.device_id();
+        let jid = jid.to_string();
+        let states = self
+            .db()
+            .read(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &jid).map_err(db_err)?;
+                keys.into_iter()
+                    .map(|key| {
+                        crate::store::read_state::read_state(conn, device_id, &key).map_err(db_err)
+                    })
+                    .collect()
+            })
+            .await?;
+        Ok(MessageReadState { states })
     }
 
     /// Alert policy and title from the durable conversation rows.

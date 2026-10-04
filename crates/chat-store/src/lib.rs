@@ -45,6 +45,7 @@ pub use materialize::{
     is_control_only, message_kind, normalized_message, poll_creation_message,
     supported_poll_creation_message,
 };
+pub use queries::MessageReadState;
 pub use store::ChatStore;
 pub use types::{
     ArrivalCursor, AvatarDescriptor, ChatCursor, ChatEntry, ChatNameExpected, ChatNameWrite,
