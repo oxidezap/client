@@ -712,3 +712,53 @@ async fn local_revoke_key_requires_group_authorship_and_defaults_direct_peer() {
     assert!(row.revoked);
     assert!(!row.from_me);
 }
+
+#[tokio::test]
+async fn local_admin_revoke_leaves_a_colliding_member_message_intact() {
+    let (_store, chat_store) = test_store().await;
+    const OTHER: &str = "559900000002@s.whatsapp.net";
+    let chat = jid(GROUP);
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("target content"),
+                incoming_info(GROUP, PEER, "MEMBER-COLLISION", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("other member"),
+                incoming_info(GROUP, OTHER, "MEMBER-COLLISION", 1_700_000_001),
+            ),
+        ],
+    )
+    .await;
+    chat_store
+        .record_revoke_target(
+            &chat,
+            &wa::MessageKey {
+                id: Some("MEMBER-COLLISION".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let rows = chat_store.messages(&chat, None, 100).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| !row.from_me));
+    let target = rows.iter().find(|row| row.sender_jid == jid(PEER)).unwrap();
+    assert!(target.revoked);
+    assert!(target.text.is_none());
+    let other = rows
+        .iter()
+        .find(|row| row.sender_jid == jid(OTHER))
+        .unwrap();
+    assert!(!other.revoked);
+    assert_eq!(other.text.as_deref(), Some("other member"));
+    assert!(matches!(
+        chat_store.message(&chat, "MEMBER-COLLISION").await,
+        Err(oxidezap_chat_store::ChatStoreError::AmbiguousMessageId)
+    ));
+}
