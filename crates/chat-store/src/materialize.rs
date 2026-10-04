@@ -23,6 +23,7 @@ pub(crate) enum MessageOp {
         new_text: Option<String>,
         new_kind: &'static str,
         new_proto: Vec<u8>,
+        sender_timestamp_ms: Option<i64>,
     },
     /// A revoke of another message: tombstone it. `target_from_me`/`target_participant`
     /// come from the revoke KEY (they identify the target message's owner, not
@@ -231,6 +232,7 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
                         new_text: extract_text(edited_base),
                         new_kind: message_kind(edited_base),
                         new_proto: waproto::codec::message_to_vec(edited),
+                        sender_timestamp_ms: pm.timestamp_ms,
                     };
                 }
                 return MessageOp::Ignore;
@@ -700,6 +702,7 @@ mod tests {
                 new_text,
                 new_kind,
                 new_proto,
+                ..
             } => {
                 assert_eq!(target_id, "MSG3");
                 assert_eq!(new_text.as_deref(), Some("fixed"));

@@ -6,14 +6,45 @@
 //! synchronous constructor returning a [`Task`] that resolves once the network
 //! answered, with failures as strings a front end can display.
 
+use oxidezap_chat_store::{MessageKind, MessageStatus};
+
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _, observe_str};
-use whatsapp_rust::waproto::whatsapp as wa;
+use whatsapp_rust::waproto::{buffa::MessageField, whatsapp as wa};
 
 use super::WhatsAppClient;
 use crate::exec::Task;
 
 /// What a send-like mutation produced: the server-assigned message id.
 pub type SendId = String;
+
+fn edit_text_content(original: Option<&wa::Message>, text: String) -> wa::Message {
+    let context = original
+        .map(oxidezap_chat_store::normalized_message)
+        .and_then(|message| message.extended_text_message.as_option())
+        .and_then(|extended| extended.context_info.as_option());
+    if let Some(context) = context {
+        wa::Message {
+            extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some(text),
+                context_info: MessageField::some(context.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    } else {
+        wa::Message {
+            conversation: Some(text),
+            ..Default::default()
+        }
+    }
+}
+
+fn sent_edit_content(sent: &wa::Message) -> Option<(&wa::Message, i64)> {
+    let protocol = oxidezap_chat_store::normalized_message(sent)
+        .protocol_message
+        .as_option()?;
+    Some((protocol.edited_message.as_option()?, protocol.timestamp_ms?))
+}
 
 impl WhatsAppClient {
     /// React to a message with an emoji (empty string removes the reaction).
@@ -74,21 +105,65 @@ impl WhatsAppClient {
             let chat: Jid = chat_jid
                 .parse()
                 .map_err(|_| "not a chat address".to_string())?;
-            if new_text.is_empty() {
+            if new_text.trim().is_empty() {
                 return Err("new text must not be empty".to_string());
             }
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let content = wa::Message {
-                conversation: Some(new_text),
-                ..Default::default()
-            };
-            live.client
-                .edit_message(chat, message_id, content)
+            let stored = live
+                .chat_store
+                .own_message(&chat, &message_id)
                 .await
-                .map(|result| result.message_id.clone())
-                .map_err(|e| e.to_string())
+                .map_err(|e| format!("database query failed: {e}"))?
+                .ok_or_else(|| "message not found".to_string())?;
+            if !stored.from_me || stored.revoked || stored.kind != MessageKind::Text {
+                return Err("only our own non-deleted text messages can be edited".to_string());
+            }
+            if matches!(stored.status, MessageStatus::Pending | MessageStatus::Error) {
+                return Err("message has not been sent".to_string());
+            }
+            if wacore::time::now_millis().saturating_sub(stored.timestamp.timestamp_millis())
+                >= 15 * 60 * 1_000
+            {
+                return Err("messages can be edited for 15 minutes after sending".to_string());
+            }
+            let content = edit_text_content(stored.message.as_deref(), new_text);
+            let result = live
+                .client
+                .edit_message(chat.clone(), message_id.clone(), content.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            let (sent_content, timestamp_ms) =
+                sent_edit_content(&result.message).ok_or_else(|| {
+                    "edit was sent but its protocol content or timestamp is missing".to_string()
+                })?;
+            let timestamp = wacore::time::from_millis(timestamp_ms)
+                .ok_or_else(|| "edit was sent with an invalid timestamp".to_string())?;
+            live.chat_store
+                .record_edit(&chat, &message_id, sent_content, timestamp)
+                .map_err(|e| format!("edit was sent but could not be saved locally: {e}"))?;
+            live.chat_store
+                .flush()
+                .await
+                .map_err(|e| format!("edit was sent but could not be saved locally: {e}"))?;
+            let current = live
+                .chat_store
+                .own_message(&chat, &message_id)
+                .await
+                .map_err(|e| format!("edit was sent but its stored result could not be read: {e}"))?
+                .ok_or_else(|| "the edited message is no longer available".to_string())?;
+            if current.revoked
+                || current
+                    .edited_at
+                    .is_none_or(|at| at.timestamp_millis() != timestamp_ms)
+            {
+                return Err(
+                    "the message changed again before this edit was confirmed; reload it and retry"
+                        .to_string(),
+                );
+            }
+            Ok(result.message_id)
         })
     }
 
@@ -403,5 +478,44 @@ impl WhatsAppClient {
                 log::warn!("Failed to send recording state: {}", e);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    #[test]
+    fn edited_reply_retains_context_and_uses_the_sent_protocol_clock() {
+        let context = wa::ContextInfo {
+            stanza_id: Some("QUOTED".into()),
+            participant: Some("peer@example.invalid".into()),
+            quoted_message: MessageField::some(wa::Message {
+                conversation: Some("quoted".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let original = wa::Message {
+            extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("original".into()),
+                context_info: MessageField::some(context.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let edited = edit_text_content(Some(&original), "replacement".into());
+        let sent = wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                timestamp_ms: Some(1_700_000_050_123),
+                edited_message: MessageField::some(edited),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (body, timestamp) = sent_edit_content(&sent).unwrap();
+        let extended = body.extended_text_message.as_option().unwrap();
+        assert_eq!(extended.text.as_deref(), Some("replacement"));
+        assert_eq!(extended.context_info.as_option().unwrap(), &context);
+        assert_eq!(timestamp, 1_700_000_050_123);
     }
 }

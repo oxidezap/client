@@ -59,7 +59,7 @@ impl WhatsAppApp {
 
     /// Whether accepting another dropped or pasted file would waste a read.
     pub(crate) fn incoming_files_busy(&self) -> bool {
-        self.paste_preview.is_some() || self.incoming_file_reading
+        self.edit_draft.is_some() || self.paste_preview.is_some() || self.incoming_file_reading
     }
 
     /// Complete the read only for the account that began it. An old read
@@ -107,7 +107,11 @@ impl WhatsAppApp {
     /// nothing would read as the window swallowing the file.
     pub(crate) fn warn_preview_busy(&mut self, cx: &mut Context<Self>) {
         self.notify_user(
-            "Finish or cancel the pending file first, then drop again.",
+            if self.edit_draft.is_some() {
+                "Finish editing the message before adding a file."
+            } else {
+                "Finish or cancel the pending file first, then drop again."
+            },
             notices::Tone::Problem,
             cx,
         );

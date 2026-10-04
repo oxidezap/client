@@ -2266,6 +2266,7 @@ impl WhatsAppClient {
             sender: info.source.sender.to_string(),
             sender_name: None, // Will be set in handle_message_received for groups
             content,
+            is_text: oxidezap_chat_store::message_kind(base_msg) == "text",
             timestamp: info.timestamp,
             is_from_me: info.source.is_from_me,
             is_read: false,
@@ -2280,6 +2281,7 @@ impl WhatsAppClient {
             },
             quoted: quoted_from(base_msg),
             revoked: false,
+            edited: false,
             system: None,
             poll,
         };

@@ -84,6 +84,38 @@ impl Bridge {
         reply: tokio::sync::oneshot::Sender<CommandOutcome>,
     ) -> Option<(Action, tokio::sync::oneshot::Sender<CommandOutcome>)> {
         match action {
+            Action::EditMessage {
+                id,
+                request,
+                answer_to,
+            } => {
+                let connection = self.hub.connection();
+                if !connection.is_connected() {
+                    answer_now(
+                        &answer_to,
+                        answered(
+                            id,
+                            Err(ProtocolError::NoSession {
+                                detail: format!("not connected: {connection:?}"),
+                            }),
+                        ),
+                    );
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    return None;
+                }
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let task = client.edit_message(request.jid, request.message_id, request.new_text);
+                oxidezap_session::spawn(async move {
+                    let result = mutation_answer(id, task.await);
+                    answer_now(&answer_to, answered(id, result));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
             Action::MarkStatusWatched(oxidezap_ipc::MarkStatusWatched { message_ids }) => {
                 // The other actions are finished when the session has taken
                 // them and what the network makes of them arrives later; this
@@ -1360,7 +1392,9 @@ impl Bridge {
         }
 
         match action {
-            Action::Wire { .. } => unreachable!("Wire actions are handled in begin_slow"),
+            Action::Wire { .. } | Action::EditMessage { .. } => {
+                unreachable!("Wire actions are handled in begin_slow")
+            }
             Action::SendText(oxidezap_ipc::SendText {
                 jid,
                 text,
@@ -2210,6 +2244,19 @@ fn send_wire_result(answer_to: &Outbox, id: u64, result: Result<DaemonResponse, 
     }
 }
 
+fn mutation_answer<T, E: std::fmt::Display>(
+    id: RequestId,
+    result: Result<Result<T, String>, E>,
+) -> Result<DaemonMessage, ProtocolError> {
+    match result {
+        Ok(Ok(_)) => Ok(DaemonMessage::Accepted { id: Some(id) }),
+        Ok(Err(detail)) => Err(ProtocolError::Refused { detail }),
+        Err(error) => Err(ProtocolError::NoSession {
+            detail: format!("session stopped before the message action finished: {error}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -2453,6 +2500,42 @@ mod tests {
             matches!(outcome, CommandOutcome::NoSession(_)),
             "got {outcome:?}"
         );
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn an_edit_after_disconnect_answers_its_request_without_starting_work() {
+        let mut bridge = bridge();
+        let client = client();
+        let (answer_to, mut answers) = tokio::sync::mpsc::channel(2);
+        let (reply, completed) = tokio::sync::oneshot::channel();
+        assert!(
+            bridge
+                .begin_slow(
+                    &client,
+                    Action::EditMessage {
+                        id: 42,
+                        request: oxidezap_ipc::EditMessage {
+                            jid: fixtures::PEER.to_string(),
+                            message_id: "EDIT".into(),
+                            new_text: "replacement".into(),
+                        },
+                        answer_to,
+                    },
+                    reply
+                )
+                .is_none()
+        );
+        let frame: DaemonMessage =
+            serde_json::from_str(&answers.try_recv().expect("correlated answer")).unwrap();
+        assert!(matches!(
+            frame,
+            DaemonMessage::Error {
+                id: Some(42),
+                error: ProtocolError::NoSession { .. }
+            }
+        ));
+        assert_eq!(completed.await.unwrap(), CommandOutcome::Accepted);
         client.close(Duration::from_secs(1)).await;
     }
 

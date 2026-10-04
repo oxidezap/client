@@ -13,7 +13,9 @@ mod calls_ctl;
 pub mod chat_row;
 mod chats;
 mod commands;
+pub(crate) mod editing;
 mod events;
+pub use editing::EditMessage;
 #[cfg(test)]
 mod frame_cost;
 mod media;
@@ -970,6 +972,10 @@ pub struct WhatsAppApp {
     /// The message being replied to, mirrored here so the send path can
     /// attach it and the composer can show it.
     reply_to: Option<ReplyDraft>,
+    edit_draft: Option<editing::EditDraft>,
+    edit_revision: u64,
+    edit_generation: u64,
+    pending_edits: std::collections::HashSet<(String, String)>,
     /// The message whose quick-react strip is open, if any. One at a time:
     /// the strip is drawn inline under its bubble, and two open strips would
     /// each move the timeline the other measured against.
@@ -1446,6 +1452,10 @@ impl WhatsAppApp {
             chat_filter: ChatFilter::default(),
             collapsed_communities: std::collections::HashSet::new(),
             reply_to: None,
+            edit_draft: None,
+            edit_revision: 0,
+            edit_generation: 0,
+            pending_edits: std::collections::HashSet::new(),
             reaction_picker_for: None,
             presence: PresenceRegistry::new(),
             account_name: None,
@@ -2250,11 +2260,15 @@ impl WhatsAppApp {
         self.sticker_validation.borrow_mut().clear();
         self.timeline_anchor = None;
         // Composed text, and the reply bar it may be answering.
+        self.edit_generation = self.edit_generation.wrapping_add(1);
+        self.edit_draft = None;
+        self.pending_edits.clear();
         self.drafts.clear();
         self.reply_to = None;
         if let Some(input) = self.input_area.clone() {
             input.update(cx, |view, cx| {
                 view.set_reply(None, cx);
+                view.set_edit_state(false, false, cx);
                 view.swap_text("", window, cx);
             });
         }
@@ -2805,6 +2819,9 @@ impl WhatsAppApp {
                 input_area.update(cx, |view, _| view.reset_typing());
             }
         }
+        if self.selected_chat.as_deref() != Some(jid.as_str()) {
+            self.leave_message_edit(window, cx);
+        }
         // Stash the outgoing chat's unsent text and restore the target's, or
         // the shared input would send A's draft to B. Skipped on reselect so
         // in-progress text survives a same-chat click.
@@ -3061,7 +3078,7 @@ impl WhatsAppApp {
             let input_area = cx.new(|cx| InputAreaView::new(window, cx));
 
             // Subscribe to events from the input area
-            cx.subscribe(&input_area, Self::handle_input_area_event)
+            cx.subscribe_in(&input_area, window, Self::handle_input_area_event)
                 .detach();
 
             self.input_area = Some(input_area);
@@ -3074,13 +3091,18 @@ impl WhatsAppApp {
     /// Handle events from the isolated input area view
     fn handle_input_area_event(
         &mut self,
-        _input_area: Entity<InputAreaView>,
+        _input_area: &Entity<InputAreaView>,
         event: &InputAreaEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
             InputAreaEvent::SendMessage(text) => {
-                self.send_message(text, cx);
+                if self.edit_draft.is_some() {
+                    self.save_message_edit(text, window, cx);
+                } else {
+                    self.send_message(text, cx);
+                }
             }
             InputAreaEvent::AttachFiles => {
                 self.attach_files(cx);
@@ -3094,6 +3116,9 @@ impl WhatsAppApp {
             }
             InputAreaEvent::CancelRecording => {
                 self.cancel_recording(cx);
+            }
+            InputAreaEvent::CancelEdit => {
+                self.cancel_message_edit(window, cx);
             }
             InputAreaEvent::CancelReply => {
                 self.cancel_reply(cx);
@@ -4219,6 +4244,9 @@ impl Render for WhatsAppApp {
             // raised them: a popup menu dispatches from its own focus, which
             // is inside the menu and not inside the row, and the root is the
             // one ancestor both paths share.
+            .on_action(cx.listener(|app, edit: &EditMessage, window, cx| {
+                app.begin_message_edit(&edit.id, window, cx);
+            }))
             .on_action(cx.listener(|app, reply: &ReplyToMessage, window, cx| {
                 app.begin_reply(&reply.id, window, cx);
             }))

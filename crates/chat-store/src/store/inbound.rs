@@ -111,6 +111,7 @@ pub(super) fn apply_inbound(
             new_text,
             new_kind,
             new_proto,
+            sender_timestamp_ms,
         } => {
             if apply_edit(
                 conn,
@@ -122,7 +123,7 @@ pub(super) fn apply_inbound(
                 new_text.as_deref(),
                 new_kind,
                 &new_proto,
-                ts_ms,
+                sender_timestamp_ms.unwrap_or(ts_ms),
                 cs,
             )? {
                 cs.chats = true;

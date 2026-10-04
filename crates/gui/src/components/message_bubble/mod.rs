@@ -34,8 +34,8 @@ use quote::render_quote;
 use reactions::{render_hover_actions, render_reaction_picker, render_reactions};
 
 use crate::app::{
-    BubbleIds, CopyMessage, OpenMessageLink, ReactToMessage, ReplyToMessage, RetryMessage,
-    WhatsAppApp,
+    BubbleIds, CopyMessage, EditMessage, OpenMessageLink, ReactToMessage, ReplyToMessage,
+    RetryMessage, WhatsAppApp,
 };
 use crate::components::parts;
 use crate::components::{BubbleText, bubble_status_ticks, render_rich_text};
@@ -131,7 +131,12 @@ pub fn render_message_bubble(
     let message_id = message.id.clone();
     let bubble_id = ids.bubble.clone();
     let content = &props.text;
-    let time: SharedString = format_time_local(&message.timestamp).into();
+    let time: SharedString = if message.edited {
+        format!("edited {}", format_time_local(&message.timestamp)).into()
+    } else {
+        format_time_local(&message.timestamp).into()
+    };
+    let menu_message = message.clone();
     let status = message.delivery_in(props.is_own_number);
     let is_playing = props.playing_message_id.as_deref() == Some(message_id.as_str());
     let has_reactions = !message.reactions.is_empty();
@@ -421,6 +426,14 @@ pub fn render_message_bubble(
             // same command. Tapping ours again takes it back, exactly as
             // the strip does.
             let mut menu = menu;
+            if crate::app::editing::can_edit_text(&menu_message, wacore::time::now_millis()) {
+                menu = menu.menu(
+                    "Edit",
+                    Box::new(EditMessage {
+                        id: menu_id.clone().into(),
+                    }),
+                );
+            }
             for emoji in WhatsAppApp::QUICK_REACTIONS {
                 let react_id = menu_id.clone();
                 menu = menu.menu(

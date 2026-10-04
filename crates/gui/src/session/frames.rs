@@ -286,6 +286,9 @@ impl<'a> Frames<'a> {
                 // For most requests this only releases the entry. For the few
                 // whose whole answer is that they were done, it is the answer.
                 match take_pending(self.pending, id) {
+                    Some(Awaiting::Mutation(tx)) => {
+                        let _ = tx.send(Ok(()));
+                    }
                     Some(Awaiting::Acted(tx)) => {
                         let _ = tx.send(());
                     }
@@ -889,6 +892,47 @@ mod tests {
     use oxidezap_ipc::StateVersion;
 
     struct NoMedia;
+
+    #[test]
+    fn edit_confirmation_is_correlated_and_refusals_and_disconnects_release_waiters() {
+        use oxidezap_ipc::ProtocolError;
+        let (sink, _events) = super::super::sink::channel();
+        let pending = Pending::default();
+        let pictures = crate::video::LatestFrames::default();
+        let mut frames = Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+        let (accepted, mut accepted_rx) = tokio::sync::oneshot::channel();
+        let (refused, mut refused_rx) = tokio::sync::oneshot::channel();
+        let (lost, mut lost_rx) = tokio::sync::oneshot::channel();
+        pending
+            .lock()
+            .unwrap()
+            .insert(1, Awaiting::Mutation(accepted));
+        pending
+            .lock()
+            .unwrap()
+            .insert(2, Awaiting::Mutation(refused));
+        pending.lock().unwrap().insert(3, Awaiting::Mutation(lost));
+        let _ = frames.apply(DaemonMessage::Accepted { id: Some(99) });
+        assert!(matches!(
+            accepted_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let _ = frames.apply(DaemonMessage::Accepted { id: Some(1) });
+        assert!(accepted_rx.try_recv().unwrap().is_ok());
+        let _ = frames.apply(DaemonMessage::Error {
+            id: Some(2),
+            error: ProtocolError::Refused {
+                detail: "edit expired".into(),
+            },
+        });
+        assert_eq!(
+            refused_rx.try_recv().unwrap().unwrap_err().detail,
+            "edit expired"
+        );
+        frames.finish();
+        assert!(lost_rx.try_recv().unwrap().is_err());
+        assert!(pending.lock().unwrap().is_empty());
+    }
 
     #[cfg(not(target_family = "wasm"))]
     #[test]

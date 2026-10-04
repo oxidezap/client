@@ -91,7 +91,7 @@ impl Render for Body {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn setup() -> (
@@ -369,7 +369,7 @@ mod tests {
         ]
     }
 
-    fn connected_app_fixture(
+    pub(crate) fn connected_app_fixture(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {
         cx.update(|cx| {

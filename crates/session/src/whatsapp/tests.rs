@@ -1703,6 +1703,8 @@ fn alias_history_unread_deduplicates_only_matching_messages() {
         status: MessageStatus::default(),
         quoted: None,
         revoked: false,
+        edited: false,
+        is_text: true,
         system: None,
         poll: None,
     };
@@ -1745,6 +1747,8 @@ fn watched_updates_come_back_watched() {
         status: MessageStatus::default(),
         quoted: None,
         revoked: false,
+        edited: false,
+        is_text: true,
         system: None,
         poll: None,
     };
