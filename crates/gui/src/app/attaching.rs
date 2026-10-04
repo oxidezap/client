@@ -107,7 +107,11 @@ impl WhatsAppApp {
     /// nothing would read as the window swallowing the file.
     pub(crate) fn warn_preview_busy(&mut self, cx: &mut Context<Self>) {
         self.notify_user(
-            "Finish or cancel the pending file first, then drop again.",
+            if self.edit_draft.is_some() {
+                "Finish editing the message before adding a file."
+            } else {
+                "Finish or cancel the pending file first, then drop again."
+            },
             notices::Tone::Problem,
             cx,
         );

@@ -1610,6 +1610,20 @@ impl ChatStore {
     }
 
     pub async fn message(&self, chat: &Jid, msg_id: &str) -> Result<Option<StoredMessage>> {
+        self.message_by_ownership(chat, msg_id, None).await
+    }
+
+    /// One outgoing target, even when another group author reused its id.
+    pub async fn own_message(&self, chat: &Jid, msg_id: &str) -> Result<Option<StoredMessage>> {
+        self.message_by_ownership(chat, msg_id, Some(true)).await
+    }
+
+    async fn message_by_ownership(
+        &self,
+        chat: &Jid,
+        msg_id: &str,
+        from_me: Option<bool>,
+    ) -> Result<Option<StoredMessage>> {
         use schema::messages::dsl;
         let device_id = self.device_id();
         let chat = chat.to_string();
@@ -1619,15 +1633,19 @@ impl ChatStore {
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                let rows: Vec<MessageRow> = dsl::messages
+                let query = dsl::messages
                     .filter(
                         dsl::device_id
                             .eq(device_id)
                             .and(dsl::chat_jid.eq_any(keys))
                             .and(dsl::msg_id.eq(&msg_id)),
                     )
-                    .load(conn)
-                    .map_err(db_err)?;
+                    .into_boxed();
+                let query = match from_me {
+                    Some(from_me) => query.filter(dsl::from_me.eq(from_me)),
+                    None => query,
+                };
+                let rows: Vec<MessageRow> = query.load(conn).map_err(db_err)?;
                 let mut unique = Vec::new();
                 let mut edit_source_ids = std::collections::HashMap::new();
                 for row in rows {

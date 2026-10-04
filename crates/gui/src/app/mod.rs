@@ -2820,7 +2820,7 @@ impl WhatsAppApp {
             }
         }
         if self.selected_chat.as_deref() != Some(jid.as_str()) {
-            self.cancel_message_edit(window, cx);
+            self.leave_message_edit(window, cx);
         }
         // Stash the outgoing chat's unsent text and restore the target's, or
         // the shared input would send A's draft to B. Skipped on reselect so

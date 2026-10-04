@@ -76,7 +76,26 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    pub(super) fn edit_is_pending(&self) -> bool {
+        self.edit_draft.as_ref().is_some_and(|draft| {
+            self.pending_edits
+                .contains(&(draft.jid.clone(), draft.id.clone()))
+        })
+    }
+
     pub(super) fn cancel_message_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Consume Escape without claiming to cancel a request already sent.
+        if self.edit_is_pending() {
+            return true;
+        }
+        self.leave_message_edit(window, cx)
+    }
+
+    pub(super) fn leave_message_edit(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -175,14 +194,10 @@ impl WhatsAppApp {
                             cx.notify();
                         }
                         Err(error) => {
-                            if same_draft {
-                                if let Some(input) = app.input_area.clone() {
-                                    input.update(cx, |view, cx| {
-                                        view.set_edit_state(true, false, cx)
-                                    });
-                                }
-                                app.notify_user(error.detail, notices::Tone::Problem, cx);
+                            if same_draft && let Some(input) = app.input_area.clone() {
+                                input.update(cx, |view, cx| view.set_edit_state(true, false, cx));
                             }
+                            app.notify_user(error.detail, notices::Tone::Problem, cx);
                         }
                     }
                 });
@@ -252,6 +267,22 @@ mod tests {
                         .update(cx, |input, cx| input.swap_text("replacement", window, cx)),
                     "original"
                 );
+                let pending_key = ("peer@example.invalid".to_string(), "EDIT".to_string());
+                app.pending_edits.insert(pending_key.clone());
+                app.close_overlay(window, cx);
+                assert!(app.edit_draft.is_some(), "Escape cannot cancel a sent edit");
+                app.begin_reply("EDIT", window, cx);
+                assert!(
+                    app.edit_draft.is_some(),
+                    "Reply cannot replace a pending edit"
+                );
+                assert_eq!(
+                    app.input_area.as_ref().unwrap().update(cx, |input, cx| {
+                        input.swap_text("replacement", window, cx)
+                    }),
+                    "replacement"
+                );
+                app.pending_edits.remove(&pending_key);
                 app.close_overlay(window, cx);
                 assert!(app.edit_draft.is_none());
                 assert!(app.reply_to.is_some());

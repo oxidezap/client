@@ -136,7 +136,7 @@ pub fn render_message_bubble(
     } else {
         format_time_local(&message.timestamp).into()
     };
-    let can_edit = crate::app::editing::can_edit_text(&message, wacore::time::now_millis());
+    let menu_message = message.clone();
     let status = message.delivery_in(props.is_own_number);
     let is_playing = props.playing_message_id.as_deref() == Some(message_id.as_str());
     let has_reactions = !message.reactions.is_empty();
@@ -426,7 +426,7 @@ pub fn render_message_bubble(
             // same command. Tapping ours again takes it back, exactly as
             // the strip does.
             let mut menu = menu;
-            if can_edit {
+            if crate::app::editing::can_edit_text(&menu_message, wacore::time::now_millis()) {
                 menu = menu.menu(
                     "Edit",
                     Box::new(EditMessage {

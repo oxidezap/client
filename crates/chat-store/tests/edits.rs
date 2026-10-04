@@ -976,3 +976,143 @@ async fn local_placeholder_does_not_spend_the_previous_pages_unread_budget() {
     assert!(!previous[0].local_revoke_placeholder);
     assert_eq!(unread, 1);
 }
+
+#[tokio::test]
+async fn owned_edit_lookup_disambiguates_a_group_collision_and_keeps_reply_context() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    let context = wa::ContextInfo {
+        stanza_id: Some("QUOTED".into()),
+        participant: Some(PEER.into()),
+        quoted_message: MessageField::some(wa::Message::text("quoted")),
+        ..Default::default()
+    };
+    let text = |content: &str| wa::Message {
+        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+            text: Some(content.into()),
+            context_info: MessageField::some(context.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    chat_store
+        .record_outgoing(&chat, "COLLISION", &text("original"), ts(1_700_000_000))
+        .unwrap();
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("different author"),
+            incoming_info(GROUP, PEER, "COLLISION", 1_700_000_010),
+        )],
+    )
+    .await;
+    assert!(chat_store.message(&chat, "COLLISION").await.is_err());
+    assert!(
+        chat_store
+            .own_message(&chat, "COLLISION")
+            .await
+            .unwrap()
+            .unwrap()
+            .from_me
+    );
+    chat_store
+        .record_edit(&chat, "COLLISION", &text("replacement"), ts(1_700_000_020))
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let own = chat_store
+        .own_message(&chat, "COLLISION")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(own.text.as_deref(), Some("replacement"));
+    assert_eq!(
+        own.message
+            .as_deref()
+            .unwrap()
+            .extended_text_message
+            .as_option()
+            .unwrap()
+            .context_info
+            .as_option()
+            .unwrap(),
+        &context
+    );
+    let rows = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|row| !row.from_me)
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("different author")
+    );
+}
+
+#[tokio::test]
+async fn delayed_local_and_incoming_edits_use_sender_ordering_not_arrival_time() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    chat_store
+        .record_outgoing(
+            &chat,
+            "EDIT-ORDER",
+            &wa::Message::text("original"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    for (id, content, sender_time, server_time) in [
+        (
+            "NEWER-EDIT",
+            "newer linked edit",
+            1_700_000_050_123,
+            1_700_000_100,
+        ),
+        (
+            "DELAYED-EDIT",
+            "delayed older edit",
+            1_700_000_025_123,
+            1_700_000_300,
+        ),
+    ] {
+        let mut info = incoming_info(GROUP, "559900000000@s.whatsapp.net", id, server_time);
+        info.source.is_from_me = true;
+        feed(
+            &chat_store,
+            [message_event(
+                wa::Message {
+                    protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                        key: MessageField::some(wa::MessageKey {
+                            id: Some("EDIT-ORDER".into()),
+                            from_me: Some(true),
+                            ..Default::default()
+                        }),
+                        r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                        timestamp_ms: Some(sender_time),
+                        edited_message: MessageField::some(wa::Message::text(content)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                info,
+            )],
+        )
+        .await;
+    }
+    chat_store
+        .record_edit(
+            &chat,
+            "EDIT-ORDER",
+            &wa::Message::text("older local reply"),
+            Utc.timestamp_millis_opt(1_700_000_030_123).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let own = chat_store
+        .own_message(&chat, "EDIT-ORDER")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(own.text.as_deref(), Some("newer linked edit"));
+    assert_eq!(own.edited_at.unwrap().timestamp_millis(), 1_700_000_050_123);
+}

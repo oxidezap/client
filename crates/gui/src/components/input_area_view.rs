@@ -432,11 +432,15 @@ impl Render for InputAreaView {
                     } else {
                         "Editing message"
                     })
-                    .child(Button::new("cancel-edit").ghost().label("Cancel").on_click(
-                        move |_, _, cx| {
-                            entity.update(cx, |_, cx| cx.emit(InputAreaEvent::CancelEdit));
-                        },
-                    ))
+                    .child(
+                        Button::new("cancel-edit")
+                            .ghost()
+                            .label("Cancel")
+                            .disabled(self.edit_pending)
+                            .on_click(move |_, _, cx| {
+                                entity.update(cx, |_, cx| cx.emit(InputAreaEvent::CancelEdit));
+                            }),
+                    )
             }))
             .children(
                 self.reply
@@ -531,7 +535,7 @@ impl InputAreaView {
                     .icon(IconName::ArrowRight)
                     .primary()
                     .tooltip(if self.editing { "Save edit" } else { "Send" })
-                    .disabled(self.edit_pending)
+                    .disabled(self.edit_pending || (self.editing && !has_text))
                     .w(control)
                     .h(control)
                     .cursor_pointer()

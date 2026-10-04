@@ -1275,12 +1275,8 @@ impl SessionHandle {
         }));
     }
 
-    /// React to a message, or remove our reaction with an empty emoji.
-    ///
-    /// Fire-and-forget like typing, not tracked like a send: there is no
-    /// bubble drawn ahead of it to rename or fail, and the network echo
-    /// arriving as `ReactionReceived` is the confirmation. The optimistic
-    /// row the timeline paints is reverted only by the next history load.
+    /// Edit a sent message and await the daemon's correlated durable result.
+    /// Refusal and disconnect are returned to the composer for retry.
     pub fn edit_message(
         &self,
         jid: String,
@@ -1299,6 +1295,12 @@ impl SessionHandle {
         rx
     }
 
+    /// React to a message, or remove our reaction with an empty emoji.
+    ///
+    /// Fire-and-forget like typing, not tracked like a send: there is no
+    /// bubble drawn ahead of it to rename or fail, and the network echo
+    /// arriving as `ReactionReceived` is the confirmation. The optimistic
+    /// row the timeline paints is reverted only by the next history load.
     pub fn send_reaction(&self, chat_jid: &str, message_id: &str, emoji: &str) {
         self.tell(ClientRequest::SendReaction(Box::new(SendReaction {
             chat_jid: chat_jid.to_string(),
