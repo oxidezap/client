@@ -1321,7 +1321,6 @@ async fn advancing_past_local_placeholder_releases_its_explicit_read_id() {
                         ..Default::default()
                     }),
                     timestamp: Some(1_700_000_010),
-                    ..Default::default()
                 }],
                 ..Default::default()
             });
