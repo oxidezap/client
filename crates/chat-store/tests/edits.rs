@@ -891,3 +891,51 @@ async fn inserting_a_local_revoke_preserves_a_newer_colliding_members_preview() 
         Some("newer member")
     );
 }
+
+#[tokio::test]
+async fn deleting_a_local_placeholder_keeps_another_members_unread_badge() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    chat_store
+        .record_revoke_target(
+            &chat,
+            &wa::MessageKey {
+                id: Some("LOCAL-DELETE-COLLISION".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("unread member"),
+            incoming_info(
+                GROUP,
+                "559900000002@s.whatsapp.net",
+                "LOCAL-DELETE-COLLISION",
+                1_700_000_011,
+            ),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+    let mut delete = delete_for_me(
+        chat.clone(),
+        "LOCAL-DELETE-COLLISION",
+        false,
+        ts(1_700_000_020),
+    );
+    if let Event::DeleteMessageForMeUpdate(update) = &mut delete {
+        update.participant_jid = Some(jid(PEER));
+    }
+    feed(&chat_store, [delete]).await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+    let rows = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sender_jid, jid("559900000002@s.whatsapp.net"));
+    assert_eq!(rows[0].text.as_deref(), Some("unread member"));
+}

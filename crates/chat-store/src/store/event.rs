@@ -404,11 +404,13 @@ pub(super) fn apply_event(
             struct Victim {
                 #[diesel(sql_type = diesel::sql_types::Bool)]
                 from_me: bool,
+                #[diesel(sql_type = diesel::sql_types::Bool)]
+                local_revoke_placeholder: bool,
                 #[diesel(sql_type = diesel::sql_types::BigInt)]
                 timestamp_ms: i64,
             }
             let victim: Victim = diesel::sql_query(
-                "SELECT from_me, timestamp_ms FROM messages WHERE device_id = ? AND id = ? LIMIT 1",
+                "SELECT from_me, local_revoke_placeholder, timestamp_ms FROM messages WHERE device_id = ? AND id = ? LIMIT 1",
             )
             .bind::<diesel::sql_types::Integer, _>(device_id)
             .bind::<diesel::sql_types::BigInt, _>(target.id)
@@ -427,6 +429,7 @@ pub(super) fn apply_event(
                 .bind::<diesel::sql_types::BigInt, _>(target.id)
                 .execute(conn)?;
             if !victim.from_me
+                && !victim.local_revoke_placeholder
                 && !read_state(conn, device_id, &chat)?
                     .covers(victim.timestamp_ms, &update.message_id)
             {
