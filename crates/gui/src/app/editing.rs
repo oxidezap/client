@@ -44,7 +44,7 @@ impl WhatsAppApp {
         }
         let Some(message) = self
             .find_chat(&jid)
-            .and_then(|chat| chat.messages.iter().find(|m| m.id == id))
+            .and_then(|chat| chat.messages.iter().find(|m| m.id == id && m.is_from_me))
         else {
             return;
         };
@@ -120,7 +120,7 @@ impl WhatsAppApp {
         if !self.can_send()
             || !self
                 .find_chat(&jid)
-                .and_then(|chat| chat.messages.iter().find(|m| m.id == id))
+                .and_then(|chat| chat.messages.iter().find(|m| m.id == id && m.is_from_me))
                 .is_some_and(|message| can_edit_text(message, wacore::time::now_millis()))
         {
             self.notify_user(
@@ -228,6 +228,13 @@ mod tests {
             app.update(cx, |app, cx| {
                 let mut message = ChatMessage::new_outgoing("EDIT".into(), "original".into());
                 message.status = MessageStatus::Sent;
+                Arc::make_mut(&mut app.chats[0])
+                    .messages
+                    .push(ChatMessage::new_incoming(
+                        "EDIT".into(),
+                        "other@example.invalid".into(),
+                        "different author".into(),
+                    ));
                 Arc::make_mut(&mut app.chats[0]).messages.push(message);
                 app.chats
                     .push(Arc::new(Chat::new("other@example.invalid".into())));
@@ -255,8 +262,8 @@ mod tests {
                         .update(cx, |input, cx| input.swap_text("unsent draft", window, cx)),
                     "unsent draft"
                 );
-                assert_eq!(app.chats[0].messages[0].content, "original");
-                assert!(!app.chats[0].messages[0].edited);
+                assert_eq!(app.chats[0].messages[1].content, "original");
+                assert!(!app.chats[0].messages[1].edited);
                 app.begin_message_edit("EDIT", window, cx);
                 app.select_chat(
                     "other@example.invalid".into(),
@@ -269,7 +276,7 @@ mod tests {
                     app.drafts.get("peer@example.invalid").map(String::as_str),
                     Some("unsent draft")
                 );
-                assert_eq!(app.chats[0].messages[0].content, "original");
+                assert_eq!(app.chats[0].messages[1].content, "original");
             })
         });
     }
