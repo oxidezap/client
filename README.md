@@ -58,7 +58,7 @@ launcher and icon for your user. Keep that directory in place: the launcher
 points to its GUI binary. X11 also receives an embedded window icon; Wayland
 uses the installed launcher whose ID matches the window. For a source build,
 copy `packaging/linux/install-desktop.sh` and
-`packaging/linux/org.oxidezap.client.local.svg` beside the three binaries first.
+`packaging/linux/org.oxidezap.client.local.png` beside the three binaries first.
 
 The web front end ships beside them as `oxidezap-<version>-web.zip`: static
 files to serve from any web server, with hosting notes in the archive.

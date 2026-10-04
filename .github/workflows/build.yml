@@ -175,7 +175,7 @@ jobs:
             # an archive can carry it where a raw asset download cannot.
             chmod +x "$out/oxidezap" "$out/oxidezapd" "$out/oxidezap-cli"
             if [ "${{ runner.os }}" = "Linux" ]; then
-              cp packaging/linux/install-desktop.sh packaging/linux/org.oxidezap.client.local.svg "$out/"
+              cp packaging/linux/install-desktop.sh packaging/linux/org.oxidezap.client.local.png "$out/"
               chmod +x "$out/install-desktop.sh"
             fi
             tar -czf "$out.tar.gz" "$out"
