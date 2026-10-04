@@ -107,18 +107,18 @@ pub(super) fn encode_read_ids(ids: &[String]) -> Option<String> {
 /// watermark is read, plus the explicitly-named ids — boundary-instant/keyed
 /// coverage that a scalar watermark cannot express (both directions of the
 /// same-second ambiguity are lossy without them).
-pub(super) struct ReadState {
+pub(crate) struct ReadState {
     pub(super) watermark_ms: i64,
     pub(super) extra_ids: Vec<String>,
 }
 
 impl ReadState {
-    pub(super) fn covers(&self, ts_ms: i64, msg_id: &str) -> bool {
+    pub(crate) fn covers(&self, ts_ms: i64, msg_id: &str) -> bool {
         ts_ms <= self.watermark_ms || self.extra_ids.iter().any(|id| id == msg_id)
     }
 }
 
-pub(super) fn read_state(
+pub(crate) fn read_state(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,

@@ -20,7 +20,7 @@ mod inbound;
 pub(crate) mod message_identity;
 mod message_rows;
 mod reaction;
-mod read_state;
+pub(crate) mod read_state;
 mod receipt;
 mod revoke;
 mod writer;

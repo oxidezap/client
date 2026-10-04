@@ -1212,3 +1212,60 @@ async fn noop_read_self_clears_manual_unread_marker() {
     let chats = chat_store.chats(false, 10).await.unwrap();
     assert_eq!(chats[0].unread_count, 0);
 }
+
+#[tokio::test]
+async fn notification_read_query_respects_aliases_and_keyed_boundary_seconds() {
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+    let covered = wa::sync_action_value::SyncActionMessage {
+        key: MessageField::some(wa::MessageKey {
+            id: Some("COVERED".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(ts(1_700_000_100))
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    message_range: MessageField::some(
+                        wa::sync_action_value::SyncActionMessageRange {
+                            last_message_timestamp: Some(1_700_000_000),
+                            messages: vec![covered],
+                            ..Default::default()
+                        },
+                    ),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    for address in [PEER, PEER_LID] {
+        for (id, time, read) in [
+            ("OLDER", 1_700_000_000 - 1, true),
+            ("COVERED", 1_700_000_000, true),
+            ("SIBLING", 1_700_000_000, false),
+            ("NEWER", 1_700_000_001, false),
+        ] {
+            assert_eq!(
+                chat_store
+                    .message_is_read(&jid(address), id, ts(time))
+                    .await
+                    .unwrap(),
+                read,
+                "{address} {id}"
+            );
+        }
+    }
+    assert!(
+        !chat_store
+            .message_is_read(&jid(GROUP), "COVERED", ts(1_700_000_000))
+            .await
+            .unwrap()
+    );
+}

@@ -3386,7 +3386,11 @@ impl WhatsAppApp {
         // Capture the user-facing part before the message moves into its
         // conversation. Statuses have their own reader and do not represent a
         // chat asking for attention; our own sends likewise never notify us.
-        let notification = (metadata.allowed && !read_now && !message.is_from_me && !is_status)
+        let notification = (metadata.allowed
+            && !message.is_read
+            && !read_now
+            && !message.is_from_me
+            && !is_status)
             .then(|| {
                 let body = if is_group {
                     format!("{}: {}", message.author_label(), message.preview_text())
@@ -4820,6 +4824,29 @@ mod tests {
             assert_eq!(app.read(cx).selected_chat.as_deref(), Some(newer_jid));
             assert!(app.read(cx).pending_notification_tags.is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn a_phone_read_message_never_raises_a_system_notification(cx: &mut gpui::TestAppContext) {
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                let mut message = ChatMessage::new_incoming(
+                    "READ".into(),
+                    "peer@example.invalid".into(),
+                    "Already read".into(),
+                );
+                message.is_read = true;
+                app.handle_message_received(
+                    "peer@example.invalid".into(),
+                    message,
+                    None,
+                    IncomingMessageMetadata::new(true, None, Some(false), None),
+                    cx,
+                );
+            })
+        });
+        assert!(cx.shown_system_notifications().is_empty());
     }
 
     #[gpui::test]

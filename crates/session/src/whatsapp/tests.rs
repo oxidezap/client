@@ -2674,3 +2674,67 @@ async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
     assert_eq!(demands[1].jid, "b@s.whatsapp.net");
     assert!(!demands[1].need_bytes);
 }
+
+#[tokio::test]
+async fn phone_read_live_replay_does_not_notify_but_new_message_does() {
+    let (chat_store, client) = test_session("read-replay-notification").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    feed(
+        &chat_store,
+        incoming_in(
+            TEST_GROUP,
+            wa::Message::text("old"),
+            "PHONE-READ",
+            1_700_000_100,
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(TEST_GROUP.parse().unwrap())
+                .timestamp(wacore::time::from_secs(1_700_000_110).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    for (id, timestamp, expected_read) in [
+        ("PHONE-READ", 1_700_000_100, true),
+        ("NEW-UNREAD", 1_700_000_200, false),
+    ] {
+        let message = wa::Message::text("text");
+        feed(
+            &chat_store,
+            incoming_in(TEST_GROUP, message.clone(), id, timestamp),
+        )
+        .await;
+        WhatsAppClient::handle_inbound_message(
+            &message,
+            &live_info(TEST_GROUP, TEST_PEER, Some("Example"), id, timestamp),
+            &client,
+            &ui_tx,
+            &book_with(&chat_store),
+            true,
+        )
+        .await;
+        let Ok(oxidezap_core::UiEvent::MessageReceived {
+            message,
+            notification_allowed,
+            ..
+        }) = ui_rx.try_recv()
+        else {
+            panic!("missing message event")
+        };
+        assert_eq!(message.is_read, expected_read);
+        assert_eq!(notification_allowed, !expected_read);
+    }
+}

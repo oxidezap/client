@@ -676,6 +676,36 @@ impl ChatStore {
         Ok(row.map(Into::into))
     }
 
+    /// Whether a phone or companion read verdict already covers this incoming
+    /// message. Check every proven chat alias, using the same watermark and
+    /// explicit boundary ids that drive unread recounts. This does not infer
+    /// read state from the message's delivery status or the chat's badge.
+    pub async fn message_is_read(
+        &self,
+        jid: &Jid,
+        message_id: &str,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let device_id = self.device_id();
+        let jid = jid.to_string();
+        let message_id = message_id.to_owned();
+        Ok(self
+            .db()
+            .read(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &jid).map_err(db_err)?;
+                for key in keys {
+                    let state = crate::store::read_state::read_state(conn, device_id, &key)
+                        .map_err(db_err)?;
+                    if state.covers(timestamp.timestamp_millis(), &message_id) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+            .await?)
+    }
+
     /// Alert policy and title from the durable conversation rows.
     ///
     /// A live message may precede GUI hydration, so the front end's `Chat`

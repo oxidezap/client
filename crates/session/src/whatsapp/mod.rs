@@ -2300,6 +2300,29 @@ impl WhatsAppClient {
                 .await
         };
 
+        // Delivery ACKs describe transport, not whether this user read the
+        // message on another device. A live replay may already be covered by
+        // a durable self-read verdict even though it is not an offline batch.
+        let already_read = if !info.source.is_from_me {
+            if let Some(store) = names.chat_store() {
+                match store
+                    .message_is_read(&info.source.chat, &info.id, info.timestamp)
+                    .await
+                {
+                    Ok(read) => Some(read),
+                    Err(error) => {
+                        warn!("could not read message attention state: {error}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        chat_message.is_read = already_read == Some(true);
+
         // The inbound durability hook commits a live batch before this event
         // is dispatched, so the store is the authority even for its *first*
         // message. GUI hydration is paged and can lag this event (or omit an
@@ -2325,6 +2348,7 @@ impl WhatsAppClient {
                         // its message before hydration must not recreate it in
                         // the inbox.
                         let allowed = eager
+                            && already_read == Some(false)
                             && allows_desktop_notification(
                                 info.source.is_from_me,
                                 metadata.allowed,
