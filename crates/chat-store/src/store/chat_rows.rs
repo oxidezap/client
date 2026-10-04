@@ -221,6 +221,27 @@ pub(super) fn bump_chat(
     chat: &str,
     bump: ChatBump<'_>,
 ) -> QueryResult<()> {
+    let target = LatestTarget::MessageId(bump.msg_id);
+    bump_chat_target(conn, device_id, chat, bump, target)
+}
+
+pub(super) fn bump_chat_row(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    bump: ChatBump<'_>,
+    row_id: i64,
+) -> QueryResult<()> {
+    bump_chat_target(conn, device_id, chat, bump, LatestTarget::RowId(row_id))
+}
+
+fn bump_chat_target(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    bump: ChatBump<'_>,
+    target: LatestTarget<'_>,
+) -> QueryResult<()> {
     use schema::chats::dsl;
     ensure_chat(conn, device_id, chat)?;
     // Ordering timestamp is monotonic on its own...
@@ -231,7 +252,7 @@ pub(super) fn bump_chat(
     // (timestamp_ms, id): a same-millisecond sibling applied later must
     // not win. Not msg_id, which is what the `message_arrival_order`
     // migration removed for biasing the tie towards a `3EB0` prefix.
-    refresh_preview_if_latest(conn, device_id, chat, bump.msg_id, bump.preview, bump.kind)?;
+    refresh_preview(conn, device_id, chat, target, bump.preview, bump.kind)?;
     if bump.unread_delta != 0 {
         // An old row materialized late (offline drain) that a read already
         // covered must not badge.

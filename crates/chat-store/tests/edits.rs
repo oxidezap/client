@@ -829,3 +829,65 @@ async fn local_admin_placeholder_never_adds_unread_attention_on_recount() {
     assert_eq!(chat_store.unread_total().await.unwrap(), 1);
     assert_eq!(chat_store.messages(&chat, None, 10).await.unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn inserting_a_local_revoke_preserves_a_newer_colliding_members_preview() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("newer member"),
+            incoming_info(
+                GROUP,
+                "559900000002@s.whatsapp.net",
+                "MISSING-COLLISION",
+                1_700_000_020,
+            ),
+        )],
+    )
+    .await;
+    chat_store
+        .record_revoke_target(
+            &chat,
+            &wa::MessageKey {
+                id: Some("MISSING-COLLISION".into()),
+                from_me: Some(false),
+                participant: Some(PEER.into()),
+                ..Default::default()
+            },
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let head = chat_store.chat(&chat).await.unwrap().unwrap();
+    assert_eq!(head.last_message_preview.as_deref(), Some("newer member"));
+    assert_eq!(head.last_message_kind, Some(MessageKind::Text));
+    assert_eq!(head.unread_count, 1);
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("late original"),
+            incoming_info(GROUP, PEER, "MISSING-COLLISION", 1_700_000_000),
+        )],
+    )
+    .await;
+    let rows = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .find(|row| row.sender_jid == jid(PEER))
+            .unwrap()
+            .revoked
+    );
+    assert_eq!(
+        chat_store
+            .chat(&chat)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_message_preview
+            .as_deref(),
+        Some("newer member")
+    );
+}

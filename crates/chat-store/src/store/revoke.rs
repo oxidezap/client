@@ -4,7 +4,7 @@
 use diesel::prelude::*;
 
 use crate::schema;
-use crate::store::chat_rows::{ChatBump, bump_chat, refresh_preview_if_latest_row};
+use crate::store::chat_rows::{ChatBump, bump_chat_row, refresh_preview_if_latest_row};
 use crate::store::message_identity::{resolve_target, stored_sender};
 use crate::store::writer::ChangeSet;
 
@@ -87,7 +87,18 @@ pub(super) fn apply_revoke(
     if !inserted {
         return Ok(false);
     }
-    bump_chat(
+    let row_id: i64 = dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq(chat))
+                .and(dsl::msg_id.eq(target_id))
+                .and(dsl::sender_jid.eq(&sender))
+                .and(dsl::from_me.eq(target_from_me)),
+        )
+        .select(dsl::id)
+        .first(conn)?;
+    bump_chat_row(
         conn,
         device_id,
         chat,
@@ -98,6 +109,7 @@ pub(super) fn apply_revoke(
             kind: None,
             unread_delta: i32::from(!target_from_me && !locally_sent),
         },
+        row_id,
     )?;
     Ok(true)
 }
