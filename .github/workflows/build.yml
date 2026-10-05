@@ -49,7 +49,7 @@ jobs:
           # targets here and joining them with `lipo`, at the cost of doubling
           # this job.
           - name: macos-aarch64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
           - name: windows-x86_64
             os: windows-latest
