@@ -22,6 +22,89 @@ use whatsapp_rust::wacore::types::events::{Event, ServerAck};
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+#[tokio::test]
+async fn a_remote_delete_failure_skips_local_writes() {
+    let result = super::mutations::delete_and_record(
+        async { Err::<(), _>("synthetic remote failure") },
+        || panic!("a refused remote delete must not update the local store"),
+        async { panic!("a refused remote delete must not flush the local store") },
+    )
+    .await;
+
+    assert_eq!(result, Err("synthetic remote failure".to_string()));
+}
+
+#[tokio::test]
+async fn a_sent_delete_succeeds_when_the_local_writer_has_stopped() {
+    let (chat_store, _) = test_session("sent-delete-stopped-writer").await;
+    chat_store.close().await.expect("stop local writer");
+    let chat: Jid = TEST_PEER.parse().expect("synthetic chat");
+
+    let result = super::mutations::delete_and_record(
+        async { Ok::<_, String>(()) },
+        || chat_store.record_revoke(&chat, "SENT-DELETE", wacore::time::now_utc()),
+        async { panic!("an unqueued delete must not await a flush") },
+    )
+    .await;
+
+    assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn a_sent_delete_succeeds_when_the_local_batch_fails() {
+    use std::cell::Cell;
+
+    let recorded = Cell::new(false);
+    let result = super::mutations::delete_and_record(
+        async { Ok::<_, String>(()) },
+        || {
+            recorded.set(true);
+            Ok(())
+        },
+        async {
+            assert!(recorded.get(), "flush must follow the queued local update");
+            Err(oxidezap_chat_store::ChatStoreError::WriteBatchFailed(
+                "synthetic rollback".to_string(),
+            ))
+        },
+    )
+    .await;
+
+    assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn a_delete_waits_for_the_remote_answer_then_the_local_flush() {
+    use std::cell::Cell;
+
+    let remotely_deleted = Cell::new(false);
+    let flushed = Cell::new(false);
+    let result = super::mutations::delete_and_record(
+        async {
+            remotely_deleted.set(true);
+            Ok::<_, String>(())
+        },
+        || {
+            assert!(
+                remotely_deleted.get(),
+                "local writes must follow remote success"
+            );
+            Ok(())
+        },
+        async {
+            flushed.set(true);
+            Ok(())
+        },
+    )
+    .await;
+
+    assert_eq!(result, Ok(()));
+    assert!(
+        flushed.get(),
+        "successful local persistence must finish before returning"
+    );
+}
+
 #[test]
 fn live_nonrenderable_fallback_uses_the_shared_message_kind() {
     let poll = wa::Message {
