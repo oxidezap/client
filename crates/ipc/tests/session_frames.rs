@@ -144,6 +144,7 @@ fn an_omitted_field_comes_back_as_what_it_was() {
         "media",
         "system",
         "revoked",
+        "edited",
         "sender_name",
     ] {
         assert!(
@@ -159,6 +160,7 @@ fn an_omitted_field_comes_back_as_what_it_was() {
     let mut full = plain.clone();
     full.sender_name = Some("Alguém".into());
     full.revoked = true;
+    full.edited = true;
     full.reactions
         .insert("🎉".into(), vec!["1@s.whatsapp.net".into()]);
     // A literal on purpose, and one no constructor could produce: every

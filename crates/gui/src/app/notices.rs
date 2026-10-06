@@ -103,6 +103,13 @@ impl Notices {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn has_problem(&self, text: &str) -> bool {
+        self.shown
+            .iter()
+            .any(|notice| notice.tone == Tone::Problem && notice.text.contains(text))
+    }
+
     /// Say one sentence to whoever is looking.
     ///
     /// The text is shown verbatim, so it is written for a reader rather than

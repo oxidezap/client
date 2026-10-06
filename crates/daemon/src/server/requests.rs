@@ -120,6 +120,23 @@ pub(super) async fn handle_request(
             )
             .await
         }
+        ClientRequest::RevokeMessage(request) => {
+            let id = match addressed(id, "a delete needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::RevokeMessage {
+                    id,
+                    request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
         ClientRequest::SendAudio(request) => {
             acted(dispatch(hub, commands, Action::SendAudio(*request)).await)
         }

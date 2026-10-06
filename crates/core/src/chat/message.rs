@@ -44,8 +44,6 @@ pub struct ChatMessage {
     /// The message this one replies to, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedMessage>,
-    /// Set when nobody typed this: a call record, a group change. Such a row
-    /// has no author and no ticks, and renders centred rather than as a bubble.
     /// Whether the sender took this message back.
     ///
     /// Kept as a fact rather than left implicit in the "[Message deleted]"
@@ -57,6 +55,8 @@ pub struct ChatMessage {
     /// The store has accepted at least one edit to this message.
     #[serde(default, skip_serializing_if = "is_false")]
     pub edited: bool,
+    /// Set when nobody typed this: a call record, a group change. Such a row
+    /// has no author and no ticks, and renders centred rather than as a bubble.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemNotice>,
     /// A poll this message opens, if it is one. Tallies are not carried:

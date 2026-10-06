@@ -186,22 +186,49 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let stored = live
-                .chat_store
-                .message(&chat, &message_id)
-                .await
-                .map_err(|e| format!("database query failed: {e}"))?;
+            // A sender revoke names our row even if another group author
+            // reused its id. Local deletes can still target an incoming row.
+            let stored = if for_everyone {
+                live.chat_store.own_message(&chat, &message_id).await
+            } else {
+                live.chat_store.message(&chat, &message_id).await
+            }
+            .map_err(|e| format!("database query failed: {e}"))?;
             if for_everyone {
-                if let Some(ref stored) = stored
-                    && !stored.from_me
-                {
+                let stored = stored.ok_or_else(|| "message not found".to_string())?;
+                if !stored.from_me {
                     return Err("only our own messages can be revoked for everyone".to_string());
                 }
+                if stored.revoked {
+                    return Err("message was already deleted for everyone".to_string());
+                }
+                if matches!(stored.status, MessageStatus::Pending | MessageStatus::Error) {
+                    return Err("message has not been sent".to_string());
+                }
+                if wacore::time::now_millis().saturating_sub(stored.timestamp.timestamp_millis())
+                    > 2 * 24 * 60 * 60 * 1_000
+                {
+                    return Err(
+                        "messages can be deleted for everyone for two days after sending"
+                            .to_string(),
+                    );
+                }
                 live.client
-                    .revoke_message(chat, message_id, whatsapp_rust::send::RevokeType::Sender)
+                    .revoke_message(
+                        chat.clone(),
+                        message_id.clone(),
+                        whatsapp_rust::send::RevokeType::Sender,
+                    )
                     .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                live.chat_store
+                    .record_revoke(&chat, &message_id, wacore::time::now_utc())
+                    .map_err(|e| format!("delete was sent but could not be saved locally: {e}"))?;
+                live.chat_store
+                    .flush()
+                    .await
+                    .map_err(|e| format!("delete was sent but could not be saved locally: {e}"))?;
+                Ok(())
             } else {
                 // Local delete rides the app-state path, so linked devices
                 // converge on it; the store catches up through the event
@@ -211,9 +238,9 @@ impl WhatsAppClient {
                     Some(stored) => (
                         stored.from_me,
                         (!stored.from_me && chat.is_group()).then_some(stored.sender_jid),
-                        Some(stored.timestamp.timestamp_millis()),
+                        stored.timestamp.timestamp_millis(),
                     ),
-                    None => (true, None, None),
+                    None => return Err("message not found".to_string()),
                 };
                 live.client
                     .chat_actions()
@@ -223,10 +250,25 @@ impl WhatsAppClient {
                         &message_id,
                         from_me,
                         false,
-                        timestamp,
+                        Some(timestamp),
                     )
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                live.chat_store
+                    .record_delete_for_me(
+                        &chat,
+                        &message_id,
+                        from_me,
+                        participant,
+                        timestamp,
+                        wacore::time::now_utc(),
+                    )
+                    .map_err(|e| format!("delete was sent but could not be saved locally: {e}"))?;
+                live.chat_store
+                    .flush()
+                    .await
+                    .map_err(|e| format!("delete was sent but could not be saved locally: {e}"))?;
+                Ok(())
             }
         })
     }

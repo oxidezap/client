@@ -34,8 +34,8 @@ use quote::render_quote;
 use reactions::{render_hover_actions, render_reaction_picker, render_reactions};
 
 use crate::app::{
-    BubbleIds, CopyMessage, EditMessage, OpenMessageLink, ReactToMessage, ReplyToMessage,
-    RetryMessage, WhatsAppApp,
+    BubbleIds, CopyMessage, DeleteSentMessage, EditMessage, OpenMessageLink, ReactToMessage,
+    ReplyToMessage, RetryMessage, WhatsAppApp, can_delete_sent,
 };
 use crate::components::parts;
 use crate::components::{BubbleText, bubble_status_ticks, render_rich_text};
@@ -91,6 +91,8 @@ pub struct BubbleProps {
     /// with the row for the reason the ids do: reading the app here would
     /// re-enter the entity the virtual list already leased to build it.
     pub reaction_picker_open: bool,
+    /// Whether its downloaded audio is being decoded or retimed for playback.
+    pub is_preparing: bool,
 }
 
 /// How far into the voice note the player is.
@@ -131,13 +133,10 @@ pub fn render_message_bubble(
     let message_id = message.id.clone();
     let bubble_id = ids.bubble.clone();
     let content = &props.text;
-    let time: SharedString = if message.edited {
-        format!("edited {}", format_time_local(&message.timestamp)).into()
-    } else {
-        format_time_local(&message.timestamp).into()
-    };
+    let time: SharedString = format_time_local(&message.timestamp).into();
     let menu_message = message.clone();
     let status = message.delivery_in(props.is_own_number);
+    let edited = message.edited && !message.revoked;
     let is_playing = props.playing_message_id.as_deref() == Some(message_id.as_str());
     let has_reactions = !message.reactions.is_empty();
 
@@ -172,6 +171,10 @@ pub fn render_message_bubble(
     let menu_id = message_id.clone();
     let menu_text = message.content.clone();
     let menu_failed = can_retry;
+    let menu_jid = props.chat_jid.clone();
+    let now_ms = wacore::time::now_millis();
+    let menu_delete_for_me = can_delete_sent(&message, false, now_ms);
+    let menu_delete_for_everyone = can_delete_sent(&message, true, now_ms);
     // A refcount, not a rescan: the row's text already parsed these when the
     // timeline was built, and the targets were shared then.
     let menu_links = content.link_targets().clone();
@@ -288,6 +291,7 @@ pub fn render_message_bubble(
                                             audio: props.audio,
                                             playback_speed: props.playback_speed,
                                             is_downloading: props.is_downloading,
+                                            is_preparing: props.is_preparing,
                                             saved_document_path: props.saved_document_path.clone(),
                                             max_media_size: layout.max_media_size(),
                                         },
@@ -329,7 +333,15 @@ pub fn render_message_bubble(
                                                     )),
                                             )
                                         })
-                                        .child(render_meta(time, status, is_from_me, metrics, cx)),
+                                        .child(render_meta(
+                                            time,
+                                            status,
+                                            is_from_me,
+                                            edited,
+                                            ids.edited.clone(),
+                                            metrics,
+                                            cx,
+                                        )),
                                 ),
                         ),
                 )
@@ -472,6 +484,26 @@ pub fn render_message_bubble(
                     }),
                 );
             }
+            if menu_delete_for_everyone {
+                menu = menu.separator().menu(
+                    "Apagar para todos",
+                    Box::new(DeleteSentMessage {
+                        jid: menu_jid.clone(),
+                        id: menu_id.clone().into(),
+                        for_everyone: true,
+                    }),
+                );
+            }
+            if menu_delete_for_me {
+                menu = menu.menu(
+                    "Apagar para mim",
+                    Box::new(DeleteSentMessage {
+                        jid: menu_jid.clone(),
+                        id: menu_id.clone().into(),
+                        for_everyone: false,
+                    }),
+                );
+            }
             if menu_failed {
                 menu.separator().menu(
                     "Send again",
@@ -491,6 +523,8 @@ fn render_meta(
     time: SharedString,
     status: Option<oxidezap_core::MessageStatus>,
     is_from_me: bool,
+    edited: bool,
+    edited_id: SharedString,
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -512,6 +546,15 @@ fn render_meta(
         .flex_shrink_0()
         .items_center()
         .gap(metrics.space_xs())
+        .children(edited.then(|| {
+            let selector = edited_id.clone();
+            div()
+                .id(edited_id)
+                .debug_selector(move || selector.to_string())
+                .text_size(metrics.text_micro())
+                .text_color(colour)
+                .child("editada")
+        }))
         .child(
             div()
                 .font_family(cx.theme().mono_font_family.clone())

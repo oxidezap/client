@@ -250,6 +250,7 @@ fn render_row(
                     || app.is_document_downloading(message_id),
                 saved_document_path: app.saved_document_path(message_id),
                 reaction_picker_open: app.reaction_picker_for() == Some(message_id.as_str()),
+                is_preparing: app.is_audio_preparing(message_id),
             };
 
             render_message_bubble(props, entity.clone(), layout, cx).into_any_element()

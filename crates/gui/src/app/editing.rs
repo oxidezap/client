@@ -38,6 +38,10 @@ impl WhatsAppApp {
             || self.incoming_files_busy()
             || self.recorder.read(cx).is_recording()
             || self.edit_draft.is_some()
+            || self.delete_confirmation.is_some()
+            || self
+                .pending_message_actions
+                .contains(&(jid.clone(), id.to_owned()))
             || self.pending_edits.contains(&(jid.clone(), id.to_owned()))
         {
             return;
@@ -126,7 +130,7 @@ impl WhatsAppApp {
         let id = draft.id.clone();
         let revision = draft.revision;
         let key = (jid.clone(), id.clone());
-        if self.pending_edits.contains(&key) {
+        if self.pending_edits.contains(&key) || self.pending_message_actions.contains(&key) {
             return;
         }
         // Keep the edited text if validation or the request fails. Submission

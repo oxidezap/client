@@ -5,6 +5,10 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 39: `ClientRequest::RevokeMessage` adds an addressed delete completion
+/// alongside v38 edits, retaining the v37 community hierarchy fields.
+/// A v38 daemon does not know the delete request.
+///
 /// 38: typed GUI `EditMessage` and durable edited markers on message frames.
 ///
 /// 37: `ChatSummary.group_hierarchy` carries the authoritative community role
@@ -279,7 +283,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 39;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

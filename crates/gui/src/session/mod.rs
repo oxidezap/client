@@ -91,8 +91,8 @@ use oxidezap_ipc::{CallAction, ClientRequest, Link, PageCursor, Request, Request
 // so `Typing` and `Download` read at the call site as what they are: the
 // request's own payload, built here and moved onto the wire unchanged.
 use oxidezap_ipc::{
-    Download, EditMessage, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, SendAudio,
-    SendMedia, SendReaction, SendText, Typing, VotePoll,
+    Download, EditMessage, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, RevokeMessage,
+    SendAudio, SendMedia, SendReaction, SendText, Typing, VotePoll,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
@@ -296,6 +296,7 @@ impl From<&oxidezap_ipc::ProtocolError> for Failure {
 /// is waiting, and a send that was refused becomes the failure the message it
 /// drew is already able to render.
 enum Awaiting {
+    /// A message mutation whose result must reach the action that opened it.
     Mutation(oneshot::Sender<Result<(), Failure>>),
     Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, Failure>>),
     /// What this account occupies on disk, for the Storage pane.
@@ -368,12 +369,12 @@ impl Awaiting {
     /// Whether nobody is listening for this any more.
     fn is_abandoned(&self) -> bool {
         match self {
+            Self::Mutation(tx) => tx.is_closed(),
             Self::Download(tx) => tx.is_closed(),
             Self::Storage(tx) => tx.is_closed(),
             Self::Acted(tx) => tx.is_closed(),
             Self::Installed { tell, .. } => tell.is_closed(),
             Self::Removed(tx) => tx.is_closed(),
-            Self::Mutation(tx) => tx.is_closed(),
             Self::Installable(tx) => tx.is_closed(),
             // Nor is a ring that has already been taken down: the window is
             // showing the update as watched and only an answer can correct it.
@@ -1091,6 +1092,24 @@ impl SessionHandle {
                 staged: None,
             },
         );
+    }
+
+    pub fn revoke_message(
+        &self,
+        jid: String,
+        message_id: String,
+        for_everyone: bool,
+    ) -> oneshot::Receiver<Result<(), Failure>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::RevokeMessage(RevokeMessage {
+                jid,
+                message_id,
+                for_everyone,
+            }),
+            Awaiting::Mutation(tx),
+        );
+        rx
     }
 
     pub fn send_audio_message(

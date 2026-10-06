@@ -23,12 +23,17 @@ use oxidezap_ipc::{CallAction, RequestId};
 /// being folded into the shared payload.
 #[derive(Debug)]
 pub enum Action {
+    SendText(oxidezap_ipc::SendText),
     EditMessage {
         id: RequestId,
         request: oxidezap_ipc::EditMessage,
         answer_to: Outbox,
     },
-    SendText(oxidezap_ipc::SendText),
+    RevokeMessage {
+        id: RequestId,
+        request: oxidezap_ipc::RevokeMessage,
+        answer_to: Outbox,
+    },
     SendAudio(oxidezap_ipc::SendAudio),
     SendMedia(oxidezap_ipc::SendMedia),
     SendReaction(oxidezap_ipc::SendReaction),

@@ -56,7 +56,8 @@ pub use protocol::{
     ChatSummary, ClientRequest, ClientScope, ConnectionState, DaemonEvent, DaemonMessage, Download,
     EditMessage, EnsureAvatars, GroupMembers, InstallPlugin, LoadChats, LoadMessages, MarkRead,
     MarkStatusWatched, MessagePreview, PageCursor, PairingCode, ProtocolError, Request, RequestId,
-    SendAudio, SendMedia, SendReaction, SendText, StateSnapshot, StateVersion, Typing, VotePoll,
+    RevokeMessage, SendAudio, SendMedia, SendReaction, SendText, StateSnapshot, StateVersion,
+    Typing, VotePoll,
 };
 pub use transport::{
     ACCOUNT_STAGED_INFIX, DEFAULT_WEB_PORT, MAX_STAGED_BYTES, PROTOCOL_VERSION, STAGED_PREFIX,

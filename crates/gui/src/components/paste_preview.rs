@@ -22,10 +22,9 @@ use crate::theme::Metrics;
 
 /// One file waiting in the modal, with its preview decoded where drawable.
 ///
-/// The image is decoded only where the recipient would see a photo: the
-/// picker's [`kind_for`](crate::platform::picker::kind_for) already knows
-/// which pictures survive the trip, and decoding anything else here previews
-/// something the other side cannot draw.
+/// The selected media kind and the file's byte signature both gate previews:
+/// a document stays a document, and mislabeled bytes are decoded according to
+/// their actual format.
 pub struct PreviewFile {
     pub file: crate::platform::picker::Picked,
     pub image: Option<Arc<Image>>,
@@ -37,8 +36,7 @@ impl PreviewFile {
     /// batch, so decoding every image of a batch retains copies nothing
     /// draws.
     pub fn with_preview(file: crate::platform::picker::Picked, decode: bool) -> Self {
-        let image = (decode
-            && crate::platform::picker::kind_for(&file.mime_type) == OutgoingMedia::Image)
+        let image = (decode && file.kind == OutgoingMedia::Image)
             .then(|| crate::platform::picker::previewable_image_mime(&file.bytes))
             .flatten()
             .and_then(gpui::ImageFormat::from_mime_type)
@@ -47,7 +45,7 @@ impl PreviewFile {
     }
 
     fn kind(&self) -> OutgoingMedia {
-        crate::platform::picker::kind_for(&self.file.mime_type)
+        self.file.kind
     }
 }
 
@@ -253,11 +251,7 @@ mod tests {
         } else {
             vec![1, 2, 3]
         };
-        Picked {
-            file_name: file_name.to_string(),
-            mime_type: mime_type.to_string(),
-            bytes,
-        }
+        Picked::automatic(file_name.to_string(), mime_type.to_string(), bytes)
     }
 
     #[test]
@@ -310,9 +304,18 @@ mod tests {
                 .image
                 .is_none()
         );
+        let document = Picked {
+            file_name: "foto.jpg".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            kind: oxidezap_core::OutgoingMedia::Document,
+            bytes: b"\x89PNG\r\n\x1a\nrest".to_vec(),
+        };
+        assert!(PreviewFile::with_preview(document, true).image.is_none());
+
         let mislabeled = Picked {
             file_name: "foto.jpg".to_string(),
             mime_type: "image/jpeg".to_string(),
+            kind: oxidezap_core::OutgoingMedia::Image,
             bytes: b"\x89PNG\r\n\x1a\nrest".to_vec(),
         };
         assert!(PreviewFile::with_preview(mislabeled, true).image.is_some());
