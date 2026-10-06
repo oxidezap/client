@@ -191,6 +191,23 @@ fn the_live_data_lane_subscribes_to_server_acks() {
 }
 
 #[test]
+fn transport_disconnections_reach_the_control_feed() {
+    use whatsapp_rust::wacore::types::events::{Disconnected, EventHandler};
+    let (handler, receiver, _) = super::interested_channel(super::CONTROL_EVENT_KINDS, 8);
+    handler.handle_event(Arc::new(Event::Disconnected(
+        Disconnected::builder()
+            .reason(wacore::net::DisconnectReason::ReadError(
+                "synthetic network failure".into(),
+            ))
+            .build(),
+    )));
+    assert!(matches!(
+        &*receiver.try_recv().unwrap(),
+        Event::Disconnected(_)
+    ));
+}
+
+#[test]
 fn the_identity_lane_subscribes_to_contact_updates() {
     assert!(
         super::IDENTITY_EVENT_KINDS
@@ -278,6 +295,7 @@ async fn a_server_ack_publishes_a_live_sent_receipt() {
         None,
         None,
         None,
+        0,
     )
     .await;
 
@@ -319,6 +337,7 @@ async fn a_nack_or_non_message_ack_does_not_publish_sent() {
             None,
             None,
             None,
+            0,
         )
         .await;
 
@@ -355,6 +374,7 @@ async fn a_chatless_ack_does_not_guess_a_live_destination() {
         None,
         None,
         None,
+        0,
     )
     .await;
 
@@ -2921,6 +2941,7 @@ async fn offline_replays_keep_phone_read_flags_without_alerting() {
         None,
         None,
         None,
+        0,
     )
     .await;
     for expected_read in [true, false] {

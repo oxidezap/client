@@ -1366,6 +1366,14 @@ impl SessionHandle {
         self.tell(ClientRequest::ReloadHistory);
     }
 
+    /// Ask the existing daemon session to retry WhatsApp, rather than opening
+    /// another IPC connection onto the same reconnect wait.
+    pub fn reconnect_whatsapp(&self) -> oneshot::Receiver<Result<(), Failure>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(ClientRequest::ReconnectSession, Awaiting::Mutation(tx));
+        rx
+    }
+
     /// Tell the daemon these status updates have been watched.
     ///
     /// Not `mark_chat_read` on the broadcast: that clears one chat, and the

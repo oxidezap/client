@@ -55,6 +55,7 @@ pub enum Action {
     /// Reload the whole history, for a front end that has just attached and
     /// holds nothing.
     ReloadHistory,
+    ReconnectSession,
     /// Forget every resolved picture and resolve them again.
     ///
     /// For a cleared media cache: the metadata may be unchanged, but the bytes
@@ -224,6 +225,7 @@ impl Action {
             _ => !matches!(
                 self,
                 Self::ReloadHistory
+                    | Self::ReconnectSession
                     | Self::RefreshVideo
                     | Self::ForgetSession(_)
                     | Self::MarkStatusWatched(_)

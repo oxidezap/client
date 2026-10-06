@@ -127,20 +127,24 @@ async fn dispatch(
             let calls = calls.clone();
             let ui = ui.clone();
             let names = names.clone();
-            move |event| {
+            move |event, epoch| {
                 let client = client.clone();
                 let calls = calls.clone();
                 let ui = ui.clone();
                 let names = names.clone();
                 let processed = processed.clone();
                 async move {
-                    WhatsAppClient::handle_event(event, client, ui, calls, names, None, None, None)
-                        .await;
+                    WhatsAppClient::handle_event(
+                        event, client, ui, calls, names, None, None, None, epoch,
+                    )
+                    .await;
                     processed.send(()).await.unwrap();
                 }
             }
         },
         stopping,
+        calls.clone(),
+        ui.clone(),
     );
     let count = relevant.len();
     for event in relevant {

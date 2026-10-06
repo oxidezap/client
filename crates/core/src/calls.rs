@@ -325,6 +325,22 @@ impl CallState {
     /// The first offer wins the slot rather than the last, because that is the
     /// one the user has already been shown.
     pub fn set_incoming(&mut self, call: IncomingCall) -> Admission {
+        // Redelivered signaling must not park a call behind itself, including
+        // after it was accepted and its stage became active.
+        if self
+            .stage
+            .as_ref()
+            .is_some_and(|stage| stage.call_id() == call.call_id)
+        {
+            return Admission::Ringing;
+        }
+        if self
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.call_id() == &call.call_id)
+        {
+            return Admission::Parked;
+        }
         let Some(stage) = &self.stage else {
             self.remote_before_connect = None;
             self.stage = Some(Stage::Incoming(call));
@@ -1256,6 +1272,38 @@ mod tests {
             state.waiting().is_none(),
             "it is the call now, not the queue"
         );
+    }
+
+    #[test]
+    fn duplicate_offers_never_park_a_call_behind_itself() {
+        let mut state = CallState::default();
+        state.set_incoming(incoming("FIRST"));
+        let before = state.clone();
+        assert_eq!(state.set_incoming(incoming("FIRST")), Admission::Ringing);
+        assert_eq!(state, before);
+        state.connect(&"FIRST".into());
+        state.set_incoming(incoming("SECOND"));
+        let before = state.clone();
+        assert_eq!(state.set_incoming(incoming("FIRST")), Admission::Ringing);
+        assert_eq!(state.set_incoming(incoming("SECOND")), Admission::Parked);
+        assert_eq!(state, before);
+        state.end(&"FIRST".into());
+        assert_eq!(state.incoming().unwrap().call_id, "SECOND");
+        assert!(state.waiting().is_none());
+    }
+
+    #[test]
+    fn incoming_calls_keep_the_protocol_timestamp() {
+        let mut wire = offer("OLD");
+        wire.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let call = IncomingCall::new(
+            "OLD",
+            "Example".into(),
+            "a@s.whatsapp.net".into(),
+            false,
+            &wire,
+        );
+        assert_eq!(call.received_at, wire.timestamp);
     }
 
     /// The same promotion, on the other way a stage can empty for good: a

@@ -5,6 +5,9 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 40: `ReconnectSession` interrupts the WhatsApp reconnect wait without
+/// replacing the account session. Older daemons cannot act on this request.
+///
 /// 39: `ClientRequest::RevokeMessage` adds an addressed delete completion
 /// alongside v38 edits, retaining the v37 community hierarchy fields.
 /// A v38 daemon does not know the delete request.
@@ -283,7 +286,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

@@ -962,6 +962,9 @@ impl WhatsAppApp {
     /// Take the daemon's call state as authoritative, and write down whatever
     /// ended on the way.
     pub(super) fn adopt_calls(&mut self, mut calls: CallState, cx: &mut Context<Self>) {
+        if self.is_offline() {
+            calls.end_all();
+        }
         // Named here rather than inside the entity, because a caller's name
         // comes from this window's chat list.
         self.name_callers(&mut calls);

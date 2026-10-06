@@ -1010,6 +1010,9 @@ pub enum ClientRequest {
     /// client can, so it starts over. Sent for it automatically when it
     /// attaches, which is the same situation.
     ReloadHistory,
+    /// Retry the account's WhatsApp connection now, preserving its identity,
+    /// store and supervised session. Valid while WhatsApp is disconnected.
+    ReconnectSession,
     /// Wipe local state and pair again.
     ///
     /// A server 401 means the stored credentials are dead and reconnecting

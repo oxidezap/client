@@ -1760,6 +1760,23 @@ impl Bridge {
                 client.reload_history();
                 CommandOutcome::Accepted
             }
+            Action::ReconnectSession => {
+                if matches!(
+                    self.hub.connection(),
+                    oxidezap_ipc::ConnectionState::LoggedOut { .. }
+                ) {
+                    return CommandOutcome::Refused(
+                        "this account must be paired again".to_string(),
+                    );
+                }
+                match client.retry_connection().await {
+                    Ok(Ok(())) => CommandOutcome::Accepted,
+                    Ok(Err(detail)) => CommandOutcome::NoSession(detail),
+                    Err(_) => CommandOutcome::NoSession(
+                        "the session stopped during reconnection".to_string(),
+                    ),
+                }
+            }
             Action::RefreshAvatars => {
                 client.reset_avatar_cache();
                 CommandOutcome::Accepted

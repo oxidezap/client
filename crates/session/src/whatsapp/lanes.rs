@@ -14,6 +14,7 @@ use whatsapp_rust::wacore::types::events::Event;
 use whatsapp_rust::wacore_binary::JidExt;
 use whatsapp_rust::wacore_binary::jid::Jid;
 
+use super::{UiEventSender, calls::CallRegistry};
 use crate::names::NameBook;
 
 /// How many lanes events about a subject are spread across.
@@ -36,19 +37,26 @@ const LANE_CAPACITY: usize = 64;
 /// naming neither is session-wide and gets a lane of its own, so a pairing
 /// code never waits behind a conversation.
 pub(super) struct EventLanes {
-    lanes: Vec<mpsc::Sender<Arc<Event>>>,
+    lanes: Vec<mpsc::Sender<(Arc<Event>, u64)>>,
     stopping: tokio::sync::watch::Receiver<()>,
+    calls: CallRegistry,
+    ui: UiEventSender,
 }
 
 impl EventLanes {
-    pub(super) fn new<F, Fut>(handle: F, stopping: tokio::sync::watch::Receiver<()>) -> Self
+    pub(super) fn new<F, Fut>(
+        handle: F,
+        stopping: tokio::sync::watch::Receiver<()>,
+        calls: CallRegistry,
+        ui: UiEventSender,
+    ) -> Self
     where
-        F: Fn(Arc<Event>) -> Fut + Clone + crate::exec::MaybeSend + 'static,
+        F: Fn(Arc<Event>, u64) -> Fut + Clone + crate::exec::MaybeSend + 'static,
         Fut: Future<Output = ()> + crate::exec::MaybeSend + 'static,
     {
         let lanes = (0..=EVENT_LANES)
             .map(|_| {
-                let (tx, mut rx) = mpsc::channel::<Arc<Event>>(LANE_CAPACITY);
+                let (tx, mut rx) = mpsc::channel::<(Arc<Event>, u64)>(LANE_CAPACITY);
                 let handle = handle.clone();
                 let mut stopping = stopping.clone();
                 crate::exec::spawn_owned(async move {
@@ -68,13 +76,18 @@ impl EventLanes {
                             // client and its store alive.
                             _ = stopping.changed() => return,
                         };
-                        handle(event).await;
+                        handle(event.0, event.1).await;
                     }
                 });
                 tx
             })
             .collect();
-        Self { lanes, stopping }
+        Self {
+            lanes,
+            stopping,
+            calls,
+            ui,
+        }
     }
 
     /// Dispatch an event and report recoverable events dropped because their
@@ -89,6 +102,7 @@ impl EventLanes {
         event: Arc<Event>,
     ) -> DispatchOutcome {
         let mut outcome = DispatchOutcome::default();
+        let epoch = self.calls.connection_event(&event, &self.ui);
         // A batch may span chats, and a lane is one chat's order: sent whole
         // on the first message's lane, a receipt for a later chat in it runs
         // on that chat's own lane and can overtake the message it answers.
@@ -98,7 +112,10 @@ impl EventLanes {
         for event in split_by_subject(&event) {
             let lane = lane_for(client, names, &event).await;
             if recoverable(&event) {
-                if self.lanes[lane].try_send(Arc::clone(&event)).is_err() {
+                if self.lanes[lane]
+                    .try_send((Arc::clone(&event), epoch))
+                    .is_err()
+                {
                     outcome.dropped_recoverable = true;
                     if let Event::Messages(batch) = &*event {
                         for inbound in batch.iter() {
@@ -121,7 +138,7 @@ impl EventLanes {
             } else {
                 let mut stopping = self.stopping.clone();
                 tokio::select! {
-                    result = self.lanes[lane].send(event) => {
+                    result = self.lanes[lane].send((event, epoch)) => {
                         if result.is_err() {
                             return outcome;
                         }

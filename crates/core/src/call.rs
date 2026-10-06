@@ -99,7 +99,7 @@ impl IncomingCall {
             caller_jid,
             is_video,
             is_offline: offer.offline,
-            received_at: wacore::time::now_utc(),
+            received_at: offer.timestamp,
         }
     }
 

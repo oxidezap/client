@@ -199,6 +199,7 @@ const CONTROL_EVENT_KINDS: &[EventKind] = &[
     EventKind::PairingCode,
     EventKind::PairSuccess,
     EventKind::Connected,
+    EventKind::Disconnected,
     EventKind::LoggedOut,
     EventKind::SelfPushNameUpdated,
     EventKind::IncomingCall,
@@ -1347,8 +1348,10 @@ impl WhatsAppClient {
                 // PN/LID pairing that decides the lane.
                 let dispatch_client = client.clone();
                 let dispatch_names = names.clone();
+                let dispatch_calls = calls.clone();
+                let dispatch_ui = ui_tx.clone();
                 let mut lanes = EventLanes::new(
-                    move |event| {
+                    move |event, epoch| {
                         let client = client.clone();
                         let ui_tx = ui_tx.clone();
                         let calls = calls.clone();
@@ -1366,11 +1369,14 @@ impl WhatsAppClient {
                                 Some(reload),
                                 Some(resolve_avatars),
                                 Some(resolve_chat_names),
+                                epoch,
                             )
                             .await;
                         }
                     },
                     stopping.clone(),
+                    dispatch_calls,
+                    dispatch_ui,
                 );
                 let mut control_open = true;
                 let mut data_open = true;
@@ -1632,8 +1638,12 @@ impl WhatsAppClient {
         reload: Option<Arc<tokio::sync::Notify>>,
         resolve_avatars: Option<AvatarResolveSignal>,
         resolve_chat_names: Option<chat_names::ChatNameResolveSignal>,
+        epoch: u64,
     ) {
         match &*event {
+            // The dispatch boundary already retired calls and published this
+            // before any older call lane can resume its asynchronous work.
+            Event::Disconnected(_) => {}
             Event::RawNode(node) => calls.accept_advertisement(node).await,
             Event::PairingQrCode(qr) => {
                 info!("QR code received");
@@ -1692,7 +1702,9 @@ impl WhatsAppClient {
                 if let Some(resolve) = resolve_chat_names {
                     resolve.new_connection();
                 }
-                let _ = ui_tx.send(UiEvent::Connected);
+                if !calls.connection_is_current(epoch) {
+                    return;
+                }
                 // Who this device is linked as. Read from the device store
                 // rather than remembered from pairing: a client attaching
                 // after a restart never saw that, and the account row was
@@ -1752,9 +1764,11 @@ impl WhatsAppClient {
                         info!("Ignoring offline call {} (stale)", call_id);
                         return;
                     }
-                    info!("Incoming call from {}", call.from.observe());
                     let offer = Arc::new((**call).clone());
-                    calls.offer(call_id.clone(), offer.clone());
+                    if !calls.offer_in_epoch(call_id.clone(), offer.clone(), epoch) {
+                        return;
+                    }
+                    info!("Incoming call from {}", call.from.observe());
                     // A call has to ring even when nobody can say which of
                     // the caller's two addresses their chat is filed under:
                     // the address as written is no worse than the one the
@@ -1777,7 +1791,7 @@ impl WhatsAppClient {
                         *is_video,
                         &offer,
                     );
-                    let _ = ui_tx.send(UiEvent::IncomingCall(ui_call));
+                    calls.publish_offer(&offer, ui_call, epoch, &ui_tx);
                 }
                 CallAction::Accept { call_id, .. } => {
                     info!("Call {} accepted by peer", call_id);

@@ -88,6 +88,11 @@ pub fn render_paste_preview(props: PastePreviewProps<'_>, cx: &App) -> impl Into
         .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
             cx.stop_propagation();
         })
+        .on_mouse_up(gpui::MouseButton::Left, |_, _window, cx| {
+            cx.stop_propagation();
+        })
+        .on_click(|_, _window, cx| cx.stop_propagation())
+        .occlude()
         .child(
             div()
                 .text_size(metrics.text_title())

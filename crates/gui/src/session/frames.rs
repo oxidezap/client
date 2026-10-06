@@ -170,7 +170,7 @@ impl<'a> Frames<'a> {
             // nothing to compare against.
             DaemonMessage::Hello { protocol, snapshot } if protocol == PROTOCOL_VERSION => {
                 self.applied = snapshot.version;
-                self.follow_calls(&snapshot.calls);
+                self.follow_calls(&snapshot_calls(&snapshot));
                 for event in catch_up(&snapshot) {
                     self.publish(event)?;
                 }
@@ -745,9 +745,17 @@ pub(super) fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     // Whatever is happening on the call front, as state. The offer for a
     // ringing call went out before this window existed, and a call this
     // account placed was never an event at all.
-    events.push(FromDaemon::Calls(Box::new(snapshot.calls.clone())));
+    events.push(FromDaemon::Calls(Box::new(snapshot_calls(snapshot))));
     events.push(FromDaemon::Account(snapshot.account.clone()));
     events
+}
+
+fn snapshot_calls(snapshot: &StateSnapshot) -> CallState {
+    let mut calls = snapshot.calls.clone();
+    if !snapshot.connection.is_connected() {
+        calls.end_all();
+    }
+    calls
 }
 
 /// How many rows a snapshot may paint.
@@ -1597,6 +1605,19 @@ mod tests {
             account: None,
             plugins: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_offline_snapshot_cannot_resurrect_a_call_card() {
+        let mut snapshot = snapshot_of(Vec::new());
+        snapshot.connection = ConnectionState::Disconnected {
+            reason: "synthetic drop".into(),
+        };
+        snapshot.calls = video_call("OLD");
+        let events = catch_up(&snapshot);
+        assert!(events.iter().any(|event| matches!(event, FromDaemon::Session(event) if matches!(&**event, UiEvent::Disconnected(_)))));
+        assert!(events.iter().any(|event| matches!(event, FromDaemon::Calls(calls) if calls.stage().is_none() && calls.waiting().is_none())));
+        assert!(snapshot_calls(&snapshot).stage().is_none());
     }
 
     fn summary(jid: &str, name: &str, unread: u32) -> ChatSummary {

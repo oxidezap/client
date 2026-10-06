@@ -116,6 +116,32 @@ pub struct BackfillReport {
 }
 
 impl WhatsAppClient {
+    /// Interrupt the library's current reconnect wait. Pause/resume wakes the
+    /// running supervisor; it does not construct another bot or open a store.
+    pub fn retry_connection(&self) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let client = &live.client;
+            if !client
+                .enable_auto_reconnect
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err("the WhatsApp session has ended".to_string());
+            }
+            // A click that arrived just after recovery must not drop a healthy
+            // connection, or the calls running over it.
+            if client.is_connected() {
+                return Ok(());
+            }
+            client.pause().await;
+            client.resume();
+            Ok(())
+        })
+    }
+
     /// Create a poll. Returns the server-assigned message id and timestamp.
     pub fn create_poll(
         &self,

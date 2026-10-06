@@ -8,6 +8,19 @@
 use oxidezap_core::{ReceiptType, UiEvent};
 use oxidezap_ipc::DaemonMessage;
 
+#[test]
+fn reconnect_session_is_an_account_request_and_round_trips() {
+    let request = oxidezap_ipc::ClientRequest::ReconnectSession;
+    assert!(request.is_account_request());
+    assert!(!request.is_control_request());
+    let encoded = serde_json::to_string(&request).unwrap();
+    assert_eq!(encoded, "{\"request\":\"reconnect_session\"}");
+    assert!(matches!(
+        serde_json::from_str::<oxidezap_ipc::ClientRequest>(&encoded).unwrap(),
+        oxidezap_ipc::ClientRequest::ReconnectSession
+    ));
+}
+
 /// One of each, so a variant added to the library is a variant this covers.
 fn every_receipt_type() -> Vec<ReceiptType> {
     vec![

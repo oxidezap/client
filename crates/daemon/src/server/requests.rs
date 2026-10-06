@@ -173,6 +173,9 @@ pub(super) async fn handle_request(
             .await
         }
         ClientRequest::ReloadHistory => acted(dispatch(hub, commands, Action::ReloadHistory).await),
+        ClientRequest::ReconnectSession => {
+            acted(dispatch(hub, commands, Action::ReconnectSession).await)
+        }
         // Answered with the page under this id, like a download and for the
         // same reason.
         ClientRequest::LoadMessages(request) => {
