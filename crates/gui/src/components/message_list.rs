@@ -102,6 +102,12 @@ pub fn render_message_list(
         .relative()
         .overflow_hidden()
         .child(
+            div()
+                .absolute()
+                .size_0()
+                .child(crate::components::rich_text_selection::RetainedSelectionKeepalive),
+        )
+        .child(
             // The gutter is each row's, not the list's. `gpui::list` honours
             // the vertical half of its own padding and lays every row out at
             // the left edge of its bounds regardless of the horizontal half,
@@ -229,6 +235,7 @@ fn render_row(
                 text: text.clone(),
                 message: Arc::clone(msg),
                 chat_jid: chat_jid.clone(),
+                selection_order: *ix as u64,
                 attempted_vote: app.attempted_poll_vote(chat_jid, message_id),
                 playing_message_id: app.playing_message_id().map(|s| s.to_string()),
                 is_group,
@@ -239,7 +246,9 @@ fn render_row(
                 decoded_image,
                 audio,
                 playback_speed: app.playback_speed(),
-                is_downloading: app.is_downloading(message_id),
+                is_downloading: app.is_downloading(message_id)
+                    || app.is_document_downloading(message_id),
+                saved_document_path: app.saved_document_path(message_id),
                 reaction_picker_open: app.reaction_picker_for() == Some(message_id.as_str()),
                 is_preparing: app.is_audio_preparing(message_id),
             };

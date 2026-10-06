@@ -9,6 +9,50 @@ mod common;
 use common::*;
 use wacore::store::traits::{MsgSecretEntry, MsgSecretStore};
 
+/// Unsupported V5 rows are still classified as polls; a keyset page lets the
+/// session skip them without letting them occupy the requested supported-poll
+/// result count.
+#[tokio::test]
+async fn poll_pages_continue_past_unsupported_variants() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let supported = wa::Message {
+        poll_creation_message_v3: buffa::MessageField::some(Default::default()),
+        ..Default::default()
+    };
+    let unsupported = wa::Message {
+        poll_creation_message_v5: buffa::MessageField::some(Default::default()),
+        ..Default::default()
+    };
+    chat_store
+        .record_outgoing(&chat, "POLL-LEGACY", &supported, ts(1_700_000_100))
+        .unwrap();
+    chat_store
+        .record_outgoing(&chat, "POLL-V5", &unsupported, ts(1_700_000_200))
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let first = chat_store
+        .poll_messages_page(Some(&chat), None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first[0].id, "POLL-V5");
+    assert_eq!(first[0].kind, MessageKind::Poll);
+    assert!(first[0].message.as_deref().is_none_or(|message| {
+        oxidezap_chat_store::supported_poll_creation_message(message).is_none()
+    }));
+    let cursor = MessageCursor::from(&first[0]);
+    let next = chat_store
+        .poll_messages_page(Some(&chat), Some(cursor), 1)
+        .await
+        .unwrap();
+    assert_eq!(next[0].id, "POLL-LEGACY");
+    assert_eq!(next[0].kind, MessageKind::Poll);
+    assert!(next[0].message.as_deref().is_some_and(|message| {
+        oxidezap_chat_store::supported_poll_creation_message(message).is_some()
+    }));
+}
+
 /// A secret the library captured at receive time is readable back for the
 /// vote, even though the stored proto carries no envelope at all.
 #[tokio::test]

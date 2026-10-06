@@ -134,6 +134,8 @@ const ID_PARAM_CHUNK: usize = 900;
 struct FtsHit {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     id: i64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    rank: f64,
 }
 
 impl ChatStore {
@@ -208,15 +210,41 @@ impl ChatStore {
                             .map_err(db_err)?,
                         None => Vec::new(),
                     };
-                    let hits = fts_hits(
-                        conn,
-                        device_id,
-                        &match_query,
-                        &keys,
-                        ranked,
-                        has_media,
-                        limit,
-                    )?;
+                    let hits = if keys.len() <= 2 {
+                        fts_hits(
+                            conn,
+                            device_id,
+                            &match_query,
+                            &keys,
+                            ranked,
+                            has_media,
+                            limit,
+                        )?
+                    } else {
+                        let mut hits = Vec::new();
+                        for key_chunk in keys.chunks(2) {
+                            hits.extend(fts_hits(
+                                conn,
+                                device_id,
+                                &match_query,
+                                key_chunk,
+                                ranked,
+                                has_media,
+                                limit,
+                            )?);
+                        }
+                        if ranked {
+                            hits.sort_by(|left, right| {
+                                left.rank
+                                    .total_cmp(&right.rank)
+                                    .then_with(|| right.id.cmp(&left.id))
+                            });
+                        } else {
+                            hits.sort_by_key(|hit| std::cmp::Reverse(hit.id));
+                        }
+                        hits.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                        hits
+                    };
                     if hits.is_empty() {
                         return Ok(Vec::new());
                     }
@@ -275,7 +303,11 @@ fn fts_hits(
     // The FTS side is still `rowid` (an external-content table's own rowid
     // keeps that name; `content_rowid='id'` only says which content column it
     // maps to), so the join crosses `m.id = f.rowid`.
-    let order = if ranked { "f.rank" } else { "f.rowid DESC" };
+    let order = if ranked {
+        "f.rank, f.rowid DESC"
+    } else {
+        "f.rowid DESC"
+    };
     // Built from the class's own label list, so the filter and `as_str` move
     // together. Every label is a fixed identifier, so the literal is safe.
     let media_filter = if has_media {
@@ -289,7 +321,7 @@ fn fts_hits(
     };
     let Some(first_key) = keys.first() else {
         return diesel::sql_query(format!(
-            "SELECT f.rowid AS id
+            "SELECT f.rowid AS id, f.rank AS rank
              FROM messages_fts f JOIN messages m ON m.id = f.rowid
              WHERE messages_fts MATCH ? AND m.device_id = ?{media_filter}
              ORDER BY {order} LIMIT ?"
@@ -300,12 +332,12 @@ fn fts_hits(
         .load(conn)
         .map_err(db_err);
     };
-    // A chat has at most two storage identities (PN and LID). Padding the
+    // Each bounded key chunk has at most two storage identities. Padding the
     // single-key case to two placeholders keeps one statically bound statement
     // instead of a variadic one; `IN (x, x)` is `IN (x)`.
     let second_key = keys.get(1).unwrap_or(first_key);
     diesel::sql_query(format!(
-        "SELECT f.rowid AS id
+        "SELECT f.rowid AS id, f.rank AS rank
          FROM messages_fts f JOIN messages m ON m.id = f.rowid
          WHERE messages_fts MATCH ? AND m.device_id = ? AND m.chat_jid IN (?, ?){media_filter}
          ORDER BY {order} LIMIT ?"
@@ -382,6 +414,9 @@ mod tests {
         diesel::sql_query("INSERT INTO device (id) VALUES (1)")
             .execute(&mut conn)
             .expect("seed the device row the fixture below references");
+        diesel::sql_query("CREATE TABLE lid_pn_mapping (device_id INTEGER NOT NULL)")
+            .execute(&mut conn)
+            .expect("mapping parent for the repair-generation triggers");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
         ensure_fts(&mut conn).expect("create the index");
 

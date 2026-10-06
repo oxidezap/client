@@ -4,42 +4,41 @@
 //! bubble, the store's durable delivery state into the ticks the UI draws, a
 //! quote the front end composed into the context info that threads the reply,
 //! and the device store into who this device is linked as.
-//! [`mark_unread_tail`] is here because it is the correction the first of them
+//! [`stored_with_unread_tail`] is here because it is the correction the first of them
 //! owes every caller that hydrates a page.
 
 use std::sync::Arc;
 
 use oxidezap_core::{ChatMessage, MessageStatus, PollContent, UiEvent};
 use whatsapp_rust::client::Client;
-use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::waproto::whatsapp as wa;
 
 use super::media;
 use crate::quoting::quoted_from;
 
-/// Un-read the newest `unread` incoming rows of a hydrated page.
-///
-/// [`stored_to_chat_message`] reads an incoming row back as read, because the
-/// store keeps read state on the chat's counter and not on the row — so every
-/// caller that hydrates stored rows owes this correction. Skipping it hands a
-/// front end a page in which nothing is unread: the read it then asks for
-/// names messages the daemon was told were already seen, no receipt goes out,
-/// and the badge comes back on the next hydration.
-///
-/// Returns whatever budget the page did not spend, for a caller walking a
-/// PN/LID pair a page at a time.
-pub(super) fn mark_unread_tail(messages: &mut [ChatMessage], unread: u32) -> u32 {
+/// Hydrate an oldest-first page, assigning unread slots only to incoming
+/// rows that contributed to the durable counter. Local revoke placeholders
+/// stay read and cannot displace a real unread message or its receipt.
+pub(super) fn stored_with_unread_tail(
+    rows: Vec<oxidezap_chat_store::StoredMessage>,
+    unread: u32,
+) -> Vec<ChatMessage> {
     let mut remaining = unread;
-    for msg in messages.iter_mut().rev() {
-        if remaining == 0 {
-            break;
-        }
-        if !msg.is_from_me {
-            msg.is_read = false;
-            remaining -= 1;
-        }
-    }
-    remaining
+    let mut messages: Vec<_> = rows
+        .into_iter()
+        .rev()
+        .map(|row| {
+            let eligible = !row.from_me && !row.local_revoke_placeholder;
+            let mut message = stored_to_chat_message(row);
+            if eligible && remaining > 0 {
+                message.is_read = false;
+                remaining -= 1;
+            }
+            message
+        })
+        .collect();
+    messages.reverse();
+    messages
 }
 
 /// Convert a durable store row into the UI message model. Media stays
@@ -48,17 +47,17 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
     // The stored proto still carries the media envelope: hydrate thumbnails +
     // download info so historical media renders and stays fetchable, instead
     // of degrading to a [kind] text row until a live redelivery.
-    let media = (!stored.revoked)
+    let base_message = (!stored.revoked)
         .then_some(stored.message.as_deref())
         .flatten()
-        .and_then(|m| media::media_of(m.get_base_message(), None));
-    let poll = (!stored.revoked)
-        .then_some(stored.message.as_deref())
-        .flatten()
-        .and_then(|m| poll_of(m.get_base_message()));
+        .map(oxidezap_chat_store::normalized_message);
+    let media = base_message.and_then(|message| media::media_of(message, None));
+    let poll = base_message.and_then(poll_of);
+    let contacts = base_message.and_then(oxidezap_chat_store::shared_contacts_text);
     let content = match (&stored.text, stored.revoked) {
         (_, true) => "[Message deleted]".to_string(),
         (Some(text), _) => text.clone(),
+        (None, _) if contacts.is_some() => contacts.unwrap_or_default(),
         (None, _) if poll.is_some() => poll
             .as_ref()
             .map(|p| p.question.clone())
@@ -77,15 +76,13 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
     } else {
         true
     };
-    let quoted = (!stored.revoked)
-        .then_some(stored.message.as_deref())
-        .flatten()
-        .and_then(|m| quoted_from(m.get_base_message()));
+    let quoted = base_message.and_then(quoted_from);
     ChatMessage {
         id: stored.id,
         sender: stored.sender_jid.to_string(),
         sender_name: None,
         content,
+        is_text: stored.kind == oxidezap_chat_store::MessageKind::Text,
         timestamp: stored.timestamp,
         is_from_me: stored.from_me,
         is_read,
@@ -144,20 +141,7 @@ pub(super) fn poll_of(message: &wa::Message) -> Option<PollContent> {
 /// and teaching the bubble to draw one while the vote refuses it would be
 /// the disagreement this sharing exists to prevent.
 pub(super) fn poll_creation_of(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
-    let base = message.get_base_message();
-    let base = [
-        &base.group_mentioned_message,
-        &base.associated_child_message,
-        &base.poll_creation_message_v4,
-    ]
-    .into_iter()
-    .find_map(|wrapper| wrapper.as_option().and_then(|w| w.message.as_option()))
-    .map(|inner| inner.get_base_message())
-    .unwrap_or(base);
-    base.poll_creation_message_v3
-        .as_option()
-        .or_else(|| base.poll_creation_message_v2.as_option())
-        .or_else(|| base.poll_creation_message.as_option())
+    oxidezap_chat_store::supported_poll_creation_message(message)
 }
 
 /// Map the store's durable delivery state onto the one the UI draws.
@@ -280,8 +264,43 @@ mod tests {
             starred: false,
             edited_at: None,
             revoked: false,
+            local_revoke_placeholder: false,
             seq: 1,
         }
+    }
+
+    #[test]
+    fn local_placeholder_does_not_consume_the_hydrated_unread_tail() {
+        let mut incoming = stored_poll_creation();
+        incoming.id = "REAL-UNREAD".into();
+        let mut placeholder = stored_poll_creation();
+        placeholder.id = "LOCAL-REVOKE".into();
+        placeholder.local_revoke_placeholder = true;
+        placeholder.revoked = true;
+        let messages = stored_with_unread_tail(vec![incoming, placeholder], 1);
+        assert!(!messages[0].is_read);
+        assert!(messages[1].is_read);
+        assert!(!messages[1].is_from_me);
+    }
+
+    #[test]
+    fn legacy_contact_rows_project_the_proto_without_a_stored_text_column() {
+        let mut stored = stored_poll_creation();
+        stored.kind = oxidezap_chat_store::MessageKind::Contact;
+        stored.message = Some(Box::new(wa::Message {
+            contact_message: MessageField::some(wa::message::ContactMessage {
+                display_name: Some("Example Alpha".into()),
+                vcard: Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            stored_to_chat_message(stored.clone()).content,
+            "Example Alpha\n+55 99 0000-0001"
+        );
+        stored.revoked = true;
+        assert_eq!(stored_to_chat_message(stored).content, "[Message deleted]");
     }
 
     /// A stored poll creation hydrates as a votable poll, with the question
@@ -366,5 +385,45 @@ mod tests {
         let poll = message.poll.expect("a v4 creation hydrates a poll");
         assert_eq!(poll.question, "Onde jantamos?");
         assert_eq!(poll.options.len(), 2);
+    }
+
+    #[test]
+    fn nested_wrappers_hydrate_media_and_quote_from_the_inner_message() {
+        let image = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                jpeg_thumbnail: Some(vec![1, 2, 3]),
+                context_info: MessageField::some(wa::ContextInfo {
+                    stanza_id: Some("quoted-message".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let associated = wa::Message {
+            associated_child_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(image),
+            }),
+            ..Default::default()
+        };
+        let mut stored = stored_poll_creation();
+        stored.kind = oxidezap_chat_store::MessageKind::Image;
+        stored.text = None;
+        stored.message = Some(Box::new(wa::Message {
+            group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(associated),
+            }),
+            ..Default::default()
+        }));
+
+        let message = stored_to_chat_message(stored);
+        assert!(
+            message.media.is_some(),
+            "wrapped image media should hydrate"
+        );
+        assert_eq!(
+            message.quoted.expect("wrapped reply quote").message_id,
+            "quoted-message"
+        );
     }
 }

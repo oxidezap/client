@@ -7,7 +7,8 @@ use waproto::whatsapp as wa;
 
 use crate::schema;
 use crate::store::chat_rows::{ChatBump, bump_chat, refresh_preview_if_latest};
-use crate::store::message_rows::message_row;
+use crate::store::message_identity::{resolve_target, stored_sender};
+use crate::store::writer::ChangeSet;
 
 /// Apply an edit to its target row. Monotonic on `edited_at_ms` so a replayed
 /// or stale (e.g. history-sync) edit can't roll back a newer one. An edit
@@ -27,70 +28,82 @@ pub(super) fn apply_edit(
     new_kind: &str,
     new_proto: &[u8],
     ts_ms: i64,
+    changes: &mut ChangeSet,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
-    let target = message_row(device_id, chat, target_id)
-        .filter(dsl::from_me.eq(from_me))
-        .filter(dsl::sender_jid.eq(if from_me { "" } else { sender }));
-    let updated = diesel::update(
-        target
-            // A tombstone absorbs edits too: revoked content must not resurface.
-            .filter(dsl::revoked.eq(false))
-            .filter(dsl::edited_at_ms.is_null().or(dsl::edited_at_ms.le(ts_ms))),
-    )
-    .set((
-        dsl::text_content.eq(new_text),
-        dsl::kind.eq(new_kind),
-        dsl::proto.eq(Some(new_proto)),
-        // Edit protos are stored raw (see the module docs in
-        // `storage_proto`): a row compressed earlier must come back to raw
-        // here, or the reader would decompress plain protobuf.
-        dsl::proto_codec.eq(crate::storage_proto::CODEC_RAW),
-        dsl::edited_at_ms.eq(Some(ts_ms)),
-    ))
-    .execute(conn)?;
-    if updated == 0 {
-        let inserted = diesel::insert_into(dsl::messages)
-            .values((
-                dsl::device_id.eq(device_id),
-                dsl::chat_jid.eq(chat),
-                dsl::msg_id.eq(target_id),
-                dsl::sender_jid.eq(sender),
-                dsl::from_me.eq(from_me),
-                dsl::timestamp_ms.eq(ts_ms),
-                dsl::kind.eq(new_kind),
-                dsl::text_content.eq(new_text),
-                dsl::proto.eq(Some(new_proto)),
-                dsl::status.eq(if from_me {
-                    wa::web_message_info::Status::SERVER_ACK as i32
-                } else {
-                    wa::web_message_info::Status::DELIVERY_ACK as i32
-                }),
-                dsl::edited_at_ms.eq(Some(ts_ms)),
-            ))
-            // Conflict = the row exists but rejected the edit (revoked, or a
-            // newer edit already applied): stale, nothing to preserve.
-            .on_conflict_do_nothing()
-            .execute(conn)?
-            > 0;
-        if inserted {
-            // The message DID happen — the chat must exist, order by it and
-            // badge it exactly as if the (never-seen) original had landed.
-            bump_chat(
-                conn,
-                device_id,
-                chat,
-                ChatBump {
-                    msg_id: target_id,
-                    ts_ms,
-                    preview: new_text,
-                    kind: Some(new_kind),
-                    unread_delta: i32::from(!from_me),
-                },
-            )?;
-            return Ok(true);
+    if let Some(target) =
+        resolve_target(conn, device_id, chat, target_id, from_me, sender, changes)?
+    {
+        let updated = diesel::update(
+            dsl::messages
+                .filter(dsl::id.eq(target.id))
+                // A tombstone absorbs edits too: revoked content must not resurface.
+                .filter(dsl::revoked.eq(false))
+                .filter(dsl::edited_at_ms.is_null().or(dsl::edited_at_ms.le(ts_ms))),
+        )
+        .set((
+            dsl::text_content.eq(new_text),
+            dsl::kind.eq(new_kind),
+            dsl::proto.eq(Some(new_proto)),
+            // Edit protos are stored raw (see the module docs in
+            // `storage_proto`): a row compressed earlier must come back to raw
+            // here, or the reader would decompress plain protobuf.
+            dsl::proto_codec.eq(crate::storage_proto::CODEC_RAW),
+            dsl::edited_at_ms.eq(Some(ts_ms)),
+        ))
+        .execute(conn)?;
+        if updated == 0 {
+            return Ok(false);
         }
+        return refresh_preview_if_latest(
+            conn,
+            device_id,
+            chat,
+            target_id,
+            new_text,
+            Some(new_kind),
+        );
+    }
+
+    let sender = stored_sender(sender, from_me);
+    let inserted = diesel::insert_into(dsl::messages)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::chat_jid.eq(chat),
+            dsl::msg_id.eq(target_id),
+            dsl::sender_jid.eq(&sender),
+            dsl::from_me.eq(from_me),
+            dsl::timestamp_ms.eq(ts_ms),
+            dsl::kind.eq(new_kind),
+            dsl::text_content.eq(new_text),
+            dsl::proto.eq(Some(new_proto)),
+            dsl::proto_codec.eq(crate::storage_proto::CODEC_RAW),
+            dsl::status.eq(if from_me {
+                wa::web_message_info::Status::SERVER_ACK as i32
+            } else {
+                wa::web_message_info::Status::DELIVERY_ACK as i32
+            }),
+            dsl::edited_at_ms.eq(Some(ts_ms)),
+        ))
+        .on_conflict_do_nothing()
+        .execute(conn)?
+        > 0;
+    if !inserted {
         return Ok(false);
     }
-    refresh_preview_if_latest(conn, device_id, chat, target_id, new_text, Some(new_kind))
+    // The message DID happen — the chat must exist, order by it and badge it
+    // exactly as if the (never-seen) original had landed.
+    bump_chat(
+        conn,
+        device_id,
+        chat,
+        ChatBump {
+            msg_id: target_id,
+            ts_ms,
+            preview: new_text,
+            kind: Some(new_kind),
+            unread_delta: i32::from(!from_me),
+        },
+    )?;
+    Ok(true)
 }

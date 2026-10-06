@@ -20,7 +20,7 @@ use whatsapp_rust::wacore_binary::jid::{Jid, observe_str};
 use oxidezap_core::{Chat, ChatMessage, UiEvent};
 
 use super::WhatsAppClient;
-use super::convert::{mark_unread_tail, stored_to_chat_message};
+use super::convert::stored_with_unread_tail;
 use super::paging::chat_cursor;
 use super::ui_queue::Sender as UiEventSender;
 use crate::names::NameBook;
@@ -564,7 +564,7 @@ impl WhatsAppClient {
                 let mention_lists = crate::mentions::mention_lists_of(&page);
                 let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
                 let mut msgs: Vec<ChatMessage> =
-                    page.into_iter().map(stored_to_chat_message).collect();
+                    stored_with_unread_tail(page, entry.unread_count.max(0) as u32);
                 crate::mentions::hydrate_mention_lists(client, names, &mention_lists, &mut msgs)
                     .await;
                 crate::mentions::hydrate_quoted_mention_lists(
@@ -590,7 +590,6 @@ impl WhatsAppClient {
                 }
                 // Each alias still needs its unread tail marked for receipts,
                 // but PN/LID counters describe the same logical chat.
-                mark_unread_tail(&mut msgs, entry.unread_count.max(0) as u32);
                 merge_alias_history_messages(existing, msgs, entry.unread_count.max(0) as u32);
                 // A page is assigned rather than added a row at a time, so
                 // the naming `add_message` does per row has to be run over it.
@@ -608,6 +607,9 @@ impl WhatsAppClient {
                 // An active alias keeps the logical conversation active,
                 // regardless of which PN/LID row leads display order.
                 existing.archived &= entry.archived;
+                if entry.group_hierarchy.is_some() {
+                    existing.group_hierarchy = entry.group_hierarchy.clone();
+                }
                 existing.set_name_if_better(name, name_priority);
                 continue;
             }
@@ -617,6 +619,7 @@ impl WhatsAppClient {
             chat.pinned_at = entry.pinned_at;
             chat.muted_until = entry.muted_until;
             chat.archived = entry.archived;
+            chat.group_hierarchy = entry.group_hierarchy.clone();
             chat.unread_count = entry.unread_count.max(0) as u32;
             // -1 = manually marked unread (WA Web convention); .max(0) above
             // must not silently eat the flag.
@@ -630,7 +633,7 @@ impl WhatsAppClient {
             }
             let mention_lists = crate::mentions::mention_lists_of(&page);
             let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
-            chat.messages = page.into_iter().map(stored_to_chat_message).collect();
+            chat.messages = stored_with_unread_tail(page, chat.unread_count);
             crate::mentions::hydrate_mention_lists(
                 client,
                 names,
@@ -659,7 +662,6 @@ impl WhatsAppClient {
                 )
                 .await;
             }
-            mark_unread_tail(&mut chat.messages, chat.unread_count);
             // After the sender names, because the best answer for "who wrote
             // the message this is replying to" is usually the reply's own
             // neighbour, and it has only just been named.

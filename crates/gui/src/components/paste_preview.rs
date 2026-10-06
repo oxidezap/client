@@ -22,10 +22,9 @@ use crate::theme::Metrics;
 
 /// One file waiting in the modal, with its preview decoded where drawable.
 ///
-/// The image is decoded only where the recipient would see a photo: the
-/// picker's [`kind_for`](crate::platform::picker::kind_for) already knows
-/// which pictures survive the trip, and decoding anything else here previews
-/// something the other side cannot draw.
+/// The selected media kind and the file's byte signature both gate previews:
+/// a document stays a document, and mislabeled bytes are decoded according to
+/// their actual format.
 pub struct PreviewFile {
     pub file: crate::platform::picker::Picked,
     pub image: Option<Arc<Image>>,
@@ -38,11 +37,10 @@ impl PreviewFile {
     /// draws.
     pub fn with_preview(file: crate::platform::picker::Picked, decode: bool) -> Self {
         let image = (decode && file.kind == OutgoingMedia::Image)
-            .then(|| {
-                gpui::ImageFormat::from_mime_type(&file.mime_type)
-                    .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())))
-            })
-            .flatten();
+            .then(|| crate::platform::picker::previewable_image_mime(&file.bytes))
+            .flatten()
+            .and_then(gpui::ImageFormat::from_mime_type)
+            .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())));
         Self { file, image }
     }
 
@@ -313,6 +311,14 @@ mod tests {
             bytes: b"\x89PNG\r\n\x1a\nrest".to_vec(),
         };
         assert!(PreviewFile::with_preview(document, true).image.is_none());
+
+        let mislabeled = Picked {
+            file_name: "foto.jpg".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            kind: oxidezap_core::OutgoingMedia::Image,
+            bytes: b"\x89PNG\r\n\x1a\nrest".to_vec(),
+        };
+        assert!(PreviewFile::with_preview(mislabeled, true).image.is_some());
     }
 
     #[test]

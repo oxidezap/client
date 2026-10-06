@@ -124,6 +124,36 @@ async fn local_reaction_adds_replaces_and_removes_own_reaction() {
 }
 
 #[tokio::test]
+async fn local_reaction_matches_own_group_target_without_participant() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    let id = "MSG-OWN-GROUP-REACTION";
+    chat_store
+        .record_outgoing(
+            &chat,
+            id,
+            &wa::Message::text("our message"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    let target = wa::MessageKey {
+        remote_jid: Some(GROUP.into()),
+        from_me: Some(true),
+        id: Some(id.into()),
+        ..Default::default()
+    };
+
+    chat_store
+        .record_reaction(&chat, &target, "👍", ts(1_700_000_020))
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let reactions = chat_store.reactions(&chat, id).await.unwrap();
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].emoji, "👍");
+    assert_eq!(reactions[0].sender_jid, Jid::default());
+}
+
+#[tokio::test]
 async fn local_reaction_requires_a_target_id() {
     let (_store, chat_store) = test_store().await;
     let err = chat_store

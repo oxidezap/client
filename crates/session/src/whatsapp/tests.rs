@@ -22,6 +22,31 @@ use whatsapp_rust::wacore::types::events::{Event, ServerAck};
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+#[test]
+fn live_nonrenderable_fallback_uses_the_shared_message_kind() {
+    let poll = wa::Message {
+        poll_creation_message_v5: MessageField::some(Default::default()),
+        ..Default::default()
+    };
+    let album = wa::Message {
+        album_message: MessageField::some(Default::default()),
+        ..Default::default()
+    };
+    let product = wa::Message {
+        product_message: MessageField::some(Default::default()),
+        ..Default::default()
+    };
+
+    assert_eq!(super::live_content_fallback(&poll, false), "[poll]");
+    assert_eq!(super::live_content_fallback(&album, false), "[album]");
+    assert_eq!(super::live_content_fallback(&product, false), "[product]");
+    assert_eq!(
+        super::live_content_fallback(&wa::Message::default(), false),
+        "[Media]"
+    );
+    assert_eq!(super::live_content_fallback(&product, true), "");
+}
+
 /// A name book with nothing behind its handle: the history paths hand the
 /// store in with every call, and only the live paths read it from there.
 fn book() -> NameBook {
@@ -80,6 +105,48 @@ fn the_live_data_lane_subscribes_to_server_acks() {
         super::DATA_EVENT_KINDS
             .contains(&whatsapp_rust::wacore::types::events::EventKind::ServerAck)
     );
+}
+
+#[test]
+fn the_identity_lane_subscribes_to_contact_updates() {
+    assert!(
+        super::IDENTITY_EVENT_KINDS
+            .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactUpdate)
+    );
+    assert!(
+        !super::CONTROL_EVENT_KINDS
+            .contains(&whatsapp_rust::wacore::types::events::EventKind::ContactUpdate),
+        "a contact full sync must not block latency-sensitive control events"
+    );
+}
+
+#[test]
+fn a_contact_sync_burst_is_not_dropped_at_identity_ingress() {
+    use whatsapp_rust::wacore::types::events::{ContactUpdate, EventHandler};
+
+    let (handler, receiver, stats) = super::interested_unbounded_channel(&[
+        whatsapp_rust::wacore::types::events::EventKind::ContactUpdate,
+    ]);
+    let update = Arc::new(Event::ContactUpdate(
+        ContactUpdate::builder()
+            .jid(TEST_PEER.parse().expect("test PN"))
+            .timestamp(
+                whatsapp_rust::wacore::time::from_secs(1_700_000_100).expect("test timestamp"),
+            )
+            .action(Box::new(wa::sync_action_value::ContactAction {
+                lid_jid: Some(TEST_AUTHOR.to_string()),
+                ..Default::default()
+            }))
+            .from_full_sync(true)
+            .build(),
+    ));
+
+    for _ in 0..256 {
+        handler.handle_event(update.clone());
+    }
+
+    assert_eq!(stats.stats().dropped_full, 0);
+    assert_eq!(receiver.len(), 256);
 }
 
 #[test]
@@ -893,8 +960,10 @@ async fn direct_group_mention_alerts_through_mute_and_archive() {
             ui_rx.try_recv(),
             Ok(oxidezap_core::UiEvent::MessageReceived {
                 notification_allowed: false,
+                chat_name: Some(name),
+                notification_archived: Some(true),
                 ..
-            })
+            }) if name == "Example group"
         ));
     }
 }
@@ -1292,6 +1361,155 @@ async fn a_stored_avatar_descriptor_reaches_the_chat_without_a_lookup() {
     );
 }
 
+#[derive(diesel::QueryableByName)]
+struct StoredProtoRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+    proto: Option<Vec<u8>>,
+}
+
+/// Read a message's durable protobuf without applying quote hydration.
+async fn persisted_proto(store: &SqliteStore, id: &str) -> wa::Message {
+    use diesel::RunQueryDsl as _;
+
+    let device = store.device_id();
+    let id = id.to_owned();
+    let row: StoredProtoRow = store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query("SELECT proto FROM messages WHERE device_id = ? AND msg_id = ?")
+                .bind::<diesel::sql_types::Integer, _>(device)
+                .bind::<diesel::sql_types::Text, _>(id)
+                .get_result(conn)
+                .map_err(oxidezap_chat_store::db_err)
+        })
+        .await
+        .expect("read stored proto");
+    whatsapp_rust::waproto::codec::message_decode(&row.proto.expect("stored payload"))
+        .expect("decode proto")
+}
+
+/// Whether a stored reply still embeds its original quoted-message payload.
+fn has_quoted_snapshot(message: &wa::Message) -> bool {
+    let context = message
+        .extended_text_message
+        .as_option()
+        .and_then(|body| body.context_info.as_option())
+        .or_else(|| {
+            message
+                .image_message
+                .as_option()
+                .and_then(|body| body.context_info.as_option())
+        });
+    context.is_some_and(|context| context.quoted_message.as_option().is_some())
+}
+
+/// Starred and media-candidate reads retain quote content after reopening.
+#[tokio::test]
+async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
+    let store =
+        SqliteStore::new("file:oxidezap-session-quote-secondary-reads?mode=memory&cache=shared")
+            .await
+            .expect("in-memory store");
+    store.create_new_device().await.expect("seed device parent");
+    let chat_store = ChatStore::new(&store).await.expect("chat store");
+    let parent = wa::Message {
+        image_message: MessageField::some(wa::message::ImageMessage {
+            mimetype: Some("image/jpeg".into()),
+            caption: Some("original photo".into()),
+            jpeg_thumbnail: Some(vec![1, 2, 3]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    chat_store
+        .handler()
+        .handle_event(Arc::new(incoming(parent.clone(), "P", 1_700_000_000)));
+    chat_store.flush().await.expect("store parent");
+
+    let quoted_photo = || wa::ContextInfo {
+        stanza_id: Some("P".into()),
+        participant: Some(TEST_PEER.into()),
+        quoted_message: MessageField::some(parent.clone()),
+        ..Default::default()
+    };
+    let text_reply = wa::Message {
+        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+            text: Some("reply".into()),
+            context_info: MessageField::some(quoted_photo()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    chat_store
+        .handler()
+        .handle_event(Arc::new(incoming(text_reply, "R", 1_700_000_060)));
+    chat_store.flush().await.expect("store text reply");
+    chat_store
+        .handler()
+        .handle_event(Arc::new(Event::StarUpdate(
+            whatsapp_rust::wacore::types::events::StarUpdate::builder()
+                .chat_jid(TEST_PEER.parse().expect("test JID"))
+                .message_id("R".to_string())
+                .from_me(false)
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_120).unwrap())
+                .action(Box::new(wa::sync_action_value::StarAction {
+                    starred: Some(true),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )));
+    chat_store.flush().await.expect("star text reply");
+    let media_reply = wa::Message {
+        image_message: MessageField::some(wa::message::ImageMessage {
+            mimetype: Some("image/jpeg".into()),
+            context_info: MessageField::some(quoted_photo()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    chat_store
+        .handler()
+        .handle_event(Arc::new(incoming(media_reply, "M", 1_700_000_180)));
+    chat_store.flush().await.expect("store media reply");
+    assert!(
+        !has_quoted_snapshot(&persisted_proto(&store, "R").await),
+        "text reply must be compacted before reading"
+    );
+    assert!(
+        !has_quoted_snapshot(&persisted_proto(&store, "M").await),
+        "media reply must be compacted before reading"
+    );
+
+    // Reopen the chat-store handle over the same SQLite database before the
+    // secondary reads, as the session does after a process restart.
+    drop(chat_store);
+    let chat_store = ChatStore::new(&store).await.expect("reopened chat store");
+    let starred = chat_store.starred_messages(10).await.expect("starred read");
+    let projected = super::convert::stored_to_chat_message(
+        starred
+            .into_iter()
+            .find(|row| row.id == "R")
+            .expect("reply"),
+    );
+    let quote = projected.quoted.expect("projected quote");
+    assert_eq!(quote.preview, "original photo");
+    assert_eq!(quote.kind, Some(oxidezap_core::QuotedKind::Image));
+
+    let pending = chat_store
+        .pending_media_messages(Some(&TEST_PEER.parse().expect("test JID")), 10)
+        .await
+        .expect("pending media read");
+    let projected = super::convert::stored_to_chat_message(
+        pending
+            .into_iter()
+            .find(|row| row.id == "M")
+            .expect("media reply"),
+    );
+    let quote = projected.quoted.expect("projected media quote");
+    assert_eq!(quote.preview, "original photo");
+    assert_eq!(quote.kind, Some(oxidezap_core::QuotedKind::Image));
+}
+
 async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
     let store = SqliteStore::new(&format!(
         "file:oxidezap-session-{name}?mode=memory&cache=shared"
@@ -1486,6 +1704,7 @@ fn alias_history_unread_deduplicates_only_matching_messages() {
         quoted: None,
         revoked: false,
         edited: false,
+        is_text: true,
         system: None,
         poll: None,
     };
@@ -1529,6 +1748,7 @@ fn watched_updates_come_back_watched() {
         quoted: None,
         revoked: false,
         edited: false,
+        is_text: true,
         system: None,
         poll: None,
     };
@@ -1825,6 +2045,35 @@ async fn a_scoped_load_skips_an_archived_chat() {
 }
 
 #[tokio::test]
+async fn history_hydration_carries_persisted_group_hierarchy_to_core_chat() {
+    let (chat_store, client) = test_session("group-hierarchy-hydration").await;
+    let hierarchy = oxidezap_core::GroupHierarchy::Subgroup {
+        parent_jid: "120363000000000009@g.us".into(),
+        kind: oxidezap_core::SubgroupKind::General,
+    };
+    let entry = ChatEntry {
+        jid: "120363000000000001@g.us".parse().expect("group JID"),
+        name: Some("General".into()),
+        last_message_at: None,
+        last_message_preview: None,
+        last_message_kind: None,
+        unread_count: 0,
+        pinned_at: None,
+        muted_until: None,
+        archived: false,
+        ephemeral_expiration: None,
+        group_hierarchy: Some(hierarchy.clone()),
+        group_hierarchy_json: None,
+    };
+
+    let chats = WhatsAppClient::hydrate_entries(&chat_store, &client, &book(), vec![entry], |_| 0)
+        .await
+        .expect("history hydrates");
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].group_hierarchy, Some(hierarchy));
+}
+
+#[tokio::test]
 async fn alias_hydration_is_archived_only_when_both_rows_are_archived() {
     let (chat_store, client) = test_session("archive-aliases").await;
     let pn = "559900000008@s.whatsapp.net";
@@ -1849,6 +2098,8 @@ async fn alias_hydration_is_archived_only_when_both_rows_are_archived() {
         muted_until: None,
         archived,
         ephemeral_expiration: None,
+        group_hierarchy: None,
+        group_hierarchy_json: None,
     };
     for (first, second, expected) in [
         (true, false, false),
@@ -1873,6 +2124,171 @@ async fn alias_hydration_is_archived_only_when_both_rows_are_archived() {
     }
 }
 
+/// App-state contact rows carry the missing bridge between a PN-keyed address
+/// book entry and a LID-keyed conversation. The protocol library deliberately
+/// leaves those pairs to the embedder; ignoring them makes a saved contact
+/// remain "Unknown contact" even after the update has supplied both aliases.
+#[tokio::test]
+async fn a_contact_update_repairs_an_already_seen_lid_chat() {
+    use whatsapp_rust::wacore::types::events::ContactUpdate;
+
+    let (chat_store, client) = test_session("contact-update-lid-mapping").await;
+    let lid = "111000011119999@lid";
+    let pn = "559900000099@s.whatsapp.net";
+    let group = "120363000000000099@g.us";
+    feed(
+        &chat_store,
+        incoming_in(lid, wa::Message::text("oi"), "MSG-LID", 1_700_000_000),
+    )
+    .await;
+    feed(
+        &chat_store,
+        from(
+            group,
+            pn,
+            None,
+            wa::Message::text("same group message"),
+            "MSG-GROUP-ALIAS",
+            1_700_000_010,
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        from(
+            group,
+            lid,
+            None,
+            wa::Message::text("same group message"),
+            "MSG-GROUP-ALIAS",
+            1_700_000_020,
+        ),
+    )
+    .await;
+    assert_eq!(
+        chat_store
+            .messages(&group.parse::<Jid>().unwrap(), None, 20)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|message| message.id == "MSG-GROUP-ALIAS")
+            .count(),
+        2
+    );
+
+    let names = Arc::new(book_with(&chat_store));
+    let before = WhatsAppClient::load_history(&chat_store, &client, &names)
+        .await
+        .expect("history loads before the contact pair");
+    assert_eq!(
+        before
+            .chats
+            .iter()
+            .find(|chat| chat.jid == lid)
+            .unwrap()
+            .name,
+        "Unknown contact"
+    );
+
+    let update = Event::ContactUpdate(
+        ContactUpdate::builder()
+            .jid(pn.parse().expect("test PN"))
+            .timestamp(
+                whatsapp_rust::wacore::time::from_secs(1_700_000_100).expect("test timestamp"),
+            )
+            .action(Box::new(wa::sync_action_value::ContactAction {
+                full_name: Some("Bia".to_string()),
+                lid_jid: Some(lid.to_string()),
+                ..Default::default()
+            }))
+            .from_full_sync(false)
+            .build(),
+    );
+    feed(&chat_store, update.clone()).await;
+    let (identity_events, identity_incoming, _identity_stats) =
+        super::interested_unbounded_channel(super::IDENTITY_EVENT_KINDS);
+    let (_session_over, stopping) = tokio::sync::watch::channel(());
+    WhatsAppClient::spawn_contact_identity_learner(
+        client.clone(),
+        identity_incoming,
+        chat_store.clone(),
+        names.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        stopping,
+    );
+    use whatsapp_rust::wacore::types::events::EventHandler;
+    identity_events.handle_event(Arc::new(update));
+    let learned = crate::exec::with_timeout(
+        async {
+            loop {
+                if client
+                    .get_lid_pn_entry(&lid.parse().expect("test LID"))
+                    .await
+                    .expect("mapping lookup")
+                    .is_some()
+                {
+                    break;
+                }
+                crate::exec::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    assert!(learned.is_some(), "the identity worker drains the update");
+    let (group_messages, group_chat) = crate::exec::with_timeout(
+        async {
+            loop {
+                // The in-memory LID cache becomes visible before its mapping
+                // transaction and queued reconciliation finish. Flush may win
+                // that race, so wait for the durable unread repair as well.
+                chat_store
+                    .flush()
+                    .await
+                    .expect("identity reconciliation flushes");
+                let group_messages = chat_store
+                    .messages(&group.parse::<Jid>().unwrap(), None, 20)
+                    .await
+                    .unwrap();
+                let group_chat = chat_store
+                    .chat(&group.parse::<Jid>().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if group_messages
+                    .iter()
+                    .filter(|message| message.id == "MSG-GROUP-ALIAS")
+                    .count()
+                    == 1
+                    && group_chat.unread_count == 1
+                {
+                    break (group_messages, group_chat);
+                }
+                crate::exec::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .expect("mapping reconciliation completes");
+    assert_eq!(
+        group_messages
+            .iter()
+            .filter(|message| message.id == "MSG-GROUP-ALIAS")
+            .count(),
+        1,
+        "learning a contact alias repairs already stored group copies"
+    );
+    assert_eq!(group_chat.unread_count, 1);
+
+    let after = WhatsAppClient::load_history(&chat_store, &client, &names)
+        .await
+        .expect("history loads after the contact pair");
+    assert_eq!(after.chats.len(), 2);
+    let lid_chat = after.chats.iter().find(|chat| chat.jid == lid).unwrap();
+    assert_eq!(lid_chat.name, "Bia");
+}
+
 /// A cursor is this crate's to write and to read, and the only thing that
 /// makes that safe is that the two agree.
 #[test]
@@ -1888,6 +2304,7 @@ fn a_message_cursor_survives_the_round_trip() {
         message: None,
         status: oxidezap_chat_store::MessageStatus::Delivered,
         revoked: false,
+        local_revoke_placeholder: false,
         edited_at: None,
         starred: false,
         seq: 4242,
@@ -1933,6 +2350,7 @@ fn stored_edit_state_reaches_own_and_peer_bubbles_in_direct_and_group_chats() {
                 starred: false,
                 edited_at: Some(timestamp),
                 revoked: false,
+                local_revoke_placeholder: false,
                 seq: 1,
             };
             let mut plain = stored.clone();
@@ -2009,6 +2427,8 @@ fn a_chat_cursor_keeps_an_address_with_a_colon_in_it() {
         muted_until: None,
         archived: false,
         ephemeral_expiration: None,
+        group_hierarchy: None,
+        group_hierarchy_json: None,
     };
     let token = chat_cursor(&entry);
     assert_eq!(
@@ -2239,6 +2659,7 @@ async fn a_new_connection_advances_the_generation_without_eager_full_pass() {
         known_picture_id: None,
         cache_key: None,
         need_bytes: true,
+        cache_miss: false,
     }]);
     let taken = signal.next().await;
     assert_eq!(taken.generation, before + 1);
@@ -2256,12 +2677,14 @@ async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
             known_picture_id: Some("pic-1".to_string()),
             cache_key: Some("a-1".to_string()),
             need_bytes: false,
+            cache_miss: false,
         },
         oxidezap_core::AvatarDemand {
             jid: "b@s.whatsapp.net".to_string(),
             known_picture_id: None,
             cache_key: None,
             need_bytes: false,
+            cache_miss: false,
         },
     ]);
 
@@ -2271,6 +2694,7 @@ async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
         known_picture_id: None,
         cache_key: None,
         need_bytes: true,
+        cache_miss: true,
     }]);
 
     let taken = signal.next().await;
@@ -2280,6 +2704,7 @@ async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
 
     assert_eq!(demands[0].jid, "a@s.whatsapp.net");
     assert!(demands[0].need_bytes, "upgraded to need_bytes = true");
+    assert!(demands[0].cache_miss, "preserved the explicit cache miss");
     assert_eq!(
         demands[0].known_picture_id, None,
         "cleared known_picture_id"
@@ -2287,4 +2712,204 @@ async fn ensure_coalesces_demands_and_upgrades_need_bytes() {
 
     assert_eq!(demands[1].jid, "b@s.whatsapp.net");
     assert!(!demands[1].need_bytes);
+}
+
+#[tokio::test]
+async fn phone_read_live_replay_does_not_notify_but_new_message_does() {
+    let (chat_store, client) = test_session("read-replay-notification").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    feed(
+        &chat_store,
+        incoming_in(
+            TEST_GROUP,
+            wa::Message::text("old"),
+            "PHONE-READ",
+            1_700_000_100,
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(TEST_GROUP.parse().unwrap())
+                .timestamp(wacore::time::from_secs(1_700_000_110).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    for (id, timestamp, expected_read) in [
+        ("PHONE-READ", 1_700_000_100, true),
+        ("NEW-UNREAD", 1_700_000_200, false),
+    ] {
+        let message = wa::Message::text("text");
+        feed(
+            &chat_store,
+            incoming_in(TEST_GROUP, message.clone(), id, timestamp),
+        )
+        .await;
+        WhatsAppClient::handle_inbound_message(
+            &message,
+            &live_info(TEST_GROUP, TEST_PEER, Some("Example"), id, timestamp),
+            &client,
+            &ui_tx,
+            &book_with(&chat_store),
+            true,
+        )
+        .await;
+        let Ok(oxidezap_core::UiEvent::MessageReceived {
+            message,
+            notification_allowed,
+            ..
+        }) = ui_rx.try_recv()
+        else {
+            panic!("missing message event")
+        };
+        assert_eq!(message.is_read, expected_read);
+        assert_eq!(notification_allowed, !expected_read);
+    }
+}
+
+#[tokio::test]
+async fn offline_replays_keep_phone_read_flags_without_alerting() {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
+    let (chat_store, client) = test_session("offline-read-replay").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    feed(
+        &chat_store,
+        incoming_in(
+            TEST_GROUP,
+            wa::Message::text("old"),
+            "PHONE-READ",
+            1_700_000_100,
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(TEST_GROUP.parse().unwrap())
+                .timestamp(wacore::time::from_secs(1_700_000_110).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    let messages =
+        [("PHONE-READ", 1_700_000_100), ("NEW-UNREAD", 1_700_000_200)].map(|(id, ts)| {
+            InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("text")))
+                .info(Arc::new(live_info(
+                    TEST_GROUP,
+                    TEST_PEER,
+                    Some("Example"),
+                    id,
+                    ts,
+                )))
+                .build()
+        });
+    WhatsAppClient::handle_event(
+        Arc::new(Event::Messages(
+            MessageBatch::builder()
+                .messages(Arc::from(messages))
+                .origin(BatchOrigin::OfflineDrain)
+                .build(),
+        )),
+        client,
+        ui_tx,
+        CallRegistry::default(),
+        Arc::new(book_with(&chat_store)),
+        None,
+        None,
+        None,
+    )
+    .await;
+    for expected_read in [true, false] {
+        let Ok(oxidezap_core::UiEvent::MessageReceived {
+            message,
+            notification_allowed,
+            ..
+        }) = ui_rx.try_recv()
+        else {
+            panic!("missing offline message event");
+        };
+        assert_eq!(message.is_read, expected_read);
+        assert!(!notification_allowed);
+    }
+}
+
+#[tokio::test]
+async fn live_and_reloaded_shared_contacts_show_the_same_details() {
+    use whatsapp_rust::waproto::buffa::MessageField;
+    let (store, client) = test_session("shared-contact-details").await;
+    let proto = wa::Message {
+        contact_message: MessageField::some(wa::message::ContactMessage {
+            display_name: Some("Example Alpha".into()),
+            vcard: Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Example"),
+            proto.clone(),
+            "SHARED-CARD",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let info = live_info(
+        TEST_GROUP,
+        TEST_PEER,
+        Some("Example"),
+        "SHARED-CARD",
+        1_700_000_000,
+    );
+    WhatsAppClient::handle_inbound_message(
+        &proto,
+        &info,
+        &client,
+        &ui_tx,
+        &book_with(&store),
+        false,
+    )
+    .await;
+    let oxidezap_core::UiEvent::MessageReceived { message, .. } = ui_rx.recv().await.unwrap()
+    else {
+        panic!("contact message event");
+    };
+    assert_eq!(message.content, "Example Alpha\n+55 99 0000-0001");
+    let stored = store
+        .message(&TEST_GROUP.parse().unwrap(), "SHARED-CARD")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        super::convert::stored_to_chat_message(stored).content,
+        message.content
+    );
 }

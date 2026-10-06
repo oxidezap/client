@@ -302,6 +302,7 @@ mod tests {
                 chat_jid: "559900000001@s.whatsapp.net".into(),
                 message: Box::new(message),
                 sender_name: None,
+                chat_name: None,
                 notification_allowed: false,
                 notification_title: None,
                 notification_archived: None,
@@ -328,6 +329,7 @@ mod tests {
                 manually_unread: false,
                 last_message: None,
                 pinned_at_ms: None,
+                group_hierarchy: None,
             })),
         })
         .unwrap();

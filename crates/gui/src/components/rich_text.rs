@@ -7,24 +7,20 @@
 //! bubble — and this is the one place that turns the parsed spans into
 //! something GPUI paints.
 //!
-//! Ordinary text takes the cheap path: no markers means no spans, and a plain
-//! string goes straight into a `div` with no highlight vector built and no
-//! second string allocated.
+//! Ordinary text takes the cheap path: no markers means no spans or highlight
+//! vector, and its shared string is drawn directly while still participating
+//! in GPUI's window-scoped text selection.
 
-use std::cell::Cell;
 use std::ops::Range;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, Edges, Element, ElementId, FontStyle, FontWeight,
-    GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString,
-    StrikethroughStyle, StyledText, UnderlineStyle, Window, transparent_black,
+    App, FontStyle, FontWeight, HighlightStyle, IntoElement, SharedString, StrikethroughStyle,
+    StyledText, UnderlineStyle,
 };
-use gpui_base::{TextSelection, TextSelectionRegistration, TextSelectionRun};
 use gpui_component::ActiveTheme as _;
 
+use crate::components::rich_text_selection::SelectableRichText;
 use crate::theme::ActiveProductTheme as _;
 
 use oxidezap_core::{Emphasis, LinkSpan, find_links_in, parse_rich_text};
@@ -100,6 +96,11 @@ impl BubbleText {
         self.text.is_empty()
     }
 
+    /// The parsed text shown in the bubble, with formatting markers removed.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
     /// What each link opens, in link order. The message menu lists these, so
     /// every address has an equivalent activation route beside the inline
     /// pointer one.
@@ -112,20 +113,26 @@ impl BubbleText {
 ///
 /// Returns an element either way: the caller styles size and colour on the
 /// parent, and both paths inherit it.
-pub fn render_rich_text(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
+pub fn render_rich_text(
+    parsed: &BubbleText,
+    selection_key: Arc<str>,
+    document_order: u64,
+    cx: &App,
+) -> impl IntoElement + use<> {
     if !parsed.links.is_empty() {
-        return render_with_links(parsed, cx).into_any_element();
+        return render_with_links(parsed, selection_key, document_order, cx).into_any_element();
     }
     if parsed.runs.is_empty() {
-        // The plain path participates in selection too. Layout and paint are
-        // still delegated to StyledText, so wrapping and inherited styling
-        // remain identical to the old fast path.
+        // Keep the cheap plain-text layout while registering the same visible
+        // text with GPUI's window selection model.
         return SelectableRichText::new(
             "message-text",
             parsed.text.clone(),
             StyledText::new(parsed.text.clone()),
             Vec::new(),
             Arc::default(),
+            selection_key,
+            document_order,
         )
         .into_any_element();
     }
@@ -155,239 +162,10 @@ pub fn render_rich_text(parsed: &BubbleText, cx: &App) -> gpui::AnyElement {
             .with_font_family_overrides(code),
         Vec::new(),
         Arc::default(),
+        selection_key,
+        document_order,
     )
     .into_any_element()
-}
-
-/// A StyledText-backed window selection run.
-///
-/// `gpui_base::SelectableText` accepts only an unformatted string. Message
-/// bubbles need the same window-level selection protocol without splitting a
-/// message into one element per emphasis/link range (which would break inline
-/// wrapping). This adapter keeps one StyledText/layout and supplies its text
-/// to `TextSelectionLayer` as one run.
-struct SelectableRichText {
-    id: ElementId,
-    text: SharedString,
-    styled_text: StyledText,
-    links: Vec<Range<usize>>,
-    link_targets: Arc<[SharedString]>,
-}
-
-impl SelectableRichText {
-    fn new(
-        id: impl Into<ElementId>,
-        text: SharedString,
-        styled_text: StyledText,
-        links: Vec<Range<usize>>,
-        link_targets: Arc<[SharedString]>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            text,
-            styled_text,
-            links,
-            link_targets,
-        }
-    }
-
-    fn paint_selection(
-        layout: &gpui::TextLayout,
-        range: Range<usize>,
-        color: gpui::Hsla,
-        window: &mut Window,
-    ) {
-        let (Some(start), Some(end)) = (
-            layout.position_for_index(range.start),
-            layout.position_for_index(range.end),
-        ) else {
-            return;
-        };
-        for bounds in selection_quad_bounds(start, end, layout.bounds(), layout.line_height()) {
-            window.paint_quad(PaintQuad {
-                bounds,
-                background: color.into(),
-                corner_radii: Corners::default(),
-                border_widths: Edges::default(),
-                border_color: transparent_black(),
-                border_style: BorderStyle::default(),
-            });
-        }
-    }
-}
-
-fn selection_quad_bounds(
-    start: Point<Pixels>,
-    end: Point<Pixels>,
-    bounds: Bounds<Pixels>,
-    line_height: Pixels,
-) -> Vec<Bounds<Pixels>> {
-    if start.y == end.y {
-        return vec![Bounds::from_corners(
-            start,
-            Point::new(end.x, end.y + line_height),
-        )];
-    }
-
-    let mut quads = vec![Bounds::from_corners(
-        start,
-        Point::new(bounds.right(), start.y + line_height),
-    )];
-    if end.y > start.y + line_height {
-        quads.push(Bounds::from_corners(
-            Point::new(bounds.left(), start.y + line_height),
-            Point::new(bounds.right(), end.y),
-        ));
-    }
-    quads.push(Bounds::from_corners(
-        Point::new(bounds.left(), end.y),
-        Point::new(end.x, end.y + line_height),
-    ));
-    quads
-}
-
-impl IntoElement for SelectableRichText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for SelectableRichText {
-    type RequestLayoutState = gpui_base::TextSelectionHandle;
-    type PrepaintState = Hitbox;
-
-    fn id(&self) -> Option<ElementId> {
-        Some(self.id.clone())
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let handle = window.with_element_state(
-            global_id.expect("SelectableRichText must have a stable element id"),
-            |retained: Option<gpui_base::TextSelectionHandle>, _| {
-                let handle = retained
-                    .unwrap_or_else(|| gpui_base::TextSelectionHandle::new(self.text.clone(), cx));
-                handle.set_fallback_copy_text(self.text.to_string(), cx);
-                (handle.clone(), handle)
-            },
-        );
-        let (layout_id, ()) = self
-            .styled_text
-            .request_layout(global_id, inspector_id, window, cx);
-        (layout_id, handle)
-    }
-
-    fn prepaint(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        handle: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        self.styled_text
-            .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
-        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        handle.register(
-            TextSelectionRegistration::new(hitbox.clone(), bounds)
-                .with_document_order(0)
-                .with_text_bounds(vec![bounds]),
-            window,
-            cx,
-        );
-        hitbox
-    }
-
-    fn paint(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        handle: &mut Self::RequestLayoutState,
-        hitbox: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let layout = self.styled_text.layout().clone();
-        let selected_text_before = TextSelection::selected_text(window, cx);
-        let projection = handle.update_runs(
-            &[
-                TextSelectionRun::new(self.text.clone(), layout.clone(), bounds)
-                    .with_document_order(0),
-            ],
-            cx,
-        );
-        if selected_text_before != TextSelection::selected_text(window, cx) {
-            window.refresh();
-        }
-        let color = gpui_base::Theme::global(cx).tokens.colors.selection;
-        for range in projection.ranges().iter().flatten().cloned() {
-            Self::paint_selection(&layout, range, color, window);
-        }
-        self.styled_text.paint(
-            global_id,
-            inspector_id,
-            bounds,
-            &mut (),
-            &mut (),
-            window,
-            cx,
-        );
-
-        if self.links.is_empty() {
-            return;
-        }
-        let links = self.links.clone();
-        let targets = self.link_targets.clone();
-        let text_layout = layout.clone();
-        let link_hitbox = hitbox.clone();
-        let mouse_down_index = Rc::new(Cell::new(None));
-        let down_index = mouse_down_index.clone();
-        let down_layout = text_layout.clone();
-        let down_hitbox = link_hitbox.clone();
-        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _cx| {
-            if !phase.bubble() || event.button != MouseButton::Left {
-                return;
-            }
-            down_index.set(if down_hitbox.is_hovered(window) {
-                down_layout.index_for_position(event.position).ok()
-            } else {
-                None
-            });
-        });
-        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-            if !phase.bubble()
-                || event.button != MouseButton::Left
-                || !link_hitbox.is_hovered(window)
-                || mouse_down_index.replace(None)
-                    != text_layout.index_for_position(event.position).ok()
-                || TextSelection::has_selection(window, cx)
-            {
-                return;
-            }
-            let Ok(index) = text_layout.index_for_position(event.position) else {
-                return;
-            };
-            let Some(link_ix) = links.iter().position(|range| range.contains(&index)) else {
-                return;
-            };
-            TextSelection::end(window, cx);
-            cx.stop_propagation();
-            cx.open_url(&targets[link_ix]);
-        });
-    }
 }
 
 /// One run's appearance.
@@ -412,15 +190,20 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
 /// Message text that holds links, in one inline flow.
 ///
 /// A `StyledText` paints but answers no clicks, so the addresses ride along
-/// as clickable ranges on the selection adapter instead of becoming elements
-/// of their own. Nothing is split into flex children, so a newline before an
-/// address starts a line the way it does without one, and a long address
+/// as clickable ranges on the selection-aware inline element instead of
+/// becoming elements of their own. Nothing is split into flex children, so a
+/// newline before an address starts a line the way it does without one, and a long address
 /// wraps the way plain text does rather than overflowing its item into the
 /// bubble's `overflow_hidden`. Clicks open the target through `cx.open_url`,
 /// which is why this needs no platform split of its own: GPUI answers that
 /// on the desktop and in the page alike. Size and colour are inherited from
 /// the parent; only the link ink comes from the theme.
-fn render_with_links(parsed: &BubbleText, cx: &App) -> SelectableRichText {
+fn render_with_links(
+    parsed: &BubbleText,
+    selection_key: Arc<str>,
+    document_order: u64,
+    cx: &App,
+) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
     let ink = cx.theme().link;
     let mono = cx.theme().mono_font_family.clone();
@@ -485,10 +268,17 @@ fn render_with_links(parsed: &BubbleText, cx: &App) -> SelectableRichText {
     // A refcount per frame, not a copy per target: the strings were shared
     // when the bubble was parsed.
     let targets = parsed.link_targets.clone();
-    // One instance per bubble, scoped under the row's own id. The adapter
-    // keeps the complete StyledText flow while TextSelectionLayer handles
-    // drag selection over it.
-    SelectableRichText::new("message-text", text, styled, ranges, targets)
+    // The single formatted layout remains intact for wrapping and selection;
+    // the adapter dispatches a click only when the pointer did not drag.
+    SelectableRichText::new(
+        "message-text",
+        text,
+        styled,
+        ranges,
+        targets,
+        selection_key,
+        document_order,
+    )
 }
 
 /// One run's appearance inside a link: its own emphasis, inked and underlined
@@ -512,9 +302,17 @@ fn link_style(
 
 #[cfg(test)]
 mod tests {
-    use gpui::{ParentElement as _, Styled as _};
+    use std::sync::Arc;
 
-    use super::BubbleText;
+    use gpui::{
+        AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement, Modifiers,
+        MouseButton, ParentElement as _, Render, Styled as _, TestAppContext, Window, div, point,
+        px,
+    };
+
+    use gpui::prelude::FluentBuilder as _;
+
+    use super::{BubbleText, render_rich_text};
 
     /// Links are resolved where the rows are built, beside the markup — so a
     /// frame hands out ranges rather than scanning the peer's text again.
@@ -678,76 +476,312 @@ mod tests {
         assert_eq!(targets[1].as_str(), parsed.links[1].target.as_str());
     }
 
-    struct SelectableRichTextTestView {
+    struct TextSelectionTestView {
         source: &'static str,
+        selection_key: Arc<str>,
+        focus_handle: FocusHandle,
+        show_text: bool,
     }
 
-    impl gpui::Render for SelectableRichTextTestView {
-        fn render(
-            &mut self,
-            _: &mut gpui::Window,
-            cx: &mut gpui::Context<Self>,
-        ) -> impl gpui::IntoElement {
-            let parsed = BubbleText::of(self.source);
-            gpui::div()
+    impl Render for TextSelectionTestView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let text = BubbleText::of(self.source);
+            div()
+                .track_focus(&self.focus_handle)
                 .size_full()
-                .child(gpui_base::TextSelectionLayer)
                 .child(
-                    gpui::div()
-                        .w(gpui::px(240.))
-                        .h(gpui::px(32.))
-                        .child(super::render_rich_text(&parsed, cx)),
+                    div()
+                        .absolute()
+                        .size_0()
+                        .child(crate::components::rich_text_selection::RetainedSelectionKeepalive),
                 )
+                .when(self.show_text, |el| {
+                    el.child(
+                        div()
+                            .id("message-row")
+                            .w(px(400.))
+                            .h(px(40.))
+                            .child(render_rich_text(&text, self.selection_key.clone(), 0, cx)),
+                    )
+                })
         }
     }
 
-    fn selected_prefix(source: &'static str, cx: &mut gpui::TestAppContext) -> String {
+    fn drag_text(
+        source: &'static str,
+        start_x: f32,
+        end_x: f32,
+        cx: &mut TestAppContext,
+    ) -> (String, Option<gpui::ClipboardItem>, Option<String>) {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
         });
-        let (_, cx) = cx.add_window_view(|_, _| SelectableRichTextTestView { source });
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
+        let selected = {
+            let mut focus_handle = None;
+            let (_, visual) = cx.add_window_view(|window, cx| {
+                let view = cx.new(|cx| {
+                    let handle = cx.focus_handle();
+                    focus_handle = Some(handle.clone());
+                    TextSelectionTestView {
+                        source,
+                        selection_key: Arc::from("test-message"),
+                        focus_handle: handle,
+                        show_text: true,
+                    }
+                });
+                gpui_component::Root::new(view, window, cx)
+            });
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                focus_handle.as_ref().unwrap().focus(window, cx);
+            });
+            visual.simulate_mouse_down(
+                point(px(start_x), px(12.)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+            visual.simulate_mouse_move(
+                point(px(end_x), px(12.)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            visual.simulate_mouse_up(
+                point(px(end_x), px(12.)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+            let selected = visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            });
+            visual.dispatch_action(gpui_component::input::Copy);
+            selected
+        };
+        (selected, cx.read_from_clipboard(), cx.opened_url())
+    }
 
-        cx.simulate_mouse_down(
-            gpui::point(gpui::px(1.), gpui::px(12.)),
-            gpui::MouseButton::Left,
-            gpui::Modifiers::default(),
-        );
-        cx.simulate_mouse_move(
-            gpui::point(gpui::px(58.), gpui::px(12.)),
-            Some(gpui::MouseButton::Left),
-            gpui::Modifiers::default(),
-        );
-        cx.simulate_mouse_up(
-            gpui::point(gpui::px(58.), gpui::px(12.)),
-            gpui::MouseButton::Left,
-            gpui::Modifiers::default(),
-        );
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-            gpui_base::TextSelection::selected_text(window, cx)
+    fn click_text(source: &'static str, x: f32, cx: &mut TestAppContext) -> Option<String> {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        {
+            let mut focus_handle = None;
+            let (_, visual) = cx.add_window_view(|window, cx| {
+                let view = cx.new(|cx| {
+                    let handle = cx.focus_handle();
+                    focus_handle = Some(handle.clone());
+                    TextSelectionTestView {
+                        source,
+                        selection_key: Arc::from("test-message"),
+                        focus_handle: handle,
+                        show_text: true,
+                    }
+                });
+                gpui_component::Root::new(view, window, cx)
+            });
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                focus_handle.as_ref().unwrap().focus(window, cx);
+            });
+            visual.simulate_mouse_down(
+                point(px(x), px(12.)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+            visual.simulate_mouse_move(
+                point(px(x + 1.), px(12.)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            // The press requests a repaint; link activation must survive the
+            // fresh element built before release and tolerate one-pixel jitter.
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.simulate_mouse_up(
+                point(px(x), px(12.)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+        }
+        cx.opened_url()
+    }
+
+    fn drag_link_away_and_back(cx: &mut TestAppContext) -> Option<String> {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        {
+            let mut focus_handle = None;
+            let (_, visual) = cx.add_window_view(|window, cx| {
+                let view = cx.new(|cx| {
+                    let handle = cx.focus_handle();
+                    focus_handle = Some(handle.clone());
+                    TextSelectionTestView {
+                        source: "alpha https://example.invalid",
+                        selection_key: Arc::from("test-message"),
+                        focus_handle: handle,
+                        show_text: true,
+                    }
+                });
+                gpui_component::Root::new(view, window, cx)
+            });
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                focus_handle.as_ref().unwrap().focus(window, cx);
+            });
+            visual.simulate_mouse_down(
+                point(px(80.), px(12.)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+            visual.simulate_mouse_move(
+                point(px(105.), px(12.)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            visual.simulate_mouse_move(
+                point(px(80.), px(12.)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            visual.simulate_mouse_up(
+                point(px(80.), px(12.)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+        }
+        cx.opened_url()
+    }
+
+    fn clipboard_text(item: Option<gpui::ClipboardItem>) -> Option<String> {
+        item?.entries.into_iter().find_map(|entry| match entry {
+            gpui::ClipboardEntry::String(text) => Some(text.text),
+            _ => None,
         })
     }
 
     #[gpui::test]
-    fn rich_text_selection_copies_a_substring(cx: &mut gpui::TestAppContext) {
-        assert_eq!(selected_prefix("alpha beta", cx), "alpha ");
-    }
-
-    #[gpui::test]
-    fn formatted_selection_copies_visible_text_without_markup(cx: &mut gpui::TestAppContext) {
-        let selected = selected_prefix("*alpha* beta", cx);
-        assert!(selected.starts_with("alpha"), "selected {selected:?}");
-        assert!(!selected.contains('*'), "selected {selected:?}");
-    }
-
-    #[gpui::test]
-    fn linked_message_allows_selection_without_opening_link(cx: &mut gpui::TestAppContext) {
-        let selected = selected_prefix("alpha https://example.invalid", cx);
+    fn plain_message_text_can_be_partially_selected_and_copied(cx: &mut TestAppContext) {
+        let (selected, clipboard, _) = drag_text("alpha beta", 1., 58., cx);
         assert_eq!(selected, "alpha ");
+        // GPUI's root copy action trims the selection's outer whitespace.
+        assert_eq!(clipboard_text(clipboard).as_deref(), Some("alpha"));
+    }
+
+    #[gpui::test]
+    fn selected_text_survives_a_virtualized_row_remount(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut focus_handle = None;
+        let mut selection_view = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                TextSelectionTestView {
+                    source: "alpha beta",
+                    selection_key: Arc::from("test-message"),
+                    focus_handle: handle,
+                    show_text: true,
+                }
+            });
+            selection_view = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            point(px(1.), px(12.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            point(px(58.), px(12.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            point(px(58.), px(12.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+
+        visual.update(|window, cx| {
+            selection_view.as_ref().unwrap().update(cx, |view, cx| {
+                view.show_text = false;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+        visual.update(|window, cx| {
+            selection_view.as_ref().unwrap().update(cx, |view, cx| {
+                view.show_text = true;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+    }
+
+    #[gpui::test]
+    fn formatted_message_selection_copies_visible_text_without_markers(cx: &mut TestAppContext) {
+        let (selected, clipboard, _) = drag_text("*alpha* beta", 1., 58., cx);
+        assert_eq!(selected, "alpha ");
+        assert_eq!(clipboard_text(clipboard).as_deref(), Some("alpha"));
+    }
+
+    #[gpui::test]
+    fn message_selection_preserves_unicode_boundaries(cx: &mut TestAppContext) {
+        let source = "café 😀 e\u{301}";
+        let (selected, clipboard, _) = drag_text(source, 1., 380., cx);
+        assert_eq!(selected, source);
+        assert_eq!(clipboard_text(clipboard).as_deref(), Some(source));
+    }
+
+    #[gpui::test]
+    fn dragging_over_a_link_selects_text_instead_of_opening_it(cx: &mut TestAppContext) {
+        let (selected, _, opened_url) = drag_text("alpha https://example.invalid", 1., 90., cx);
+        assert!(!selected.is_empty());
+        assert_eq!(opened_url, None);
+    }
+
+    #[gpui::test]
+    fn clicking_a_message_link_still_opens_it(cx: &mut TestAppContext) {
+        assert_eq!(
+            click_text("alpha https://example.invalid", 80., cx).as_deref(),
+            Some("https://example.invalid")
+        );
+    }
+
+    #[gpui::test]
+    fn dragging_a_link_away_and_back_does_not_open_it(cx: &mut TestAppContext) {
+        assert_eq!(drag_link_away_and_back(cx), None);
     }
 
     /// A stopwatch rather than an assertion: what a conversation pays to

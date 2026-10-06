@@ -11,14 +11,24 @@
 //! them where the user keeps things — and return a description of where they
 //! went, because on one of the two there is no path to report.
 
+/// Where the requested download went. The browser owns its destination and
+/// does not disclose a local path to the page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadOutcome {
+    NativeFile(std::path::PathBuf),
+    #[cfg_attr(
+        not(target_family = "wasm"),
+        expect(dead_code, reason = "constructed by the browser implementation")
+    )]
+    BrowserDownloadRequested(String),
+}
+
 /// Save these bytes under this name.
-///
-/// Returns where they landed, in words, for the line that says so.
 ///
 /// # Errors
 ///
 /// Nowhere to write, or writing failed.
-pub fn save(file_name: &str, data: &[u8]) -> Result<String, String> {
+pub fn save(file_name: &str, data: &[u8]) -> Result<DownloadOutcome, String> {
     imp::save(file_name, data)
 }
 
@@ -31,6 +41,9 @@ pub fn save(file_name: &str, data: &[u8]) -> Result<String, String> {
 /// carrying a `cfg` of their own.
 pub const SAVES_OFF_THREAD: bool = cfg!(not(target_family = "wasm"));
 
+/// Whether this platform can act on a returned local path.
+pub const SUPPORTS_SAVED_FILE_ACTIONS: bool = cfg!(not(target_family = "wasm"));
+
 #[cfg(not(target_family = "wasm"))]
 mod imp {
     use std::io::Write as _;
@@ -41,9 +54,9 @@ mod imp {
     /// `$XDG_DOWNLOAD_DIR`, then `$HOME` or `%USERPROFILE%` + `/Downloads`,
     /// then the working directory — the same fallback chain the database
     /// uses when no home is known.
-    pub(super) fn save(file_name: &str, data: &[u8]) -> Result<String, String> {
+    pub(super) fn save(file_name: &str, data: &[u8]) -> Result<super::DownloadOutcome, String> {
         write(file_name, data)
-            .map(|path| path.display().to_string())
+            .map(super::DownloadOutcome::NativeFile)
             .map_err(|e| e.to_string())
     }
 
@@ -100,8 +113,15 @@ mod imp {
                     .map(|home| home.join("Downloads"))
             })
             .unwrap_or_else(|| PathBuf::from("."));
-        std::fs::create_dir_all(&dir)?;
+        write_in(&dir, file_name, data)
+    }
 
+    pub(super) fn write_in(
+        dir: &std::path::Path,
+        file_name: &str,
+        data: &[u8],
+    ) -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(dir)?;
         let name = safe_name(file_name);
 
         // create_new + " (n)" suffixing so a download never clobbers an
@@ -142,7 +162,17 @@ mod imp {
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::imp::safe_name;
+    use super::imp::{safe_name, write_in};
+    use portable_atomic::{AtomicU64, Ordering};
+
+    fn scratch() -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "oxidezap-download-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     /// The name comes off the wire. A sender who names a file
     /// `../../.ssh/authorized_keys` must not reach outside the directory it
@@ -176,6 +206,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn regression_193_collision_returns_the_actual_suffixed_path_without_overwrite() {
+        let dir = scratch();
+        let first = write_in(&dir, "report.pdf", b"original").unwrap();
+        let second = write_in(&dir, "report.pdf", b"downloaded").unwrap();
+        assert_eq!(first, dir.join("report.pdf"));
+        assert_eq!(second, dir.join("report (1).pdf"));
+        assert_eq!(std::fs::read(first).unwrap(), b"original");
+        assert_eq!(std::fs::read(second).unwrap(), b"downloaded");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regression_193_hostile_unicode_filename_is_sanitized_before_returning_path() {
+        let dir = scratch();
+        let path = write_in(&dir, "../café:report.txt", b"data").unwrap();
+        assert_eq!(path, dir.join(".._café_report.txt"));
+        assert_eq!(std::fs::read(path).unwrap(), b"data");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Windows resolves these to devices whatever the extension, so a save
     /// under one would not be a save at all.
     #[test]
@@ -206,7 +257,7 @@ mod imp {
     /// browser to its own blob and loses often enough to land a zero-byte
     /// file. The timer is the whole fix, and a leaked URL costs one blob until
     /// the tab goes.
-    pub(super) fn save(file_name: &str, data: &[u8]) -> Result<String, String> {
+    pub(super) fn save(file_name: &str, data: &[u8]) -> Result<super::DownloadOutcome, String> {
         let window = web_sys::window().ok_or("no window to save from")?;
         let document = window.document().ok_or("no document to save from")?;
         // Before the blob, because a failure after one is a blob the browser
@@ -260,7 +311,9 @@ mod imp {
             );
         }
 
-        Ok(format!("{file_name} (your browser's downloads)"))
+        Ok(super::DownloadOutcome::BrowserDownloadRequested(format!(
+            "{file_name} (your browser's downloads)"
+        )))
     }
 
     /// Drop the object URL once the browser has had time to read it.

@@ -4,13 +4,6 @@ use super::*;
 use gpui_component::ActiveTheme as _;
 use gpui_component::FocusTrapElement as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Textarea, TextareaState};
-
-pub(super) struct EditDraft {
-    pub jid: String,
-    pub message_id: String,
-    pub input: Entity<TextareaState>,
-}
 
 /// A deletion choice captured from one message's context menu. The request is
 /// not made until the user confirms this exact target and scope.
@@ -23,14 +16,6 @@ pub(super) struct DeleteConfirmation {
     pub message_time: String,
 }
 
-pub(crate) fn can_edit_sent(message: &ChatMessage, now_ms: i64) -> bool {
-    can_delete_sent(message, false, now_ms)
-        && message.media.is_none()
-        && message.system.is_none()
-        && !message.content.trim().is_empty()
-        && now_ms.saturating_sub(message.timestamp.timestamp_millis()) <= 15 * 60 * 1_000
-}
-
 pub(crate) fn can_delete_sent(message: &ChatMessage, for_everyone: bool, now_ms: i64) -> bool {
     message.is_from_me
         && !message.revoked
@@ -41,167 +26,7 @@ pub(crate) fn can_delete_sent(message: &ChatMessage, for_everyone: bool, now_ms:
                 <= 2 * 24 * 60 * 60 * 1_000)
 }
 
-/// Apply only the daemon-acknowledged edit to the addressed own row.
-fn apply_accepted_edit(chat: &mut Chat, message_id: &str, text: &str) {
-    let newest = chat
-        .messages
-        .last()
-        .is_some_and(|message| message.id == message_id);
-    if let Some(message) = chat
-        .messages
-        .iter_mut()
-        .find(|message| message.id == message_id && message.is_from_me)
-    {
-        message.content = text.to_owned();
-        message.edited = true;
-        if newest {
-            chat.last_message = Some(text.to_owned());
-        }
-    }
-}
-
 impl WhatsAppApp {
-    pub(super) fn begin_message_edit(
-        &mut self,
-        jid: &str,
-        message_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.delete_confirmation.is_some() {
-            return;
-        }
-        let Some(message) = self
-            .find_chat(jid)
-            .filter(|_| self.selected_chat.as_deref() == Some(jid))
-            .and_then(|chat| {
-                chat.messages
-                    .iter()
-                    .find(|message| message.id == message_id)
-            })
-        else {
-            return;
-        };
-        if !self.can_send()
-            || !can_edit_sent(message, wacore::time::now_millis())
-            || self
-                .pending_message_actions
-                .contains(&(jid.to_owned(), message_id.to_owned()))
-        {
-            self.notify_user(
-                "This message can no longer be edited.",
-                notices::Tone::Problem,
-                cx,
-            );
-            return;
-        }
-        let text = message.content.clone();
-        let input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, 5)
-                .placeholder("Edit message")
-        });
-        input.update(cx, |input, cx| input.set_value(&text, window, cx));
-        let focus = input.read(cx).focus_handle(cx);
-        self.edit_draft = Some(EditDraft {
-            jid: jid.to_owned(),
-            message_id: message_id.to_owned(),
-            input,
-        });
-        window.focus(&focus, cx);
-        cx.notify();
-    }
-
-    pub(super) fn cancel_message_edit(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.edit_draft.take().is_some() {
-            cx.notify();
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(super) fn save_message_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(draft) = self.edit_draft.as_ref() else {
-            return;
-        };
-        let text = draft.input.read(cx).text().to_string();
-        if text.trim().is_empty() {
-            self.notify_user(
-                "An edited message cannot be empty.",
-                notices::Tone::Problem,
-                cx,
-            );
-            return;
-        }
-        let jid = draft.jid.clone();
-        let message_id = draft.message_id.clone();
-        let key = (jid.clone(), message_id.clone());
-        if self.pending_message_actions.contains(&key) {
-            return;
-        }
-        let eligible = self
-            .find_chat(&jid)
-            .and_then(|chat| {
-                chat.messages
-                    .iter()
-                    .find(|message| message.id == message_id)
-            })
-            .is_some_and(|message| can_edit_sent(message, wacore::time::now_millis()));
-        if !self.can_send() || !eligible {
-            self.notify_user(
-                "This message can no longer be edited.",
-                notices::Tone::Problem,
-                cx,
-            );
-            return;
-        }
-        self.pending_message_actions.insert(key.clone());
-        let Some(client) = self.client.as_ref() else {
-            self.pending_message_actions.remove(&key);
-            self.notify_user(
-                "Could not edit message: the daemon is unavailable.",
-                notices::Tone::Problem,
-                cx,
-            );
-            return;
-        };
-        let answer = client.edit_message(jid, message_id, text.clone());
-        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let result = answer.await;
-            let _ =
-                entity.update(cx, |app, cx| {
-                    app.pending_message_actions.remove(&key);
-                    match result {
-                        Ok(Ok(())) => {
-                            if let Some(chat) = app.find_chat_mut(&key.0) {
-                                apply_accepted_edit(chat, &key.1, &text);
-                            }
-                            app.invalidate_message_cache(&key.0, cx);
-                            app.invalidate_chat_cache();
-                            if app.edit_draft.as_ref().is_some_and(|draft| {
-                                draft.jid == key.0 && draft.message_id == key.1
-                            }) {
-                                app.edit_draft = None;
-                            }
-                            cx.notify();
-                        }
-                        Ok(Err(failure)) => app.notify_user(
-                            what_went_wrong("Could not edit message", &failure),
-                            notices::Tone::Problem,
-                            cx,
-                        ),
-                        Err(_) => app.notify_user(
-                            "Could not edit message: the daemon connection ended.",
-                            notices::Tone::Problem,
-                            cx,
-                        ),
-                    }
-                });
-        })
-        .detach();
-    }
-
     pub(super) fn delete_sent_message(
         &mut self,
         jid: &str,
@@ -210,7 +35,7 @@ impl WhatsAppApp {
         cx: &mut Context<Self>,
     ) {
         let key = (jid.to_owned(), message_id.to_owned());
-        if self.pending_message_actions.contains(&key) {
+        if self.pending_message_actions.contains(&key) || self.pending_edits.contains(&key) {
             return;
         }
         let eligible = self
@@ -236,6 +61,7 @@ impl WhatsAppApp {
         self.delete_attempts
             .push((jid.to_owned(), message_id.to_owned(), for_everyone));
         self.pending_message_actions.insert(key.clone());
+        let generation = self.edit_generation;
         let Some(client) = self.client.as_ref() else {
             self.pending_message_actions.remove(&key);
             self.notify_user(
@@ -249,6 +75,9 @@ impl WhatsAppApp {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let result = answer.await;
             let _ = entity.update(cx, |app, cx| {
+                if app.edit_generation != generation {
+                    return;
+                }
                 app.pending_message_actions.remove(&key);
                 match result {
                     Ok(Ok(())) => {
@@ -320,6 +149,9 @@ impl WhatsAppApp {
             || !can_delete_sent(message, for_everyone, wacore::time::now_millis())
             || self
                 .pending_message_actions
+                .contains(&(jid.to_owned(), message_id.to_owned()))
+            || self
+                .pending_edits
                 .contains(&(jid.to_owned(), message_id.to_owned()))
         {
             self.notify_user(
@@ -472,76 +304,6 @@ pub(super) fn render_message_delete(
         .focus_trap("message-delete-trap", focus)
 }
 
-pub(super) fn render_message_edit(
-    draft: &EditDraft,
-    app: Entity<WhatsAppApp>,
-    cx: &App,
-) -> impl IntoElement + use<> {
-    let metrics = cx.product().metrics;
-    let input = draft.input.clone();
-    let focus = input.read(cx).focus_handle(cx);
-    let cancel = app.clone();
-    div()
-        .id("message-edit-modal")
-        .debug_selector(|| "message-edit-modal".into())
-        .track_focus(&focus)
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .p(metrics.space_xxl())
-        .bg(crate::components::parts::scrim(cx).opacity(0.92))
-        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(
-            div()
-                .w_full()
-                .max_w(metrics.bubble_max_width())
-                .p(metrics.space_xxl())
-                .rounded(metrics.radius_lg())
-                .bg(cx.theme().background)
-                .flex()
-                .flex_col()
-                .gap(metrics.space_lg())
-                .child("Edit message")
-                .child(Textarea::new(&input).w_full())
-                .child(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .gap(metrics.space_md())
-                        .child(
-                            div()
-                                .id("message-edit-cancel")
-                                .debug_selector(|| "message-edit-cancel".into())
-                                .child(
-                                    Button::new("message-edit-cancel-button")
-                                        .label("Cancel")
-                                        .on_click(move |_, _, cx| {
-                                            cancel.update(cx, |app, cx| {
-                                                app.cancel_message_edit(cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("message-edit-save")
-                                .debug_selector(|| "message-edit-save".into())
-                                .child(
-                                    Button::new("message-edit-save-button")
-                                        .label("Save")
-                                        .primary()
-                                        .on_click(move |_, _, cx| {
-                                            app.update(cx, |app, cx| app.save_message_edit(cx));
-                                        }),
-                                ),
-                        ),
-                ),
-        )
-        .focus_trap("message-edit-trap", &focus)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,96 +363,6 @@ mod tests {
         message.timestamp = chrono::Utc.timestamp_millis_opt(now_ms).unwrap();
         message.status = MessageStatus::Sent;
         message
-    }
-
-    #[test]
-    fn edit_and_delete_windows_are_independent() {
-        let now = 1_700_000_000_000;
-        let mut message = sent(now - 14 * 60 * 1_000);
-        assert!(can_edit_sent(&message, now));
-        assert!(can_delete_sent(&message, true, now));
-        message.timestamp = chrono::Utc
-            .timestamp_millis_opt(now - 16 * 60 * 1_000)
-            .unwrap();
-        assert!(!can_edit_sent(&message, now));
-        assert!(can_delete_sent(&message, true, now));
-        message.timestamp = chrono::Utc
-            .timestamp_millis_opt(now - 3 * 24 * 60 * 60 * 1_000)
-            .unwrap();
-        assert!(!can_delete_sent(&message, true, now));
-        assert!(can_delete_sent(&message, false, now));
-    }
-
-    #[test]
-    fn unsent_incoming_media_and_revoked_messages_are_ineligible() {
-        let now = 1_700_000_000_000;
-        let mut message = sent(now);
-        message.status = MessageStatus::Pending;
-        assert!(!can_edit_sent(&message, now));
-        message.status = MessageStatus::Sent;
-        message.is_from_me = false;
-        assert!(!can_delete_sent(&message, false, now));
-        message.is_from_me = true;
-        message.revoked = true;
-        assert!(!can_delete_sent(&message, false, now));
-    }
-
-    #[test]
-    fn accepted_edit_marks_only_the_addressed_own_message_in_direct_or_group_chat() {
-        for jid in ["peer@example.invalid", "120363000000000001@g.us"] {
-            let now = 1_700_000_000_000;
-            let mut chat = Chat::new(jid.into());
-            chat.add_message(sent(now));
-            let mut other = sent(now);
-            other.id = "SENT-2".into();
-            chat.add_message(other);
-            chat.add_message(ChatMessage::new_incoming(
-                "PEER-1".into(),
-                "peer@example.invalid".into(),
-                "peer text".into(),
-            ));
-            apply_accepted_edit(&mut chat, "SENT-1", "corrected");
-            assert_eq!(
-                chat.messages
-                    .iter()
-                    .find(|m| m.id == "SENT-1")
-                    .unwrap()
-                    .content,
-                "corrected"
-            );
-            assert!(
-                chat.messages
-                    .iter()
-                    .find(|m| m.id == "SENT-1")
-                    .unwrap()
-                    .edited
-            );
-            assert!(
-                !chat
-                    .messages
-                    .iter()
-                    .find(|m| m.id == "SENT-2")
-                    .unwrap()
-                    .edited
-            );
-            assert!(
-                !chat
-                    .messages
-                    .iter()
-                    .find(|m| m.id == "PEER-1")
-                    .unwrap()
-                    .edited
-            );
-            apply_accepted_edit(&mut chat, "PEER-1", "must not change");
-            assert_eq!(
-                chat.messages
-                    .iter()
-                    .find(|m| m.id == "PEER-1")
-                    .unwrap()
-                    .content,
-                "peer text"
-            );
-        }
     }
 
     #[gpui::test]
@@ -876,94 +548,6 @@ mod tests {
                     "second message"
                 );
             });
-        });
-    }
-
-    #[gpui::test]
-    fn edit_modal_cancel_keeps_the_composer_draft(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            crate::theme::init(cx);
-            init_app_bindings(cx);
-        });
-        let mut app_entity = None;
-        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
-            let app = cx.new(|cx| {
-                let mut app = WhatsAppApp::new(cx);
-                app.app_state = AppState::Connected;
-                app.destination = Destination::Chats;
-                let mut chat = Chat::new("peer@example.invalid".into());
-                chat.add_message(sent(wacore::time::now_millis()));
-                app.chats.push(Arc::new(chat));
-                app
-            });
-            app_entity = Some(app.clone());
-            gpui_component::Root::new(app, window, cx)
-        });
-        let app = app_entity.unwrap();
-        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-            app.update(cx, |app, cx| {
-                app.select_chat(
-                    "peer@example.invalid".into(),
-                    ChatOpen::ToCompose,
-                    window,
-                    cx,
-                );
-                app.input_area.as_ref().unwrap().update(cx, |input, cx| {
-                    input.swap_text("unsent composer draft", window, cx);
-                });
-                app.begin_message_edit("peer@example.invalid", "SENT-1", window, cx);
-            });
-        });
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("message-edit-modal").is_some());
-        assert!(cx.debug_bounds("message-edit-save").is_some());
-        let cancel = cx.debug_bounds("message-edit-cancel").unwrap();
-        cx.simulate_click(cancel.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-        cx.read(|cx| assert!(app.read(cx).edit_draft.is_none()));
-        cx.read(|cx| {
-            assert!(
-                !app.read(cx)
-                    .find_chat("peer@example.invalid")
-                    .unwrap()
-                    .messages[0]
-                    .edited
-            );
-        });
-        cx.update(|window, cx| {
-            let composer = app.read(cx).input_area.as_ref().unwrap().clone();
-            let draft = composer.update(cx, |input, cx| {
-                input.swap_text("unsent composer draft", window, cx)
-            });
-            assert_eq!(draft, "unsent composer draft");
-        });
-
-        // A rejected Save must keep the edit visible and must not claim that
-        // the replacement reached the server. This fixture has no daemon.
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.begin_message_edit("peer@example.invalid", "SENT-1", window, cx);
-            });
-            let input = app.read(cx).edit_draft.as_ref().unwrap().input.clone();
-            input.update(cx, |input, cx| input.set_value("replacement", window, cx));
-            window.draw(cx).clear(cx);
-        });
-        let save = cx.debug_bounds("message-edit-save").unwrap();
-        cx.simulate_click(save.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-        cx.read(|cx| {
-            let app = app.read(cx);
-            assert!(app.edit_draft.is_some());
-            assert_eq!(
-                app.find_chat("peer@example.invalid").unwrap().messages[0].content,
-                "hello"
-            );
-            assert!(!app.find_chat("peer@example.invalid").unwrap().messages[0].edited);
         });
     }
 }

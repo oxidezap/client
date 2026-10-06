@@ -22,23 +22,65 @@ pub(super) fn refresh_preview_if_latest(
     preview: Option<&str>,
     kind: Option<&str>,
 ) -> QueryResult<bool> {
+    refresh_preview(
+        conn,
+        device_id,
+        chat,
+        LatestTarget::MessageId(msg_id),
+        preview,
+        kind,
+    )
+}
+
+/// Refresh only when this stable row, including its author, is the newest.
+pub(super) fn refresh_preview_if_latest_row(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    row_id: i64,
+    preview: Option<&str>,
+    kind: Option<&str>,
+) -> QueryResult<bool> {
+    refresh_preview(
+        conn,
+        device_id,
+        chat,
+        LatestTarget::RowId(row_id),
+        preview,
+        kind,
+    )
+}
+
+enum LatestTarget<'a> {
+    MessageId(&'a str),
+    RowId(i64),
+}
+
+fn refresh_preview(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    target: LatestTarget<'_>,
+    preview: Option<&str>,
+    kind: Option<&str>,
+) -> QueryResult<bool> {
     use schema::messages::dsl;
-    // Both halves of the pair, which is what `messages()` reads. Parity of
-    // order is not parity of rows: with a split still standing, the newest row
-    // of the union can sit under the key this write does not look at, and the
-    // preview then names a message the conversation does not end with.
     let keys = crate::lid::chat_key_candidates(conn, device_id, chat)?;
-    let newest: Option<String> = dsl::messages
+    let newest: Option<(i64, String)> = dsl::messages
         .filter(
             dsl::device_id
                 .eq(device_id)
                 .and(dsl::chat_jid.eq_any(&keys)),
         )
         .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
-        .select(dsl::msg_id)
+        .select((dsl::id, dsl::msg_id))
         .first(conn)
         .optional()?;
-    if newest.as_deref() != Some(msg_id) {
+    let matches = newest.is_some_and(|(row_id, msg_id)| match target {
+        LatestTarget::MessageId(id) => msg_id == id,
+        LatestTarget::RowId(id) => row_id == id,
+    });
+    if !matches {
         return Ok(false);
     }
     diesel::update(chat_row(device_id, chat))
@@ -179,6 +221,27 @@ pub(super) fn bump_chat(
     chat: &str,
     bump: ChatBump<'_>,
 ) -> QueryResult<()> {
+    let target = LatestTarget::MessageId(bump.msg_id);
+    bump_chat_target(conn, device_id, chat, bump, target)
+}
+
+pub(super) fn bump_chat_row(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    bump: ChatBump<'_>,
+    row_id: i64,
+) -> QueryResult<()> {
+    bump_chat_target(conn, device_id, chat, bump, LatestTarget::RowId(row_id))
+}
+
+fn bump_chat_target(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    bump: ChatBump<'_>,
+    target: LatestTarget<'_>,
+) -> QueryResult<()> {
     use schema::chats::dsl;
     ensure_chat(conn, device_id, chat)?;
     // Ordering timestamp is monotonic on its own...
@@ -189,7 +252,7 @@ pub(super) fn bump_chat(
     // (timestamp_ms, id): a same-millisecond sibling applied later must
     // not win. Not msg_id, which is what the `message_arrival_order`
     // migration removed for biasing the tie towards a `3EB0` prefix.
-    refresh_preview_if_latest(conn, device_id, chat, bump.msg_id, bump.preview, bump.kind)?;
+    refresh_preview(conn, device_id, chat, target, bump.preview, bump.kind)?;
     if bump.unread_delta != 0 {
         // An old row materialized late (offline drain) that a read already
         // covered must not badge.
@@ -241,6 +304,8 @@ pub(crate) fn merge_chat_metadata(
         Option<String>,
         bool,
         bool,
+        bool,
+        Option<String>,
     );
     let prefs = |conn: &mut SqliteConnection, key: &str| -> QueryResult<Option<PrefRow>> {
         chat_row(device_id, key)
@@ -254,6 +319,8 @@ pub(crate) fn merge_chat_metadata(
                 dsl::name,
                 dsl::mute_appstate_seen,
                 dsl::archive_appstate_seen,
+                dsl::name_from_address_book,
+                dsl::address_book_fallback,
             ))
             .first(conn)
             .optional()
@@ -263,8 +330,9 @@ pub(crate) fn merge_chat_metadata(
     };
     let src_state = read_state(conn, device_id, src)?;
     ensure_chat(conn, device_id, dest)?;
-    let dest_row =
-        prefs(conn, dest)?.unwrap_or((0, 0, None, None, false, None, None, false, false));
+    let dest_row = prefs(conn, dest)?.unwrap_or((
+        0, 0, None, None, false, None, None, false, false, false, None,
+    ));
     let dest_state = read_state(conn, device_id, dest)?;
 
     let mut merged = ReadState {
@@ -303,6 +371,11 @@ pub(crate) fn merge_chat_metadata(
     } else {
         dest_row.4 || src_row.4
     };
+    let (name, name_from_address_book, address_book_fallback) = if dest_row.6.is_some() {
+        (dest_row.6.clone(), dest_row.9, dest_row.10.clone())
+    } else {
+        (src_row.6.clone(), src_row.9, src_row.10.clone())
+    };
     diesel::update(chat_row(device_id, dest))
         .set((
             dsl::last_message_ts.eq(src_row.0.max(dest_row.0)),
@@ -311,7 +384,9 @@ pub(crate) fn merge_chat_metadata(
             dsl::muted_until.eq(muted_until),
             dsl::archived.eq(archived),
             dsl::ephemeral_expiration.eq(dest_row.5.or(src_row.5)),
-            dsl::name.eq(dest_row.6.or(src_row.6)),
+            dsl::name.eq(name),
+            dsl::name_from_address_book.eq(name_from_address_book),
+            dsl::address_book_fallback.eq(address_book_fallback),
             dsl::mute_appstate_seen.eq(dest_row.7 || src_row.7),
             dsl::archive_appstate_seen.eq(dest_row.8 || src_row.8),
             dsl::read_boundary_ms.eq(merged.watermark_ms),

@@ -233,6 +233,49 @@ async fn scoped_search_resolves_the_peer_alias() {
     );
 }
 
+#[cfg(feature = "search")]
+#[tokio::test]
+async fn scoped_search_includes_aliases_beyond_the_first_two_keys() {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+    let newest_lid = "111000011110002";
+    let historical_lid = "111000011110001";
+    for (lid, updated_at) in [(newest_lid, 1_699_999_999), (historical_lid, 1_699_999_998)] {
+        store
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: lid.into(),
+                phone_number: "559900000001".into(),
+                created_at: updated_at,
+                updated_at,
+                learning_source: "usync".into(),
+            })
+            .await
+            .expect("store historical mapping");
+    }
+    let old_chat = format!("{historical_lid}@lid");
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("aliasneedle in the archive"),
+            incoming_info(&old_chat, &old_chat, "MSG-HISTORICAL-SEARCH", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let hits = chat_store
+        .search_messages_in_chat(&jid(PEER), "aliasneedle", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        ["MSG-HISTORICAL-SEARCH"]
+    );
+}
+
 /// Hits come back fully hydrated from one statement rather than a point query
 /// each, so everything a caller reads off a hit still has to be there.
 #[cfg(feature = "search")]

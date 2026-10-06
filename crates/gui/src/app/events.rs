@@ -231,7 +231,8 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::LoggedOut(message) => {
-                self.leave_connected_view(cx);
+                self.leave_connected_view(None, cx);
+                self.invalidate_document_downloads();
                 self.app_state = AppState::LoggedOut { message };
                 cx.notify();
             }
@@ -247,6 +248,7 @@ impl WhatsAppApp {
                 chat_jid,
                 message,
                 sender_name,
+                chat_name,
                 notification_allowed,
                 notification_title,
                 notification_archived,
@@ -255,10 +257,11 @@ impl WhatsAppApp {
                     chat_jid,
                     *message,
                     sender_name,
-                    IncomingAlert::new(
+                    IncomingMessageMetadata::new(
                         notification_allowed,
                         notification_title,
                         notification_archived,
+                        chat_name,
                     ),
                     cx,
                 );
@@ -305,6 +308,7 @@ impl WhatsAppApp {
                     self.invalidate_chat_cache();
                     cx.notify();
                 }
+                self.notify_user(reason, notices::Tone::Problem, cx);
             }
             UiEvent::ChatPresence {
                 chat_jid,
@@ -315,6 +319,13 @@ impl WhatsAppApp {
                 self.handle_chat_presence(chat_jid, sender_jid, sender_name, composing, cx);
             }
             UiEvent::AccountUpdated { name, jid, lid } => {
+                if (self.account_jid != jid || self.account_lid != lid)
+                    && let Some(window) = self.modal_window
+                {
+                    let _ = window.update(cx, |_, window, cx| {
+                        super::clear_window_message_selection(window, cx);
+                    });
+                }
                 if self.account_name != name || self.account_jid != jid || self.account_lid != lid {
                     self.account_name = name;
                     self.account_jid = jid;

@@ -89,6 +89,20 @@ impl Bridge {
                 request,
                 answer_to,
             } => {
+                let connection = self.hub.connection();
+                if !connection.is_connected() {
+                    answer_now(
+                        &answer_to,
+                        answered(
+                            id,
+                            Err(ProtocolError::NoSession {
+                                detail: format!("not connected: {connection:?}"),
+                            }),
+                        ),
+                    );
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    return None;
+                }
                 let Some(permit) = self.permit() else {
                     let _ = reply.send(too_busy());
                     return None;
@@ -107,6 +121,20 @@ impl Bridge {
                 request,
                 answer_to,
             } => {
+                let connection = self.hub.connection();
+                if !connection.is_connected() {
+                    answer_now(
+                        &answer_to,
+                        answered(
+                            id,
+                            Err(ProtocolError::NoSession {
+                                detail: format!("not connected: {connection:?}"),
+                            }),
+                        ),
+                    );
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    return None;
+                }
                 let Some(permit) = self.permit() else {
                     let _ = reply.send(too_busy());
                     return None;
@@ -2076,19 +2104,6 @@ fn answered(id: RequestId, result: Result<DaemonMessage, ProtocolError>) -> Stri
         .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
 }
 
-fn mutation_answer<T, E: std::fmt::Display>(
-    id: RequestId,
-    result: Result<Result<T, String>, E>,
-) -> Result<DaemonMessage, ProtocolError> {
-    match result {
-        Ok(Ok(_)) => Ok(DaemonMessage::Accepted { id: Some(id) }),
-        Ok(Err(detail)) => Err(ProtocolError::Refused { detail }),
-        Err(error) => Err(ProtocolError::NoSession {
-            detail: format!("session stopped before the message action finished: {error}"),
-        }),
-    }
-}
-
 /// Unique optimistic-send id.
 ///
 /// A millisecond timestamp alone collides on fast double-sends, and the
@@ -2259,6 +2274,19 @@ fn send_wire_result(answer_to: &Outbox, id: u64, result: Result<DaemonResponse, 
     };
     if let Ok(line) = serde_json::to_string(&envelope) {
         answer_now(answer_to, line);
+    }
+}
+
+fn mutation_answer<T, E: std::fmt::Display>(
+    id: RequestId,
+    result: Result<Result<T, String>, E>,
+) -> Result<DaemonMessage, ProtocolError> {
+    match result {
+        Ok(Ok(_)) => Ok(DaemonMessage::Accepted { id: Some(id) }),
+        Ok(Err(detail)) => Err(ProtocolError::Refused { detail }),
+        Err(error) => Err(ProtocolError::NoSession {
+            detail: format!("session stopped before the message action finished: {error}"),
+        }),
     }
 }
 
@@ -2505,6 +2533,47 @@ mod tests {
             matches!(outcome, CommandOutcome::NoSession(_)),
             "got {outcome:?}"
         );
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn mutations_after_disconnect_answer_without_starting_work() {
+        let mut bridge = bridge();
+        let client = client();
+        let (answer_to, mut answers) = tokio::sync::mpsc::channel(2);
+        for action in [
+            Action::EditMessage {
+                id: 42,
+                request: oxidezap_ipc::EditMessage {
+                    jid: fixtures::PEER.to_string(),
+                    message_id: "EDIT".into(),
+                    new_text: "replacement".into(),
+                },
+                answer_to: answer_to.clone(),
+            },
+            Action::RevokeMessage {
+                id: 42,
+                request: oxidezap_ipc::RevokeMessage {
+                    jid: fixtures::PEER.to_string(),
+                    message_id: "DELETE".into(),
+                    for_everyone: true,
+                },
+                answer_to: answer_to.clone(),
+            },
+        ] {
+            let (reply, completed) = tokio::sync::oneshot::channel();
+            assert!(bridge.begin_slow(&client, action, reply).is_none());
+            let frame: DaemonMessage =
+                serde_json::from_str(&answers.try_recv().expect("correlated answer")).unwrap();
+            assert!(matches!(
+                frame,
+                DaemonMessage::Error {
+                    id: Some(42),
+                    error: ProtocolError::NoSession { .. }
+                }
+            ));
+            assert_eq!(completed.await.unwrap(), CommandOutcome::Accepted);
+        }
         client.close(Duration::from_secs(1)).await;
     }
 

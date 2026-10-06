@@ -170,6 +170,52 @@ async fn companion_receipt_resolves_across_pn_lid_mapping() {
     assert_eq!(chats[0].jid, jid(PEER));
 }
 
+#[tokio::test]
+async fn pn_receipt_finds_a_message_under_a_historical_lid() {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+    let (store, chat_store) = test_store().await;
+    let historical = jid("999900000000001@lid");
+    chat_store
+        .record_outgoing(
+            &historical,
+            "OUT-HISTORICAL-LID",
+            &wa::Message::text("olá"),
+            ts(1_700_000_100),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    add_lid_mapping(&store).await;
+    store
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "999900000000001".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_699_999_999,
+            updated_at: 1_699_999_999,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("record historical mapping");
+
+    feed(
+        &chat_store,
+        [peer_receipt(
+            jid(PEER),
+            &["OUT-HISTORICAL-LID"],
+            ReceiptType::Read,
+            1_700_000_200,
+        )],
+    )
+    .await;
+
+    let message = chat_store
+        .message(&jid(PEER), "OUT-HISTORICAL-LID")
+        .await
+        .unwrap()
+        .expect("the alias-aware lookup finds the historical-key row");
+    assert_eq!(message.status, MessageStatus::Read);
+}
+
 /// A 1:1 keeps its receipt rows, so a reader can say *when* the peer got and
 /// read the message and not merely that they did. `messages.status` carries the
 /// state it reached and no instant, which is the half WA Web's contact message

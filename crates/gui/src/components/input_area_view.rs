@@ -11,7 +11,7 @@ use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, 
 use gpui_component::{
     ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants},
-    input::{InputEvent, Paste, Textarea, TextareaState},
+    input::{Enter, InputEvent, Paste, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
 };
 
@@ -44,6 +44,7 @@ pub enum InputAreaEvent {
     CancelRecording,
     /// User dropped the reply they were composing.
     CancelReply,
+    CancelEdit,
 }
 
 /// Typing indicator state with debouncing.
@@ -108,6 +109,8 @@ pub struct InputAreaView {
     input: Entity<TextareaState>,
     /// Whether PTT recording is active
     is_recording: bool,
+    editing: bool,
+    edit_pending: bool,
     /// When the current recording started, for the elapsed counter.
     recording_started_at: Option<Instant>,
     /// Most recent input level, 0..=1, for the live meter.
@@ -136,6 +139,19 @@ pub struct InputAreaView {
 impl EventEmitter<InputAreaEvent> for InputAreaView {}
 
 impl InputAreaView {
+    pub fn init_bindings(cx: &mut App) {
+        // Only this textarea treats Control+Enter as a newline. Other fields
+        // retain the component library's secondary-confirm shortcut.
+        cx.bind_keys([gpui::KeyBinding::new(
+            "ctrl-enter",
+            Enter {
+                secondary: false,
+                shift: true,
+            },
+            Some("MessageComposer > Input"),
+        )]);
+    }
+
     /// Create a new input area view
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Enter sends and Shift+Enter breaks the line, which is what
@@ -155,6 +171,8 @@ impl InputAreaView {
         Self {
             input,
             is_recording: false,
+            editing: false,
+            edit_pending: false,
             recording_started_at: None,
             level: 0.0,
             reply: None,
@@ -180,7 +198,7 @@ impl InputAreaView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            InputEvent::PressEnter { .. } => {
+            InputEvent::PressEnter { shift: false, .. } => {
                 self.submit_input(window, cx);
             }
             InputEvent::Change => {
@@ -290,6 +308,9 @@ impl InputAreaView {
     /// Read, trim-check, clear and emit the composed message (Enter and the
     /// send button share this path).
     fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit_pending {
+            return;
+        }
         let text = self.input.read(cx).text().to_string();
         if text.trim().is_empty() {
             return;
@@ -349,6 +370,12 @@ impl InputAreaView {
         cx.notify();
     }
 
+    pub fn set_edit_state(&mut self, editing: bool, pending: bool, cx: &mut Context<Self>) {
+        self.editing = editing;
+        self.edit_pending = pending;
+        cx.notify();
+    }
+
     pub fn set_reply(&mut self, reply: Option<ReplyDraft>, cx: &mut Context<Self>) {
         self.reply = reply;
         cx.notify();
@@ -394,9 +421,31 @@ impl Render for InputAreaView {
             .bg(cx.theme().background)
             .border_t_1()
             .border_color(cx.theme().border)
+            .children(self.editing.then(|| {
+                let entity = entity.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(if self.edit_pending {
+                        "Saving edit..."
+                    } else {
+                        "Editing message"
+                    })
+                    .child(
+                        Button::new("cancel-edit")
+                            .ghost()
+                            .label("Cancel")
+                            .disabled(self.edit_pending)
+                            .on_click(move |_, _, cx| {
+                                entity.update(cx, |_, cx| cx.emit(InputAreaEvent::CancelEdit));
+                            }),
+                    )
+            }))
             .children(
                 self.reply
                     .clone()
+                    .filter(|_| !self.editing)
                     .map(|reply| render_reply_bar(reply, entity.clone(), metrics, cx)),
             )
             .child(if is_recording {
@@ -432,6 +481,14 @@ impl InputAreaView {
             .any(|c| !c.is_whitespace());
 
         div()
+            .key_context("MessageComposer")
+            .on_action(|action: &Enter, _, cx| {
+                if !action.shift {
+                    // The textarea propagates submission. Consume it here so
+                    // GPUI cannot also insert the key's newline as text input.
+                    cx.stop_propagation();
+                }
+            })
             .flex()
             .items_center()
             .gap(metrics.space_md())
@@ -442,6 +499,7 @@ impl InputAreaView {
                     "Attach a photo, a video or a document",
                     control,
                 )
+                .disabled(self.editing)
                 .cursor_pointer()
                 .debug_selector(|| "attach-trigger".into())
                 .dropdown_menu(move |menu, _window, _cx| {
@@ -478,7 +536,11 @@ impl InputAreaView {
                     .capture_action::<Paste>(
                         cx.listener(|view, _: &Paste, _window, cx| view.paste_image(cx)),
                     )
-                    .child(Textarea::new(&self.input).w_full()),
+                    .child(
+                        Textarea::new(&self.input)
+                            .readonly(self.edit_pending)
+                            .w_full(),
+                    ),
             )
             .child(
                 parts::icon_button(
@@ -492,11 +554,12 @@ impl InputAreaView {
             // Record or send, never both: which one is available follows
             // whether there is anything to send, the way every messaging
             // client behaves.
-            .child(if has_text {
+            .child(if has_text || self.editing {
                 Button::new("send")
                     .icon(IconName::ArrowRight)
                     .primary()
-                    .tooltip("Send")
+                    .tooltip(if self.editing { "Save edit" } else { "Send" })
+                    .disabled(self.edit_pending || (self.editing && !has_text))
                     .w(control)
                     .h(control)
                     .cursor_pointer()
@@ -514,7 +577,7 @@ impl InputAreaView {
                 Button::new("ptt")
                     .icon(ProductIcon::Mic)
                     .ghost()
-                    .disabled(!can_record)
+                    .disabled(!can_record || self.editing)
                     .tooltip(if can_record {
                         "Hold to record a voice message"
                     } else {
@@ -727,6 +790,7 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
+            crate::app::init_app_bindings(cx);
         });
         let window = cx
             .open_window(size(px(640.), px(120.)), |window, cx| {
@@ -812,6 +876,97 @@ mod tests {
             attachment_categories,
             _events: events,
         }
+    }
+
+    #[test]
+    fn modified_enter_inserts_newlines_without_sending_and_plain_enter_sends_once() {
+        let ComposerFixture {
+            mut cx,
+            window,
+            input,
+            ..
+        } = setup();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let observed = sent.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
+                if let InputAreaEvent::SendMessage(text) = event {
+                    observed.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        cx.update_window(*window, |_, window, cx| {
+            input.update(cx, |view, cx| {
+                view.input.update(cx, |field, cx| {
+                    field.set_value("hello", window, cx);
+                    field.set_cursor_position(
+                        gpui_component::input::Position::new(0, 5),
+                        window,
+                        cx,
+                    );
+                })
+            });
+        })
+        .unwrap();
+        for key in ["ctrl-enter", "shift-enter"] {
+            cx.update_window(*window, |_, window, cx| {
+                window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert!(sent.borrow().is_empty(), "{key} submitted the message");
+        }
+        cx.update(|cx| {
+            assert_eq!(
+                input.read(cx).input.read(cx).text().to_string(),
+                "hello\n\n"
+            )
+        });
+        cx.update_window(*window, |_, window, cx| {
+            window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(&*sent.borrow(), &["hello\n\n"]);
+        cx.update(|cx| assert!(input.read(cx).input.read(cx).text().to_string().is_empty()));
+    }
+
+    #[test]
+    fn secondary_confirmation_still_submits_without_a_newline() {
+        let ComposerFixture {
+            mut cx,
+            window,
+            input,
+            ..
+        } = setup();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let observed = sent.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
+                if let InputAreaEvent::SendMessage(text) = event {
+                    observed.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        cx.update_window(*window, |_, window, cx| {
+            input.update(cx, |view, cx| {
+                view.swap_text("command send", window, cx);
+            });
+            if cfg!(target_os = "macos") {
+                window.dispatch_keystroke(Keystroke::parse("cmd-enter").unwrap(), cx);
+            } else {
+                window.dispatch_action(
+                    Box::new(gpui_component::input::Enter {
+                        secondary: true,
+                        shift: false,
+                    }),
+                    cx,
+                );
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(&*sent.borrow(), &["command send"]);
     }
 
     #[test]

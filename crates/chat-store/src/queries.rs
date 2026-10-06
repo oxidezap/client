@@ -19,6 +19,20 @@ use crate::types::{
     ReceiptEntry, StoredMessage,
 };
 
+/// A conversation's durable read verdicts at one point in time.
+/// Reuse within an offline batch; live arrivals should request fresh state.
+pub struct MessageReadState {
+    states: Vec<crate::store::read_state::ReadState>,
+}
+
+impl MessageReadState {
+    pub fn covers(&self, message_id: &str, timestamp: DateTime<Utc>) -> bool {
+        self.states
+            .iter()
+            .any(|state| state.covers(timestamp.timestamp_millis(), message_id))
+    }
+}
+
 /// How many keys one batched lookup may bind at a time.
 ///
 /// SQLite's compiled-in parameter ceiling is 999 on older builds; a page well
@@ -169,10 +183,16 @@ struct ChatRow {
     mute_appstate_seen: bool,
     #[allow(dead_code)]
     archive_appstate_seen: bool,
+    #[allow(dead_code)]
+    name_from_address_book: bool,
+    #[allow(dead_code)]
+    address_book_fallback: Option<String>,
+    group_hierarchy: Option<String>,
 }
 
 impl From<ChatRow> for ChatEntry {
     fn from(row: ChatRow) -> Self {
+        let group_hierarchy_json = row.group_hierarchy;
         ChatEntry {
             jid: parse_jid(&row.jid),
             name: row.name,
@@ -195,6 +215,10 @@ impl From<ChatRow> for ChatEntry {
             }),
             archived: row.archived,
             ephemeral_expiration: row.ephemeral_expiration.map(|e| e as u32),
+            group_hierarchy: group_hierarchy_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok()),
+            group_hierarchy_json,
         }
     }
 }
@@ -218,6 +242,225 @@ pub(crate) struct MessageRow {
     starred: bool,
     edited_at_ms: Option<i64>,
     revoked: bool,
+    local_revoke_placeholder: bool,
+}
+
+/// Fold an author-equivalent legacy copy for a read without hiding a
+/// tombstone or treating a sender collision as the same message.
+fn fold_read_duplicate(
+    held: MessageRow,
+    incoming: MessageRow,
+    held_edit_source_id: Option<i64>,
+    incoming_edit_source_id: Option<i64>,
+) -> (MessageRow, Option<i64>) {
+    let held_is_survivor = held.id <= incoming.id;
+    let mut survivor = if held_is_survivor {
+        held.clone()
+    } else {
+        incoming.clone()
+    };
+    let revoked = held.revoked || incoming.revoked;
+    let edited = match (
+        held.edited_at_ms
+            .map(|timestamp| (timestamp, held_edit_source_id.unwrap_or(held.id))),
+        incoming
+            .edited_at_ms
+            .map(|timestamp| (timestamp, incoming_edit_source_id.unwrap_or(incoming.id))),
+    ) {
+        (Some((left, left_id)), Some((right, right_id)))
+            if right > left || (right == left && right_id < left_id) =>
+        {
+            Some((&incoming, right_id))
+        }
+        (Some(_), Some(_)) => Some((&held, held_edit_source_id.unwrap_or(held.id))),
+        (Some((_, left_id)), None) => Some((&held, left_id)),
+        (None, Some((_, right_id))) => Some((&incoming, right_id)),
+        (None, None) => None,
+    };
+    let content = if revoked {
+        None
+    } else {
+        edited.map(|(row, _)| row).or_else(|| {
+            [&held, &incoming].into_iter().max_by_key(|row| {
+                (
+                    row.text_content.is_some(),
+                    row.proto.is_some(),
+                    std::cmp::Reverse(row.id),
+                )
+            })
+        })
+    };
+    let status = if MessageStatus::from_raw(incoming.status)
+        .wins_over(MessageStatus::from_raw(held.status))
+    {
+        incoming.status
+    } else {
+        held.status
+    };
+    survivor.revoked = revoked;
+    survivor.local_revoke_placeholder =
+        held.local_revoke_placeholder || incoming.local_revoke_placeholder;
+    survivor.status = status;
+    survivor.starred = held.starred || incoming.starred;
+    survivor.timestamp_ms = held.timestamp_ms.max(incoming.timestamp_ms);
+    survivor.edited_at_ms = edited.map(|(row, _)| row.edited_at_ms.unwrap_or_default());
+    if let Some(content) = content {
+        survivor.kind = content.kind.clone();
+    }
+    survivor.text_content = content.and_then(|row| row.text_content.clone());
+    survivor.proto = content.and_then(|row| row.proto.clone());
+    survivor.proto_codec = if revoked {
+        crate::storage_proto::CODEC_RAW
+    } else {
+        content.map_or(survivor.proto_codec, |row| row.proto_codec)
+    };
+    (survivor, edited.map(|(_, source_id)| source_id))
+}
+
+fn fold_read_copies(mut copies: Vec<MessageRow>) -> (MessageRow, Option<i64>) {
+    copies.sort_by_key(|row| row.id);
+    let mut folded = copies.remove(0);
+    let mut edit_source_id = folded.edited_at_ms.map(|_| folded.id);
+    for incoming in copies {
+        let incoming_edit_source_id = incoming.edited_at_ms.map(|_| incoming.id);
+        (folded, edit_source_id) =
+            fold_read_duplicate(folded, incoming, edit_source_id, incoming_edit_source_id);
+    }
+    (folded, edit_source_id)
+}
+
+/// Fold every author-equivalent copy of the stanza ids in one raw page. The
+/// page query remains timestamp-indexed; this bounded follow-up lets a copy
+/// outside its raw slice contribute content and be suppressed on later pages.
+fn page_rows_with_copies(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    keys: &[String],
+    rows: &[MessageRow],
+) -> std::result::Result<Vec<(MessageRow, Option<i64>, bool)>, wacore::store::error::StoreError> {
+    use schema::messages::dsl;
+    let mut msg_ids: Vec<String> = rows.iter().map(|row| row.msg_id.clone()).collect();
+    msg_ids.sort();
+    msg_ids.dedup();
+    let mut candidates = Vec::new();
+    for key_page in keys.chunks(BIND_CHUNK / 2) {
+        let id_chunk_size = BIND_CHUNK - key_page.len() - 1;
+        for id_page in msg_ids.chunks(id_chunk_size) {
+            candidates.extend(
+                dsl::messages
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::chat_jid.eq_any(key_page.to_vec()))
+                            .and(dsl::msg_id.eq_any(id_page.to_vec())),
+                    )
+                    .load::<MessageRow>(conn)
+                    .map_err(db_err)?,
+            );
+        }
+    }
+
+    let mut folded_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut copies = Vec::new();
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.msg_id == row.msg_id && candidate.from_me == row.from_me)
+        {
+            if crate::store::message_identity::authors_match(
+                conn,
+                device_id,
+                row.from_me,
+                &row.sender_jid,
+                candidate.from_me,
+                &candidate.sender_jid,
+            )
+            .map_err(db_err)?
+            {
+                copies.push(candidate.clone());
+            }
+        }
+        if copies.is_empty() {
+            copies.push(row.clone());
+        }
+        let has_alias_copies = copies.len() > 1;
+        let (folded, edit_source_id) = fold_read_copies(copies);
+        folded_rows.push((folded, edit_source_id, has_alias_copies));
+    }
+    Ok(folded_rows)
+}
+
+fn rows_at_timestamp(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    keys: &[String],
+    timestamp_ms: i64,
+) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
+    use schema::messages::dsl;
+    dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq_any(keys.to_vec()))
+                .and(dsl::timestamp_ms.eq(timestamp_ms)),
+        )
+        .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
+        .load(conn)
+        .map_err(db_err)
+}
+
+fn key_is_before_page(row: &MessageRow, cursor: Option<&MessageCursor>) -> bool {
+    match cursor {
+        Some(cursor) => (row.timestamp_ms, row.id) < (cursor.timestamp_ms, cursor.seq),
+        None => true,
+    }
+}
+
+fn key_is_after_page(row: &MessageRow, cursor: &MessageCursor) -> bool {
+    (row.timestamp_ms, row.id) > (cursor.timestamp_ms, cursor.seq)
+}
+
+fn push_unique_message(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    kept: &mut Vec<MessageRow>,
+    edit_source_ids: &mut std::collections::HashMap<i64, i64>,
+    row: MessageRow,
+    incoming_edit_source_id: Option<i64>,
+) -> std::result::Result<(), wacore::store::error::StoreError> {
+    for prior in kept.iter_mut() {
+        if prior.msg_id == row.msg_id
+            && crate::store::message_identity::authors_match(
+                conn,
+                device_id,
+                prior.from_me,
+                &prior.sender_jid,
+                row.from_me,
+                &row.sender_jid,
+            )
+            .map_err(db_err)?
+        {
+            let held_id = prior.id;
+            let incoming_id = row.id;
+            let held_source_id = edit_source_ids.get(&held_id).copied();
+            let (folded, edit_source_id) =
+                fold_read_duplicate(prior.clone(), row, held_source_id, incoming_edit_source_id);
+            edit_source_ids.remove(&held_id);
+            edit_source_ids.remove(&incoming_id);
+            if let Some(edit_source_id) = edit_source_id {
+                edit_source_ids.insert(folded.id, edit_source_id);
+            } else {
+                edit_source_ids.remove(&folded.id);
+            }
+            *prior = folded;
+            return Ok(());
+        }
+    }
+    if let Some(edit_source_id) = incoming_edit_source_id {
+        edit_source_ids.insert(row.id, edit_source_id);
+    }
+    kept.push(row);
+    Ok(())
 }
 
 impl From<MessageRow> for StoredMessage {
@@ -248,6 +491,7 @@ impl From<MessageRow> for StoredMessage {
             starred: row.starred,
             edited_at: row.edited_at_ms.and_then(ms_to_utc),
             revoked: row.revoked,
+            local_revoke_placeholder: row.local_revoke_placeholder,
             seq: row.id,
         }
     }
@@ -446,6 +690,41 @@ impl ChatStore {
         Ok(row.map(Into::into))
     }
 
+    /// Whether a phone or companion read verdict already covers this incoming
+    /// message. Check every proven chat alias, using the same watermark and
+    /// explicit boundary ids that drive unread recounts. This does not infer
+    /// read state from the message's delivery status or the chat's badge.
+    pub async fn message_is_read(
+        &self,
+        jid: &Jid,
+        message_id: &str,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        Ok(self
+            .message_read_state(jid)
+            .await?
+            .covers(message_id, timestamp))
+    }
+
+    /// Read all proven aliases once for a batch of incoming messages.
+    pub async fn message_read_state(&self, jid: &Jid) -> Result<MessageReadState> {
+        let device_id = self.device_id();
+        let jid = jid.to_string();
+        let states = self
+            .db()
+            .read(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &jid).map_err(db_err)?;
+                keys.into_iter()
+                    .map(|key| {
+                        crate::store::read_state::read_state(conn, device_id, &key).map_err(db_err)
+                    })
+                    .collect()
+            })
+            .await?;
+        Ok(MessageReadState { states })
+    }
+
     /// Alert policy and title from the durable conversation rows.
     ///
     /// A live message may precede GUI hydration, so the front end's `Chat`
@@ -486,9 +765,9 @@ impl ChatStore {
             .into_iter()
             .filter_map(|(_, _, name)| name)
             .find(|name| {
-                !name.trim().is_empty()
-                    && !(is_group
-                        && matches!(name.trim(), "Unnamed group" | "Group name unavailable"))
+                let name = name.trim();
+                !(name.is_empty()
+                    || is_group && matches!(name, "Unnamed group" | "Group name unavailable"))
             });
         Ok(Some(ChatNotificationMetadata {
             muted,
@@ -505,28 +784,33 @@ impl ChatStore {
     /// like avatar bytes, so an account with more chats than any page holds
     /// still revalidates all of them. Archived chats are included — the
     /// archived list draws them with the same fallback — and the answer is
-    /// the stored JID plus the stored name (or lack of one), which is
-    /// exactly what the pass's CAS writes compare against.
+    /// the stored JID, name and exact hierarchy JSON (or their absence), which
+    /// are the resolver's compare-and-swap expectations. Keeping the raw value
+    /// lets a fresh answer replace metadata this client cannot decode.
     ///
     /// One statement in practice: the two domain suffixes are SQL `LIKE`
     /// predicates, not a bound list of JIDs.
-    pub async fn special_chat_names(&self) -> Result<Vec<(Jid, Option<String>)>> {
+    pub async fn special_chat_names(&self) -> Result<Vec<(Jid, Option<String>, Option<String>)>> {
         use schema::chats::dsl;
         let device_id = self.device_id();
-        let rows: Vec<(String, Option<String>)> = self
+        let rows: Vec<(String, Option<String>, Option<String>)> = self
             .db()
             .read(move |conn| {
                 dsl::chats
                     .filter(dsl::device_id.eq(device_id))
                     .filter(dsl::jid.like("%@g.us").or(dsl::jid.like("%@newsletter")))
-                    .select((dsl::jid, dsl::name))
+                    .select((dsl::jid, dsl::name, dsl::group_hierarchy))
                     .load(conn)
                     .map_err(db_err)
             })
             .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(jid, name)| jid.parse::<Jid>().ok().map(|jid| (jid, name)))
+            .filter_map(|(jid, name, hierarchy_json)| {
+                jid.parse::<Jid>()
+                    .ok()
+                    .map(|jid| (jid, name, hierarchy_json))
+            })
             .collect())
     }
 
@@ -596,11 +880,7 @@ impl ChatStore {
                 use schema::chats::dsl as chats;
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                let rows: Vec<MessageRow> = page_query(device_id, &keys, before.as_ref())
-                    .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
-                    .limit(limit)
-                    .load(conn)
-                    .map_err(db_err)?;
+                let rows = fill_unique(conn, device_id, &keys, before.clone(), limit)?;
                 let messages = finalize_messages(conn, device_id, rows)?;
 
                 let counts: Vec<i32> = chats::chats
@@ -624,6 +904,7 @@ impl ChatStore {
                             .eq(device_id)
                             .and(dsl::chat_jid.eq_any(keys))
                             .and(dsl::from_me.eq(false))
+                            .and(dsl::local_revoke_placeholder.eq(false))
                             .and(
                                 dsl::timestamp_ms
                                     .gt(cursor.timestamp_ms)
@@ -705,13 +986,14 @@ impl ChatStore {
 /// asking, so a duplicate collapsed inside the page would end the history at
 /// the split rather than at its beginning — and a page that serves the unread
 /// tail would leave the messages it dropped out of `ReadTracker`, where their
-/// receipts are owed. Each pass costs a query only when the last one collapsed
-/// something, which a merged pair never does.
+/// receipts are owed. Each raw batch makes one indexed lookup for its stanza
+/// ids across the chat's alias keys; that lets a
+/// copy outside the raw limit contribute its folded timestamp and keeps it
+/// from reappearing on a later page.
 ///
 /// Both readers go through it: the single chat's page and the batch an attach
-/// load asks for. The batch is where this was missing, which is the shape of
-/// every other defect in this batch — the rule written once and not repeated on
-/// its twin.
+/// load asks for. Rows sharing an id collapse only when their authors are
+/// proven equivalent; sender collisions remain separate bubbles.
 fn fill_unique(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -721,12 +1003,9 @@ fn fill_unique(
 ) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
-    // Alias candidates represent one PN/LID thread, where the same id is a
-    // duplicate even though the wire sender spelling differs. A single chat
-    // can legitimately contain that id from two group participants, so its
-    // sender remains part of the read identity.
-    let dedupe_by_sender = keys.len() == 1;
-    let mut ids = std::collections::HashSet::new();
+    let mut edit_source_ids = std::collections::HashMap::new();
+    let mut saw_alias_copies = false;
+    let page_cursor = before.clone();
     let mut before = before;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
@@ -740,20 +1019,46 @@ fn fill_unique(
             timestamp_ms: row.timestamp_ms,
             seq: row.id,
         });
-        for row in rows {
-            let identity = if dedupe_by_sender {
-                (row.msg_id.clone(), row.sender_jid.clone())
-            } else {
-                (row.msg_id.clone(), String::new())
-            };
-            if ids.insert(identity) {
-                kept.push(row);
+        for (row, edit_source_id, has_alias_copies) in
+            page_rows_with_copies(conn, device_id, keys, &rows)?
+        {
+            saw_alias_copies |= has_alias_copies;
+            if key_is_before_page(&row, page_cursor.as_ref()) {
+                push_unique_message(
+                    conn,
+                    device_id,
+                    &mut kept,
+                    &mut edit_source_ids,
+                    row,
+                    edit_source_id,
+                )?;
+            }
+        }
+        if !exhausted && limit > 0 && (kept.len() as i64) >= limit && saw_alias_copies {
+            kept.sort_by_key(|row| std::cmp::Reverse((row.timestamp_ms, row.id)));
+            let cutoff = kept[(limit - 1) as usize].timestamp_ms;
+            let tied_rows = rows_at_timestamp(conn, device_id, keys, cutoff)?;
+            for (row, edit_source_id, _) in
+                page_rows_with_copies(conn, device_id, keys, &tied_rows)?
+            {
+                if key_is_before_page(&row, page_cursor.as_ref()) {
+                    push_unique_message(
+                        conn,
+                        device_id,
+                        &mut kept,
+                        &mut edit_source_ids,
+                        row,
+                        edit_source_id,
+                    )?;
+                }
             }
         }
         if exhausted {
             break;
         }
     }
+    kept.sort_by_key(|row| std::cmp::Reverse((row.timestamp_ms, row.id)));
+    kept.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(kept)
 }
 
@@ -774,11 +1079,9 @@ fn fill_unique_after(
 ) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
     let mut kept: Vec<MessageRow> = Vec::new();
-    // The same read identity [`fill_unique`] uses: alias candidates are one
-    // thread, so the id alone is the duplicate; a single chat may hold the
-    // same id from two group participants and keeps the sender in the key.
-    let dedupe_by_sender = keys.len() == 1;
-    let mut ids = std::collections::HashSet::new();
+    let mut edit_source_ids = std::collections::HashMap::new();
+    let mut saw_alias_copies = false;
+    let page_cursor = after.clone();
     let mut after = after;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
@@ -806,14 +1109,38 @@ fn fill_unique_after(
                 seq: last.id,
             };
         }
-        for row in rows {
-            let identity = if dedupe_by_sender {
-                (row.msg_id.clone(), row.sender_jid.clone())
-            } else {
-                (row.msg_id.clone(), String::new())
-            };
-            if ids.insert(identity) {
-                kept.push(row);
+        for (row, edit_source_id, has_alias_copies) in
+            page_rows_with_copies(conn, device_id, keys, &rows)?
+        {
+            saw_alias_copies |= has_alias_copies;
+            if key_is_after_page(&row, &page_cursor) {
+                push_unique_message(
+                    conn,
+                    device_id,
+                    &mut kept,
+                    &mut edit_source_ids,
+                    row,
+                    edit_source_id,
+                )?;
+            }
+        }
+        if !exhausted && limit > 0 && (kept.len() as i64) >= limit && saw_alias_copies {
+            kept.sort_by_key(|row| (row.timestamp_ms, row.id));
+            let cutoff = kept[(limit - 1) as usize].timestamp_ms;
+            let tied_rows = rows_at_timestamp(conn, device_id, keys, cutoff)?;
+            for (row, edit_source_id, _) in
+                page_rows_with_copies(conn, device_id, keys, &tied_rows)?
+            {
+                if key_is_after_page(&row, &page_cursor) {
+                    push_unique_message(
+                        conn,
+                        device_id,
+                        &mut kept,
+                        &mut edit_source_ids,
+                        row,
+                        edit_source_id,
+                    )?;
+                }
             }
         }
         // `rows` was empty: the store is exhausted and the cursor did not
@@ -822,6 +1149,8 @@ fn fill_unique_after(
             break;
         }
     }
+    kept.sort_by_key(|row| (row.timestamp_ms, row.id));
+    kept.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(kept)
 }
 
@@ -917,10 +1246,11 @@ fn hydrate_quotes(
     for need in &needs {
         by_chat.entry(need.chat.as_str()).or_default().push(need);
     }
-    // Counterpart identities, resolved once per distinct participant and only
-    // when the exact author misses (the common case never gets here).
-    let mut aliases: std::collections::HashMap<String, Option<String>> =
+    // Complete alias components, resolved once per distinct participant and
+    // only when its normalized exact author misses.
+    let mut aliases: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    let mut own_participants: Option<Vec<String>> = None;
     for (chat, chat_needs) in by_chat {
         let keys = candidates
             .get(chat)
@@ -939,24 +1269,38 @@ fn hydrate_quotes(
                 parents.entry(row.msg_id.clone()).or_default().push(row);
             }
         }
+        if parents.values().flatten().any(|row| row.from_me) && own_participants.is_none() {
+            own_participants = Some(
+                crate::store::message_identity::own_participant_jids(conn, device_id)
+                    .map_err(db_err)?,
+            );
+        }
+        let own_participant_keys = own_participants.as_deref().unwrap_or(&[]);
         for need in chat_needs {
             let rows: &[crate::storage_proto::ParentRow] =
                 parents.get(&need.stanza).map(Vec::as_slice).unwrap_or(&[]);
-            if rows.iter().all(|row| row.sender != need.participant)
-                && !aliases.contains_key(&need.participant)
-            {
-                // A mapping read that fails is not a read failure: without
-                // the alias the quote resolves by exact author only.
-                let alias = if need.participant.is_empty() {
-                    None
+            if !aliases.contains_key(&need.participant) {
+                // Resolve the full component even when an exact row exists:
+                // an equivalent copy may carry the tombstone, edit, or
+                // recovered content that wins the storage merge.
+                let aliases_for_participant = if need.participant.is_empty() {
+                    Vec::new()
                 } else {
-                    crate::lid::counterpart_chat_key(conn, device_id, &need.participant)
-                        .unwrap_or(None)
+                    crate::lid::chat_key_candidates(conn, device_id, &need.participant)
+                        .unwrap_or_default()
                 };
-                aliases.insert(need.participant.clone(), alias);
+                aliases.insert(need.participant.clone(), aliases_for_participant);
             }
-            let alias = aliases.get(&need.participant).and_then(|a| a.as_deref());
-            let Some(parent) = pick_quote_parent(rows, &need.participant, alias) else {
+            let aliases_for_participant = aliases
+                .get(&need.participant)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let Some(parent) = pick_quote_parent(
+                rows,
+                &need.participant,
+                aliases_for_participant,
+                own_participant_keys,
+            ) else {
                 continue;
             };
             let Some(bytes) = parent.proto.as_deref() else {
@@ -976,8 +1320,8 @@ fn hydrate_quotes(
     Ok(())
 }
 
-/// One page of parent rows: `(msg_id, sender, proto, codec)` for a chunk of
-/// stanza ids under either storage identity of one chat.
+/// One page of parent rows: `(msg_id, sender, from_me, proto, codec)` for a
+/// chunk of stanza ids under either storage identity of one chat.
 fn parent_chunk(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -993,16 +1337,57 @@ fn parent_chunk(
                 .and(dsl::chat_jid.eq_any(keys.to_vec()))
                 .and(dsl::msg_id.eq_any(stanzas.to_vec())),
         )
-        .select((dsl::msg_id, dsl::sender_jid, dsl::proto, dsl::proto_codec))
-        .load::<(String, String, Option<Vec<u8>>, i32)>(conn)
+        .select((
+            dsl::id,
+            dsl::msg_id,
+            dsl::sender_jid,
+            dsl::from_me,
+            dsl::text_content.is_not_null(),
+            dsl::proto,
+            dsl::proto_codec,
+            dsl::edited_at_ms,
+            dsl::revoked,
+        ))
+        .load::<(
+            i64,
+            String,
+            String,
+            bool,
+            bool,
+            Option<Vec<u8>>,
+            i32,
+            Option<i64>,
+            bool,
+        )>(conn)
         .map(|rows| {
             rows.into_iter()
-                .map(|(msg_id, sender, proto, codec)| ParentRow {
-                    msg_id,
-                    sender,
-                    proto,
-                    codec,
-                })
+                .map(
+                    |(
+                        id,
+                        msg_id,
+                        sender,
+                        from_me,
+                        text_present,
+                        proto,
+                        codec,
+                        edited_at_ms,
+                        revoked,
+                    )| {
+                        let proto_present = proto.is_some();
+                        ParentRow {
+                            id,
+                            msg_id,
+                            sender,
+                            from_me,
+                            text_present,
+                            proto_present,
+                            proto,
+                            codec,
+                            edited_at_ms,
+                            revoked,
+                        }
+                    },
+                )
                 .collect()
         })
 }
@@ -1225,6 +1610,20 @@ impl ChatStore {
     }
 
     pub async fn message(&self, chat: &Jid, msg_id: &str) -> Result<Option<StoredMessage>> {
+        self.message_by_ownership(chat, msg_id, None).await
+    }
+
+    /// One outgoing target, even when another group author reused its id.
+    pub async fn own_message(&self, chat: &Jid, msg_id: &str) -> Result<Option<StoredMessage>> {
+        self.message_by_ownership(chat, msg_id, Some(true)).await
+    }
+
+    async fn message_by_ownership(
+        &self,
+        chat: &Jid,
+        msg_id: &str,
+        from_me: Option<bool>,
+    ) -> Result<Option<StoredMessage>> {
         use schema::messages::dsl;
         let device_id = self.device_id();
         let chat = chat.to_string();
@@ -1234,16 +1633,33 @@ impl ChatStore {
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                let rows: Vec<MessageRow> = dsl::messages
+                let query = dsl::messages
                     .filter(
                         dsl::device_id
                             .eq(device_id)
                             .and(dsl::chat_jid.eq_any(keys))
                             .and(dsl::msg_id.eq(&msg_id)),
                     )
-                    .load(conn)
-                    .map_err(db_err)?;
-                finalize_messages(conn, device_id, rows)
+                    .into_boxed();
+                let query = match from_me {
+                    Some(from_me) => query.filter(dsl::from_me.eq(from_me)),
+                    None => query,
+                };
+                let rows: Vec<MessageRow> = query.load(conn).map_err(db_err)?;
+                let mut unique = Vec::new();
+                let mut edit_source_ids = std::collections::HashMap::new();
+                for row in rows {
+                    let edit_source_id = row.edited_at_ms.map(|_| row.id);
+                    push_unique_message(
+                        conn,
+                        device_id,
+                        &mut unique,
+                        &mut edit_source_ids,
+                        row,
+                        edit_source_id,
+                    )?;
+                }
+                finalize_messages(conn, device_id, unique)
             })
             .await?;
         // `message()` names no sender, so same-id rows from two group
@@ -1792,18 +2208,19 @@ impl ChatStore {
     pub async fn starred_messages(&self, limit: i64) -> Result<Vec<StoredMessage>> {
         use schema::messages::dsl;
         let device_id = self.device_id();
-        let rows: Vec<MessageRow> = self
+        let rows: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
-                dsl::messages
+                let rows: Vec<MessageRow> = dsl::messages
                     .filter(dsl::device_id.eq(device_id).and(dsl::starred.eq(true)))
                     .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
                     .limit(limit.max(0))
                     .load(conn)
-                    .map_err(db_err)
+                    .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// Poll creation messages, optionally scoped to one chat, newest first.
@@ -1815,10 +2232,22 @@ impl ChatStore {
         chat: Option<&Jid>,
         limit: i64,
     ) -> Result<Vec<StoredMessage>> {
+        self.poll_messages_page(chat, None, limit).await
+    }
+
+    /// One page of poll creations, newest first. The cursor is the oldest
+    /// row already scanned, allowing callers to skip unsupported poll variants
+    /// without letting them consume a supported-results limit.
+    pub async fn poll_messages_page(
+        &self,
+        chat: Option<&Jid>,
+        before: Option<MessageCursor>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
         use schema::messages::dsl;
         let device_id = self.device_id();
         let chat = chat.map(ToString::to_string);
-        let rows: Vec<MessageRow> = self
+        let rows: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
                 let mut query = dsl::messages
@@ -1833,14 +2262,24 @@ impl ChatStore {
                         crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
                     query = query.filter(dsl::chat_jid.eq_any(keys));
                 }
-                query
+                if let Some(cursor) = before {
+                    query = query.filter(
+                        dsl::timestamp_ms
+                            .lt(cursor.timestamp_ms)
+                            .or(dsl::timestamp_ms
+                                .eq(cursor.timestamp_ms)
+                                .and(dsl::id.lt(cursor.seq))),
+                    );
+                }
+                let rows: Vec<MessageRow> = query
                     .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
                     .limit(limit.max(0))
                     .load(conn)
-                    .map_err(db_err)
+                    .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// How much history the store holds, per chat or account-wide.
@@ -1934,7 +2373,7 @@ impl ChatStore {
             MessageKind::Document.as_str(),
             MessageKind::Sticker.as_str(),
         ];
-        let rows: Vec<MessageRow> = self
+        let rows: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
                 let mut query = dsl::messages
@@ -1945,14 +2384,15 @@ impl ChatStore {
                         crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
                     query = query.filter(dsl::chat_jid.eq_any(keys));
                 }
-                query
+                let rows: Vec<MessageRow> = query
                     .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
                     .limit(limit.max(0))
                     .load(conn)
-                    .map_err(db_err)
+                    .map_err(db_err)?;
+                finalize_messages(conn, device_id, rows)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// Delete chat rows that hold no messages. Returns how many were removed.
@@ -2016,6 +2456,9 @@ mod tests {
         diesel::sql_query("CREATE TABLE device (id INTEGER PRIMARY KEY)")
             .execute(&mut conn)
             .expect("device parent");
+        diesel::sql_query("CREATE TABLE lid_pn_mapping (device_id INTEGER NOT NULL)")
+            .execute(&mut conn)
+            .expect("mapping parent for the repair-generation triggers");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
         let rows: Vec<PlanRow> = diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
             .load(&mut conn)
@@ -2035,10 +2478,14 @@ mod tests {
         use diesel::sql_types::{BigInt, Bool, Integer, Text};
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
         // See `plan`'s comment: the cascade migration's FK needs this parent
-        // to exist before it runs.
+        // to exist before it runs. The repair triggers also need its mapping
+        // table.
         diesel::sql_query("CREATE TABLE device (id INTEGER PRIMARY KEY)")
             .execute(&mut conn)
             .expect("device parent");
+        diesel::sql_query("CREATE TABLE lid_pn_mapping (device_id INTEGER NOT NULL)")
+            .execute(&mut conn)
+            .expect("mapping parent for the repair-generation triggers");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
         // Placeholder order is the filter order diesel renders:
         // `device_id = ? AND msg_id = ? AND from_me = ? ... LIMIT ?`.

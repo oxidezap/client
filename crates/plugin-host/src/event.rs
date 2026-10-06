@@ -363,6 +363,7 @@ mod tests {
             chat_jid: chat.into(),
             message: Box::new(message),
             sender_name: None,
+            chat_name: None,
             notification_allowed: false,
             notification_title: None,
             notification_archived: None,

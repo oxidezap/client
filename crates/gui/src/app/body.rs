@@ -61,6 +61,9 @@ impl Render for Body {
                     }
                     AppState::Syncing => render_syncing_view(cx).into_any_element(),
                     AppState::Connected | AppState::Offline if app.showing_settings(cx) => {
+                        if gpui_base::TextSelection::has_selection(window, cx) {
+                            super::clear_window_message_selection(window, cx);
+                        }
                         render_settings_view(app, window, cx).into_any_element()
                     }
                     AppState::Connected | AppState::Offline => {
@@ -88,7 +91,7 @@ impl Render for Body {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn setup() -> (
@@ -366,7 +369,7 @@ mod tests {
         ]
     }
 
-    fn connected_app_fixture(
+    pub(crate) fn connected_app_fixture(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {
         cx.update(|cx| {

@@ -1,8 +1,8 @@
 //! Messages exchanged over the socket.
 
 use oxidezap_core::{
-    AccountId, CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, GroupRoster,
-    LogLevel, OutgoingMedia, PluginAction, PluginSurface, QuotedMessage, UiEvent,
+    AccountId, CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, GroupHierarchy,
+    GroupRoster, LogLevel, OutgoingMedia, PluginAction, PluginSurface, QuotedMessage, UiEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -157,6 +157,9 @@ pub struct ChatSummary {
     /// about every chat — skipped when absent so those frames stay small.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_at_ms: Option<i64>,
+    /// Server-reported community relationship, omitted until known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_hierarchy: Option<GroupHierarchy>,
 }
 
 impl ChatSummary {
@@ -685,15 +688,6 @@ pub struct SendText {
     pub quoted: Option<QuotedMessage>,
 }
 
-/// Replace the text of one sent message. Answered only after the session's
-/// mutation and durable local materialization finish.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EditMessage {
-    pub jid: String,
-    pub message_id: String,
-    pub new_text: String,
-}
-
 /// Delete one sent message locally or request deletion for everyone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevokeMessage {
@@ -781,6 +775,15 @@ pub struct SendMedia {
     /// [`SendText`] and [`SendAudio`] carry, for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedMessage>,
+}
+
+/// Edit a sent text message. The acknowledgement is sent after the network
+/// accepts the edit and the local store durably records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditMessage {
+    pub jid: String,
+    pub message_id: String,
+    pub new_text: String,
 }
 
 /// React to a message with an emoji. See [`ClientRequest::SendReaction`].
@@ -967,7 +970,6 @@ pub enum ClientRequest {
     /// — and the serde working set — of every request. The wire is unchanged:
     /// `Box` is transparent to serde, and the round-trip test pins the bytes.
     SendText(Box<SendText>),
-    EditMessage(EditMessage),
     RevokeMessage(RevokeMessage),
     /// Send a recorded voice note.
     ///
@@ -990,6 +992,7 @@ pub enum ClientRequest {
     /// is unchanged — `Box` is transparent to serde — and the round-trip
     /// test pins the bytes.
     SendReaction(Box<SendReaction>),
+    EditMessage(EditMessage),
     /// Tell the peer whether we are typing. One request rather than two,
     /// because it is one piece of state with two values.
     Typing(Typing),
@@ -1472,6 +1475,7 @@ mod tests {
             manually_unread: false,
             last_message: None,
             pinned_at_ms: None,
+            group_hierarchy: None,
         };
         let snapshot = StateSnapshot {
             version: StateVersion::INITIAL,
@@ -1532,6 +1536,7 @@ mod tests {
                 manually_unread: false,
                 last_message: None,
                 pinned_at_ms: None,
+                group_hierarchy: None,
             }),
             DaemonEvent::ChatRemoved {
                 jid: "559900000001@s.whatsapp.net".into(),
@@ -1654,6 +1659,7 @@ mod tests {
             manually_unread: false,
             last_message: None,
             pinned_at_ms: None,
+            group_hierarchy: None,
         };
         let snapshot = StateSnapshot {
             version: StateVersion::INITIAL,
@@ -1678,6 +1684,7 @@ mod tests {
             manually_unread: true,
             last_message: None,
             pinned_at_ms: None,
+            group_hierarchy: None,
         };
         assert!(chat.has_unread(), "it carries a badge");
 
@@ -1789,6 +1796,36 @@ mod tests {
     }
 
     #[test]
+    fn subgroup_summary_wire_preserves_typed_parent_identity() {
+        let hierarchy = GroupHierarchy::Subgroup {
+            parent_jid: "120363000000000009@g.us".into(),
+            kind: oxidezap_core::SubgroupKind::Announcement,
+        };
+        let summary = ChatSummary {
+            jid: "120363000000000001@g.us".into(),
+            name: "Announcements".into(),
+            unread: 0,
+            manually_unread: false,
+            last_message: None,
+            pinned_at_ms: None,
+            group_hierarchy: Some(hierarchy.clone()),
+        };
+        let json = serde_json::to_value(&summary).expect("serialize summary");
+        assert_eq!(
+            json["group_hierarchy"]["parent_jid"],
+            "120363000000000009@g.us"
+        );
+        assert_eq!(
+            json["group_hierarchy"]["kind"], "announcement",
+            "role labels remain typed rather than encoded in display names"
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatSummary>(json).expect("deserialize summary"),
+            summary
+        );
+    }
+
+    #[test]
     fn frames_round_trip_through_json() {
         let msg = DaemonMessage::Update {
             version: StateVersion::INITIAL.next(),
@@ -1798,6 +1835,7 @@ mod tests {
                 unread: 2,
                 manually_unread: false,
                 pinned_at_ms: None,
+                group_hierarchy: None,
                 last_message: Some(MessagePreview {
                     id: Some("3EB0".into()),
                     text: "hi".into(),

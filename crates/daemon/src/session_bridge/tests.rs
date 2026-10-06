@@ -28,6 +28,7 @@ pub(super) fn received(chat_jid: &str, message: ChatMessage, sender_name: Option
         chat_jid: chat_jid.into(),
         message: Box::new(message),
         sender_name: sender_name.map(str::to_string),
+        chat_name: None,
         notification_allowed: false,
         notification_title: None,
         notification_archived: None,
@@ -214,6 +215,60 @@ fn a_complete_reload_does_not_wipe_a_chat_it_has_never_held() {
     assert!(
         bridge.hub.chat("1@s.whatsapp.net").is_some(),
         "a live-only chat survives a reload that has never seen it"
+    );
+}
+
+/// An archived conversation is deliberately absent from the daemon's active
+/// snapshot. An offline message for it carries the store's archive answer and
+/// must not recreate the row before an archived page is explicitly requested.
+#[test]
+fn an_archived_message_does_not_enter_the_active_snapshot() {
+    let jid = "2@g.us";
+    let mut event = received(
+        jid,
+        message("m1", "3@lid", 10, false, false),
+        Some("Member"),
+    );
+    let UiEvent::MessageReceived {
+        notification_archived,
+        ..
+    } = &mut event
+    else {
+        unreachable!("received fixture is a message")
+    };
+    *notification_archived = Some(true);
+
+    let mut bridge = bridge();
+    bridge.observe(event);
+
+    assert!(
+        bridge.hub.chat(jid).is_none(),
+        "an archived message must not resurrect its chat in the active snapshot"
+    );
+}
+
+/// A message can arrive before the active page has hydrated the conversation.
+/// The store-backed conversation name must replace both a generated fallback
+/// and a participant label in the daemon snapshot.
+#[test]
+fn a_live_message_uses_its_durable_chat_name() {
+    let jid = "2@g.us";
+    let mut event = received(
+        jid,
+        message("m1", "3@lid", 10, false, false),
+        Some("Member"),
+    );
+    let UiEvent::MessageReceived { chat_name, .. } = &mut event else {
+        unreachable!("received fixture is a message")
+    };
+    *chat_name = Some("Example group".into());
+
+    let mut bridge = bridge();
+    bridge.observe(event);
+
+    assert_eq!(
+        bridge.hub.chat(jid).map(|chat| chat.name),
+        Some("Example group".into())
     );
 }
 

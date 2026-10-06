@@ -28,6 +28,7 @@
 //! let mut changes = chat_store.subscribe();
 //! ```
 
+mod contacts_text;
 mod error;
 #[cfg(feature = "search")]
 mod fts;
@@ -40,11 +41,17 @@ mod storage_proto;
 mod store;
 pub mod types;
 
+pub use contacts_text::shared_contacts_text;
 pub use error::{ChatStoreError, Result, db_err};
-pub use materialize::is_control_only;
+pub use materialize::{
+    is_control_only, message_kind, normalized_message, poll_creation_message,
+    supported_poll_creation_message,
+};
+pub use queries::MessageReadState;
 pub use store::ChatStore;
 pub use types::{
     ArrivalCursor, AvatarDescriptor, ChatCursor, ChatEntry, ChatNameExpected, ChatNameWrite,
-    ChatNotificationMetadata, ContactEntry, MediaRef, MessageCoverage, MessageCursor, MessageKind,
-    MessageStatus, ReactionEntry, ReceiptEntry, StoreChange, StoredMessage,
+    ChatNotificationMetadata, ContactEntry, GroupHierarchyWrite, MediaRef, MessageCoverage,
+    MessageCursor, MessageKind, MessageStatus, ReactionEntry, ReceiptEntry, StoreChange,
+    StoredMessage,
 };

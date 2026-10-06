@@ -100,10 +100,10 @@ pub(super) fn apply_receipt(
         }
     }
     // A modern peer addresses the receipt by whichever identity it has for
-    // the thread — LID receipts for PN-keyed rows or vice versa. Retry the
-    // misses under the mapped counterpart key (WA Web's alternate-key
-    // fallback, `fixMsgKeysWithPnMapping`); costs one indexed lookup and only
-    // on the miss path, so the already-consistent case stays free.
+    // the thread — LID receipts for PN-keyed rows or vice versa. Retry misses
+    // across the complete mapped alias component, including historical LIDs
+    // (WA Web's alternate-key fallback, `fixMsgKeysWithPnMapping`); this runs
+    // only on the miss path, so the already-consistent case stays free.
     //
     // Where a message answers under the counterpart key, its receipt belongs
     // there too: the satellite prune is per chat and drops receipt rows whose
@@ -117,17 +117,29 @@ pub(super) fn apply_receipt(
     // Resolved only when something actually missed, so a receipt whose messages
     // all answered under the key they were addressed by pays nothing extra —
     // which is the overwhelmingly common case and the one worth keeping free.
-    let counterpart = if missed.is_empty() || receipt.source.chat.is_group() {
-        None
+    let counterparts = if missed.is_empty() || receipt.source.chat.is_group() {
+        Vec::new()
     } else {
-        crate::lid::counterpart_chat_key(conn, device_id, &chat)?
+        crate::lid::chat_key_candidates(conn, device_id, &chat)?
+            .into_iter()
+            .filter(|candidate| candidate != &chat)
+            .collect()
     };
+    let mut relocated_keys = Vec::new();
     for msg_id in missed {
-        if let Some(alt) = &counterpart
-            && advance_status(conn, device_id, alt, msg_id, status)?
-        {
-            wrote = true;
-            relocated.insert(msg_id, alt.clone());
+        let mut advanced_elsewhere = false;
+        for alt in &counterparts {
+            if advance_status(conn, device_id, alt, msg_id, status)? {
+                wrote = true;
+                relocated.insert(msg_id, alt.clone());
+                if !relocated_keys.contains(alt) {
+                    relocated_keys.push(alt.clone());
+                }
+                advanced_elsewhere = true;
+                break;
+            }
+        }
+        if advanced_elsewhere {
             continue;
         }
         // The status not advancing does not mean the row is missing: a replayed
@@ -143,22 +155,22 @@ pub(super) fn apply_receipt(
         if message_exists(conn, device_id, &chat, msg_id)? {
             continue;
         }
-        if let Some(alt) = &counterpart
-            && message_exists(conn, device_id, alt, msg_id)?
-        {
+        let mut found_elsewhere = None;
+        for alt in &counterparts {
+            if message_exists(conn, device_id, alt, msg_id)? {
+                found_elsewhere = Some(alt);
+                break;
+            }
+        }
+        if let Some(alt) = found_elsewhere {
             relocated.insert(msg_id, alt.clone());
+            if !relocated_keys.contains(alt) {
+                relocated_keys.push(alt.clone());
+            }
         } else {
             unowned.push(msg_id);
         }
     }
-    // Held back until the batch is known to have written something: the
-    // counterpart key is only interesting to a subscriber if a row under it
-    // moved, and a replay relocates without touching anything.
-    let alt_key = if relocated.is_empty() {
-        None
-    } else {
-        counterpart
-    };
 
     // Both chat kinds record the per-state rows. A group needs them to say who
     // has read; a 1:1 needs them because the message's own `status` keeps only
@@ -185,9 +197,7 @@ pub(super) fn apply_receipt(
 
     if wrote {
         cs.message_chats.insert(chat);
-        if let Some(alt) = alt_key {
-            cs.message_chats.insert(alt);
-        }
+        cs.message_chats.extend(relocated_keys);
     }
     Ok(())
 }

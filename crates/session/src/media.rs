@@ -23,8 +23,9 @@ pub fn named_image_format(data: &[u8]) -> Option<ImageFormat> {
 
 /// The formats this build decodes: the four WhatsApp's own clients accept.
 ///
-/// A picture in any other format is still sent — with its bytes untouched
-/// and its type corrected — but never decoded here.
+/// Other formats are never decoded here. The outbound preparation either
+/// converts a supported native format or refuses an inline photo before
+/// upload; an explicit document keeps its original bytes.
 pub fn allowed_image_format(data: &[u8]) -> Option<ImageFormat> {
     named_image_format(data).filter(|format| {
         matches!(

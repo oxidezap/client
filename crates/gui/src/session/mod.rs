@@ -1094,24 +1094,6 @@ impl SessionHandle {
         );
     }
 
-    pub fn edit_message(
-        &self,
-        jid: String,
-        message_id: String,
-        new_text: String,
-    ) -> oneshot::Receiver<Result<(), Failure>> {
-        let (tx, rx) = oneshot::channel();
-        self.ask(
-            ClientRequest::EditMessage(EditMessage {
-                jid,
-                message_id,
-                new_text,
-            }),
-            Awaiting::Mutation(tx),
-        );
-        rx
-    }
-
     pub fn revoke_message(
         &self,
         jid: String,
@@ -1310,6 +1292,26 @@ impl SessionHandle {
             jid: jid.to_string(),
             composing,
         }));
+    }
+
+    /// Edit a sent message and await the daemon's correlated durable result.
+    /// Refusal and disconnect are returned to the composer for retry.
+    pub fn edit_message(
+        &self,
+        jid: String,
+        message_id: String,
+        new_text: String,
+    ) -> oneshot::Receiver<Result<(), Failure>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::EditMessage(EditMessage {
+                jid,
+                message_id,
+                new_text,
+            }),
+            Awaiting::Mutation(tx),
+        );
+        rx
     }
 
     /// React to a message, or remove our reaction with an empty emoji.

@@ -14,11 +14,13 @@ mod chat_rows;
 mod contacts;
 mod edit;
 mod event;
+mod group_hierarchy;
 mod history_sync;
 mod inbound;
+pub(crate) mod message_identity;
 mod message_rows;
 mod reaction;
-mod read_state;
+pub(crate) mod read_state;
 mod receipt;
 mod revoke;
 mod writer;
@@ -33,7 +35,7 @@ use wacore::store::error::StoreError;
 use wacore::types::events::{
     BatchOrigin, Event, EventHandler, EventInterest, EventKind, InboundMessage, MessageBatch,
 };
-use wacore_binary::Jid;
+use wacore_binary::{Jid, JidExt as _};
 use waproto::whatsapp as wa;
 use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
 
@@ -44,7 +46,7 @@ use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
 use crate::error::db_err;
 use crate::error::{ChatStoreError, Result};
 use crate::materialize::{extract_text, message_kind};
-use crate::types::{ChatNameWrite, StoreChange};
+use crate::types::{ChatNameWrite, GroupHierarchyWrite, StoreChange};
 
 // Reachable at the paths they had while this was one file, so the rest of the
 // crate names them the same way.
@@ -84,6 +86,8 @@ pub(crate) enum WriterMsg {
     Revoke {
         chat: Jid,
         target_id: String,
+        target_from_me: bool,
+        target_participant: String,
         timestamp_ms: i64,
     },
     Reaction {
@@ -95,11 +99,15 @@ pub(crate) enum WriterMsg {
         timestamp_ms: i64,
     },
     Reconcile(Jid),
+    ReconcileAll,
+    ReconcileMappings(Vec<(String, String)>),
     /// Display names resolved from server metadata (group subjects,
     /// channel names) for chats whose rows hold NULL. Written only when a
     /// name is news — like the group-subject arm — so a pass that learned
     /// nothing broadcasts nothing and the debounced reload stays quiet.
     ChatNames(Vec<ChatNameWrite>),
+    /// Authoritative, typed community relationships read from group overviews.
+    GroupHierarchies(Vec<GroupHierarchyWrite>),
     SendFailed {
         chat: Jid,
         msg_id: String,
@@ -195,6 +203,7 @@ impl EventHandler for ChatStoreHandler {
             EventKind::UndecryptableMessage,
             EventKind::HistorySync,
             EventKind::ContactUpdate,
+            EventKind::ContactRemoved,
             EventKind::PinUpdate,
             EventKind::MuteUpdate,
             EventKind::ArchiveUpdate,
@@ -288,6 +297,94 @@ struct MigrationCount {
     count: i64,
 }
 
+#[derive(diesel::QueryableByName)]
+struct UnknownKindRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    device_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    chat_jid: String,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    proto: Vec<u8>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    proto_codec: i32,
+}
+
+#[derive(diesel::QueryableByName)]
+struct MetadataValue {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
+}
+
+/// One-time, classifier-versioned repair. Candidate rows are loaded in bounded
+/// id pages, and the marker is committed with the updates so an interrupted
+/// pass rolls back rather than leaving a half-repaired database.
+fn repair_unknown_message_kinds(conn: &mut diesel::SqliteConnection) -> QueryResult<()> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    const KEY: &str = "message_kind_classifier";
+    const VERSION: &str = "2026-09-24-v1";
+    conn.transaction(|conn| {
+        let version = diesel::sql_query("SELECT value FROM chat_store_meta WHERE key = ?")
+            .bind::<Text, _>(KEY)
+            .get_result::<MetadataValue>(conn)
+            .optional()?;
+        if version.is_some_and(|v| v.value == VERSION) {
+            return Ok(());
+        }
+
+        let mut after_id = 0_i64;
+        loop {
+            let rows = diesel::sql_query(
+                "SELECT id, device_id, chat_jid, proto, proto_codec FROM messages \
+                 WHERE id > ? AND kind = 'unknown' AND revoked = 0 AND proto IS NOT NULL \
+                 ORDER BY id LIMIT 256",
+            )
+            .bind::<BigInt, _>(after_id)
+            .load::<UnknownKindRow>(conn)?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut affected_chats = std::collections::HashSet::new();
+            for row in rows {
+                after_id = row.id;
+                let Ok(message) =
+                    crate::storage_proto::decode_storage_proto(&row.proto, row.proto_codec)
+                else {
+                    continue;
+                };
+                let kind = crate::materialize::message_kind(&message);
+                if kind == "unknown" {
+                    continue;
+                }
+                let text = crate::materialize::extract_text(
+                    crate::materialize::normalized_message(&message),
+                );
+                diesel::sql_query(
+                    "UPDATE messages SET kind = ?, text_content = ? \
+                     WHERE id = ? AND kind = 'unknown' AND revoked = 0",
+                )
+                .bind::<Text, _>(kind)
+                .bind::<Nullable<Text>, _>(text)
+                .bind::<BigInt, _>(row.id)
+                .execute(conn)?;
+                affected_chats.insert((row.device_id, row.chat_jid));
+            }
+            for (device_id, chat) in affected_chats {
+                chat_rows::recompute_chat_preview(conn, device_id, &chat)?;
+            }
+        }
+        diesel::sql_query(
+            "INSERT INTO chat_store_meta (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind::<Text, _>(KEY)
+        .bind::<Text, _>(VERSION)
+        .execute(conn)?;
+        Ok(())
+    })
+}
+
 impl ChatStore {
     /// Prepare the shared chat schema once before account runtimes start.
     ///
@@ -304,6 +401,7 @@ impl ChatStore {
             conn.run_pending_migrations(MIGRATIONS)
                 .map(|_| ())
                 .map_err(StoreError::Migration)?;
+            repair_unknown_message_kinds(conn).map_err(crate::error::db_err)?;
             #[cfg(feature = "search")]
             crate::fts::ensure_fts(conn).map_err(db_err)?;
             Ok(())
@@ -313,13 +411,26 @@ impl ChatStore {
     }
 
     /// Open the already-prepared database on the same file as `store`, bound to
-    /// its device id, and start the writer task.
+    /// its device id, repair proven legacy message duplicates when the mapping
+    /// ledger has advanced, and start the writer task.
     ///
+    /// The per-device mapping-revision marker avoids repeating the device-wide pass;
+    /// newly learned aliases use a scoped writer request. Repairs are
+    /// transactional; a tombstone wins, and previews/unread are re-derived.
     /// This is the entry point for a runtime after the registry has called
     /// [`Self::prepare`]. It does not launch another migration runner.
     pub async fn new_prepared(store: &SqliteStore) -> Result<Arc<Self>> {
         let db = store.shared();
         let device_id = store.device_id();
+        db.run(move |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                let mut changes = ChangeSet::default();
+                crate::store::message_identity::reconcile_startup(conn, device_id, &mut changes)?;
+                Ok(())
+            })
+            .map_err(crate::error::db_err)
+        })
+        .await?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
@@ -420,13 +531,13 @@ impl ChatStore {
         message: &wa::Message,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
-        let base = wacore::proto_helpers::MessageExt::get_base_message(message);
+        let base = crate::materialize::normalized_message(message);
         self.tx
             .send(WriterMsg::Outgoing {
                 chat: chat.clone(),
                 msg_id: msg_id.into(),
                 proto: waproto::codec::message_to_vec(message),
-                kind: message_kind(base),
+                kind: message_kind(message),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
@@ -447,13 +558,13 @@ impl ChatStore {
         new_content: &wa::Message,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
-        let base = wacore::proto_helpers::MessageExt::get_base_message(new_content);
+        let base = crate::materialize::normalized_message(new_content);
         self.tx
             .send(WriterMsg::Edit {
                 chat: chat.clone(),
                 target_id: target_id.to_owned(),
                 proto: waproto::codec::message_to_vec(new_content),
-                kind: message_kind(base),
+                kind: message_kind(new_content),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
@@ -555,10 +666,58 @@ impl ChatStore {
         target_id: &str,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
+        self.record_revoke_target(
+            chat,
+            &wa::MessageKey {
+                id: Some(target_id.to_owned()),
+                from_me: Some(true),
+                ..Default::default()
+            },
+            timestamp,
+        )
+    }
+
+    /// Record a revoke this client sent, including an administrator deleting
+    /// another group member's message. `target` names the original message's
+    /// author, not the administrator who sent the revoke.
+    ///
+    /// A target id is required. Received group and broadcast messages require
+    /// their participant; a received direct message defaults to the chat's peer.
+    /// Goes through the writer queue; use [`flush`](Self::flush) to await
+    /// completion. Delayed content cannot resurrect the tombstone.
+    pub fn record_revoke_target(
+        &self,
+        chat: &Jid,
+        target: &wa::MessageKey,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        let target_id = target
+            .id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ChatStoreError::Store(StoreError::Validation(
+                    "revoke target key missing id".into(),
+                ))
+            })?;
+        let target_from_me = target.from_me.unwrap_or(false);
+        let target_participant = if target_from_me {
+            String::new()
+        } else if let Some(participant) = target.participant.as_ref().filter(|p| !p.is_empty()) {
+            participant.clone()
+        } else if chat.is_group() || chat.is_status_broadcast() || chat.is_broadcast_list() {
+            return Err(ChatStoreError::Store(StoreError::Validation(
+                "received multi-author revoke target key missing participant".into(),
+            )));
+        } else {
+            chat.to_string()
+        };
         self.tx
             .send(WriterMsg::Revoke {
                 chat: chat.clone(),
-                target_id: target_id.to_owned(),
+                target_id: target_id.clone(),
+                target_from_me,
+                target_participant,
                 timestamp_ms: timestamp.timestamp_millis(),
             })
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
@@ -627,18 +786,37 @@ impl ChatStore {
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
-    /// Reconcile a 1:1 peer's PN- and LID-keyed rows into a single thread.
+    /// Reconcile proven duplicate authors in a chat and, for a 1:1 peer,
+    /// merge every PN- and LID-keyed thread in the known alias component.
     ///
-    /// Receipts dropped under the wrong identity (before this crate resolved
-    /// PN/LID aliases) left some stores with a split pair: a populated chat
-    /// under the phone-number key plus a stray `@lid` twin. Live traffic for
-    /// the peer now heals such a pair on its own; this makes the repair
-    /// on-demand for embedders that want it eagerly. Idempotent — a peer with
-    /// one thread (or no LID mapping yet) is a no-op. Goes through the writer
-    /// queue; use [`flush`](Self::flush) to await completion.
+    /// Receipts dropped under the wrong identity left some stores with a
+    /// split pair: a populated chat under the phone-number key plus a stray
+    /// `@lid` twin. Live traffic heals known pairs on its own; this makes the
+    /// repair on-demand for embedders that want it eagerly. Idempotent —
+    /// unknown aliases and distinct authors are never guessed together. Goes
+    /// through the writer queue; use [`flush`](Self::flush) to await completion.
     pub fn reconcile_chat(&self, chat: &Jid) -> Result<()> {
         self.tx
             .send(WriterMsg::Reconcile(chat.clone()))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Reconcile legacy message identities after the account learns new PN/LID
+    /// mappings. Use [`flush`](Self::flush) to await the transaction.
+    pub fn reconcile_message_mappings(&self, mappings: &[(String, String)]) -> Result<()> {
+        if mappings.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::ReconcileMappings(mappings.to_vec()))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Reconcile all stored message identities explicitly. Use [`flush`](Self::flush)
+    /// to await the transaction; startup and learned mappings use scoped repairs.
+    pub fn reconcile_all_messages(&self) -> Result<()> {
+        self.tx
+            .send(WriterMsg::ReconcileAll)
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
@@ -687,6 +865,20 @@ impl ChatStore {
         }
         self.tx
             .send(WriterMsg::ChatNames(names))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Apply a batch of authoritative group hierarchy results.
+    ///
+    /// Each write compares against the hierarchy observed before its lookup.
+    /// A changed hierarchy is persisted atomically and invalidates the chat
+    /// list; unknown or stale results never clear an existing relationship.
+    pub fn apply_group_hierarchies(&self, writes: Vec<GroupHierarchyWrite>) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::GroupHierarchies(writes))
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
@@ -791,6 +983,42 @@ mod migration_tests {
         assert!(has_column(&store, "messages", "id").await);
     }
 
+    /// The backend and chat store share a ledger. A newer backend migration
+    /// must neither prevent a chat-store downgrade nor be reverted by it.
+    fn revert_last_chat_migration(
+        conn: &mut diesel::SqliteConnection,
+    ) -> std::result::Result<(), StoreError> {
+        use diesel::migration::{Migration, MigrationSource};
+        use diesel::sqlite::Sqlite;
+
+        let migrations: Vec<Box<dyn Migration<Sqlite>>> =
+            MIGRATIONS.migrations().map_err(StoreError::Migration)?;
+        let applied = conn.applied_migrations().map_err(StoreError::Migration)?;
+        let backend_versions = |versions: &[diesel::migration::MigrationVersion<'_>]| {
+            versions
+                .iter()
+                .filter(|version| !migrations.iter().any(|m| m.name().version() == **version))
+                .map(|version| version.as_owned())
+                .collect::<Vec<_>>()
+        };
+        let backend_before = backend_versions(&applied);
+        let migration = migrations
+            .iter()
+            .filter(|migration| applied.contains(&migration.name().version()))
+            .max_by(|a, b| a.name().version().cmp(&b.name().version()))
+            .expect("an applied chat-store migration remains");
+        let result = conn
+            .revert_migration(migration.as_ref())
+            .map(|_| ())
+            .map_err(StoreError::Migration);
+        assert_eq!(
+            backend_versions(&conn.applied_migrations().map_err(StoreError::Migration)?),
+            backend_before,
+            "a chat-store downgrade must preserve every backend migration"
+        );
+        result
+    }
+
     #[tokio::test]
     async fn stable_id_downgrade_round_trips_then_sender_identity_refuses() {
         let store = SqliteStore::new(&format!(
@@ -801,16 +1029,61 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // The current top migration only tracks which source last supplied
-        // mute/archive preferences. Revert it first so the historical
-        // downgrade assertions below still start at account-cascade.
+        assert!(has_column(&store, "messages", "local_revoke_placeholder").await);
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
+            .await
+            .expect("local-revoke-placeholder downgrade is reversible");
+        assert!(!has_column(&store, "messages", "local_revoke_placeholder").await);
+
+        // The typed hierarchy column is followed by chat-name provenance,
+        // then the pending-alias queue, classifier metadata, and identity-
+        // repair state before the older tested migration edges.
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("community-hierarchy downgrade is reversible");
+        assert!(!has_column(&store, "chats", "group_hierarchy").await);
+
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("chat-name-provenance downgrade is reversible");
+        assert!(!has_column(&store, "chats", "name_from_address_book").await);
+        assert!(!has_column(&store, "chats", "address_book_fallback").await);
+        assert!(!has_table(&store, "contact_name_removals").await);
+
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("identity-repair queue downgrade is reversible");
+        assert!(!has_table(&store, "message_identity_repair_pending").await);
+        assert!(has_table(&store, "message_identity_repair_state").await);
+
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("message-kind repair metadata downgrade is reversible");
+        assert!(!has_table(&store, "chat_store_meta").await);
+
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("identity-repair marker downgrade is reversible");
+        assert!(!has_table(&store, "message_identity_repair_state").await);
+
+        // The next migration tracks which source last supplied mute/archive
+        // preferences. Revert it so the historical assertions start at
+        // account-cascade.
+        store
+            .shared()
+            .run(revert_last_chat_migration)
             .await
             .expect("preference-provenance downgrade is reversible");
         assert!(!has_column(&store, "chats", "mute_appstate_seen").await);
@@ -822,11 +1095,7 @@ mod migration_tests {
         // the constraint, which loses nothing durable.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("account-cascade follow-up downgrade is reversible");
         assert!(
@@ -840,11 +1109,7 @@ mod migration_tests {
         // honest answer rather than a failed revert.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("revert the reversible labels migration");
         assert!(!has_table(&store, "contact_labels").await);
@@ -854,11 +1119,7 @@ mod migration_tests {
         // refetches.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("avatar-descriptor downgrade is reversible");
         assert!(!has_table(&store, "avatar_descriptors").await);
@@ -867,11 +1128,7 @@ mod migration_tests {
         // (without the `id`/`proto_codec` columns) rather than failing.
         store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect("stable-id downgrade is reversible");
         assert_eq!(table_count(&store).await, 1);
@@ -883,11 +1140,7 @@ mod migration_tests {
         // still refuses.
         let error = store
             .shared()
-            .run(|conn| {
-                conn.revert_last_migration(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(StoreError::Migration)
-            })
+            .run(revert_last_chat_migration)
             .await
             .expect_err("irreversible migration must reject downgrade");
         assert!(error.to_string().contains("migration"));
@@ -971,6 +1224,17 @@ mod migration_tests {
         store_a.create_new_device().await.expect("create device A");
         store_b.create_new_device().await.expect("create device B");
         ChatStore::new(&store_a).await.expect("run migrations");
+        use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+        store_a
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "111000011112222".into(),
+                phone_number: "559900000001".into(),
+                created_at: 1,
+                updated_at: 1,
+                learning_source: "test".into(),
+            })
+            .await
+            .expect("insert mapping with pending repair");
 
         store_a
             .shared()

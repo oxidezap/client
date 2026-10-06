@@ -59,7 +59,7 @@ impl WhatsAppApp {
 
     /// Whether accepting another dropped or pasted file would waste a read.
     pub(crate) fn incoming_files_busy(&self) -> bool {
-        self.paste_preview.is_some() || self.incoming_file_reading
+        self.edit_draft.is_some() || self.paste_preview.is_some() || self.incoming_file_reading
     }
 
     /// Complete the read only for the account that began it. An old read
@@ -107,7 +107,11 @@ impl WhatsAppApp {
     /// nothing would read as the window swallowing the file.
     pub(crate) fn warn_preview_busy(&mut self, cx: &mut Context<Self>) {
         self.notify_user(
-            "Finish or cancel the pending file first, then drop again.",
+            if self.edit_draft.is_some() {
+                "Finish editing the message before adding a file."
+            } else {
+                "Finish or cancel the pending file first, then drop again."
+            },
             notices::Tone::Problem,
             cx,
         );
@@ -451,10 +455,16 @@ fn echo_of(
     match kind {
         OutgoingMedia::Image => {
             let (width, height) = image_size(&file.bytes);
+            let actual_mime = crate::platform::picker::image_mime_from_bytes(&file.bytes);
+            let drawable = crate::platform::picker::previewable_image_mime(&file.bytes).is_some();
             MediaContent::image(
-                Arc::new(file.bytes.clone()),
-                file.mime_type.clone(),
-                // These *are* the picture, so nothing is left to fetch.
+                Arc::new(if drawable {
+                    file.bytes.clone()
+                } else {
+                    Vec::new()
+                }),
+                actual_mime.unwrap_or(&file.mime_type).to_string(),
+                // A native-convertible source gets its JPEG from the daemon.
                 false,
             )
             .with_size(width, height)
@@ -496,23 +506,33 @@ mod tests {
     use super::echo_of;
     use crate::platform::picker::{Picked, kind_for};
 
-    /// A file of this type, with bytes that are nothing in particular: what is
-    /// being asserted is what the *type* decides, and no branch here reads a
-    /// byte of a document.
+    /// Document bytes need no signature; photo echoes must match real bytes.
     fn picked(file_name: &str, mime_type: &str) -> Picked {
-        Picked::automatic(file_name.to_string(), mime_type.to_string(), vec![0; 4096])
+        let mut bytes = vec![0; 4096];
+        let signature: &[u8] = match mime_type {
+            "image/jpeg" => b"\xff\xd8\xff",
+            "image/png" => b"\x89PNG\r\n\x1a\n",
+            "image/gif" => b"GIF89a",
+            "image/webp" => b"RIFF\0\0\0\0WEBP",
+            _ => b"",
+        };
+        bytes[..signature.len()].copy_from_slice(signature);
+        Picked::automatic(file_name.to_string(), mime_type.to_string(), bytes)
     }
 
     #[test]
     fn a_picture_nothing_draws_is_sent_and_echoed_as_a_document() {
-        for undrawable in [
-            "image/svg+xml",
-            "image/heic",
-            "image/heif",
-            "image/avif",
-            "image/tiff",
-            "image/bmp",
-        ] {
+        let mut undrawable = vec!["image/svg+xml"];
+        if !cfg!(target_os = "macos") {
+            undrawable.extend([
+                "image/heic",
+                "image/heif",
+                "image/avif",
+                "image/tiff",
+                "image/bmp",
+            ]);
+        }
+        for undrawable in undrawable {
             let file = picked("desenho", undrawable);
             let kind = kind_for(&file.mime_type);
             assert_eq!(kind, OutgoingMedia::Document, "{undrawable}");
@@ -539,6 +559,7 @@ mod tests {
             assert_eq!(echo.data.len(), file.bytes.len(), "{photo}");
         }
     }
+
     #[test]
     fn explicit_document_kind_wins_even_when_the_mime_is_an_image() {
         let mut file = picked("photo.jpg", "image/jpeg");
@@ -546,5 +567,20 @@ mod tests {
         let echo = echo_of(&file, file.kind);
         assert_eq!(echo.media_type, MediaType::Document);
         assert!(echo.data.is_empty());
+    }
+
+    #[test]
+    fn optimistic_echo_uses_image_bytes_not_a_wrong_declared_mime() {
+        let mut png = picked("wrong.jpg", "image/jpeg");
+        png.bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let echo = echo_of(&png, OutgoingMedia::Image);
+        assert_eq!(echo.mime_type, "image/png");
+        assert_eq!(echo.data.as_slice(), png.bytes.as_slice());
+
+        let mut heic = picked("wrong.jpg", "image/jpeg");
+        heic.bytes[..12].copy_from_slice(b"\0\0\0\x18ftypheic");
+        let echo = echo_of(&heic, OutgoingMedia::Image);
+        assert_eq!(echo.mime_type, "image/heic");
+        assert!(echo.data.is_empty(), "JPEG cannot render HEIC bytes");
     }
 }

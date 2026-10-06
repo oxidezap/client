@@ -22,6 +22,9 @@ pub struct ChatMessage {
     pub sender_name: Option<String>,
     /// Message text content
     pub content: String,
+    /// Whether the body is text rather than a projection of another message kind.
+    #[serde(default)]
+    pub is_text: bool,
     /// When the message was sent/received
     pub timestamp: DateTime<Utc>,
     /// Whether this message was sent by the current user
@@ -49,8 +52,7 @@ pub struct ChatMessage {
     /// deleted update to watch — should not have to recognise a sentence.
     #[serde(default, skip_serializing_if = "is_false")]
     pub revoked: bool,
-    /// Whether the durable store has accepted an edit of this message.
-    /// The store retains the timestamp and ordering; the UI needs only this fact.
+    /// The store has accepted at least one edit to this message.
     #[serde(default, skip_serializing_if = "is_false")]
     pub edited: bool,
     /// Set when nobody typed this: a call record, a group change. Such a row
@@ -114,6 +116,7 @@ impl ChatMessage {
             sender: "Me".to_string(),
             sender_name: None,
             content,
+            is_text: true,
             timestamp: wacore::time::now_utc(),
             is_from_me: true,
             is_read: false,
@@ -132,6 +135,7 @@ impl ChatMessage {
     pub fn new_outgoing_with_media(id: String, content: String, media: MediaContent) -> Self {
         Self {
             media: Some(media),
+            is_text: false,
             ..Self::new_outgoing(id, content)
         }
     }
@@ -144,6 +148,7 @@ impl ChatMessage {
             sender,
             sender_name: None,
             content,
+            is_text: true,
             timestamp: wacore::time::now_utc(),
             is_from_me: false,
             is_read: false,

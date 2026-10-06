@@ -53,6 +53,16 @@ cd oxidezap-nightly-linux-x86_64
 ./oxidezap
 ```
 
+On Linux, run `./install-desktop.sh` from the extracted archive to install a
+launcher and icon for your user. Keep that directory in place: the launcher
+points to its GUI binary. X11 also receives an embedded window icon; Wayland
+uses the installed launcher whose ID matches the window. The installer requires
+`iconv` and an archive path encoded as UTF-8; newline, `=` and `%` characters
+are rejected because they cannot reliably be represented in its desktop entry.
+For a source build,
+copy `packaging/linux/install-desktop.sh` and
+`packaging/linux/org.oxidezap.client.local.png` beside the three binaries first.
+
 The web front end ships beside them as `oxidezap-<version>-web.zip`: static
 files to serve from any web server, with hosting notes in the archive.
 

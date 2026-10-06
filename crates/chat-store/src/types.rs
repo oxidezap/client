@@ -22,6 +22,10 @@ pub enum MessageKind {
     Contact,
     Location,
     Poll,
+    /// Parent for a grouped album; child media rows carry their own kinds.
+    Album,
+    /// WhatsApp product/catalog message.
+    Product,
     Event,
     GroupInvite,
     /// Hydrated business template (WABA notification).
@@ -56,6 +60,11 @@ pub enum MessageKind {
 }
 
 impl MessageKind {
+    /// Classify a WhatsApp message with the chat store's persisted vocabulary.
+    pub fn of(message: &wa::Message) -> Self {
+        Self::from_db(crate::materialize::message_kind(message).to_owned())
+    }
+
     /// The database label. Stable: these are on-disk values.
     pub fn as_str(&self) -> &str {
         match self {
@@ -70,6 +79,8 @@ impl MessageKind {
             Self::Contact => "contact",
             Self::Location => "location",
             Self::Poll => "poll",
+            Self::Album => "album",
+            Self::Product => "product",
             Self::Event => "event",
             Self::GroupInvite => "group_invite",
             Self::Template => "template",
@@ -113,6 +124,8 @@ impl MessageKind {
             "contact" => Self::Contact,
             "location" => Self::Location,
             "poll" => Self::Poll,
+            "album" => Self::Album,
+            "product" => Self::Product,
             "event" => Self::Event,
             "group_invite" => Self::GroupInvite,
             "template" => Self::Template,
@@ -233,6 +246,11 @@ pub struct ChatEntry {
     pub muted_until: Option<DateTime<Utc>>,
     pub archived: bool,
     pub ephemeral_expiration: Option<u32>,
+    /// Server-reported community relationship; `None` is unknown or unreadable.
+    pub group_hierarchy: Option<oxidezap_core::GroupHierarchy>,
+    /// Original database value retained so an older client can CAS-replace an
+    /// unrecognized future role after fetching a fresh authoritative overview.
+    pub group_hierarchy_json: Option<String>,
 }
 
 /// The durable chat metadata a live message needs before it can alert.
@@ -266,6 +284,8 @@ pub struct StoredMessage {
     pub starred: bool,
     pub edited_at: Option<DateTime<Utc>>,
     pub revoked: bool,
+    /// A locally created tombstone that never contributed to unread counts.
+    pub local_revoke_placeholder: bool,
     /// Arrival order within this store, ascending. Opaque: compare it, don't
     /// interpret it. It exists because the server's `t` is whole seconds, so
     /// two messages exchanged in the same second carry the same `timestamp`
@@ -507,6 +527,48 @@ pub enum ChatNameExpected {
     /// unconditionally (a same-value write is still a no-op broadcast).
     /// For direct setters, not for passes racing live renames.
     Any,
+}
+
+/// One authoritative group overview and the hierarchy observed before its
+/// network request. The CAS prevents an older answer from replacing metadata
+/// written by a newer lookup; no row is created by this enrichment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupHierarchyWrite {
+    pub jid: Jid,
+    /// Exact JSON read before the lookup; `None` means the SQL column was NULL.
+    pub expected_json: Option<String>,
+    pub hierarchy: oxidezap_core::GroupHierarchy,
+}
+
+impl GroupHierarchyWrite {
+    /// A typed overview captured against the hierarchy currently in storage.
+    pub fn checked(
+        jid: Jid,
+        expected: Option<oxidezap_core::GroupHierarchy>,
+        hierarchy: oxidezap_core::GroupHierarchy,
+    ) -> Self {
+        Self::checked_json(
+            jid,
+            expected
+                .map(|expected| serde_json::to_string(&expected).expect("hierarchy serializes")),
+            hierarchy,
+        )
+    }
+
+    /// A typed overview captured against the exact stored JSON, including a
+    /// value this client cannot deserialize. The CAS can then recover rather
+    /// than leaving future metadata permanently stuck in storage.
+    pub fn checked_json(
+        jid: Jid,
+        expected_json: Option<String>,
+        hierarchy: oxidezap_core::GroupHierarchy,
+    ) -> Self {
+        Self {
+            jid,
+            expected_json,
+            hierarchy,
+        }
+    }
 }
 
 impl ChatNameWrite {

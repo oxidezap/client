@@ -14,9 +14,13 @@ use crate::store::chat_rows::{
     ChatBump, bump_chat, chat_row, delete_chat_rows, ensure_chat, recompute_chat_preview,
     remaining_messages,
 };
-use crate::store::contacts::upsert_contact_names;
+use crate::store::contacts::{
+    clear_contact_names, clear_contact_removal_tombstones, update_address_book_chat_names,
+    upsert_contact_names,
+};
 use crate::store::history_sync::apply_history_sync;
 use crate::store::inbound::apply_inbound;
+use crate::store::message_identity::resolve_target;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message, message_row};
 use crate::store::read_state::{
     UNREAD_MARKER, advance_read_state, clear_unread_marker, count_uncovered_incoming, count_unread,
@@ -68,6 +72,7 @@ pub(super) fn apply_event(
                     starred: false,
                     overwrite: false,
                 },
+                cs,
             )?;
             // A duplicate placeholder (or one for an id that was already
             // recovered/revoked) must neither recount nor blank the preview.
@@ -91,6 +96,7 @@ pub(super) fn apply_event(
         }
         Event::HistorySync(lazy) => apply_history_sync(conn, device_id, lazy, cs),
         Event::ContactUpdate(update) => {
+            clear_contact_removal_tombstones(conn, device_id, &update.jid.to_string())?;
             upsert_contact_names(
                 conn,
                 device_id,
@@ -98,7 +104,21 @@ pub(super) fn apply_event(
                 update.action.full_name.as_deref(),
                 update.action.first_name.as_deref(),
             )?;
+            cs.chats |= update_address_book_chat_names(
+                conn,
+                device_id,
+                &update.jid.to_string(),
+                update.action.full_name.as_deref(),
+                update.action.first_name.as_deref(),
+            )?;
             cs.contacts = true;
+            Ok(())
+        }
+        Event::ContactRemoved(removed) => {
+            let (contacts_changed, chats_changed) =
+                clear_contact_names(conn, device_id, &removed.jid.to_string())?;
+            cs.contacts |= contacts_changed;
+            cs.chats |= chats_changed;
             Ok(())
         }
         // A group renamed is a fact about the chat row, not only a sentence
@@ -126,7 +146,11 @@ pub(super) fn apply_event(
                 return Ok(());
             }
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::name.eq(subject))
+                .set((
+                    schema::chats::name.eq(subject),
+                    schema::chats::name_from_address_book.eq(false),
+                    schema::chats::address_book_fallback.eq(None::<String>),
+                ))
                 .execute(conn)?;
             cs.chats = true;
             Ok(())
@@ -361,6 +385,18 @@ pub(super) fn apply_event(
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| chat.clone());
+            let Some(target) = resolve_target(
+                conn,
+                device_id,
+                &chat,
+                &update.message_id,
+                update.from_me,
+                &sender,
+                cs,
+            )?
+            else {
+                return Ok(());
+            };
             // Capture the victim's read state before it goes: deleting an
             // unread inbound row must also drop its badge (sentinel -1 and
             // already-read rows are untouched).
@@ -368,25 +404,17 @@ pub(super) fn apply_event(
             struct Victim {
                 #[diesel(sql_type = diesel::sql_types::Bool)]
                 from_me: bool,
+                #[diesel(sql_type = diesel::sql_types::Bool)]
+                local_revoke_placeholder: bool,
                 #[diesel(sql_type = diesel::sql_types::BigInt)]
                 timestamp_ms: i64,
             }
-            let victim: Option<Victim> = diesel::sql_query(
-                "SELECT from_me, timestamp_ms FROM messages \
-                 WHERE device_id = ? AND chat_jid = ? AND msg_id = ? \
-                   AND from_me = ? AND sender_jid = ? LIMIT 1",
+            let victim: Victim = diesel::sql_query(
+                "SELECT from_me, local_revoke_placeholder, timestamp_ms FROM messages WHERE device_id = ? AND id = ? LIMIT 1",
             )
             .bind::<diesel::sql_types::Integer, _>(device_id)
-            .bind::<diesel::sql_types::Text, _>(&chat)
-            .bind::<diesel::sql_types::Text, _>(&update.message_id)
-            .bind::<diesel::sql_types::Bool, _>(update.from_me)
-            .bind::<diesel::sql_types::Text, _>(if update.from_me { "" } else { sender.as_str() })
-            .load::<Victim>(conn)?
-            .into_iter()
-            .next();
-            if victim.is_none() {
-                return Ok(());
-            }
+            .bind::<diesel::sql_types::BigInt, _>(target.id)
+            .get_result(conn)?;
             let message_count: i64 = schema::messages::table
                 .filter(
                     schema::messages::device_id
@@ -396,21 +424,14 @@ pub(super) fn apply_event(
                 )
                 .count()
                 .get_result(conn)?;
-            diesel::sql_query(
-                "DELETE FROM messages WHERE device_id = ? AND chat_jid = ? \
-                 AND msg_id = ? AND from_me = ? AND sender_jid = ?",
-            )
-            .bind::<diesel::sql_types::Integer, _>(device_id)
-            .bind::<diesel::sql_types::Text, _>(&chat)
-            .bind::<diesel::sql_types::Text, _>(&update.message_id)
-            .bind::<diesel::sql_types::Bool, _>(update.from_me)
-            .bind::<diesel::sql_types::Text, _>(if update.from_me { "" } else { sender.as_str() })
-            .execute(conn)?;
-            if let Some(Victim {
-                from_me: false,
-                timestamp_ms: ts_ms,
-            }) = victim
-                && !read_state(conn, device_id, &chat)?.covers(ts_ms, &update.message_id)
+            diesel::sql_query("DELETE FROM messages WHERE device_id = ? AND id = ?")
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .bind::<diesel::sql_types::BigInt, _>(target.id)
+                .execute(conn)?;
+            if !victim.from_me
+                && !victim.local_revoke_placeholder
+                && !read_state(conn, device_id, &chat)?
+                    .covers(victim.timestamp_ms, &update.message_id)
             {
                 diesel::update(
                     chat_row(device_id, &chat).filter(schema::chats::unread_count.gt(0)),

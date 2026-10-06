@@ -2445,15 +2445,19 @@ impl WhatsAppClient {
     /// The call's own event stream: what the peer says about its video, and
     /// what the network says about ours.
     fn watch_call_events(handle: Arc<CallHandle>, calls: CallRegistry, ui_sender: UiEventSender) {
-        crate::exec::spawn(Self::run_call_events(handle, calls, ui_sender));
+        let Some(events) = handle.take_events() else {
+            warn!("call {}: event receiver already acquired", handle.call_id());
+            return;
+        };
+        crate::exec::spawn(Self::run_call_events(handle, events, calls, ui_sender));
     }
 
     async fn run_call_events(
         handle: Arc<CallHandle>,
+        events: async_channel::Receiver<CallEvent>,
         calls: CallRegistry,
         ui_sender: UiEventSender,
     ) {
-        let events = handle.events();
         let call_id = handle.call_id().to_string();
         while let Ok(event) = events.recv().await {
             match event {

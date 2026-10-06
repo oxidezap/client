@@ -34,8 +34,8 @@ use quote::render_quote;
 use reactions::{render_hover_actions, render_reaction_picker, render_reactions};
 
 use crate::app::{
-    BubbleIds, CopyMessage, DeleteSentMessage, EditSentMessage, OpenMessageLink, ReactToMessage,
-    ReplyToMessage, RetryMessage, WhatsAppApp, can_delete_sent, can_edit_sent,
+    BubbleIds, CopyMessage, DeleteSentMessage, EditMessage, OpenMessageLink, ReactToMessage,
+    ReplyToMessage, RetryMessage, WhatsAppApp, can_delete_sent,
 };
 use crate::components::parts;
 use crate::components::{BubbleText, bubble_status_ticks, render_rich_text};
@@ -60,6 +60,8 @@ pub struct BubbleProps {
     /// Which conversation this row is drawn in. A bubble does not carry it
     /// — the vote names the chat, so it travels in beside the message.
     pub chat_jid: SharedString,
+    /// Current message index used when text spans multiple bubbles.
+    pub selection_order: u64,
     /// Last vote requested here, not a confirmed vote.
     pub attempted_vote: Option<u32>,
     pub playing_message_id: Option<String>,
@@ -83,6 +85,8 @@ pub struct BubbleProps {
     pub playback_speed: f32,
     /// Whether this message's media is being fetched right now.
     pub is_downloading: bool,
+    /// Exact native file produced by this message's download, if still known.
+    pub saved_document_path: Option<std::path::PathBuf>,
     /// Whether the quick-react strip is open under this bubble. Travels
     /// with the row for the reason the ids do: reading the app here would
     /// re-enter the entity the virtual list already leased to build it.
@@ -130,6 +134,7 @@ pub fn render_message_bubble(
     let bubble_id = ids.bubble.clone();
     let content = &props.text;
     let time: SharedString = format_time_local(&message.timestamp).into();
+    let menu_message = message.clone();
     let status = message.delivery_in(props.is_own_number);
     let edited = message.edited && !message.revoked;
     let is_playing = props.playing_message_id.as_deref() == Some(message_id.as_str());
@@ -168,7 +173,6 @@ pub fn render_message_bubble(
     let menu_failed = can_retry;
     let menu_jid = props.chat_jid.clone();
     let now_ms = wacore::time::now_millis();
-    let menu_edit = can_edit_sent(&message, now_ms);
     let menu_delete_for_me = can_delete_sent(&message, false, now_ms);
     let menu_delete_for_everyone = can_delete_sent(&message, true, now_ms);
     // A refcount, not a rescan: the row's text already parsed these when the
@@ -288,6 +292,7 @@ pub fn render_message_bubble(
                                             playback_speed: props.playback_speed,
                                             is_downloading: props.is_downloading,
                                             is_preparing: props.is_preparing,
+                                            saved_document_path: props.saved_document_path.clone(),
                                             max_media_size: layout.max_media_size(),
                                         },
                                         cx,
@@ -320,7 +325,12 @@ pub fn render_message_bubble(
                                                     .min_w_0()
                                                     .text_size(metrics.text_body())
                                                     .text_color(cx.theme().foreground)
-                                                    .child(render_rich_text(content, cx)),
+                                                    .child(render_rich_text(
+                                                        content,
+                                                        ids.selection_key.clone(),
+                                                        props.selection_order,
+                                                        cx,
+                                                    )),
                                             )
                                         })
                                         .child(render_meta(
@@ -428,6 +438,14 @@ pub fn render_message_bubble(
             // same command. Tapping ours again takes it back, exactly as
             // the strip does.
             let mut menu = menu;
+            if crate::app::editing::can_edit_text(&menu_message, wacore::time::now_millis()) {
+                menu = menu.menu(
+                    "Edit",
+                    Box::new(EditMessage {
+                        id: menu_id.clone().into(),
+                    }),
+                );
+            }
             for emoji in WhatsAppApp::QUICK_REACTIONS {
                 let react_id = menu_id.clone();
                 menu = menu.menu(
@@ -463,15 +481,6 @@ pub fn render_message_bubble(
                     format!("Open {target}"),
                     Box::new(OpenMessageLink {
                         url: target.clone(),
-                    }),
-                );
-            }
-            if menu_edit {
-                menu = menu.separator().menu(
-                    "Edit",
-                    Box::new(EditSentMessage {
-                        jid: menu_jid.clone(),
-                        id: menu_id.clone().into(),
                     }),
                 );
             }

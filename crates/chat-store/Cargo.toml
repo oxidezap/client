@@ -26,7 +26,10 @@ flate2 = { workspace = true }
 chrono = { workspace = true, features = ["now"] }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
+# Legacy vCards can encode names using UTF-8 or a declared legacy charset.
+encoding_rs = "0.8"
 log = { workspace = true }
+oxidezap-core = { workspace = true }
 # The one executor this crate names, on both targets: `tokio::spawn` inside
 # the session's runtime, the page's own loop in a browser. See `src/spawn.rs`.
 oxidezap-platform = { workspace = true }

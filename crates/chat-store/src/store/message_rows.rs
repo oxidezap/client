@@ -5,6 +5,8 @@
 use diesel::prelude::*;
 
 use crate::schema;
+use crate::store::message_identity::{resolve_target, stored_sender};
+use crate::store::writer::ChangeSet;
 
 pub(super) struct NewMessage<'a> {
     pub(super) chat_jid: &'a str,
@@ -46,73 +48,49 @@ pub(super) fn insert_message(
     conn: &mut SqliteConnection,
     device_id: i32,
     new: NewMessage<'_>,
+    changes: &mut ChangeSet,
 ) -> QueryResult<StoredRow> {
     use schema::messages::dsl;
-    // Local optimistic rows do not carry a sender. Their ids still must not
-    // claim an inbound row that uses the same chat/id under its real sender.
-    if new.sender_jid.is_empty()
-        && diesel::select(diesel::dsl::exists(message_row(
-            device_id,
-            new.chat_jid,
-            new.msg_id,
-        )))
-        .get_result(conn)?
-    {
-        return Ok(StoredRow::Skipped);
-    }
-    let values = (
-        dsl::device_id.eq(device_id),
-        dsl::chat_jid.eq(new.chat_jid),
-        dsl::msg_id.eq(new.msg_id),
-        dsl::sender_jid.eq(new.sender_jid),
-        dsl::from_me.eq(new.from_me),
-        dsl::timestamp_ms.eq(new.timestamp_ms),
-        dsl::kind.eq(new.kind),
-        dsl::text_content.eq(new.text),
-        dsl::proto.eq(new.proto),
-        dsl::proto_codec.eq(new.proto_codec),
-        dsl::status.eq(new.status),
-        dsl::starred.eq(new.starred),
-    );
-    let inserted = diesel::insert_into(dsl::messages)
-        .values(values)
-        .on_conflict_do_nothing()
-        .execute(conn)?
-        > 0;
-    if inserted {
-        return Ok(StoredRow::Inserted);
-    }
-    if new.overwrite {
-        type ExistingMessage = (String, bool, Option<String>, Option<Vec<u8>>, i32);
-        let existing: Option<ExistingMessage> = message_row(device_id, new.chat_jid, new.msg_id)
-            .filter(dsl::sender_jid.eq(new.sender_jid))
+    let sender = stored_sender(new.sender_jid, new.from_me);
+    if let Some(existing) = resolve_target(
+        conn,
+        device_id,
+        new.chat_jid,
+        new.msg_id,
+        new.from_me,
+        &sender,
+        changes,
+    )? {
+        if !new.overwrite {
+            // History is a stale copy: live rows and placeholders win.
+            return Ok(StoredRow::Skipped);
+        }
+        type ExistingMessage = (bool, Option<String>, Option<Vec<u8>>, i32, Option<i64>);
+        let existing_content: ExistingMessage = dsl::messages
+            .filter(dsl::id.eq(existing.id))
             .select((
-                dsl::sender_jid,
                 dsl::revoked,
                 dsl::text_content,
                 dsl::proto,
                 dsl::proto_codec,
+                dsl::edited_at_ms,
             ))
-            .first(conn)
-            .optional()?;
-        if existing
-            .as_ref()
-            .is_some_and(|(sender, revoked, text, proto, codec)| {
-                sender == new.sender_jid
-                    && !revoked
-                    && text.as_deref() == new.text
-                    && proto.as_deref() == new.proto
-                    && *codec == new.proto_codec
-            })
+            .first(conn)?;
+        let (revoked, text, proto, codec, edited_at_ms) = existing_content;
+        if revoked
+            || edited_at_ms.is_some()
+            || (text.as_deref() == new.text
+                && proto.as_deref() == new.proto
+                && codec == new.proto_codec)
         {
             return Ok(StoredRow::Skipped);
         }
         let refreshed = diesel::update(
-            message_row(device_id, new.chat_jid, new.msg_id)
+            dsl::messages
+                .filter(dsl::id.eq(existing.id))
                 .filter(dsl::revoked.eq(false))
-                .filter(dsl::sender_jid.eq(new.sender_jid))
-                // A redelivery carries the PRE-edit original; an edited row
-                // must keep its newer content.
+                // A redelivery carries the PRE-edit original; edited rows
+                // must keep their newer content.
                 .filter(dsl::edited_at_ms.is_null()),
         )
         .set((
@@ -122,11 +100,36 @@ pub(super) fn insert_message(
             dsl::proto_codec.eq(new.proto_codec),
         ))
         .execute(conn)?;
-        if refreshed > 0 {
-            return Ok(StoredRow::Refreshed);
-        }
+        return Ok(if refreshed > 0 {
+            StoredRow::Refreshed
+        } else {
+            StoredRow::Skipped
+        });
     }
-    Ok(StoredRow::Skipped)
+
+    let inserted = diesel::insert_into(dsl::messages)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::chat_jid.eq(new.chat_jid),
+            dsl::msg_id.eq(new.msg_id),
+            dsl::sender_jid.eq(&sender),
+            dsl::from_me.eq(new.from_me),
+            dsl::timestamp_ms.eq(new.timestamp_ms),
+            dsl::kind.eq(new.kind),
+            dsl::text_content.eq(new.text),
+            dsl::proto.eq(new.proto),
+            dsl::proto_codec.eq(new.proto_codec),
+            dsl::status.eq(new.status),
+            dsl::starred.eq(new.starred),
+        ))
+        .on_conflict_do_nothing()
+        .execute(conn)?
+        > 0;
+    Ok(if inserted {
+        StoredRow::Inserted
+    } else {
+        StoredRow::Skipped
+    })
 }
 
 pub(crate) type MessageRowFilter<'a> = diesel::dsl::Filter<

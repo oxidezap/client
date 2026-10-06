@@ -49,7 +49,7 @@ jobs:
           # targets here and joining them with `lipo`, at the cost of doubling
           # this job.
           - name: macos-aarch64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
           - name: windows-x86_64
             os: windows-latest
@@ -79,7 +79,7 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig1-dev libfreetype6-dev
 
-      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: protoc
 
@@ -174,6 +174,10 @@ jobs:
             # Preserving the execute bit, which the bare binaries never had:
             # an archive can carry it where a raw asset download cannot.
             chmod +x "$out/oxidezap" "$out/oxidezapd" "$out/oxidezap-cli"
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              cp packaging/linux/install-desktop.sh packaging/linux/org.oxidezap.client.local.png "$out/"
+              chmod +x "$out/install-desktop.sh"
+            fi
             tar -czf "$out.tar.gz" "$out"
             echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
           fi

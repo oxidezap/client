@@ -256,6 +256,29 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   "Unknown contact" six times in a row. The count is the one thing that is
   always true, which is why an all-stranger group reads "50 members" — the
   answer `participants` could never give.
+- **A community tree comes from `GroupOverview`, never from names.** The
+  overview is the engine's typed source for community role, subgroup role and
+  parent JID; a display name that happens to equal another group's says
+  nothing about their relationship. `None` means the relationship has not
+  been resolved, not that WhatsApp declared the group standalone, so history,
+  live message summaries and reconnect snapshots preserve the last known
+  hierarchy until another typed overview changes it. The store updates this
+  metadata by compare-and-swap against the exact stored JSON a lookup started
+  from, just like resolved names, so a late pass cannot replace newer server
+  state. The raw value is retained even if this client cannot decode a newer
+  role, allowing a fresh overview to replace it after a downgrade. On
+  the Groups filter, a subgroup is nested only when its parent JID is present
+  and explicitly a community. Otherwise it remains a visible subgroup at the
+  root; no string comparison repairs missing metadata. Search matches both
+  names and JIDs, and when a matching child is under a collapsed community it
+  reveals that path with the parent as context. The open/closed state is keyed
+  by community JID, not name, so renames and duplicate titles cannot move it.
+  A pinned subgroup of an unpinned community stays in the pinned block at the
+  root instead of being demoted into that community's subtree. With the chat
+  list focused, Space toggles the selected community; while the
+  search field is focused, Space remains ordinary input. If that hides the open
+  subgroup, the parent remains the visible list-selection anchor and arrow-key
+  navigation continues there without closing the conversation.
 - **What a file is sent as is decided in the front end; what it looks like is
   worked out where the bytes land.** Two questions, and they are answered in
   two places because they have two different pieces of evidence. The *kind* —
@@ -282,8 +305,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   untouched (a screenshot is a PNG, and re-encoding one is the loss nobody
   wants); everything else this build can decode becomes a JPEG, at the same
   dimensions, out of the decode the thumbnail was already paying for. What
-  cannot be decoded goes out as it came, because bytes nothing here can read
-  are bytes nothing here can improve.
+  cannot be decoded is refused before upload rather than sent as an inline
+  photo the recipient cannot open. On macOS, readable HEIC/HEIF, AVIF, BMP
+  and TIFF originals can first become JPEG through the native image converter;
+  an explicit document send remains the way to preserve their original bytes.
   Two smaller things fall out of having read the bytes at all. The message
   states the type the *payload* is rather than the one it was picked as —
   those are two different claims, and only one of them was read out of the
@@ -300,6 +325,12 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   through, so a message sent without one is a grey box on *both* sides. A
   video has none, and that is the gap rather than a decision: producing one
   means decoding H.264 where the account is held.
+  The same last gate checks video bytes, not just the file's extension. A
+  compatible MP4 with H.264/AAC keeps its bytes; a MOV or another format the
+  macOS converter understands is exported to MP4 and inspected again before
+  upload. Unknown or unconvertible containers fail visibly instead of earning
+  a server ack for a video the recipient never receives. Both GUI and CLI
+  enter this preparation path, and the explicit document path bypasses it.
   Nothing about the staging is new here. A picked file goes out exactly the
   way a voice note does — `Session::send_staged` is the one path, and the four
   media caches, the reservation order and the abandoned-upload race are all
@@ -1649,9 +1680,25 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   partial (`WHERE from_me = TRUE`) because the only device-wide
   `(device_id, msg_id)` lookup is the chatless server-ack path, which always
   filters outbound; everything else is chat-scoped and rides the identity
-  UNIQUE autoindex. A reply's embedded `quotedMessage` is dropped when the
-  parent is materialized (same chat, stanza id, author — exact or PN/LID
-  counterpart, never a bare id match), kept inline otherwise, and rehydrated
+  UNIQUE autoindex. That index enforces stored spellings, not author identity:
+  `store::message_identity` treats every `from_me` spelling as this account,
+  strips a peer's device suffix, and accepts PN/LID aliases only when this
+  account's mapping ledger proves the pair. Live, history, local sends, edits,
+  revokes and placeholders all resolve through that rule; an unknown alias or
+  a different author never matches. A per-device mapping-generation marker
+  gates the device-wide legacy repair: the first prepared open runs it, later
+  startups repeat it after any durable ledger mutation (including same-second
+  replacements), while a newly learned pair
+  repairs only rows whose sender is one of those aliases and their known chat
+  component. Repairs keep the oldest stable `messages.id`, retain the newest
+  copy's timestamp, fold status and stars, and let a tombstone beat every copy
+  (including its FTS text).
+  Alias reads use the same author-aware fold, while `message()` stays ambiguous
+  when distinct authors really reused an id. A reply's embedded
+  `quotedMessage` is dropped when the parent is materialized (same chat, stanza
+  id, author — device-normalized, own-account sentinel, or proven PN/LID
+  counterpart, never a bare id match), kept inline
+  otherwise, and rehydrated
   in batch on read: one identity resolution per chat on the page plus one
   parent lookup per chat, never one per reply, and the injected copy is never
   written back. A `MessageContextInfo` holding only the `messageSecret` is

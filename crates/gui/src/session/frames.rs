@@ -783,6 +783,7 @@ fn placeholder_chat(summary: &ChatSummary) -> Chat {
     chat.pinned_at = summary
         .pinned_at_ms
         .and_then(DateTime::from_timestamp_millis);
+    chat.group_hierarchy = summary.group_hierarchy.clone();
     if let Some(preview) = &summary.last_message {
         chat.last_message = Some(preview.text.clone());
         chat.last_message_time = DateTime::from_timestamp_millis(preview.timestamp_ms);
@@ -891,6 +892,47 @@ mod tests {
     use oxidezap_ipc::StateVersion;
 
     struct NoMedia;
+
+    #[test]
+    fn edit_confirmation_is_correlated_and_refusals_and_disconnects_release_waiters() {
+        use oxidezap_ipc::ProtocolError;
+        let (sink, _events) = super::super::sink::channel();
+        let pending = Pending::default();
+        let pictures = crate::video::LatestFrames::default();
+        let mut frames = Frames::new(&sink, &pending, &NoMedia, &pictures, Arc::new(|_, _| false));
+        let (accepted, mut accepted_rx) = tokio::sync::oneshot::channel();
+        let (refused, mut refused_rx) = tokio::sync::oneshot::channel();
+        let (lost, mut lost_rx) = tokio::sync::oneshot::channel();
+        pending
+            .lock()
+            .unwrap()
+            .insert(1, Awaiting::Mutation(accepted));
+        pending
+            .lock()
+            .unwrap()
+            .insert(2, Awaiting::Mutation(refused));
+        pending.lock().unwrap().insert(3, Awaiting::Mutation(lost));
+        let _ = frames.apply(DaemonMessage::Accepted { id: Some(99) });
+        assert!(matches!(
+            accepted_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let _ = frames.apply(DaemonMessage::Accepted { id: Some(1) });
+        assert!(accepted_rx.try_recv().unwrap().is_ok());
+        let _ = frames.apply(DaemonMessage::Error {
+            id: Some(2),
+            error: ProtocolError::Refused {
+                detail: "edit expired".into(),
+            },
+        });
+        assert_eq!(
+            refused_rx.try_recv().unwrap().unwrap_err().detail,
+            "edit expired"
+        );
+        frames.finish();
+        assert!(lost_rx.try_recv().unwrap().is_err());
+        assert!(pending.lock().unwrap().is_empty());
+    }
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
@@ -1564,6 +1606,7 @@ mod tests {
             unread,
             manually_unread: false,
             pinned_at_ms: None,
+            group_hierarchy: None,
             last_message: Some(oxidezap_ipc::MessagePreview {
                 id: Some("3EB0".into()),
                 text: "olá".into(),

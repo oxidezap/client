@@ -49,7 +49,35 @@ pub(super) fn range_bound(
 }
 
 /// Extra read-boundary ids kept per chat; overflow drops the oldest entries.
-const READ_EXTRA_IDS_CAP: usize = 256;
+pub(super) const READ_EXTRA_IDS_CAP: usize = 256;
+
+/// Distinct incoming ids timestamped above `frontier_ms`: rows a capped
+/// scalar frontier cannot cover but an explicit read verdict still reaches.
+/// Returns `None` when more exist than the retained list can durably hold —
+/// persisting a truncated set would leave the dropped ids to a later
+/// recount — so the caller seeds nothing id-based instead.
+pub(super) fn coverable_future_ids(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    frontier_ms: i64,
+) -> QueryResult<Option<Vec<String>>> {
+    use schema::messages::dsl as msgs;
+    let ids: Vec<String> = msgs::messages
+        .filter(
+            msgs::device_id
+                .eq(device_id)
+                .and(msgs::chat_jid.eq(chat))
+                .and(msgs::from_me.eq(false))
+                .and(msgs::local_revoke_placeholder.eq(false))
+                .and(msgs::timestamp_ms.gt(frontier_ms)),
+        )
+        .select(msgs::msg_id)
+        .distinct()
+        .limit((READ_EXTRA_IDS_CAP + 1) as i64)
+        .load(conn)?;
+    Ok((ids.len() <= READ_EXTRA_IDS_CAP).then_some(ids))
+}
 
 /// Bound the kept ids, dropping the oldest first. The list is unbounded on the
 /// wire — a chat read a keyed second at a time accumulates one entry per
@@ -79,18 +107,18 @@ pub(super) fn encode_read_ids(ids: &[String]) -> Option<String> {
 /// watermark is read, plus the explicitly-named ids — boundary-instant/keyed
 /// coverage that a scalar watermark cannot express (both directions of the
 /// same-second ambiguity are lossy without them).
-pub(super) struct ReadState {
+pub(crate) struct ReadState {
     pub(super) watermark_ms: i64,
     pub(super) extra_ids: Vec<String>,
 }
 
 impl ReadState {
-    pub(super) fn covers(&self, ts_ms: i64, msg_id: &str) -> bool {
+    pub(crate) fn covers(&self, ts_ms: i64, msg_id: &str) -> bool {
         ts_ms <= self.watermark_ms || self.extra_ids.iter().any(|id| id == msg_id)
     }
 }
 
-pub(super) fn read_state(
+pub(crate) fn read_state(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
@@ -135,18 +163,43 @@ pub(super) fn advance_read_state(
         }
     }
     if !state.extra_ids.is_empty() {
-        let implied: Vec<String> = dsl::messages
+        // An id is implied only when every incoming row under it sits at or
+        // below the watermark. Twins can straddle it — an older covered
+        // copy must not drop the id a newer copy still needs — and outgoing
+        // rows never badge, so only incoming rows decide either way.
+        let below: std::collections::HashSet<String> = dsl::messages
             .filter(
                 dsl::device_id
                     .eq(device_id)
                     .and(dsl::chat_jid.eq(chat))
                     .and(dsl::msg_id.eq_any(&state.extra_ids))
+                    .and(dsl::from_me.eq(false))
                     .and(dsl::timestamp_ms.le(state.watermark_ms)),
             )
             .select(dsl::msg_id)
-            .load(conn)?;
-        if !implied.is_empty() {
-            state.extra_ids.retain(|id| !implied.contains(id));
+            .distinct()
+            .load::<String>(conn)?
+            .into_iter()
+            .collect();
+        if !below.is_empty() {
+            let above: std::collections::HashSet<String> = dsl::messages
+                .filter(
+                    dsl::device_id
+                        .eq(device_id)
+                        .and(dsl::chat_jid.eq(chat))
+                        .and(dsl::msg_id.eq_any(&state.extra_ids))
+                        .and(dsl::from_me.eq(false))
+                        .and(dsl::local_revoke_placeholder.eq(false))
+                        .and(dsl::timestamp_ms.gt(state.watermark_ms)),
+                )
+                .select(dsl::msg_id)
+                .distinct()
+                .load::<String>(conn)?
+                .into_iter()
+                .collect();
+            state
+                .extra_ids
+                .retain(|id| !below.contains(id) || above.contains(id));
         }
     }
     cap_read_ids(&mut state.extra_ids);
@@ -207,6 +260,7 @@ pub(super) fn count_unread(
                 .eq(device_id)
                 .and(dsl::chat_jid.eq(chat))
                 .and(dsl::from_me.eq(false))
+                .and(dsl::local_revoke_placeholder.eq(false))
                 .and(dsl::timestamp_ms.gt(state.watermark_ms)),
         )
         .into_boxed();
@@ -235,6 +289,7 @@ pub(super) fn count_uncovered_incoming(
                 .eq(device_id)
                 .and(dsl::chat_jid.eq(chat))
                 .and(dsl::from_me.eq(false))
+                .and(dsl::local_revoke_placeholder.eq(false))
                 .and(dsl::timestamp_ms.gt(state.watermark_ms)),
         )
         .into_boxed();

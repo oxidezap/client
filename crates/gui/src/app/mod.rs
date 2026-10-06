@@ -13,7 +13,9 @@ mod calls_ctl;
 pub mod chat_row;
 mod chats;
 mod commands;
+pub(crate) mod editing;
 mod events;
+pub use editing::EditMessage;
 #[cfg(test)]
 mod frame_cost;
 mod media;
@@ -39,7 +41,7 @@ pub use chats::{
     ChatFilter, ChatListCache, Survival, survives_archived_scan, survives_complete_load,
 };
 pub use media::RecordingState;
-pub(crate) use message_actions::{can_delete_sent, can_edit_sent};
+pub(crate) use message_actions::can_delete_sent;
 pub use messages::{BubbleIds, MessageListCache, TimelineItem};
 pub use paging::nearing_end;
 
@@ -316,7 +318,7 @@ use gpui_component::VirtualListScrollHandle;
 use gpui_component::input::InputState;
 
 // Define our own actions since gpui-component's actions module is private
-actions!(chat_list, [SelectUp, SelectDown]);
+actions!(chat_list, [SelectUp, SelectDown, ToggleSelectedCommunity]);
 actions!(
     oxidezap,
     [
@@ -392,13 +394,6 @@ pub struct RetryMessage {
 pub struct ReactToMessage {
     pub id: gpui::SharedString,
     pub emoji: gpui::SharedString,
-}
-
-#[derive(Clone, PartialEq, gpui::Action)]
-#[action(namespace = message, no_json)]
-pub struct EditSentMessage {
-    pub jid: gpui::SharedString,
-    pub id: gpui::SharedString,
 }
 
 #[derive(Clone, PartialEq, gpui::Action)]
@@ -605,11 +600,14 @@ actions!(calls, [AcceptCall, DeclineCall]);
 
 /// Initialize chat list and call popup key bindings
 pub fn init_app_bindings(cx: &mut gpui::App) {
+    crate::components::InputAreaView::init_bindings(cx);
     // `secondary` is Command on macOS and Control elsewhere, which is what
     // makes one binding table correct on every platform.
     cx.bind_keys([
         KeyBinding::new("up", SelectUp, Some(CHAT_LIST_CONTEXT)),
         KeyBinding::new("down", SelectDown, Some(CHAT_LIST_CONTEXT)),
+        // Exclude the Input context so matched Space remains available to the editor.
+        KeyBinding::new("space", ToggleSelectedCommunity, Some("ChatList && !Input")),
         // Window-wide: reachable whatever owns focus, because both are ways
         // *out* of wherever the user currently is.
         KeyBinding::new("secondary-k", FocusSearch, None),
@@ -935,6 +933,13 @@ pub struct WhatsAppApp {
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
+    /// Native document destinations, scoped to the account, chat and message
+    /// that initiated the save. Browser handoffs never enter this map.
+    saved_documents: HashMap<(String, String, String), std::path::PathBuf>,
+    /// Document saves use the same account/chat/message identity as results.
+    document_downloads_in_flight: std::collections::HashSet<(String, String, String)>,
+    /// Invalidates detached saves when the active account/session is reset.
+    document_state_generation: u64,
     /// What call is happening, where this window draws it, and what it has
     /// asked the devices for that has not come back yet. See [`calls_ctl`].
     calls: Entity<calls_ctl::Calls>,
@@ -988,14 +993,19 @@ pub struct WhatsAppApp {
     mobile_panel: MobilePanel,
     /// Which conversations the sidebar is showing.
     chat_filter: ChatFilter,
+    /// JIDs of community rows the Groups list has collapsed.
+    collapsed_communities: std::collections::HashSet<String>,
     /// The message being replied to, mirrored here so the send path can
     /// attach it and the composer can show it.
     reply_to: Option<ReplyDraft>,
+    edit_draft: Option<editing::EditDraft>,
+    edit_revision: u64,
+    edit_generation: u64,
+    pending_edits: std::collections::HashSet<(String, String)>,
     /// The message whose quick-react strip is open, if any. One at a time:
     /// the strip is drawn inline under its bubble, and two open strips would
     /// each move the timeline the other measured against.
     reaction_picker_for: Option<String>,
-    edit_draft: Option<message_actions::EditDraft>,
     delete_confirmation: Option<message_actions::DeleteConfirmation>,
     pending_message_actions: HashSet<(String, String)>,
     #[cfg(test)]
@@ -1037,12 +1047,13 @@ pub struct WhatsAppApp {
     last_avatar_window_fingerprint: Option<u64>,
 }
 
-/// Store-backed attention decision delivered with a live message. The GUI's
-/// paged chat row may not yet know any of these facts.
-struct IncomingAlert {
+/// Store-backed conversation and attention facts delivered with a message.
+/// The GUI's paged chat row may not yet know any of them.
+struct IncomingMessageMetadata {
     allowed: bool,
     title: Option<String>,
     archived: Option<bool>,
+    chat_name: Option<String>,
 }
 
 const NOTIFICATION_PAGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
@@ -1072,14 +1083,32 @@ fn remove_pending_notification(queue: &mut VecDeque<String>, tag: &str) -> bool 
     queue.remove(index).is_some()
 }
 
-impl IncomingAlert {
-    fn new(allowed: bool, title: Option<String>, archived: Option<bool>) -> Self {
+impl IncomingMessageMetadata {
+    fn new(
+        allowed: bool,
+        title: Option<String>,
+        archived: Option<bool>,
+        chat_name: Option<String>,
+    ) -> Self {
         Self {
             allowed,
             title,
             archived,
+            chat_name,
         }
     }
+}
+
+pub(super) fn clear_window_message_selection(window: &mut Window, cx: &mut App) {
+    gpui_base::TextSelection::clear(window, cx);
+    crate::components::rich_text_selection::forget_window_selection_registry(
+        window.window_handle().window_id(),
+        cx,
+    );
+}
+
+fn message_has_selectable_text(message: &ChatMessage) -> bool {
+    message.system.is_none() && message.poll.is_none() && !message.content.is_empty()
 }
 
 impl WhatsAppApp {
@@ -1238,9 +1267,18 @@ impl WhatsAppApp {
                         // re-pair — its name under the sidebar, its number
                         // beneath, and its JID still reading as "(You)" —
                         // until some later `AccountUpdated` corrected it.
+                        let jid = account.as_ref().and_then(|a| a.jid.clone());
+                        let lid = account.as_ref().and_then(|a| a.lid.clone());
+                        if (app.account_jid != jid || app.account_lid != lid)
+                            && let Some(window) = app.modal_window
+                        {
+                            let _ = window.update(cx, |_, window, cx| {
+                                clear_window_message_selection(window, cx);
+                            });
+                        }
                         app.account_name = account.as_ref().and_then(|a| a.name.clone());
-                        app.account_jid = account.as_ref().and_then(|a| a.jid.clone());
-                        app.account_lid = account.and_then(|a| a.lid);
+                        app.account_jid = jid;
+                        app.account_lid = lid;
                         cx.notify();
                     }),
                     FromDaemon::Avatar { jid, key } => entity.update(cx, |app, cx| {
@@ -1423,6 +1461,9 @@ impl WhatsAppApp {
             recovery: cx.new(|_| recovery::Recovering::new()),
             notices: cx.new(|_| notices::Notices::new()),
             downloads_in_flight: std::collections::HashSet::new(),
+            saved_documents: HashMap::new(),
+            document_downloads_in_flight: std::collections::HashSet::new(),
+            document_state_generation: 0,
             calls: cx.new(|_| calls_ctl::Calls::new()),
             plugins: cx.new(|_| plugins_ctl::Plugins::new()),
             search: cx.new(|_| search::Search::new()),
@@ -1442,9 +1483,13 @@ impl WhatsAppApp {
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
             chat_filter: ChatFilter::default(),
+            collapsed_communities: std::collections::HashSet::new(),
             reply_to: None,
-            reaction_picker_for: None,
             edit_draft: None,
+            edit_revision: 0,
+            edit_generation: 0,
+            pending_edits: std::collections::HashSet::new(),
+            reaction_picker_for: None,
             delete_confirmation: None,
             pending_message_actions: HashSet::new(),
             #[cfg(test)]
@@ -1604,13 +1649,10 @@ impl WhatsAppApp {
         }
 
         let query = self.search.read(cx).list_query();
-        let matches = |chat: &Chat| {
-            self.chat_filter.matches(chat)
-                && (contains_ignore_case(&chat.name, query)
-                    || contains_ignore_case(&chat.jid, query))
-        };
-
-        let filtered: Vec<&Chat> = self.conversations().filter(|c| matches(c)).collect();
+        let filtered: Vec<&Chat> = self
+            .conversations()
+            .filter(|chat| self.chat_filter.matches(chat))
+            .collect();
 
         let mut rows: Vec<ChatRow> = filtered
             .into_iter()
@@ -1627,6 +1669,14 @@ impl WhatsAppApp {
                 )
             })
             .collect();
+        let mut rows = if self.chat_filter == ChatFilter::Groups {
+            chats::hierarchical_group_rows(&rows, query, &self.collapsed_communities)
+        } else {
+            rows.retain(|row| {
+                contains_ignore_case(&row.name, query) || contains_ignore_case(&row.jid, query)
+            });
+            rows
+        };
         chat_row::disambiguate_names(&mut rows);
         let rows: Arc<[ChatRow]> = rows.into();
 
@@ -1673,6 +1723,39 @@ impl WhatsAppApp {
             return;
         }
         self.chat_filter = filter;
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
+    /// Toggle the selected community when the chat list (not its search
+    /// input) owns focus. This keeps the disclosure action keyboard reachable
+    /// without turning a typed space into a list command.
+    pub fn toggle_selected_community(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search_input = self.search.read(cx).list_input().cloned();
+        if search_input.is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window)) {
+            return;
+        }
+        let jid = {
+            let cache = self.chat_list_cache.borrow();
+            let Some(cache) = cache.as_ref() else {
+                return;
+            };
+            let Some(selected) = self.chat_list_selection_jid(cache) else {
+                return;
+            };
+            let Some(jid) = chats::selected_community_toggle(&cache.rows, &selected) else {
+                return;
+            };
+            jid
+        };
+        self.toggle_community(&jid, cx);
+    }
+
+    /// Expand or collapse a community by its stable JID.
+    pub fn toggle_community(&mut self, jid: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_communities.remove(jid) {
+            self.collapsed_communities.insert(jid.to_string());
+        }
         self.invalidate_chat_cache();
         cx.notify();
     }
@@ -1944,6 +2027,84 @@ impl WhatsAppApp {
     /// same messages: every caller here is announcing that the chat's history
     /// changed, which is exactly when the search's matches stop describing it.
     fn invalidate_message_cache(&mut self, chat_jid: &str, cx: &mut App) {
+        if self.selected_chat.as_deref() == Some(chat_jid)
+            && let Some(window) = self.modal_window
+        {
+            let selected_messages =
+                crate::components::rich_text_selection::active_selection_message_snapshots(
+                    window.window_id(),
+                    cx,
+                );
+            let selected_ids: Vec<String> = selected_messages
+                .iter()
+                .map(|(message_id, _, _)| message_id.clone())
+                .collect();
+            let selection_is_stale = if selected_ids.is_empty() {
+                false
+            } else {
+                let cache = self.message_list_cache.borrow();
+                match (cache.get(chat_jid), self.find_chat(chat_jid)) {
+                    (Some(previous), Some(current)) => {
+                        let previous_by_id: HashMap<&str, (usize, &ChatMessage)> = previous
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .map(|(index, message)| {
+                                (message.id.as_str(), (index, message.as_ref()))
+                            })
+                            .collect();
+                        let current_by_id: HashMap<&str, (usize, &ChatMessage)> = current
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .map(|(index, message)| (message.id.as_str(), (index, message)))
+                            .collect();
+                        selected_ids.iter().any(|message_id| {
+                            let (Some((old_index, old)), Some((new_index, new))) = (
+                                previous_by_id.get(message_id.as_str()),
+                                current_by_id.get(message_id.as_str()),
+                            ) else {
+                                return true;
+                            };
+                            old_index != new_index
+                                || !message_has_selectable_text(old)
+                                || !message_has_selectable_text(new)
+                                || old.content != new.content
+                                || old.revoked != new.revoked
+                        })
+                    }
+                    (None, Some(current)) => {
+                        // The render cache may already be gone, but retained
+                        // participants keep the visible text to compare against.
+                        let current_by_id: HashMap<&str, (usize, &ChatMessage)> = current
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .map(|(index, message)| (message.id.as_str(), (index, message)))
+                            .collect();
+                        selected_messages.iter().any(
+                            |(message_id, selected_text, selected_order)| {
+                                let Some((current_order, message)) =
+                                    current_by_id.get(message_id.as_str())
+                                else {
+                                    return true;
+                                };
+                                *current_order as u64 != *selected_order
+                                    || !message_has_selectable_text(message)
+                                    || crate::components::BubbleText::of(&message.content).text()
+                                        != selected_text.as_ref()
+                            },
+                        )
+                    }
+                    _ => true,
+                }
+            };
+            if selection_is_stale {
+                let _ = window.update(cx, |_, window, cx| {
+                    clear_window_message_selection(window, cx);
+                });
+            }
+        }
         self.message_list_cache.borrow_mut().remove(chat_jid);
         self.refresh_conversation_search(chat_jid, cx);
         self.refresh_media_viewer(chat_jid, cx);
@@ -1961,8 +2122,22 @@ impl WhatsAppApp {
     /// exactly when its timeline needs filling, and the frame that draws it
     /// is the one place that knows which chat that is — the selection can
     /// name a chat the window is not showing (Settings is up, the reader is
-    /// in Status).
-    pub fn note_visible_conversation(&mut self, jid: Option<String>, cx: &mut App) {
+    /// in Status). Leaving that visible conversation clears its message-text
+    /// selection so the hidden pane cannot keep answering Copy.
+    pub fn note_visible_conversation(
+        &mut self,
+        jid: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .retained_chat
+            .as_deref()
+            .is_some_and(|previous| jid.as_deref() != Some(previous))
+            && gpui_base::TextSelection::has_selection(window, cx)
+        {
+            clear_window_message_selection(window, cx);
+        }
         if let Some(jid) = &jid {
             self.ensure_timeline_page(jid, cx);
         }
@@ -2069,7 +2244,7 @@ impl WhatsAppApp {
         // controls to stop it, and an encode that could still finish, pass an
         // epoch nothing had bumped, and send the old account's note from the
         // newly paired one.
-        self.leave_connected_view(cx);
+        self.leave_connected_view(Some(window), cx);
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.incoming_file_reading = false;
         self.paste_preview = None;
@@ -2096,6 +2271,7 @@ impl WhatsAppApp {
         // [`plugins_ctl::Plugins::forget`].
         self.plugins.update(cx, |plugins, cx| plugins.forget(cx));
         self.chats.clear();
+        self.collapsed_communities.clear();
         self.selected_chat = None;
         self.visible_chat = None;
         self.retained_chat = None;
@@ -2127,11 +2303,15 @@ impl WhatsAppApp {
         self.sticker_validation.borrow_mut().clear();
         self.timeline_anchor = None;
         // Composed text, and the reply bar it may be answering.
+        self.edit_generation = self.edit_generation.wrapping_add(1);
+        self.edit_draft = None;
+        self.pending_edits.clear();
         self.drafts.clear();
         self.reply_to = None;
         if let Some(input) = self.input_area.clone() {
             input.update(cx, |view, cx| {
                 view.set_reply(None, cx);
+                view.set_edit_state(false, false, cx);
                 view.swap_text("", window, cx);
             });
         }
@@ -2148,6 +2328,9 @@ impl WhatsAppApp {
         // Playback itself is already stopped, above.
         self.video_players.clear();
         self.downloads_in_flight.clear();
+        self.saved_documents.clear();
+        self.document_downloads_in_flight.clear();
+        self.document_state_generation = self.document_state_generation.wrapping_add(1);
         // The viewer names a chat and a message in it, both of which have
         // just gone; and both searches were typed against a list and a
         // conversation this account no longer has.
@@ -2168,9 +2351,20 @@ impl WhatsAppApp {
     ///
     /// Not [`AppState::Offline`]: that keeps the conversation on screen and
     /// only refuses to send.
-    fn leave_connected_view(&mut self, cx: &mut Context<Self>) {
-        self.edit_draft = None;
+    fn leave_connected_view(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        // The window-scoped text selection outlives the conversation's rows.
+        // Clear it with the rest of the connected view so Copy cannot expose
+        // hidden message text after a disconnect, error, or logout. Account
+        // teardown already has the Window; other transitions use its handle.
+        if let Some(window) = window {
+            clear_window_message_selection(window, cx);
+        } else if let Some(window) = self.modal_window {
+            let _ = window.update(cx, |_, window, cx| {
+                clear_window_message_selection(window, cx);
+            });
+        }
         self.delete_confirmation = None;
+        self.pending_message_actions.clear();
         if self.recorder.read(cx).state() != RecordingState::Idle {
             self.cancel_recording(cx);
         }
@@ -2440,7 +2634,7 @@ impl WhatsAppApp {
             // typed, let alone sent.
             self.drafts.remove(jid);
         }
-        self.forget_missing_selection();
+        self.forget_missing_selection(cx);
         // The viewer names a chat and a message in it, and resolves them every
         // frame: one left open over a chat that has just gone draws nothing,
         // keeps the keyboard, and swallows the Escape meant to close it.
@@ -2455,12 +2649,17 @@ impl WhatsAppApp {
     /// pointing at a deleted chat draws the empty state — and on a phone that
     /// is the whole screen, with the Back button belonging to a conversation
     /// that is not there.
-    fn forget_missing_selection(&mut self) {
+    fn forget_missing_selection(&mut self, cx: &mut App) {
         if self
             .selected_chat
             .as_deref()
             .is_some_and(|jid| !self.chats.iter().any(|chat| chat.jid == jid))
         {
+            if let Some(window) = self.modal_window {
+                let _ = window.update(cx, |_, window, cx| {
+                    clear_window_message_selection(window, cx);
+                });
+            }
             self.selected_chat = None;
         }
     }
@@ -2570,10 +2769,10 @@ impl WhatsAppApp {
             return;
         }
 
-        let current_index = self
-            .selected_chat
-            .as_ref()
-            .and_then(|jid| cache.rows.iter().position(|row| &row.jid == jid));
+        let selected_row = self.chat_list_selection_jid(&cache);
+        let current_index = selected_row
+            .as_deref()
+            .and_then(|jid| cache.rows.iter().position(|row| row.jid == jid));
 
         let next_index = match current_index {
             Some(idx) if idx + 1 < cache.rows.len() => idx + 1,
@@ -2594,10 +2793,10 @@ impl WhatsAppApp {
             return;
         }
 
-        let current_index = self
-            .selected_chat
-            .as_ref()
-            .and_then(|jid| cache.rows.iter().position(|row| &row.jid == jid));
+        let selected_row = self.chat_list_selection_jid(&cache);
+        let current_index = selected_row
+            .as_deref()
+            .and_then(|jid| cache.rows.iter().position(|row| row.jid == jid));
 
         let prev_index = match current_index {
             Some(idx) if idx > 0 => idx - 1,
@@ -2647,8 +2846,10 @@ impl WhatsAppApp {
         // operating system's.
         crate::platform::request_gesture_authorization();
         if self.selected_chat.as_deref() != Some(jid.as_str()) {
-            self.cancel_message_edit(cx);
             self.cancel_message_delete(cx);
+            // Message-text selection belongs to the conversation being left,
+            // not to the next list reusing the window selection layer.
+            clear_window_message_selection(window, cx);
         }
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,
@@ -2663,6 +2864,9 @@ impl WhatsAppApp {
             if let Some(ref input_area) = self.input_area {
                 input_area.update(cx, |view, _| view.reset_typing());
             }
+        }
+        if self.selected_chat.as_deref() != Some(jid.as_str()) {
+            self.leave_message_edit(window, cx);
         }
         // Stash the outgoing chat's unsent text and restore the target's, or
         // the shared input would send A's draft to B. Skipped on reselect so
@@ -2920,7 +3124,7 @@ impl WhatsAppApp {
             let input_area = cx.new(|cx| InputAreaView::new(window, cx));
 
             // Subscribe to events from the input area
-            cx.subscribe(&input_area, Self::handle_input_area_event)
+            cx.subscribe_in(&input_area, window, Self::handle_input_area_event)
                 .detach();
 
             self.input_area = Some(input_area);
@@ -2933,13 +3137,18 @@ impl WhatsAppApp {
     /// Handle events from the isolated input area view
     fn handle_input_area_event(
         &mut self,
-        _input_area: Entity<InputAreaView>,
+        _input_area: &Entity<InputAreaView>,
         event: &InputAreaEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
             InputAreaEvent::SendMessage(text) => {
-                self.send_message(text, cx);
+                if self.edit_draft.is_some() {
+                    self.save_message_edit(text, window, cx);
+                } else {
+                    self.send_message(text, cx);
+                }
             }
             InputAreaEvent::AttachFiles(category) => {
                 self.attach_category(*category, cx);
@@ -2953,6 +3162,9 @@ impl WhatsAppApp {
             }
             InputAreaEvent::CancelRecording => {
                 self.cancel_recording(cx);
+            }
+            InputAreaEvent::CancelEdit => {
+                self.cancel_message_edit(window, cx);
             }
             InputAreaEvent::CancelReply => {
                 self.cancel_reply(cx);
@@ -3208,7 +3420,7 @@ impl WhatsAppApp {
         chat_jid: String,
         mut message: ChatMessage,
         sender_name: Option<String>,
-        alert: IncomingAlert,
+        metadata: IncomingMessageMetadata,
         cx: &mut App,
     ) {
         // Parse JID to determine chat type
@@ -3245,8 +3457,12 @@ impl WhatsAppApp {
         // Capture the user-facing part before the message moves into its
         // conversation. Statuses have their own reader and do not represent a
         // chat asking for attention; our own sends likewise never notify us.
-        let notification =
-            (alert.allowed && !read_now && !message.is_from_me && !is_status).then(|| {
+        let notification = (metadata.allowed
+            && !message.is_read
+            && !read_now
+            && !message.is_from_me
+            && !is_status)
+            .then(|| {
                 let body = if is_group {
                     format!("{}: {}", message.author_label(), message.preview_text())
                 } else {
@@ -3271,8 +3487,12 @@ impl WhatsAppApp {
         if let Some(index) = chat_index {
             // Update the existing chat
             let chat = Arc::make_mut(&mut self.chats[index]);
-            if let Some(archived) = alert.archived {
+            if let Some(archived) = metadata.archived {
                 chat.archived = archived;
+            }
+
+            if let Some(ref name) = metadata.chat_name {
+                chat.set_name_if_not_worse(name.clone(), 2);
             }
 
             // For groups: update participant name, NOT the chat name
@@ -3282,7 +3502,8 @@ impl WhatsAppApp {
                 }
             } else if !is_status {
                 // For DMs only: update chat name if we have a better one
-                if let Some(ref name) = sender_name
+                if metadata.chat_name.is_none()
+                    && let Some(ref name) = sender_name
                     && !message.is_from_me
                 {
                     chat.set_name_if_not_worse(name.clone(), 2);
@@ -3303,14 +3524,18 @@ impl WhatsAppApp {
         } else {
             // Create new chat
             let display_name = if is_group || is_status {
-                // For groups/status, don't use sender name as chat name
-                None
+                // A participant is not the conversation. Only use the
+                // store-backed subject delivered separately by the session.
+                metadata.chat_name.clone()
             } else if message.is_from_me {
-                // For outgoing DMs, use cached name
-                self.name_cache.get(&chat_jid).cloned()
+                // Prefer the durable contact name, then a local cache entry.
+                metadata
+                    .chat_name
+                    .clone()
+                    .or_else(|| self.name_cache.get(&chat_jid).cloned())
             } else {
-                // For incoming DMs, use sender name
-                sender_name.clone()
+                // The resolved address-book name outranks a push name.
+                metadata.chat_name.clone().or_else(|| sender_name.clone())
             };
 
             let mut new_chat = if let Some(name) = display_name {
@@ -3318,7 +3543,10 @@ impl WhatsAppApp {
             } else {
                 Chat::new(chat_jid.clone())
             };
-            new_chat.archived = alert.archived.unwrap_or(false);
+            // An absent row has no previous archive state to preserve. Keep
+            // an unknown answer out of the active inbox until store hydration
+            // supplies an explicit state; `Some(false)` still unarchives it.
+            new_chat.archived = metadata.archived.unwrap_or(true);
 
             // For groups: track participant
             if is_group && let Some(ref name) = sender_name {
@@ -3351,7 +3579,7 @@ impl WhatsAppApp {
         }
 
         if let Some((message_id, sender, body)) = notification {
-            self.notify_incoming_message(&chat_jid, &message_id, &sender, body, alert.title, cx);
+            self.notify_incoming_message(&chat_jid, &message_id, &sender, body, metadata.title, cx);
         }
     }
 
@@ -4062,6 +4290,9 @@ impl Render for WhatsAppApp {
             // raised them: a popup menu dispatches from its own focus, which
             // is inside the menu and not inside the row, and the root is the
             // one ancestor both paths share.
+            .on_action(cx.listener(|app, edit: &EditMessage, window, cx| {
+                app.begin_message_edit(&edit.id, window, cx);
+            }))
             .on_action(cx.listener(|app, reply: &ReplyToMessage, window, cx| {
                 app.begin_reply(&reply.id, window, cx);
             }))
@@ -4070,9 +4301,6 @@ impl Render for WhatsAppApp {
             }))
             .on_action(cx.listener(|app, react: &ReactToMessage, window, cx| {
                 app.toggle_reaction(&react.id, &react.emoji, window, cx);
-            }))
-            .on_action(cx.listener(|app, edit: &EditSentMessage, window, cx| {
-                app.begin_message_edit(&edit.jid, &edit.id, window, cx);
             }))
             .on_action(cx.listener(|app, delete: &DeleteSentMessage, _window, cx| {
                 app.begin_message_delete(&delete.jid, &delete.id, delete.for_everyone, cx);
@@ -4112,9 +4340,6 @@ impl Render for WhatsAppApp {
             )
             .into_any_element()
         });
-        let message_edit = self.edit_draft.as_ref().map(|draft| {
-            message_actions::render_message_edit(draft, cx.entity().clone(), cx).into_any_element()
-        });
         let message_delete = self.delete_confirmation.as_ref().map(|confirmation| {
             message_actions::render_message_delete(
                 confirmation,
@@ -4129,7 +4354,6 @@ impl Render for WhatsAppApp {
         // one the root answers for.
         let call_card = call_overlay.is_some();
         let paste_preview_open = paste_preview.is_some();
-        let message_edit_open = message_edit.is_some();
         let message_delete_open = message_delete.is_some();
 
         // Above the call card as well as the body: a notice raised by
@@ -4140,7 +4364,6 @@ impl Render for WhatsAppApp {
         // nothing at all while it is empty.
         root.child(body.cached(gpui::StyleRefinement::default().size_full()))
             .children(paste_preview)
-            .children(message_edit)
             .children(message_delete)
             .children(call_overlay)
             .child(self.notices().clone())
@@ -4152,7 +4375,6 @@ impl Render for WhatsAppApp {
                         entity.update(cx, |app, _| {
                             app.keyboard_surfaces.call_card = call_card;
                             app.keyboard_surfaces.paste_preview = paste_preview_open;
-                            app.keyboard_surfaces.message_edit = message_edit_open;
                             app.keyboard_surfaces.message_delete = message_delete_open;
                         });
                         let entity = entity.downgrade();
@@ -4252,6 +4474,172 @@ fn timeline_may_page(visible: Option<&str>, anchored: Option<&str>, chat_jid: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SelectionExitTestView {
+        focus_handle: FocusHandle,
+        selection_key: Arc<str>,
+    }
+
+    impl Render for SelectionExitTestView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let text = crate::components::BubbleText::of("alpha beta");
+            div().track_focus(&self.focus_handle).size_full().child(
+                div()
+                    .id("message-row")
+                    .w(gpui::px(400.))
+                    .h(gpui::px(40.))
+                    .child(crate::components::render_rich_text(
+                        &text,
+                        self.selection_key.clone(),
+                        0,
+                        cx,
+                    )),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn repeated_cache_misses_preserve_unchanged_message_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let jid = "peer@example.invalid";
+        let mut focus_handle = None;
+        let mut app_entity = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                let mut chat = Chat::new(jid.to_string());
+                chat.messages.push(ChatMessage::new_incoming(
+                    "test-message".into(),
+                    jid.into(),
+                    "alpha beta".into(),
+                ));
+                app.chats.push(Arc::new(chat));
+                app.selected_chat = Some(jid.to_string());
+                app
+            });
+            app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+            app_entity = Some(app);
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                SelectionExitTestView {
+                    focus_handle: handle,
+                    selection_key: Arc::from("test-message"),
+                }
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            gpui::point(gpui::px(1.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+
+        visual.update(|window, cx| {
+            app_entity.as_ref().unwrap().update(cx, |app, cx| {
+                // Model the call-history path: two updates before another list
+                // frame leaves the render cache absent both times.
+                app.invalidate_message_cache(jid, cx);
+                app.invalidate_message_cache(jid, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+    }
+
+    #[gpui::test]
+    fn leaving_connected_view_clears_selected_message_text(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut focus_handle = None;
+        let mut app_entity = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let app = cx.new(WhatsAppApp::new);
+            app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+            app_entity = Some(app);
+            let view = cx.new(|cx| {
+                let handle = cx.focus_handle();
+                focus_handle = Some(handle.clone());
+                SelectionExitTestView {
+                    focus_handle: handle,
+                    selection_key: Arc::from("test-message"),
+                }
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            focus_handle.as_ref().unwrap().focus(window, cx);
+        });
+        visual.simulate_mouse_down(
+            gpui::point(gpui::px(1.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_move(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(gpui::px(58.), gpui::px(12.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            "alpha "
+        );
+
+        visual.update(|window, cx| {
+            app_entity
+                .as_ref()
+                .unwrap()
+                .update(cx, |app, cx| app.leave_connected_view(Some(window), cx));
+        });
+        assert_eq!(
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                gpui_base::TextSelection::selected_text(window, cx)
+            }),
+            ""
+        );
+    }
 
     #[test]
     fn a_sent_receipt_replaces_only_the_outgoing_pending_clock() {
@@ -4528,6 +4916,29 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_phone_read_message_never_raises_a_system_notification(cx: &mut gpui::TestAppContext) {
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                let mut message = ChatMessage::new_incoming(
+                    "READ".into(),
+                    "peer@example.invalid".into(),
+                    "Already read".into(),
+                );
+                message.is_read = true;
+                app.handle_message_received(
+                    "peer@example.invalid".into(),
+                    message,
+                    None,
+                    IncomingMessageMetadata::new(true, None, Some(false), None),
+                    cx,
+                );
+            })
+        });
+        assert!(cx.shown_system_notifications().is_empty());
+    }
+
+    #[gpui::test]
     fn an_incoming_message_outside_the_active_chat_raises_one_system_notification(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4564,7 +4975,7 @@ mod tests {
                             "New message".into(),
                         ),
                         Some("Example contact".into()),
-                        IncomingAlert::new(true, None, Some(false)),
+                        IncomingMessageMetadata::new(true, None, Some(false), None),
                         cx,
                     );
                 });
@@ -4581,7 +4992,7 @@ mod tests {
                         "Quiet message".into(),
                     ),
                     Some("Muted contact".into()),
-                    IncomingAlert::new(false, None, None),
+                    IncomingMessageMetadata::new(false, None, None, None),
                     cx,
                 );
             });
@@ -4599,7 +5010,7 @@ mod tests {
                         "No longer quiet".into(),
                     ),
                     Some("Muted contact".into()),
-                    IncomingAlert::new(true, None, Some(false)),
+                    IncomingMessageMetadata::new(true, None, Some(false), None),
                     cx,
                 );
             });
@@ -4627,7 +5038,7 @@ mod tests {
                             "Group message".into(),
                         ),
                         Some(sender.into()),
-                        IncomingAlert::new(true, None, Some(false)),
+                        IncomingMessageMetadata::new(true, None, Some(false), None),
                         cx,
                     );
                 });
@@ -4652,8 +5063,18 @@ mod tests {
                         "Muted before hydration".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(false, Some("Stored subject".into()), None),
+                    IncomingMessageMetadata::new(
+                        false,
+                        Some("Stored subject".into()),
+                        None,
+                        Some("Stored subject".into()),
+                    ),
                     cx,
+                );
+                assert!(
+                    app.find_chat("new-group@g.us")
+                        .is_some_and(|chat| chat.archived),
+                    "unknown archive state must not place an absent chat in the active inbox"
                 );
                 app.handle_message_received(
                     "new-group@g.us".into(),
@@ -4663,7 +5084,12 @@ mod tests {
                         "Allowed before hydration".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(true, Some("Stored subject".into()), Some(false)),
+                    IncomingMessageMetadata::new(
+                        true,
+                        Some("Stored subject".into()),
+                        Some(false),
+                        Some("Stored subject".into()),
+                    ),
                     cx,
                 );
             });
@@ -4671,6 +5097,41 @@ mod tests {
         let notifications = cx.shown_system_notifications();
         assert_eq!(notifications.len(), 5);
         assert_eq!(notifications[4].title.as_ref(), "Stored subject");
+        cx.update(|cx| {
+            app.update(cx, |app, _cx| {
+                assert_eq!(
+                    app.find_chat("new-group@g.us")
+                        .map(|chat| chat.name.as_str()),
+                    Some("Stored subject")
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.handle_message_received(
+                    "known-contact@lid".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-KNOWN-CONTACT".into(),
+                        "known-contact@lid".into(),
+                        "Known before hydration".into(),
+                    ),
+                    None,
+                    IncomingMessageMetadata::new(
+                        false,
+                        None,
+                        Some(false),
+                        Some("Address book contact".into()),
+                    ),
+                    cx,
+                );
+                assert_eq!(
+                    app.find_chat("known-contact@lid")
+                        .map(|chat| chat.name.as_str()),
+                    Some("Address book contact")
+                );
+            });
+        });
 
         cx.update(|cx| {
             app.update(cx, |app, cx| {
@@ -4682,10 +5143,11 @@ mod tests {
                         "Mentioned you".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(
+                    IncomingMessageMetadata::new(
                         true,
                         Some("Mentioned in Archived example".into()),
                         Some(true),
+                        Some("Archived example".into()),
                     ),
                     cx,
                 );
@@ -4693,6 +5155,11 @@ mod tests {
                     app.find_chat("archived-group@g.us")
                         .is_some_and(|chat| chat.archived),
                     "a mentioned archived group must not reappear in the active list"
+                );
+                assert_eq!(
+                    app.find_chat("archived-group@g.us")
+                        .map(|chat| chat.name.as_str()),
+                    Some("Archived example")
                 );
             });
         });
@@ -4714,7 +5181,12 @@ mod tests {
                         "No longer archived".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(false, None, Some(false)),
+                    IncomingMessageMetadata::new(
+                        false,
+                        None,
+                        Some(false),
+                        Some("Archived example".into()),
+                    ),
                     cx,
                 );
                 assert!(
@@ -4733,7 +5205,12 @@ mod tests {
                         "Unknown archive state".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(false, None, None),
+                    IncomingMessageMetadata::new(
+                        false,
+                        None,
+                        None,
+                        Some("Archived example".into()),
+                    ),
                     cx,
                 );
                 assert!(

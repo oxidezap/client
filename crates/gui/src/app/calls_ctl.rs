@@ -1026,9 +1026,8 @@ impl WhatsAppApp {
             KeyboardOwner::RingingCall(_) => window.focus(&self.call_focus, cx),
             KeyboardOwner::MessageDelete => window.focus(&self.message_delete_focus, cx),
             KeyboardOwner::MessageEdit => {
-                if let Some(draft) = self.edit_draft.as_ref() {
-                    let focus = draft.input.read(cx).focus_handle(cx);
-                    window.focus(&focus, cx);
+                if let Some(input) = self.input_area.as_ref() {
+                    window.focus(&input.read(cx).focus_handle(cx), cx);
                 }
             }
             KeyboardOwner::PastePreview => {

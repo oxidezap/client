@@ -364,6 +364,7 @@ mod tests {
             unread,
             manually_unread: false,
             pinned_at_ms: None,
+            group_hierarchy: None,
             last_message: Some(MessagePreview {
                 id: Some(format!("{jid}-newest")),
                 text: "t".into(),

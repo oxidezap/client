@@ -6,12 +6,14 @@
 //! folding arriving traffic and hydrated history into a timeline, and in
 //! [`retain`] what a conversation lets go of when it is holding too much.
 
+mod group_hierarchy;
 mod media;
 mod merge;
 mod message;
 mod reactions;
 mod retain;
 
+pub use group_hierarchy::{GroupHierarchy, SubgroupKind};
 pub use media::{DownloadableMedia, MediaContent, MediaType, OutgoingMedia};
 pub use message::{ChatMessage, PollContent, Resend};
 pub use retain::ReleasedMedia;
@@ -121,6 +123,12 @@ pub struct Chat {
     pub archived: bool,
     /// Whether this is a group chat
     pub is_group: bool,
+    /// The server-reported community relationship, if it is known.
+    ///
+    /// `None` means metadata has not established the relationship yet; it is
+    /// not an assertion that this is a standalone group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_hierarchy: Option<GroupHierarchy>,
     /// Whether this is the status broadcast.
     ///
     /// Not a conversation: nothing is addressed to it and nothing is replied
@@ -214,6 +222,7 @@ impl Chat {
             muted_until: None,
             archived: false,
             is_group,
+            group_hierarchy: None,
             is_status,
             avatar_picture_id: None,
             avatar_cache_key: None,

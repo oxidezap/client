@@ -15,6 +15,9 @@ diesel::table! {
         read_boundary_ids -> Nullable<Text>,
         mute_appstate_seen -> Bool,
         archive_appstate_seen -> Bool,
+        name_from_address_book -> Bool,
+        address_book_fallback -> Nullable<Text>,
+        group_hierarchy -> Nullable<Text>,
     }
 }
 
@@ -42,6 +45,7 @@ diesel::table! {
         starred -> Bool,
         edited_at_ms -> Nullable<BigInt>,
         revoked -> Bool,
+        local_revoke_placeholder -> Bool,
     }
 }
 
@@ -113,6 +117,29 @@ diesel::table! {
 }
 
 diesel::table! {
+    message_identity_repair_state (device_id) {
+        device_id -> Integer,
+        mapping_revision -> BigInt,
+        repaired_revision -> BigInt,
+        full_repair_pending -> Bool,
+    }
+}
+
+diesel::table! {
+    message_identity_repair_pending (device_id, lid) {
+        device_id -> Integer,
+        lid -> Text,
+    }
+}
+
+diesel::table! {
+    contact_name_removals (device_id, jid) {
+        device_id -> Integer,
+        jid -> Text,
+    }
+}
+
+diesel::table! {
     avatar_descriptors (device_id, jid) {
         device_id -> Integer,
         jid -> Text,
@@ -129,5 +156,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     reactions,
     contacts,
     contact_labels,
-    message_receipts
+    message_receipts,
+    message_identity_repair_state,
+    message_identity_repair_pending,
+    contact_name_removals
 );

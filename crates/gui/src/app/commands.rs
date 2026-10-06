@@ -334,9 +334,6 @@ impl WhatsAppApp {
         if self.cancel_message_delete(cx) {
             return;
         }
-        if self.cancel_message_edit(cx) {
-            return;
-        }
         if self.cancel_paste_preview(cx) {
             return;
         }
@@ -352,6 +349,9 @@ impl WhatsAppApp {
         }
         if self.is_searching(cx) {
             self.clear_search(window, cx);
+            return;
+        }
+        if self.cancel_message_edit(window, cx) {
             return;
         }
         let composer_focused = self

@@ -38,6 +38,10 @@ mod media;
 /// What a picked file becomes on the wire: its shape, and the message that
 /// carries it.
 mod outgoing;
+/// Native image conversion before an inline media upload.
+mod outgoing_image;
+/// Native video conversion before an inline media upload.
+mod outgoing_video;
 
 /// Pages, their cursors, and where a read stops.
 mod paging;
@@ -80,12 +84,12 @@ use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::PresencePolicy;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
+use whatsapp_rust::wacore::proto_helpers::MessageExt;
 // The same type either way; only the road to it differs. On a desktop the
 // library re-exports it, and in a browser that re-export is behind a default
 // feature the wasm build drops — so it is named at its own crate there.
 #[cfg(all(test, not(target_family = "wasm")))]
 use whatsapp_rust::store::SqliteStore;
-use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use whatsapp_rust::wacore::types::events::{
     ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
@@ -169,8 +173,77 @@ fn interested_channel(
     )
 }
 
+fn interested_unbounded_channel(
+    kinds: &[EventKind],
+) -> (
+    Arc<InterestedEventHandler>,
+    async_channel::Receiver<Arc<Event>>,
+    Arc<ChannelEventHandler>,
+) {
+    let (inner, receiver) = ChannelEventHandler::new();
+    let interest = EventInterest::of(kinds);
+    (
+        Arc::new(InterestedEventHandler {
+            inner: inner.clone(),
+            interest,
+        }),
+        receiver,
+        inner,
+    )
+}
+
 /// Durable data changes whose live projection keeps an open conversation
 /// current while the history reloader coalesces store invalidations.
+const CONTROL_EVENT_KINDS: &[EventKind] = &[
+    EventKind::PairingQrCode,
+    EventKind::PairingCode,
+    EventKind::PairSuccess,
+    EventKind::Connected,
+    EventKind::LoggedOut,
+    EventKind::SelfPushNameUpdated,
+    EventKind::IncomingCall,
+    EventKind::RawNode,
+    EventKind::MissedCall,
+    EventKind::CallEndedElsewhere,
+    EventKind::GroupUpdate,
+    // Post-sync repair for the name resolver: an offline drain or a history
+    // chunk can materialize a previously unknown group/channel after the
+    // Connected full-pass snapshot.
+    EventKind::OfflineSyncCompleted,
+    EventKind::HistorySync,
+    EventKind::DeleteChatUpdate,
+];
+
+/// App-state contacts carry the PN/LID pairs the protocol library leaves to
+/// its embedder. They have their own lossless ingress and batched worker: a
+/// full contact sync can be much larger than the latency-sensitive control
+/// mailbox, while these durable identity facts must not be dropped.
+const IDENTITY_EVENT_KINDS: &[EventKind] = &[EventKind::ContactUpdate];
+
+fn contact_identity_pair(
+    update: &whatsapp_rust::wacore::types::events::ContactUpdate,
+) -> Option<(String, String)> {
+    // Some app-state producers put one alias in the action and the other in
+    // the mutation key (`update.jid`). Prefer the explicit fields, then
+    // complete the pair from that key.
+    let explicit_lid = update
+        .action
+        .lid_jid
+        .as_deref()
+        .and_then(|value| value.parse::<Jid>().ok())
+        .filter(Jid::is_lid);
+    let explicit_pn = update
+        .action
+        .pn_jid
+        .as_deref()
+        .and_then(|value| value.parse::<Jid>().ok())
+        .filter(Jid::is_pn);
+    let lid = explicit_lid.or_else(|| update.jid.is_lid().then(|| update.jid.clone()));
+    let pn = explicit_pn.or_else(|| update.jid.is_pn().then(|| update.jid.clone()));
+    lid.zip(pn)
+        .map(|(lid, pn)| (lid.user.to_string(), pn.user.to_string()))
+}
+
 const DATA_EVENT_KINDS: &[EventKind] = &[
     EventKind::Messages,
     // A positive message ack is the first delivery state of an optimistic
@@ -502,6 +575,7 @@ impl AvatarResolveSignal {
             known_picture_id: None,
             cache_key: None,
             need_bytes: true,
+            cache_miss: false,
         }));
     }
 
@@ -526,6 +600,7 @@ impl AvatarResolveSignal {
                                 existing.cache_key = item.cache_key.clone();
                             }
                         }
+                        existing.cache_miss |= item.cache_miss;
                     })
                     .or_insert(item);
             }
@@ -671,6 +746,19 @@ pub struct WhatsAppClient {
     /// while the process is offline); a live message in an unnamed special
     /// chat asks for just that chat.
     resolve_chat_names: chat_names::ChatNameResolveSignal,
+}
+
+fn live_content_fallback(message: &wa::Message, has_media: bool) -> String {
+    if has_media {
+        return String::new();
+    }
+
+    match oxidezap_chat_store::MessageKind::of(message) {
+        oxidezap_chat_store::MessageKind::Poll => "[poll]".to_string(),
+        oxidezap_chat_store::MessageKind::Album => "[album]".to_string(),
+        oxidezap_chat_store::MessageKind::Product => "[product]".to_string(),
+        _ => "[Media]".to_string(),
+    }
 }
 
 impl WhatsAppClient {
@@ -1206,31 +1294,10 @@ impl WhatsAppClient {
         // The UI observes only the event kinds handled below. Two bounded
         // mailboxes reserve space for session and call control; committed
         // ChatStore invalidations remain the recovery source for raw-event lag.
-        let (control_events, control_incoming, control_stats) = interested_channel(
-            &[
-                EventKind::PairingQrCode,
-                EventKind::PairingCode,
-                EventKind::PairSuccess,
-                EventKind::Connected,
-                EventKind::LoggedOut,
-                EventKind::SelfPushNameUpdated,
-                EventKind::IncomingCall,
-                EventKind::RawNode,
-                EventKind::MissedCall,
-                EventKind::CallEndedElsewhere,
-                EventKind::GroupUpdate,
-                // Post-sync repair for the name resolver: an offline drain
-                // or a history chunk can materialize a previously unknown
-                // group/channel AFTER the Connected full-pass snapshot, and
-                // neither reaches the session handler as a live sighting —
-                // so the drain's completion re-asks for a full pass over
-                // what the store holds now.
-                EventKind::OfflineSyncCompleted,
-                EventKind::HistorySync,
-                EventKind::DeleteChatUpdate,
-            ],
-            64,
-        );
+        let (control_events, control_incoming, control_stats) =
+            interested_channel(CONTROL_EVENT_KINDS, 64);
+        let (identity_events, identity_incoming, _identity_stats) =
+            interested_unbounded_channel(IDENTITY_EVENT_KINDS);
         let (data_events, data_incoming, data_stats) = interested_channel(DATA_EVENT_KINDS, 256);
         // What tells this session's own tasks that it is over.
         //
@@ -1254,6 +1321,15 @@ impl WhatsAppClient {
         let _call_advertisements = bot.client().acquire_raw_node_forwarding();
         bot.client().subscribe_handler(control_events).detach();
         bot.client().subscribe_handler(data_events).detach();
+        bot.client().subscribe_handler(identity_events).detach();
+        Self::spawn_contact_identity_learner(
+            bot.client(),
+            identity_incoming,
+            chat_store.clone(),
+            names.clone(),
+            reload.clone(),
+            stopping.clone(),
+        );
         {
             let client = bot.client();
             let ui_tx = ui_tx.clone();
@@ -1425,9 +1501,9 @@ impl WhatsAppClient {
         // Notify UI that init is complete
         let _ = ui_tx.send(UiEvent::InitComplete);
 
-        // bot.run() reconnects internally, so on its own it only returns after
-        // a logout; the shutdown signal is how a replaced client's thread gets
-        // to exit (letting block_on return drops the runtime + SQLite pool).
+        // bot.run() supervises reconnects and returns its classified completion.
+        // The shutdown signal also lets a replaced client's thread exit
+        // (letting block_on return drops the runtime + SQLite pool).
         let client = bot.client();
         tokio::select! {
             // Said out loud, because this is a session ending. `run`
@@ -1435,7 +1511,7 @@ impl WhatsAppClient {
             // left to try — and returning quietly left a window sitting on
             // "Connecting to WhatsApp" with a console that had stopped saying
             // anything at all, which reads as a hang rather than as a stop.
-            () = bot.run() => info!("the WhatsApp session ended"),
+            reason = bot.run() => info!("the WhatsApp session ended: {reason:?}"),
             _ = shutdown.notified() => {
                 // Graceful stop: flushes state and closes the transport. The
                 // dropped run future is not awaited out instead, because a
@@ -1455,6 +1531,89 @@ impl WhatsAppClient {
         use whatsapp_rust::wacore::stanza::call::{REJECT_REASON_BUSY, REJECT_REASON_ENC};
 
         !matches!(reason, Some(REJECT_REASON_BUSY) | Some(REJECT_REASON_ENC))
+    }
+
+    /// Consume app-state identity pairs losslessly and persist them in
+    /// batches. This is separate from the latency-sensitive event lanes: a
+    /// full contact sync can contain hundreds of updates, and persisting one
+    /// mapping at a time on the global lane both delayed connection events and
+    /// made a bounded ingress discard the tail of the sync.
+    fn spawn_contact_identity_learner(
+        client: Arc<Client>,
+        incoming: async_channel::Receiver<Arc<Event>>,
+        chat_store: Arc<ChatStore>,
+        names: Arc<NameBook>,
+        reload: Arc<tokio::sync::Notify>,
+        mut stopping: tokio::sync::watch::Receiver<()>,
+    ) {
+        crate::exec::spawn_owned(async move {
+            loop {
+                let first = tokio::select! {
+                    event = incoming.recv() => match event {
+                        Ok(event) => event,
+                        Err(_) => return,
+                    },
+                    _ = stopping.changed() => return,
+                };
+                let mut mappings = Vec::new();
+                if let Event::ContactUpdate(update) = &*first
+                    && let Some(pair) = contact_identity_pair(update)
+                {
+                    mappings.push(pair);
+                }
+                // Drain the already queued portion of a full sync into the
+                // client's durable batch API. New arrivals remain queued for
+                // the next pass; no fixed batch limit is needed because the
+                // event bus has already materialized this finite burst.
+                while let Ok(event) = incoming.try_recv() {
+                    if let Event::ContactUpdate(update) = &*event
+                        && let Some(pair) = contact_identity_pair(update)
+                    {
+                        mappings.push(pair);
+                    }
+                }
+                if mappings.is_empty() {
+                    continue;
+                }
+
+                loop {
+                    let learned = client.add_lid_pn_mappings(
+                        mappings.clone(),
+                        whatsapp_rust::lid_pn_cache::LearningSource::Other,
+                    );
+                    let result = tokio::select! {
+                        result = learned => result,
+                        _ = stopping.changed() => return,
+                    };
+                    match result {
+                        Ok(_) => break,
+                        Err(error) => {
+                            warn!("could not persist a batch of contact LID/PN mappings: {error}");
+                            tokio::select! {
+                                _ = crate::exec::sleep(std::time::Duration::from_secs(1)) => {}
+                                _ = stopping.changed() => return,
+                            }
+                        }
+                    }
+                }
+
+                // The writer may have already materialized the same author
+                // under both keys before this mapping became durable. Fold
+                // those legacy rows before consumers re-read the affected chats.
+                if let Err(error) = chat_store.reconcile_message_mappings(&mappings) {
+                    warn!("could not queue message identity reconciliation: {error}");
+                } else if let Err(error) = chat_store.flush().await {
+                    warn!("could not reconcile message identities after learning aliases: {error}");
+                }
+
+                // A previous read may have cached an honest mapping miss.
+                // Invalidate only after the batch is durable; the generation
+                // in NameBook prevents an older in-flight lookup from putting
+                // that miss back after this point.
+                names.forget();
+                reload.notify_one();
+            }
+        });
     }
 
     /// Handle events from the WhatsApp client
@@ -1706,14 +1865,50 @@ impl WhatsAppClient {
                         })
                         .collect::<Vec<_>>()
                 });
+                // Cache read frontiers per conversation for this offline batch.
+                // Already-read replays must keep their read flag even though
+                // offline batches cannot trigger alerts.
+                let mut offline_reads = HashMap::new();
+                if !eager {
+                    for inbound in batch
+                        .iter()
+                        .filter(|inbound| !inbound.info.source.is_from_me)
+                    {
+                        let key = inbound.info.source.chat.to_non_ad_string();
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            offline_reads.entry(key)
+                        {
+                            let state = if let Some(store) = names.chat_store() {
+                                match store.message_read_state(&inbound.info.source.chat).await {
+                                    Ok(state) => Some(state),
+                                    Err(error) => {
+                                        warn!("could not read offline attention state: {error}");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            entry.insert(state);
+                        }
+                    }
+                }
                 for inbound in batch.iter() {
-                    Self::handle_inbound_message(
+                    let cached_read = offline_reads
+                        .get(&inbound.info.source.chat.to_non_ad_string())
+                        .map(|state| {
+                            state
+                                .as_ref()
+                                .map(|state| state.covers(&inbound.info.id, inbound.info.timestamp))
+                        });
+                    Self::handle_inbound_message_with_read(
                         &inbound.message,
                         &inbound.info,
                         &client,
                         &ui_tx,
                         &names,
                         eager,
+                        cached_read,
                     )
                     .await;
                 }
@@ -1930,7 +2125,7 @@ impl WhatsAppClient {
         }
     }
 
-    /// One decrypted inbound message -> UiEvent (reaction or chat message).
+    #[cfg(test)]
     async fn handle_inbound_message(
         msg: &wa::Message,
         info: &whatsapp_rust::wacore::types::message::MessageInfo,
@@ -1939,8 +2134,22 @@ impl WhatsAppClient {
         names: &NameBook,
         eager: bool,
     ) {
-        // Use MessageExt to unwrap ephemeral/device_sent/view_once wrappers
-        let base_msg = msg.get_base_message();
+        Self::handle_inbound_message_with_read(msg, info, client, ui_tx, names, eager, None).await;
+    }
+
+    /// One decrypted inbound message -> UiEvent (reaction or chat message).
+    async fn handle_inbound_message_with_read(
+        msg: &wa::Message,
+        info: &whatsapp_rust::wacore::types::message::MessageInfo,
+        client: &Arc<Client>,
+        ui_tx: &UiEventSender,
+        names: &NameBook,
+        eager: bool,
+        cached_read: Option<Option<bool>>,
+    ) {
+        // Use the shared store normalization for both ordinary envelopes and
+        // the nested wrappers it peels, so live and hydrated paths agree.
+        let base_msg = oxidezap_chat_store::normalized_message(msg);
 
         // Check if this is a reaction message
         if let Some(reaction) = base_msg.reaction_message.as_option() {
@@ -2020,18 +2229,13 @@ impl WhatsAppClient {
         let poll = poll_of(base_msg);
 
         // Extract text content
-        let content = msg
+        let content = base_msg
             .text_content()
             .map(|s| s.to_string())
-            .or_else(|| msg.get_caption().map(|s| s.to_string()))
+            .or_else(|| base_msg.get_caption().map(|s| s.to_string()))
+            .or_else(|| oxidezap_chat_store::shared_contacts_text(base_msg))
             .or_else(|| poll.as_ref().map(|poll| poll.question.clone()))
-            .unwrap_or_else(|| {
-                if media_result.is_some() {
-                    String::new() // Empty for media-only messages
-                } else {
-                    "[Media]".to_string()
-                }
-            });
+            .unwrap_or_else(|| live_content_fallback(base_msg, media_result.is_some()));
 
         // A mention arrives as `@` plus the user part — the digits of a LID
         // where the peer is LID-addressed — and a phone draws the contact's
@@ -2062,6 +2266,7 @@ impl WhatsAppClient {
             sender: info.source.sender.to_string(),
             sender_name: None, // Will be set in handle_message_received for groups
             content,
+            is_text: oxidezap_chat_store::message_kind(base_msg) == "text",
             timestamp: info.timestamp,
             is_from_me: info.source.is_from_me,
             is_read: false,
@@ -2158,7 +2363,7 @@ impl WhatsAppClient {
         let mentions_me = info.source.chat.is_group()
             && !info.source.is_from_me
             && crate::mentions::mentions_own_account(Some(msg), &history::own_jids(client));
-        let (notification_allowed, notification_title, notification_archived) = if eager {
+        let (notification_allowed, notification_title, notification_archived, chat_name) =
             if let Some(store) = names.chat_store() {
                 match store.notification_metadata(&info.source.chat).await {
                     Ok(Some(metadata)) => {
@@ -2166,53 +2371,87 @@ impl WhatsAppClient {
                         // copy of the chat policy: self echoes are displayed
                         // as outgoing bubbles and must never ask a front end
                         // to alert, even when their chat is otherwise eligible.
-                        let allowed = allows_desktop_notification(
-                            info.source.is_from_me,
-                            metadata.allowed,
-                            mentions_me,
-                        );
+                        // Offline drains are not new attention, but they still
+                        // need the durable archive bit: an archived chat is
+                        // absent from the active page, so a front end receiving
+                        // its message before hydration must not recreate it in
+                        // the inbox.
+                        let allowed = eager
+                            && allows_desktop_notification(
+                                info.source.is_from_me,
+                                metadata.allowed,
+                                mentions_me,
+                            );
+                        let identity = names.identity(client, &info.source.chat).await;
+                        let (resolved_name, priority) = names
+                            .resolve(
+                                store,
+                                &info.source.chat,
+                                metadata.name.as_deref(),
+                                &identity,
+                            )
+                            .await;
+                        let chat_name = (priority > 0).then_some(resolved_name.clone());
                         let title = if allowed {
-                            let identity = names.identity(client, &info.source.chat).await;
-                            let (title, priority) = names
-                                .resolve(
-                                    store,
-                                    &info.source.chat,
-                                    metadata.name.as_deref(),
-                                    &identity,
-                                )
-                                .await;
                             if mentions_me {
                                 let group = if priority > 0 {
-                                    title.as_str()
+                                    resolved_name.as_str()
                                 } else {
                                     "group"
                                 };
                                 Some(format!("Mentioned in {group}"))
                             } else {
-                                (priority > 0).then_some(title)
+                                (priority > 0).then_some(resolved_name)
                             }
                         } else {
                             None
                         };
-                        (allowed, title, Some(metadata.archived))
+                        (allowed, title, Some(metadata.archived), chat_name)
                     }
-                    Ok(None) => (false, None, None),
+                    Ok(None) => (false, None, None, None),
                     Err(error) => {
                         warn!("could not read chat notification policy: {error}");
-                        (false, None, None)
+                        (false, None, None, None)
                     }
                 }
             } else {
-                (false, None, None)
-            }
+                (false, None, None, None)
+            };
+
+        // Delivery ACKs describe transport, not whether this user read the
+        // message on another device. A live replay may already be covered by
+        // a durable self-read verdict even though it is not an offline batch.
+        // Resolve this after all notification/name I/O, immediately before
+        // publication. Offline drains reuse their per-chat batch snapshot.
+        let already_read = if info.source.is_from_me {
+            None
+        } else if let Some(read) = cached_read {
+            read
         } else {
-            (false, None, None)
+            if let Some(store) = names.chat_store() {
+                match store
+                    .message_is_read(&info.source.chat, &info.id, info.timestamp)
+                    .await
+                {
+                    Ok(read) => Some(read),
+                    Err(error) => {
+                        warn!("could not read message attention state: {error}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
         };
+        chat_message.is_read = already_read == Some(true);
+
+        let notification_allowed = notification_allowed && already_read == Some(false);
 
         let _ = ui_tx.send(UiEvent::MessageReceived {
             chat_jid,
             message: Box::new(chat_message),
             sender_name,
+            chat_name,
             notification_allowed,
             notification_title,
             notification_archived,
@@ -2552,8 +2791,13 @@ impl WhatsAppClient {
             // coming back, because a picture in a format the recipient will
             // not draw is re-encoded there.
             let (shape, mut file) =
-                match crate::exec::unblock(move || outgoing::prepare(file)).await {
-                    Ok(prepared) => prepared,
+                match crate::exec::unblock(move || outgoing::prepare_for_send(file)).await {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(reason)) => {
+                        warn!("that file could not be prepared: {reason}");
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, reason);
+                        return;
+                    }
                     Err(e) => {
                         // The executor is going away, which is the session
                         // shutting down. Reported rather than dropped: the bubble

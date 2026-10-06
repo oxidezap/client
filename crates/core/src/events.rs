@@ -59,6 +59,11 @@ pub enum UiEvent {
         chat_jid: String,
         message: Box<ChatMessage>,
         sender_name: Option<String>,
+        /// Durable display name of the conversation when the store can
+        /// resolve one. Separate from `sender_name` (a group participant) and
+        /// `notification_title` (which may be formatted as a mention alert).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_name: Option<String>,
         /// A live, committed message in a known, unmuted, unarchived chat.
         /// Missing from an older daemon's frame means unknown and suppresses
         /// the alert; the GUI still owns focus and duplicate filtering.
@@ -403,6 +408,7 @@ mod notification_wire_tests {
                 "example",
             )),
             sender_name: None,
+            chat_name: Some("Example group".into()),
             notification_allowed: true,
             notification_title: Some("Example group".into()),
             notification_archived: Some(true),
@@ -413,6 +419,7 @@ mod notification_wire_tests {
             .and_then(serde_json::Value::as_object_mut)
             .unwrap();
         fields.remove("notification_allowed");
+        fields.remove("chat_name");
         fields.remove("notification_title");
         fields.remove("notification_archived");
         let older: UiEvent = serde_json::from_value(wire).unwrap();
@@ -420,6 +427,7 @@ mod notification_wire_tests {
             older,
             UiEvent::MessageReceived {
                 notification_allowed: false,
+                chat_name: None,
                 notification_title: None,
                 notification_archived: None,
                 ..
