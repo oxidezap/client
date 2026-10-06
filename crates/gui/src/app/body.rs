@@ -433,6 +433,34 @@ pub(super) mod tests {
         (cx, app)
     }
 
+    fn start_outgoing_call(
+        cx: &mut gpui::VisualTestContext,
+        app: &Entity<WhatsAppApp>,
+        call_id: &str,
+    ) {
+        app.update(cx, |app, cx| {
+            app.calls.update(cx, |calls, cx| {
+                calls.place_outgoing(
+                    OutgoingCall::new(
+                        call_id,
+                        "peer@example.invalid".into(),
+                        "Test peer".into(),
+                        false,
+                    ),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    fn outgoing_call_cancel_point(cx: &mut gpui::VisualTestContext) -> gpui::Point<gpui::Pixels> {
+        cx.debug_bounds("call-cancel")
+            .expect("the outgoing call must render its Cancel control")
+            .center()
+    }
+
     #[gpui::test]
     fn pasted_image_waits_in_a_visible_preview(cx: &mut gpui::TestAppContext) {
         let (mut cx, app) = paste_preview_fixture(cx);
@@ -509,6 +537,182 @@ pub(super) mod tests {
             assert!(app.read(cx).attachment_attempts.is_empty());
             assert!(app.read(cx).paste_preview.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn paste_preview_background_does_not_activate_overlapping_call_control(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1100.)));
+        cx.run_until_parked();
+        start_outgoing_call(&mut cx, &app, "test-call-before-preview");
+        let baseline_point = outgoing_call_cancel_point(&mut cx);
+        cx.simulate_click(baseline_point, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| assert!(app.read(cx).call_state(cx).stage().is_none()));
+
+        start_outgoing_call(&mut cx, &app, "test-call-under-preview");
+        let call_cancel_point = outgoing_call_cancel_point(&mut cx);
+
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                assert!(app.open_confirmation(
+                    "peer@example.invalid".into(),
+                    None,
+                    crate::platform::picker::Chosen {
+                        files: vec![crate::platform::picker::Picked::automatic(
+                            "pasted.png".into(),
+                            "image/png".into(),
+                            one_pixel_png(),
+                        )],
+                        refused: Vec::new(),
+                    },
+                    cx,
+                ));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(app.call_state(cx).stage().is_some());
+            assert!(app.paste_preview.is_some());
+            assert!(
+                !app.keyboard_surfaces.call_card,
+                "a confirmation modal must temporarily hide the interactive call card"
+            );
+            assert_eq!(app.keyboard_owner, Some(KeyboardOwner::PastePreview));
+        });
+        let preview = cx
+            .debug_bounds("paste-preview")
+            .expect("the modal preview must cover the window");
+        assert!(
+            preview.contains(&call_cancel_point),
+            "the modal covers the previously verified call control point"
+        );
+
+        cx.simulate_click(call_cancel_point, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(
+                app.paste_preview.is_some(),
+                "background click keeps preview open"
+            );
+            assert!(
+                app.call_state(cx).stage().is_some(),
+                "the overlapping call control must not receive the modal click"
+            );
+            assert!(
+                !app.keyboard_surfaces.call_card,
+                "the card stays suppressed while the modal is open"
+            );
+        });
+
+        let cancel = cx
+            .debug_bounds("paste-preview-cancel")
+            .expect("cancel control");
+        cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(app.paste_preview.is_none());
+            assert!(app.call_state(cx).stage().is_some());
+            assert_eq!(
+                app.keyboard_owner,
+                Some(KeyboardOwner::RingingCall("test-call-under-preview".into()))
+            );
+            assert!(
+                app.keyboard_surfaces.call_card,
+                "the card returns after close"
+            );
+        });
+
+        cx.simulate_click(call_cancel_point, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| assert!(app.read(cx).call_state(cx).stage().is_none()));
+    }
+
+    #[gpui::test]
+    fn media_viewer_scrim_does_not_activate_overlapping_call_control(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1100.)));
+        cx.run_until_parked();
+
+        start_outgoing_call(&mut cx, &app, "test-call-before-viewer");
+        let baseline_point = outgoing_call_cancel_point(&mut cx);
+        cx.simulate_click(baseline_point, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| assert!(app.read(cx).call_state(cx).stage().is_none()));
+
+        start_outgoing_call(&mut cx, &app, "test-call-under-viewer");
+        let call_cancel_point = outgoing_call_cancel_point(&mut cx);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let mut photo = ChatMessage::new_incoming(
+                    "viewer-photo".into(),
+                    "peer@example.invalid".into(),
+                    String::new(),
+                );
+                photo.media = Some(
+                    oxidezap_core::MediaContent::image(
+                        std::sync::Arc::new(one_pixel_png()),
+                        "image/png".into(),
+                        false,
+                    )
+                    .with_size(Some(1), Some(1)),
+                );
+                Arc::make_mut(&mut app.chats[0]).messages.push(photo);
+                app.open_media_viewer("viewer-photo", window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(app.media_viewer(cx).is_some());
+            assert!(app.call_state(cx).stage().is_some());
+            assert!(
+                !app.keyboard_surfaces.call_card,
+                "a fullscreen viewer must temporarily hide the interactive call card"
+            );
+            assert_eq!(app.keyboard_owner, Some(KeyboardOwner::Viewer));
+        });
+
+        cx.simulate_click(call_cancel_point, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(
+                app.media_viewer(cx).is_none(),
+                "the scrim keeps its close action"
+            );
+            assert!(
+                app.call_state(cx).stage().is_some(),
+                "the call control behind the scrim must not receive its click"
+            );
+            assert_eq!(
+                app.keyboard_owner,
+                Some(KeyboardOwner::RingingCall("test-call-under-viewer".into()))
+            );
+            assert!(
+                app.keyboard_surfaces.call_card,
+                "the card returns after close"
+            );
+        });
+
+        cx.simulate_click(call_cancel_point, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| assert!(app.read(cx).call_state(cx).stage().is_none()));
     }
 
     #[gpui::test]

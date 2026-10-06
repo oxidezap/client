@@ -2340,17 +2340,15 @@ impl WhatsAppApp {
         self.search.update(cx, |search, cx| search.forget(cx));
     }
 
-    /// Everything that has to stop when the connected view goes away.
+    /// Stop transient controls tied to a live connection when it goes away.
     ///
     /// The controls that stop them are drawn by that view, so anything still
     /// running when it is replaced has no way to be stopped: a recording
     /// holds the microphone open, ticks every 100ms and grows a buffer, and
     /// a voice note plays on over a screen that is now an error message.
-    /// Three transitions leave that view — a disconnect, an error and a
-    /// logout — which is three chances to forget, so it is one method.
-    ///
-    /// Not [`AppState::Offline`]: that keeps the conversation on screen and
-    /// only refuses to send.
+    /// A disconnect keeps cached history on screen in [`AppState::Offline`],
+    /// while an error or logout replaces it. In all three cases, controls
+    /// whose work belongs to the live connection must stop here.
     fn leave_connected_view(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         // The window-scoped text selection outlives the conversation's rows.
         // Clear it with the rest of the connected view so Copy cannot expose
@@ -4316,15 +4314,6 @@ impl Render for WhatsAppApp {
         // it, computed before the borrow below.
         let connected = matches!(self.app_state, AppState::Connected | AppState::Offline);
 
-        // Outside the Settings-versus-conversation branch on purpose. The
-        // card and the focus it takes were built by the conversation view
-        // alone, so a call arriving while Settings was open rang at the far
-        // end with nothing on screen to answer or refuse it — and no working
-        // shortcut either — until the user happened to close Settings.
-        let call_overlay = connected
-            .then(|| render_call_overlay(self, window, cx))
-            .flatten();
-
         let paste_preview = self.paste_preview.as_ref().map(|preview| {
             render_paste_preview(
                 PastePreviewProps {
@@ -4350,11 +4339,25 @@ impl Render for WhatsAppApp {
             .into_any_element()
         });
 
+        // Outside the Settings-versus-conversation branch on purpose. The
+        // card and the focus it takes were built by the conversation view
+        // alone, so a call arriving while Settings was open rang at the far
+        // end with nothing on screen to answer or refuse it — and no working
+        // shortcut either — until the user happened to close Settings.
+        // Modal surfaces own mouse and keyboard input while open. Keep the
+        // call state alive underneath them, but do not render an interactive
+        // call card above a fullscreen viewer or confirmation surface.
+        let paste_preview_open = paste_preview.is_some();
+        let message_delete_open = message_delete.is_some();
+        let media_viewer_open = self.viewer.read(cx).showing().is_some();
+        let modal_open = paste_preview_open || message_delete_open || media_viewer_open;
+        let call_overlay = (connected && !modal_open)
+            .then(|| render_call_overlay(self, window, cx))
+            .flatten();
+
         // The card is the one surface the root draws itself, so it is the
         // one the root answers for.
         let call_card = call_overlay.is_some();
-        let paste_preview_open = paste_preview.is_some();
-        let message_delete_open = message_delete.is_some();
 
         // Above the call card as well as the body: a notice raised by
         // something the call did is about the call, and a card that covered
@@ -4362,32 +4365,50 @@ impl Render for WhatsAppApp {
         // out of here, so the clock taking a line down repaints the stack and
         // asks nothing of the conversation underneath it; the stack draws
         // nothing at all while it is empty.
-        root.child(body.cached(gpui::StyleRefinement::default().size_full()))
-            .children(paste_preview)
-            .children(message_delete)
-            .children(call_overlay)
-            .child(self.notices().clone())
-            // Cached views report their surfaces in prepaint. Move focus after
-            // drawing, when focus can schedule the frame that delivers blur/focus.
-            .child(
-                gpui::canvas(
-                    move |_, window, cx| {
-                        entity.update(cx, |app, _| {
-                            app.keyboard_surfaces.call_card = call_card;
-                            app.keyboard_surfaces.paste_preview = paste_preview_open;
-                            app.keyboard_surfaces.message_delete = message_delete_open;
-                        });
-                        let entity = entity.downgrade();
-                        window.defer(cx, move |window, cx| {
-                            let _ = entity.update(cx, |app, cx| {
-                                app.sync_overlay_focus(window, cx);
-                            });
-                        });
-                    },
-                    |_, (), _, _| {},
+        let conversation_strip = !self.showing_settings(cx)
+            && self.destination == Destination::Chats
+            && self.responsive_layout(window, cx).show_chat_area()
+            && self.selected_chat_jid().is_some();
+        let offline_banner = (self.is_offline() && !conversation_strip)
+            .then(|| crate::views::render_offline_strip(entity.clone(), cx.product().metrics, cx));
+        root.child(
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(body.cached(gpui::StyleRefinement::default().size_full())),
                 )
-                .absolute(),
+                .children(offline_banner),
+        )
+        .children(paste_preview)
+        .children(message_delete)
+        .children(call_overlay)
+        .child(self.notices().clone())
+        // Cached views report their surfaces in prepaint. Move focus after
+        // drawing, when focus can schedule the frame that delivers blur/focus.
+        .child(
+            gpui::canvas(
+                move |_, window, cx| {
+                    entity.update(cx, |app, _| {
+                        app.keyboard_surfaces.call_card = call_card;
+                        app.keyboard_surfaces.paste_preview = paste_preview_open;
+                        app.keyboard_surfaces.message_delete = message_delete_open;
+                    });
+                    let entity = entity.downgrade();
+                    window.defer(cx, move |window, cx| {
+                        let _ = entity.update(cx, |app, cx| {
+                            app.sync_overlay_focus(window, cx);
+                        });
+                    });
+                },
+                |_, (), _, _| {},
             )
+            .absolute(),
+        )
     }
 }
 

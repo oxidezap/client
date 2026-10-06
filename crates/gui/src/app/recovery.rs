@@ -136,6 +136,40 @@ impl Recovering {
 }
 
 impl WhatsAppApp {
+    /// Retry WhatsApp through the live IPC connection. Only failure to reach
+    /// that service uses the separate front-end attach recovery.
+    pub fn retry_whatsapp_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.as_ref() else {
+            self.retry_connection(cx);
+            return;
+        };
+        let answer = client.reconnect_whatsapp();
+        cx.spawn(async move |app: WeakEntity<Self>, cx| {
+            let result = answer.await;
+            let _ = app.update(cx, |app, cx| app.finish_whatsapp_retry(result, cx));
+        })
+        .detach();
+    }
+
+    fn finish_whatsapp_retry(
+        &mut self,
+        result: Result<Result<(), Failure>, tokio::sync::oneshot::error::RecvError>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_offline() {
+            return;
+        }
+        match result {
+            // Accepted means the existing supervisor was woken, not that
+            // WhatsApp is online yet. Only its Connected event says that.
+            Ok(Ok(())) => {}
+            // A daemon refusal is an answer over healthy IPC, not a reason
+            // to attach another reader to the same ended account session.
+            Ok(Err(failure)) => self.notify_user(failure.detail, notices::Tone::Problem, cx),
+            Err(_) => self.retry_connection(cx),
+        }
+    }
+
     /// Seconds until the automatic retry, or `None` when none is scheduled.
     pub fn retry_countdown(&self, cx: &App) -> Option<u64> {
         self.recovery.read(cx).countdown_secs()
@@ -206,6 +240,63 @@ impl WhatsAppApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn a_rejected_whatsapp_retry_does_not_reattach_healthy_ipc(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| {
+            let mut app = WhatsAppApp::new(cx);
+            app.app_state = AppState::Offline;
+            app
+        });
+        app.update(cx, |app, cx| {
+            app.finish_whatsapp_retry(Ok(Err(Failure::permanent("session ended"))), cx);
+            assert!(app.is_offline());
+            assert!(app.reconnect_task.is_none());
+            assert!(app.notices.read(cx).has_problem("session ended"));
+            app.finish_whatsapp_retry(Ok(Ok(())), cx);
+            assert!(app.is_offline(), "only Connected can restore sending");
+        });
+    }
+
+    #[gpui::test]
+    fn whatsapp_loss_preserves_history_and_waits_on_the_existing_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app = cx.new(|cx| {
+            let mut app = WhatsAppApp::new(cx);
+            app.app_state = AppState::Connected;
+            app.chats
+                .push(Arc::new(Chat::new("999000@s.whatsapp.net".into())));
+            app
+        });
+        app.update(cx, |app, cx| {
+            let mut ringing = CallState::default();
+            ringing.set_incoming(oxidezap_core::IncomingCall {
+                call_id: "BEFORE-DROP".into(),
+                caller_name: "Example".into(),
+                caller_jid: "999000@s.whatsapp.net".into(),
+                is_video: false,
+                is_offline: false,
+                received_at: wacore::time::now_utc(),
+            });
+            app.adopt_calls(ringing.clone(), cx);
+            assert!(app.calls.read(cx).state().incoming().is_some());
+            app.handle_event(UiEvent::Disconnected("synthetic drop".into()), cx);
+            assert!(app.is_offline());
+            assert!(!app.can_send());
+            assert_eq!(app.chats.len(), 1);
+            assert!(app.calls.read(cx).state().stage().is_none());
+            assert!(app.retry_countdown(cx).is_none());
+            assert!(app.reconnect_task.is_none());
+            app.adopt_calls(ringing, cx);
+            assert!(
+                app.calls.read(cx).state().stage().is_none(),
+                "offline replay cannot reopen the card"
+            );
+            app.handle_event(UiEvent::Connected, cx);
+            assert!(app.can_send());
+        });
+    }
 
     /// The countdown is derived from a deadline rather than decremented, so a
     /// tick that runs late lands on the right number instead of the number of

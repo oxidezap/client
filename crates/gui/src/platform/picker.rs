@@ -251,7 +251,14 @@ fn selected_kind_and_mime(
     let inferred_from_name = declared_mime.is_empty()
         || (category == Some(AttachmentCategory::PhotosVideos) && generic_mime);
     let candidate = if inferred_from_name {
-        mime_for_name(file_name)
+        let named_mime = mime_for_name(file_name);
+        if category == Some(AttachmentCategory::PhotosVideos)
+            && named_mime == "application/octet-stream"
+        {
+            image_mime_from_bytes(bytes).unwrap_or(named_mime)
+        } else {
+            named_mime
+        }
     } else {
         declared_mime
     };
@@ -578,35 +585,43 @@ mod imp {
             );
             let photo = directory.join(format!("{marker}.png"));
             let heic = directory.join(format!("{marker}.heic"));
+            let extensionless = directory.join(format!("{marker}-without-extension"));
             std::fs::write(&photo, b"\x89PNG\r\n\x1a\nrest").expect("write photo fixture");
             std::fs::write(&heic, b"original HEIC bytes").expect("write HEIC fixture");
+            std::fs::write(&extensionless, b"\x89PNG\r\n\x1a\nrest")
+                .expect("write extensionless photo fixture");
 
             let media = read_all(
-                &[photo.clone(), heic.clone()],
+                &[photo.clone(), extensionless.clone(), heic.clone()],
                 Some(AttachmentCategory::PhotosVideos),
                 &mut super::super::Budget::default(),
             );
             let documents = read_all(
-                &[photo.clone(), heic.clone()],
+                &[photo.clone(), extensionless.clone(), heic.clone()],
                 Some(AttachmentCategory::Document),
                 &mut super::super::Budget::default(),
             );
             std::fs::remove_file(photo).expect("remove photo fixture");
             std::fs::remove_file(heic).expect("remove HEIC fixture");
+            std::fs::remove_file(extensionless).expect("remove extensionless fixture");
 
-            assert_eq!(media.files.len(), 1);
+            assert_eq!(media.files.len(), 2);
             assert_eq!(media.files[0].kind, oxidezap_core::OutgoingMedia::Image);
+            assert_eq!(media.files[1].kind, oxidezap_core::OutgoingMedia::Image);
+            assert_eq!(media.files[1].mime_type, "image/png");
             assert_eq!(media.refused.len(), 1);
             assert!(media.refused[0].contains(".heic"));
-            assert_eq!(documents.files.len(), 2);
+            assert_eq!(documents.files.len(), 3);
             assert!(
                 documents
                     .files
                     .iter()
                     .all(|file| file.kind == oxidezap_core::OutgoingMedia::Document)
             );
-            assert_eq!(documents.files[1].bytes, b"original HEIC bytes");
-            assert_eq!(documents.files[1].mime_type, "image/heic");
+            assert_eq!(documents.files[1].bytes, b"\x89PNG\r\n\x1a\nrest");
+            assert_eq!(documents.files[1].mime_type, "application/octet-stream");
+            assert_eq!(documents.files[2].bytes, b"original HEIC bytes");
+            assert_eq!(documents.files[2].mime_type, "image/heic");
         }
     }
 }
@@ -1020,6 +1035,17 @@ mod tests {
             ),
             Ok((OutgoingMedia::Image, "image/png".into()))
         );
+        for declared_mime in ["", "application/octet-stream"] {
+            assert_eq!(
+                selected_kind_and_mime(
+                    "photo-without-extension",
+                    declared_mime,
+                    png,
+                    Some(AttachmentCategory::PhotosVideos),
+                ),
+                Ok((OutgoingMedia::Image, "image/png".into()))
+            );
+        }
         assert!(
             selected_kind_and_mime(
                 "false.png",
@@ -1051,6 +1077,15 @@ mod tests {
         assert_eq!(
             selected_kind_and_mime(
                 "photo.png",
+                "application/octet-stream",
+                png,
+                Some(AttachmentCategory::Document),
+            ),
+            Ok((OutgoingMedia::Document, "application/octet-stream".into()))
+        );
+        assert_eq!(
+            selected_kind_and_mime(
+                "photo-without-extension",
                 "application/octet-stream",
                 png,
                 Some(AttachmentCategory::Document),

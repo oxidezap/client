@@ -33,6 +33,17 @@ fn offered_video(offer: &WaIncomingCall) -> bool {
     matches!(&offer.action, CallAction::Offer { is_video, .. } if *is_video)
 }
 
+/// Offers normally stop ringing after about 45 seconds. This deliberately
+/// wider window leaves room for delivery latency and modest clock skew while
+/// preventing a reconnect backlog from ringing calls from minutes ago. It is
+/// a freshness policy, not a protocol TTL: future timestamps are not refused.
+const MAX_RINGABLE_OFFER_AGE_MS: i64 = 120_000;
+
+fn ringable_offer(offer: &WaIncomingCall, now_ms: i64) -> bool {
+    !offer.offline
+        && now_ms.saturating_sub(offer.timestamp.timestamp_millis()) <= MAX_RINGABLE_OFFER_AGE_MS
+}
+
 fn direct_peer_video(state: VideoState) -> Option<bool> {
     match state {
         VideoState::Enabled => Some(true),
@@ -225,6 +236,9 @@ const ANNOUNCED_ENDINGS: usize = 256;
 
 #[derive(Default)]
 struct Calls {
+    /// Captured before an event queues, and invalidated on transport loss.
+    connection_epoch: u64,
+    disconnected: bool,
     peer_lanes: HashMap<String, Arc<Mutex<()>>>,
     starting: HashMap<String, u64>,
     next_start: u64,
@@ -310,13 +324,122 @@ impl Drop for StartGuard {
 }
 
 impl CallRegistry {
-    /// Record a ringing offer, so accept and decline have something to act on.
-    pub(in crate::whatsapp) fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
-        self.calls
-            .lock()
-            .expect("call registry poisoned")
-            .pending
-            .insert(call_id, call);
+    /// Apply connection boundaries before any asynchronous event lane. Sending
+    /// the disconnect under this lock orders it against offer publication.
+    pub(in crate::whatsapp) fn connection_event(&self, event: &Event, ui: &UiEventSender) -> u64 {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        let mut retired = Vec::new();
+        match event {
+            Event::Disconnected(_) | Event::LoggedOut(_) => {
+                calls.connection_epoch = calls
+                    .connection_epoch
+                    .checked_add(1)
+                    .expect("call epoch exhausted");
+                calls.disconnected = true;
+                let retired_ids: Vec<_> = calls
+                    .pending
+                    .keys()
+                    .chain(calls.active.keys())
+                    .chain(calls.outgoing.keys())
+                    .chain(calls.in_flight.iter())
+                    .cloned()
+                    .collect();
+                for id in retired_ids {
+                    if calls.announced.insert(id.clone()) {
+                        calls.announced_order.push_back(id);
+                    }
+                }
+                while calls.announced_order.len() > ANNOUNCED_ENDINGS {
+                    if let Some(id) = calls.announced_order.pop_front() {
+                        calls.announced.remove(&id);
+                    }
+                }
+                calls.pending.clear();
+                let accepting: Vec<_> = calls.in_flight.iter().cloned().collect();
+                for id in accepting {
+                    calls.cancelled.insert(id, Ending::Remote);
+                }
+                retired.extend(calls.active.drain().map(|(_, handle)| handle));
+                calls.outgoing.clear();
+                calls.peer_lanes.clear();
+                if let Event::Disconnected(disconnected) = event {
+                    let _ = ui.send(UiEvent::Disconnected(disconnected.reason.to_string()));
+                }
+            }
+            Event::Connected(_) => {
+                calls.disconnected = false;
+                // Offers run on different lanes. Publish readiness here,
+                // before presence/name refresh awaits, so a valid new call
+                // cannot reach an interface that still considers us offline.
+                let _ = ui.send(UiEvent::Connected);
+            }
+            _ => {}
+        }
+        let epoch = calls.connection_epoch;
+        drop(calls);
+        if matches!(event, Event::Disconnected(_) | Event::LoggedOut(_)) {
+            self.registration.notify_waiters();
+        }
+        for handle in retired {
+            drop(crate::exec::spawn(
+                async move { handle.hangup_local().await },
+            ));
+        }
+        epoch
+    }
+
+    pub(in crate::whatsapp) fn offer_in_epoch(
+        &self,
+        call_id: String,
+        call: Arc<WaIncomingCall>,
+        epoch: u64,
+    ) -> bool {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        if calls.disconnected
+            || calls.connection_epoch != epoch
+            || !ringable_offer(&call, wacore::time::now_millis())
+            || calls.announced.contains(&call_id)
+            || calls.pending.contains_key(&call_id)
+            || calls.active.contains_key(&call_id)
+            || calls.in_flight.contains(&call_id)
+        {
+            return false;
+        }
+        calls.pending.insert(call_id, call);
+        true
+    }
+
+    pub(in crate::whatsapp) fn connection_is_current(&self, epoch: u64) -> bool {
+        let calls = self.calls.lock().expect("call registry poisoned");
+        !calls.disconnected && calls.connection_epoch == epoch
+    }
+
+    /// Recheck after caller-name lookup, with the send in the same section as
+    /// connection retirement. A stale offer cannot follow its disconnect.
+    pub(in crate::whatsapp) fn publish_offer(
+        &self,
+        offer: &Arc<WaIncomingCall>,
+        call: IncomingCall,
+        epoch: u64,
+        ui: &UiEventSender,
+    ) -> bool {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        if calls.disconnected
+            || calls.connection_epoch != epoch
+            || !calls
+                .pending
+                .get(&call.call_id)
+                .is_some_and(|pending| Arc::ptr_eq(pending, offer))
+        {
+            return false;
+        }
+        // Caller lookup can itself wait through an outage. Recheck age as
+        // well as generation, and do not leave an unannounced offer to accept.
+        if !ringable_offer(offer, wacore::time::now_millis()) {
+            calls.pending.remove(&call.call_id);
+            return false;
+        }
+        ui.send(UiEvent::IncomingCall(call)).is_ok()
     }
 
     /// Take a ringing offer and mark its acceptance as in flight, together.
@@ -2875,6 +2998,170 @@ fn log_termination(call_id: &str, outcome: CallTermination) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn replay_offer(id: &str) -> Arc<WaIncomingCall> {
+        let jid: Jid = "999000@s.whatsapp.net".parse().unwrap();
+        Arc::new(
+            WaIncomingCall::builder()
+                .from(jid.clone())
+                .stanza_id(id.to_string())
+                .timestamp(wacore::time::now_utc())
+                .offline(false)
+                .action(CallAction::Offer {
+                    call_id: id.into(),
+                    call_creator: jid,
+                    caller_pn: None,
+                    caller_country_code: None,
+                    device_class: None,
+                    joinable: true,
+                    is_video: false,
+                    audio: Vec::new(),
+                    group_jid: None,
+                })
+                .build(),
+        )
+    }
+
+    #[test]
+    fn offer_freshness_allows_delivery_margin_and_one_sided_clock_skew() {
+        let now = wacore::time::now_millis();
+        let mut offer = (*replay_offer("SKEW")).clone();
+        offer.timestamp = wacore::time::from_millis(now - 120_000).unwrap();
+        assert!(ringable_offer(&offer, now));
+        offer.timestamp = wacore::time::from_millis(now - 121_000).unwrap();
+        assert!(!ringable_offer(&offer, now));
+        offer.timestamp = wacore::time::from_millis(now + 300_000).unwrap();
+        assert!(ringable_offer(&offer, now), "future time is not stale");
+        offer.offline = true;
+        assert!(!ringable_offer(&offer, now));
+    }
+
+    #[test]
+    fn a_historic_offer_first_delivered_after_reconnect_does_not_ring() {
+        let calls = CallRegistry::default();
+        let (ui, mut events) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let epoch = calls.connection_event(
+            &Event::Disconnected(
+                wacore::types::events::Disconnected::builder()
+                    .reason(wacore::net::DisconnectReason::ReadError("offline".into()))
+                    .build(),
+            ),
+            &ui,
+        );
+        calls.connection_event(
+            &Event::Connected(wacore::types::events::Connected::builder().build()),
+            &ui,
+        );
+        let mut old = (*replay_offer("BACKLOG")).clone();
+        old.timestamp =
+            wacore::time::from_millis(old.timestamp.timestamp_millis() - 300_000).unwrap();
+        assert!(
+            !old.offline,
+            "an offline flag is not required for freshness"
+        );
+        assert!(!calls.offer_in_epoch("BACKLOG".into(), Arc::new(old), epoch));
+        let fresh = replay_offer("CURRENT");
+        assert!(calls.offer_in_epoch("CURRENT".into(), fresh.clone(), epoch));
+        let current = IncomingCall::new(
+            "CURRENT",
+            "Example".into(),
+            fresh.from.to_string(),
+            false,
+            &fresh,
+        );
+        assert!(calls.publish_offer(&fresh, current, epoch, &ui));
+        assert!(matches!(events.try_recv(), Ok(UiEvent::Disconnected(_))));
+        assert!(matches!(events.try_recv(), Ok(UiEvent::Connected)));
+        assert!(
+            matches!(events.try_recv(), Ok(UiEvent::IncomingCall(call)) if call.call_id == "CURRENT")
+        );
+        assert!(events.try_recv().is_err());
+        assert!(calls.begin_accept("BACKLOG").is_none());
+    }
+
+    #[test]
+    fn an_offer_that_aged_during_caller_lookup_is_not_published_or_acceptible() {
+        let calls = CallRegistry::default();
+        let (ui, mut events) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let mut old = (*replay_offer("LOOKUP")).clone();
+        old.timestamp =
+            wacore::time::from_millis(old.timestamp.timestamp_millis() - 300_000).unwrap();
+        let old = Arc::new(old);
+        // The registered offer is the one held across the name lookup; age
+        // can change without either its identity or its epoch changing.
+        calls
+            .calls
+            .lock()
+            .unwrap()
+            .pending
+            .insert("LOOKUP".into(), old.clone());
+        let call = IncomingCall::new(
+            "LOOKUP",
+            "Example".into(),
+            old.from.to_string(),
+            false,
+            &old,
+        );
+        assert!(!calls.publish_offer(&old, call, 0, &ui));
+        assert!(events.try_recv().is_err());
+        assert!(calls.begin_accept("LOOKUP").is_none());
+    }
+
+    #[test]
+    fn an_offer_delayed_across_reconnect_cannot_ring_again() {
+        let calls = CallRegistry::default();
+        let (ui, mut events) = ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(ui_queue::HistoryBudget::new()),
+        );
+        let old = replay_offer("OLD");
+        let queued = replay_offer("QUEUED");
+        assert!(calls.offer_in_epoch("OLD".into(), old.clone(), 0));
+        calls.mark_accepting("ACCEPTING");
+        let disconnected = Event::Disconnected(
+            wacore::types::events::Disconnected::builder()
+                .reason(wacore::net::DisconnectReason::ReadError(
+                    "synthetic drop".into(),
+                ))
+                .build(),
+        );
+        let next = calls.connection_event(&disconnected, &ui);
+        assert!(calls.calls.lock().unwrap().pending.is_empty());
+        assert_eq!(calls.ending_for("ACCEPTING"), Some(Ending::Remote));
+        calls.connection_event(
+            &Event::Connected(wacore::types::events::Connected::builder().build()),
+            &ui,
+        );
+        let old_ui = IncomingCall::new("OLD", "Example".into(), old.from.to_string(), false, &old);
+        assert!(!calls.publish_offer(&old, old_ui, 0, &ui));
+        assert!(!calls.connection_is_current(0));
+        assert!(calls.connection_is_current(next));
+        assert!(!calls.offer_in_epoch("QUEUED".into(), queued, 0));
+        assert!(!calls.offer_in_epoch("OLD".into(), old, next));
+        assert!(!calls.offer_in_epoch("ACCEPTING".into(), replay_offer("ACCEPTING"), next));
+        let fresh = replay_offer("FRESH");
+        assert!(calls.offer_in_epoch("FRESH".into(), fresh.clone(), next));
+        let fresh_ui = IncomingCall::new(
+            "FRESH",
+            "Example".into(),
+            fresh.from.to_string(),
+            false,
+            &fresh,
+        );
+        assert!(calls.publish_offer(&fresh, fresh_ui, next, &ui));
+        assert!(matches!(events.try_recv(), Ok(UiEvent::Disconnected(_))));
+        assert!(matches!(events.try_recv(), Ok(UiEvent::Connected)));
+        assert!(
+            matches!(events.try_recv(), Ok(UiEvent::IncomingCall(call)) if call.call_id == "FRESH")
+        );
+        assert!(events.try_recv().is_err());
+    }
 
     #[cfg_attr(not(target_family = "wasm"), test)]
     #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]

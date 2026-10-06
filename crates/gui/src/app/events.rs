@@ -227,6 +227,7 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::Connected => {
+                self.recovery.update(cx, |recovering, _| recovering.stop());
                 self.app_state = AppState::Connected;
                 cx.notify();
             }
@@ -237,9 +238,16 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::Disconnected(reason) => {
-                // Nothing diagnosed it, so it is the outage the screen was
-                // written for.
-                self.connection_ended(oxidezap_core::Fault::unreachable(reason), cx);
+                // WhatsApp disconnected, but the daemon connection carrying
+                // this event is still alive. Its supervisor owns recovery.
+                warn!("WhatsApp disconnected: {reason}");
+                self.leave_connected_view(None, cx);
+                self.recovery.update(cx, |recovering, _| recovering.stop());
+                self.app_state = AppState::Offline;
+                let mut calls = self.calls.read(cx).state().clone();
+                calls.end_all();
+                self.adopt_calls(calls, cx);
+                cx.notify();
             }
             UiEvent::Error(msg) => {
                 self.connection_ended(oxidezap_core::Fault::unreachable(msg), cx);

@@ -7,7 +7,7 @@
 //! gave both a red `Cancel`, which said the same word for leaving a call
 //! unanswered and for hanging up on someone.
 
-use gpui::{App, Entity, IntoElement, ParentElement, Styled, div};
+use gpui::{App, Entity, InteractiveElement, IntoElement, ParentElement, Styled, div};
 use gpui_component::ActiveTheme as _;
 use gpui_component::Icon;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -116,6 +116,7 @@ pub fn outgoing(
         ))
         .child(
             div()
+                .debug_selector(|| "call-cancel".into())
                 .w_full()
                 .flex()
                 .justify_center()

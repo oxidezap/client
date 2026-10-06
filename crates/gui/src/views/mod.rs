@@ -13,6 +13,7 @@ mod logged_out;
 pub mod pairing;
 mod settings;
 
+pub(crate) use chat::render_offline_strip;
 pub use chat::{render_call_overlay, render_connected_view};
 pub use error::{render_error_view, render_refused_view};
 pub use loading::{render_connecting_view, render_loading_view, render_syncing_view};

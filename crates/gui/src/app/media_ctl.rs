@@ -28,6 +28,20 @@ impl PendingAudioPreparation {
     fn resume_snapshot(&self) -> (f32, bool) {
         (self.position, self.was_playing)
     }
+
+    /// Toggle the saved intent and return it when the browser player has
+    /// already accepted the clip and is still decoding it.
+    fn toggle_playback(&mut self, player_loading: bool) -> Option<bool> {
+        self.was_playing = !self.was_playing;
+        player_loading.then_some(self.was_playing)
+    }
+
+    /// Update the saved seek position and return it when the player can bank
+    /// the seek while its browser decode is in flight.
+    fn seek(&mut self, fraction: f32, player_loading: bool) -> Option<f32> {
+        self.position = fraction.clamp(0.0, 1.0);
+        player_loading.then_some(self.position)
+    }
 }
 
 fn media_identity(data: &Arc<Vec<u8>>) -> usize {
@@ -324,7 +338,10 @@ impl WhatsAppApp {
             .as_mut()
             .filter(|pending| pending.message_id == message_id)
         {
-            pending.position = fraction.clamp(0.0, 1.0);
+            let seek = pending.seek(fraction, self.audio_player.is_loading());
+            if let Some(position) = seek {
+                self.audio_player.seek(position);
+            }
             cx.notify();
             return;
         }
@@ -606,10 +623,17 @@ impl WhatsAppApp {
             .as_mut()
             .filter(|pending| pending.message_id == message_id)
         {
-            // A native preparation has no stream to pause yet. Flip the
-            // intent stored beside the worker; completion will install the
-            // samples at the saved position and honour this pause.
-            pending.was_playing = !pending.was_playing;
+            // A native preparation has no stream to pause yet, so completion
+            // will honour the updated snapshot. WebAudio has already accepted
+            // the clip while its decode is pending; forward the same intent so
+            // the player applies it as soon as the buffer arrives.
+            if let Some(should_play) = pending.toggle_playback(self.audio_player.is_loading()) {
+                if should_play {
+                    self.audio_player.resume();
+                } else {
+                    self.audio_player.pause();
+                }
+            }
             cx.notify();
             return;
         }
@@ -645,7 +669,13 @@ impl WhatsAppApp {
             .as_mut()
             .filter(|pending| pending.message_id == message_id)
         {
-            pending.was_playing = !pending.was_playing;
+            if let Some(should_play) = pending.toggle_playback(self.audio_player.is_loading()) {
+                if should_play {
+                    self.audio_player.resume();
+                } else {
+                    self.audio_player.pause();
+                }
+            }
             cx.notify();
             return;
         }
@@ -1636,6 +1666,21 @@ mod tests {
 
         assert_eq!(pending.resume_snapshot(), (0.625, false));
         assert!(pending.matches("voice-1", 7));
+    }
+
+    #[test]
+    fn pending_audio_controls_forward_only_while_player_is_loading() {
+        let mut pending = pending(7, 0.25, true);
+
+        assert_eq!(pending.toggle_playback(false), None);
+        assert_eq!(pending.resume_snapshot(), (0.25, false));
+        assert_eq!(pending.toggle_playback(true), Some(true));
+        assert_eq!(pending.toggle_playback(true), Some(false));
+
+        assert_eq!(pending.seek(-0.5, false), None);
+        assert_eq!(pending.resume_snapshot(), (0.0, false));
+        assert_eq!(pending.seek(1.5, true), Some(1.0));
+        assert_eq!(pending.resume_snapshot(), (1.0, false));
     }
 
     #[test]

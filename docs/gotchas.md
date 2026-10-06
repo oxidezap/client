@@ -345,6 +345,22 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   lists rather than a `Result`: picking four photos and one film sends the
   four and says what happened to the fifth.
 
+- **A WhatsApp outage is not an IPC outage.** Subscribe to `Disconnected` on
+  the session control feed; the library keeps its automatic backoff and its
+  single supervisor/store writer. The offline Retry action uses the existing
+  client's `pause`/`resume` lifecycle to interrupt that backoff, not a second
+  front-end attachment or a rebuilt session. A rejected retry stays offline
+  and reports its reason; only losing IPC starts attachment recovery.
+- **A recovered offer is not necessarily a new call.** Call work carries the
+  connection epoch from intake and rechecks it after caller lookup, with offer
+  publication ordered against disconnect under the registry lock. Offers
+  explicitly marked offline never ring. An unmarked offer can still be a
+  backlog item first delivered after reconnect, so its original stanza time
+  is checked both before registration and before publication: at most two
+  minutes old, deliberately wider than normal 45-second ringing to allow
+  delivery delay and modest clock skew. Future timestamps are accepted; this
+  is a conservative freshness policy, not a claimed server TTL. Offline
+  snapshots also retire their call cards rather than replaying them.
 - **An ending is claimed, not owned.** Two places want to publish
   `UiEvent::CallEnded` — the arm handling the peer's `<terminate>`, and the
   watcher parked on `wait_ended` that the resulting hangup resolves — and in a

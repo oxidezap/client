@@ -22,6 +22,89 @@ use whatsapp_rust::wacore::types::events::{Event, ServerAck};
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+#[tokio::test]
+async fn a_remote_delete_failure_skips_local_writes() {
+    let result = super::mutations::delete_and_record(
+        async { Err::<(), _>("synthetic remote failure") },
+        || panic!("a refused remote delete must not update the local store"),
+        async { panic!("a refused remote delete must not flush the local store") },
+    )
+    .await;
+
+    assert_eq!(result, Err("synthetic remote failure".to_string()));
+}
+
+#[tokio::test]
+async fn a_sent_delete_succeeds_when_the_local_writer_has_stopped() {
+    let (chat_store, _) = test_session("sent-delete-stopped-writer").await;
+    chat_store.close().await.expect("stop local writer");
+    let chat: Jid = TEST_PEER.parse().expect("synthetic chat");
+
+    let result = super::mutations::delete_and_record(
+        async { Ok::<_, String>(()) },
+        || chat_store.record_revoke(&chat, "SENT-DELETE", wacore::time::now_utc()),
+        async { panic!("an unqueued delete must not await a flush") },
+    )
+    .await;
+
+    assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn a_sent_delete_succeeds_when_the_local_batch_fails() {
+    use std::cell::Cell;
+
+    let recorded = Cell::new(false);
+    let result = super::mutations::delete_and_record(
+        async { Ok::<_, String>(()) },
+        || {
+            recorded.set(true);
+            Ok(())
+        },
+        async {
+            assert!(recorded.get(), "flush must follow the queued local update");
+            Err(oxidezap_chat_store::ChatStoreError::WriteBatchFailed(
+                "synthetic rollback".to_string(),
+            ))
+        },
+    )
+    .await;
+
+    assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn a_delete_waits_for_the_remote_answer_then_the_local_flush() {
+    use std::cell::Cell;
+
+    let remotely_deleted = Cell::new(false);
+    let flushed = Cell::new(false);
+    let result = super::mutations::delete_and_record(
+        async {
+            remotely_deleted.set(true);
+            Ok::<_, String>(())
+        },
+        || {
+            assert!(
+                remotely_deleted.get(),
+                "local writes must follow remote success"
+            );
+            Ok(())
+        },
+        async {
+            flushed.set(true);
+            Ok(())
+        },
+    )
+    .await;
+
+    assert_eq!(result, Ok(()));
+    assert!(
+        flushed.get(),
+        "successful local persistence must finish before returning"
+    );
+}
+
 #[test]
 fn live_nonrenderable_fallback_uses_the_shared_message_kind() {
     let poll = wa::Message {
@@ -105,6 +188,23 @@ fn the_live_data_lane_subscribes_to_server_acks() {
         super::DATA_EVENT_KINDS
             .contains(&whatsapp_rust::wacore::types::events::EventKind::ServerAck)
     );
+}
+
+#[test]
+fn transport_disconnections_reach_the_control_feed() {
+    use whatsapp_rust::wacore::types::events::{Disconnected, EventHandler};
+    let (handler, receiver, _) = super::interested_channel(super::CONTROL_EVENT_KINDS, 8);
+    handler.handle_event(Arc::new(Event::Disconnected(
+        Disconnected::builder()
+            .reason(wacore::net::DisconnectReason::ReadError(
+                "synthetic network failure".into(),
+            ))
+            .build(),
+    )));
+    assert!(matches!(
+        &*receiver.try_recv().unwrap(),
+        Event::Disconnected(_)
+    ));
 }
 
 #[test]
@@ -195,6 +295,7 @@ async fn a_server_ack_publishes_a_live_sent_receipt() {
         None,
         None,
         None,
+        0,
     )
     .await;
 
@@ -236,6 +337,7 @@ async fn a_nack_or_non_message_ack_does_not_publish_sent() {
             None,
             None,
             None,
+            0,
         )
         .await;
 
@@ -272,6 +374,7 @@ async fn a_chatless_ack_does_not_guess_a_live_destination() {
         None,
         None,
         None,
+        0,
     )
     .await;
 
@@ -2838,6 +2941,7 @@ async fn offline_replays_keep_phone_read_flags_without_alerting() {
         None,
         None,
         None,
+        0,
     )
     .await;
     for expected_read in [true, false] {

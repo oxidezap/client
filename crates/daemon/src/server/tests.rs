@@ -614,6 +614,48 @@ fn a_mismatched_hello_is_rejected_with_both_versions() {
 }
 
 #[test]
+fn a_daemon_before_manual_whatsapp_retry_is_rejected() {
+    let rejection = check_hello(&hello(39, false)).expect_err("v39 cannot carry ReconnectSession");
+    assert!(matches!(
+        serde_json::from_str::<DaemonMessage>(&rejection.unwrap()).unwrap(),
+        DaemonMessage::Error {
+            error: ProtocolError::VersionMismatch {
+                client: 39,
+                daemon: 40
+            },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn manual_whatsapp_retry_reaches_the_session_while_offline() {
+    let hub = connected_hub();
+    hub.apply(crate::state::Change::live(
+        oxidezap_ipc::DaemonEvent::ConnectionChanged(oxidezap_ipc::ConnectionState::Disconnected {
+            reason: "synthetic drop".into(),
+        }),
+    ));
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let answer = handle_request(
+        bare(ClientRequest::ReconnectSession),
+        &hub,
+        &no_plugins(),
+        &commands,
+        &outbox(),
+    )
+    .await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Accepted { .. }
+    ));
+    assert!(matches!(
+        taken.await.unwrap(),
+        Some(Action::ReconnectSession)
+    ));
+}
+
+#[test]
 fn state_is_not_served_before_a_hello() {
     let line = serde_json::to_string(&ClientRequest::Snapshot).unwrap();
     let rejection = check_hello(&line).expect_err("anything else is turned away");

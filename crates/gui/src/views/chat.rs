@@ -500,7 +500,7 @@ fn render_chat_area(
 ///
 /// Not a disabled field: a greyed-out composer says "you cannot type here"
 /// and stops. What the reader needs is why, and the way back.
-fn render_offline_strip(
+pub(crate) fn render_offline_strip(
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
@@ -526,7 +526,7 @@ fn render_offline_strip(
                 .min_w_0()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().muted_foreground)
-                .child("Offline. You can read this conversation, but not send in it."),
+                .child("Offline. Your messages stay readable. Reconnect to send."),
         )
         .child(
             Button::new("reconnect")
@@ -534,7 +534,7 @@ fn render_offline_strip(
                 .ghost()
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
-                    entity.update(cx, |app, cx| app.retry_connection(cx));
+                    entity.update(cx, |app, cx| app.retry_whatsapp_connection(cx));
                 }),
         )
 }

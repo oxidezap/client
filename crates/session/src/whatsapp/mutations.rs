@@ -17,6 +17,25 @@ use crate::exec::Task;
 /// What a send-like mutation produced: the server-assigned message id.
 pub type SendId = String;
 
+/// Once the remote delete succeeds, a local writer failure must not invite a
+/// retry of a mutation that already happened. Keep the local update ordered
+/// after the remote answer, and report its failures through diagnostics.
+pub(super) async fn delete_and_record<T, E: std::fmt::Display>(
+    delete: impl std::future::Future<Output = Result<T, E>>,
+    record: impl FnOnce() -> oxidezap_chat_store::Result<()>,
+    flush: impl std::future::Future<Output = oxidezap_chat_store::Result<()>>,
+) -> Result<(), String> {
+    delete.await.map_err(|e| e.to_string())?;
+    if let Err(e) = record() {
+        log::warn!("delete succeeded remotely but could not be queued locally: {e}");
+        return Ok(());
+    }
+    if let Err(e) = flush.await {
+        log::warn!("delete succeeded remotely but could not be saved locally: {e}");
+    }
+    Ok(())
+}
+
 fn edit_text_content(original: Option<&wa::Message>, text: String) -> wa::Message {
     let context = original
         .map(oxidezap_chat_store::normalized_message)
@@ -213,22 +232,19 @@ impl WhatsAppClient {
                             .to_string(),
                     );
                 }
-                live.client
-                    .revoke_message(
+                delete_and_record(
+                    live.client.revoke_message(
                         chat.clone(),
                         message_id.clone(),
                         whatsapp_rust::send::RevokeType::Sender,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
-                live.chat_store
-                    .record_revoke(&chat, &message_id, wacore::time::now_utc())
-                    .map_err(|e| format!("delete was sent but could not be saved locally: {e}"))?;
-                live.chat_store
-                    .flush()
-                    .await
-                    .map_err(|e| format!("delete was sent but could not be saved locally: {e}"))?;
-                Ok(())
+                    ),
+                    || {
+                        live.chat_store
+                            .record_revoke(&chat, &message_id, wacore::time::now_utc())
+                    },
+                    live.chat_store.flush(),
+                )
+                .await
             } else {
                 // Local delete rides the app-state path, so linked devices
                 // converge on it; the store catches up through the event
@@ -242,33 +258,28 @@ impl WhatsAppClient {
                     ),
                     None => return Err("message not found".to_string()),
                 };
-                live.client
-                    .chat_actions()
-                    .delete_message_for_me(
+                delete_and_record(
+                    live.client.chat_actions().delete_message_for_me(
                         &chat,
                         participant.as_ref(),
                         &message_id,
                         from_me,
                         false,
                         Some(timestamp),
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
-                live.chat_store
-                    .record_delete_for_me(
-                        &chat,
-                        &message_id,
-                        from_me,
-                        participant,
-                        timestamp,
-                        wacore::time::now_utc(),
-                    )
-                    .map_err(|e| format!("delete was sent but could not be saved locally: {e}"))?;
-                live.chat_store
-                    .flush()
-                    .await
-                    .map_err(|e| format!("delete was sent but could not be saved locally: {e}"))?;
-                Ok(())
+                    ),
+                    || {
+                        live.chat_store.record_delete_for_me(
+                            &chat,
+                            &message_id,
+                            from_me,
+                            participant.clone(),
+                            timestamp,
+                            wacore::time::now_utc(),
+                        )
+                    },
+                    live.chat_store.flush(),
+                )
+                .await
             }
         })
     }

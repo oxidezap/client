@@ -83,6 +83,17 @@ pub fn render_media_viewer(
         // conversation nobody could see. Swallowing it here is what makes the
         // picture the only thing on screen that responds.
         .on_scroll_wheel(|_, _window, cx| cx.stop_propagation())
+        // Mouse-up is where GPUI synthesizes click handlers. Stop both halves
+        // of the pointer sequence at the modal, after a child control has had
+        // its own chance to act, and occlude overlapping hitboxes behind it.
+        .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(gpui::MouseButton::Left, |_, _window, cx| {
+            cx.stop_propagation();
+        })
+        .on_click(|_, _window, cx| cx.stop_propagation())
+        .occlude()
         .on_action(move |_: &ViewerPrev, _window, cx| {
             key_prev_entity.update(cx, |app, cx| app.step_media_viewer(false, cx));
         })
