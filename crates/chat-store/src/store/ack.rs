@@ -201,6 +201,7 @@ impl DeferredAcks {
     /// The pre-batch queue is the truth for consumptions — the inserts that
     /// took those acks rolled back, so they are still owed rows. The batch's
     /// additions ride along on top, because nothing will deliver them again.
+    #[cfg(test)]
     pub(super) fn rolled_back(self, mut pre_batch: Self) -> Self {
         for entry in self.added_this_batch {
             pre_batch.push_bounded(entry);

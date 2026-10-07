@@ -942,3 +942,35 @@ async fn a_metadata_answer_for_a_deleted_chat_writes_nothing() {
         }
     }
 }
+
+#[tokio::test]
+async fn empty_flush_and_close_do_not_hide_a_persistent_commit_barrier_failure() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let failed = Arc::new(AtomicBool::new(false));
+    let (db, store) = barrier_store(Arc::clone(&failed)).await;
+    failed.store(true, Ordering::Release);
+    store
+        .record_outgoing(
+            &jid(PEER),
+            "BARRIER-PERSISTENT",
+            &wa::Message::text("committed once"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    assert!(store.flush().await.is_err());
+    assert!(
+        store.flush().await.is_err(),
+        "an empty flush must still validate backend durability"
+    );
+    assert!(
+        store.close().await.is_err(),
+        "close cannot hide an outstanding backend failure"
+    );
+    failed.store(false, Ordering::Release);
+    let reopened = ChatStore::new(&db).await.unwrap();
+    assert_eq!(
+        reopened.messages(&jid(PEER), None, 10).await.unwrap().len(),
+        1
+    );
+    reopened.close().await.unwrap();
+}

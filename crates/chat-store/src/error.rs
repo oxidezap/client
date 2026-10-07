@@ -13,9 +13,9 @@ pub enum ChatStoreError {
     #[error("message id is ambiguous; query the chat page for sender identity")]
     AmbiguousMessageId,
 
-    /// A writer batch rolled back; the writes acknowledged by this `flush`
-    /// were dropped. Carries the underlying error rendered to text (one batch
-    /// outcome fans out to many flush waiters).
+    /// A writer barrier failed. Rolled-back accepted writes remain in memory
+    /// for a later flush, unless the writer was closed. May also report an
+    /// admission rejection or a post-commit backend durability failure.
     #[error("write batch failed: {0}")]
     WriteBatchFailed(String),
 }

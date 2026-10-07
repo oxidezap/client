@@ -25,7 +25,7 @@ mod receipt;
 mod revoke;
 mod writer;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
@@ -60,6 +60,64 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 /// Capacity of the invalidation broadcast. Lagging receivers see
 /// `RecvError::Lagged` and should re-query everything they display.
 const CHANGE_CHANNEL_CAPACITY: usize = 256;
+
+/// Includes writes waiting in the channel, executing, and retained after rollback.
+const WRITE_QUEUE_CAPACITY: usize = 1024;
+
+struct QueuedWrite {
+    message: WriterMsg,
+    write_loss: bool,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+#[derive(Clone)]
+struct WriterSender {
+    tx: mpsc::UnboundedSender<QueuedWrite>,
+    capacity: Arc<tokio::sync::Semaphore>,
+    barriers: Arc<tokio::sync::Semaphore>,
+    rejected: Arc<Mutex<bool>>,
+}
+
+impl WriterSender {
+    fn send(&self, message: WriterMsg) -> std::result::Result<(), &'static str> {
+        let permit = match Arc::clone(&self.capacity).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                *self.rejected.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                return Err("writer queue full; write was not accepted");
+            }
+        };
+        self.tx
+            .send(QueuedWrite {
+                message,
+                write_loss: false,
+                _permit: permit,
+            })
+            .map_err(|_| "writer stopped")
+    }
+
+    async fn barrier(&self, message: WriterMsg) -> std::result::Result<(), &'static str> {
+        // One separate control slot keeps recovery reachable at full data
+        // capacity, without an unbounded queue of cancelled flush requests.
+        let permit = Arc::clone(&self.barriers)
+            .acquire_owned()
+            .await
+            .map_err(|_| "writer stopped")?;
+        // Snapshot rejection and enqueue under one lock. A rejection after
+        // this barrier belongs to the next barrier, not this one's outcome.
+        let mut rejected = self.rejected.lock().unwrap_or_else(|e| e.into_inner());
+        let write_loss = std::mem::take(&mut *rejected);
+        let result = self.tx.send(QueuedWrite {
+            message,
+            write_loss,
+            _permit: Some(permit),
+        });
+        if result.is_err() {
+            *rejected |= write_loss;
+        }
+        result.map_err(|_| "writer stopped")
+    }
+}
 
 pub(crate) enum WriterMsg {
     Event(Arc<Event>),
@@ -140,16 +198,72 @@ pub(crate) enum WriterMsg {
         jid: Jid,
         seq: u64,
     },
-    // String, not StoreError: one batch outcome fans out to many waiters and
-    // StoreError is not Clone.
-    Flush(oneshot::Sender<std::result::Result<(), String>>),
+    Flush(oneshot::Sender<BarrierOutcome>),
     /// A flush that the writer does not come back from.
     ///
     /// Answered after the loop has broken and the database handle is dropped,
     /// so a caller awaiting it knows the writer is gone rather than merely
     /// caught up — which a flush cannot say, since the writer answers one and
     /// goes straight back to waiting with the handle still open.
-    Stop(oneshot::Sender<()>),
+    Stop(oneshot::Sender<BarrierOutcome>),
+}
+
+/// A barrier keeps custody of a temporal error until the public future returns
+/// it. Sending through oneshot alone does not acknowledge receipt: the receiver
+/// may remain unpolled and then be dropped.
+pub(crate) struct BarrierOutcome {
+    error: Option<Arc<BarrierError>>,
+    unreceived: Arc<Mutex<Option<Arc<BarrierError>>>>,
+}
+
+struct BarrierError {
+    first: Arc<str>,
+    write_loss: bool,
+}
+
+impl BarrierOutcome {
+    fn publish(
+        error: Option<String>,
+        write_loss: bool,
+        unreceived: &Arc<Mutex<Option<Arc<BarrierError>>>>,
+    ) -> Self {
+        let mut current = unreceived.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = error {
+            // Keep the first unseen error and permanent write-admission loss.
+            // This bounded summary survives later transient failures. A fresh
+            // generation prevents an older response from clearing newer loss.
+            *current = Some(Arc::new(BarrierError {
+                first: current
+                    .as_ref()
+                    .map_or_else(|| Arc::from(error), |old| Arc::clone(&old.first)),
+                write_loss: write_loss || current.as_ref().is_some_and(|old| old.write_loss),
+            }));
+        }
+        Self {
+            error: current.clone(),
+            unreceived: Arc::clone(unreceived),
+        }
+    }
+
+    fn into_result(self) -> std::result::Result<(), String> {
+        let Some(error) = self.error else {
+            return Ok(());
+        };
+        let mut current = self.unreceived.lock().unwrap_or_else(|e| e.into_inner());
+        // An older response must not acknowledge a newer failure, even when
+        // both failures happen to have the same text.
+        if current
+            .as_ref()
+            .is_some_and(|value| Arc::ptr_eq(value, &error))
+        {
+            *current = None;
+        }
+        let mut message = error.first.to_string();
+        if error.write_loss && !message.contains("writer admission overflow") {
+            message.push_str("; writer admission overflow: one or more writes were not accepted");
+        }
+        Err(message)
+    }
 }
 
 /// SQLite-backed chat/message/contact history, materialized from the client's
@@ -164,13 +278,13 @@ pub(crate) enum WriterMsg {
 pub struct ChatStore {
     db: SharedSqlite,
     device_id: i32,
-    tx: mpsc::UnboundedSender<WriterMsg>,
+    tx: WriterSender,
     changes: broadcast::Sender<StoreChange>,
     skip_hook_committed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct ChatStoreHandler {
-    tx: mpsc::UnboundedSender<WriterMsg>,
+    tx: WriterSender,
     skip_hook_committed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -191,8 +305,11 @@ impl EventHandler for ChatStoreHandler {
         {
             return;
         }
-        // Writer gone (store dropped): nothing to record into, drop silently.
-        let _ = self.tx.send(WriterMsg::Event(event));
+        // This synchronous engine callback cannot await admission or return an error.
+        // A rejection is logged and also reported by the next flush/close.
+        if let Err(error) = self.tx.send(WriterMsg::Event(event)) {
+            log::error!("chat-store: event not accepted: {error}");
+        }
     }
 
     fn interest(&self) -> EventInterest {
@@ -432,7 +549,14 @@ impl ChatStore {
         })
         .await?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (queue_tx, rx) = mpsc::unbounded_channel();
+        let rejected = Arc::new(Mutex::new(false));
+        let tx = WriterSender {
+            tx: queue_tx,
+            capacity: Arc::new(tokio::sync::Semaphore::new(WRITE_QUEUE_CAPACITY)),
+            barriers: Arc::new(tokio::sync::Semaphore::new(1)),
+            rejected: Arc::clone(&rejected),
+        };
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
 
         let this = Arc::new(Self {
@@ -499,10 +623,10 @@ impl ChatStore {
         let (done, result) = oneshot::channel();
         self.tx
             .send(WriterMsg::InboundDurability { event, done })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?;
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?;
         result
             .await
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?
             .map_err(ChatStoreError::WriteBatchFailed)
     }
 
@@ -541,7 +665,7 @@ impl ChatStore {
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Record an edit this client just sent for one of its own messages.
@@ -568,7 +692,7 @@ impl ChatStore {
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Mark a send this client gave up on (no server answer will come to do
@@ -582,7 +706,7 @@ impl ChatStore {
                 chat: chat.clone(),
                 msg_id: msg_id.into(),
             })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Record that these status updates have been watched on this device.
@@ -607,7 +731,7 @@ impl ChatStore {
                 chat: chat.clone(),
                 msg_ids,
             })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Record which picture a chat is showing, and where its bytes are cached.
@@ -638,7 +762,7 @@ impl ChatStore {
                 cache_key: cache_key.into(),
                 seq,
             })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Drop a chat's descriptor, because WhatsApp says it has no picture.
@@ -651,7 +775,7 @@ impl ChatStore {
                 jid: jid.clone(),
                 seq,
             })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Record a sender revoke this client just sent for one of its own
@@ -720,7 +844,7 @@ impl ChatStore {
                 target_participant,
                 timestamp_ms: timestamp.timestamp_millis(),
             })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Apply a locally requested delete-for-me through the same materializer
@@ -752,7 +876,7 @@ impl ChatStore {
             .send(WriterMsg::Event(Arc::new(Event::DeleteMessageForMeUpdate(
                 update,
             ))))
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Record a reaction this client just sent. An empty `emoji` removes this
@@ -783,7 +907,7 @@ impl ChatStore {
                 emoji: emoji.to_owned(),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Reconcile proven duplicate authors in a chat and, for a 1:1 peer,
@@ -798,7 +922,7 @@ impl ChatStore {
     pub fn reconcile_chat(&self, chat: &Jid) -> Result<()> {
         self.tx
             .send(WriterMsg::Reconcile(chat.clone()))
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Reconcile legacy message identities after the account learns new PN/LID
@@ -809,7 +933,7 @@ impl ChatStore {
         }
         self.tx
             .send(WriterMsg::ReconcileMappings(mappings.to_vec()))
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Reconcile all stored message identities explicitly. Use [`flush`](Self::flush)
@@ -817,7 +941,7 @@ impl ChatStore {
     pub fn reconcile_all_messages(&self) -> Result<()> {
         self.tx
             .send(WriterMsg::ReconcileAll)
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Persist display names resolved from server metadata (group subjects,
@@ -851,7 +975,7 @@ impl ChatStore {
                 chat.clone(),
                 name.into(),
             )]))
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// [`set_chat_name`](Self::set_chat_name) for a whole resolution pass:
@@ -865,7 +989,7 @@ impl ChatStore {
         }
         self.tx
             .send(WriterMsg::ChatNames(names))
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
     /// Apply a batch of authoritative group hierarchy results.
@@ -879,49 +1003,42 @@ impl ChatStore {
         }
         self.tx
             .send(WriterMsg::GroupHierarchies(writes))
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
-    /// Wait until every write enqueued before this call is committed. Errors
-    /// with [`ChatStoreError::WriteBatchFailed`] when any batch since the
-    /// previous flush answer rolled back. The contract is TEMPORAL, not
-    /// per-caller: writes enqueued by anyone before this call share its fate,
-    /// so a failure that dropped someone else's earlier writes still reports
-    /// here (conservative: a false failure is possible, a false success is
-    /// not).
-    /// Commit everything enqueued before this call, then stop the writer and
-    /// let go of the database.
-    ///
-    /// [`flush`](Self::flush) is the wrong tool where the database is about to
-    /// be deleted: it says the queue is caught up, and the writer answers it
-    /// and goes straight back to waiting with `SharedSqlite` still open. This
-    /// one does not come back — the answer is sent after the loop has broken
-    /// and the handle is dropped, so a caller that awaits it knows nothing
-    /// here is holding the file any more.
-    ///
-    /// One way: the store takes no further writes afterwards.
-    ///
-    /// # Errors
-    ///
-    /// The writer is already gone, which for every caller means the same thing
-    /// as success and is reported rather than hidden because only the caller
-    /// knows whether it expected to be first.
+    /// Drain accepted writes, stop the writer, and release its database handle.
+    /// A final failed attempt returns `WriteBatchFailed`; remaining in-memory
+    /// writes are then discarded. Call `flush` first if recovery is required.
+    /// No writes are accepted after the writer stops.
     pub async fn close(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(WriterMsg::Stop(tx))
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?;
+            .barrier(WriterMsg::Stop(tx))
+            .await
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?;
         rx.await
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?
+            .into_result()
+            .map_err(ChatStoreError::WriteBatchFailed)
     }
 
+    /// Commit accepted writes preceding this barrier, retrying retained writes
+    /// in their original order. Rollback retains the failed batch and everything
+    /// behind it. A later flush can recover after the underlying fault is fixed.
+    /// Reports queue admission failures and post-commit durability failures too.
+    /// The error is temporal across callers, not an individual write receipt.
+    /// Cancellation retains it until a public flush/close future returns it.
+    /// Handling or discarding the returned result belongs to the caller.
+    /// Enqueue success alone is not crash durability: retained writes are in RAM.
     pub async fn flush(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(WriterMsg::Flush(tx))
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?;
+            .barrier(WriterMsg::Flush(tx))
+            .await
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?;
         rx.await
-            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?
+            .into_result()
             .map_err(ChatStoreError::WriteBatchFailed)
     }
 
@@ -1293,5 +1410,96 @@ mod migration_tests {
                 .expect("inspect cascaded rows");
             assert_eq!(counts, (0, 1), "unexpected rows in {table}");
         }
+    }
+}
+
+#[cfg(test)]
+mod barrier_tests {
+    use super::BarrierOutcome;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_new_failure_preserves_an_unreceived_admission_error() {
+        let unreceived = Arc::new(Mutex::new(None));
+        let cancelled =
+            BarrierOutcome::publish(Some("writer admission overflow".into()), false, &unreceived);
+        drop(cancelled);
+        let later = BarrierOutcome::publish(
+            Some("backend durability barrier".into()),
+            false,
+            &unreceived,
+        );
+        assert_eq!(
+            later.into_result().unwrap_err(),
+            "writer admission overflow"
+        );
+        assert!(
+            BarrierOutcome::publish(None, false, &unreceived)
+                .into_result()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_older_response_cannot_clear_a_new_failure_with_different_text() {
+        let unreceived = Arc::new(Mutex::new(None));
+        let older =
+            BarrierOutcome::publish(Some("writer admission overflow".into()), false, &unreceived);
+        let newer = BarrierOutcome::publish(
+            Some("backend durability barrier".into()),
+            false,
+            &unreceived,
+        );
+        assert_eq!(
+            older.into_result().unwrap_err(),
+            "writer admission overflow"
+        );
+        assert_eq!(
+            newer.into_result().unwrap_err(),
+            "writer admission overflow"
+        );
+        assert!(
+            BarrierOutcome::publish(None, false, &unreceived)
+                .into_result()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn later_admission_loss_survives_cancellation_and_transient_failures() {
+        let unreceived = Arc::new(Mutex::new(None));
+        let older = BarrierOutcome::publish(Some("backend failure".into()), false, &unreceived);
+        let cancelled = BarrierOutcome::publish(Some("lost writes".into()), true, &unreceived);
+        drop(cancelled);
+        let latest =
+            BarrierOutcome::publish(Some("another backend failure".into()), false, &unreceived);
+        assert_eq!(older.into_result().unwrap_err(), "backend failure");
+        let message = latest.into_result().unwrap_err();
+        assert!(message.contains("backend failure"));
+        assert!(message.contains("writer admission overflow"));
+        assert!(
+            BarrierOutcome::publish(None, false, &unreceived)
+                .into_result()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn receiving_an_older_error_keeps_a_newer_identical_error() {
+        let unreceived = Arc::new(Mutex::new(None));
+        let older = BarrierOutcome::publish(Some("failed".into()), false, &unreceived);
+        let newer = BarrierOutcome::publish(Some("failed".into()), false, &unreceived);
+        assert!(older.into_result().is_err());
+        assert!(
+            BarrierOutcome::publish(None, false, &unreceived)
+                .into_result()
+                .is_err()
+        );
+        assert!(newer.into_result().is_err());
+        assert!(
+            BarrierOutcome::publish(None, false, &unreceived)
+                .into_result()
+                .is_ok()
+        );
     }
 }
