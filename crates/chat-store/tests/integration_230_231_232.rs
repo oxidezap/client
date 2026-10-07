@@ -137,3 +137,62 @@ async fn retained_batch_preserves_revoke_identity_and_operation_ack_correlation(
     assert_eq!(late.timestamp, server_time);
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn sqlite_busy_recovers_within_the_bounded_automatic_attempts() {
+    use diesel::Connection;
+    use whatsapp_rust_sqlite_storage::SqliteStoreConfig;
+    let path = std::env::temp_dir().join(format!(
+        "oxidezap-232-transient-{}.sqlite",
+        std::process::id()
+    ));
+    let db = SqliteStore::with_config(
+        path.to_str().unwrap(),
+        SqliteStoreConfig {
+            busy_timeout: Duration::from_millis(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    db.create_new_device().await.unwrap();
+    let store = ChatStore::new(&db).await.unwrap();
+    // A separate connection is deliberate fault injection, never a production pool.
+    let mut locker = diesel::SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+    diesel::sql_query("BEGIN IMMEDIATE")
+        .execute(&mut locker)
+        .unwrap();
+    let mut probe = diesel::SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+    diesel::sql_query("PRAGMA busy_timeout = 1")
+        .execute(&mut probe)
+        .unwrap();
+    let contention = diesel::sql_query("BEGIN IMMEDIATE")
+        .execute(&mut probe)
+        .expect_err("fault injection holds the write lock");
+    assert!(contention.to_string().contains("locked"));
+    drop(probe);
+    store
+        .record_outgoing(
+            &jid(PEER),
+            "BUSY",
+            &wa::Message::text("retained"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    let unlock = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        diesel::sql_query("ROLLBACK").execute(&mut locker).unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(5), store.flush())
+        .await
+        .expect("automatic retries are bounded")
+        .expect("a transient lock recovers without losing the write");
+    unlock.await.unwrap();
+    assert!(store.message(&jid(PEER), "BUSY").await.unwrap().is_some());
+    store.close().await.unwrap();
+    drop(store);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
