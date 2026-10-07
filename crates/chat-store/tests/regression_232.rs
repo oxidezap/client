@@ -237,6 +237,10 @@ async fn queued_writes_have_a_finite_admission_bound() {
         accepted > 0 && accepted <= 1024,
         "queued writes must be bounded, accepted {accepted}"
     );
+    assert!(
+        store.flush().await.is_err(),
+        "overflow is also visible at the flush barrier"
+    );
     store.flush().await.unwrap();
     store
         .record_outgoing(
@@ -347,6 +351,7 @@ async fn rollback_retains_deferred_ack_and_does_not_apply_later_inbound() {
             .unwrap()
             .is_none()
     );
+    assert!(store.flush().await.is_err());
     db.shared()
         .run(|conn| {
             diesel::sql_query("DROP TRIGGER reject_poison")
