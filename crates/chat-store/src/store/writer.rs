@@ -89,7 +89,11 @@ pub(super) async fn writer_loop(
                     let _ = done.send(outcome);
                     return;
                 }
-                let _ = done.send(outcome);
+                if let Err(Err(error)) = done.send(outcome) {
+                    // Cancellation is not observation. In particular, a lost
+                    // admission error has no retained write to fail again.
+                    pending_error = Some(error);
+                }
             }
             WriterMsg::InboundDurability { event, done } => {
                 // The hook is isolated on both sides: a poison inbound cannot

@@ -682,3 +682,30 @@ async fn inbound_traffic_cannot_restart_a_suspended_local_batch() {
         .unwrap();
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn cancelled_flush_does_not_consume_an_unobserved_admission_error() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let (_db, store) = test_store().await;
+    let handler = store.handler();
+    for index in 0..1025 {
+        handler.handle_event(Arc::new(message_event(
+            wa::Message::text("synthetic admission pressure"),
+            incoming_info(PEER, PEER, &format!("CANCEL-{index}"), 1_700_000_000),
+        )));
+    }
+    let mut cancelled = Box::pin(store.flush());
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        cancelled.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    drop(cancelled);
+    assert!(
+        store.flush().await.is_err(),
+        "a cancelled waiter must not consume the only overflow result"
+    );
+    store.flush().await.unwrap();
+    store.close().await.unwrap();
+}
