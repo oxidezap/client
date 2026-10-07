@@ -102,7 +102,7 @@ jobs:
       # The build script that embeds gpui-component's icons runs on the host,
       # and `waproto` generates code with protoc — both are host builds even
       # though the artifact is wasm.
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+      - uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2
         with:
           tool: protoc,trunk
 
