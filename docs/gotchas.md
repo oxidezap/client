@@ -1681,7 +1681,9 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   byte limit: a history event can contain many messages. Synchronous recorders
   return an error when full. The engine's synchronous event handler cannot
   return one, so it logs rejection and the next flush/close reports overflow.
-  One separate, asynchronously admitted control slot keeps flush/close reachable
+  A barrier captures writer admission loss when queued; rejections after that
+  point belong to a later barrier. One separate, asynchronously admitted control
+  slot keeps flush/close reachable
   without an unlimited control queue. Post-commit barrier failures never replay
   committed SQL; flush/close also recheck backend durability with no SQL writes.
   A cancelled flush does not acknowledge its error. The first unreceived error

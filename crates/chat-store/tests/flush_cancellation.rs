@@ -94,3 +94,44 @@ async fn later_write_overflow_remains_visible_behind_a_cancelled_backend_error()
     store.flush().await.unwrap();
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn rejection_after_barrier_enqueue_belongs_to_the_next_flush() {
+    let (_db, store) = test_store().await;
+    let handler = store.handler();
+    for index in 0..1024 {
+        handler.handle_event(Arc::new(message_event(
+            wa::Message::text("accepted before barrier"),
+            incoming_info(PEER, PEER, &format!("ORDERED-{index}"), 1_700_000_000),
+        )));
+    }
+    let answer_ready = Arc::new(tokio::sync::Notify::new());
+    let waker = Waker::from(Arc::new(AnswerReady(answer_ready)));
+    let mut context = Context::from_waker(&waker);
+    let mut earlier = Box::pin(store.flush());
+    assert!(matches!(earlier.as_mut().poll(&mut context), Poll::Pending));
+    handler.handle_event(Arc::new(message_event(
+        wa::Message::text("rejected after barrier"),
+        incoming_info(PEER, PEER, "AFTER-BARRIER", 1_700_000_001),
+    )));
+    earlier
+        .await
+        .expect("later traffic cannot fail the earlier barrier");
+    assert!(
+        store
+            .flush()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("writer admission overflow")
+    );
+    store.flush().await.unwrap();
+    assert!(
+        store
+            .message(&jid(PEER), "AFTER-BARRIER")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.close().await.unwrap();
+}

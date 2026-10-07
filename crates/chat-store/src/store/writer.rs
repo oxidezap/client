@@ -47,7 +47,6 @@ pub(super) async fn writer_loop(
     device_id: i32,
     mut rx: mpsc::UnboundedReceiver<QueuedWrite>,
     changes: broadcast::Sender<StoreChange>,
-    rejected: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let deferred = Arc::new(std::sync::Mutex::new(DeferredAcks::default()));
     let mut pending = VecDeque::new();
@@ -64,6 +63,7 @@ pub(super) async fn writer_loop(
             },
         };
         let stopping = matches!(&queued.message, WriterMsg::Stop(_));
+        let write_loss = queued.write_loss;
         match queued.message {
             WriterMsg::Flush(done) | WriterMsg::Stop(done) => {
                 // Stop and flush use the same result, but stop also releases
@@ -76,11 +76,10 @@ pub(super) async fn writer_loop(
                 if !paused && let Err(error) = db.run(|_| Ok(())).await {
                     pending_error = Some(format!("backend durability barrier: {error:?}"));
                 }
-                let write_loss = rejected.swap(false, std::sync::atomic::Ordering::AcqRel);
                 if write_loss {
-                    pending_error = Some(
-                        "writer admission overflow: one or more writes were not accepted".into(),
-                    );
+                    pending_error.get_or_insert_with(|| {
+                        "writer admission overflow: one or more writes were not accepted".into()
+                    });
                 }
                 let outcome =
                     BarrierOutcome::publish(pending_error.take(), write_loss, &unreceived);
@@ -111,6 +110,7 @@ pub(super) async fn writer_loop(
                     Ok(()) => {
                         let batch = Arc::new(vec![QueuedWrite {
                             message: WriterMsg::Event(event),
+                            write_loss: false,
                             _permit: queued._permit,
                         }]);
                         attempt_batch(&db, device_id, &batch, &changes, &deferred)
@@ -127,6 +127,7 @@ pub(super) async fn writer_loop(
             message => {
                 pending.push_back(QueuedWrite {
                     message,
+                    write_loss: false,
                     _permit: queued._permit,
                 });
                 while pending.len() < BATCH_MAX {
