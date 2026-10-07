@@ -640,3 +640,45 @@ async fn recovered_local_write_persists_across_fresh_disk_store_open() {
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }
+
+#[tokio::test]
+async fn inbound_traffic_cannot_restart_a_suspended_local_batch() {
+    let (db, store) = test_store().await;
+    poison(&db).await;
+    store
+        .record_outgoing(
+            &jid(PEER),
+            "POISON",
+            &wa::Message::text("retained"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    assert!(store.flush().await.is_err());
+    db.shared()
+        .run(|conn| {
+            diesel::sql_query("DROP TRIGGER reject_poison")
+                .execute(conn)
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        assert!(
+            store
+                .commit_inbound_batch(&[inbound("LATER")])
+                .await
+                .is_err()
+        );
+    }
+    assert!(store.message(&jid(PEER), "POISON").await.unwrap().is_none());
+    // The hook errors are also reported at the next explicit barrier.
+    assert!(store.flush().await.is_err());
+    store.flush().await.unwrap();
+    assert!(store.message(&jid(PEER), "POISON").await.unwrap().is_some());
+    store
+        .commit_inbound_batch(&[inbound("LATER")])
+        .await
+        .unwrap();
+    store.close().await.unwrap();
+}

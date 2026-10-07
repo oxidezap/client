@@ -427,7 +427,15 @@ async fn history_hydration_costs() {
             }
         }
     }
-    feed(&chat_store, events).await;
+    // Respect bounded synchronous writer admission when seeding the measurement.
+    let materialize_started = wacore::time::Instant::now();
+    for chunk in events.chunks(128) {
+        feed(&chat_store, chunk.iter().cloned()).await;
+    }
+    eprintln!(
+        "materialize 1650 synthetic events: {:?}",
+        materialize_started.elapsed()
+    );
 
     let entries = chat_store.chats(false, 100).await.unwrap();
     assert_eq!(entries.len(), CHATS);

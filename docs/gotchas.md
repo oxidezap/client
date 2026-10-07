@@ -1668,6 +1668,26 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row
   past PENDING already has a real server answer and must never be regressed.
+- **A writer enqueue is admission, not durable completion.** `chat-store`
+  retains rolled-back writes in arrival order. It tries a transaction at most
+  three times, with 25 ms and 50 ms delays between attempts, then suspends
+  automatic processing. Each attempt also inherits the configured SQLite busy
+  timeout. An explicit `flush()` retries the retained prefix; later writes and
+  inbound hooks cannot pass it. A permanently invalid event therefore requires
+  repair or a failed close, not a tight retry loop or silent removal.
+  The inbound durability hook commits earlier local writes first and runs its
+  own transaction. Its failed input belongs to the caller's redelivery path.
+  Retention and admission share 1024 write slots. This is a count limit, not a
+  byte limit: a history event can contain many messages. Synchronous recorders
+  return an error when full. The engine's synchronous event handler cannot
+  return one, so it logs rejection and the next flush/close reports overflow.
+  One separate, asynchronously admitted control slot keeps flush/close reachable
+  without an unlimited control queue. Post-commit barrier failures never replay
+  committed SQL; flush/close also recheck backend durability with no SQL writes.
+  `close()` makes a final attempt and reports an error if it must discard
+  remaining uncommitted payloads. Retained data exists only in memory: process
+  crashes and failed closes can lose it. This is neither a durable outbox nor
+  an exactly-once API. Callers needing that guarantee must own a durable journal.
 - **An invalidation is a claim that something changed.** A subscriber answers
   `StoreChange` by re-querying, so emitting one for a batch that wro
 - **Migration versions are shared with `whatsapp-rust-sqlite-storage`, so name

@@ -6,7 +6,7 @@
 //! one owns the loop, its batching and barrier rules, and the post-commit
 //! invalidation fan-out.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -19,7 +19,6 @@ use whatsapp_rust_sqlite_storage::{CommitBarrierError, SharedSqlite};
 
 use crate::error::db_err;
 use crate::schema;
-use crate::store::WriterMsg;
 use crate::store::ack::{AckApplied, DeferredAcks, apply_server_ack, lock_deferred_acks};
 use crate::store::chat_rows::{ChatBump, bump_chat};
 use crate::store::edit::apply_edit;
@@ -28,6 +27,7 @@ use crate::store::message_identity::authors_match;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message, message_row};
 use crate::store::reaction::apply_reaction;
 use crate::store::revoke::apply_revoke;
+use crate::store::{QueuedWrite, WriterMsg};
 use crate::types::StoreChange;
 
 /// Max events applied per transaction. Bounds transaction size during
@@ -45,145 +45,271 @@ pub(crate) struct ChangeSet {
 pub(super) async fn writer_loop(
     db: SharedSqlite,
     device_id: i32,
-    mut rx: mpsc::UnboundedReceiver<WriterMsg>,
+    mut rx: mpsc::UnboundedReceiver<QueuedWrite>,
     changes: broadcast::Sender<StoreChange>,
+    rejected: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    // Sticky across iterations: a failed batch with no flush waiter of its
-    // own must still be reported to the NEXT flush (a >BATCH_MAX backlog spans
-    // several transactions). Consumed when delivered.
-    let mut pending_error: Option<String> = None;
-    // Outlives every batch: the insert that answers a deferred ack is by
-    // definition in a later one. Shared with the blocking closure rather than
-    // moved into it, so a panic inside the transaction cannot carry the queue
-    // off with it — the acks a dying batch deferred are exactly the ones with
-    // no other record left.
-    let deferred_acks = Arc::new(std::sync::Mutex::new(DeferredAcks::default()));
-    while let Some(first) = rx.recv().await {
-        let mut batch = Vec::with_capacity(8);
-        let mut flushes = Vec::new();
-        let mut stopping = None;
-        let mut inbound_done = None;
-        // A Flush is a batch BARRIER: stop draining there, so writes enqueued
-        // after a caller's flush() can neither commit ahead of that call's
-        // answer nor drag the awaited writes down with a later failure. A Stop
-        // is the same barrier and the last one: whatever was enqueued ahead of
-        // it is written, and nothing after it ever is.
-        let mut queue_msg = |msg: WriterMsg, batch: &mut Vec<WriterMsg>| match msg {
-            WriterMsg::Flush(done) => {
-                flushes.push(done);
-                true
-            }
-            WriterMsg::Stop(done) => {
-                stopping = Some(done);
-                true
+    let deferred = Arc::new(std::sync::Mutex::new(DeferredAcks::default()));
+    let mut pending = VecDeque::new();
+    let mut paused = false;
+    let mut pending_error = None;
+    let mut next = None;
+    loop {
+        let queued = match next.take() {
+            Some(queued) => queued,
+            None => match rx.recv().await {
+                Some(queued) => queued,
+                None => break,
+            },
+        };
+        let stopping = matches!(&queued.message, WriterMsg::Stop(_));
+        match queued.message {
+            WriterMsg::Flush(done) | WriterMsg::Stop(done) => {
+                // Stop and flush use the same result, but stop also releases
+                // every retained payload and the database before answering.
+                let result = drain_pending(&db, device_id, &mut pending, &changes, &deferred).await;
+                paused = result.is_err();
+                if let Err(error) = result {
+                    pending_error = Some(error);
+                }
+                if !paused && let Err(error) = db.run(|_| Ok(())).await {
+                    pending_error = Some(format!("backend durability barrier: {error:?}"));
+                }
+                if rejected.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    pending_error = Some(
+                        "writer admission overflow: one or more writes were not accepted".into(),
+                    );
+                }
+                let outcome = pending_error.take().map_or(Ok(()), Err);
+                if stopping {
+                    rx.close();
+                    drop(pending);
+                    drop(rx);
+                    drop(db);
+                    let _ = done.send(outcome);
+                    return;
+                }
+                let _ = done.send(outcome);
             }
             WriterMsg::InboundDurability { event, done } => {
-                batch.push(WriterMsg::Event(event));
-                inbound_done = Some(done);
-                true
+                // The hook is isolated on both sides: a poison inbound cannot
+                // roll back earlier local writes, and failure to persist those
+                // writes cannot be hidden by a successful inbound callback.
+                let result = if paused && !pending.is_empty() {
+                    Err(format!(
+                        "writer suspended with {} retained writes; flush to retry",
+                        pending.len()
+                    ))
+                } else {
+                    drain_pending(&db, device_id, &mut pending, &changes, &deferred).await
+                };
+                paused = result.is_err();
+                let result = match result {
+                    Ok(()) => {
+                        let batch = Arc::new(vec![QueuedWrite {
+                            message: WriterMsg::Event(event),
+                            _permit: queued._permit,
+                        }]);
+                        attempt_batch(&db, device_id, &batch, &changes, &deferred)
+                            .await
+                            .map_err(|(error, _committed)| error)
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = &result {
+                    pending_error = Some(error.clone());
+                }
+                let _ = done.send(result);
             }
-            other => {
-                batch.push(other);
-                false
-            }
-        };
-        let mut at_barrier = queue_msg(first, &mut batch);
-        while !at_barrier && batch.len() < BATCH_MAX {
-            match rx.try_recv() {
-                Ok(msg) => at_barrier = queue_msg(msg, &mut batch),
-                Err(_) => break,
-            }
-        }
-
-        if !batch.is_empty() {
-            // Snapshot what a failure has to fold back onto. Deferred acks are
-            // rare, so the usual clone is of an empty queue.
-            let pre_batch = {
-                let mut acks = lock_deferred_acks(&deferred_acks);
-                acks.begin_batch();
-                acks.clone()
-            };
-            let shared = Arc::clone(&deferred_acks);
-            let committed_changes = Arc::new(std::sync::Mutex::new(None));
-            let committed_changes_for_db = Arc::clone(&committed_changes);
-            let result = db
-                .run(move |conn| {
-                    let mut deferred = lock_deferred_acks(&shared);
-                    let result = conn.transaction(|conn| {
-                        let mut cs = ChangeSet::default();
-                        for msg in &batch {
-                            apply_writer_msg(conn, device_id, msg, &mut cs, &mut deferred)?;
+            message => {
+                pending.push_back(QueuedWrite {
+                    message,
+                    _permit: queued._permit,
+                });
+                while pending.len() < BATCH_MAX {
+                    match rx.try_recv() {
+                        Ok(queued)
+                            if !matches!(
+                                queued.message,
+                                WriterMsg::Flush(_)
+                                    | WriterMsg::Stop(_)
+                                    | WriterMsg::InboundDurability { .. }
+                            ) =>
+                        {
+                            pending.push_back(queued);
                         }
-                        Ok(cs)
-                    });
-                    result
-                        .map(|cs| {
-                            *committed_changes_for_db
+                        Ok(queued) => {
+                            next = Some(queued);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Once attempts are exhausted, new traffic does not keep
+                // retrying a poison write. Only an explicit barrier retries.
+                if !paused
+                    && let Err(error) =
+                        drain_pending(&db, device_id, &mut pending, &changes, &deferred).await
+                {
+                    paused = true;
+                    pending_error = Some(error);
+                }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        log::error!(
+            "chat-store: writer dropped with {} uncommitted writes",
+            pending.len()
+        );
+    }
+}
+
+async fn drain_pending(
+    db: &SharedSqlite,
+    device_id: i32,
+    pending: &mut VecDeque<QueuedWrite>,
+    changes: &broadcast::Sender<StoreChange>,
+    deferred: &Arc<std::sync::Mutex<DeferredAcks>>,
+) -> std::result::Result<(), String> {
+    while !pending.is_empty() {
+        let batch = Arc::new(
+            pending
+                .drain(..pending.len().min(BATCH_MAX))
+                .collect::<Vec<_>>(),
+        );
+        if let Err((error, committed)) =
+            attempt_batch(db, device_id, &batch, changes, deferred).await
+        {
+            if !committed {
+                // The blocking closure has completed, so this is the sole owner.
+                let batch = Arc::try_unwrap(batch)
+                    .unwrap_or_else(|_| unreachable!("completed writer batch"));
+                for queued in batch.into_iter().rev() {
+                    pending.push_front(queued);
+                }
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Bounded retries of rolled-back transactions. A post-commit failure never
+/// replays the SQL. The queue holds each payload and its admission permit until
+/// commit, so retention cannot grow beyond the write admission budget.
+async fn attempt_batch(
+    db: &SharedSqlite,
+    device_id: i32,
+    batch: &Arc<Vec<QueuedWrite>>,
+    changes: &broadcast::Sender<StoreChange>,
+    deferred: &Arc<std::sync::Mutex<DeferredAcks>>,
+) -> std::result::Result<(), (String, bool)> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        let pre_batch = {
+            let mut acks = lock_deferred_acks(deferred);
+            acks.begin_batch();
+            acks.clone()
+        };
+        let shared = Arc::clone(deferred);
+        let input = Arc::clone(batch);
+        let committed_changes = Arc::new(std::sync::Mutex::new((None, None)));
+        let committed_changes_for_db = Arc::clone(&committed_changes);
+        let result = db
+            .run(move |conn| {
+                let mut acks = lock_deferred_acks(&shared);
+                let result = conn.transaction(|conn| {
+                    let mut cs = ChangeSet::default();
+                    for queued in input.iter() {
+                        if let Err(error) =
+                            apply_writer_msg(conn, device_id, &queued.message, &mut cs, &mut acks)
+                        {
+                            committed_changes_for_db
                                 .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cs);
-                        })
-                        .map_err(db_err)
-                })
-                .await;
-            let inbound_outcome = result.as_ref().map(|_| ()).map_err(ToString::to_string);
-            if let Some(done) = inbound_done {
-                let _ = done.send(inbound_outcome);
-            }
-            match result {
-                Ok(()) => {
-                    if let Some(cs) = committed_changes
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take()
-                    {
-                        emit_changes(&changes, cs);
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .1 = Some(write_description(&queued.message));
+                            return Err(error);
+                        }
                     }
+                    Ok(cs)
+                });
+                result
+                    .map(|cs| {
+                        committed_changes_for_db
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .0 = Some(cs);
+                    })
+                    .map_err(db_err)
+            })
+            .await;
+        let (cs, failed_write) = std::mem::take(
+            &mut *committed_changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let committed = cs.is_some();
+        if let Some(cs) = cs {
+            emit_changes(changes, cs);
+        }
+        match result {
+            Ok(()) => {
+                lock_deferred_acks(deferred).committed();
+                return Ok(());
+            }
+            Err(error) if committed || is_commit_barrier_error(&error) => {
+                lock_deferred_acks(deferred).committed();
+                warn!("chat-store: post-commit durability barrier failed: {error}");
+                return Err((error.to_string(), true));
+            }
+            Err(error) => {
+                // All input is retained, including ACK/operation registrations.
+                // Restore exactly, then replay input once. Folding additions
+                // back as well would duplicate them on every failed attempt.
+                *lock_deferred_acks(deferred) = pre_batch;
+                if attempt + 1 == ATTEMPTS {
+                    let error = format!(
+                        "retained {} writes after {ATTEMPTS} attempts; failed {}: {error:?}",
+                        batch.len(),
+                        failed_write
+                            .as_deref()
+                            .unwrap_or("transaction or database task")
+                    );
+                    warn!("chat-store: {error}");
+                    return Err((error, false));
                 }
-                Err(e) if is_commit_barrier_error(&e) => {
-                    if let Some(cs) = committed_changes
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take()
-                    {
-                        emit_changes(&changes, cs);
-                    }
-                    let mut acks = lock_deferred_acks(&deferred_acks);
-                    acks.committed();
-                    warn!("chat-store: post-commit durability barrier failed: {e}");
-                    pending_error = Some(e.to_string());
-                }
-                Err(e) => {
-                    // Nothing committed: the transaction rolled back, or the
-                    // pool/task failed before or during it. Restore the queue
-                    // state so deferred acks remain retryable.
-                    let mut acks = lock_deferred_acks(&deferred_acks);
-                    *acks = std::mem::take(&mut *acks).rolled_back(pre_batch);
-                    warn!("chat-store: dropping write batch: {e}");
-                    pending_error = Some(e.to_string());
-                }
+                oxidezap_platform::sleep(std::time::Duration::from_millis(25 << attempt)).await;
             }
         }
-        if !flushes.is_empty() {
-            let outcome = match pending_error.take() {
-                Some(e) => Err(e),
-                None => Ok(()),
-            };
-            for done in flushes {
-                let _ = done.send(outcome.clone());
+    }
+    unreachable!("bounded attempts return an outcome")
+}
+
+fn write_description(message: &WriterMsg) -> String {
+    match message {
+        WriterMsg::Outgoing { chat, msg_id, .. } => format!("outgoing {msg_id:?} in {chat}"),
+        WriterMsg::Edit {
+            chat, target_id, ..
+        } => format!("edit {target_id:?} in {chat}"),
+        WriterMsg::Revoke {
+            chat, target_id, ..
+        } => format!("revoke {target_id:?} in {chat}"),
+        WriterMsg::Reaction {
+            chat, target_id, ..
+        } => format!("reaction {target_id:?} in {chat}"),
+        WriterMsg::SendFailed { chat, msg_id } => format!("send failure {msg_id:?} in {chat}"),
+        WriterMsg::Event(event) | WriterMsg::InboundDurability { event, .. } => {
+            if let Some(batch) = event.as_messages() {
+                format!(
+                    "message event {:?}",
+                    batch.messages.first().map(|message| &message.info.id)
+                )
+            } else {
+                "non-message event".into()
             }
         }
-        if let Some(done) = stopping {
-            // The handle goes before the answer, because the answer is what a
-            // caller about to delete the database waits on and the handle is
-            // what it is waiting to be rid of. Answering first would let that
-            // deletion start against a connection this task still held open —
-            // and this store's browser VFS writes changed blocks *after* the
-            // commit, so a page it was still holding could land behind the
-            // delete and put the file back.
-            drop(db);
-            let _ = done.send(());
-            return;
-        }
+        _ => "metadata write".into(),
     }
 }
 
