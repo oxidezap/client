@@ -2539,13 +2539,16 @@ impl WhatsAppClient {
                 // Receipts/reactions arrive keyed by this id; rename the
                 // optimistic bubble before they can race it.
                 notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
-                record_outgoing(
+                if let Err(error) = record_outgoing(
                     &live.chat_store,
                     &jid,
                     &msg_id,
                     &message,
                     &live.resolve_chat_names,
-                );
+                ) {
+                    notify_send_failed(&ui_sender, &jid_str, &msg_id, error);
+                    return;
+                }
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
                     .send_message_with_options(jid.clone(), message, options)
@@ -2701,13 +2704,16 @@ impl WhatsAppClient {
                 // the ack can't precede the row in the writer queue.
                 let msg_id = client.generate_message_id();
                 notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
-                record_outgoing(
+                if let Err(error) = record_outgoing(
                     &live.chat_store,
                     &jid,
                     &msg_id,
                     &message,
                     &live.resolve_chat_names,
-                );
+                ) {
+                    notify_send_failed(&ui_sender, &jid_str, &msg_id, error);
+                    return;
+                }
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
                     .send_message_with_options(jid.clone(), message, options)
@@ -2848,13 +2854,16 @@ impl WhatsAppClient {
             // the ack can't precede the row in the writer queue.
             let msg_id = client.generate_message_id();
             notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
-            record_outgoing(
+            if let Err(error) = record_outgoing(
                 &live.chat_store,
                 &jid,
                 &msg_id,
                 &message,
                 &live.resolve_chat_names,
-            );
+            ) {
+                notify_send_failed(&ui_sender, &jid_str, &msg_id, error);
+                return;
+            }
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(jid.clone(), message, options)
@@ -3169,29 +3178,40 @@ fn notify_send_failed(ui_sender: &UiEventSender, chat_jid: &str, message_id: &st
     });
 }
 
-/// Best-effort durable record of a message this client just sent; the UI's
-/// optimistic bubble is independent of this.
+/// Admit the outgoing row before sending under the same id. Refusal must
+/// stop the send; admission preserves writer order but is not a commit barrier.
 fn record_outgoing(
     store: &ChatStore,
     jid: &Jid,
     message_id: &str,
     message: &wa::Message,
     resolve_chat_names: &chat_names::ChatNameResolveSignal,
-) {
-    if let Err(e) = store.record_outgoing(
-        jid,
-        message_id,
-        message,
-        whatsapp_rust::wacore::time::now_utc(),
-    ) {
-        warn!("Failed to record outgoing message {}: {e}", message_id);
-    } else if jid.is_group() || jid.is_newsletter() {
+) -> Result<(), String> {
+    store
+        .record_outgoing(
+            jid,
+            message_id,
+            message,
+            whatsapp_rust::wacore::time::now_utc(),
+        )
+        .map_err(|error| {
+            // ChatStoreError's outer Display only says "storage error". Preserve
+            // the admission reason so the caller can distinguish a full queue
+            // from a stopped writer.
+            let reason = match error {
+                oxidezap_chat_store::ChatStoreError::Store(source) => source.to_string(),
+                error => error.to_string(),
+            };
+            format!("message was not sent: {reason}")
+        })?;
+    if jid.is_group() || jid.is_newsletter() {
         // Outgoing traffic creates its row through the same writer as
         // inbound traffic, but it does not produce an inbound Messages event
         // on this device. Queue the sighting after the write so a newly
         // created group/channel is resolved without waiting for a reconnect.
         resolve_chat_names.request_named([jid.to_non_ad_string()]);
     }
+    Ok(())
 }
 
 /// Best-effort failure mark on the durable row a client-side send error
@@ -3252,5 +3272,68 @@ mod notification_policy_tests {
         assert!(allows_desktop_notification(false, true, false));
         assert!(allows_desktop_notification(false, false, true));
         assert!(!allows_desktop_notification(false, false, false));
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod outgoing_admission_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refusing_an_outgoing_send_preserves_previously_admitted_rows() {
+        let backend = SqliteStore::new(&format!(
+            "file:session-outgoing-admission-{}?mode=memory&cache=shared",
+            std::process::id()
+        ))
+        .await
+        .unwrap();
+        backend.create_new_device().await.unwrap();
+        let store = ChatStore::new(&backend).await.unwrap();
+        let chat: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
+        let names = chat_names::ChatNameResolveSignal::new();
+        let message = wa::Message {
+            conversation: Some("synthetic pending send".to_string()),
+            ..Default::default()
+        };
+        // No await inside the loop: the current-thread writer cannot drain
+        // its bounded channel before this producer reaches admission refusal.
+        let (rejected, error) = (0..4096)
+            .find_map(|index| {
+                record_outgoing(&store, &chat, &format!("QUEUED-{index}"), &message, &names)
+                    .err()
+                    .map(|error| (index, error))
+            })
+            .expect("the outgoing queue must be bounded");
+        assert!(rejected > 0, "some earlier rows were admitted");
+        assert!(error.contains("writer queue full"), "{error}");
+        assert!(error.contains("message was not sent"), "{error}");
+        // Overflow is visible to the barrier too, but the accepted prefix is
+        // still materialized. The refused send has no row to acknowledge.
+        assert!(store.flush().await.is_err());
+        store.flush().await.unwrap();
+        assert!(
+            store
+                .own_message(&chat, "QUEUED-0")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .own_message(&chat, &format!("QUEUED-{}", rejected - 1))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .own_message(&chat, &format!("QUEUED-{rejected}"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.close().await.unwrap();
+        let stopped = record_outgoing(&store, &chat, "STOPPED", &message, &names).unwrap_err();
+        assert!(stopped.contains("writer stopped"), "{stopped}");
     }
 }

@@ -368,7 +368,7 @@ impl WhatsAppClient {
                 &msg_id,
                 &message,
                 &live.resolve_chat_names,
-            );
+            )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)

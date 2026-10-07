@@ -119,15 +119,12 @@ struct Operation {
 
 /// Message-class acks that arrived before their outgoing row existed.
 ///
-/// `Event::ServerAck` is dispatched synchronously on the socket-read path,
-/// while `send_message` returns at the stanza write. A host that records its
-/// outgoing message *after* the send resolves — the safe order, since
-/// recording first leaves a forever-pending ghost row when the send fails and
-/// the store has no row delete — therefore races the ack. The window is narrow,
-/// needing the local enqueue to lose to a full round trip, but the loss used to
-/// be silent and permanent: the row kept its `pending` clock until some
-/// delivery receipt happened to lift it (never, for an offline recipient) and
-/// never picked up the server's authoritative send timestamp.
+/// `Event::ServerAck` is dispatched synchronously on the socket-read path.
+/// Consumers should generate the id and record the outgoing row before sending,
+/// abort on admission failure, and mark a failed send with `mark_send_failed`.
+/// Callers recording after send have only this bounded compatibility window.
+/// Unknown ACKs beyond the cap are rejected and reported by flush/close; an
+/// accepted waiter is never evicted to admit a later unknown operation ACK.
 ///
 /// This is the same materialize-later shape the store already uses for
 /// out-of-order edits and revokes, minus the placeholder row: an ack carries no
@@ -138,6 +135,8 @@ pub(crate) struct DeferredAcks {
     /// is a prefix drain.
     entries: std::collections::VecDeque<DeferredAck>,
     operations: std::collections::VecDeque<Operation>,
+    /// Overflow is reported by the next public barrier, including after rollback.
+    admission_failed: bool,
     operations_added_this_batch: Vec<Operation>,
     /// Everything [`defer`](Self::defer) added since [`begin_batch`], kept even
     /// after `take_matching` consumes it.
@@ -201,18 +200,25 @@ impl DeferredAcks {
         }
     }
 
-    /// Append within the cap, evicting the oldest waiter to make room.
-    fn push_bounded(&mut self, entry: DeferredAck) {
-        if self.entries.len() >= DEFERRED_ACK_CAP
-            && let Some(evicted) = self.entries.pop_front()
-        {
+    /// Preserve admitted waiters. Unknown operation traffic must not evict an
+    /// earlier real message ack. Arbitrary unknown ids cannot all fit a finite
+    /// queue: reject excess input visibly instead of claiming it was retained.
+    fn push_bounded(&mut self, entry: DeferredAck) -> bool {
+        if self.entries.len() >= DEFERRED_ACK_CAP {
+            self.admission_failed = true;
             warn!(
                 target: "ChatStore/Ack",
-                "Dropping unmatched message ack for {}: {DEFERRED_ACK_CAP} acks already waiting",
-                evicted.ack.id
+                "Cannot retain unmatched message ack {}: {DEFERRED_ACK_CAP} acks already waiting; flush/close will report loss",
+                entry.ack.id
             );
+            return false;
         }
         self.entries.push_back(entry);
+        true
+    }
+
+    pub(super) fn take_admission_failure(&mut self) -> bool {
+        std::mem::take(&mut self.admission_failed)
     }
 
     /// Open a writer batch: the previous batch's additions are settled and no
@@ -276,8 +282,9 @@ impl DeferredAcks {
             chat,
             ack: ack.clone(),
         };
-        self.added_this_batch.push(entry.clone());
-        self.push_bounded(entry);
+        if self.push_bounded(entry.clone()) {
+            self.added_this_batch.push(entry);
+        }
     }
 
     fn expire_operations(&mut self, now_ms: i64) {
@@ -668,19 +675,29 @@ mod deferred_ack_tests {
     }
 
     #[test]
-    fn evicts_the_oldest_at_capacity() {
+    fn preserves_admitted_acks_and_reports_overflow() {
         let mut acks = DeferredAcks::default();
         for i in 0..DEFERRED_ACK_CAP + 1 {
             acks.defer(&ack(&format!("ACK-{i}")), None, 0);
         }
         assert!(
-            acks.take_matching("ACK-0", CHAT, 0).is_none(),
-            "the oldest makes room"
+            acks.take_matching("ACK-0", CHAT, 0).is_some(),
+            "later unknown operations cannot evict an admitted message ack"
         );
         assert!(
             acks.take_matching(&format!("ACK-{DEFERRED_ACK_CAP}"), CHAT, 0)
-                .is_some()
+                .is_none()
         );
+    }
+
+    #[test]
+    fn overflow_is_reported_once_per_observation() {
+        let mut acks = DeferredAcks::default();
+        for i in 0..DEFERRED_ACK_CAP + 1 {
+            acks.defer(&ack(&format!("ACK-{i}")), None, 0);
+        }
+        assert!(acks.take_admission_failure());
+        assert!(!acks.take_admission_failure());
     }
 
     /// A rolled-back batch undoes what it consumed: the insert that took the
