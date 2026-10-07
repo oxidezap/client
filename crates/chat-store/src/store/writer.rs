@@ -76,12 +76,14 @@ pub(super) async fn writer_loop(
                 if !paused && let Err(error) = db.run(|_| Ok(())).await {
                     pending_error = Some(format!("backend durability barrier: {error:?}"));
                 }
-                if rejected.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let write_loss = rejected.swap(false, std::sync::atomic::Ordering::AcqRel);
+                if write_loss {
                     pending_error = Some(
                         "writer admission overflow: one or more writes were not accepted".into(),
                     );
                 }
-                let outcome = BarrierOutcome::publish(pending_error.take(), &unreceived);
+                let outcome =
+                    BarrierOutcome::publish(pending_error.take(), write_loss, false, &unreceived);
                 if stopping {
                     rx.close();
                     drop(pending);

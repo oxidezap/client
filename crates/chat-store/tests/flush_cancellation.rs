@@ -47,3 +47,50 @@ async fn cancellation_after_send_preserves_the_unreceived_error() {
     store.flush().await.unwrap();
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn later_write_overflow_remains_visible_behind_a_cancelled_backend_error() {
+    let (db, store) = test_store().await;
+    db.shared().run(|conn| {
+        diesel::sql_query("CREATE TRIGGER loss_poison BEFORE INSERT ON messages WHEN NEW.msg_id = 'POISON' BEGIN SELECT RAISE(ABORT, 'synthetic backend failure'); END")
+            .execute(conn).map_err(db_err)?;
+        Ok(())
+    }).await.unwrap();
+    let handler = store.handler();
+    handler.handle_event(Arc::new(message_event(
+        wa::Message::text("retained poison"),
+        incoming_info(PEER, PEER, "POISON", 1_700_000_000),
+    )));
+    let answer_ready = Arc::new(tokio::sync::Notify::new());
+    let waker = Waker::from(Arc::new(AnswerReady(Arc::clone(&answer_ready))));
+    let mut context = Context::from_waker(&waker);
+    let mut cancelled = Box::pin(store.flush());
+    assert!(matches!(
+        cancelled.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    tokio::time::timeout(Duration::from_secs(5), answer_ready.notified())
+        .await
+        .unwrap();
+    drop(cancelled);
+    for index in 0..1025 {
+        handler.handle_event(Arc::new(message_event(
+            wa::Message::text("synthetic pressure"),
+            incoming_info(PEER, PEER, &format!("LATER-LOSS-{index}"), 1_700_000_001),
+        )));
+    }
+    db.shared()
+        .run(|conn| {
+            diesel::sql_query("DROP TRIGGER loss_poison")
+                .execute(conn)
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = store.flush().await.unwrap_err().to_string();
+    assert!(error.contains("synthetic backend failure"));
+    assert!(error.contains("writer admission overflow"));
+    store.flush().await.unwrap();
+    store.close().await.unwrap();
+}
