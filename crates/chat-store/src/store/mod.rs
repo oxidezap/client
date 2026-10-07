@@ -25,7 +25,7 @@ mod receipt;
 mod revoke;
 mod writer;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
@@ -194,16 +194,51 @@ pub(crate) enum WriterMsg {
         jid: Jid,
         seq: u64,
     },
-    // String, not StoreError: one batch outcome fans out to many waiters and
-    // StoreError is not Clone.
-    Flush(oneshot::Sender<std::result::Result<(), String>>),
+    Flush(oneshot::Sender<BarrierOutcome>),
     /// A flush that the writer does not come back from.
     ///
     /// Answered after the loop has broken and the database handle is dropped,
     /// so a caller awaiting it knows the writer is gone rather than merely
     /// caught up — which a flush cannot say, since the writer answers one and
     /// goes straight back to waiting with the handle still open.
-    Stop(oneshot::Sender<std::result::Result<(), String>>),
+    Stop(oneshot::Sender<BarrierOutcome>),
+}
+
+/// A barrier keeps custody of a temporal error until the public future returns
+/// it. Sending through oneshot alone does not acknowledge receipt: the receiver
+/// may remain unpolled and then be dropped.
+pub(crate) struct BarrierOutcome {
+    error: Option<Arc<str>>,
+    unreceived: Arc<Mutex<Option<Arc<str>>>>,
+}
+
+impl BarrierOutcome {
+    fn publish(error: Option<String>, unreceived: &Arc<Mutex<Option<Arc<str>>>>) -> Self {
+        let mut current = unreceived.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = error {
+            *current = Some(Arc::from(error));
+        }
+        Self {
+            error: current.clone(),
+            unreceived: Arc::clone(unreceived),
+        }
+    }
+
+    fn into_result(self) -> std::result::Result<(), String> {
+        let Some(error) = self.error else {
+            return Ok(());
+        };
+        let mut current = self.unreceived.lock().unwrap_or_else(|e| e.into_inner());
+        // An older response must not acknowledge a newer failure, even when
+        // both failures happen to have the same text.
+        if current
+            .as_ref()
+            .is_some_and(|value| Arc::ptr_eq(value, &error))
+        {
+            *current = None;
+        }
+        Err(error.to_string())
+    }
 }
 
 /// SQLite-backed chat/message/contact history, materialized from the client's
@@ -983,6 +1018,7 @@ impl ChatStore {
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?;
         rx.await
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?
+            .into_result()
             .map_err(ChatStoreError::WriteBatchFailed)
     }
 
@@ -991,6 +1027,8 @@ impl ChatStore {
     /// behind it. A later flush can recover after the underlying fault is fixed.
     /// Reports queue admission failures and post-commit durability failures too.
     /// The error is temporal across callers, not an individual write receipt.
+    /// Cancellation retains it until a public flush/close future returns it.
+    /// Handling or discarding the returned result belongs to the caller.
     /// Enqueue success alone is not crash durability: retained writes are in RAM.
     pub async fn flush(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -1000,6 +1038,7 @@ impl ChatStore {
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?;
         rx.await
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))?
+            .into_result()
             .map_err(ChatStoreError::WriteBatchFailed)
     }
 
@@ -1371,5 +1410,30 @@ mod migration_tests {
                 .expect("inspect cascaded rows");
             assert_eq!(counts, (0, 1), "unexpected rows in {table}");
         }
+    }
+}
+
+#[cfg(test)]
+mod barrier_tests {
+    use super::BarrierOutcome;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn receiving_an_older_error_keeps_a_newer_identical_error() {
+        let unreceived = Arc::new(Mutex::new(None));
+        let older = BarrierOutcome::publish(Some("failed".into()), &unreceived);
+        let newer = BarrierOutcome::publish(Some("failed".into()), &unreceived);
+        assert!(older.into_result().is_err());
+        assert!(
+            BarrierOutcome::publish(None, &unreceived)
+                .into_result()
+                .is_err()
+        );
+        assert!(newer.into_result().is_err());
+        assert!(
+            BarrierOutcome::publish(None, &unreceived)
+                .into_result()
+                .is_ok()
+        );
     }
 }
