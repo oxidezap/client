@@ -216,7 +216,10 @@ impl BarrierOutcome {
     fn publish(error: Option<String>, unreceived: &Arc<Mutex<Option<Arc<str>>>>) -> Self {
         let mut current = unreceived.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = error {
-            *current = Some(Arc::from(error));
+            // Keep the first unseen failure, including permanent admission loss,
+            // until a public future receives it. A fresh allocation identifies
+            // this failure generation so an older response cannot clear it.
+            *current = Some(Arc::from(current.as_deref().unwrap_or(&error)));
         }
         Self {
             error: current.clone(),
@@ -1423,6 +1426,44 @@ mod migration_tests {
 mod barrier_tests {
     use super::BarrierOutcome;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_new_failure_preserves_an_unreceived_admission_error() {
+        let unreceived = Arc::new(Mutex::new(None));
+        let cancelled =
+            BarrierOutcome::publish(Some("writer admission overflow".into()), &unreceived);
+        drop(cancelled);
+        let later = BarrierOutcome::publish(Some("backend durability barrier".into()), &unreceived);
+        assert_eq!(
+            later.into_result().unwrap_err(),
+            "writer admission overflow"
+        );
+        assert!(
+            BarrierOutcome::publish(None, &unreceived)
+                .into_result()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_older_response_cannot_clear_a_new_failure_with_different_text() {
+        let unreceived = Arc::new(Mutex::new(None));
+        let older = BarrierOutcome::publish(Some("writer admission overflow".into()), &unreceived);
+        let newer = BarrierOutcome::publish(Some("backend durability barrier".into()), &unreceived);
+        assert_eq!(
+            older.into_result().unwrap_err(),
+            "writer admission overflow"
+        );
+        assert_eq!(
+            newer.into_result().unwrap_err(),
+            "writer admission overflow"
+        );
+        assert!(
+            BarrierOutcome::publish(None, &unreceived)
+                .into_result()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn receiving_an_older_error_keeps_a_newer_identical_error() {
