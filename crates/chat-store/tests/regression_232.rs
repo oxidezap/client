@@ -391,3 +391,252 @@ async fn rollback_retains_deferred_ack_and_does_not_apply_later_inbound() {
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn ordinary_event_rollback_retains_mixed_writes_and_blocks_later_batches() {
+    use wacore::types::events::{ContactUpdate, PinUpdate};
+    let (db, store) = test_store().await;
+    poison(&db).await;
+    let chat = jid(PEER);
+    store
+        .record_outgoing(
+            &chat,
+            "ORDINARY-LOCAL",
+            &wa::Message::text("original"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    store
+        .record_edit(
+            &chat,
+            "ORDINARY-LOCAL",
+            &wa::Message::text("edited"),
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    store
+        .record_reaction(
+            &chat,
+            &wa::MessageKey {
+                remote_jid: Some(PEER.into()),
+                from_me: Some(true),
+                id: Some("ORDINARY-LOCAL".into()),
+                ..Default::default()
+            },
+            "x",
+            ts(1_700_000_020),
+        )
+        .unwrap();
+    let handler = store.handler();
+    handler.handle_event(Arc::new(peer_receipt(
+        chat.clone(),
+        &["ORDINARY-LOCAL"],
+        ReceiptType::Delivered,
+        1_700_000_030,
+    )));
+    handler.handle_event(Arc::new(Event::PinUpdate(
+        PinUpdate::builder()
+            .jid(chat.clone())
+            .timestamp(ts(1_700_000_040))
+            .action(Box::new(wa::sync_action_value::PinAction {
+                pinned: Some(true),
+            }))
+            .from_full_sync(false)
+            .build(),
+    )));
+    handler.handle_event(Arc::new(Event::ContactUpdate(
+        ContactUpdate::builder()
+            .jid(chat.clone())
+            .timestamp(ts(1_700_000_050))
+            .action(Box::new(wa::sync_action_value::ContactAction {
+                full_name: Some("Synthetic Retained Contact".into()),
+                ..Default::default()
+            }))
+            .from_full_sync(false)
+            .build(),
+    )));
+    // Unlike the hook path, this event shares the preceding local transaction.
+    handler.handle_event(Arc::new(message_event(
+        wa::Message::text("poison inbound"),
+        incoming_info(PEER, PEER, "POISON", 1_700_000_060),
+    )));
+    assert!(store.flush().await.is_err());
+    assert!(
+        store
+            .message(&chat, "ORDINARY-LOCAL")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.contact(&chat).await.unwrap().is_none());
+    assert!(
+        store
+            .reactions(&chat, "ORDINARY-LOCAL")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .record_outgoing(
+            &chat,
+            "ORDINARY-LATER",
+            &wa::Message::text("after failed barrier"),
+            ts(1_700_000_070),
+        )
+        .unwrap();
+    assert!(store.flush().await.is_err());
+    assert!(
+        store
+            .message(&chat, "ORDINARY-LATER")
+            .await
+            .unwrap()
+            .is_none(),
+        "later writes must not overtake retained earlier writes"
+    );
+    db.shared()
+        .run(|conn| {
+            diesel::sql_query("DROP TRIGGER reject_poison")
+                .execute(conn)
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store.flush().await.unwrap();
+    let row = store
+        .message(&chat, "ORDINARY-LOCAL")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.text.as_deref(), Some("edited"));
+    assert_eq!(row.status, MessageStatus::Delivered);
+    assert_eq!(
+        store
+            .reactions(&chat, "ORDINARY-LOCAL")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .chat(&chat)
+            .await
+            .unwrap()
+            .unwrap()
+            .pinned_at
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .contact(&chat)
+            .await
+            .unwrap()
+            .unwrap()
+            .full_name
+            .as_deref(),
+        Some("Synthetic Retained Contact")
+    );
+    assert!(
+        store
+            .message(&chat, "ORDINARY-LATER")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.message(&chat, "POISON").await.unwrap().is_some());
+    assert_eq!(store.messages(&chat, None, 10).await.unwrap().len(), 3);
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn handler_overflow_is_reported_by_flush_and_does_not_claim_delivery() {
+    let (_db, store) = test_store().await;
+    let handler = store.handler();
+    // A synchronous burst cannot yield to the writer on this runtime.
+    for index in 0..1025 {
+        handler.handle_event(Arc::new(message_event(
+            wa::Message::text("synthetic event"),
+            incoming_info(PEER, PEER, &format!("EVENT-CAP-{index}"), 1_700_000_000),
+        )));
+    }
+    let error = store
+        .flush()
+        .await
+        .expect_err("EventHandler has no return value, so flush must expose rejection");
+    assert!(error.to_string().contains("overflow"));
+    assert!(
+        store
+            .message(&jid(PEER), "EVENT-CAP-1024")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.flush().await.unwrap();
+    handler.handle_event(Arc::new(message_event(
+        wa::Message::text("retry rejected event"),
+        incoming_info(PEER, PEER, "EVENT-CAP-1024", 1_700_000_010),
+    )));
+    store.flush().await.unwrap();
+    assert!(
+        store
+            .message(&jid(PEER), "EVENT-CAP-1024")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovered_local_write_persists_across_fresh_disk_store_open() {
+    let path =
+        std::env::temp_dir().join(format!("oxidezap-232-reopen-{}.sqlite", std::process::id()));
+    let url = path.to_str().unwrap();
+    let db = SqliteStore::new(url).await.unwrap();
+    db.create_new_device().await.unwrap();
+    let store = ChatStore::new(&db).await.unwrap();
+    poison(&db).await;
+    store
+        .record_outgoing(
+            &jid(PEER),
+            "POISON",
+            &wa::Message::text("original"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    store
+        .record_edit(
+            &jid(PEER),
+            "POISON",
+            &wa::Message::text("recovered on disk"),
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    assert!(store.flush().await.is_err());
+    db.shared()
+        .run(|conn| {
+            diesel::sql_query("DROP TRIGGER reject_poison")
+                .execute(conn)
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // Close itself is the recovery barrier. No successful flush precedes it.
+    store.close().await.unwrap();
+    let device_id = db.device_id();
+    drop(store);
+    drop(db);
+    let reopened_db = SqliteStore::new_for_device(url, device_id).await.unwrap();
+    let reopened = ChatStore::new(&reopened_db).await.unwrap();
+    let rows = reopened.messages(&jid(PEER), None, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text.as_deref(), Some("recovered on disk"));
+    reopened.close().await.unwrap();
+    drop(reopened);
+    drop(reopened_db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
