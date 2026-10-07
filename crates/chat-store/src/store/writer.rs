@@ -71,10 +71,11 @@ pub(super) async fn writer_loop(
                 let result = drain_pending(&db, device_id, &mut pending, &changes, &deferred).await;
                 paused = result.is_err();
                 if let Err(error) = result {
-                    pending_error = Some(error);
+                    pending_error.get_or_insert(error);
                 }
                 if !paused && let Err(error) = db.run(|_| Ok(())).await {
-                    pending_error = Some(format!("backend durability barrier: {error:?}"));
+                    pending_error
+                        .get_or_insert_with(|| format!("backend durability barrier: {error:?}"));
                 }
                 if write_loss {
                     pending_error.get_or_insert_with(|| {
@@ -120,7 +121,7 @@ pub(super) async fn writer_loop(
                     Err(error) => Err(error),
                 };
                 if let Err(error) = &result {
-                    pending_error = Some(error.clone());
+                    pending_error.get_or_insert_with(|| error.clone());
                 }
                 let _ = done.send(result);
             }
@@ -156,7 +157,7 @@ pub(super) async fn writer_loop(
                         drain_pending(&db, device_id, &mut pending, &changes, &deferred).await
                 {
                     paused = true;
-                    pending_error = Some(error);
+                    pending_error.get_or_insert(error);
                 }
             }
         }

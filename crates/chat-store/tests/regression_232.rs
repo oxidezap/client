@@ -739,3 +739,48 @@ async fn one_barrier_reports_both_a_retained_batch_failure_and_admission_loss() 
         }
     }
 }
+
+#[tokio::test]
+async fn unpublished_writer_failure_survives_suspended_inbound_and_repair() {
+    let (db, store) = test_store().await;
+    poison(&db).await;
+    store
+        .record_outgoing(
+            &jid(PEER),
+            "POISON",
+            &wa::Message::text("accepted poison"),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    for id in ["SUSPENDED-A", "SUSPENDED-B"] {
+        let error = store
+            .commit_inbound_batch(&[inbound(id)])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("writer suspended"), "{error}");
+    }
+    db.shared()
+        .run(|conn| {
+            diesel::sql_query("DROP TRIGGER reject_poison")
+                .execute(conn)
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = store.flush().await.unwrap_err().to_string();
+    assert!(error.contains("synthetic permanent failure"), "{error}");
+    store.flush().await.unwrap();
+    assert!(
+        store
+            .own_message(&jid(PEER), "POISON")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    for id in ["SUSPENDED-A", "SUSPENDED-B"] {
+        assert!(store.message(&jid(PEER), id).await.unwrap().is_none());
+    }
+    store.close().await.unwrap();
+}

@@ -1686,7 +1686,9 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   slot keeps flush/close reachable
   without an unlimited control queue. Post-commit barrier failures never replay
   committed SQL; flush/close also recheck backend durability with no SQL writes.
-  A cancelled flush does not acknowledge its error. The first unreceived error
+  The first pending writer failure also survives a refused inbound callback
+  until flush/close publishes it. A cancelled flush does not acknowledge its
+  error. The first unreceived error
   remains available even if another barrier fails, so a transient backend error
   cannot hide earlier admission loss. The retained response also accumulates
   the write admission-loss flag, so later writer overflow survives cancellation and
