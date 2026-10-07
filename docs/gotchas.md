@@ -1684,6 +1684,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   One separate, asynchronously admitted control slot keeps flush/close reachable
   without an unlimited control queue. Post-commit barrier failures never replay
   committed SQL; flush/close also recheck backend durability with no SQL writes.
+  A cancelled flush does not acknowledge its error. The first unreceived error
+  remains available even if another barrier fails, so a transient backend error
+  cannot hide earlier admission loss. A new failure still advances the response
+  generation: receiving an older response cannot clear that newer failure.
   `close()` makes a final attempt and reports an error if it must discard
   remaining uncommitted payloads. Retained data exists only in memory: process
   crashes and failed closes can lose it. This is neither a durable outbox nor
