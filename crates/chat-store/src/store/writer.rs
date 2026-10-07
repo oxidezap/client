@@ -83,7 +83,7 @@ pub(super) async fn writer_loop(
                     );
                 }
                 let outcome =
-                    BarrierOutcome::publish(pending_error.take(), write_loss, false, &unreceived);
+                    BarrierOutcome::publish(pending_error.take(), write_loss, &unreceived);
                 if stopping {
                     rx.close();
                     drop(pending);
