@@ -709,3 +709,33 @@ async fn cancelled_flush_does_not_consume_an_unobserved_admission_error() {
     store.flush().await.unwrap();
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn one_barrier_reports_both_a_retained_batch_failure_and_admission_loss() {
+    for stopping in [false, true] {
+        let (db, store) = test_store().await;
+        poison(&db).await;
+        let handler = store.handler();
+        handler.handle_event(Arc::new(message_event(
+            wa::Message::text("accepted poison"),
+            incoming_info(PEER, PEER, "POISON", 1_700_000_000),
+        )));
+        for index in 0..1025 {
+            handler.handle_event(Arc::new(message_event(
+                wa::Message::text("synthetic pressure"),
+                incoming_info(PEER, PEER, &format!("SAME-BARRIER-{index}"), 1_700_000_001),
+            )));
+        }
+        let result = if stopping {
+            store.close().await
+        } else {
+            store.flush().await
+        };
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("synthetic permanent failure"), "{error}");
+        assert!(error.contains("writer admission overflow"), "{error}");
+        if !stopping {
+            assert!(store.close().await.is_err());
+        }
+    }
+}

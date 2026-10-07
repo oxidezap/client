@@ -66,6 +66,7 @@ const WRITE_QUEUE_CAPACITY: usize = 1024;
 
 struct QueuedWrite {
     message: WriterMsg,
+    write_loss: bool,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -74,7 +75,7 @@ struct WriterSender {
     tx: mpsc::UnboundedSender<QueuedWrite>,
     capacity: Arc<tokio::sync::Semaphore>,
     barriers: Arc<tokio::sync::Semaphore>,
-    rejected: Arc<std::sync::atomic::AtomicBool>,
+    rejected: Arc<Mutex<bool>>,
 }
 
 impl WriterSender {
@@ -82,14 +83,14 @@ impl WriterSender {
         let permit = match Arc::clone(&self.capacity).try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
-                self.rejected
-                    .store(true, std::sync::atomic::Ordering::Release);
+                *self.rejected.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 return Err("writer queue full; write was not accepted");
             }
         };
         self.tx
             .send(QueuedWrite {
                 message,
+                write_loss: false,
                 _permit: permit,
             })
             .map_err(|_| "writer stopped")
@@ -102,12 +103,19 @@ impl WriterSender {
             .acquire_owned()
             .await
             .map_err(|_| "writer stopped")?;
-        self.tx
-            .send(QueuedWrite {
-                message,
-                _permit: Some(permit),
-            })
-            .map_err(|_| "writer stopped")
+        // Snapshot rejection and enqueue under one lock. A rejection after
+        // this barrier belongs to the next barrier, not this one's outcome.
+        let mut rejected = self.rejected.lock().unwrap_or_else(|e| e.into_inner());
+        let write_loss = std::mem::take(&mut *rejected);
+        let result = self.tx.send(QueuedWrite {
+            message,
+            write_loss,
+            _permit: Some(permit),
+        });
+        if result.is_err() {
+            *rejected |= write_loss;
+        }
+        result.map_err(|_| "writer stopped")
     }
 }
 
@@ -552,7 +560,7 @@ impl ChatStore {
         .await?;
 
         let (queue_tx, rx) = mpsc::unbounded_channel();
-        let rejected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rejected = Arc::new(Mutex::new(false));
         let tx = WriterSender {
             tx: queue_tx,
             capacity: Arc::new(tokio::sync::Semaphore::new(WRITE_QUEUE_CAPACITY)),
@@ -568,7 +576,7 @@ impl ChatStore {
             changes: changes.clone(),
             skip_hook_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
-        crate::spawn::spawn(writer_loop(db, device_id, rx, changes, rejected));
+        crate::spawn::spawn(writer_loop(db, device_id, rx, changes));
         Ok(this)
     }
 
