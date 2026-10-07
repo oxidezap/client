@@ -210,3 +210,66 @@ async fn overflow_replayed_after_rollback_survives_cancelled_barrier_delivery() 
     );
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn later_ack_loss_remains_visible_behind_a_cancelled_backend_error() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake, Waker};
+    struct AnswerReady(Arc<tokio::sync::Notify>);
+    impl Wake for AnswerReady {
+        fn wake(self: Arc<Self>) {
+            self.0.notify_one();
+        }
+    }
+    let (db, store) = test_store().await;
+    db.shared().run(|conn| {
+        diesel::sql_query("CREATE TRIGGER later_ack_poison BEFORE INSERT ON messages WHEN NEW.msg_id = 'POISON' BEGIN SELECT RAISE(ABORT, 'synthetic backend failure'); END")
+            .execute(conn).map_err(db_err)?;
+        Ok(())
+    }).await.unwrap();
+    enqueue(
+        &store,
+        [message_event(
+            wa::Message::text("retained poison"),
+            incoming_info(PEER, PEER, "POISON", 1_700_000_000),
+        )],
+    );
+    let answer_ready = Arc::new(tokio::sync::Notify::new());
+    let waker = Waker::from(Arc::new(AnswerReady(Arc::clone(&answer_ready))));
+    let mut context = Context::from_waker(&waker);
+    let mut cancelled = Box::pin(store.flush());
+    assert!(matches!(
+        cancelled.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    tokio::time::timeout(Duration::from_secs(5), answer_ready.notified())
+        .await
+        .unwrap();
+    drop(cancelled);
+    db.shared()
+        .run(|conn| {
+            diesel::sql_query("DROP TRIGGER later_ack_poison")
+                .execute(conn)
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    enqueue(&store, [ack("REAL", jid(PEER))]);
+    pressure(&store, 0).await;
+    let error = store.flush().await.unwrap_err().to_string();
+    assert!(error.contains("synthetic backend failure"));
+    assert!(error.contains("unmatched ACK capacity"));
+    record_real(&store);
+    store.flush().await.unwrap();
+    assert_eq!(
+        store
+            .own_message(&jid(PEER), "REAL")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::ServerAck
+    );
+    store.close().await.unwrap();
+}

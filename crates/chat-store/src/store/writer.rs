@@ -78,19 +78,26 @@ pub(super) async fn writer_loop(
                 if !paused && let Err(error) = db.run(|_| Ok(())).await {
                     pending_error = Some(format!("backend durability barrier: {error:?}"));
                 }
-                if rejected.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let write_loss = rejected.swap(false, std::sync::atomic::Ordering::AcqRel);
+                if write_loss {
                     pending_error = Some(
                         "writer admission overflow: one or more writes were not accepted".into(),
                     );
                 }
-                if lock_deferred_acks(&deferred).take_admission_failure() {
+                let ack_loss = lock_deferred_acks(&deferred).take_admission_failure();
+                if ack_loss {
                     let loss = "unmatched ACK capacity exceeded: one or more incoming acknowledgements could not be retained";
                     pending_error = Some(match pending_error.take() {
                         Some(error) => format!("{error}; {loss}"),
                         None => loss.to_owned(),
                     });
                 }
-                let outcome = BarrierOutcome::publish(pending_error.take(), &unreceived);
+                let outcome = BarrierOutcome::publish(
+                    pending_error.take(),
+                    write_loss,
+                    ack_loss,
+                    &unreceived,
+                );
                 if stopping {
                     rx.close();
                     drop(pending);

@@ -208,18 +208,35 @@ pub(crate) enum WriterMsg {
 /// it. Sending through oneshot alone does not acknowledge receipt: the receiver
 /// may remain unpolled and then be dropped.
 pub(crate) struct BarrierOutcome {
-    error: Option<Arc<str>>,
-    unreceived: Arc<Mutex<Option<Arc<str>>>>,
+    error: Option<Arc<BarrierError>>,
+    unreceived: Arc<Mutex<Option<Arc<BarrierError>>>>,
+}
+
+struct BarrierError {
+    first: Arc<str>,
+    write_loss: bool,
+    ack_loss: bool,
 }
 
 impl BarrierOutcome {
-    fn publish(error: Option<String>, unreceived: &Arc<Mutex<Option<Arc<str>>>>) -> Self {
+    fn publish(
+        error: Option<String>,
+        write_loss: bool,
+        ack_loss: bool,
+        unreceived: &Arc<Mutex<Option<Arc<BarrierError>>>>,
+    ) -> Self {
         let mut current = unreceived.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = error {
-            // Keep the first unseen failure, including permanent admission loss,
-            // until a public future receives it. A fresh allocation identifies
-            // this failure generation so an older response cannot clear it.
-            *current = Some(Arc::from(current.as_deref().unwrap_or(&error)));
+            // Keep the first unseen error and both kinds of permanent loss.
+            // This bounded summary survives later transient failures. A fresh
+            // generation prevents an older response from clearing newer loss.
+            *current = Some(Arc::new(BarrierError {
+                first: current
+                    .as_ref()
+                    .map_or_else(|| Arc::from(error), |old| Arc::clone(&old.first)),
+                write_loss: write_loss || current.as_ref().is_some_and(|old| old.write_loss),
+                ack_loss: ack_loss || current.as_ref().is_some_and(|old| old.ack_loss),
+            }));
         }
         Self {
             error: current.clone(),
@@ -240,7 +257,14 @@ impl BarrierOutcome {
         {
             *current = None;
         }
-        Err(error.to_string())
+        let mut message = error.first.to_string();
+        if error.write_loss && !message.contains("writer admission overflow") {
+            message.push_str("; writer admission overflow: one or more writes were not accepted");
+        }
+        if error.ack_loss && !message.contains("unmatched ACK capacity exceeded") {
+            message.push_str("; unmatched ACK capacity exceeded: one or more incoming acknowledgements could not be retained");
+        }
+        Err(message)
     }
 }
 
@@ -1430,16 +1454,25 @@ mod barrier_tests {
     #[test]
     fn a_new_failure_preserves_an_unreceived_admission_error() {
         let unreceived = Arc::new(Mutex::new(None));
-        let cancelled =
-            BarrierOutcome::publish(Some("writer admission overflow".into()), &unreceived);
+        let cancelled = BarrierOutcome::publish(
+            Some("writer admission overflow".into()),
+            false,
+            false,
+            &unreceived,
+        );
         drop(cancelled);
-        let later = BarrierOutcome::publish(Some("backend durability barrier".into()), &unreceived);
+        let later = BarrierOutcome::publish(
+            Some("backend durability barrier".into()),
+            false,
+            false,
+            &unreceived,
+        );
         assert_eq!(
             later.into_result().unwrap_err(),
             "writer admission overflow"
         );
         assert!(
-            BarrierOutcome::publish(None, &unreceived)
+            BarrierOutcome::publish(None, false, false, &unreceived)
                 .into_result()
                 .is_ok()
         );
@@ -1448,8 +1481,18 @@ mod barrier_tests {
     #[test]
     fn an_older_response_cannot_clear_a_new_failure_with_different_text() {
         let unreceived = Arc::new(Mutex::new(None));
-        let older = BarrierOutcome::publish(Some("writer admission overflow".into()), &unreceived);
-        let newer = BarrierOutcome::publish(Some("backend durability barrier".into()), &unreceived);
+        let older = BarrierOutcome::publish(
+            Some("writer admission overflow".into()),
+            false,
+            false,
+            &unreceived,
+        );
+        let newer = BarrierOutcome::publish(
+            Some("backend durability barrier".into()),
+            false,
+            false,
+            &unreceived,
+        );
         assert_eq!(
             older.into_result().unwrap_err(),
             "writer admission overflow"
@@ -1459,7 +1502,35 @@ mod barrier_tests {
             "writer admission overflow"
         );
         assert!(
-            BarrierOutcome::publish(None, &unreceived)
+            BarrierOutcome::publish(None, false, false, &unreceived)
+                .into_result()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn later_admission_loss_survives_cancellation_and_transient_failures() {
+        let unreceived = Arc::new(Mutex::new(None));
+        let older =
+            BarrierOutcome::publish(Some("backend failure".into()), false, false, &unreceived);
+        let cancelled =
+            BarrierOutcome::publish(Some("lost writes".into()), true, false, &unreceived);
+        drop(cancelled);
+        let cancelled = BarrierOutcome::publish(Some("lost ACKs".into()), false, true, &unreceived);
+        drop(cancelled);
+        let latest = BarrierOutcome::publish(
+            Some("another backend failure".into()),
+            false,
+            false,
+            &unreceived,
+        );
+        assert_eq!(older.into_result().unwrap_err(), "backend failure");
+        let message = latest.into_result().unwrap_err();
+        assert!(message.contains("backend failure"));
+        assert!(message.contains("writer admission overflow"));
+        assert!(message.contains("unmatched ACK capacity exceeded"));
+        assert!(
+            BarrierOutcome::publish(None, false, false, &unreceived)
                 .into_result()
                 .is_ok()
         );
@@ -1468,17 +1539,17 @@ mod barrier_tests {
     #[test]
     fn receiving_an_older_error_keeps_a_newer_identical_error() {
         let unreceived = Arc::new(Mutex::new(None));
-        let older = BarrierOutcome::publish(Some("failed".into()), &unreceived);
-        let newer = BarrierOutcome::publish(Some("failed".into()), &unreceived);
+        let older = BarrierOutcome::publish(Some("failed".into()), false, false, &unreceived);
+        let newer = BarrierOutcome::publish(Some("failed".into()), false, false, &unreceived);
         assert!(older.into_result().is_err());
         assert!(
-            BarrierOutcome::publish(None, &unreceived)
+            BarrierOutcome::publish(None, false, false, &unreceived)
                 .into_result()
                 .is_err()
         );
         assert!(newer.into_result().is_err());
         assert!(
-            BarrierOutcome::publish(None, &unreceived)
+            BarrierOutcome::publish(None, false, false, &unreceived)
                 .into_result()
                 .is_ok()
         );
