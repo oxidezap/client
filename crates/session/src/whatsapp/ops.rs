@@ -250,12 +250,18 @@ impl WhatsAppClient {
                     .map_err(|e| format!("database query failed: {e}"))?
                     .ok_or_else(|| "the poll's secret was not stored".to_string())?,
             };
-            live.client
+            let result = live
+                .client
                 .polls()
                 .vote(&chat, &poll_id, &creator, &secret, &names)
                 .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
+                log::warn!(
+                    "poll vote was sent but its acknowledgement could not be tracked: {error}"
+                );
+            }
+            Ok(())
         })
     }
 
@@ -362,7 +368,7 @@ impl WhatsAppClient {
                 &msg_id,
                 &message,
                 &live.resolve_chat_names,
-            );
+            )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)
@@ -404,6 +410,12 @@ impl WhatsAppClient {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&Jid::status_broadcast(), &result.message_id)
+            {
+                log::warn!("status was sent but its acknowledgement could not be tracked: {error}");
+            }
             Ok((
                 result.message_id.clone(),
                 whatsapp_rust::wacore::time::now_millis(),

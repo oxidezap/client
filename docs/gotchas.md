@@ -1691,9 +1691,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   error. The first unreceived error
   remains available even if another barrier fails, so a transient backend error
   cannot hide earlier admission loss. The retained response also accumulates
-  the write admission-loss flag, so later writer overflow survives cancellation and
+  write/ACK admission-loss flags, so later overflow survives cancellation and
   intervening backend failures without an unbounded error list. A new failure
-  still advances the response generation: receiving an older response cannot clear that newer failure.
+  still advances the response
+  generation: receiving an older response cannot clear that newer failure.
   `close()` makes a final attempt and reports an error if it must discard
   remaining uncommitted payloads. Retained data exists only in memory: process
   crashes and failed closes can lose it. This is neither a durable outbox nor

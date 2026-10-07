@@ -19,7 +19,9 @@ use whatsapp_rust_sqlite_storage::{CommitBarrierError, SharedSqlite};
 
 use crate::error::db_err;
 use crate::schema;
-use crate::store::ack::{AckApplied, DeferredAcks, apply_server_ack, lock_deferred_acks};
+use crate::store::ack::{
+    AckApplied, DeferredAcks, apply_server_ack_with_operations, lock_deferred_acks,
+};
 use crate::store::chat_rows::{ChatBump, bump_chat};
 use crate::store::edit::apply_edit;
 use crate::store::event::apply_event;
@@ -82,8 +84,20 @@ pub(super) async fn writer_loop(
                         "writer admission overflow: one or more writes were not accepted".into()
                     });
                 }
-                let outcome =
-                    BarrierOutcome::publish(pending_error.take(), write_loss, &unreceived);
+                let ack_loss = lock_deferred_acks(&deferred).take_admission_failure();
+                if ack_loss {
+                    let loss = "unmatched ACK capacity exceeded: one or more incoming acknowledgements could not be retained";
+                    pending_error = Some(match pending_error.take() {
+                        Some(error) => format!("{error}; {loss}"),
+                        None => loss.to_owned(),
+                    });
+                }
+                let outcome = BarrierOutcome::publish(
+                    pending_error.take(),
+                    write_loss,
+                    ack_loss,
+                    &unreceived,
+                );
                 if stopping {
                     rx.close();
                     drop(pending);
@@ -352,6 +366,13 @@ fn apply_writer_msg(
 ) -> QueryResult<()> {
     match msg {
         WriterMsg::Event(event) => apply_event(conn, device_id, event, cs, deferred),
+        WriterMsg::Operation { chat, operation_id } => deferred.record_operation(
+            conn,
+            device_id,
+            &chat.to_string(),
+            operation_id,
+            wacore::time::now_utc().timestamp_millis(),
+        ),
         WriterMsg::InboundDurability { event, .. } => {
             apply_event(conn, device_id, event, cs, deferred)
         }
@@ -429,18 +450,21 @@ fn apply_writer_msg(
                 // The row this send's ack was waiting for now exists. Applying
                 // it here also corrects the optimistic timestamp we just wrote
                 // to the server's, before anything renders the row.
-                if let Some(ack) = deferred.take_matching(
+                while let Some(ack) = deferred.take_matching(
                     msg_id,
                     &chat_str,
                     wacore::time::now_utc().timestamp_millis(),
-                ) && let AckApplied::Deferrable(_) = apply_server_ack(conn, device_id, &ack, cs)?
-                {
-                    // The row exists, so this should not happen; say so rather
-                    // than let the ack vanish the way it used to.
-                    warn!(
-                        target: "ChatStore/Ack",
-                        "Held ack for {msg_id} matched no row even after its insert"
-                    );
+                ) {
+                    if let AckApplied::Deferrable(_) =
+                        apply_server_ack_with_operations(conn, device_id, &ack, cs, deferred)?
+                    {
+                        // The row exists, so this should not happen; say so rather
+                        // than let the ack vanish the way it used to.
+                        warn!(
+                            target: "ChatStore/Ack",
+                            "Held ack for {msg_id} matched no row even after its insert"
+                        );
+                    }
                 }
             }
             cs.message_chats.insert(chat_str);

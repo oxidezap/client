@@ -121,6 +121,10 @@ impl WriterSender {
 
 pub(crate) enum WriterMsg {
     Event(Arc<Event>),
+    Operation {
+        chat: Jid,
+        operation_id: String,
+    },
     InboundDurability {
         event: Arc<Event>,
         done: oneshot::Sender<std::result::Result<(), String>>,
@@ -219,17 +223,19 @@ pub(crate) struct BarrierOutcome {
 struct BarrierError {
     first: Arc<str>,
     write_loss: bool,
+    ack_loss: bool,
 }
 
 impl BarrierOutcome {
     fn publish(
         error: Option<String>,
         write_loss: bool,
+        ack_loss: bool,
         unreceived: &Arc<Mutex<Option<Arc<BarrierError>>>>,
     ) -> Self {
         let mut current = unreceived.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = error {
-            // Keep the first unseen error and permanent write-admission loss.
+            // Keep the first unseen error and both kinds of permanent loss.
             // This bounded summary survives later transient failures. A fresh
             // generation prevents an older response from clearing newer loss.
             *current = Some(Arc::new(BarrierError {
@@ -237,6 +243,7 @@ impl BarrierOutcome {
                     .as_ref()
                     .map_or_else(|| Arc::from(error), |old| Arc::clone(&old.first)),
                 write_loss: write_loss || current.as_ref().is_some_and(|old| old.write_loss),
+                ack_loss: ack_loss || current.as_ref().is_some_and(|old| old.ack_loss),
             }));
         }
         Self {
@@ -261,6 +268,9 @@ impl BarrierOutcome {
         let mut message = error.first.to_string();
         if error.write_loss && !message.contains("writer admission overflow") {
             message.push_str("; writer admission overflow: one or more writes were not accepted");
+        }
+        if error.ack_loss && !message.contains("unmatched ACK capacity exceeded") {
+            message.push_str("; unmatched ACK capacity exceeded: one or more incoming acknowledgements could not be retained");
         }
         Err(message)
     }
@@ -636,7 +646,12 @@ impl ChatStore {
         self.changes.subscribe()
     }
 
-    /// Record a message this client just sent. Goes through the writer queue so
+    /// Record an outgoing message before sending with the same pre-generated id.
+    /// Do not send if admission fails; call `mark_send_failed` if the send fails.
+    /// Recording after the network send is supported only within the bounded
+    /// early-ACK window (64 unknown ACKs, 60 seconds). At capacity, admitted
+    /// waiters remain and excess ACKs are rejected; flush/close reports the loss.
+    /// Goes through the writer queue so
     /// it cannot race the server ack / receipts that follow it in event order.
     /// Status starts at [`MessageStatus::Pending`](crate::types::MessageStatus::Pending)
     /// and is lifted by acks/receipts. `timestamp` is the optimistic display
@@ -664,6 +679,32 @@ impl ChatStore {
                 kind: message_kind(message),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
+            })
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
+    }
+
+    /// Register the stanza id returned by a successful amendment send.
+    /// The id belongs to the operation, not the message it changes. No message
+    /// row is created. Call this before the target recorder, using the fresh
+    /// `SendResult.message_id`, never the target id. Existing recorders remain
+    /// available for callers without an operation id.
+    ///
+    /// Correlation is bounded to 256 operations for 60 seconds in this writer;
+    /// reconnect preserves it, closing or restarting the store does not.
+    /// Queue admission is not a commit acknowledgement or server acceptance.
+    /// Unknown acks still share the 64-entry early-message queue until their
+    /// operation is recorded. Chatless acks cannot be safely correlated and
+    /// keep the ordinary early-row deferral. Evicting an operation at capacity
+    /// warns; its late acks become unknown again. More than 64 unknown acks
+    /// exceed the admission bound: existing waiters stay, excess ACKs are lost,
+    /// and flush/close reports the loss. Reusing operation
+    /// ids across chats or for message rows is unsupported: known collisions
+    /// are refused, and future rows cannot retroactively disambiguate an ack.
+    pub fn record_operation(&self, chat: &Jid, operation_id: &str) -> Result<()> {
+        self.tx
+            .send(WriterMsg::Operation {
+                chat: chat.clone(),
+                operation_id: operation_id.to_owned(),
             })
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
@@ -1025,7 +1066,7 @@ impl ChatStore {
     /// Commit accepted writes preceding this barrier, retrying retained writes
     /// in their original order. Rollback retains the failed batch and everything
     /// behind it. A later flush can recover after the underlying fault is fixed.
-    /// Reports queue admission failures and post-commit durability failures too.
+    /// Reports write/unknown-ACK admission failures and post-commit durability failures too.
     /// The error is temporal across callers, not an individual write receipt.
     /// Cancellation retains it until a public flush/close future returns it.
     /// Handling or discarding the returned result belongs to the caller.
@@ -1421,11 +1462,16 @@ mod barrier_tests {
     #[test]
     fn a_new_failure_preserves_an_unreceived_admission_error() {
         let unreceived = Arc::new(Mutex::new(None));
-        let cancelled =
-            BarrierOutcome::publish(Some("writer admission overflow".into()), false, &unreceived);
+        let cancelled = BarrierOutcome::publish(
+            Some("writer admission overflow".into()),
+            false,
+            false,
+            &unreceived,
+        );
         drop(cancelled);
         let later = BarrierOutcome::publish(
             Some("backend durability barrier".into()),
+            false,
             false,
             &unreceived,
         );
@@ -1434,7 +1480,7 @@ mod barrier_tests {
             "writer admission overflow"
         );
         assert!(
-            BarrierOutcome::publish(None, false, &unreceived)
+            BarrierOutcome::publish(None, false, false, &unreceived)
                 .into_result()
                 .is_ok()
         );
@@ -1443,10 +1489,15 @@ mod barrier_tests {
     #[test]
     fn an_older_response_cannot_clear_a_new_failure_with_different_text() {
         let unreceived = Arc::new(Mutex::new(None));
-        let older =
-            BarrierOutcome::publish(Some("writer admission overflow".into()), false, &unreceived);
+        let older = BarrierOutcome::publish(
+            Some("writer admission overflow".into()),
+            false,
+            false,
+            &unreceived,
+        );
         let newer = BarrierOutcome::publish(
             Some("backend durability barrier".into()),
+            false,
             false,
             &unreceived,
         );
@@ -1459,7 +1510,7 @@ mod barrier_tests {
             "writer admission overflow"
         );
         assert!(
-            BarrierOutcome::publish(None, false, &unreceived)
+            BarrierOutcome::publish(None, false, false, &unreceived)
                 .into_result()
                 .is_ok()
         );
@@ -1468,17 +1519,26 @@ mod barrier_tests {
     #[test]
     fn later_admission_loss_survives_cancellation_and_transient_failures() {
         let unreceived = Arc::new(Mutex::new(None));
-        let older = BarrierOutcome::publish(Some("backend failure".into()), false, &unreceived);
-        let cancelled = BarrierOutcome::publish(Some("lost writes".into()), true, &unreceived);
+        let older =
+            BarrierOutcome::publish(Some("backend failure".into()), false, false, &unreceived);
+        let cancelled =
+            BarrierOutcome::publish(Some("lost writes".into()), true, false, &unreceived);
         drop(cancelled);
-        let latest =
-            BarrierOutcome::publish(Some("another backend failure".into()), false, &unreceived);
+        let cancelled = BarrierOutcome::publish(Some("lost ACKs".into()), false, true, &unreceived);
+        drop(cancelled);
+        let latest = BarrierOutcome::publish(
+            Some("another backend failure".into()),
+            false,
+            false,
+            &unreceived,
+        );
         assert_eq!(older.into_result().unwrap_err(), "backend failure");
         let message = latest.into_result().unwrap_err();
         assert!(message.contains("backend failure"));
         assert!(message.contains("writer admission overflow"));
+        assert!(message.contains("unmatched ACK capacity exceeded"));
         assert!(
-            BarrierOutcome::publish(None, false, &unreceived)
+            BarrierOutcome::publish(None, false, false, &unreceived)
                 .into_result()
                 .is_ok()
         );
@@ -1487,17 +1547,17 @@ mod barrier_tests {
     #[test]
     fn receiving_an_older_error_keeps_a_newer_identical_error() {
         let unreceived = Arc::new(Mutex::new(None));
-        let older = BarrierOutcome::publish(Some("failed".into()), false, &unreceived);
-        let newer = BarrierOutcome::publish(Some("failed".into()), false, &unreceived);
+        let older = BarrierOutcome::publish(Some("failed".into()), false, false, &unreceived);
+        let newer = BarrierOutcome::publish(Some("failed".into()), false, false, &unreceived);
         assert!(older.into_result().is_err());
         assert!(
-            BarrierOutcome::publish(None, false, &unreceived)
+            BarrierOutcome::publish(None, false, false, &unreceived)
                 .into_result()
                 .is_err()
         );
         assert!(newer.into_result().is_err());
         assert!(
-            BarrierOutcome::publish(None, false, &unreceived)
+            BarrierOutcome::publish(None, false, false, &unreceived)
                 .into_result()
                 .is_ok()
         );

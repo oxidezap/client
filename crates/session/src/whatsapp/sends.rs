@@ -29,7 +29,7 @@ impl WhatsAppClient {
     /// `announce` exists for the one flow whose answer is the id *before* the
     /// send resolves: an enqueued send tells a client what to watch for, and
     /// the id it is told has to be the one the store records and WhatsApp is
-    /// handed. It is sent the moment the id is chosen, then the send runs on.
+    /// handed. It is sent after the outgoing record is admitted, then the send runs on.
     pub fn send_text_wire(
         &self,
         to: String,
@@ -78,16 +78,14 @@ impl WhatsAppClient {
 
             let client = &live.client;
             let msg_id = client.generate_message_id();
-            if let Some(announce) = announce {
-                let _ = announce.send(msg_id.clone());
-            }
-            super::record_outgoing(
+            admit_announced_outgoing(
                 &live.chat_store,
                 &chat,
                 &msg_id,
                 &message,
                 &live.resolve_chat_names,
-            );
+                announce,
+            )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)
@@ -169,7 +167,7 @@ impl WhatsAppClient {
                 &msg_id,
                 &message,
                 &live.resolve_chat_names,
-            );
+            )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)
@@ -244,7 +242,7 @@ impl WhatsAppClient {
                 &msg_id,
                 &message,
                 &live.resolve_chat_names,
-            );
+            )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)
@@ -313,7 +311,7 @@ impl WhatsAppClient {
                 &msg_id,
                 &message,
                 &live.resolve_chat_names,
-            );
+            )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(chat.clone(), message, options)
@@ -327,6 +325,22 @@ impl WhatsAppClient {
             }
         })
     }
+}
+
+/// The wire's enqueue acknowledgement is valid only after local admission.
+fn admit_announced_outgoing(
+    store: &oxidezap_chat_store::ChatStore,
+    chat: &Jid,
+    message_id: &str,
+    message: &wa::Message,
+    names: &super::chat_names::ChatNameResolveSignal,
+    announce: Option<tokio::sync::oneshot::Sender<String>>,
+) -> Result<(), String> {
+    super::record_outgoing(store, chat, message_id, message, names)?;
+    if let Some(announce) = announce {
+        let _ = announce.send(message_id.to_owned());
+    }
+    Ok(())
 }
 
 /// The quote behind a reply id, read from the store.
@@ -436,5 +450,92 @@ mod tests {
         );
         assert_eq!(quoted_kind_of(&Stored::Text), None);
         assert_eq!(quoted_kind_of(&Stored::Poll), None);
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod announcement_tests {
+    use super::*;
+    use oxidezap_chat_store::ChatStore;
+    use whatsapp_rust::store::SqliteStore;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wire_id_announcement_requires_successful_outgoing_admission() {
+        for mode in ["accepted", "full", "stopped"] {
+            let backend = SqliteStore::new(&format!(
+                "file:wire-announcement-{mode}-{}?mode=memory&cache=shared",
+                std::process::id()
+            ))
+            .await
+            .unwrap();
+            backend.create_new_device().await.unwrap();
+            let store = ChatStore::new(&backend).await.unwrap();
+            let chat: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
+            let names = super::super::chat_names::ChatNameResolveSignal::new();
+            let message = wa::Message {
+                conversation: Some("synthetic queued send".into()),
+                ..Default::default()
+            };
+            if mode == "full" {
+                for index in 0..1024 {
+                    store
+                        .record_outgoing(
+                            &chat,
+                            format!("FILL-{index}"),
+                            &message,
+                            whatsapp_rust::wacore::time::now_utc(),
+                        )
+                        .unwrap();
+                }
+            } else if mode == "stopped" {
+                store.close().await.unwrap();
+            }
+            let (announce, mut announced) = tokio::sync::oneshot::channel();
+            let result = admit_announced_outgoing(
+                &store,
+                &chat,
+                "WIRE-ID",
+                &message,
+                &names,
+                Some(announce),
+            );
+            if mode == "accepted" {
+                result.unwrap();
+                assert_eq!(announced.try_recv().unwrap(), "WIRE-ID");
+                store.flush().await.unwrap();
+                assert!(store.own_message(&chat, "WIRE-ID").await.unwrap().is_some());
+                store.close().await.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains(if mode == "full" {
+                        "writer queue full"
+                    } else {
+                        "writer stopped"
+                    }),
+                    "{error}"
+                );
+                assert!(
+                    matches!(
+                        announced.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                    ),
+                    "{mode}: refused sends must not announce an enqueued ID"
+                );
+                if mode == "full" {
+                    assert!(store.flush().await.is_err());
+                    store.flush().await.unwrap();
+                    assert!(store.own_message(&chat, "WIRE-ID").await.unwrap().is_none());
+                    assert!(
+                        store
+                            .own_message(&chat, "FILL-1023")
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                    store.close().await.unwrap();
+                }
+            }
+        }
     }
 }
