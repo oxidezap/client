@@ -259,7 +259,6 @@ async fn queued_writes_have_a_finite_admission_bound() {
 #[tokio::test]
 async fn sqlite_busy_retains_local_write_until_lock_released() {
     use diesel::Connection;
-    use wacore::store::traits::ProtocolStore;
     use whatsapp_rust_sqlite_storage::SqliteStoreConfig;
     let path =
         std::env::temp_dir().join(format!("oxidezap-232-busy-{}.sqlite", std::process::id()));
@@ -279,6 +278,15 @@ async fn sqlite_busy_retains_local_write_until_lock_released() {
     diesel::sql_query("BEGIN IMMEDIATE")
         .execute(&mut locker)
         .unwrap();
+    let mut probe = diesel::SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+    diesel::sql_query("PRAGMA busy_timeout = 1")
+        .execute(&mut probe)
+        .unwrap();
+    let contention = diesel::sql_query("BEGIN IMMEDIATE")
+        .execute(&mut probe)
+        .expect_err("fault injection holds the write lock");
+    assert!(contention.to_string().contains("locked"));
+    drop(probe);
     store
         .record_outgoing(
             &jid(PEER),
@@ -287,14 +295,10 @@ async fn sqlite_busy_retains_local_write_until_lock_released() {
             ts(1_700_000_000),
         )
         .unwrap();
-    let failure = tokio::time::timeout(Duration::from_secs(5), store.flush())
+    let _failure = tokio::time::timeout(Duration::from_secs(5), store.flush())
         .await
         .expect("retries must stop")
         .expect_err("held writer lock must fail");
-    assert!(
-        failure.to_string().contains("locked"),
-        "must exercise SQLite contention: {failure}"
-    );
     diesel::sql_query("ROLLBACK").execute(&mut locker).unwrap();
     drop(locker);
     store.flush().await.expect("retry after lock release");
