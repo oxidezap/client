@@ -9,7 +9,7 @@ use waproto::whatsapp as wa;
 
 use crate::materialize::{KIND_UNDECRYPTABLE, unavailable_kind};
 use crate::schema;
-use crate::store::ack::{AckApplied, DeferredAcks, apply_server_ack};
+use crate::store::ack::{AckApplied, DeferredAcks, apply_server_ack_with_operations};
 use crate::store::chat_rows::{
     ChatBump, bump_chat, chat_row, delete_chat_rows, ensure_chat, recompute_chat_preview,
     remaining_messages,
@@ -45,7 +45,9 @@ pub(super) fn apply_event(
         }
         Event::Receipt(receipt) => apply_receipt(conn, device_id, receipt, cs),
         Event::ServerAck(ack) => {
-            if let AckApplied::Deferrable(chat) = apply_server_ack(conn, device_id, ack, cs)? {
+            if let AckApplied::Deferrable(chat) =
+                apply_server_ack_with_operations(conn, device_id, ack, cs, deferred)?
+            {
                 deferred.defer(ack, chat, wacore::time::now_utc().timestamp_millis());
             }
             Ok(())

@@ -113,6 +113,10 @@ impl WriterSender {
 
 pub(crate) enum WriterMsg {
     Event(Arc<Event>),
+    Operation {
+        chat: Jid,
+        operation_id: String,
+    },
     InboundDurability {
         event: Arc<Event>,
         done: oneshot::Sender<std::result::Result<(), String>>,
@@ -600,6 +604,31 @@ impl ChatStore {
                 kind: message_kind(message),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
+            })
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
+    }
+
+    /// Register the stanza id returned by a successful amendment send.
+    /// The id belongs to the operation, not the message it changes. No message
+    /// row is created. Call this before the target recorder, using the fresh
+    /// `SendResult.message_id`, never the target id. Existing recorders remain
+    /// available for callers without an operation id.
+    ///
+    /// Correlation is bounded to 256 operations for 60 seconds in this writer;
+    /// reconnect preserves it, closing or restarting the store does not.
+    /// Queue admission is not a commit acknowledgement or server acceptance.
+    /// Unknown acks still share the 64-entry early-message queue until their
+    /// operation is recorded. Chatless acks cannot be safely correlated and
+    /// keep the ordinary early-row deferral. Evicting an operation at capacity
+    /// warns; its late acks become unknown again. More than 64 unknown acks
+    /// can still evict a genuine early ack, with a warning. Reusing operation
+    /// ids across chats or for message rows is unsupported: known collisions
+    /// are refused, and future rows cannot retroactively disambiguate an ack.
+    pub fn record_operation(&self, chat: &Jid, operation_id: &str) -> Result<()> {
+        self.tx
+            .send(WriterMsg::Operation {
+                chat: chat.clone(),
+                operation_id: operation_id.to_owned(),
             })
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
