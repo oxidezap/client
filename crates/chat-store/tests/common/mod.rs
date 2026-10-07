@@ -238,10 +238,11 @@ fn built_ack(id: &str, chat: Option<Jid>, at: Option<DateTime<Utc>>, code: Optio
     )
 }
 
-/// The protocol message that takes `id` back.
+/// A peer sender revoke. Its key uses the sending account's perspective.
 pub fn revoke(id: &str) -> wa::Message {
     revoke_key(wa::MessageKey {
         id: Some(id.into()),
+        from_me: Some(true),
         ..Default::default()
     })
 }

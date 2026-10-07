@@ -10,6 +10,7 @@ use crate::materialize::{MessageOp, classify};
 use crate::store::chat_rows::{ChatBump, bump_chat};
 use crate::store::contacts::{upsert_contact_business_name, upsert_contact_push_name};
 use crate::store::edit::apply_edit;
+use crate::store::message_identity::{own_participant_jids, stored_sender};
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message};
 use crate::store::reaction::apply_reaction;
 use crate::store::revoke::apply_revoke;
@@ -135,12 +136,34 @@ pub(super) fn apply_inbound(
             target_from_me,
             target_participant,
         } => {
+            // Relay keys use the sending account's perspective. A true bit
+            // names that account, even when the group key has a participant.
+            // Only a peer's false bit needs checking against our own PN/LID;
+            // linked-device keys already use our account's perspective. A
+            // peer's false key without a participant names us in a direct chat.
+            let (target_sender, target_from_me) = if target_from_me {
+                (sender.as_str(), info.source.is_from_me)
+            } else {
+                let fallback_author = if info.source.is_from_me
+                    && (info.source.chat.is_pn() || info.source.chat.is_lid())
+                {
+                    chat.as_str()
+                } else {
+                    sender.as_str()
+                };
+                let author = target_participant.as_deref().unwrap_or(fallback_author);
+                let is_own = !info.source.is_from_me
+                    && (target_participant.is_none()
+                        || own_participant_jids(conn, device_id)?
+                            .contains(&stored_sender(author, false)));
+                (author, is_own)
+            };
             if apply_revoke(
                 conn,
                 device_id,
                 &chat,
                 &target_id,
-                target_participant.as_deref().unwrap_or(&sender),
+                target_sender,
                 target_from_me,
                 ts_ms,
                 false,
