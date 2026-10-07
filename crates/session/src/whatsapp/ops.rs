@@ -250,12 +250,18 @@ impl WhatsAppClient {
                     .map_err(|e| format!("database query failed: {e}"))?
                     .ok_or_else(|| "the poll's secret was not stored".to_string())?,
             };
-            live.client
+            let result = live
+                .client
                 .polls()
                 .vote(&chat, &poll_id, &creator, &secret, &names)
                 .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
+                log::warn!(
+                    "poll vote was sent but its acknowledgement could not be tracked: {error}"
+                );
+            }
+            Ok(())
         })
     }
 
