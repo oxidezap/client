@@ -27,7 +27,7 @@ use crate::store::message_identity::authors_match;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message, message_row};
 use crate::store::reaction::apply_reaction;
 use crate::store::revoke::apply_revoke;
-use crate::store::{QueuedWrite, WriterMsg};
+use crate::store::{BarrierOutcome, QueuedWrite, WriterMsg};
 use crate::types::StoreChange;
 
 /// Max events applied per transaction. Bounds transaction size during
@@ -53,6 +53,7 @@ pub(super) async fn writer_loop(
     let mut pending = VecDeque::new();
     let mut paused = false;
     let mut pending_error = None;
+    let unreceived = Arc::new(std::sync::Mutex::new(None));
     let mut next = None;
     loop {
         let queued = match next.take() {
@@ -80,7 +81,7 @@ pub(super) async fn writer_loop(
                         "writer admission overflow: one or more writes were not accepted".into(),
                     );
                 }
-                let outcome = pending_error.take().map_or(Ok(()), Err);
+                let outcome = BarrierOutcome::publish(pending_error.take(), &unreceived);
                 if stopping {
                     rx.close();
                     drop(pending);
@@ -89,11 +90,7 @@ pub(super) async fn writer_loop(
                     let _ = done.send(outcome);
                     return;
                 }
-                if let Err(Err(error)) = done.send(outcome) {
-                    // Cancellation is not observation. In particular, a lost
-                    // admission error has no retained write to fail again.
-                    pending_error = Some(error);
-                }
+                let _ = done.send(outcome);
             }
             WriterMsg::InboundDurability { event, done } => {
                 // The hook is isolated on both sides: a poison inbound cannot
