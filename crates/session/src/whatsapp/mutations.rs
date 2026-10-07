@@ -330,11 +330,20 @@ impl WhatsAppClient {
             let Some(proto) = stored.message.map(|boxed| *boxed) else {
                 return Err("that message has no forwardable content".to_string());
             };
-            live.client
-                .forward_message(target, &proto)
+            let result = live
+                .client
+                .forward_message(target.clone(), &proto)
                 .await
-                .map(|result| result.message_id.clone())
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&target, &result.message_id)
+            {
+                log::warn!(
+                    "message was forwarded but its acknowledgement could not be tracked: {error}"
+                );
+            }
+            Ok(result.message_id)
         })
     }
 
@@ -386,6 +395,9 @@ impl WhatsAppClient {
                 ..Default::default()
             };
             let msg_id = live.client.generate_message_id();
+            live.chat_store
+                .record_operation(&chat, &msg_id)
+                .map_err(|error| format!("list response was not sent: {error}"))?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             live.client
                 .send_message_with_options(chat, message, options)

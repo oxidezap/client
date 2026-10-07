@@ -330,3 +330,41 @@ async fn distinct_early_ack_answers_keep_arrival_order_and_timestamp_corrections
         );
     }
 }
+
+#[tokio::test]
+async fn status_operation_pressure_preserves_direct_message_ack() {
+    let (_store, chat_store) = test_store().await;
+    let direct = jid(PEER);
+    let status = Jid::status_broadcast();
+    let authoritative = ts(1_700_000_042);
+    feed(&chat_store, [ack_at("REAL", direct.clone(), authoritative)]).await;
+    for i in 0..65 {
+        let id = format!("STATUS-{i}");
+        // The engine emits the ACK before its status send future returns.
+        feed(&chat_store, [ack(&id, status.clone())]).await;
+        chat_store.record_operation(&status, &id).unwrap();
+    }
+    chat_store
+        .record_outgoing(
+            &direct,
+            "REAL",
+            &wa::Message::text("real"),
+            ts(1_700_000_001),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let real = chat_store
+        .own_message(&direct, "REAL")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(real.status, MessageStatus::ServerAck);
+    assert_eq!(real.timestamp, authoritative);
+    assert!(
+        chat_store
+            .message(&status, "STATUS-0")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

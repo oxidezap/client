@@ -410,6 +410,12 @@ impl WhatsAppClient {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&Jid::status_broadcast(), &result.message_id)
+            {
+                log::warn!("status was sent but its acknowledgement could not be tracked: {error}");
+            }
             Ok((
                 result.message_id.clone(),
                 whatsapp_rust::wacore::time::now_millis(),
