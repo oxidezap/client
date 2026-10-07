@@ -25,10 +25,10 @@ pub(crate) enum MessageOp {
         new_proto: Vec<u8>,
         sender_timestamp_ms: Option<i64>,
     },
-    /// A revoke of another message: tombstone it. `target_from_me`/`target_participant`
-    /// come from the revoke KEY (they identify the target message's owner, not
-    /// the revoker — an admin revoke is authored by someone else), used when
-    /// the tombstone has to be created before its content arrives.
+    /// A revoke of another message: tombstone it. These are the raw key's
+    /// `fromMe` and participant, not a resolved local author. The live relay
+    /// path translates the sending account's perspective before row lookup;
+    /// history has a separate producer and must not inherit that translation.
     Revoke {
         target_id: String,
         target_from_me: bool,
