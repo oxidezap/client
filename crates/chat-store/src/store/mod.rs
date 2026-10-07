@@ -611,7 +611,12 @@ impl ChatStore {
         self.changes.subscribe()
     }
 
-    /// Record a message this client just sent. Goes through the writer queue so
+    /// Record an outgoing message before sending with the same pre-generated id.
+    /// Do not send if admission fails; call `mark_send_failed` if the send fails.
+    /// Recording after the network send is supported only within the bounded
+    /// early-ACK window (64 unknown ACKs, 60 seconds). At capacity, admitted
+    /// waiters remain and excess ACKs are rejected; flush/close reports the loss.
+    /// Goes through the writer queue so
     /// it cannot race the server ack / receipts that follow it in event order.
     /// Status starts at [`MessageStatus::Pending`](crate::types::MessageStatus::Pending)
     /// and is lifted by acks/receipts. `timestamp` is the optimistic display
@@ -656,7 +661,8 @@ impl ChatStore {
     /// operation is recorded. Chatless acks cannot be safely correlated and
     /// keep the ordinary early-row deferral. Evicting an operation at capacity
     /// warns; its late acks become unknown again. More than 64 unknown acks
-    /// can still evict a genuine early ack, with a warning. Reusing operation
+    /// exceed the admission bound: existing waiters stay, excess ACKs are lost,
+    /// and flush/close reports the loss. Reusing operation
     /// ids across chats or for message rows is unsupported: known collisions
     /// are refused, and future rows cannot retroactively disambiguate an ack.
     pub fn record_operation(&self, chat: &Jid, operation_id: &str) -> Result<()> {
@@ -1025,7 +1031,7 @@ impl ChatStore {
     /// Commit accepted writes preceding this barrier, retrying retained writes
     /// in their original order. Rollback retains the failed batch and everything
     /// behind it. A later flush can recover after the underlying fault is fixed.
-    /// Reports queue admission failures and post-commit durability failures too.
+    /// Reports write/unknown-ACK admission failures and post-commit durability failures too.
     /// The error is temporal across callers, not an individual write receipt.
     /// Cancellation retains it until a public flush/close future returns it.
     /// Handling or discarding the returned result belongs to the caller.

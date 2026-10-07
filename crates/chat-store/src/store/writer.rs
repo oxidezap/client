@@ -83,6 +83,13 @@ pub(super) async fn writer_loop(
                         "writer admission overflow: one or more writes were not accepted".into(),
                     );
                 }
+                if lock_deferred_acks(&deferred).take_admission_failure() {
+                    let loss = "unmatched ACK capacity exceeded: one or more incoming acknowledgements could not be retained";
+                    pending_error = Some(match pending_error.take() {
+                        Some(error) => format!("{error}; {loss}"),
+                        None => loss.to_owned(),
+                    });
+                }
                 let outcome = BarrierOutcome::publish(pending_error.take(), &unreceived);
                 if stopping {
                     rx.close();
