@@ -395,25 +395,25 @@ async fn edit_of_latest_message_refreshes_preview_and_stale_edit_is_ignored() {
 }
 
 #[tokio::test]
-async fn revoke_tombstone_keeps_target_from_me() {
+async fn own_phone_revoke_tombstone_keeps_target_from_me() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
 
-    // Revoke of OUR OWN message (key.fromMe = true) arriving before the
-    // content: the tombstone must not read as incoming forever.
+    // Our linked phone supplies both an own envelope and key.fromMe = true.
+    // The same key bit in a peer envelope would name the peer's message.
     let revoke = revoke_key(wa::MessageKey {
         id: Some("MSG-FM".into()),
         from_me: Some(true),
         ..Default::default()
     });
-    feed(
-        &chat_store,
-        [message_event(
-            revoke,
-            incoming_info(PEER, PEER, "MSG-FM2", 1_700_000_000),
-        )],
-    )
-    .await;
+    let mut info = incoming_info(
+        PEER,
+        "559900000099@s.whatsapp.net",
+        "MSG-FM2",
+        1_700_000_000,
+    );
+    info.source.is_from_me = true;
+    feed(&chat_store, [message_event(revoke, info)]).await;
     let tombstone = chat_store.message(&chat, "MSG-FM").await.unwrap().unwrap();
     assert!(tombstone.revoked);
     assert!(tombstone.from_me);
