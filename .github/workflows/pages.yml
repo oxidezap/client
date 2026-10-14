@@ -157,7 +157,10 @@ jobs:
         with:
           name: bundle
           path: web/dist
-          retention-days: 1
+          # Failed-job reruns reuse the original build's upload. Keep it long
+          # enough for recovery; after expiry rerun all jobs to rebuild it.
+          retention-days: 14
+          if-no-files-found: error
 
   # No concurrency group, deliberately. Actions concurrency is not a queue:
   # `cancel-in-progress: false` protects the job that is running, and a third
@@ -191,6 +194,7 @@ jobs:
     # it just has nowhere to publish to.
     if: |
       github.event.action != 'closed' &&
+      !github.event.pull_request.draft &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository) &&
       (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')

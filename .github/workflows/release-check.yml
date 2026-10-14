@@ -1,0 +1,14 @@
+# Exercise the production packager without granting publication permissions.
+name: Release artifacts
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: release-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: pr-${{ github.event.number }}
