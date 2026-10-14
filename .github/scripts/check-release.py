@@ -1,4 +1,6 @@
 """Check packaged native executables without running foreign code."""
+import gzip
+import io
 import struct
 import sys
 import tarfile
@@ -30,10 +32,15 @@ def check(path, version, platform):
     if windows:
         with zipfile.ZipFile(path) as archive:
             assert archive.testzip() is None, 'archive CRC failure'
+            names = [entry.filename for entry in archive.infolist()]
+            assert len(names) == len(set(names)), 'duplicate ZIP member'
             files = {entry.filename: (archive.read(entry), entry.external_attr >> 16)
                      for entry in archive.infolist() if not entry.is_dir()}
     else:
-        with tarfile.open(path, 'r:gz') as archive:
+        # Read through the gzip trailer so CRC and truncation errors surface.
+        with gzip.open(path, 'rb') as compressed:
+            payload = compressed.read()
+        with tarfile.open(fileobj=io.BytesIO(payload), mode='r:') as archive:
             files = {}
             for entry in archive:
                 if entry.isdir():
