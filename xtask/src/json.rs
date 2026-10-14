@@ -2,8 +2,8 @@
 //!
 //! `jq` is what the shell used, and pulling a serde graph in to replace it
 //! would cost this directory the property that makes it buildable on its own.
-//! What is actually asked of it is `.state`, `.head.sha` and `.sha`: string
-//! values at known paths. So this is a scanner rather than a document model —
+//! It reads `.state`, `.head.sha` and `.sha` as strings and `.draft` as a
+//! boolean at known paths. So this is a scanner rather than a document model —
 //! it walks the text, skipping whatever it is not looking at, and answers the
 //! one path it was given.
 //!
@@ -21,7 +21,21 @@ use std::str::CharIndices;
 pub fn string_at(text: &str, path: &str) -> Option<String> {
     let mut p = Parser::new(text);
     p.skip_ws();
-    p.value_at(&path.split('.').collect::<Vec<_>>())
+    p.value_at(&path.split('.').collect::<Vec<_>>(), false)
+}
+
+/// Read a JSON boolean, rejecting strings and missing fields.
+pub fn bool_at(text: &str, path: &str) -> Option<bool> {
+    let mut p = Parser::new(text);
+    p.skip_ws();
+    match p
+        .value_at(&path.split('.').collect::<Vec<_>>(), true)?
+        .as_str()
+    {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 struct Parser<'a> {
@@ -74,10 +88,21 @@ impl<'a> Parser<'a> {
 
     /// Walk `path` from the value about to be read, answering the string it
     /// arrives at.
-    fn value_at(&mut self, path: &[&str]) -> Option<String> {
+    fn value_at(&mut self, path: &[&str], boolean: bool) -> Option<String> {
         let Some(&key) = path.first() else {
             // Arrived: the value here is the answer, and only if it is a
             // string.
+            if boolean {
+                self.skip_ws();
+                let mut word = String::new();
+                while let Some((_, c)) = self.peek() {
+                    if c.is_ascii_whitespace() || matches!(c, ',' | '}' | ']') {
+                        break;
+                    }
+                    word.push(self.next()?.1);
+                }
+                return matches!(word.as_str(), "true" | "false").then_some(word);
+            }
             return self.string();
         };
         self.skip_ws();
@@ -97,7 +122,7 @@ impl<'a> Parser<'a> {
                 return None;
             }
             if name == key {
-                return self.value_at(&path[1..]);
+                return self.value_at(&path[1..], boolean);
             }
             self.skip_value();
             self.skip_ws();

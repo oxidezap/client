@@ -136,3 +136,20 @@ same reason the branch write is one: a legacy Pages build takes the tip as it
 finds it, so any run that notices can fix it and a run that has been overtaken
 can stand down. It needs `pages: write` on the job, which is why `publish` and
 `take-down` carry it.
+
+## Release artifacts and Pages recovery
+
+Native release archives are built and checked on pull requests through
+`release-check.yml`, using the same matrix and packager as tags and nightly.
+Linux ARM64 uses `ubuntu-22.04-arm`, builds `aarch64-unknown-linux-gnu`, and
+ships `oxidezap-<version>-linux-aarch64.tar.gz` with all three binaries and
+the desktop installer. Each native runner checks the archive's complete member
+set, binary format, architecture and executable permissions, then runs the
+packaged CLI's help command. This smoke test does not exercise the GUI or a
+WhatsApp session. Publishing still requires every build to succeed.
+
+Pages bundles are retained for 14 days. A failed-job rerun reuses the original
+Build artifact, so after that window use **Re-run all jobs** to recreate it.
+Run 37649799287 uploaded its bundle on October 7 with one-day retention; its
+Publish rerun on October 9 could no longer download it. Draft pull requests
+build the bundle but do not publish a preview.

@@ -278,8 +278,11 @@ fn undo_if_closed(args: &[&str]) -> Result<()> {
             false
         }
         // Ours to undo.
-        State::Closed => {
-            note!("closed while publishing; removing {} again", job.target);
+        State::Closed | State::Draft => {
+            note!(
+                "closed or draft while publishing; removing {} again",
+                job.target
+            );
             pages::run(&job, &Remote::from_env()?)?;
             true
         }

@@ -46,7 +46,7 @@ on:
   # Buildable and previewable from a pull request: the build is the part that
   # breaks, and finding out at merge time is finding out late.
   pull_request:
-    types: [opened, synchronize, reopened, closed]
+    types: [opened, synchronize, reopened, closed, ready_for_review, converted_to_draft]
   workflow_dispatch:
 
 permissions:
@@ -61,7 +61,7 @@ jobs:
     name: Build
     # A closed pull request has nothing to build; it only has a preview to
     # take down.
-    if: github.event.action != 'closed'
+    if: github.event.action != 'closed' && github.event.action != 'converted_to_draft'
     runs-on: ubuntu-latest
     # On this job and not on the workflow, which is the distinction the note
     # over `publish` is about. Cancelling a *build* costs nothing anyone
@@ -157,7 +157,10 @@ jobs:
         with:
           name: bundle
           path: web/dist
-          retention-days: 1
+          # Failed-job reruns reuse the original build's upload. Keep it long
+          # enough for recovery; after expiry rerun all jobs to rebuild it.
+          retention-days: 14
+          if-no-files-found: error
 
   # No concurrency group, deliberately. Actions concurrency is not a queue:
   # `cancel-in-progress: false` protects the job that is running, and a third
@@ -191,6 +194,7 @@ jobs:
     # it just has nowhere to publish to.
     if: |
       github.event.action != 'closed' &&
+      !github.event.pull_request.draft &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository) &&
       (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')
@@ -269,7 +273,7 @@ jobs:
             --check still-current \
             --settle
 
-      # If the pull request closed while we were publishing, undo it.
+      # If the pull request closed or became draft while publishing, undo it.
       #
       # The check above runs before every attempt at the branch, and that
       # still leaves one gap it cannot close: a preview being published for
@@ -286,7 +290,7 @@ jobs:
       # decides — open, superseded, closed — and the refusal to read a broken
       # check as any of them are in `xtask`, where they are a `match` on an
       # enum rather than a `case` on an exit code.
-      - name: Take it down again if the pull request closed meanwhile
+      - name: Take it down again if the pull request closed or became draft
         id: undone
         if: github.event_name == 'pull_request'
         env:
@@ -309,7 +313,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # A preview is only worth having if it goes away. The directory is removed
-  # when the pull request closes, merged or not.
+  # when the pull request closes or returns to draft.
   take-down:
     name: Take the preview down
     # Same-repository only, matching `publish` above: a fork's pull request
@@ -321,7 +325,7 @@ jobs:
     # than tidy.
     if: |
       github.event_name == 'pull_request' &&
-      github.event.action == 'closed' &&
+      (github.event.action == 'closed' || github.event.action == 'converted_to_draft') &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     # `pages: write` for the same reason as `publish`, and it matters most

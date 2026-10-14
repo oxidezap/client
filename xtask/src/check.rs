@@ -33,6 +33,8 @@ pub enum State {
     Superseded,
     /// The pull request is closed; its preview should not exist at all.
     Closed,
+    /// Draft pull requests have no published preview.
+    Draft,
 }
 
 /// Which question a given write to the branch is conditional on.
@@ -49,12 +51,12 @@ pub enum Precondition {
     /// Publishing: proceed only while this run is still the current one.
     StillCurrent,
     /// The compensating removal after a publish: proceed only if the pull
-    /// request has closed since. Superseded is *not* a reason to remove — a
+    /// request has closed or returned to draft since. Superseded is *not* a reason to remove — a
     /// newer run of the same pull request owns the preview, and deleting it
     /// would take down one that is wanted.
     NowClosed,
     /// The take-down job: proceed only while the pull request is still
-    /// closed. A reopened one has a `reopened` run publishing its preview
+    /// closed or draft. A reopened or ready one has a `reopened` run publishing its preview
     /// behind us.
     StillClosed,
 }
@@ -88,15 +90,15 @@ impl Precondition {
             Precondition::Always => Ok(Wanted::Yes),
             Precondition::StillCurrent => match api.state()? {
                 State::Current => Ok(Wanted::Yes),
-                State::Superseded | State::Closed => Ok(Wanted::StandDown),
+                State::Superseded | State::Closed | State::Draft => Ok(Wanted::StandDown),
             },
             Precondition::NowClosed => match api.state()? {
-                State::Closed => Ok(Wanted::Yes),
+                State::Closed | State::Draft => Ok(Wanted::Yes),
                 State::Current | State::Superseded => Ok(Wanted::StandDown),
             },
             Precondition::StillClosed => {
-                if api.pull_request_is_open()? {
-                    note!("pull request was reopened; its preview is wanted again");
+                if api.pull_request_preview_wanted()? {
+                    note!("pull request is open and ready; its preview is wanted again");
                     Ok(Wanted::StandDown)
                 } else {
                     Ok(Wanted::Yes)
@@ -149,6 +151,10 @@ impl Api {
                 note!("pull request is closed; its preview should not exist");
                 return Ok(State::Closed);
             }
+            if draft(&pr)? {
+                note!("pull request is draft; its preview should not exist");
+                return Ok(State::Draft);
+            }
             let head = field(&pr, "head.sha")?;
             let want = &self.pr_head;
             if want.is_empty() {
@@ -179,9 +185,9 @@ impl Api {
 
     /// The take-down job's question, which is about the pull request alone —
     /// it has no build of its own to be superseded.
-    pub fn pull_request_is_open(&self) -> Result<bool> {
+    pub fn pull_request_preview_wanted(&self) -> Result<bool> {
         let pr = self.get(&format!("pulls/{}", self.number()?))?;
-        Ok(field(&pr, "state")? == "open")
+        Ok(field(&pr, "state")? == "open" && !draft(&pr)?)
     }
 
     fn number(&self) -> Result<&str> {
@@ -320,9 +326,23 @@ fn field(body: &str, path: &str) -> Result<String> {
         .ok_or_else(|| Error(format!("the API answered with no `{path}` in it")))
 }
 
+fn draft(body: &str) -> Result<bool> {
+    json::bool_at(body, "draft")
+        .ok_or_else(|| err!("the API answered with no boolean `draft` in it"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Answer, first_line};
+    use super::{Answer, draft, first_line};
+
+    #[test]
+    fn draft_status_requires_a_real_boolean() {
+        assert!(draft(r#"{"state":"open","draft":true}"#).unwrap());
+        assert!(!draft(r#"{"draft":false}"#).unwrap());
+        assert!(draft(r#"{"title":"draft: true"}"#).is_err());
+        assert!(draft(r#"{"draft":"false"}"#).is_err());
+        assert!(draft(r#"{"draft":trueish}"#).is_err());
+    }
 
     /// 404 and 403 are not the same answer, and `-f` made them one.
     ///

@@ -43,6 +43,9 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
           # Apple Silicon only. The macos-13 (Intel) pool queues for tens of
           # minutes on free runners, and an Intel build would hold the whole
           # nightly behind it. Intel Macs can be covered later by building both
@@ -181,6 +184,24 @@ jobs:
             tar -czf "$out.tar.gz" "$out"
             echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
           fi
+
+      - name: Verify archive contents and binary architecture
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          PLATFORM: ${{ matrix.name }}
+        run: python3 .github/scripts/check-release.py "$ASSET" "$VERSION" "$PLATFORM"
+
+      - name: Run the packaged CLI on its native runner
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          PLATFORM: ${{ matrix.name }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          cli="./oxidezap-$VERSION-$PLATFORM/oxidezap-cli"
+          if [ "$RUNNER_OS" = "Windows" ]; then cli="$cli.exe"; fi
+          "$cli" --help
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
