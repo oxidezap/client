@@ -253,6 +253,27 @@ pub struct ChatEntry {
     pub group_hierarchy_json: Option<String>,
 }
 
+/// Which chats to include in a chat-list page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatArchiveFilter {
+    /// Chats whose archived flag is false.
+    Unarchived,
+    /// Chats whose archived flag is true.
+    Archived,
+    /// Chats regardless of their archived flag.
+    All,
+}
+
+impl ChatArchiveFilter {
+    pub(crate) fn archived(self) -> Option<bool> {
+        match self {
+            Self::Unarchived => Some(false),
+            Self::Archived => Some(true),
+            Self::All => None,
+        }
+    }
+}
+
 /// The durable chat metadata a live message needs before it can alert.
 ///
 /// `allowed` is conservative across an unmerged PN/LID pair: either side's

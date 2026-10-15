@@ -2501,7 +2501,11 @@ async fn a_truncated_load_says_where_the_list_continues() {
     // the whole point: the page after a load is not the load.
     let after = parse_chat_cursor(&token).expect("this crate reads its own token");
     let page = chat_store
-        .chats_page(false, Some(after), 5)
+        .chats_page(
+            oxidezap_chat_store::ChatArchiveFilter::Unarchived,
+            Some(after),
+            5,
+        )
         .await
         .expect("a page after the load");
     assert!(!page.is_empty(), "there is more behind a truncated load");

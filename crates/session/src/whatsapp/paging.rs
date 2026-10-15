@@ -478,7 +478,15 @@ impl WhatsAppClient {
 
             let limit = limit.clamp(1, Self::CHAT_PAGE);
             let entries = store
-                .chats_page(include_archived, after, limit)
+                .chats_page(
+                    if include_archived {
+                        oxidezap_chat_store::ChatArchiveFilter::All
+                    } else {
+                        oxidezap_chat_store::ChatArchiveFilter::Unarchived
+                    },
+                    after,
+                    limit,
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             // Off the page as it was read, before the aliases below join it:
