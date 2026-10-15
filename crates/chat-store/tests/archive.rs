@@ -144,3 +144,49 @@ async fn archive_queries_are_device_scoped_and_observe_updates() {
             .is_empty()
     );
 }
+
+/// Store queries expose rows until the writer reconciles their identities.
+#[tokio::test]
+async fn archived_unread_total_matches_stored_rows_before_alias_hydration() {
+    let (store, chats) = test_store().await;
+    add_lid_mapping(&store).await;
+    let device = store.device_id();
+    store.shared().run(move |conn| {
+        for peer in [PEER, PEER_LID] {
+            diesel::sql_query(format!(
+                "INSERT INTO chats (device_id, jid, archived, unread_count) VALUES ({device}, '{peer}', 1, 2)"
+            )).execute(conn).map_err(db_err)?;
+        }
+        Ok(())
+    }).await.unwrap();
+    assert_eq!(
+        chats
+            .chats_page(ChatArchiveFilter::Archived, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(chats.archived_unread_total().await.unwrap(), 2);
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(format!(
+                "UPDATE chats SET archived = 0 WHERE device_id = {device} AND jid = '{PEER}'"
+            ))
+            .execute(conn)
+            .map(|_| ())
+            .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        chats
+            .chats_page(ChatArchiveFilter::Archived, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(chats.archived_unread_total().await.unwrap(), 1);
+}

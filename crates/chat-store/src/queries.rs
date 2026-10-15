@@ -653,9 +653,15 @@ impl ChatStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Number of archived chats with a positive unread message count for this
-    /// device. Counts chats, not messages; a manual unread marker (`-1`) alone
-    /// does not contribute. Independent of chat-list pagination.
+    /// Count of this device's stored archived chat rows with `unread_count > 0`,
+    /// independent of chat-list pagination. Counts rows, not messages.
+    ///
+    /// Like [`chats_page`](Self::chats_page), this reads stored metadata before
+    /// session alias hydration: an unreconciled PN/LID pair can contribute two
+    /// rows. Reconciliation, not this query, merges their metadata.
+    ///
+    /// Negative manual-unread markers never contribute, even if message rows
+    /// exist behind them. This does not reconstruct unread state from receipts.
     pub async fn archived_unread_total(&self) -> Result<i64> {
         use schema::chats::dsl;
         let device_id = self.device_id();

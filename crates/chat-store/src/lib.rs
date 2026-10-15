@@ -27,8 +27,8 @@
 //! let page = chat_store.messages(&chats[0].jid, None, 40).await?;
 //! // Archive selection happens before the page limit in both ordered runs.
 //! let archived = chat_store.chats_page(ChatArchiveFilter::Archived, None, 50).await?;
-//! // Number of archived chats with positive unread counts, across every page.
-//! let archived_unread_chats = chat_store.archived_unread_total().await?;
+//! // Stored archived rows with positive unread counters, across every page.
+//! let archived_unread_rows = chat_store.archived_unread_total().await?;
 //! let mut changes = chat_store.subscribe();
 //! ```
 
