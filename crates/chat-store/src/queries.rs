@@ -14,9 +14,9 @@ use crate::error::{ChatStoreError, Result, db_err};
 use crate::schema;
 use crate::store::ChatStore;
 use crate::types::{
-    ArrivalCursor, AvatarDescriptor, ChatCursor, ChatEntry, ChatNotificationMetadata, ContactEntry,
-    MediaRef, MessageCoverage, MessageCursor, MessageKind, MessageStatus, ReactionEntry,
-    ReceiptEntry, StoredMessage,
+    ArrivalCursor, AvatarDescriptor, ChatArchiveFilter, ChatCursor, ChatEntry,
+    ChatNotificationMetadata, ContactEntry, MediaRef, MessageCoverage, MessageCursor, MessageKind,
+    MessageStatus, ReactionEntry, ReceiptEntry, StoredMessage,
 };
 
 /// A conversation's durable read verdicts at one point in time.
@@ -546,11 +546,17 @@ impl ChatStore {
     ///
     /// Equivalent to [`chats_page`](Self::chats_page) with no cursor.
     pub async fn chats(&self, include_archived: bool, limit: i64) -> Result<Vec<ChatEntry>> {
-        self.chats_page(include_archived, None, limit).await
+        let filter = if include_archived {
+            ChatArchiveFilter::All
+        } else {
+            ChatArchiveFilter::Unarchived
+        };
+        self.chats_page(filter, None, limit).await
     }
 
     /// One page of the chat list. Pass the cursor of the last chat you already
-    /// have to get the page after it.
+    /// have to get the page after it. Keep the same archive filter while paging;
+    /// start again without a cursor when changing the filter.
     ///
     /// The list is two ordered runs concatenated — pinned chats by pin time,
     /// then everything else by activity — because SQLite cannot serve the
@@ -560,7 +566,7 @@ impl ChatStore {
     /// scan that stops at `limit`.
     pub async fn chats_page(
         &self,
-        include_archived: bool,
+        archive_filter: ChatArchiveFilter,
         after: Option<ChatCursor>,
         limit: i64,
     ) -> Result<Vec<ChatEntry>> {
@@ -586,8 +592,8 @@ impl ChatStore {
                         .filter(dsl::device_id.eq(device_id))
                         .filter(dsl::pinned_at.is_not_null())
                         .into_boxed();
-                    if !include_archived {
-                        query = query.filter(dsl::archived.eq(false));
+                    if let Some(archived) = archive_filter.archived() {
+                        query = query.filter(dsl::archived.eq(archived));
                     }
                     if let (Some(pinned_at), Some(cursor)) = (resume_pinned, &after) {
                         query = query.filter(
@@ -622,8 +628,8 @@ impl ChatStore {
                         .filter(dsl::device_id.eq(device_id))
                         .filter(dsl::pinned_at.is_null())
                         .into_boxed();
-                    if !include_archived {
-                        query = query.filter(dsl::archived.eq(false));
+                    if let Some(archived) = archive_filter.archived() {
+                        query = query.filter(dsl::archived.eq(archived));
                     }
                     if start_in_activity_run && let Some(cursor) = &after {
                         query = query.filter(
@@ -645,6 +651,32 @@ impl ChatStore {
             })
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Count of this device's stored archived chat rows with `unread_count > 0`,
+    /// independent of chat-list pagination. Counts rows, not messages.
+    ///
+    /// Like [`chats_page`](Self::chats_page), this reads stored metadata before
+    /// session alias hydration: an unreconciled PN/LID pair can contribute two
+    /// rows. Reconciliation, not this query, merges their metadata.
+    ///
+    /// Negative manual-unread markers never contribute, even if message rows
+    /// exist behind them. This does not reconstruct unread state from receipts.
+    pub async fn archived_unread_total(&self) -> Result<i64> {
+        use schema::chats::dsl;
+        let device_id = self.device_id();
+        Ok(self
+            .db()
+            .read(move |conn| {
+                dsl::chats
+                    .filter(dsl::device_id.eq(device_id))
+                    .filter(dsl::archived.eq(true))
+                    .filter(dsl::unread_count.gt(0))
+                    .count()
+                    .get_result(conn)
+                    .map_err(db_err)
+            })
+            .await?)
     }
 
     /// One chat by key, or `None` if the store has never seen it.

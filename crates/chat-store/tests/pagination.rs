@@ -290,11 +290,18 @@ async fn an_impossible_timestamp_does_not_stop_the_chat_list() {
     };
     feed(&chat_store, [history_sync_event(history)]).await;
 
-    let first = chat_store.chats_page(false, None, 1).await.unwrap();
+    let first = chat_store
+        .chats_page(oxidezap_chat_store::ChatArchiveFilter::Unarchived, None, 1)
+        .await
+        .unwrap();
     assert_eq!(first.len(), 1);
     let cursor = ChatCursor::from(&first[0]);
     let second = chat_store
-        .chats_page(false, Some(cursor), 10)
+        .chats_page(
+            oxidezap_chat_store::ChatArchiveFilter::Unarchived,
+            Some(cursor),
+            10,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -576,7 +583,11 @@ async fn chat_list_pages_across_the_pinned_boundary() {
     let mut cursor = None;
     loop {
         let page = chat_store
-            .chats_page(false, cursor.take(), 1)
+            .chats_page(
+                oxidezap_chat_store::ChatArchiveFilter::Unarchived,
+                cursor.take(),
+                1,
+            )
             .await
             .unwrap();
         if page.is_empty() {

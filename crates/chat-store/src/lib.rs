@@ -25,6 +25,10 @@
 //!
 //! let chats = chat_store.chats(false, 50).await?;
 //! let page = chat_store.messages(&chats[0].jid, None, 40).await?;
+//! // Archive selection happens before the page limit in both ordered runs.
+//! let archived = chat_store.chats_page(ChatArchiveFilter::Archived, None, 50).await?;
+//! // Stored archived rows with positive unread counters, across every page.
+//! let archived_unread_rows = chat_store.archived_unread_total().await?;
 //! let mut changes = chat_store.subscribe();
 //! ```
 
@@ -50,8 +54,8 @@ pub use materialize::{
 pub use queries::MessageReadState;
 pub use store::ChatStore;
 pub use types::{
-    ArrivalCursor, AvatarDescriptor, ChatCursor, ChatEntry, ChatNameExpected, ChatNameWrite,
-    ChatNotificationMetadata, ContactEntry, GroupHierarchyWrite, MediaRef, MessageCoverage,
-    MessageCursor, MessageKind, MessageStatus, ReactionEntry, ReceiptEntry, StoreChange,
-    StoredMessage,
+    ArrivalCursor, AvatarDescriptor, ChatArchiveFilter, ChatCursor, ChatEntry, ChatNameExpected,
+    ChatNameWrite, ChatNotificationMetadata, ContactEntry, GroupHierarchyWrite, MediaRef,
+    MessageCoverage, MessageCursor, MessageKind, MessageStatus, ReactionEntry, ReceiptEntry,
+    StoreChange, StoredMessage,
 };
