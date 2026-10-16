@@ -1633,12 +1633,16 @@ mod tests {
     }
 
     async fn test_store(name: &str) -> Arc<ChatStore> {
-        let backend = whatsapp_rust::store::SqliteStore::new(&format!(
+        let backend = whatsapp_rust::store::SqliteStore::open(&format!(
             "file:oxidezap-names-{name}?mode=memory&cache=shared",
         ))
         .await
         .expect("in-memory store");
-        backend.create_new_device().await.expect("seed device");
+        backend
+            .database()
+            .provision_device(backend.device_id())
+            .await
+            .expect("seed device");
         ChatStore::new(&backend).await.expect("chat store")
     }
 

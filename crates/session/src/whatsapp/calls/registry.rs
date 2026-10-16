@@ -2570,16 +2570,18 @@ impl WhatsAppClient {
     /// The call's own event stream: what the peer says about its video, and
     /// what the network says about ours.
     fn watch_call_events(handle: Arc<CallHandle>, calls: CallRegistry, ui_sender: UiEventSender) {
-        let Some(events) = handle.take_events() else {
+        let Some(mut events) = handle.take_events() else {
             warn!("call {}: event receiver already acquired", handle.call_id());
             return;
         };
-        crate::exec::spawn(Self::run_call_events(handle, events, calls, ui_sender));
+        crate::exec::spawn(async move {
+            Self::run_call_events(handle, &mut events, calls, ui_sender).await;
+        });
     }
 
     async fn run_call_events(
         handle: Arc<CallHandle>,
-        events: async_channel::Receiver<CallEvent>,
+        events: &mut whatsapp_rust::voip::CallEvents,
         calls: CallRegistry,
         ui_sender: UiEventSender,
     ) {
@@ -2589,8 +2591,6 @@ impl WhatsAppClient {
                 event @ CallEvent::PeerVideoStateChanged { .. } => {
                     calls.peer_video_event(&handle, event, &ui_sender).await;
                 }
-                // A compatibility copy of the preceding source-bearing event.
-                CallEvent::VideoStateChanged { .. } => {}
                 // The peer has lost our stream and is asking for a point
                 // it can start from. Sending it more P-frames it cannot
                 // decode is the one thing that certainly does not help.
@@ -3172,7 +3172,7 @@ mod tests {
 
     #[cfg_attr(not(target_family = "wasm"), test)]
     #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
-    fn source_video_event_keeps_the_operation_and_rejects_legacy() {
+    fn source_video_event_keeps_the_operation_and_ignores_unrelated_events() {
         use whatsapp_rust::wacore::voip::{CallSession, PeerVideoTransition};
         let registry = whatsapp_rust::wacore::voip::CallRegistry::default();
         let source = Jid::lid("200").with_device(2);
@@ -3199,22 +3199,7 @@ mod tests {
         assert_eq!(update.call_creator, creator);
         assert_eq!(update.state, VideoState::UpgradeRequestV2);
         assert_eq!(update.upgrade_token, Some(token));
-        assert!(
-            peer_video_update(CallEvent::VideoStateChanged {
-                state: VideoState::UpgradeRequestV2,
-                orientation: Some(3),
-                upgrade_token: Some(token),
-            })
-            .is_none()
-        );
-        assert!(
-            peer_video_update(CallEvent::VideoStateChanged {
-                state: VideoState::Stopped,
-                orientation: None,
-                upgrade_token: None,
-            })
-            .is_none()
-        );
+        assert!(peer_video_update(CallEvent::VideoKeyframeNeeded).is_none());
     }
 
     #[cfg_attr(not(target_family = "wasm"), test)]

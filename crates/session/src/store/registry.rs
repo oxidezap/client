@@ -3,9 +3,8 @@
 //! This is deliberately the only session-layer entry point that turns an
 //! [`AccountId`] into a SQLite store, and the only one that lists, creates,
 //! resets or removes one. The lifecycle primitives it calls
-//! (`list_devices`/`create_sibling_device`/`reset_device`/`remove_device`) are
-//! the upstream API landed in whatsapp-rust#1505 (WR-1); this registry never
-//! touches the private `device` table itself.
+//! belong to `SqliteDatabase`; this registry never touches the private
+//! `device` table itself.
 //!
 //! **Caller obligation, inherited from WR-1 as-is.** Neither `reset_device` nor
 //! `remove_device` invalidates a live handle for that account: a session still
@@ -25,8 +24,12 @@ use wacore::store::error::StoreError;
 
 #[cfg(not(target_family = "wasm"))]
 type Store = whatsapp_rust::store::SqliteStore;
+#[cfg(not(target_family = "wasm"))]
+type Database = whatsapp_rust::store::SqliteDatabase;
 #[cfg(target_family = "wasm")]
 type Store = whatsapp_rust_sqlite_storage::SqliteStore;
+#[cfg(target_family = "wasm")]
+type Database = whatsapp_rust_sqlite_storage::SqliteDatabase;
 
 /// One account as [`StoreRegistry::accounts`] reports it, with no `device`
 /// vocabulary leaking past this module: [`Self::id`] is the same opaque
@@ -45,35 +48,15 @@ pub struct StoredAccount {
 pub struct StoreRegistry {
     database_path: String,
     chat_schema: Arc<OnceCell<()>>,
-    /// The one connection pool for the shared file, opened once and reused by
-    /// every account through [`whatsapp_rust::store::SqliteStore::share_for_device`].
-    ///
-    /// This is the default topology section 7 of the multi-account plan asks
-    /// for: one pool, one write-permit semaphore, and siblings that differ
-    /// only in which `device_id` a handle is bound to. It is not an
-    /// optimization — sharing the semaphore is what keeps two accounts'
-    /// writers from ever running independent transactions against the same
-    /// physical file at once. Upstream's own docs name the failure mode two
-    /// separate pools hit: a deferred read-then-write transaction on each
-    /// side can deadlock on the upgrade, and `busy_timeout` cannot break that
-    /// (it only retries `SQLITE_BUSY`, not the lock-upgrade deadlock). One
-    /// pool makes the two writers the same writer, so the deadlock has no
-    /// second party to happen with.
-    ///
-    /// Bound to [`AccountId::LEGACY`] at open time for no semantic reason:
-    /// opening a `SqliteStore` does not require its bound id to already have
-    /// a row, and every consumer of this cell immediately re-binds via
-    /// `share_for_device` before doing anything account-scoped. The four
-    /// lifecycle methods below (`list_devices`/`create_sibling_device`/
-    /// `reset_device`/`remove_device`) don't consult the bound id either —
-    /// `list_devices` reads the whole table and the other three take the id
-    /// as a parameter — so this same handle serves them too.
-    base: Arc<OnceCell<Store>>,
+    /// Opened once. Every account store shares this database's connection
+    /// pools and write permits, so concurrent account writers cannot deadlock
+    /// by upgrading independent read transactions on the same physical file.
+    base: Arc<OnceCell<Database>>,
 }
 
 impl std::fmt::Debug for StoreRegistry {
-    // `Store` (the upstream `SqliteStore`) does not implement `Debug`, so the
-    // admin handle is named rather than printed.
+    // The database handle does not implement `Debug`, so name it rather
+    // than trying to print its connection pools.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StoreRegistry")
             .field("database_path", &self.database_path)
@@ -107,18 +90,20 @@ impl StoreRegistry {
     /// the field doc on [`Self::base`] for why that sharing matters.
     pub async fn store(&self, account_id: AccountId) -> Result<Store, StoreError> {
         let base = self.base().await?;
-        Ok(base.share_for_device(account_id.as_i32()))
+        Ok(base.store(account_id.as_i32()))
     }
 
     /// The one open pool for this database, opened on first use.
     ///
     /// Every account-scoped handle ([`Self::store`]) and every lifecycle
     /// operation below is a sibling of this same handle, bound to whichever
-    /// id it needs via `share_for_device`.
-    async fn base(&self) -> Result<&Store, StoreError> {
+    /// id it needs via `SqliteDatabase::store`.
+    async fn base(&self) -> Result<&Database, StoreError> {
         self.base
-            .get_or_try_init(|| {
+            .get_or_try_init(|| async {
                 crate::store::open_for_account(&self.database_path, AccountId::LEGACY)
+                    .await
+                    .map(|store| store.database())
             })
             .await
     }
@@ -152,12 +137,12 @@ impl StoreRegistry {
     /// Allocate a new local account in this database, race-free.
     ///
     /// The id comes from SQLite's own `AUTOINCREMENT`, inside the transaction
-    /// [`whatsapp_rust::store::SqliteStore::create_sibling_device`] runs, so two
+    /// [`whatsapp_rust::store::SqliteDatabase::create_device`] runs, so two
     /// concurrent calls can never return the same id and a removed id is never
     /// reissued.
     pub async fn create_account(&self) -> Result<AccountId, StoreError> {
         let base = self.base().await?;
-        let (id, _sibling) = base.create_sibling_device().await?;
+        let id = base.create_device().await?.device_id();
         AccountId::new(id).map_err(|_| {
             StoreError::Validation(format!(
                 "the shared database allocated a non-positive account id ({id})"
@@ -233,16 +218,24 @@ mod tests {
         // private `device` table itself.
         let account_a = AccountId::LEGACY;
         let account_b = AccountId::new(2).expect("positive account id");
-        let seed_a =
-            whatsapp_rust::store::SqliteStore::new_for_device(&database, account_a.as_i32())
-                .await
-                .expect("open device A");
-        seed_a.create_new_device().await.expect("create device A");
-        let seed_b =
-            whatsapp_rust::store::SqliteStore::new_for_device(&database, account_b.as_i32())
-                .await
-                .expect("open device B");
-        seed_b.create_new_device().await.expect("create device B");
+        let seed_a = whatsapp_rust::store::SqliteDatabase::open(&database, Default::default())
+            .await
+            .expect("open device A")
+            .store(account_a.as_i32());
+        seed_a
+            .database()
+            .provision_device(seed_a.device_id())
+            .await
+            .expect("create device A");
+        let seed_b = whatsapp_rust::store::SqliteDatabase::open(&database, Default::default())
+            .await
+            .expect("open device B")
+            .store(account_b.as_i32());
+        seed_b
+            .database()
+            .provision_device(seed_b.device_id())
+            .await
+            .expect("create device B");
 
         let registry = StoreRegistry::new(database);
         let store_a = registry.store(account_a).await.expect("open store A");

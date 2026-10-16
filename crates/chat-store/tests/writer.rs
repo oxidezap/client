@@ -15,7 +15,7 @@ async fn barrier_store(
     failed: Arc<std::sync::atomic::AtomicBool>,
 ) -> (SqliteStore, Arc<ChatStore>) {
     use std::sync::atomic::Ordering;
-    use whatsapp_rust_sqlite_storage::{CommitBarrierHook, SqliteStoreConfig};
+    use whatsapp_rust_sqlite_storage::{CommitBarrierHook, SqliteDatabaseConfig};
     static COUNTER: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
 
@@ -31,17 +31,22 @@ async fn barrier_store(
             }
         })
     });
-    let store = SqliteStore::with_config(
+    let store = whatsapp_rust_sqlite_storage::SqliteDatabase::open(
         &format!(
             "file:memdb_chat_store_barrier_{}_{}?mode=memory&cache=shared",
             std::process::id(),
             id
         ),
-        SqliteStoreConfig::default().with_commit_barrier(barrier),
+        SqliteDatabaseConfig::default().with_commit_barrier(barrier),
     )
     .await
+    .map(|database| database.store(1))
     .expect("create barrier store");
-    store.create_new_device().await.expect("seed device parent");
+    store
+        .database()
+        .provision_device(store.device_id())
+        .await
+        .expect("seed device parent");
     let chat_store = ChatStore::new(&store).await.expect("create chat store");
     (store, chat_store)
 }

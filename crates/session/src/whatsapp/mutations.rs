@@ -8,7 +8,7 @@
 
 use oxidezap_chat_store::{MessageKind, MessageStatus};
 
-use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _, observe_str};
+use whatsapp_rust::wacore_binary::jid::{Jid, observe_str};
 use whatsapp_rust::waproto::{buffa::MessageField, whatsapp as wa};
 
 use super::WhatsAppClient;
@@ -114,12 +114,15 @@ impl WhatsAppClient {
                 .send_reaction_raw(&chat, key, &emoji)
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&chat, result.message_id.as_str())
+            {
                 log::warn!(
                     "reaction was sent but its acknowledgement could not be tracked: {error}"
                 );
             }
-            Ok(result.message_id)
+            Ok(result.message_id.into_string())
         })
     }
 
@@ -169,7 +172,10 @@ impl WhatsAppClient {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&chat, result.message_id.as_str())
+            {
                 log::warn!("edit was sent but its acknowledgement could not be tracked: {error}");
             }
             let (sent_content, timestamp_ms) =
@@ -201,7 +207,7 @@ impl WhatsAppClient {
                         .to_string(),
                 );
             }
-            Ok(result.message_id)
+            Ok(result.message_id.into_string())
         })
     }
 
@@ -258,7 +264,7 @@ impl WhatsAppClient {
                             message_id.clone(),
                             whatsapp_rust::send::RevokeType::Sender,
                         ).await?;
-                        if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
+                        if let Err(error) = live.chat_store.record_operation(&chat, result.message_id.as_str()) {
                             log::warn!("revoke was sent but its acknowledgement could not be tracked: {error}");
                         }
                         Ok::<_, whatsapp_rust::send::SendError>(result)
@@ -278,7 +284,7 @@ impl WhatsAppClient {
                 let (from_me, participant, timestamp) = match stored {
                     Some(stored) => (
                         stored.from_me,
-                        (!stored.from_me && chat.is_group()).then_some(stored.sender_jid),
+                        (!stored.from_me && super::participant_keyed_chat(&chat)).then_some(stored.sender_jid),
                         stored.timestamp.timestamp_millis(),
                     ),
                     None => return Err("message not found".to_string()),
@@ -350,13 +356,13 @@ impl WhatsAppClient {
                 .map_err(|e| e.to_string())?;
             if let Err(error) = live
                 .chat_store
-                .record_operation(&target, &result.message_id)
+                .record_operation(&target, result.message_id.as_str())
             {
                 log::warn!(
                     "message was forwarded but its acknowledgement could not be tracked: {error}"
                 );
             }
-            Ok(result.message_id)
+            Ok(result.message_id.into_string())
         })
     }
 
@@ -411,13 +417,13 @@ impl WhatsAppClient {
             };
             let msg_id = live.client.generate_message_id();
             live.chat_store
-                .record_operation(&chat, &msg_id)
+                .record_operation(&chat, msg_id.as_str())
                 .map_err(|error| format!("list response was not sent: {error}"))?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             live.client
-                .send_message_with_options(chat, message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
-                .map(|result| result.message_id.clone())
+                .map(|result| result.message_id.to_string())
                 .map_err(|e| e.to_string())
         })
     }

@@ -205,11 +205,8 @@ async fn a_vote_does_not_raise_an_unclearable_badge() {
 
     let vote = {
         let mut constructed: wa::Message = Default::default();
-        constructed.poll_update_message = MessageField::some({
-            let mut constructed: wa::message::PollUpdateMessage = Default::default();
-
-            constructed
-        });
+        constructed.poll_update_message =
+            MessageField::some(wa::message::PollUpdateMessage::default());
         constructed
     };
     feed(

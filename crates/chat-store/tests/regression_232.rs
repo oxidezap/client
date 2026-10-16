@@ -267,19 +267,23 @@ async fn queued_writes_have_a_finite_admission_bound() {
 #[tokio::test]
 async fn sqlite_busy_retains_local_write_until_lock_released() {
     use diesel::Connection;
-    use whatsapp_rust_sqlite_storage::SqliteStoreConfig;
+    use whatsapp_rust_sqlite_storage::SqliteDatabaseConfig;
     let path =
         std::env::temp_dir().join(format!("oxidezap-232-busy-{}.sqlite", std::process::id()));
-    let db = SqliteStore::with_config(
+    let db = whatsapp_rust_sqlite_storage::SqliteDatabase::open(
         path.to_str().unwrap(),
-        SqliteStoreConfig {
+        SqliteDatabaseConfig {
             busy_timeout: Duration::from_millis(1),
             ..Default::default()
         },
     )
     .await
+    .map(|database| database.store(1))
     .unwrap();
-    db.create_new_device().await.unwrap();
+    db.database()
+        .provision_device(db.device_id())
+        .await
+        .unwrap();
     let store = ChatStore::new(&db).await.unwrap();
     // A separate connection is deliberate fault injection, never a production pool.
     let mut locker = diesel::SqliteConnection::establish(path.to_str().unwrap()).unwrap();
@@ -601,8 +605,11 @@ async fn recovered_local_write_persists_across_fresh_disk_store_open() {
     let path =
         std::env::temp_dir().join(format!("oxidezap-232-reopen-{}.sqlite", std::process::id()));
     let url = path.to_str().unwrap();
-    let db = SqliteStore::new(url).await.unwrap();
-    db.create_new_device().await.unwrap();
+    let db = SqliteStore::open(url).await.unwrap();
+    db.database()
+        .provision_device(db.device_id())
+        .await
+        .unwrap();
     let store = ChatStore::new(&db).await.unwrap();
     poison(&db).await;
     store
@@ -636,7 +643,10 @@ async fn recovered_local_write_persists_across_fresh_disk_store_open() {
     let device_id = db.device_id();
     drop(store);
     drop(db);
-    let reopened_db = SqliteStore::new_for_device(url, device_id).await.unwrap();
+    let reopened_db = whatsapp_rust_sqlite_storage::SqliteDatabase::open(url, Default::default())
+        .await
+        .unwrap()
+        .store(device_id);
     let reopened = ChatStore::new(&reopened_db).await.unwrap();
     let rows = reopened.messages(&jid(PEER), None, 10).await.unwrap();
     assert_eq!(rows.len(), 1);

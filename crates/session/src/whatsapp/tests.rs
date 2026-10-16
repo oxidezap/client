@@ -146,7 +146,7 @@ fn book_with(store: &Arc<ChatStore>) -> NameBook {
 
 #[tokio::test]
 async fn persistent_companion_uses_manual_presence() {
-    let store = SqliteStore::new("file:oxidezap-presence-policy?mode=memory&cache=shared")
+    let store = SqliteStore::open("file:oxidezap-presence-policy?mode=memory&cache=shared")
         .await
         .expect("in-memory store");
     let bot = super::persistent_companion(whatsapp_rust::bot::Bot::builder())
@@ -1141,22 +1141,25 @@ fn a_calls_later_stanza_is_handled_behind_its_offer() {
     let call_id = "CALL-ORDER-1";
     let peer: Jid = TEST_PEER.parse().expect("test JID");
     let at = whatsapp_rust::wacore::time::from_secs(1_700_000_000).expect("test timestamp");
-    let offer = Event::IncomingCall(Box::new(IncomingCall::new_for_test(
-        peer.clone(),
-        "STANZA-1".to_string(),
-        at,
-        CallAction::Offer {
-            call_id: call_id.to_string(),
-            call_creator: peer.clone(),
-            caller_pn: None,
-            caller_country_code: None,
-            device_class: None,
-            joinable: true,
-            is_video: false,
-            audio: Vec::new(),
-            group_jid: None,
-        },
-    )));
+    let offer = Event::IncomingCall(Box::new(
+        IncomingCall::builder()
+            .from(peer.clone())
+            .stanza_id("STANZA-1".to_string())
+            .timestamp(at)
+            .offline(false)
+            .action(CallAction::Offer {
+                call_id: call_id.to_string(),
+                call_creator: peer.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            })
+            .build(),
+    ));
     let missed = Event::MissedCall(MissedCall::new(
         peer,
         call_id.to_string(),
@@ -1272,7 +1275,7 @@ fn events_are_keyed_by_what_they_are_about() {
     let presence = whatsapp_rust::wacore::types::events::Event::Presence(
         whatsapp_rust::wacore::types::events::PresenceUpdate::builder()
             .from(TEST_PEER.parse().unwrap())
-            .unavailable(false)
+            .status(whatsapp_rust::wacore::types::presence::PresenceStatus::Available)
             .build(),
     );
     assert_eq!(
@@ -1554,10 +1557,14 @@ fn has_quoted_snapshot(message: &wa::Message) -> bool {
 #[tokio::test]
 async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
     let store =
-        SqliteStore::new("file:oxidezap-session-quote-secondary-reads?mode=memory&cache=shared")
+        SqliteStore::open("file:oxidezap-session-quote-secondary-reads?mode=memory&cache=shared")
             .await
             .expect("in-memory store");
-    store.create_new_device().await.expect("seed device parent");
+    store
+        .database()
+        .provision_device(store.device_id())
+        .await
+        .expect("seed device parent");
     let chat_store = ChatStore::new(&store).await.expect("chat store");
     let parent = {
         let mut constructed: wa::Message = Default::default();
@@ -1667,7 +1674,7 @@ async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
 }
 
 async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
-    let store = SqliteStore::new(&format!(
+    let store = SqliteStore::open(&format!(
         "file:oxidezap-session-{name}?mode=memory&cache=shared"
     ))
     .await

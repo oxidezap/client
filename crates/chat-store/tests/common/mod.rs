@@ -56,12 +56,16 @@ pub async fn test_store() -> (SqliteStore, Arc<ChatStore>) {
         std::process::id(),
         id
     );
-    let store = SqliteStore::new(&db_name).await.expect("create store");
+    let store = SqliteStore::open(&db_name).await.expect("create store");
     // Production's BotBuilder creates the device row. These integration tests
     // open ChatStore directly, so create the same legacy account through the
     // public storage API before the FK cascade accepts chat rows.
     use wacore::store::traits::ProtocolStore;
-    store.create_new_device().await.expect("seed device parent");
+    store
+        .database()
+        .provision_device(store.device_id())
+        .await
+        .expect("seed device parent");
     let chat_store = ChatStore::new(&store).await.expect("create chat store");
     (store, chat_store)
 }
@@ -315,8 +319,17 @@ pub async fn add_lid_mapping(store: &SqliteStore) {
     // The mapping table's FK needs the device row the client normally creates.
     // `test_store` already creates it for ordinary chat rows; keep this helper
     // safe when it is called after that setup.
-    if !store.device_exists(1).await.expect("check device") {
-        store.create_new_device().await.expect("create device");
+    if !store
+        .database()
+        .device_exists(1)
+        .await
+        .expect("check device")
+    {
+        store
+            .database()
+            .provision_device(store.device_id())
+            .await
+            .expect("create device");
     }
     store
         .put_lid_mapping(&LidPnMappingEntry {

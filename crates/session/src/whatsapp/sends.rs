@@ -83,19 +83,22 @@ impl WhatsAppClient {
             admit_announced_outgoing(
                 &live.chat_store,
                 &chat,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
                 announce,
             )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(chat.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
             {
-                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Ok(_) => Ok((
+                    msg_id.into_string(),
+                    whatsapp_rust::wacore::time::now_millis(),
+                )),
                 Err(e) => {
-                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    super::mark_send_failed(&live.chat_store, &chat, msg_id.as_str());
                     Err(e.to_string())
                 }
             }
@@ -166,18 +169,21 @@ impl WhatsAppClient {
             super::record_outgoing(
                 &live.chat_store,
                 &chat,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
             )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(chat.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
             {
-                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Ok(_) => Ok((
+                    msg_id.into_string(),
+                    whatsapp_rust::wacore::time::now_millis(),
+                )),
                 Err(e) => {
-                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    super::mark_send_failed(&live.chat_store, &chat, msg_id.as_str());
                     Err(e.to_string())
                 }
             }
@@ -241,18 +247,21 @@ impl WhatsAppClient {
             super::record_outgoing(
                 &live.chat_store,
                 &chat,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
             )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(chat.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
             {
-                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Ok(_) => Ok((
+                    msg_id.into_string(),
+                    whatsapp_rust::wacore::time::now_millis(),
+                )),
                 Err(e) => {
-                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    super::mark_send_failed(&live.chat_store, &chat, msg_id.as_str());
                     Err(e.to_string())
                 }
             }
@@ -310,18 +319,21 @@ impl WhatsAppClient {
             super::record_outgoing(
                 &live.chat_store,
                 &chat,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
             )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(chat.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
             {
-                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Ok(_) => Ok((
+                    msg_id.into_string(),
+                    whatsapp_rust::wacore::time::now_millis(),
+                )),
                 Err(e) => {
-                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    super::mark_send_failed(&live.chat_store, &chat, msg_id.as_str());
                     Err(e.to_string())
                 }
             }
@@ -464,13 +476,17 @@ mod announcement_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn wire_id_announcement_requires_successful_outgoing_admission() {
         for mode in ["accepted", "full", "stopped"] {
-            let backend = SqliteStore::new(&format!(
+            let backend = SqliteStore::open(&format!(
                 "file:wire-announcement-{mode}-{}?mode=memory&cache=shared",
                 std::process::id()
             ))
             .await
             .unwrap();
-            backend.create_new_device().await.unwrap();
+            backend
+                .database()
+                .provision_device(backend.device_id())
+                .await
+                .unwrap();
             let store = ChatStore::new(&backend).await.unwrap();
             let chat: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
             let names = super::super::chat_names::ChatNameResolveSignal::new();

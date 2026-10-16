@@ -375,10 +375,10 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
     } else {
         None
     };
-    let call_events = handle.take_events().expect("the fixture owns the receiver");
-    let watcher = crate::exec::spawn(WhatsAppClient::run_call_events(
+    let mut call_events = handle.take_events().expect("the fixture owns the receiver");
+    let mut watcher = Box::pin(WhatsAppClient::run_call_events(
         handle.clone(),
-        call_events.clone(),
+        &mut call_events,
         calls.clone(),
         ui.clone(),
     ));
@@ -453,11 +453,12 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
     }
     fixture.inject(accept).await.unwrap();
     dispatch(&fixture, &mut cursor, &calls, &ui).await;
-    call_events.close();
-    tokio::time::timeout(std::time::Duration::from_secs(3), watcher)
-        .await
-        .unwrap()
-        .unwrap();
+    let _ = whatsapp_rust::futures::poll!(watcher.as_mut());
+    drop(watcher);
+    assert!(
+        call_events.try_recv().is_err(),
+        "the watcher must drain queued events"
+    );
     if wrong_user {
         assert_eq!(
             fixture
@@ -547,15 +548,13 @@ mod tests {
 
     #[tokio::test]
     async fn delayed_watcher_keeps_upgrade_and_stop_in_source_queue_order() {
-        for (accepting_upgrade, pressure, legacy_only, before_activation) in [
-            (true, false, false, false),
-            (false, false, false, false),
-            (true, true, false, false),
-            (false, true, false, false),
-            (true, false, true, false),
-            (false, false, true, false),
-            (true, false, false, true),
-            (false, false, false, true),
+        for (accepting_upgrade, pressure, before_activation) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+            (false, false, true),
         ] {
             let fixture = Arc::new(CallFixture::new().await.unwrap());
             let calls = CallRegistry::default();
@@ -624,15 +623,14 @@ mod tests {
                         .build()])
                     .build()
             };
-            let queue = handle.take_events().expect("the fixture owns the receiver");
+            let mut queue = handle.take_events().expect("the fixture owns the receiver");
             if pressure {
-                for index in 0..queue.capacity().unwrap() {
+                for index in 0..1024 {
                     fixture
                         .inject(video(VideoState::Paused, index))
                         .await
                         .unwrap();
                 }
-                assert!(queue.is_full(), "the real handle queue was not pressured");
             }
             fixture
                 .inject(video(
@@ -645,22 +643,13 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            if legacy_only {
-                // Fault injection: retain only the real compatibility companion.
-                assert!(matches!(
-                    queue.try_recv().unwrap(),
-                    CallEvent::PeerVideoStateChanged { .. }
-                ));
-                assert_eq!(queue.len(), 1);
-            } else {
-                fixture
-                    .inject(video(VideoState::Stopped, 1001))
-                    .await
-                    .unwrap();
-            }
+            fixture
+                .inject(video(VideoState::Stopped, 1001))
+                .await
+                .unwrap();
             let mut watching = Box::pin(WhatsAppClient::run_call_events(
                 handle.clone(),
-                queue.clone(),
+                &mut queue,
                 calls.clone(),
                 ui.clone(),
             ));
@@ -670,11 +659,6 @@ mod tests {
                 let pending = held.outgoing[id].peer_video.as_ref().unwrap();
                 assert_eq!(pending.source, fixture.peer().clone().with_device(2));
                 assert_eq!(pending.upgrade_token.is_some(), !accepting_upgrade);
-                assert_eq!(
-                    queue.len(),
-                    3,
-                    "only one complete operation may leave the queue before activation"
-                );
             }
             // Normal cases hold the watcher; the last two reverse that scheduling.
             dispatch(&fixture, &mut cursor, &calls, &ui).await;
@@ -682,11 +666,12 @@ mod tests {
             while let Ok(event) = received.try_recv() {
                 global_changes.push(event);
             }
-            queue.close();
-            tokio::time::timeout(std::time::Duration::from_secs(3), watching)
-                .await
-                .unwrap();
-            assert!(queue.is_empty());
+            let _ = whatsapp_rust::futures::poll!(watching.as_mut());
+            drop(watching);
+            assert!(
+                queue.try_recv().is_err(),
+                "the watcher must drain queued events"
+            );
             let mut remote = None;
             let mut requested = false;
             while let Ok(event) = received.try_recv() {
@@ -702,11 +687,11 @@ mod tests {
             }
             assert_eq!(
                 remote,
-                if legacy_only { None } else { Some(false) },
-                "accept={accepting_upgrade}, pressure={pressure}, legacy={legacy_only}"
+                Some(false),
+                "accept={accepting_upgrade}, pressure={pressure}"
             );
             assert!(!requested, "a stopped request was resurrected");
-            assert_eq!(calls.upgrade_pending(id), accepting_upgrade && legacy_only);
+            assert!(!calls.upgrade_pending(id));
             assert!(!calls.calls.lock().unwrap().upgrades.contains_key(id));
             assert!(
                 before_activation || global_changes.is_empty(),

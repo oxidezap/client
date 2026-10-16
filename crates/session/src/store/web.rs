@@ -286,14 +286,14 @@ pub async fn wipe() -> std::io::Result<()> {
 /// there is no ordering here for the pragma to describe. Saying `off` is
 /// saying what is already true; the durability window is the module's own
 /// subject, above.
-pub fn settings() -> whatsapp_rust_sqlite_storage::SqliteStoreConfig {
+pub fn settings() -> whatsapp_rust_sqlite_storage::SqliteDatabaseConfig {
     if is_durable() {
         // The store's own default, which is `normal`: this backend has a disk
         // at the moment of the write, so the pragma describes something real
         // and refusing it would refuse the durability it exists for.
-        return whatsapp_rust_sqlite_storage::SqliteStoreConfig::default();
+        return whatsapp_rust_sqlite_storage::SqliteDatabaseConfig::default();
     }
-    whatsapp_rust_sqlite_storage::SqliteStoreConfig {
+    whatsapp_rust_sqlite_storage::SqliteDatabaseConfig {
         synchronous: whatsapp_rust_sqlite_storage::Synchronous::Off,
         ..Default::default()
     }
@@ -304,10 +304,7 @@ pub async fn open_for_account(
     database_path: &str,
     account_id: AccountId,
 ) -> Result<whatsapp_rust_sqlite_storage::SqliteStore, StoreError> {
-    whatsapp_rust_sqlite_storage::SqliteStore::with_config_for_device(
-        database_path,
-        account_id.as_i32(),
-        settings(),
-    )
-    .await
+    whatsapp_rust_sqlite_storage::SqliteDatabase::open(database_path, settings())
+        .await
+        .map(|database| database.store(account_id.as_i32()))
 }
