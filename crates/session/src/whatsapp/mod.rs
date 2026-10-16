@@ -2674,7 +2674,6 @@ impl WhatsAppClient {
                 info!("Audio uploaded successfully");
 
                 let audio_message = {
-                    // This marks it as a voice message
                     let mut constructed: wa::message::AudioMessage = Default::default();
                     constructed.url = Some(upload_result.url);
                     constructed.direct_path = Some(upload_result.direct_path);
@@ -2684,6 +2683,7 @@ impl WhatsAppClient {
                     constructed.file_length = Some(upload_result.file_length);
                     constructed.mimetype = Some("audio/ogg; codecs=opus".to_string());
                     constructed.seconds = Some(duration_secs);
+                    // This marks it as a voice message
                     constructed.ptt = Some(true);
                     constructed.waveform = Some(waveform);
                     constructed

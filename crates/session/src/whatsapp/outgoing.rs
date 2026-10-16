@@ -771,8 +771,6 @@ pub(super) fn message(
         OutgoingMedia::Video => {
             let mut constructed: wa::Message = Default::default();
             constructed.video_message = MessageField::some({
-                // What the CDN handed back for exactly this: without it the
-                // other side downloads the whole file before the first frame.
                 let mut constructed: wa::message::VideoMessage = Default::default();
                 constructed.url = url;
                 constructed.direct_path = direct_path;
@@ -787,6 +785,8 @@ pub(super) fn message(
                 constructed.height = shape.height;
                 constructed.seconds = shape.duration_secs;
                 constructed.jpeg_thumbnail = shape.thumbnail;
+                // What the CDN handed back for exactly this: without it the
+                // other side downloads the whole file before the first frame.
                 constructed.streaming_sidecar = upload.streaming_sidecar;
                 constructed.context_info = context.into();
                 constructed
@@ -796,9 +796,6 @@ pub(super) fn message(
         OutgoingMedia::Document => {
             let mut constructed: wa::Message = Default::default();
             constructed.document_message = MessageField::some({
-                // Both, and they are not the same field: `file_name` is what a
-                // save writes and `title` is what the bubble prints. A
-                // document with no title draws as its URL in some clients.
                 let mut constructed: wa::message::DocumentMessage = Default::default();
                 constructed.url = url;
                 constructed.direct_path = direct_path;
@@ -809,6 +806,9 @@ pub(super) fn message(
                 constructed.media_key_timestamp = media_key_timestamp;
                 constructed.mimetype = mimetype;
                 constructed.caption = caption;
+                // Both, and they are not the same field: `file_name` is what a
+                // save writes and `title` is what the bubble prints. A
+                // document with no title draws as its URL in some clients.
                 constructed.file_name = Some(file.file_name.clone());
                 constructed.title = Some(file.file_name.clone());
                 constructed.context_info = context.into();

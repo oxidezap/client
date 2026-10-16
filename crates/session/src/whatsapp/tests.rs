@@ -1309,9 +1309,9 @@ async fn a_quoted_author_is_filed_where_their_bubbles_are() {
             let mut constructed: message::ExtendedTextMessage = Default::default();
             constructed.text = Some("e o áudio?".to_string());
             constructed.context_info = buffa::MessageField::some({
-                // As a sending device spells itself.
                 let mut constructed: wa::ContextInfo = Default::default();
                 constructed.stanza_id = Some("ORIGINAL".to_string());
+                // As a sending device spells itself.
                 constructed.participant = Some(TEST_PEER.replace('@', ":12@"));
                 constructed.quoted_message = buffa::MessageField::some({
                     let mut constructed: wa::Message = Default::default();
@@ -1377,9 +1377,9 @@ async fn a_quoted_author_is_named_from_the_book_their_bubbles_are() {
             let mut constructed: message::ExtendedTextMessage = Default::default();
             constructed.text = Some("e o áudio?".to_string());
             constructed.context_info = buffa::MessageField::some({
-                // As a sending device spells itself.
                 let mut constructed: wa::ContextInfo = Default::default();
                 constructed.stanza_id = Some("MSG-ORIGINAL".to_string());
+                // As a sending device spells itself.
                 constructed.participant = Some(TEST_AUTHOR.replace('@', ":12@"));
                 constructed.quoted_message = buffa::MessageField::some({
                     let mut constructed: wa::Message = Default::default();

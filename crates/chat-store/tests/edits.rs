@@ -698,10 +698,10 @@ async fn local_admin_revoke_targets_the_member_and_survives_redelivery() {
             .record_revoke_target(
                 &chat,
                 &{
-                    // Device-qualified keys must resolve the same author as delivery.
                     let mut constructed: wa::MessageKey = Default::default();
                     constructed.id = Some(id.into());
                     constructed.from_me = Some(false);
+                    // Device-qualified keys must resolve the same author as delivery.
                     constructed.participant = Some("559900000001:7@s.whatsapp.net".into());
                     constructed
                 },

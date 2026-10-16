@@ -33,9 +33,9 @@ fn relay(chat: &str, own: bool, key_from_me: bool, participant: Option<&str>) ->
     };
     message_event(
         revoke_key({
-            // In a peer DM this is how the sender addresses us, not our chat key.
             let mut constructed: wa::MessageKey = Default::default();
             constructed.id = Some("TARGET".into());
+            // In a peer DM this is how the sender addresses us, not our chat key.
             constructed.remote_jid = Some(if chat == PEER && !own { OWN } else { chat }.into());
             constructed.from_me = Some(key_from_me);
             constructed.participant = participant.map(str::to_owned);
