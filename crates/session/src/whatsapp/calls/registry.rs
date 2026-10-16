@@ -41,7 +41,9 @@ const MAX_RINGABLE_OFFER_AGE_MS: i64 = 120_000;
 
 fn ringable_offer(offer: &WaIncomingCall, now_ms: i64) -> bool {
     !offer.offline
-        && now_ms.saturating_sub(offer.timestamp.timestamp_millis()) <= MAX_RINGABLE_OFFER_AGE_MS
+        && offer.timestamp.is_some_and(|timestamp| {
+            now_ms.saturating_sub(timestamp.timestamp_millis()) <= MAX_RINGABLE_OFFER_AGE_MS
+        })
 }
 
 fn direct_peer_video(state: VideoState) -> Option<bool> {
@@ -3026,12 +3028,17 @@ mod tests {
     fn offer_freshness_allows_delivery_margin_and_one_sided_clock_skew() {
         let now = wacore::time::now_millis();
         let mut offer = (*replay_offer("SKEW")).clone();
-        offer.timestamp = wacore::time::from_millis(now - 120_000).unwrap();
+        offer.timestamp = wacore::time::from_millis(now - 120_000);
         assert!(ringable_offer(&offer, now));
-        offer.timestamp = wacore::time::from_millis(now - 121_000).unwrap();
+        offer.timestamp = wacore::time::from_millis(now - 121_000);
         assert!(!ringable_offer(&offer, now));
-        offer.timestamp = wacore::time::from_millis(now + 300_000).unwrap();
+        offer.timestamp = wacore::time::from_millis(now + 300_000);
         assert!(ringable_offer(&offer, now), "future time is not stale");
+        offer.timestamp = None;
+        assert!(
+            !ringable_offer(&offer, now),
+            "missing time cannot prove freshness"
+        );
         offer.offline = true;
         assert!(!ringable_offer(&offer, now));
     }
@@ -3057,7 +3064,7 @@ mod tests {
         );
         let mut old = (*replay_offer("BACKLOG")).clone();
         old.timestamp =
-            wacore::time::from_millis(old.timestamp.timestamp_millis() - 300_000).unwrap();
+            wacore::time::from_millis(old.timestamp.unwrap().timestamp_millis() - 300_000);
         assert!(
             !old.offline,
             "an offline flag is not required for freshness"
@@ -3091,7 +3098,7 @@ mod tests {
         );
         let mut old = (*replay_offer("LOOKUP")).clone();
         old.timestamp =
-            wacore::time::from_millis(old.timestamp.timestamp_millis() - 300_000).unwrap();
+            wacore::time::from_millis(old.timestamp.unwrap().timestamp_millis() - 300_000);
         let old = Arc::new(old);
         // The registered offer is the one held across the name lookup; age
         // can change without either its identity or its epoch changing.

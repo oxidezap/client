@@ -9,6 +9,7 @@
 use whatsapp_rust::wacore::proto_helpers::MessageExt as _;
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _};
 use whatsapp_rust::waproto::whatsapp as wa;
+use whatsapp_rust::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
 use super::WhatsAppClient;
 use super::convert::{poll_creation_of, stored_to_chat_message};
@@ -403,10 +404,7 @@ impl WhatsAppClient {
                     0xFF1E_6E4F,
                     wa::message::extended_text_message::FontType::System,
                     &[],
-                    StatusSendOptions {
-                        privacy: StatusPrivacySetting::Contacts,
-                        ..Default::default()
-                    },
+                    StatusSendOptions::default().with_privacy(StatusPrivacySetting::Contacts),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -447,11 +445,14 @@ impl WhatsAppClient {
             let about = info.values().next().and_then(|u| u.status.clone());
             let is_business = info.values().next().is_some_and(|u| u.is_business);
             let picture_url = client
-                .contacts()
-                .get_profile_picture(&target, false)
+                .pictures()
+                .lookup(ProfilePictureRequest::new(
+                    ProfilePictureTarget::Contact(&target),
+                    ProfilePictureType::Full,
+                ))
                 .await
                 .ok()
-                .flatten()
+                .and_then(|outcome| outcome.into_found())
                 .map(|p| p.url);
             let name = live
                 .chat_store
@@ -490,11 +491,14 @@ impl WhatsAppClient {
                 .ok_or_else(|| "no profile returned".to_string())?;
             let name = user.verified_name.as_ref().and_then(|v| v.name.clone());
             let picture_url = client
-                .contacts()
-                .get_profile_picture(&target, false)
+                .pictures()
+                .lookup(ProfilePictureRequest::new(
+                    ProfilePictureTarget::Contact(&target),
+                    ProfilePictureType::Full,
+                ))
                 .await
                 .ok()
-                .flatten()
+                .and_then(|outcome| outcome.into_found())
                 .map(|p| p.url);
             Ok(ProfileView {
                 jid: target.to_string(),

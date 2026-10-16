@@ -1295,7 +1295,7 @@ mod tests {
     #[test]
     fn incoming_calls_keep_the_protocol_timestamp() {
         let mut wire = offer("OLD");
-        wire.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        wire.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0);
         let call = IncomingCall::new(
             "OLD",
             "Example".into(),
@@ -1303,7 +1303,23 @@ mod tests {
             false,
             &wire,
         );
-        assert_eq!(call.received_at, wire.timestamp);
+        assert_eq!(Some(call.received_at), wire.timestamp);
+    }
+
+    #[test]
+    fn incoming_call_without_server_time_uses_local_receipt_time() {
+        let mut wire = offer("NO-TIME");
+        wire.timestamp = None;
+        let before = wacore::time::now_utc();
+        let call = IncomingCall::new(
+            "NO-TIME",
+            "Example".into(),
+            "a@s.whatsapp.net".into(),
+            false,
+            &wire,
+        );
+        let after = wacore::time::now_utc();
+        assert!(call.received_at >= before && call.received_at <= after);
     }
 
     /// The same promotion, on the other way a stage can empty for good: a
