@@ -508,6 +508,17 @@ mod tests {
     }
 
     #[test]
+    fn future_button_response_keeps_kind_without_inventing_display_text() {
+        // Message.buttonsResponseMessage is field 43. Its nested field 99
+        // represents a response arm that this generated schema does not know.
+        let bytes = [
+            0xda, 0x02, 0x09, 0x9a, 0x06, 0x06, b'f', b'u', b't', b'u', b'r', b'e',
+        ];
+        let message = waproto::codec::message_decode(&bytes).unwrap();
+        assert_eq!(store_result(&message), ("buttons_response", None));
+    }
+
+    #[test]
     fn classifies_business_response_messages() {
         use wa::message::buttons_response_message::Response;
         let buttons_resp = {
