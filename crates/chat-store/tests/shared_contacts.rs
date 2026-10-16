@@ -5,28 +5,30 @@ use common::*;
 #[tokio::test]
 async fn shared_contacts_keep_names_numbers_and_original_vcards_after_reload() {
     let (store, chat_store) = test_store().await;
-    let card = wa::message::ContactMessage {
-        display_name: Some("Example Alpha".into()),
-        vcard: Some("BEGIN:VCARD\nVERSION:3.0\nFN:Example Alpha\nTEL;waid=559900000001:+55 99 0000-0001\nX-UNKNOWN:keep original data\nEND:VCARD".into()),
-        ..Default::default()
+    let card = {
+        let mut constructed: wa::message::ContactMessage = Default::default();
+        constructed.display_name = Some("Example Alpha".into());
+        constructed.vcard = Some("BEGIN:VCARD\nVERSION:3.0\nFN:Example Alpha\nTEL;waid=559900000001:+55 99 0000-0001\nX-UNKNOWN:keep original data\nEND:VCARD".into());
+        constructed
     };
-    let single = wa::Message {
-        contact_message: MessageField::some(card.clone()),
-        ..Default::default()
+    let single = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.contact_message = MessageField::some(card.clone());
+        constructed
     };
-    let multiple = wa::Message {
-        contacts_array_message: MessageField::some(wa::message::ContactsArrayMessage {
-            contacts: vec![
-                card.clone(),
-                wa::message::ContactMessage {
-                    display_name: Some("Example Beta".into()),
-                    vcard: Some("FN:Example Beta\nTEL:+55 99 0000-0002".into()),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        }),
-        ..Default::default()
+    let multiple = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.contacts_array_message = MessageField::some({
+            let mut constructed: wa::message::ContactsArrayMessage = Default::default();
+            constructed.contacts = vec![card.clone(), {
+                let mut constructed: wa::message::ContactMessage = Default::default();
+                constructed.display_name = Some("Example Beta".into());
+                constructed.vcard = Some("FN:Example Beta\nTEL:+55 99 0000-0002".into());
+                constructed
+            }];
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,

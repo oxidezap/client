@@ -26,17 +26,21 @@ async fn edit_updates_and_revoke_tombstones() {
     .await;
 
     // Edit arrives as protocolMessage MESSAGE_EDIT targeting the original id.
-    let edit = wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some("MSG-E".into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-            edited_message: MessageField::from_box(Box::new(wa::Message::text("fixed"))),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let edit = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-E".into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+            constructed.edited_message =
+                MessageField::from_box(Box::new(wa::Message::text("fixed")));
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -324,17 +328,21 @@ async fn edit_of_revoked_message_is_a_no_op() {
     .await;
 
     // An edit targeting the tombstone must not resurrect content.
-    let edit = wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some("MSG-ER".into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-            edited_message: MessageField::from_box(Box::new(wa::Message::text("resurrected"))),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let edit = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-ER".into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+            constructed.edited_message =
+                MessageField::from_box(Box::new(wa::Message::text("resurrected")));
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -366,17 +374,21 @@ async fn edit_of_latest_message_refreshes_preview_and_stale_edit_is_ignored() {
 
     let edit_with = |text: &str, id: &str, ts: i64| {
         message_event(
-            wa::Message {
-                protocol_message: MessageField::some(wa::message::ProtocolMessage {
-                    key: MessageField::some(wa::MessageKey {
-                        id: Some("MSG-EP".into()),
-                        ..Default::default()
-                    }),
-                    r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-                    edited_message: MessageField::from_box(Box::new(wa::Message::text(text))),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.protocol_message = MessageField::some({
+                    let mut constructed: wa::message::ProtocolMessage = Default::default();
+                    constructed.key = MessageField::some({
+                        let mut constructed: wa::MessageKey = Default::default();
+                        constructed.id = Some("MSG-EP".into());
+                        constructed
+                    });
+                    constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+                    constructed.edited_message =
+                        MessageField::from_box(Box::new(wa::Message::text(text)));
+                    constructed
+                });
+                constructed
             },
             incoming_info(PEER, PEER, id, ts),
         )
@@ -401,10 +413,11 @@ async fn own_phone_revoke_tombstone_keeps_target_from_me() {
 
     // Our linked phone supplies both an own envelope and key.fromMe = true.
     // The same key bit in a peer envelope would name the peer's message.
-    let revoke = revoke_key(wa::MessageKey {
-        id: Some("MSG-FM".into()),
-        from_me: Some(true),
-        ..Default::default()
+    let revoke = revoke_key({
+        let mut constructed: wa::MessageKey = Default::default();
+        constructed.id = Some("MSG-FM".into());
+        constructed.from_me = Some(true);
+        constructed
     });
     let mut info = incoming_info(
         PEER,
@@ -516,11 +529,12 @@ async fn admin_revoke_tombstone_keeps_target_author() {
 
     // Admin revoke arriving BEFORE the original: the tombstone must attribute
     // the message to its author (revoke key participant), not to the admin.
-    let revoke = revoke_key(wa::MessageKey {
-        id: Some("MSG-ADM".into()),
-        from_me: Some(false),
-        participant: Some(author.into()),
-        ..Default::default()
+    let revoke = revoke_key({
+        let mut constructed: wa::MessageKey = Default::default();
+        constructed.id = Some("MSG-ADM".into());
+        constructed.from_me = Some(false);
+        constructed.participant = Some(author.into());
+        constructed
     });
     feed(
         &chat_store,
@@ -547,17 +561,21 @@ async fn redelivery_after_edit_keeps_edited_content() {
         )
     };
     feed(&chat_store, [original()]).await;
-    let edit = wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some("MSG-RED".into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-            edited_message: MessageField::from_box(Box::new(wa::Message::text("edited"))),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let edit = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-RED".into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+            constructed.edited_message =
+                MessageField::from_box(Box::new(wa::Message::text("edited")));
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -606,17 +624,21 @@ async fn edit_before_target_materializes_edited_content() {
     let chat = jid(PEER);
 
     // Offline drain reordering: the edit is applied before the original.
-    let edit = wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some("MSG-EB".into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-            edited_message: MessageField::from_box(Box::new(wa::Message::text("fixed"))),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let edit = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-EB".into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+            constructed.edited_message =
+                MessageField::from_box(Box::new(wa::Message::text("fixed")));
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -675,12 +697,13 @@ async fn local_admin_revoke_targets_the_member_and_survives_redelivery() {
         chat_store
             .record_revoke_target(
                 &chat,
-                &wa::MessageKey {
-                    id: Some(id.into()),
-                    from_me: Some(false),
+                &{
                     // Device-qualified keys must resolve the same author as delivery.
-                    participant: Some("559900000001:7@s.whatsapp.net".into()),
-                    ..Default::default()
+                    let mut constructed: wa::MessageKey = Default::default();
+                    constructed.id = Some(id.into());
+                    constructed.from_me = Some(false);
+                    constructed.participant = Some("559900000001:7@s.whatsapp.net".into());
+                    constructed
                 },
                 ts(1_700_000_010),
             )
@@ -711,9 +734,10 @@ async fn local_admin_revoke_targets_the_member_and_survives_redelivery() {
 #[tokio::test]
 async fn local_revoke_key_requires_multi_author_authorship_and_defaults_direct_peer() {
     let (_store, chat_store) = test_store().await;
-    let target = wa::MessageKey {
-        id: Some("PEER-REVOKE".into()),
-        ..Default::default()
+    let target = {
+        let mut constructed: wa::MessageKey = Default::default();
+        constructed.id = Some("PEER-REVOKE".into());
+        constructed
     };
     for multi_author_chat in [GROUP, "status@broadcast", "1700000000@broadcast"] {
         assert!(
@@ -770,11 +794,12 @@ async fn local_admin_revoke_leaves_a_colliding_member_message_intact() {
     chat_store
         .record_revoke_target(
             &chat,
-            &wa::MessageKey {
-                id: Some("MEMBER-COLLISION".into()),
-                from_me: Some(false),
-                participant: Some(PEER.into()),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MEMBER-COLLISION".into());
+                constructed.from_me = Some(false);
+                constructed.participant = Some(PEER.into());
+                constructed
             },
             ts(1_700_000_010),
         )
@@ -814,11 +839,12 @@ async fn local_admin_placeholder_never_adds_unread_attention_on_recount() {
     chat_store
         .record_revoke_target(
             &chat,
-            &wa::MessageKey {
-                id: Some("LOCAL-PLACEHOLDER".into()),
-                from_me: Some(false),
-                participant: Some(PEER.into()),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("LOCAL-PLACEHOLDER".into());
+                constructed.from_me = Some(false);
+                constructed.participant = Some(PEER.into());
+                constructed
             },
             ts(1_700_000_010),
         )
@@ -843,11 +869,11 @@ async fn local_admin_placeholder_never_adds_unread_attention_on_recount() {
     assert_eq!(chat_store.unread_total().await.unwrap(), 1);
     let mut read = mark_read_event(GROUP, true, 1_700_000_009);
     if let Event::MarkChatAsReadUpdate(update) = &mut read {
-        update.action.message_range =
-            MessageField::some(wa::sync_action_value::SyncActionMessageRange {
-                last_message_timestamp: Some(1_700_000_009),
-                ..Default::default()
-            });
+        update.action.message_range = MessageField::some({
+            let mut constructed: wa::sync_action_value::SyncActionMessageRange = Default::default();
+            constructed.last_message_timestamp = Some(1_700_000_009);
+            constructed
+        });
     }
     feed(&chat_store, [read]).await;
     assert_eq!(chat_store.unread_total().await.unwrap(), 1);
@@ -883,11 +909,12 @@ async fn inserting_a_local_revoke_preserves_a_newer_colliding_members_preview() 
     chat_store
         .record_revoke_target(
             &chat,
-            &wa::MessageKey {
-                id: Some("MISSING-COLLISION".into()),
-                from_me: Some(false),
-                participant: Some(PEER.into()),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MISSING-COLLISION".into());
+                constructed.from_me = Some(false);
+                constructed.participant = Some(PEER.into());
+                constructed
             },
             ts(1_700_000_010),
         )
@@ -932,11 +959,12 @@ async fn deleting_a_local_placeholder_keeps_another_members_unread_badge() {
     chat_store
         .record_revoke_target(
             &chat,
-            &wa::MessageKey {
-                id: Some("LOCAL-DELETE-COLLISION".into()),
-                from_me: Some(false),
-                participant: Some(PEER.into()),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("LOCAL-DELETE-COLLISION".into());
+                constructed.from_me = Some(false);
+                constructed.participant = Some(PEER.into());
+                constructed
             },
             ts(1_700_000_010),
         )
@@ -988,11 +1016,12 @@ async fn local_placeholder_does_not_spend_the_previous_pages_unread_budget() {
     chat_store
         .record_revoke_target(
             &chat,
-            &wa::MessageKey {
-                id: Some("LOCAL-NEWER".into()),
-                from_me: Some(false),
-                participant: Some(PEER.into()),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("LOCAL-NEWER".into());
+                constructed.from_me = Some(false);
+                constructed.participant = Some(PEER.into());
+                constructed
             },
             ts(1_700_000_010),
         )
@@ -1014,19 +1043,22 @@ async fn local_placeholder_does_not_spend_the_previous_pages_unread_budget() {
 async fn owned_edit_lookup_disambiguates_a_group_collision_and_keeps_reply_context() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(GROUP);
-    let context = wa::ContextInfo {
-        stanza_id: Some("QUOTED".into()),
-        participant: Some(PEER.into()),
-        quoted_message: MessageField::some(wa::Message::text("quoted")),
-        ..Default::default()
+    let context = {
+        let mut constructed: wa::ContextInfo = Default::default();
+        constructed.stanza_id = Some("QUOTED".into());
+        constructed.participant = Some(PEER.into());
+        constructed.quoted_message = MessageField::some(wa::Message::text("quoted"));
+        constructed
     };
-    let text = |content: &str| wa::Message {
-        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
-            text: Some(content.into()),
-            context_info: MessageField::some(context.clone()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let text = |content: &str| {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = MessageField::some({
+            let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+            constructed.text = Some(content.into());
+            constructed.context_info = MessageField::some(context.clone());
+            constructed
+        });
+        constructed
     };
     chat_store
         .record_outgoing(&chat, "COLLISION", &text("original"), ts(1_700_000_000))
@@ -1113,19 +1145,23 @@ async fn delayed_local_and_incoming_edits_use_sender_ordering_not_arrival_time()
         feed(
             &chat_store,
             [message_event(
-                wa::Message {
-                    protocol_message: MessageField::some(wa::message::ProtocolMessage {
-                        key: MessageField::some(wa::MessageKey {
-                            id: Some("EDIT-ORDER".into()),
-                            from_me: Some(true),
-                            ..Default::default()
-                        }),
-                        r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-                        timestamp_ms: Some(sender_time),
-                        edited_message: MessageField::some(wa::Message::text(content)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
+                {
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.protocol_message = MessageField::some({
+                        let mut constructed: wa::message::ProtocolMessage = Default::default();
+                        constructed.key = MessageField::some({
+                            let mut constructed: wa::MessageKey = Default::default();
+                            constructed.id = Some("EDIT-ORDER".into());
+                            constructed.from_me = Some(true);
+                            constructed
+                        });
+                        constructed.r#type =
+                            Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+                        constructed.timestamp_ms = Some(sender_time);
+                        constructed.edited_message = MessageField::some(wa::Message::text(content));
+                        constructed
+                    });
+                    constructed
                 },
                 info,
             )],

@@ -517,7 +517,8 @@ pub(super) fn read_message_range(
     chat_jid: &Jid,
     (ts_secs, ids): ReadBoundary,
 ) -> wa::sync_action_value::SyncActionMessageRange {
-    use whatsapp_rust::features::{message_key, message_range};
+    use whatsapp_rust::features::message_range;
+    use whatsapp_rust::{MessageId, MessageRef};
 
     let messages = ids
         .into_iter()
@@ -534,12 +535,18 @@ pub(super) fn read_message_range(
             } else {
                 None
             };
-            Some((
-                message_key(id, chat_jid, from_me, participant.as_ref()),
-                ts_secs,
-            ))
+            let id = MessageId::new(id).ok()?;
+            Some((id, from_me, participant))
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    message_range(ts_secs, None, messages)
+    message_range(
+        ts_secs,
+        None,
+        messages.iter().filter_map(|(id, from_me, participant)| {
+            MessageRef::new(chat_jid, id.clone(), participant.as_ref(), *from_me)
+                .ok()
+                .map(|reference| (reference, ts_secs))
+        }),
+    )
 }

@@ -608,8 +608,11 @@ async fn a_receipt_arriving_after_a_delete_does_not_resurrect_it() {
                 .delete_starred(true)
                 .delete_media(false)
                 .timestamp(ts(1_700_000_300))
-                .action(Box::new(wa::sync_action_value::ClearChatAction {
-                    message_range: None.into(),
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::ClearChatAction =
+                        Default::default();
+                    constructed.message_range = None.into();
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),

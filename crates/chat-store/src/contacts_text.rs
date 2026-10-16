@@ -218,9 +218,10 @@ mod tests {
             ("FN;ENCODING=QUOTED-PRINTABLE:Malformed=ZZ", "Malformed=ZZ"),
         ] {
             assert_eq!(
-                contact_text(&wa::message::ContactMessage {
-                    vcard: Some(vcard.into()),
-                    ..Default::default()
+                contact_text(&{
+                    let mut constructed: wa::message::ContactMessage = Default::default();
+                    constructed.vcard = Some(vcard.into());
+                    constructed
                 }),
                 expected
             );
@@ -229,32 +230,38 @@ mod tests {
 
     #[test]
     fn contact_names_phones_folding_and_vcard_escapes_are_readable() {
-        let contact = wa::message::ContactMessage {
-            vcard: Some("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Example\\, Contact\r\nitem1.TEL;waid=559900000001:+55 99 0000-\r\n 0001\r\nTEL;VALUE=uri:tel:+55 99 0000-0001\r\nEND:VCARD".into()),
-            ..Default::default()
+        let contact = {
+            let mut constructed: wa::message::ContactMessage = Default::default();
+            constructed.vcard = Some("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Example\\, Contact\r\nitem1.TEL;waid=559900000001:+55 99 0000-\r\n 0001\r\nTEL;VALUE=uri:tel:+55 99 0000-0001\r\nEND:VCARD".into());
+            constructed
         };
         assert_eq!(contact_text(&contact), "Example, Contact\n+55 99 0000-0001");
-        let named = wa::message::ContactMessage {
-            display_name: Some("Shared name".into()),
-            ..contact
+        let named = {
+            let mut constructed: wa::message::ContactMessage = contact;
+            constructed.display_name = Some("Shared name".into());
+            constructed
         };
         assert_eq!(contact_text(&named), "Shared name\n+55 99 0000-0001");
     }
 
     #[test]
     fn multiple_contacts_and_structured_names_do_not_drop_cards() {
-        let contacts = wa::Message {
-            contacts_array_message: MessageField::some(wa::message::ContactsArrayMessage {
-                contacts: vec![
-                    wa::message::ContactMessage {
-                        vcard: Some("N:Family\\;Name;Given;;;\nTEL:+559900000001".into()),
-                        ..Default::default()
+        let contacts = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.contacts_array_message = MessageField::some({
+                let mut constructed: wa::message::ContactsArrayMessage = Default::default();
+                constructed.contacts = vec![
+                    {
+                        let mut constructed: wa::message::ContactMessage = Default::default();
+                        constructed.vcard =
+                            Some("N:Family\\;Name;Given;;;\nTEL:+559900000001".into());
+                        constructed
                     },
                     wa::message::ContactMessage::default(),
-                ],
-                ..Default::default()
-            }),
-            ..Default::default()
+                ];
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             shared_contacts_text(&contacts).as_deref(),

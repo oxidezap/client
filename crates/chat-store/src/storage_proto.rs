@@ -667,18 +667,21 @@ mod tests {
     use wacore::proto_helpers::MessageBuilderExt as _;
 
     fn text_reply(stanza_id: &str, participant: &str, quoted: wa::Message) -> wa::Message {
-        wa::Message {
-            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
-                text: Some("pong".into()),
-                context_info: buffa::MessageField::some(wa::ContextInfo {
-                    stanza_id: Some(stanza_id.into()),
-                    participant: Some(participant.into()),
-                    quoted_message: buffa::MessageField::some(quoted),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut constructed: wa::Message = Default::default();
+            constructed.extended_text_message = buffa::MessageField::some({
+                let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+                constructed.text = Some("pong".into());
+                constructed.context_info = buffa::MessageField::some({
+                    let mut constructed: wa::ContextInfo = Default::default();
+                    constructed.stanza_id = Some(stanza_id.into());
+                    constructed.participant = Some(participant.into());
+                    constructed.quoted_message = buffa::MessageField::some(quoted);
+                    constructed
+                });
+                constructed
+            });
+            constructed
         }
     }
 
@@ -721,9 +724,10 @@ mod tests {
     #[test]
     fn secret_only_envelope_is_stripped_entirely() {
         let mut msg = wa::Message::text("hi");
-        msg.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
-            message_secret: Some(vec![7u8; 32]),
-            ..Default::default()
+        msg.message_context_info = buffa::MessageField::some({
+            let mut constructed: wa::MessageContextInfo = Default::default();
+            constructed.message_secret = Some(vec![7u8; 32]);
+            constructed
         });
         assert!(strip_redundant_secret(&mut msg));
         assert!(msg.message_context_info.as_option().is_none());
@@ -731,24 +735,29 @@ mod tests {
 
     #[test]
     fn secret_envelope_on_a_poll_creation_is_kept_for_voting() {
-        let mut msg = wa::Message {
-            poll_creation_message_v3: buffa::MessageField::some(wa::message::PollCreationMessage {
-                name: Some("Onde jantamos?".into()),
-                options: ["Centro", "Praia"]
+        let mut msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v3 = buffa::MessageField::some({
+                let mut constructed: wa::message::PollCreationMessage = Default::default();
+                constructed.name = Some("Onde jantamos?".into());
+                constructed.options = ["Centro", "Praia"]
                     .iter()
-                    .map(|name| wa::message::poll_creation_message::Option {
-                        option_name: Some((*name).to_owned()),
-                        ..Default::default()
+                    .map(|name| {
+                        let mut constructed: wa::message::poll_creation_message::Option =
+                            Default::default();
+                        constructed.option_name = Some((*name).to_owned());
+                        constructed
                     })
-                    .collect(),
-                selectable_options_count: Some(1),
-                ..Default::default()
-            }),
-            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
-                message_secret: Some(vec![7u8; 32]),
-                ..Default::default()
-            }),
-            ..Default::default()
+                    .collect();
+                constructed.selectable_options_count = Some(1);
+                constructed
+            });
+            constructed.message_context_info = buffa::MessageField::some({
+                let mut constructed: wa::MessageContextInfo = Default::default();
+                constructed.message_secret = Some(vec![7u8; 32]);
+                constructed
+            });
+            constructed
         };
         // The vote encrypts to this secret and reads it back out of the
         // stored proto, so stripping it here is what made every vote fail
@@ -760,21 +769,25 @@ mod tests {
 
     #[test]
     fn v5_v6_poll_secrets_survive_storage_compaction() {
-        let v5 = wa::Message {
-            poll_creation_message_v5: buffa::MessageField::some(Default::default()),
-            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
-                message_secret: Some(vec![9; 32]),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let v5 = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v5 = buffa::MessageField::some(Default::default());
+            constructed.message_context_info = buffa::MessageField::some({
+                let mut constructed: wa::MessageContextInfo = Default::default();
+                constructed.message_secret = Some(vec![9; 32]);
+                constructed
+            });
+            constructed
         };
-        let v6 = wa::Message {
-            poll_creation_message_v6: buffa::MessageField::some(Default::default()),
-            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
-                message_secret: Some(vec![8; 32]),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let v6 = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v6 = buffa::MessageField::some(Default::default());
+            constructed.message_context_info = buffa::MessageField::some({
+                let mut constructed: wa::MessageContextInfo = Default::default();
+                constructed.message_secret = Some(vec![8; 32]);
+                constructed
+            });
+            constructed
         };
         for (mut message, expected) in [(v5, 9), (v6, 8)] {
             assert!(!strip_redundant_secret(&mut message));
@@ -793,10 +806,11 @@ mod tests {
     #[test]
     fn secret_envelope_with_bot_metadata_is_untouched() {
         let mut msg = wa::Message::text("hi");
-        msg.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
-            message_secret: Some(vec![7u8; 32]),
-            bot_metadata: buffa::MessageField::some(wa::BotMetadata::default()),
-            ..Default::default()
+        msg.message_context_info = buffa::MessageField::some({
+            let mut constructed: wa::MessageContextInfo = Default::default();
+            constructed.message_secret = Some(vec![7u8; 32]);
+            constructed.bot_metadata = buffa::MessageField::some(wa::BotMetadata::default());
+            constructed
         });
         assert!(!strip_redundant_secret(&mut msg));
         let ctx = msg.message_context_info.as_option().expect("kept");
@@ -805,9 +819,10 @@ mod tests {
 
     #[test]
     fn secret_envelope_with_unknown_wire_fields_still_strips() {
-        let ctx = wa::MessageContextInfo {
-            message_secret: Some(vec![7u8; 32]),
-            ..Default::default()
+        let ctx = {
+            let mut constructed: wa::MessageContextInfo = Default::default();
+            constructed.message_secret = Some(vec![7u8; 32]);
+            constructed
         };
         // Field 99, varint, value 1 — a future field this code does not know.
         let mut bytes = ctx.encode_to_vec();
@@ -849,12 +864,14 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             bytes.push((x >> 33) as u8);
         }
-        let msg = wa::Message {
-            image_message: buffa::MessageField::some(wa::message::ImageMessage {
-                file_sha256: Some(bytes),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.image_message = buffa::MessageField::some({
+                let mut constructed: wa::message::ImageMessage = Default::default();
+                constructed.file_sha256 = Some(bytes);
+                constructed
+            });
+            constructed
         };
         let raw = waproto::codec::message_to_vec(&msg);
         assert!(raw.len() >= COMPRESS_THRESHOLD_BYTES);

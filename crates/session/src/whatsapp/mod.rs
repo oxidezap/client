@@ -2514,22 +2514,24 @@ impl WhatsAppClient {
                 // wire carries as an extended text message: a bare
                 // `conversation` has nowhere to put the context.
                 let message = match &quoted {
-                    Some(quoted) => wa::Message {
-                        extended_text_message: whatsapp_rust::buffa::MessageField::some(
-                            wa::message::ExtendedTextMessage {
-                                text: Some(content.clone()),
-                                context_info: whatsapp_rust::buffa::MessageField::some(
-                                    quote_context(quoted),
-                                ),
-                                ..Default::default()
-                            },
-                        ),
-                        ..Default::default()
-                    },
-                    None => wa::Message {
-                        conversation: Some(content.clone()),
-                        ..Default::default()
-                    },
+                    Some(quoted) => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.extended_text_message =
+                            whatsapp_rust::buffa::MessageField::some({
+                                let mut constructed: wa::message::ExtendedTextMessage =
+                                    Default::default();
+                                constructed.text = Some(content.clone());
+                                constructed.context_info =
+                                    whatsapp_rust::buffa::MessageField::some(quote_context(quoted));
+                                constructed
+                            });
+                        constructed
+                    }
+                    None => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.conversation = Some(content.clone());
+                        constructed
+                    }
                 };
 
                 // Record BEFORE sending: the server ack event fires during
@@ -2597,7 +2599,13 @@ impl WhatsAppClient {
                     "Downloading media: {} bytes expected",
                     downloadable.file_length
                 );
-                match client.download(&downloadable).await {
+                match client
+                    .download(
+                        &downloadable,
+                        whatsapp_rust::download::DownloadLimits::default(),
+                    )
+                    .await
+                {
                     Ok(data) => {
                         info!("Media downloaded successfully: {} bytes", data.len());
                         let _ = tx.send(Ok(data));
@@ -2665,39 +2673,42 @@ impl WhatsAppClient {
 
                 info!("Audio uploaded successfully");
 
-                let audio_message = wa::message::AudioMessage {
-                    url: Some(upload_result.url),
-                    direct_path: Some(upload_result.direct_path),
-                    media_key: Some(upload_result.media_key.to_vec()),
-                    file_sha256: Some(upload_result.file_sha256.to_vec()),
-                    file_enc_sha256: Some(upload_result.file_enc_sha256.to_vec()),
-                    file_length: Some(upload_result.file_length),
-                    mimetype: Some("audio/ogg; codecs=opus".to_string()),
-                    seconds: Some(duration_secs),
-                    ptt: Some(true), // This marks it as a voice message
-                    waveform: Some(waveform),
-                    ..Default::default()
+                let audio_message = {
+                    // This marks it as a voice message
+                    let mut constructed: wa::message::AudioMessage = Default::default();
+                    constructed.url = Some(upload_result.url);
+                    constructed.direct_path = Some(upload_result.direct_path);
+                    constructed.media_key = Some(upload_result.media_key.to_vec());
+                    constructed.file_sha256 = Some(upload_result.file_sha256.to_vec());
+                    constructed.file_enc_sha256 = Some(upload_result.file_enc_sha256.to_vec());
+                    constructed.file_length = Some(upload_result.file_length);
+                    constructed.mimetype = Some("audio/ogg; codecs=opus".to_string());
+                    constructed.seconds = Some(duration_secs);
+                    constructed.ptt = Some(true);
+                    constructed.waveform = Some(waveform);
+                    constructed
                 };
 
                 // Quoted the same way the text path does it, because a voice
                 // note answering a message is a reply — the recipient should
                 // see the quote bar over it, not a bare note.
                 let message = match &quoted {
-                    Some(quoted) => wa::Message {
-                        audio_message: whatsapp_rust::buffa::MessageField::some(
-                            wa::message::AudioMessage {
-                                context_info: whatsapp_rust::buffa::MessageField::some(
-                                    quote_context(quoted),
-                                ),
-                                ..audio_message
-                            },
-                        ),
-                        ..Default::default()
-                    },
-                    None => wa::Message {
-                        audio_message: whatsapp_rust::buffa::MessageField::some(audio_message),
-                        ..Default::default()
-                    },
+                    Some(quoted) => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.audio_message = whatsapp_rust::buffa::MessageField::some({
+                            let mut constructed: wa::message::AudioMessage = audio_message;
+                            constructed.context_info =
+                                whatsapp_rust::buffa::MessageField::some(quote_context(quoted));
+                            constructed
+                        });
+                        constructed
+                    }
+                    None => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.audio_message =
+                            whatsapp_rust::buffa::MessageField::some(audio_message);
+                        constructed
+                    }
                 };
 
                 // Same ordering as the text path: record before sending so
@@ -3291,9 +3302,10 @@ mod outgoing_admission_tests {
         let store = ChatStore::new(&backend).await.unwrap();
         let chat: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
         let names = chat_names::ChatNameResolveSignal::new();
-        let message = wa::Message {
-            conversation: Some("synthetic pending send".to_string()),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some("synthetic pending send".to_string());
+            constructed
         };
         // No await inside the loop: the current-thread writer cannot drain
         // its bounded channel before this producer reaches admission refusal.

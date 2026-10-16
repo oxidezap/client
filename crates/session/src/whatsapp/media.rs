@@ -56,7 +56,10 @@ async fn download_media<T: Downloadable>(
     media_name: &str,
 ) -> Option<Vec<u8>> {
     info!("Downloading {}...", media_name);
-    match client.download(media).await {
+    match client
+        .download(media, whatsapp_rust::download::DownloadLimits::default())
+        .await
+    {
         Ok(data) => {
             info!(
                 "{} downloaded successfully: {} bytes",
@@ -351,9 +354,10 @@ mod tests {
     }
 
     fn sticker(msg: wa::message::StickerMessage) -> wa::Message {
-        wa::Message {
-            sticker_message: MessageField::some(msg),
-            ..Default::default()
+        {
+            let mut constructed: wa::Message = Default::default();
+            constructed.sticker_message = MessageField::some(msg);
+            constructed
         }
     }
 
@@ -393,11 +397,12 @@ mod tests {
 
     #[test]
     fn historical_sticker_keeps_thumbnail_without_download_metadata() {
-        let message = sticker(wa::message::StickerMessage {
-            png_thumbnail: Some(vec![1, 2, 3]),
-            width: Some(64),
-            height: Some(64),
-            ..Default::default()
+        let message = sticker({
+            let mut constructed: wa::message::StickerMessage = Default::default();
+            constructed.png_thumbnail = Some(vec![1, 2, 3]);
+            constructed.width = Some(64);
+            constructed.height = Some(64);
+            constructed
         });
 
         let media = media_of(&message, None).expect("sticker metadata");
@@ -414,9 +419,11 @@ mod tests {
         assert!(media_of(&sticker(wa::message::StickerMessage::default()), None).is_none());
         assert!(
             media_of(
-                &wa::Message {
-                    image_message: MessageField::some(wa::message::ImageMessage::default()),
-                    ..Default::default()
+                &{
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.image_message =
+                        MessageField::some(wa::message::ImageMessage::default());
+                    constructed
                 },
                 None
             )
@@ -428,14 +435,15 @@ mod tests {
     /// themselves: the mime is the sticker's own, not the thumbnail's.
     #[test]
     fn fetched_bytes_replace_the_still_and_keep_the_media_mime() {
-        let message = sticker(wa::message::StickerMessage {
-            png_thumbnail: Some(vec![1, 2, 3]),
-            direct_path: Some(DIRECT_PATH.to_string()),
-            media_key: key(),
-            file_enc_sha256: key(),
-            file_length: Some(2048),
-            is_animated: Some(true),
-            ..Default::default()
+        let message = sticker({
+            let mut constructed: wa::message::StickerMessage = Default::default();
+            constructed.png_thumbnail = Some(vec![1, 2, 3]);
+            constructed.direct_path = Some(DIRECT_PATH.to_string());
+            constructed.media_key = key();
+            constructed.file_enc_sha256 = key();
+            constructed.file_length = Some(2048);
+            constructed.is_animated = Some(true);
+            constructed
         });
 
         let still = media_of(&message, None).expect("sticker still");
@@ -453,20 +461,22 @@ mod tests {
 
     #[test]
     fn an_image_carries_its_caption_and_its_fetch() {
-        let message = wa::Message {
-            image_message: MessageField::some(wa::message::ImageMessage {
-                jpeg_thumbnail: Some(vec![4, 5]),
-                caption: Some("a photo".to_string()),
-                mimetype: Some("image/png".to_string()),
-                direct_path: Some(DIRECT_PATH.to_string()),
-                media_key: key(),
-                file_enc_sha256: key(),
-                file_length: Some(4096),
-                width: Some(800),
-                height: Some(600),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.image_message = MessageField::some({
+                let mut constructed: wa::message::ImageMessage = Default::default();
+                constructed.jpeg_thumbnail = Some(vec![4, 5]);
+                constructed.caption = Some("a photo".to_string());
+                constructed.mimetype = Some("image/png".to_string());
+                constructed.direct_path = Some(DIRECT_PATH.to_string());
+                constructed.media_key = key();
+                constructed.file_enc_sha256 = key();
+                constructed.file_length = Some(4096);
+                constructed.width = Some(800);
+                constructed.height = Some(600);
+                constructed
+            });
+            constructed
         };
 
         let still = media_of(&message, None).expect("image still");
@@ -488,17 +498,19 @@ mod tests {
     /// never reach here — so both roads describe the same bubble.
     #[test]
     fn a_video_is_its_poster_frame_either_way() {
-        let message = wa::Message {
-            video_message: MessageField::some(wa::message::VideoMessage {
-                jpeg_thumbnail: Some(vec![2, 3]),
-                seconds: Some(12),
-                caption: Some("a clip".to_string()),
-                direct_path: Some(DIRECT_PATH.to_string()),
-                media_key: key(),
-                file_enc_sha256: key(),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.video_message = MessageField::some({
+                let mut constructed: wa::message::VideoMessage = Default::default();
+                constructed.jpeg_thumbnail = Some(vec![2, 3]);
+                constructed.seconds = Some(12);
+                constructed.caption = Some("a clip".to_string());
+                constructed.direct_path = Some(DIRECT_PATH.to_string());
+                constructed.media_key = key();
+                constructed.file_enc_sha256 = key();
+                constructed
+            });
+            constructed
         };
 
         for fetched in [None, Some(vec![0xff])] {
@@ -519,15 +531,17 @@ mod tests {
     /// an ordinary video.
     #[test]
     fn a_round_video_note_is_a_video() {
-        let message = wa::Message {
-            ptv_message: MessageField::some(wa::message::VideoMessage {
-                jpeg_thumbnail: Some(vec![6]),
-                direct_path: Some(DIRECT_PATH.to_string()),
-                media_key: key(),
-                file_enc_sha256: key(),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.ptv_message = MessageField::some({
+                let mut constructed: wa::message::VideoMessage = Default::default();
+                constructed.jpeg_thumbnail = Some(vec![6]);
+                constructed.direct_path = Some(DIRECT_PATH.to_string());
+                constructed.media_key = key();
+                constructed.file_enc_sha256 = key();
+                constructed
+            });
+            constructed
         };
 
         let media = media_of(&message, None).expect("ptv metadata");
@@ -539,16 +553,18 @@ mod tests {
     /// audio is fetched — on both roads.
     #[test]
     fn a_voice_note_keeps_its_waveform_and_needs_a_fetch() {
-        let with_download = wa::Message {
-            audio_message: MessageField::some(wa::message::AudioMessage {
-                seconds: Some(7),
-                waveform: Some(vec![0, 50, 100]),
-                direct_path: Some(DIRECT_PATH.to_string()),
-                media_key: key(),
-                file_enc_sha256: key(),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let with_download = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.audio_message = MessageField::some({
+                let mut constructed: wa::message::AudioMessage = Default::default();
+                constructed.seconds = Some(7);
+                constructed.waveform = Some(vec![0, 50, 100]);
+                constructed.direct_path = Some(DIRECT_PATH.to_string());
+                constructed.media_key = key();
+                constructed.file_enc_sha256 = key();
+                constructed
+            });
+            constructed
         };
 
         let media = media_of(&with_download, None).expect("audio metadata");
@@ -563,12 +579,14 @@ mod tests {
 
         // Nothing to fetch: there is no such thing as a voice note that never
         // plays.
-        let orphan = wa::Message {
-            audio_message: MessageField::some(wa::message::AudioMessage {
-                seconds: Some(7),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let orphan = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.audio_message = MessageField::some({
+                let mut constructed: wa::message::AudioMessage = Default::default();
+                constructed.seconds = Some(7);
+                constructed
+            });
+            constructed
         };
         assert!(media_of(&orphan, None).is_none());
     }
@@ -577,14 +595,16 @@ mod tests {
     /// fetch it.
     #[test]
     fn a_document_is_a_row_even_with_nothing_to_fetch() {
-        let message = wa::Message {
-            document_message: MessageField::some(wa::message::DocumentMessage {
-                file_name: Some("minutes.pdf".to_string()),
-                caption: Some("last week".to_string()),
-                mimetype: Some("application/pdf".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.document_message = MessageField::some({
+                let mut constructed: wa::message::DocumentMessage = Default::default();
+                constructed.file_name = Some("minutes.pdf".to_string());
+                constructed.caption = Some("last week".to_string());
+                constructed.mimetype = Some("application/pdf".to_string());
+                constructed
+            });
+            constructed
         };
 
         let media = media_of(&message, None).expect("document metadata");
@@ -600,15 +620,19 @@ mod tests {
     /// is the same sticker.
     #[test]
     fn a_lottie_wrapped_sticker_is_a_sticker() {
-        let inner = wa::message::StickerMessage {
-            png_thumbnail: Some(vec![1]),
-            ..Default::default()
+        let inner = {
+            let mut constructed: wa::message::StickerMessage = Default::default();
+            constructed.png_thumbnail = Some(vec![1]);
+            constructed
         };
-        let message = wa::Message {
-            lottie_sticker_message: MessageField::some(wa::message::FutureProofMessage {
-                message: MessageField::some(sticker(inner)),
-            }),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.lottie_sticker_message = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::some(sticker(inner));
+                constructed
+            });
+            constructed
         };
 
         let media = media_of(&message, None).expect("lottie sticker");

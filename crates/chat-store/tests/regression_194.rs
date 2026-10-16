@@ -6,44 +6,52 @@ mod common;
 use common::*;
 
 fn edit(target_id: &str, text: &str) -> wa::Message {
-    wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some(target_id.into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-            edited_message: MessageField::from_box(Box::new(wa::Message::text(text))),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some(target_id.into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+            constructed.edited_message = MessageField::from_box(Box::new(wa::Message::text(text)));
+            constructed
+        });
+        constructed
     }
 }
 
 fn history_copy(chat: &str, sender: &str, from_me: bool, msg_id: &str, text: &str) -> Event {
-    let message = wa::WebMessageInfo {
-        key: MessageField::some(wa::MessageKey {
-            remote_jid: Some(chat.into()),
-            from_me: Some(from_me),
-            id: Some(msg_id.into()),
-            ..Default::default()
-        }),
-        participant: (!from_me).then(|| sender.into()),
-        message: MessageField::from_box(Box::new(wa::Message::text(text))),
-        message_timestamp: Some(1_700_000_000),
-        ..Default::default()
+    let message = {
+        let mut constructed: wa::WebMessageInfo = Default::default();
+        constructed.key = MessageField::some({
+            let mut constructed: wa::MessageKey = Default::default();
+            constructed.remote_jid = Some(chat.into());
+            constructed.from_me = Some(from_me);
+            constructed.id = Some(msg_id.into());
+            constructed
+        });
+        constructed.participant = (!from_me).then(|| sender.into());
+        constructed.message = MessageField::from_box(Box::new(wa::Message::text(text)));
+        constructed.message_timestamp = Some(1_700_000_000);
+        constructed
     };
-    history_sync_event(wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![wa::Conversation {
-            id: chat.into(),
-            messages: vec![wa::HistorySyncMsg {
-                message: MessageField::some(message),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-        ..Default::default()
+    history_sync_event({
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = chat.into();
+            constructed.messages = vec![{
+                let mut constructed: wa::HistorySyncMsg = Default::default();
+                constructed.message = MessageField::some(message);
+                constructed
+            }];
+            constructed
+        }];
+        constructed
     })
 }
 
@@ -129,10 +137,11 @@ async fn phone_authored_live_message_accepts_phone_edit_and_revoke() {
     feed(
         &chat_store,
         [message_event(
-            revoke_key(wa::MessageKey {
-                id: Some("MSG-194-OWN".into()),
-                from_me: Some(true),
-                ..Default::default()
+            revoke_key({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-194-OWN".into());
+                constructed.from_me = Some(true);
+                constructed
             }),
             own_info(PEER, "MSG-194-REVOKE", 1_700_000_020),
         )],
@@ -195,10 +204,11 @@ async fn own_placeholders_absorb_later_phone_and_companion_copies() {
     feed(
         &chat_store,
         [message_event(
-            revoke_key(wa::MessageKey {
-                id: Some("MSG-194-EARLY-REVOKE".into()),
-                from_me: Some(true),
-                ..Default::default()
+            revoke_key({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-194-EARLY-REVOKE".into());
+                constructed.from_me = Some(true);
+                constructed
             }),
             own_info(PEER, "MSG-194-EARLY-REVOKE-EVENT", 1_700_000_020),
         )],
@@ -259,10 +269,11 @@ async fn known_pn_lid_alias_targets_edits_and_group_revokes() {
     feed(
         &chat_store,
         [message_event(
-            revoke_key(wa::MessageKey {
-                id: Some("MSG-194-ALIAS".into()),
-                participant: Some(PEER_LID.into()),
-                ..Default::default()
+            revoke_key({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-194-ALIAS".into());
+                constructed.participant = Some(PEER_LID.into());
+                constructed
             }),
             incoming_info(
                 GROUP,
@@ -669,19 +680,22 @@ async fn reopening_repairs_legacy_alias_duplicates_without_resurrecting_revoked_
         )],
     )
     .await;
-    let reaction = wa::Message {
-        reaction_message: MessageField::some(wa::message::ReactionMessage {
-            key: MessageField::some(wa::MessageKey {
-                remote_jid: Some(PEER_LID.into()),
-                from_me: Some(false),
-                id: Some("MSG-194-LEGACY".into()),
-                ..Default::default()
-            }),
-            text: Some("👍".into()),
-            sender_timestamp_ms: Some(1_700_000_060_000),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let reaction = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.reaction_message = MessageField::some({
+            let mut constructed: wa::message::ReactionMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.remote_jid = Some(PEER_LID.into());
+                constructed.from_me = Some(false);
+                constructed.id = Some("MSG-194-LEGACY".into());
+                constructed
+            });
+            constructed.text = Some("👍".into());
+            constructed.sender_timestamp_ms = Some(1_700_000_060_000);
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,

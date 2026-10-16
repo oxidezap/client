@@ -833,10 +833,11 @@ impl ChatStore {
     ) -> Result<()> {
         self.record_revoke_target(
             chat,
-            &wa::MessageKey {
-                id: Some(target_id.to_owned()),
-                from_me: Some(true),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some(target_id.to_owned());
+                constructed.from_me = Some(true);
+                constructed
             },
             timestamp,
         )
@@ -907,9 +908,12 @@ impl ChatStore {
             .message_id(target_id.to_owned())
             .from_me(from_me)
             .timestamp(timestamp)
-            .action(Box::new(wa::sync_action_value::DeleteMessageForMeAction {
-                delete_media: Some(false),
-                message_timestamp: Some(message_timestamp_ms),
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::DeleteMessageForMeAction =
+                    Default::default();
+                constructed.delete_media = Some(false);
+                constructed.message_timestamp = Some(message_timestamp_ms);
+                constructed
             }))
             .from_full_sync(false)
             .build();

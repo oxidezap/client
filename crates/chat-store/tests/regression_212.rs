@@ -21,67 +21,74 @@ fn history_wmi(
     text: &str,
     ts_secs: u64,
 ) -> wa::WebMessageInfo {
-    wa::WebMessageInfo {
-        key: MessageField::some(wa::MessageKey {
-            remote_jid: Some(chat.into()),
-            from_me: Some(from_me),
-            id: Some(msg_id.into()),
-            ..Default::default()
-        }),
-        participant: sender.map(str::to_string),
-        message: MessageField::from_box(Box::new(wa::Message::text(text))),
-        message_timestamp: Some(ts_secs),
-        ..Default::default()
+    {
+        let mut constructed: wa::WebMessageInfo = Default::default();
+        constructed.key = MessageField::some({
+            let mut constructed: wa::MessageKey = Default::default();
+            constructed.remote_jid = Some(chat.into());
+            constructed.from_me = Some(from_me);
+            constructed.id = Some(msg_id.into());
+            constructed
+        });
+        constructed.participant = sender.map(str::to_string);
+        constructed.message = MessageField::from_box(Box::new(wa::Message::text(text)));
+        constructed.message_timestamp = Some(ts_secs);
+        constructed
     }
 }
 
 /// A phone-read conversation: `unreadCount: 0` with two incoming rows and one
 /// own row.
 fn read_history_chat() -> Event {
-    history_sync_event(wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![wa::Conversation {
-            id: PEER.into(),
-            conversation_timestamp: Some(1_700_000_020),
-            unread_count: Some(0),
-            messages: vec![
-                wa::HistorySyncMsg {
-                    message: MessageField::some(history_wmi(
+    history_sync_event({
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = PEER.into();
+            constructed.conversation_timestamp = Some(1_700_000_020);
+            constructed.unread_count = Some(0);
+            constructed.messages = vec![
+                {
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(history_wmi(
                         PEER,
                         Some(PEER),
                         false,
                         "MSG-212-H1",
                         "hello",
                         1_700_000_000,
-                    )),
-                    ..Default::default()
+                    ));
+                    constructed
                 },
-                wa::HistorySyncMsg {
-                    message: MessageField::some(history_wmi(
+                {
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(history_wmi(
                         PEER,
                         Some(PEER),
                         false,
                         "MSG-212-H2",
                         "world",
                         1_700_000_010,
-                    )),
-                    ..Default::default()
+                    ));
+                    constructed
                 },
-                wa::HistorySyncMsg {
-                    message: MessageField::some(history_wmi(
+                {
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(history_wmi(
                         PEER,
                         Some(OWN_LEGACY_SENDER),
                         true,
                         "MSG-212-OWN",
                         "mine",
                         1_700_000_020,
-                    )),
-                    ..Default::default()
+                    ));
+                    constructed
                 },
-            ],
-            ..Default::default()
-        }],
-        ..Default::default()
+            ];
+            constructed
+        }];
+        constructed
     })
 }
 
@@ -261,39 +268,43 @@ async fn startup_sweep_backfills_baseline_before_first_repair() {
     // own author here, so nothing below may rewrite this chat's aggregates.
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(1_700_000_010),
-                unread_count: Some(0),
-                messages: vec![
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_010);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(PEER),
                             false,
                             "MSG-212-H1",
                             "hello",
                             1_700_000_000,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(PEER),
                             false,
                             "MSG-212-H2",
                             "world",
                             1_700_000_010,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
+                ];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -417,27 +428,30 @@ async fn marked_unread_history_keeps_marker_through_seed() {
     let (store, chat_store) = test_store().await;
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(1_700_000_000),
-                unread_count: Some(0),
-                marked_as_unread: Some(true),
-                messages: vec![wa::HistorySyncMsg {
-                    message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_000);
+                constructed.unread_count = Some(0);
+                constructed.marked_as_unread = Some(true);
+                constructed.messages = vec![{
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(history_wmi(
                         PEER,
                         Some(PEER),
                         false,
                         "MSG-212-MARKED",
                         "pinned unread",
                         1_700_000_000,
-                    )),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+                    ));
+                    constructed
+                }];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -455,26 +469,29 @@ async fn future_dated_history_row_does_not_reopen_phone_read_chat() {
     let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(future_secs),
-                unread_count: Some(0),
-                messages: vec![wa::HistorySyncMsg {
-                    message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(future_secs);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![{
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(history_wmi(
                         PEER,
                         Some(PEER),
                         false,
                         "MSG-212-SKEWED",
                         "ahead of the clock",
                         future_secs,
-                    )),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+                    ));
+                    constructed
+                }];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -525,39 +542,43 @@ async fn upgrade_repair_merging_incoming_duplicates_without_marker_keeps_zero() 
     // the stored count stays the phone's zero.
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(1_700_000_010),
-                unread_count: Some(0),
-                messages: vec![
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_010);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(PEER),
                             false,
                             "MSG-212-LEGACYDUP",
                             "two copies",
                             1_700_000_005,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(PEER_LID),
                             false,
                             "MSG-212-LEGACYDUP",
                             "two copies",
                             1_700_000_006,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
+                ];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -604,30 +625,33 @@ async fn oversized_future_snapshot_keeps_phone_read_zero() {
     let (store, chat_store) = test_store().await;
     let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
     let messages: Vec<wa::HistorySyncMsg> = (0..300)
-        .map(|n| wa::HistorySyncMsg {
-            message: MessageField::some(history_wmi(
+        .map(|n| {
+            let mut constructed: wa::HistorySyncMsg = Default::default();
+            constructed.message = MessageField::some(history_wmi(
                 PEER,
                 Some(PEER),
                 false,
                 &format!("MSG-212-FLOOD-{n}"),
                 "skewed",
                 future_secs,
-            )),
-            ..Default::default()
+            ));
+            constructed
         })
         .collect();
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(future_secs),
-                unread_count: Some(0),
-                messages,
-                ..Default::default()
-            }],
-            ..Default::default()
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(future_secs);
+                constructed.unread_count = Some(0);
+                constructed.messages = messages;
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -670,26 +694,29 @@ async fn seed_does_not_evict_existing_keyed_coverage() {
     let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(future_secs),
-                unread_count: Some(0),
-                messages: vec![wa::HistorySyncMsg {
-                    message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(future_secs);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![{
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(history_wmi(
                         PEER,
                         Some(PEER),
                         false,
                         "MSG-212-EVICT-NEW",
                         "no room",
                         future_secs,
-                    )),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+                    ));
+                    constructed
+                }];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -708,39 +735,43 @@ async fn sweep_covers_future_rows_for_later_merges() {
     let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(1_700_000_010),
-                unread_count: Some(0),
-                messages: vec![
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_010);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(PEER),
                             false,
                             "MSG-212-SWEEP-HIST",
                             "history",
                             1_700_000_000,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(PEER),
                             false,
                             "MSG-212-SWEEP-FUT",
                             "ahead of the clock",
                             future_secs,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
+                ];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -800,30 +831,33 @@ async fn oversized_legacy_snapshot_seeds_nothing_at_all() {
     let (store, chat_store) = test_store().await;
     let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
     let messages: Vec<wa::HistorySyncMsg> = (0..300)
-        .map(|n| wa::HistorySyncMsg {
-            message: MessageField::some(history_wmi(
+        .map(|n| {
+            let mut constructed: wa::HistorySyncMsg = Default::default();
+            constructed.message = MessageField::some(history_wmi(
                 PEER,
                 Some(PEER),
                 false,
                 &format!("MSG-212-LEGACYFLOOD-{n}"),
                 "skewed",
                 future_secs,
-            )),
-            ..Default::default()
+            ));
+            constructed
         })
         .collect();
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(future_secs),
-                unread_count: Some(0),
-                messages,
-                ..Default::default()
-            }],
-            ..Default::default()
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(future_secs);
+                constructed.unread_count = Some(0);
+                constructed.messages = messages;
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -846,30 +880,33 @@ async fn seed_counts_capacity_after_pruning_implied_ids() {
     let (store, chat_store) = test_store().await;
     // A full retained list whose rows the next frontier already implies.
     let messages: Vec<wa::HistorySyncMsg> = (0..256)
-        .map(|n| wa::HistorySyncMsg {
-            message: MessageField::some(history_wmi(
+        .map(|n| {
+            let mut constructed: wa::HistorySyncMsg = Default::default();
+            constructed.message = MessageField::some(history_wmi(
                 PEER,
                 Some(PEER),
                 false,
                 &format!("MSG-212-PRUNE-{n}"),
                 "history",
                 1_700_000_000 + n as u64,
-            )),
-            ..Default::default()
+            ));
+            constructed
         })
         .collect();
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(1_700_000_300),
-                unread_count: Some(0),
-                messages,
-                ..Default::default()
-            }],
-            ..Default::default()
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_300);
+                constructed.unread_count = Some(0);
+                constructed.messages = messages;
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -900,26 +937,29 @@ async fn seed_counts_capacity_after_pruning_implied_ids() {
     let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(future_secs),
-                unread_count: Some(0),
-                messages: vec![wa::HistorySyncMsg {
-                    message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(future_secs);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![{
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(history_wmi(
                         PEER,
                         Some(PEER),
                         false,
                         "MSG-212-PRUNE-NEW",
                         "room after pruning",
                         future_secs,
-                    )),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+                    ));
+                    constructed
+                }];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -940,39 +980,43 @@ async fn seed_frees_only_ids_without_a_newer_row() {
     // one, side by side before any mapping proves them one message.
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(1_700_000_010),
-                unread_count: Some(0),
-                messages: vec![
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_010);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(PEER),
                             false,
                             "MSG-212-STRADDLE",
                             "old copy",
                             1_700_000_005,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(PEER_LID),
                             false,
                             "MSG-212-STRADDLE",
                             "future copy",
                             future_secs,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
+                ];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -1005,26 +1049,29 @@ async fn seed_frees_only_ids_without_a_newer_row() {
     // while the newcomer is refused rather than evicting it.
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(future_secs),
-                unread_count: Some(0),
-                messages: vec![wa::HistorySyncMsg {
-                    message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(future_secs);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![{
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(history_wmi(
                         PEER,
                         Some(PEER),
                         false,
                         "MSG-212-STRADDLE-NEW",
                         "no room",
                         future_secs,
-                    )),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+                    ));
+                    constructed
+                }];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -1045,39 +1092,43 @@ async fn outgoing_twins_do_not_occupy_read_coverage_room() {
     // outgoing twin must not keep the id occupying room.
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(1_700_000_010),
-                unread_count: Some(0),
-                messages: vec![
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_010);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(PEER),
                             false,
                             "MSG-212-DIRECTION",
                             "incoming copy",
                             1_700_000_005,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(history_wmi(
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(history_wmi(
                             PEER,
                             Some(OWN_LEGACY_SENDER),
                             true,
                             "MSG-212-DIRECTION",
                             "own copy",
                             future_secs,
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
+                ];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -1109,26 +1160,29 @@ async fn outgoing_twins_do_not_occupy_read_coverage_room() {
     // already sits below the new frontier, so it frees its room.
     feed(
         &chat_store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(future_secs),
-                unread_count: Some(0),
-                messages: vec![wa::HistorySyncMsg {
-                    message: MessageField::some(history_wmi(
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(future_secs);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![{
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(history_wmi(
                         PEER,
                         Some(PEER),
                         false,
                         "MSG-212-DIRECTION-NEW",
                         "room after pruning",
                         future_secs,
-                    )),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+                    ));
+                    constructed
+                }];
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -1242,10 +1296,11 @@ async fn local_revoke_placeholders_do_not_exhaust_history_read_coverage() {
         chat_store
             .record_revoke_target(
                 &jid(PEER),
-                &wa::MessageKey {
-                    id: Some(format!("LOCAL-FUTURE-{n}")),
-                    from_me: Some(false),
-                    ..Default::default()
+                &{
+                    let mut constructed: wa::MessageKey = Default::default();
+                    constructed.id = Some(format!("LOCAL-FUTURE-{n}"));
+                    constructed.from_me = Some(false);
+                    constructed
                 },
                 future,
             )
@@ -1268,10 +1323,11 @@ async fn local_placeholder_only_chat_does_not_seed_a_read_frontier_on_repair() {
     chat_store
         .record_revoke_target(
             &jid(PEER),
-            &wa::MessageKey {
-                id: Some("LOCAL-ONLY".into()),
-                from_me: Some(false),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("LOCAL-ONLY".into());
+                constructed.from_me = Some(false);
+                constructed
             },
             ts(1_700_000_010),
         )
@@ -1298,11 +1354,12 @@ async fn advancing_past_local_placeholder_releases_its_explicit_read_id() {
     chat_store
         .record_revoke_target(
             &jid(GROUP),
-            &wa::MessageKey {
-                id: Some("LOCAL-KEYED".into()),
-                from_me: Some(false),
-                participant: Some(PEER.into()),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("LOCAL-KEYED".into());
+                constructed.from_me = Some(false);
+                constructed.participant = Some(PEER.into());
+                constructed
             },
             ts(1_700_000_010),
         )
@@ -1310,20 +1367,23 @@ async fn advancing_past_local_placeholder_releases_its_explicit_read_id() {
     chat_store.flush().await.unwrap();
     let mut keyed = mark_read_event(GROUP, true, 1_700_000_010);
     if let Event::MarkChatAsReadUpdate(update) = &mut keyed {
-        update.action.message_range =
-            MessageField::some(wa::sync_action_value::SyncActionMessageRange {
-                last_message_timestamp: Some(1_700_000_010),
-                messages: vec![wa::sync_action_value::SyncActionMessage {
-                    key: MessageField::some(wa::MessageKey {
-                        id: Some("LOCAL-KEYED".into()),
-                        from_me: Some(false),
-                        participant: Some(PEER.into()),
-                        ..Default::default()
-                    }),
-                    timestamp: Some(1_700_000_010),
-                }],
-                ..Default::default()
-            });
+        update.action.message_range = MessageField::some({
+            let mut constructed: wa::sync_action_value::SyncActionMessageRange = Default::default();
+            constructed.last_message_timestamp = Some(1_700_000_010);
+            constructed.messages = vec![{
+                let mut constructed: wa::sync_action_value::SyncActionMessage = Default::default();
+                constructed.key = MessageField::some({
+                    let mut constructed: wa::MessageKey = Default::default();
+                    constructed.id = Some("LOCAL-KEYED".into());
+                    constructed.from_me = Some(false);
+                    constructed.participant = Some(PEER.into());
+                    constructed
+                });
+                constructed.timestamp = Some(1_700_000_010);
+                constructed
+            }];
+            constructed
+        });
     }
     feed(
         &chat_store,

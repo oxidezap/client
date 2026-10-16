@@ -253,7 +253,7 @@ impl WhatsAppClient {
             let result = live
                 .client
                 .polls()
-                .vote(&chat, &poll_id, &creator, &secret, &names)
+                .vote_raw(&chat, &poll_id, &creator, &secret, &names)
                 .await
                 .map_err(|e| e.to_string())?;
             if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
@@ -349,16 +349,16 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let message = wa::Message {
-                location_message: whatsapp_rust::buffa::MessageField::some(
-                    wa::message::LocationMessage {
-                        degrees_latitude: Some(latitude),
-                        degrees_longitude: Some(longitude),
-                        name,
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
+            let message = {
+                let mut constructed: wa::Message = Default::default();
+                constructed.location_message = whatsapp_rust::buffa::MessageField::some({
+                    let mut constructed: wa::message::LocationMessage = Default::default();
+                    constructed.degrees_latitude = Some(latitude);
+                    constructed.degrees_longitude = Some(longitude);
+                    constructed.name = name;
+                    constructed
+                });
+                constructed
             };
             let client = &live.client;
             let msg_id = client.generate_message_id();
@@ -900,7 +900,10 @@ impl WhatsAppClient {
                 .and_then(|media| media.downloadable)
                 .ok_or_else(|| "that message carries no downloadable media".to_string())?;
             live.client
-                .download(&downloadable)
+                .download(
+                    &downloadable,
+                    whatsapp_rust::download::DownloadLimits::default(),
+                )
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -1206,7 +1209,14 @@ impl WhatsAppClient {
                     continue;
                 };
                 report.requested += 1;
-                match live.client.download(&downloadable).await {
+                match live
+                    .client
+                    .download(
+                        &downloadable,
+                        whatsapp_rust::download::DownloadLimits::default(),
+                    )
+                    .await
+                {
                     Ok(bytes) => report.files.push(BackfillFile {
                         message_id,
                         chat_jid,

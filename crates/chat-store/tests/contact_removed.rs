@@ -9,10 +9,11 @@ fn contact_update(jid: &str, full_name: &str, first_name: &str) -> Event {
         ContactUpdate::builder()
             .jid(jid.parse().expect("test JID"))
             .timestamp(ts(1_700_000_100))
-            .action(Box::new(wa::sync_action_value::ContactAction {
-                full_name: Some(full_name.to_owned()),
-                first_name: Some(first_name.to_owned()),
-                ..Default::default()
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::ContactAction = Default::default();
+                constructed.full_name = Some(full_name.to_owned());
+                constructed.first_name = Some(first_name.to_owned());
+                constructed
             }))
             .from_full_sync(false)
             .build(),
@@ -34,22 +35,25 @@ async fn removal_retires_history_address_book_names_but_keeps_independent_server
     let (_device, store) = test_store().await;
     feed(
         &store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![
-                wa::Conversation {
-                    id: PEER.into(),
-                    name: Some("Saved Name".into()),
-                    display_name: Some("Independent Fallback".into()),
-                    ..Default::default()
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![
+                {
+                    let mut constructed: wa::Conversation = Default::default();
+                    constructed.id = PEER.into();
+                    constructed.name = Some("Saved Name".into());
+                    constructed.display_name = Some("Independent Fallback".into());
+                    constructed
                 },
-                wa::Conversation {
-                    id: "559900000099@s.whatsapp.net".into(),
-                    display_name: Some("Independent Server Name".into()),
-                    ..Default::default()
+                {
+                    let mut constructed: wa::Conversation = Default::default();
+                    constructed.id = "559900000099@s.whatsapp.net".into();
+                    constructed.display_name = Some("Independent Server Name".into());
+                    constructed
                 },
-            ],
-            ..Default::default()
+            ];
+            constructed
         })],
     )
     .await;
@@ -116,15 +120,17 @@ async fn removal_retires_history_address_book_names_but_keeps_independent_server
     // the independent fallback survives because its provenance was retained.
     feed(
         &store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                name: Some("Saved Name".into()),
-                display_name: Some("Independent Fallback".into()),
-                ..Default::default()
-            }],
-            ..Default::default()
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.name = Some("Saved Name".into());
+                constructed.display_name = Some("Independent Fallback".into());
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -148,14 +154,16 @@ async fn removal_retires_history_address_book_names_but_keeps_independent_server
     .await;
     feed(
         &store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                display_name: Some("Coincident Name".into()),
-                ..Default::default()
-            }],
-            ..Default::default()
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.display_name = Some("Coincident Name".into());
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -178,14 +186,16 @@ async fn removal_tombstone_blocks_delayed_history_until_contact_is_added_again()
     feed(&store, [contact_removed(PEER)]).await;
     feed(
         &store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                name: Some("Stale Saved Name".into()),
-                ..Default::default()
-            }],
-            ..Default::default()
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.name = Some("Stale Saved Name".into());
+                constructed
+            }];
+            constructed
         })],
     )
     .await;
@@ -194,14 +204,16 @@ async fn removal_tombstone_blocks_delayed_history_until_contact_is_added_again()
     feed(&store, [contact_update(PEER, "New Saved Name", "New")]).await;
     feed(
         &store,
-        [history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                name: Some("New Saved Name".into()),
-                ..Default::default()
-            }],
-            ..Default::default()
+        [history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.name = Some("New Saved Name".into());
+                constructed
+            }];
+            constructed
         })],
     )
     .await;

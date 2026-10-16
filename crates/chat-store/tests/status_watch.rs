@@ -203,8 +203,10 @@ async fn a_redelivered_pin_buys_no_reload() {
             wacore::types::events::PinUpdate::builder()
                 .jid(jid(PEER))
                 .timestamp(ts(ts_secs))
-                .action(Box::new(wa::sync_action_value::PinAction {
-                    pinned: Some(true),
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::PinAction = Default::default();
+                    constructed.pinned = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),

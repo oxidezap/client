@@ -45,11 +45,12 @@ async fn rejected_inbound_preserves_preceding_local_writes_and_causal_order() {
     store
         .record_reaction(
             &chat,
-            &wa::MessageKey {
-                remote_jid: Some(PEER.into()),
-                from_me: Some(true),
-                id: Some("LOCAL".into()),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.remote_jid = Some(PEER.into());
+                constructed.from_me = Some(true);
+                constructed.id = Some("LOCAL".into());
+                constructed
             },
             "x",
             ts(1_700_000_020),
@@ -66,8 +67,10 @@ async fn rejected_inbound_preserves_preceding_local_writes_and_causal_order() {
         PinUpdate::builder()
             .jid(chat.clone())
             .timestamp(ts(1_700_000_040))
-            .action(Box::new(wa::sync_action_value::PinAction {
-                pinned: Some(true),
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::PinAction = Default::default();
+                constructed.pinned = Some(true);
+                constructed
             }))
             .from_full_sync(false)
             .build(),
@@ -76,9 +79,10 @@ async fn rejected_inbound_preserves_preceding_local_writes_and_causal_order() {
         ContactUpdate::builder()
             .jid(chat.clone())
             .timestamp(ts(1_700_000_050))
-            .action(Box::new(wa::sync_action_value::ContactAction {
-                full_name: Some("Synthetic Contact".into()),
-                ..Default::default()
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::ContactAction = Default::default();
+                constructed.full_name = Some("Synthetic Contact".into());
+                constructed
             }))
             .from_full_sync(false)
             .build(),
@@ -417,11 +421,12 @@ async fn ordinary_event_rollback_retains_mixed_writes_and_blocks_later_batches()
     store
         .record_reaction(
             &chat,
-            &wa::MessageKey {
-                remote_jid: Some(PEER.into()),
-                from_me: Some(true),
-                id: Some("ORDINARY-LOCAL".into()),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.remote_jid = Some(PEER.into());
+                constructed.from_me = Some(true);
+                constructed.id = Some("ORDINARY-LOCAL".into());
+                constructed
             },
             "x",
             ts(1_700_000_020),
@@ -438,8 +443,10 @@ async fn ordinary_event_rollback_retains_mixed_writes_and_blocks_later_batches()
         PinUpdate::builder()
             .jid(chat.clone())
             .timestamp(ts(1_700_000_040))
-            .action(Box::new(wa::sync_action_value::PinAction {
-                pinned: Some(true),
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::PinAction = Default::default();
+                constructed.pinned = Some(true);
+                constructed
             }))
             .from_full_sync(false)
             .build(),
@@ -448,9 +455,10 @@ async fn ordinary_event_rollback_retains_mixed_writes_and_blocks_later_batches()
         ContactUpdate::builder()
             .jid(chat.clone())
             .timestamp(ts(1_700_000_050))
-            .action(Box::new(wa::sync_action_value::ContactAction {
-                full_name: Some("Synthetic Retained Contact".into()),
-                ..Default::default()
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::ContactAction = Default::default();
+                constructed.full_name = Some("Synthetic Retained Contact".into());
+                constructed
             }))
             .from_full_sync(false)
             .build(),

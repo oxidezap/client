@@ -104,30 +104,34 @@ mod tests {
     use whatsapp_rust::waproto::whatsapp::message;
 
     fn text_reply(context: wa::ContextInfo) -> wa::Message {
-        wa::Message {
-            extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-                text: Some("e o áudio?".to_string()),
-                context_info: buffa::MessageField::some(context),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut constructed: wa::Message = Default::default();
+            constructed.extended_text_message = buffa::MessageField::some({
+                let mut constructed: message::ExtendedTextMessage = Default::default();
+                constructed.text = Some("e o áudio?".to_string());
+                constructed.context_info = buffa::MessageField::some(context);
+                constructed
+            });
+            constructed
         }
     }
 
     fn quoted_text(text: &str) -> buffa::MessageField<wa::Message> {
-        buffa::MessageField::some(wa::Message {
-            conversation: Some(text.to_string()),
-            ..Default::default()
+        buffa::MessageField::some({
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some(text.to_string());
+            constructed
         })
     }
 
     #[test]
     fn reads_a_text_reply() {
-        let message = text_reply(wa::ContextInfo {
-            stanza_id: Some("ORIGINAL".to_string()),
-            participant: Some("a@s.whatsapp.net".to_string()),
-            quoted_message: quoted_text("ping"),
-            ..Default::default()
+        let message = text_reply({
+            let mut constructed: wa::ContextInfo = Default::default();
+            constructed.stanza_id = Some("ORIGINAL".to_string());
+            constructed.participant = Some("a@s.whatsapp.net".to_string());
+            constructed.quoted_message = quoted_text("ping");
+            constructed
         });
         let quoted = quoted_from(&message).expect("this is a reply");
         assert_eq!(quoted.message_id, "ORIGINAL");
@@ -138,9 +142,10 @@ mod tests {
 
     #[test]
     fn a_plain_message_is_not_a_reply() {
-        let message = wa::Message {
-            conversation: Some("ping".to_string()),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some("ping".to_string());
+            constructed
         };
         assert!(quoted_from(&message).is_none());
     }
@@ -149,9 +154,10 @@ mod tests {
     fn context_without_a_stanza_id_yields_no_quote() {
         // Mentions also travel in ContextInfo; that is not a reply, and
         // rendering an empty quote bar for one would be worse than nothing.
-        let message = text_reply(wa::ContextInfo {
-            mentioned_jid: vec!["a@s.whatsapp.net".to_string()],
-            ..Default::default()
+        let message = text_reply({
+            let mut constructed: wa::ContextInfo = Default::default();
+            constructed.mentioned_jid = vec!["a@s.whatsapp.net".to_string()];
+            constructed
         });
         assert!(quoted_from(&message).is_none());
     }
@@ -160,17 +166,20 @@ mod tests {
     /// named it; the context lookup did not look at it.
     #[test]
     fn reads_a_reply_sent_as_a_video_note() {
-        let message = wa::Message {
-            ptv_message: buffa::MessageField::some(message::VideoMessage {
-                context_info: buffa::MessageField::some(wa::ContextInfo {
-                    stanza_id: Some("ORIGINAL".to_string()),
-                    participant: Some("a@s.whatsapp.net".to_string()),
-                    quoted_message: quoted_text("ping"),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.ptv_message = buffa::MessageField::some({
+                let mut constructed: message::VideoMessage = Default::default();
+                constructed.context_info = buffa::MessageField::some({
+                    let mut constructed: wa::ContextInfo = Default::default();
+                    constructed.stanza_id = Some("ORIGINAL".to_string());
+                    constructed.participant = Some("a@s.whatsapp.net".to_string());
+                    constructed.quoted_message = quoted_text("ping");
+                    constructed
+                });
+                constructed
+            });
+            constructed
         };
         let quoted = quoted_from(&message).expect("a video note can be a reply");
         assert_eq!(quoted.message_id, "ORIGINAL");
@@ -181,10 +190,11 @@ mod tests {
     /// the quoted body. The jump target is in hand either way.
     #[test]
     fn a_reply_without_the_quoted_body_keeps_its_jump_target() {
-        let message = text_reply(wa::ContextInfo {
-            stanza_id: Some("ORIGINAL".to_string()),
-            participant: Some("a@s.whatsapp.net".to_string()),
-            ..Default::default()
+        let message = text_reply({
+            let mut constructed: wa::ContextInfo = Default::default();
+            constructed.stanza_id = Some("ORIGINAL".to_string());
+            constructed.participant = Some("a@s.whatsapp.net".to_string());
+            constructed
         });
         let quoted = quoted_from(&message).expect("the linkage is the quote");
         assert_eq!(quoted.message_id, "ORIGINAL");
@@ -195,14 +205,17 @@ mod tests {
 
     #[test]
     fn a_quoted_photo_reports_its_kind() {
-        let message = text_reply(wa::ContextInfo {
-            stanza_id: Some("ORIGINAL".to_string()),
-            participant: Some("a@s.whatsapp.net".to_string()),
-            quoted_message: buffa::MessageField::some(wa::Message {
-                image_message: buffa::MessageField::some(message::ImageMessage::default()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let message = text_reply({
+            let mut constructed: wa::ContextInfo = Default::default();
+            constructed.stanza_id = Some("ORIGINAL".to_string());
+            constructed.participant = Some("a@s.whatsapp.net".to_string());
+            constructed.quoted_message = buffa::MessageField::some({
+                let mut constructed: wa::Message = Default::default();
+                constructed.image_message =
+                    buffa::MessageField::some(message::ImageMessage::default());
+                constructed
+            });
+            constructed
         });
         let quoted = quoted_from(&message).unwrap();
         assert_eq!(quoted.kind, Some(QuotedKind::Image));

@@ -240,10 +240,11 @@ fn built_ack(id: &str, chat: Option<Jid>, at: Option<DateTime<Utc>>, code: Optio
 
 /// A peer sender revoke. Its key uses the sending account's perspective.
 pub fn revoke(id: &str) -> wa::Message {
-    revoke_key(wa::MessageKey {
-        id: Some(id.into()),
-        from_me: Some(true),
-        ..Default::default()
+    revoke_key({
+        let mut constructed: wa::MessageKey = Default::default();
+        constructed.id = Some(id.into());
+        constructed.from_me = Some(true);
+        constructed
     })
 }
 
@@ -251,13 +252,15 @@ pub fn revoke(id: &str) -> wa::Message {
 /// that the reader did. The store reads those to decide whose tombstone this
 /// becomes, so a test about that says the whole key.
 pub fn revoke_key(key: wa::MessageKey) -> wa::Message {
-    wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(key),
-            r#type: Some(wa::message::protocol_message::Type::REVOKE),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some(key);
+            constructed.r#type = Some(wa::message::protocol_message::Type::REVOKE);
+            constructed
+        });
+        constructed
     }
 }
 
@@ -281,9 +284,10 @@ pub fn delete_for_me(chat: Jid, id: &str, from_me: bool, at: DateTime<Utc>) -> E
 /// The range an app-state action covers: everything up to and including
 /// `ts_secs`, with no message keys listed.
 pub fn range_up_to(ts_secs: i64) -> MessageField<wa::sync_action_value::SyncActionMessageRange> {
-    MessageField::some(wa::sync_action_value::SyncActionMessageRange {
-        last_message_timestamp: Some(ts_secs),
-        ..Default::default()
+    MessageField::some({
+        let mut constructed: wa::sync_action_value::SyncActionMessageRange = Default::default();
+        constructed.last_message_timestamp = Some(ts_secs);
+        constructed
     })
 }
 
@@ -293,9 +297,11 @@ pub fn mark_read_event(chat: &str, read: bool, ts_secs: i64) -> Event {
         wacore::types::events::MarkChatAsReadUpdate::builder()
             .jid(jid(chat))
             .timestamp(ts(ts_secs))
-            .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
-                read: Some(read),
-                ..Default::default()
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
+                    Default::default();
+                constructed.read = Some(read);
+                constructed
             }))
             .from_full_sync(false)
             .build(),

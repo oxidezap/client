@@ -95,8 +95,10 @@ async fn a_pin_names_its_chat_instead_of_the_whole_list() {
             wacore::types::events::PinUpdate::builder()
                 .jid(jid(PEER))
                 .timestamp(ts(1_700_000_050))
-                .action(Box::new(wa::sync_action_value::PinAction {
-                    pinned: Some(true),
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::PinAction = Default::default();
+                    constructed.pinned = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
@@ -475,18 +477,21 @@ async fn batched_reads_answer_what_the_single_ones_do() {
     ];
     // Only the middle one is reacted to: a page is mostly rows with nothing.
     events.push(message_event(
-        wa::Message {
-            reaction_message: MessageField::some(wa::message::ReactionMessage {
-                key: MessageField::some(wa::MessageKey {
-                    id: Some("B-2".into()),
-                    remote_jid: Some(PEER.into()),
-                    from_me: Some(false),
-                    ..Default::default()
-                }),
-                text: Some("🎉".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut constructed: wa::Message = Default::default();
+            constructed.reaction_message = MessageField::some({
+                let mut constructed: wa::message::ReactionMessage = Default::default();
+                constructed.key = MessageField::some({
+                    let mut constructed: wa::MessageKey = Default::default();
+                    constructed.id = Some("B-2".into());
+                    constructed.remote_jid = Some(PEER.into());
+                    constructed.from_me = Some(false);
+                    constructed
+                });
+                constructed.text = Some("🎉".into());
+                constructed
+            });
+            constructed
         },
         incoming_info(PEER, PEER, "B-R", 1_700_000_030),
     ));

@@ -175,39 +175,49 @@ pub(super) fn quote_context(quoted: &oxidezap_core::QuotedMessage) -> wa::Contex
     // have drawn a photo — and `QuotedKind` exists precisely to carry that
     // distinction across a preview that cannot.
     let original = match quoted.kind {
-        Some(QuotedKind::Image) => wa::Message {
-            image_message: MessageField::some(wa::message::ImageMessage {
-                caption,
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        Some(QuotedKind::Video) => wa::Message {
-            video_message: MessageField::some(wa::message::VideoMessage {
-                caption,
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        Some(QuotedKind::Audio) => wa::Message {
-            audio_message: MessageField::some(wa::message::AudioMessage::default()),
-            ..Default::default()
-        },
-        Some(QuotedKind::Document) => wa::Message {
-            document_message: MessageField::some(wa::message::DocumentMessage {
-                caption,
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        Some(QuotedKind::Sticker) => wa::Message {
-            sticker_message: MessageField::some(wa::message::StickerMessage::default()),
-            ..Default::default()
-        },
-        None => wa::Message {
-            conversation: Some(quoted.preview.clone()),
-            ..Default::default()
-        },
+        Some(QuotedKind::Image) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.image_message = MessageField::some({
+                let mut constructed: wa::message::ImageMessage = Default::default();
+                constructed.caption = caption;
+                constructed
+            });
+            constructed
+        }
+        Some(QuotedKind::Video) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.video_message = MessageField::some({
+                let mut constructed: wa::message::VideoMessage = Default::default();
+                constructed.caption = caption;
+                constructed
+            });
+            constructed
+        }
+        Some(QuotedKind::Audio) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.audio_message = MessageField::some(wa::message::AudioMessage::default());
+            constructed
+        }
+        Some(QuotedKind::Document) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.document_message = MessageField::some({
+                let mut constructed: wa::message::DocumentMessage = Default::default();
+                constructed.caption = caption;
+                constructed
+            });
+            constructed
+        }
+        Some(QuotedKind::Sticker) => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.sticker_message =
+                MessageField::some(wa::message::StickerMessage::default());
+            constructed
+        }
+        None => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some(quoted.preview.clone());
+            constructed
+        }
     };
     whatsapp_rust::wacore::proto_helpers::build_quote_context(
         quoted.message_id.clone(),
@@ -236,20 +246,24 @@ mod tests {
     use whatsapp_rust::buffa::MessageField;
 
     fn stored_poll_creation() -> oxidezap_chat_store::StoredMessage {
-        let proto = wa::Message {
-            poll_creation_message_v3: MessageField::some(wa::message::PollCreationMessage {
-                name: Some("Onde jantamos?".into()),
-                options: ["Centro", "Praia"]
+        let proto = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v3 = MessageField::some({
+                let mut constructed: wa::message::PollCreationMessage = Default::default();
+                constructed.name = Some("Onde jantamos?".into());
+                constructed.options = ["Centro", "Praia"]
                     .iter()
-                    .map(|name| wa::message::poll_creation_message::Option {
-                        option_name: Some((*name).to_owned()),
-                        ..Default::default()
+                    .map(|name| {
+                        let mut constructed: wa::message::poll_creation_message::Option =
+                            Default::default();
+                        constructed.option_name = Some((*name).to_owned());
+                        constructed
                     })
-                    .collect(),
-                selectable_options_count: Some(1),
-                ..Default::default()
-            }),
-            ..Default::default()
+                    .collect();
+                constructed.selectable_options_count = Some(1);
+                constructed
+            });
+            constructed
         };
         oxidezap_chat_store::StoredMessage {
             chat_jid: "559900000001-1620000000@g.us".parse().unwrap(),
@@ -287,13 +301,15 @@ mod tests {
     fn legacy_contact_rows_project_the_proto_without_a_stored_text_column() {
         let mut stored = stored_poll_creation();
         stored.kind = oxidezap_chat_store::MessageKind::Contact;
-        stored.message = Some(Box::new(wa::Message {
-            contact_message: MessageField::some(wa::message::ContactMessage {
-                display_name: Some("Example Alpha".into()),
-                vcard: Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        stored.message = Some(Box::new({
+            let mut constructed: wa::Message = Default::default();
+            constructed.contact_message = MessageField::some({
+                let mut constructed: wa::message::ContactMessage = Default::default();
+                constructed.display_name = Some("Example Alpha".into());
+                constructed.vcard = Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into());
+                constructed
+            });
+            constructed
         }));
         assert_eq!(
             stored_to_chat_message(stored.clone()).content,
@@ -375,11 +391,14 @@ mod tests {
     fn a_v4_wrapped_creation_hydrates_as_a_votable_poll() {
         let mut stored = stored_poll_v2();
         let proto = stored.message.take().expect("proto");
-        stored.message = Some(Box::new(wa::Message {
-            poll_creation_message_v4: MessageField::some(wa::message::FutureProofMessage {
-                message: MessageField::some(*proto),
-            }),
-            ..Default::default()
+        stored.message = Some(Box::new({
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v4 = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::some(*proto);
+                constructed
+            });
+            constructed
         }));
         let message = stored_to_chat_message(stored);
         let poll = message.poll.expect("a v4 creation hydrates a poll");
@@ -389,31 +408,40 @@ mod tests {
 
     #[test]
     fn nested_wrappers_hydrate_media_and_quote_from_the_inner_message() {
-        let image = wa::Message {
-            image_message: MessageField::some(wa::message::ImageMessage {
-                jpeg_thumbnail: Some(vec![1, 2, 3]),
-                context_info: MessageField::some(wa::ContextInfo {
-                    stanza_id: Some("quoted-message".to_string()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let image = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.image_message = MessageField::some({
+                let mut constructed: wa::message::ImageMessage = Default::default();
+                constructed.jpeg_thumbnail = Some(vec![1, 2, 3]);
+                constructed.context_info = MessageField::some({
+                    let mut constructed: wa::ContextInfo = Default::default();
+                    constructed.stanza_id = Some("quoted-message".to_string());
+                    constructed
+                });
+                constructed
+            });
+            constructed
         };
-        let associated = wa::Message {
-            associated_child_message: MessageField::some(wa::message::FutureProofMessage {
-                message: MessageField::some(image),
-            }),
-            ..Default::default()
+        let associated = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.associated_child_message = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::some(image);
+                constructed
+            });
+            constructed
         };
         let mut stored = stored_poll_creation();
         stored.kind = oxidezap_chat_store::MessageKind::Image;
         stored.text = None;
-        stored.message = Some(Box::new(wa::Message {
-            group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
-                message: MessageField::some(associated),
-            }),
-            ..Default::default()
+        stored.message = Some(Box::new({
+            let mut constructed: wa::Message = Default::default();
+            constructed.group_mentioned_message = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::some(associated);
+                constructed
+            });
+            constructed
         }));
 
         let message = stored_to_chat_message(stored);

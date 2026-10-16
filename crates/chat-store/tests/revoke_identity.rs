@@ -32,12 +32,14 @@ fn relay(chat: &str, own: bool, key_from_me: bool, participant: Option<&str>) ->
         wacore::types::message::EditAttribute::AdminRevoke
     };
     message_event(
-        revoke_key(wa::MessageKey {
-            id: Some("TARGET".into()),
+        revoke_key({
             // In a peer DM this is how the sender addresses us, not our chat key.
-            remote_jid: Some(if chat == PEER && !own { OWN } else { chat }.into()),
-            from_me: Some(key_from_me),
-            participant: participant.map(str::to_owned),
+            let mut constructed: wa::MessageKey = Default::default();
+            constructed.id = Some("TARGET".into());
+            constructed.remote_jid = Some(if chat == PEER && !own { OWN } else { chat }.into());
+            constructed.from_me = Some(key_from_me);
+            constructed.participant = participant.map(str::to_owned);
+            constructed
         }),
         info,
     )

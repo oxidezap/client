@@ -32,16 +32,18 @@ async fn history_prefills_live_row_without_overwriting_appstate() {
     );
 
     let snapshot = |muted: bool, archived: bool| {
-        history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(1_700_000_000),
-                mute_end_time: muted.then_some(1_900_000_000),
-                archived: Some(archived),
-                ..Default::default()
-            }],
-            ..Default::default()
+        history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_000);
+                constructed.mute_end_time = muted.then_some(1_900_000_000);
+                constructed.archived = Some(archived);
+                constructed
+            }];
+            constructed
         })
     };
     feed(&chat_store, [snapshot(true, true)]).await;
@@ -73,9 +75,10 @@ async fn history_prefills_live_row_without_overwriting_appstate() {
                 wacore::types::events::MuteUpdate::builder()
                     .jid(jid(PEER))
                     .timestamp(ts(1_700_000_100))
-                    .action(Box::new(wa::sync_action_value::MuteAction {
-                        muted: Some(false),
-                        ..Default::default()
+                    .action(Box::new({
+                        let mut constructed: wa::sync_action_value::MuteAction = Default::default();
+                        constructed.muted = Some(false);
+                        constructed
                     }))
                     .from_full_sync(false)
                     .build(),
@@ -84,9 +87,11 @@ async fn history_prefills_live_row_without_overwriting_appstate() {
                 wacore::types::events::ArchiveUpdate::builder()
                     .jid(jid(PEER))
                     .timestamp(ts(1_700_000_100))
-                    .action(Box::new(wa::sync_action_value::ArchiveChatAction {
-                        archived: Some(false),
-                        ..Default::default()
+                    .action(Box::new({
+                        let mut constructed: wa::sync_action_value::ArchiveChatAction =
+                            Default::default();
+                        constructed.archived = Some(false);
+                        constructed
                     }))
                     .from_full_sync(false)
                     .build(),
@@ -109,18 +114,20 @@ async fn history_prefills_live_row_without_overwriting_appstate() {
 async fn missing_preference_options_do_not_unmute_or_unarchive() {
     let (_store, chat_store) = test_store().await;
     let snapshot = |muted: bool, archived: Option<bool>| {
-        history_sync_event(wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            conversations: vec![wa::Conversation {
-                id: PEER.into(),
-                conversation_timestamp: Some(1_700_000_000),
+        history_sync_event({
+            let mut constructed: wa::HistorySync = Default::default();
+            constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            constructed.conversations = vec![{
                 // Present zero is an explicit unmute on the wire, not a
                 // missing preference.
-                mute_end_time: Some(if muted { 1_900_000_000 } else { 0 }),
-                archived,
-                ..Default::default()
-            }],
-            ..Default::default()
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.into();
+                constructed.conversation_timestamp = Some(1_700_000_000);
+                constructed.mute_end_time = Some(if muted { 1_900_000_000 } else { 0 });
+                constructed.archived = archived;
+                constructed
+            }];
+            constructed
         })
     };
     feed(&chat_store, [snapshot(true, Some(true))]).await;
@@ -195,67 +202,72 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
     )
     .await;
 
-    let make_wmi = |id: &str, from_me: bool, ts: u64, text: &str| wa::WebMessageInfo {
-        key: MessageField::some(wa::MessageKey {
-            remote_jid: Some(PEER.into()),
-            from_me: Some(from_me),
-            id: Some(id.into()),
-            ..Default::default()
-        }),
-        message: MessageField::from_box(Box::new(wa::Message::text(text))),
-        message_timestamp: Some(ts),
-        status: Some(wa::web_message_info::Status::READ),
-        push_name: Some("Alice Example".into()),
-        ..Default::default()
+    let make_wmi = |id: &str, from_me: bool, ts: u64, text: &str| {
+        let mut constructed: wa::WebMessageInfo = Default::default();
+        constructed.key = MessageField::some({
+            let mut constructed: wa::MessageKey = Default::default();
+            constructed.remote_jid = Some(PEER.into());
+            constructed.from_me = Some(from_me);
+            constructed.id = Some(id.into());
+            constructed
+        });
+        constructed.message = MessageField::from_box(Box::new(wa::Message::text(text)));
+        constructed.message_timestamp = Some(ts);
+        constructed.status = Some(wa::web_message_info::Status::READ);
+        constructed.push_name = Some("Alice Example".into());
+        constructed
     };
-    let history = wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![
+    let history = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![
             // Fresh chat (no live row): mute/pin land via the INSERT path.
             // Wire values are unix seconds; the store must convert to ms.
-            wa::Conversation {
-                id: "559900000004@s.whatsapp.net".to_string(),
-                conversation_timestamp: Some(1_700_000_500),
-                mute_end_time: Some(1_800_000_000),
-                pinned: Some(1_700_000_800),
-                username: Some("alice_example".to_string()),
-                unread_count: Some(7),
-                marked_as_unread: Some(true),
-                ..Default::default()
+            {
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = "559900000004@s.whatsapp.net".to_string();
+                constructed.conversation_timestamp = Some(1_700_000_500);
+                constructed.mute_end_time = Some(1_800_000_000);
+                constructed.pinned = Some(1_700_000_800);
+                constructed.username = Some("alice_example".to_string());
+                constructed.unread_count = Some(7);
+                constructed.marked_as_unread = Some(true);
+                constructed
             },
-            wa::Conversation {
-                id: PEER.to_string(),
-                name: Some("Alice".into()),
-                conversation_timestamp: Some(1_700_000_900),
-                unread_count: Some(0),
-                messages: vec![
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(make_wmi(
+            {
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.to_string();
+                constructed.name = Some("Alice".into());
+                constructed.conversation_timestamp = Some(1_700_000_900);
+                constructed.unread_count = Some(0);
+                constructed.messages = vec![
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message = MessageField::some(make_wmi(
                             "MSG-H1",
                             false,
                             1_700_000_000,
                             "stale history copy",
-                        )),
-                        ..Default::default()
+                        ));
+                        constructed
                     },
-                    wa::HistorySyncMsg {
-                        message: MessageField::some(make_wmi(
-                            "MSG-H2",
-                            true,
-                            1_700_000_900,
-                            "sent",
-                        )),
-                        ..Default::default()
+                    {
+                        let mut constructed: wa::HistorySyncMsg = Default::default();
+                        constructed.message =
+                            MessageField::some(make_wmi("MSG-H2", true, 1_700_000_900, "sent"));
+                        constructed
                     },
-                ],
-                ..Default::default()
+                ];
+                constructed
             },
-        ],
-        pushnames: vec![wa::Pushname {
-            id: Some("559900000003@s.whatsapp.net".into()),
-            pushname: Some("Bob Example".into()),
-        }],
-        ..Default::default()
+        ];
+        constructed.pushnames = vec![{
+            let mut constructed: wa::Pushname = Default::default();
+            constructed.id = Some("559900000003@s.whatsapp.net".into());
+            constructed.pushname = Some("Bob Example".into());
+            constructed
+        }];
+        constructed
     };
 
     feed(&chat_store, [history_sync_event(history)]).await;
@@ -409,18 +421,21 @@ async fn history_hydration_costs() {
             // query was spending a pooled read to discover.
             if m % 10 == 0 {
                 events.push(message_event(
-                    wa::Message {
-                        reaction_message: MessageField::some(wa::message::ReactionMessage {
-                            key: MessageField::some(wa::MessageKey {
-                                id: Some(id.clone()),
-                                remote_jid: Some(chat.clone()),
-                                from_me: Some(false),
-                                ..Default::default()
-                            }),
-                            text: Some("👍".into()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
+                    {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.reaction_message = MessageField::some({
+                            let mut constructed: wa::message::ReactionMessage = Default::default();
+                            constructed.key = MessageField::some({
+                                let mut constructed: wa::MessageKey = Default::default();
+                                constructed.id = Some(id.clone());
+                                constructed.remote_jid = Some(chat.clone());
+                                constructed.from_me = Some(false);
+                                constructed
+                            });
+                            constructed.text = Some("👍".into());
+                            constructed
+                        });
+                        constructed
                     },
                     incoming_info(&chat, &chat, &format!("R-{c}-{m}"), 1_700_000_100),
                 ));
@@ -560,15 +575,17 @@ async fn history_without_name_does_not_erase_existing_name() {
     );
 
     // A history chunk for the same conversation carries no name at all.
-    let history = wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![wa::Conversation {
-            id: GROUP.to_string(),
-            conversation_timestamp: Some(1_700_000_100),
-            unread_count: Some(0),
-            ..Default::default()
-        }],
-        ..Default::default()
+    let history = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = GROUP.to_string();
+            constructed.conversation_timestamp = Some(1_700_000_100);
+            constructed.unread_count = Some(0);
+            constructed
+        }];
+        constructed
     };
     feed(&chat_store, [history_sync_event(history)]).await;
     assert_eq!(
@@ -584,16 +601,18 @@ async fn history_without_name_does_not_erase_existing_name() {
     );
 
     // And a chunk that does carry a name still updates over it.
-    let renamed = wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![wa::Conversation {
-            id: GROUP.to_string(),
-            name: Some("Trip planning v2".into()),
-            conversation_timestamp: Some(1_700_000_200),
-            unread_count: Some(0),
-            ..Default::default()
-        }],
-        ..Default::default()
+    let renamed = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = GROUP.to_string();
+            constructed.name = Some("Trip planning v2".into());
+            constructed.conversation_timestamp = Some(1_700_000_200);
+            constructed.unread_count = Some(0);
+            constructed
+        }];
+        constructed
     };
     feed(&chat_store, [history_sync_event(renamed)]).await;
     assert_eq!(

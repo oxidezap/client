@@ -203,11 +203,14 @@ async fn nameless_verified_cert_creates_no_contact_row() {
 async fn a_vote_does_not_raise_an_unclearable_badge() {
     let (_store, chat_store) = test_store().await;
 
-    let vote = wa::Message {
-        poll_update_message: MessageField::some(wa::message::PollUpdateMessage {
-            ..Default::default()
-        }),
-        ..Default::default()
+    let vote = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.poll_update_message = MessageField::some({
+            let mut constructed: wa::message::PollUpdateMessage = Default::default();
+
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -232,11 +235,14 @@ async fn a_vote_does_not_raise_an_unclearable_badge() {
 async fn a_wrapped_message_is_still_the_message_inside_it() {
     let (_store, chat_store) = test_store().await;
 
-    let wrapped = wa::Message {
-        group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
-            message: MessageField::some(wa::Message::text("bom dia")),
-        }),
-        ..Default::default()
+    let wrapped = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.group_mentioned_message = MessageField::some({
+            let mut constructed: wa::message::FutureProofMessage = Default::default();
+            constructed.message = MessageField::some(wa::Message::text("bom dia"));
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,

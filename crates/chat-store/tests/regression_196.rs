@@ -9,18 +9,21 @@ use diesel::QueryableByName;
 use diesel::sql_types::{Integer, Nullable};
 
 fn reply(text: &str, parent: &str) -> wa::Message {
-    wa::Message {
-        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
-            text: Some(text.into()),
-            context_info: MessageField::some(wa::ContextInfo {
-                stanza_id: Some(parent.into()),
-                participant: Some(PEER.into()),
-                quoted_message: MessageField::some(wa::Message::text("parent")),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = MessageField::some({
+            let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+            constructed.text = Some(text.into());
+            constructed.context_info = MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some(parent.into());
+                constructed.participant = Some(PEER.into());
+                constructed.quoted_message = MessageField::some(wa::Message::text("parent"));
+                constructed
+            });
+            constructed
+        });
+        constructed
     }
 }
 
@@ -132,17 +135,20 @@ async fn pending_media_read_rehydrates_a_proven_compacted_quote() {
         )],
     )
     .await;
-    let media_reply = wa::Message {
-        image_message: MessageField::some(wa::message::ImageMessage {
-            context_info: MessageField::some(wa::ContextInfo {
-                stanza_id: Some("P".into()),
-                participant: Some(PEER.into()),
-                quoted_message: MessageField::some(wa::Message::text("parent")),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let media_reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.image_message = MessageField::some({
+            let mut constructed: wa::message::ImageMessage = Default::default();
+            constructed.context_info = MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some("P".into());
+                constructed.participant = Some(PEER.into());
+                constructed.quoted_message = MessageField::some(wa::Message::text("parent"));
+                constructed
+            });
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
