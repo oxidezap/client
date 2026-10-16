@@ -59,20 +59,22 @@ impl WhatsAppClient {
                 if !mentioned.is_empty() {
                     context.mentioned_jid = mentioned;
                 }
-                wa::Message {
-                    extended_text_message: whatsapp_rust::buffa::MessageField::some(
-                        wa::message::ExtendedTextMessage {
-                            text: Some(text.clone()),
-                            context_info: whatsapp_rust::buffa::MessageField::some(context),
-                            ..Default::default()
-                        },
-                    ),
-                    ..Default::default()
+                {
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.extended_text_message = whatsapp_rust::buffa::MessageField::some({
+                        let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+                        constructed.text = Some(text.clone());
+                        constructed.context_info =
+                            whatsapp_rust::buffa::MessageField::some(context);
+                        constructed
+                    });
+                    constructed
                 }
             } else {
-                wa::Message {
-                    conversation: Some(text.clone()),
-                    ..Default::default()
+                {
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.conversation = Some(text.clone());
+                    constructed
                 }
             };
 
@@ -81,19 +83,22 @@ impl WhatsAppClient {
             admit_announced_outgoing(
                 &live.chat_store,
                 &chat,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
                 announce,
             )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(chat.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
             {
-                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Ok(_) => Ok((
+                    msg_id.into_string(),
+                    whatsapp_rust::wacore::time::now_millis(),
+                )),
                 Err(e) => {
-                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    super::mark_send_failed(&live.chat_store, &chat, msg_id.as_str());
                     Err(e.to_string())
                 }
             }
@@ -164,18 +169,21 @@ impl WhatsAppClient {
             super::record_outgoing(
                 &live.chat_store,
                 &chat,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
             )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(chat.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
             {
-                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Ok(_) => Ok((
+                    msg_id.into_string(),
+                    whatsapp_rust::wacore::time::now_millis(),
+                )),
                 Err(e) => {
-                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    super::mark_send_failed(&live.chat_store, &chat, msg_id.as_str());
                     Err(e.to_string())
                 }
             }
@@ -218,39 +226,42 @@ impl WhatsAppClient {
                 Ok(response) => response,
                 Err(e) => return Err(e.to_string()),
             };
-            let message = wa::Message {
-                audio_message: whatsapp_rust::buffa::MessageField::some(
-                    wa::message::AudioMessage {
-                        url: Some(upload.url),
-                        direct_path: Some(upload.direct_path),
-                        media_key: Some(upload.media_key.to_vec()),
-                        file_sha256: Some(upload.file_sha256.to_vec()),
-                        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
-                        file_length: Some(upload.file_length),
-                        mimetype: Some("audio/ogg; codecs=opus".to_string()),
-                        seconds: Some(0),
-                        ptt: Some(ptt),
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
+            let message = {
+                let mut constructed: wa::Message = Default::default();
+                constructed.audio_message = whatsapp_rust::buffa::MessageField::some({
+                    let mut constructed: wa::message::AudioMessage = Default::default();
+                    constructed.url = Some(upload.url);
+                    constructed.direct_path = Some(upload.direct_path);
+                    constructed.media_key = Some(upload.media_key.to_vec());
+                    constructed.file_sha256 = Some(upload.file_sha256.to_vec());
+                    constructed.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
+                    constructed.file_length = Some(upload.file_length);
+                    constructed.mimetype = Some("audio/ogg; codecs=opus".to_string());
+                    constructed.seconds = Some(0);
+                    constructed.ptt = Some(ptt);
+                    constructed
+                });
+                constructed
             };
             let msg_id = client.generate_message_id();
             super::record_outgoing(
                 &live.chat_store,
                 &chat,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
             )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(chat.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
             {
-                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Ok(_) => Ok((
+                    msg_id.into_string(),
+                    whatsapp_rust::wacore::time::now_millis(),
+                )),
                 Err(e) => {
-                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    super::mark_send_failed(&live.chat_store, &chat, msg_id.as_str());
                     Err(e.to_string())
                 }
             }
@@ -289,37 +300,40 @@ impl WhatsAppClient {
                 Ok(response) => response,
                 Err(e) => return Err(e.to_string()),
             };
-            let message = wa::Message {
-                sticker_message: whatsapp_rust::buffa::MessageField::some(
-                    wa::message::StickerMessage {
-                        url: Some(upload.url),
-                        direct_path: Some(upload.direct_path),
-                        media_key: Some(upload.media_key.to_vec()),
-                        file_sha256: Some(upload.file_sha256.to_vec()),
-                        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
-                        file_length: Some(upload.file_length),
-                        mimetype: Some("image/webp".to_string()),
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
+            let message = {
+                let mut constructed: wa::Message = Default::default();
+                constructed.sticker_message = whatsapp_rust::buffa::MessageField::some({
+                    let mut constructed: wa::message::StickerMessage = Default::default();
+                    constructed.url = Some(upload.url);
+                    constructed.direct_path = Some(upload.direct_path);
+                    constructed.media_key = Some(upload.media_key.to_vec());
+                    constructed.file_sha256 = Some(upload.file_sha256.to_vec());
+                    constructed.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
+                    constructed.file_length = Some(upload.file_length);
+                    constructed.mimetype = Some("image/webp".to_string());
+                    constructed
+                });
+                constructed
             };
             let msg_id = client.generate_message_id();
             super::record_outgoing(
                 &live.chat_store,
                 &chat,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
             )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(chat.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
             {
-                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Ok(_) => Ok((
+                    msg_id.into_string(),
+                    whatsapp_rust::wacore::time::now_millis(),
+                )),
                 Err(e) => {
-                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    super::mark_send_failed(&live.chat_store, &chat, msg_id.as_str());
                     Err(e.to_string())
                 }
             }
@@ -462,19 +476,24 @@ mod announcement_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn wire_id_announcement_requires_successful_outgoing_admission() {
         for mode in ["accepted", "full", "stopped"] {
-            let backend = SqliteStore::new(&format!(
+            let backend = SqliteStore::open(&format!(
                 "file:wire-announcement-{mode}-{}?mode=memory&cache=shared",
                 std::process::id()
             ))
             .await
             .unwrap();
-            backend.create_new_device().await.unwrap();
+            backend
+                .database()
+                .provision_device(backend.device_id())
+                .await
+                .unwrap();
             let store = ChatStore::new(&backend).await.unwrap();
             let chat: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
             let names = super::super::chat_names::ChatNameResolveSignal::new();
-            let message = wa::Message {
-                conversation: Some("synthetic queued send".into()),
-                ..Default::default()
+            let message = {
+                let mut constructed: wa::Message = Default::default();
+                constructed.conversation = Some("synthetic queued send".into());
+                constructed
             };
             if mode == "full" {
                 for index in 0..1024 {

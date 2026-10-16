@@ -16,13 +16,15 @@ use wacore::store::traits::{MsgSecretEntry, MsgSecretStore};
 async fn poll_pages_continue_past_unsupported_variants() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
-    let supported = wa::Message {
-        poll_creation_message_v3: buffa::MessageField::some(Default::default()),
-        ..Default::default()
+    let supported = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.poll_creation_message_v3 = buffa::MessageField::some(Default::default());
+        constructed
     };
-    let unsupported = wa::Message {
-        poll_creation_message_v5: buffa::MessageField::some(Default::default()),
-        ..Default::default()
+    let unsupported = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.poll_creation_message_v5 = buffa::MessageField::some(Default::default());
+        constructed
     };
     chat_store
         .record_outgoing(&chat, "POLL-LEGACY", &supported, ts(1_700_000_100))

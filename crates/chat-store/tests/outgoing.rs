@@ -14,34 +14,30 @@ async fn wrapped_and_new_poll_kinds_are_classified_on_outgoing_write() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
     for (id, message) in [
-        (
-            "OUT-V4",
-            wa::Message {
-                poll_creation_message_v4: buffa::MessageField::some(
-                    wa::message::FutureProofMessage {
-                        message: buffa::MessageField::some(wa::Message {
-                            poll_creation_message_v3: buffa::MessageField::some(Default::default()),
-                            ..Default::default()
-                        }),
-                    },
-                ),
-                ..Default::default()
-            },
-        ),
-        (
-            "OUT-V5",
-            wa::Message {
-                poll_creation_message_v5: buffa::MessageField::some(Default::default()),
-                ..Default::default()
-            },
-        ),
-        (
-            "OUT-V6",
-            wa::Message {
-                poll_creation_message_v6: buffa::MessageField::some(Default::default()),
-                ..Default::default()
-            },
-        ),
+        ("OUT-V4", {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v4 = buffa::MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = buffa::MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.poll_creation_message_v3 =
+                        buffa::MessageField::some(Default::default());
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        }),
+        ("OUT-V5", {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v5 = buffa::MessageField::some(Default::default());
+            constructed
+        }),
+        ("OUT-V6", {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v6 = buffa::MessageField::some(Default::default());
+            constructed
+        }),
     ] {
         chat_store
             .record_outgoing(&chat, id, &message, ts(1_700_000_100))
@@ -58,9 +54,10 @@ async fn wrapped_and_new_poll_kinds_are_classified_on_outgoing_write() {
 async fn prepare_repairs_recoverable_unknown_kind_idempotently() {
     let (store, chat_store) = test_store().await;
     let chat = jid(PEER);
-    let poll = wa::Message {
-        poll_creation_message_v5: buffa::MessageField::some(Default::default()),
-        ..Default::default()
+    let poll = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.poll_creation_message_v5 = buffa::MessageField::some(Default::default());
+        constructed
     };
     chat_store
         .record_outgoing(&chat, "OUT-REPAIR-POLL", &poll, ts(1_700_000_100))

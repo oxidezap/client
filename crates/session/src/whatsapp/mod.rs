@@ -94,9 +94,7 @@ use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingC
 use whatsapp_rust::wacore::types::events::{
     ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
 };
-use whatsapp_rust::wacore::types::presence::{
-    ChatPresence as WaChatPresence, ChatPresenceMedia, ReceiptType,
-};
+use whatsapp_rust::wacore::types::presence::{ChatActivity, PresenceStatus, ReceiptType};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 use whatsapp_rust::waproto::whatsapp as wa;
 #[cfg(all(test, target_family = "wasm"))]
@@ -1521,9 +1519,9 @@ impl WhatsAppClient {
             _ = shutdown.notified() => {
                 // Graceful stop: flushes state and closes the transport. The
                 // dropped run future is not awaited out instead, because a
-                // disconnect() landing before run()'s first poll would be
+                // shutdown() landing before run()'s first poll would be
                 // clobbered by run's own is_running swap.
-                client.disconnect().await;
+                client.shutdown().await;
             }
         }
     }
@@ -2012,11 +2010,10 @@ impl WhatsAppClient {
                     return;
                 }
                 let composing = match update.state {
-                    WaChatPresence::Composing => Some(match update.media {
-                        ChatPresenceMedia::Audio => ComposingKind::Audio,
-                        ChatPresenceMedia::Text => ComposingKind::Text,
-                    }),
-                    WaChatPresence::Paused => None,
+                    ChatActivity::Typing => Some(ComposingKind::Text),
+                    ChatActivity::RecordingAudio => Some(ComposingKind::Audio),
+                    ChatActivity::Idle => None,
+                    _ => return,
                 };
                 // Same rule as the receipt above: a typing line is drawn on
                 // a conversation somebody is looking at, and a guessed key
@@ -2052,12 +2049,12 @@ impl WhatsAppClient {
                 });
             }
             Event::Presence(update) => {
-                let availability = if update.unavailable {
-                    update
+                let availability = match update.status {
+                    PresenceStatus::Available => Availability::Online,
+                    PresenceStatus::Unavailable => update
                         .last_seen
-                        .map_or(Availability::Unknown, Availability::LastSeen)
-                } else {
-                    Availability::Online
+                        .map_or(Availability::Unknown, Availability::LastSeen),
+                    _ => Availability::Unknown,
                 };
                 // Keyed like the receipt and chat-presence branches beside
                 // it: a chat whose JID was migrated from a phone number to a
@@ -2514,22 +2511,24 @@ impl WhatsAppClient {
                 // wire carries as an extended text message: a bare
                 // `conversation` has nowhere to put the context.
                 let message = match &quoted {
-                    Some(quoted) => wa::Message {
-                        extended_text_message: whatsapp_rust::buffa::MessageField::some(
-                            wa::message::ExtendedTextMessage {
-                                text: Some(content.clone()),
-                                context_info: whatsapp_rust::buffa::MessageField::some(
-                                    quote_context(quoted),
-                                ),
-                                ..Default::default()
-                            },
-                        ),
-                        ..Default::default()
-                    },
-                    None => wa::Message {
-                        conversation: Some(content.clone()),
-                        ..Default::default()
-                    },
+                    Some(quoted) => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.extended_text_message =
+                            whatsapp_rust::buffa::MessageField::some({
+                                let mut constructed: wa::message::ExtendedTextMessage =
+                                    Default::default();
+                                constructed.text = Some(content.clone());
+                                constructed.context_info =
+                                    whatsapp_rust::buffa::MessageField::some(quote_context(quoted));
+                                constructed
+                            });
+                        constructed
+                    }
+                    None => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.conversation = Some(content.clone());
+                        constructed
+                    }
                 };
 
                 // Record BEFORE sending: the server ack event fires during
@@ -2538,20 +2537,20 @@ impl WhatsAppClient {
                 let msg_id = client.generate_message_id();
                 // Receipts/reactions arrive keyed by this id; rename the
                 // optimistic bubble before they can race it.
-                notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
+                notify_message_id(&ui_sender, &jid_str, local_id, msg_id.as_str());
                 if let Err(error) = record_outgoing(
                     &live.chat_store,
                     &jid,
-                    &msg_id,
+                    msg_id.as_str(),
                     &message,
                     &live.resolve_chat_names,
                 ) {
-                    notify_send_failed(&ui_sender, &jid_str, &msg_id, error);
+                    notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), error);
                     return;
                 }
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
-                    .send_message_with_options(jid.clone(), message, options)
+                    .send(whatsapp_rust::SendRequest::new(&jid, message).with_options(options))
                     .await
                 {
                     Ok(result) => {
@@ -2559,8 +2558,8 @@ impl WhatsAppClient {
                     }
                     Err(e) => {
                         error!("Failed to send message {}: {}", msg_id, e);
-                        mark_send_failed(&live.chat_store, &jid, &msg_id);
-                        notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string());
+                        mark_send_failed(&live.chat_store, &jid, msg_id.as_str());
+                        notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), e.to_string());
                     }
                 }
             } else {
@@ -2597,7 +2596,13 @@ impl WhatsAppClient {
                     "Downloading media: {} bytes expected",
                     downloadable.file_length
                 );
-                match client.download(&downloadable).await {
+                match client
+                    .download(
+                        &downloadable,
+                        whatsapp_rust::download::DownloadLimits::default(),
+                    )
+                    .await
+                {
                     Ok(data) => {
                         info!("Media downloaded successfully: {} bytes", data.len());
                         let _ = tx.send(Ok(data));
@@ -2665,58 +2670,61 @@ impl WhatsAppClient {
 
                 info!("Audio uploaded successfully");
 
-                let audio_message = wa::message::AudioMessage {
-                    url: Some(upload_result.url),
-                    direct_path: Some(upload_result.direct_path),
-                    media_key: Some(upload_result.media_key.to_vec()),
-                    file_sha256: Some(upload_result.file_sha256.to_vec()),
-                    file_enc_sha256: Some(upload_result.file_enc_sha256.to_vec()),
-                    file_length: Some(upload_result.file_length),
-                    mimetype: Some("audio/ogg; codecs=opus".to_string()),
-                    seconds: Some(duration_secs),
-                    ptt: Some(true), // This marks it as a voice message
-                    waveform: Some(waveform),
-                    ..Default::default()
+                let audio_message = {
+                    let mut constructed: wa::message::AudioMessage = Default::default();
+                    constructed.url = Some(upload_result.url);
+                    constructed.direct_path = Some(upload_result.direct_path);
+                    constructed.media_key = Some(upload_result.media_key.to_vec());
+                    constructed.file_sha256 = Some(upload_result.file_sha256.to_vec());
+                    constructed.file_enc_sha256 = Some(upload_result.file_enc_sha256.to_vec());
+                    constructed.file_length = Some(upload_result.file_length);
+                    constructed.mimetype = Some("audio/ogg; codecs=opus".to_string());
+                    constructed.seconds = Some(duration_secs);
+                    // This marks it as a voice message
+                    constructed.ptt = Some(true);
+                    constructed.waveform = Some(waveform);
+                    constructed
                 };
 
                 // Quoted the same way the text path does it, because a voice
                 // note answering a message is a reply — the recipient should
                 // see the quote bar over it, not a bare note.
                 let message = match &quoted {
-                    Some(quoted) => wa::Message {
-                        audio_message: whatsapp_rust::buffa::MessageField::some(
-                            wa::message::AudioMessage {
-                                context_info: whatsapp_rust::buffa::MessageField::some(
-                                    quote_context(quoted),
-                                ),
-                                ..audio_message
-                            },
-                        ),
-                        ..Default::default()
-                    },
-                    None => wa::Message {
-                        audio_message: whatsapp_rust::buffa::MessageField::some(audio_message),
-                        ..Default::default()
-                    },
+                    Some(quoted) => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.audio_message = whatsapp_rust::buffa::MessageField::some({
+                            let mut constructed: wa::message::AudioMessage = audio_message;
+                            constructed.context_info =
+                                whatsapp_rust::buffa::MessageField::some(quote_context(quoted));
+                            constructed
+                        });
+                        constructed
+                    }
+                    None => {
+                        let mut constructed: wa::Message = Default::default();
+                        constructed.audio_message =
+                            whatsapp_rust::buffa::MessageField::some(audio_message);
+                        constructed
+                    }
                 };
 
                 // Same ordering as the text path: record before sending so
                 // the ack can't precede the row in the writer queue.
                 let msg_id = client.generate_message_id();
-                notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
+                notify_message_id(&ui_sender, &jid_str, local_id, msg_id.as_str());
                 if let Err(error) = record_outgoing(
                     &live.chat_store,
                     &jid,
-                    &msg_id,
+                    msg_id.as_str(),
                     &message,
                     &live.resolve_chat_names,
                 ) {
-                    notify_send_failed(&ui_sender, &jid_str, &msg_id, error);
+                    notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), error);
                     return;
                 }
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
-                    .send_message_with_options(jid.clone(), message, options)
+                    .send(whatsapp_rust::SendRequest::new(&jid, message).with_options(options))
                     .await
                 {
                     Ok(result) => {
@@ -2724,8 +2732,8 @@ impl WhatsAppClient {
                     }
                     Err(e) => {
                         error!("Failed to send audio message {}: {}", msg_id, e);
-                        mark_send_failed(&live.chat_store, &jid, &msg_id);
-                        notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string());
+                        mark_send_failed(&live.chat_store, &jid, msg_id.as_str());
+                        notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), e.to_string());
                     }
                 }
             } else {
@@ -2853,20 +2861,20 @@ impl WhatsAppClient {
             // Same ordering as the text path: record before sending so
             // the ack can't precede the row in the writer queue.
             let msg_id = client.generate_message_id();
-            notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
+            notify_message_id(&ui_sender, &jid_str, local_id, msg_id.as_str());
             if let Err(error) = record_outgoing(
                 &live.chat_store,
                 &jid,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
             ) {
-                notify_send_failed(&ui_sender, &jid_str, &msg_id, error);
+                notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), error);
                 return;
             }
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(jid.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&jid, message).with_options(options))
                 .await
             {
                 Ok(result) => {
@@ -2874,8 +2882,8 @@ impl WhatsAppClient {
                 }
                 Err(e) => {
                     error!("Failed to send media message {}: {}", msg_id, e);
-                    mark_send_failed(&live.chat_store, &jid, &msg_id);
-                    notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string());
+                    mark_send_failed(&live.chat_store, &jid, msg_id.as_str());
+                    notify_send_failed(&ui_sender, &jid_str, msg_id.as_str(), e.to_string());
                 }
             }
         })
@@ -3281,19 +3289,24 @@ mod outgoing_admission_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn refusing_an_outgoing_send_preserves_previously_admitted_rows() {
-        let backend = SqliteStore::new(&format!(
+        let backend = SqliteStore::open(&format!(
             "file:session-outgoing-admission-{}?mode=memory&cache=shared",
             std::process::id()
         ))
         .await
         .unwrap();
-        backend.create_new_device().await.unwrap();
+        backend
+            .database()
+            .provision_device(backend.device_id())
+            .await
+            .unwrap();
         let store = ChatStore::new(&backend).await.unwrap();
         let chat: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
         let names = chat_names::ChatNameResolveSignal::new();
-        let message = wa::Message {
-            conversation: Some("synthetic pending send".to_string()),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some("synthetic pending send".to_string());
+            constructed
         };
         // No await inside the loop: the current-thread writer cannot drain
         // its bounded channel before this producer reaches admission refusal.

@@ -27,9 +27,10 @@ async fn alias_reconcile_keeps_explicit_unmute_and_unarchive_over_history() {
                 wacore::types::events::MuteUpdate::builder()
                     .jid(jid(PEER))
                     .timestamp(ts(1_700_000_001))
-                    .action(Box::new(wa::sync_action_value::MuteAction {
-                        muted: Some(false),
-                        ..Default::default()
+                    .action(Box::new({
+                        let mut constructed: wa::sync_action_value::MuteAction = Default::default();
+                        constructed.muted = Some(false);
+                        constructed
                     }))
                     .from_full_sync(false)
                     .build(),
@@ -38,9 +39,11 @@ async fn alias_reconcile_keeps_explicit_unmute_and_unarchive_over_history() {
                 wacore::types::events::ArchiveUpdate::builder()
                     .jid(jid(PEER))
                     .timestamp(ts(1_700_000_001))
-                    .action(Box::new(wa::sync_action_value::ArchiveChatAction {
-                        archived: Some(false),
-                        ..Default::default()
+                    .action(Box::new({
+                        let mut constructed: wa::sync_action_value::ArchiveChatAction =
+                            Default::default();
+                        constructed.archived = Some(false);
+                        constructed
                     }))
                     .from_full_sync(false)
                     .build(),
@@ -49,16 +52,18 @@ async fn alias_reconcile_keeps_explicit_unmute_and_unarchive_over_history() {
                 wa::Message::text("newer LID side"),
                 incoming_info(PEER_LID, PEER_LID, "MSG-LID-PREF", 1_700_000_100),
             ),
-            history_sync_event(wa::HistorySync {
-                sync_type: wa::history_sync::HistorySyncType::RECENT,
-                conversations: vec![wa::Conversation {
-                    id: PEER_LID.into(),
-                    conversation_timestamp: Some(1_700_000_100),
-                    mute_end_time: Some(1_900_000_000),
-                    archived: Some(true),
-                    ..Default::default()
-                }],
-                ..Default::default()
+            history_sync_event({
+                let mut constructed: wa::HistorySync = Default::default();
+                constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+                constructed.conversations = vec![{
+                    let mut constructed: wa::Conversation = Default::default();
+                    constructed.id = PEER_LID.into();
+                    constructed.conversation_timestamp = Some(1_700_000_100);
+                    constructed.mute_end_time = Some(1_900_000_000);
+                    constructed.archived = Some(true);
+                    constructed
+                }];
+                constructed
             }),
         ],
     )
@@ -328,8 +333,10 @@ async fn reconcile_merges_split_pair() {
                 wacore::types::events::PinUpdate::builder()
                     .jid(jid(PEER))
                     .timestamp(ts(1_700_000_050))
-                    .action(Box::new(wa::sync_action_value::PinAction {
-                        pinned: Some(true),
+                    .action(Box::new({
+                        let mut constructed: wa::sync_action_value::PinAction = Default::default();
+                        constructed.pinned = Some(true);
+                        constructed
                     }))
                     .from_full_sync(false)
                     .build(),
@@ -418,16 +425,19 @@ async fn a_removal_that_ties_with_its_reaction_survives_the_merge() {
     // second.
     let react = |chat: &str, emoji: &str, id: &str| {
         message_event(
-            wa::Message {
-                reaction_message: MessageField::some(wa::message::ReactionMessage {
-                    key: MessageField::some(wa::MessageKey {
-                        id: Some("MSG-TIE".into()),
-                        ..Default::default()
-                    }),
-                    text: Some(emoji.into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.reaction_message = MessageField::some({
+                    let mut constructed: wa::message::ReactionMessage = Default::default();
+                    constructed.key = MessageField::some({
+                        let mut constructed: wa::MessageKey = Default::default();
+                        constructed.id = Some("MSG-TIE".into());
+                        constructed
+                    });
+                    constructed.text = Some(emoji.into());
+                    constructed
+                });
+                constructed
             },
             incoming_info(chat, alice, id, 1_700_000_010),
         )
@@ -663,16 +673,19 @@ async fn merge_folds_a_reactor_split_across_their_identities() {
 
     let react = |chat: &str, emoji: &str, id: &str, ts: i64| {
         message_event(
-            wa::Message {
-                reaction_message: MessageField::some(wa::message::ReactionMessage {
-                    key: MessageField::some(wa::MessageKey {
-                        id: Some("MSG-RX".into()),
-                        ..Default::default()
-                    }),
-                    text: Some(emoji.into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.reaction_message = MessageField::some({
+                    let mut constructed: wa::message::ReactionMessage = Default::default();
+                    constructed.key = MessageField::some({
+                        let mut constructed: wa::MessageKey = Default::default();
+                        constructed.id = Some("MSG-RX".into());
+                        constructed
+                    });
+                    constructed.text = Some(emoji.into());
+                    constructed
+                });
+                constructed
             },
             incoming_info(chat, chat, id, ts),
         )
@@ -725,16 +738,19 @@ async fn a_withdrawal_beats_its_reaction_in_the_same_tick() {
 
     let react = |chat: &str, emoji: &str, id: &str| {
         message_event(
-            wa::Message {
-                reaction_message: MessageField::some(wa::message::ReactionMessage {
-                    key: MessageField::some(wa::MessageKey {
-                        id: Some("MSG-TIE".into()),
-                        ..Default::default()
-                    }),
-                    text: Some(emoji.into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.reaction_message = MessageField::some({
+                    let mut constructed: wa::message::ReactionMessage = Default::default();
+                    constructed.key = MessageField::some({
+                        let mut constructed: wa::MessageKey = Default::default();
+                        constructed.id = Some("MSG-TIE".into());
+                        constructed
+                    });
+                    constructed.text = Some(emoji.into());
+                    constructed
+                });
+                constructed
             },
             // The same second on both, which is the tie.
             incoming_info(chat, chat, id, 1_700_000_010),
@@ -907,19 +923,22 @@ async fn lid_reaction_reaches_pn_keyed_message() {
     .await;
     add_lid_mapping(&store).await;
 
-    let reaction = wa::Message {
-        reaction_message: MessageField::some(wa::message::ReactionMessage {
-            key: MessageField::some(wa::MessageKey {
-                remote_jid: Some(PEER_LID.to_string()),
-                from_me: Some(false),
-                id: Some("MSG-R1".to_string()),
-                ..Default::default()
-            }),
-            text: Some("👍".to_string()),
-            sender_timestamp_ms: Some(1_700_000_100_000),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let reaction = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.reaction_message = MessageField::some({
+            let mut constructed: wa::message::ReactionMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.remote_jid = Some(PEER_LID.to_string());
+                constructed.from_me = Some(false);
+                constructed.id = Some("MSG-R1".to_string());
+                constructed
+            });
+            constructed.text = Some("👍".to_string());
+            constructed.sender_timestamp_ms = Some(1_700_000_100_000);
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -962,17 +981,21 @@ async fn merge_folds_src_side_edit_and_revoke() {
         .await;
     }
     // Edit and revoke land only on the LID side.
-    let edit = wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some("MSG-ED".into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-            edited_message: MessageField::from_box(Box::new(wa::Message::text("consertada"))),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let edit = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-ED".into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+            constructed.edited_message =
+                MessageField::from_box(Box::new(wa::Message::text("consertada")));
+            constructed
+        });
+        constructed
     };
     let revoke = revoke("MSG-RV");
     feed(
@@ -1041,17 +1064,20 @@ async fn merge_keeps_strictly_newer_edit_across_sides() {
         )
         .await;
     }
-    let edit = |target: &str, text: &str| wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some(target.into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-            edited_message: MessageField::from_box(Box::new(wa::Message::text(text))),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let edit = |target: &str, text: &str| {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some(target.into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+            constructed.edited_message = MessageField::from_box(Box::new(wa::Message::text(text)));
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,

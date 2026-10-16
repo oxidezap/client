@@ -264,29 +264,33 @@ async fn an_empty_chat_has_no_oldest_message() {
 async fn an_impossible_timestamp_does_not_stop_the_chat_list() {
     let (_store, chat_store) = test_store().await;
 
-    let history = wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![
-            wa::Conversation {
-                id: "559900000004@s.whatsapp.net".to_string(),
+    let history = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![
+            {
                 // Above `i64::MAX`, so the cast wraps: a timestamp far in
                 // the future arriving as one far in the past is the same
                 // corrupt cursor by the other route.
-                conversation_timestamp: Some(u64::MAX),
-                ..Default::default()
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = "559900000004@s.whatsapp.net".to_string();
+                constructed.conversation_timestamp = Some(u64::MAX);
+                constructed
             },
-            wa::Conversation {
-                id: PEER.to_string(),
-                conversation_timestamp: Some(1_700_000_900),
-                ..Default::default()
+            {
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = PEER.to_string();
+                constructed.conversation_timestamp = Some(1_700_000_900);
+                constructed
             },
-            wa::Conversation {
-                id: GROUP.to_string(),
-                conversation_timestamp: Some(u64::MAX / 2),
-                ..Default::default()
+            {
+                let mut constructed: wa::Conversation = Default::default();
+                constructed.id = GROUP.to_string();
+                constructed.conversation_timestamp = Some(u64::MAX / 2);
+                constructed
             },
-        ],
-        ..Default::default()
+        ];
+        constructed
     };
     feed(&chat_store, [history_sync_event(history)]).await;
 
@@ -333,17 +337,21 @@ async fn same_millisecond_sibling_does_not_hijack_preview() {
     .await;
 
     // Editing the OLDER same-millisecond sibling must not steal the preview.
-    let edit = wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some("MSG-A1".into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-            edited_message: MessageField::from_box(Box::new(wa::Message::text("hijacked"))),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let edit = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-A1".into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+            constructed.edited_message =
+                MessageField::from_box(Box::new(wa::Message::text("hijacked")));
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -556,8 +564,10 @@ async fn chat_list_pages_across_the_pinned_boundary() {
             wacore::types::events::PinUpdate::builder()
                 .jid(jid(peer))
                 .timestamp(ts(1_700_000_500 + i as i64))
-                .action(Box::new(wa::sync_action_value::PinAction {
-                    pinned: Some(true),
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::PinAction = Default::default();
+                    constructed.pinned = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
@@ -690,27 +700,34 @@ async fn arrival_feed_surfaces_backfill_dated_before_the_last_page() {
 
     // Two years older than the live message, and it arrives now.
     let old_ts = 1_640_000_000u64;
-    let history = wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![wa::Conversation {
-            id: GROUP.to_string(),
-            messages: vec![wa::HistorySyncMsg {
-                message: MessageField::some(wa::WebMessageInfo {
-                    key: MessageField::some(wa::MessageKey {
-                        remote_jid: Some(GROUP.into()),
-                        from_me: Some(false),
-                        id: Some("BACKFILL-1".into()),
-                        participant: Some(PEER.into()),
-                    }),
-                    message: MessageField::from_box(Box::new(wa::Message::text("old"))),
-                    message_timestamp: Some(old_ts),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-        ..Default::default()
+    let history = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = GROUP.to_string();
+            constructed.messages = vec![{
+                let mut constructed: wa::HistorySyncMsg = Default::default();
+                constructed.message = MessageField::some({
+                    let mut constructed: wa::WebMessageInfo = Default::default();
+                    constructed.key = MessageField::some({
+                        let mut constructed: wa::MessageKey = Default::default();
+                        constructed.remote_jid = Some(GROUP.into());
+                        constructed.from_me = Some(false);
+                        constructed.id = Some("BACKFILL-1".into());
+                        constructed.participant = Some(PEER.into());
+                        constructed
+                    });
+                    constructed.message =
+                        MessageField::from_box(Box::new(wa::Message::text("old")));
+                    constructed.message_timestamp = Some(old_ts);
+                    constructed
+                });
+                constructed
+            }];
+            constructed
+        }];
+        constructed
     };
     feed(&chat_store, [history_sync_event(history)]).await;
 

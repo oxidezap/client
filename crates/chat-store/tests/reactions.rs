@@ -25,16 +25,19 @@ async fn reactions_add_replace_and_remove() {
 
     let react = |emoji: &str, id: &str, ts: i64| {
         message_event(
-            wa::Message {
-                reaction_message: MessageField::some(wa::message::ReactionMessage {
-                    key: MessageField::some(wa::MessageKey {
-                        id: Some("MSG-R".into()),
-                        ..Default::default()
-                    }),
-                    text: Some(emoji.into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.reaction_message = MessageField::some({
+                    let mut constructed: wa::message::ReactionMessage = Default::default();
+                    constructed.key = MessageField::some({
+                        let mut constructed: wa::MessageKey = Default::default();
+                        constructed.id = Some("MSG-R".into());
+                        constructed
+                    });
+                    constructed.text = Some(emoji.into());
+                    constructed
+                });
+                constructed
             },
             incoming_info(GROUP, alice, id, ts),
         )
@@ -67,11 +70,13 @@ async fn reactions_add_replace_and_remove() {
 async fn local_reaction_adds_replaces_and_removes_own_reaction() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(GROUP);
-    let target = wa::MessageKey {
-        remote_jid: Some(GROUP.into()),
-        from_me: Some(false),
-        id: Some("MSG-LOCAL-REACTION".into()),
-        participant: Some(PEER.into()),
+    let target = {
+        let mut constructed: wa::MessageKey = Default::default();
+        constructed.remote_jid = Some(GROUP.into());
+        constructed.from_me = Some(false);
+        constructed.id = Some("MSG-LOCAL-REACTION".into());
+        constructed.participant = Some(PEER.into());
+        constructed
     };
 
     feed(
@@ -136,11 +141,12 @@ async fn local_reaction_matches_own_group_target_without_participant() {
             ts(1_700_000_000),
         )
         .unwrap();
-    let target = wa::MessageKey {
-        remote_jid: Some(GROUP.into()),
-        from_me: Some(true),
-        id: Some(id.into()),
-        ..Default::default()
+    let target = {
+        let mut constructed: wa::MessageKey = Default::default();
+        constructed.remote_jid = Some(GROUP.into());
+        constructed.from_me = Some(true);
+        constructed.id = Some(id.into());
+        constructed
     };
 
     chat_store
@@ -188,11 +194,13 @@ async fn local_reaction_checks_the_target_author_on_id_collision() {
     )
     .await;
 
-    let target_for = |participant: &str| wa::MessageKey {
-        remote_jid: Some(GROUP.into()),
-        from_me: Some(false),
-        id: Some("REACTION-COLLISION".into()),
-        participant: Some(participant.into()),
+    let target_for = |participant: &str| {
+        let mut constructed: wa::MessageKey = Default::default();
+        constructed.remote_jid = Some(GROUP.into());
+        constructed.from_me = Some(false);
+        constructed.id = Some("REACTION-COLLISION".into());
+        constructed.participant = Some(participant.into());
+        constructed
     };
     chat_store
         .record_reaction(&chat, &target_for(mallory), "👎", ts(1_700_000_020))
@@ -231,11 +239,13 @@ async fn local_reaction_checks_the_target_author_on_id_collision() {
 async fn local_reaction_removal_blocks_stale_history_reaction() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(GROUP);
-    let target = wa::MessageKey {
-        remote_jid: Some(GROUP.into()),
-        from_me: Some(false),
-        id: Some("MSG-REACTION-TOMBSTONE".into()),
-        participant: Some(PEER.into()),
+    let target = {
+        let mut constructed: wa::MessageKey = Default::default();
+        constructed.remote_jid = Some(GROUP.into());
+        constructed.from_me = Some(false);
+        constructed.id = Some("MSG-REACTION-TOMBSTONE".into());
+        constructed.participant = Some(PEER.into());
+        constructed
     };
 
     feed(
@@ -254,29 +264,35 @@ async fn local_reaction_removal_blocks_stale_history_reaction() {
         .unwrap();
     chat_store.flush().await.unwrap();
 
-    let history = wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![wa::Conversation {
-            id: GROUP.to_string(),
-            messages: vec![wa::HistorySyncMsg {
-                message: MessageField::some(wa::WebMessageInfo {
-                    key: MessageField::some(target.clone()),
-                    reactions: vec![wa::Reaction {
-                        key: MessageField::some(wa::MessageKey {
-                            from_me: Some(true),
-                            ..target.clone()
-                        }),
-                        text: Some("👍".into()),
-                        sender_timestamp_ms: Some(1_700_000_010_000),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-        ..Default::default()
+    let history = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = GROUP.to_string();
+            constructed.messages = vec![{
+                let mut constructed: wa::HistorySyncMsg = Default::default();
+                constructed.message = MessageField::some({
+                    let mut constructed: wa::WebMessageInfo = Default::default();
+                    constructed.key = MessageField::some(target.clone());
+                    constructed.reactions = vec![{
+                        let mut constructed: wa::Reaction = Default::default();
+                        constructed.key = MessageField::some({
+                            let mut constructed: wa::MessageKey = target.clone();
+                            constructed.from_me = Some(true);
+                            constructed
+                        });
+                        constructed.text = Some("👍".into());
+                        constructed.sender_timestamp_ms = Some(1_700_000_010_000);
+                        constructed
+                    }];
+                    constructed
+                });
+                constructed
+            }];
+            constructed
+        }];
+        constructed
     };
     feed(&chat_store, [history_sync_event(history)]).await;
     assert!(
@@ -316,16 +332,19 @@ async fn stale_reaction_timestamp_does_not_replace_newer() {
     .await;
     let react = |emoji: &str, id: &str, ts: i64| {
         message_event(
-            wa::Message {
-                reaction_message: MessageField::some(wa::message::ReactionMessage {
-                    key: MessageField::some(wa::MessageKey {
-                        id: Some("MSG-RT".into()),
-                        ..Default::default()
-                    }),
-                    text: Some(emoji.into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.reaction_message = MessageField::some({
+                    let mut constructed: wa::message::ReactionMessage = Default::default();
+                    constructed.key = MessageField::some({
+                        let mut constructed: wa::MessageKey = Default::default();
+                        constructed.id = Some("MSG-RT".into());
+                        constructed
+                    });
+                    constructed.text = Some(emoji.into());
+                    constructed
+                });
+                constructed
             },
             incoming_info(PEER, PEER, id, ts),
         )

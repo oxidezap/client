@@ -102,8 +102,8 @@ fn database_dir() -> Option<std::path::PathBuf> {
 ///
 /// A real file under a real VFS, so every knob the store offers means what it
 /// says.
-pub fn settings() -> whatsapp_rust::store::SqliteStoreConfig {
-    whatsapp_rust::store::SqliteStoreConfig::default()
+pub fn settings() -> whatsapp_rust::store::SqliteDatabaseConfig {
+    whatsapp_rust::store::SqliteDatabaseConfig::default()
 }
 
 /// Open the one shared database while binding the handle to one local account.
@@ -111,10 +111,7 @@ pub async fn open_for_account(
     database_path: &str,
     account_id: AccountId,
 ) -> Result<whatsapp_rust::store::SqliteStore, StoreError> {
-    whatsapp_rust::store::SqliteStore::with_config_for_device(
-        database_path,
-        account_id.as_i32(),
-        settings(),
-    )
-    .await
+    whatsapp_rust::store::SqliteDatabase::open(database_path, settings())
+        .await
+        .map(|database| database.store(account_id.as_i32()))
 }

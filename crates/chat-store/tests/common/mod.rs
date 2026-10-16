@@ -56,12 +56,16 @@ pub async fn test_store() -> (SqliteStore, Arc<ChatStore>) {
         std::process::id(),
         id
     );
-    let store = SqliteStore::new(&db_name).await.expect("create store");
+    let store = SqliteStore::open(&db_name).await.expect("create store");
     // Production's BotBuilder creates the device row. These integration tests
     // open ChatStore directly, so create the same legacy account through the
     // public storage API before the FK cascade accepts chat rows.
     use wacore::store::traits::ProtocolStore;
-    store.create_new_device().await.expect("seed device parent");
+    store
+        .database()
+        .provision_device(store.device_id())
+        .await
+        .expect("seed device parent");
     let chat_store = ChatStore::new(&store).await.expect("create chat store");
     (store, chat_store)
 }
@@ -240,10 +244,11 @@ fn built_ack(id: &str, chat: Option<Jid>, at: Option<DateTime<Utc>>, code: Optio
 
 /// A peer sender revoke. Its key uses the sending account's perspective.
 pub fn revoke(id: &str) -> wa::Message {
-    revoke_key(wa::MessageKey {
-        id: Some(id.into()),
-        from_me: Some(true),
-        ..Default::default()
+    revoke_key({
+        let mut constructed: wa::MessageKey = Default::default();
+        constructed.id = Some(id.into());
+        constructed.from_me = Some(true);
+        constructed
     })
 }
 
@@ -251,13 +256,15 @@ pub fn revoke(id: &str) -> wa::Message {
 /// that the reader did. The store reads those to decide whose tombstone this
 /// becomes, so a test about that says the whole key.
 pub fn revoke_key(key: wa::MessageKey) -> wa::Message {
-    wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(key),
-            r#type: Some(wa::message::protocol_message::Type::REVOKE),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some(key);
+            constructed.r#type = Some(wa::message::protocol_message::Type::REVOKE);
+            constructed
+        });
+        constructed
     }
 }
 
@@ -281,9 +288,10 @@ pub fn delete_for_me(chat: Jid, id: &str, from_me: bool, at: DateTime<Utc>) -> E
 /// The range an app-state action covers: everything up to and including
 /// `ts_secs`, with no message keys listed.
 pub fn range_up_to(ts_secs: i64) -> MessageField<wa::sync_action_value::SyncActionMessageRange> {
-    MessageField::some(wa::sync_action_value::SyncActionMessageRange {
-        last_message_timestamp: Some(ts_secs),
-        ..Default::default()
+    MessageField::some({
+        let mut constructed: wa::sync_action_value::SyncActionMessageRange = Default::default();
+        constructed.last_message_timestamp = Some(ts_secs);
+        constructed
     })
 }
 
@@ -293,9 +301,11 @@ pub fn mark_read_event(chat: &str, read: bool, ts_secs: i64) -> Event {
         wacore::types::events::MarkChatAsReadUpdate::builder()
             .jid(jid(chat))
             .timestamp(ts(ts_secs))
-            .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
-                read: Some(read),
-                ..Default::default()
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
+                    Default::default();
+                constructed.read = Some(read);
+                constructed
             }))
             .from_full_sync(false)
             .build(),
@@ -309,8 +319,17 @@ pub async fn add_lid_mapping(store: &SqliteStore) {
     // The mapping table's FK needs the device row the client normally creates.
     // `test_store` already creates it for ordinary chat rows; keep this helper
     // safe when it is called after that setup.
-    if !store.device_exists(1).await.expect("check device") {
-        store.create_new_device().await.expect("create device");
+    if !store
+        .database()
+        .device_exists(1)
+        .await
+        .expect("check device")
+    {
+        store
+            .database()
+            .provision_device(store.device_id())
+            .await
+            .expect("create device");
     }
     store
         .put_lid_mapping(&LidPnMappingEntry {

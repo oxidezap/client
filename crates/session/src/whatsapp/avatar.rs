@@ -23,6 +23,7 @@ use oxidezap_chat_store::ChatStore;
 use oxidezap_core::UiEvent;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt};
+use whatsapp_rust::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
 use super::WhatsAppClient;
 use super::ui_queue::Sender as UiEventSender;
@@ -51,8 +52,6 @@ enum Lookup {
     NotFound,
     /// Permission refused (privacy restricted or not authorized).
     NotAuthorized,
-    /// Rate limit reached on WhatsApp server; retryable with backoff.
-    RateOverlimit,
     /// An unknown outcome or refusal: the previous picture stays.
     Unknown,
     /// The lookup failed. Deliberately not remembered, so a transient failure
@@ -86,7 +85,6 @@ impl Lookup {
             // fetch, so this session keeps what it had.
             Outcome::Found(_) | Outcome::Unchanged => Self::Unchanged,
             Outcome::NotFound => Self::NotFound,
-            Outcome::RateOverlimit => Self::RateOverlimit,
             Outcome::NotAuthorized => Self::NotAuthorized,
             _ => Self::Unknown,
         }
@@ -95,9 +93,7 @@ impl Lookup {
     /// Whether the fallback is worth asking, and only it.
     ///
     /// The one outcome a community parent is known to produce for the wrong
-    /// query. `RateOverlimit` is deliberately excluded: it is about this
-    /// client's request rate, not about the entity, and asking again would
-    /// spend another request against a limit already reached.
+    /// query. Rate-limit errors stay `Failed` and never trigger a second query.
     fn wants_community_fallback(&self) -> bool {
         matches!(self, Self::NotAuthorized | Self::Unknown)
     }
@@ -236,8 +232,14 @@ async fn lookup(
     let existing_id = if need_bytes { None } else { known_id };
     if jid.is_group() {
         let asked = match client
-            .groups()
-            .lookup_profile_picture(jid, true, existing_id)
+            .pictures()
+            .lookup(
+                ProfilePictureRequest::new(
+                    ProfilePictureTarget::Group(jid),
+                    ProfilePictureType::Preview,
+                )
+                .existing_id(existing_id),
+            )
             .await
         {
             Ok(outcome) => Lookup::of(outcome),
@@ -255,8 +257,14 @@ async fn lookup(
         // Not authorized, which for a community parent is what
         // `w:profile:picture` answers. Ask the `w:g2` query before giving up.
         match client
-            .groups()
-            .lookup_community_profile_picture(jid, true, existing_id)
+            .pictures()
+            .lookup(
+                ProfilePictureRequest::new(
+                    ProfilePictureTarget::Community(jid),
+                    ProfilePictureType::Preview,
+                )
+                .existing_id(existing_id),
+            )
             .await
         {
             Ok(outcome) => asked.or_community(outcome),
@@ -266,8 +274,14 @@ async fn lookup(
         }
     } else {
         match client
-            .contacts()
-            .lookup_profile_picture(jid, true, existing_id)
+            .pictures()
+            .lookup(
+                ProfilePictureRequest::new(
+                    ProfilePictureTarget::Contact(jid),
+                    ProfilePictureType::Preview,
+                )
+                .existing_id(existing_id),
+            )
             .await
         {
             Ok(outcome) => Lookup::of(outcome),
@@ -361,14 +375,6 @@ pub(super) async fn resolve(
                 ),
                 Lookup::Unchanged => {
                     resolver.mark(&jid_str, generation, AvatarResolutionState::MetadataKnown);
-                    continue;
-                }
-                Lookup::RateOverlimit => {
-                    resolver.mark_failed(&jid_str);
-                    let _ = ui_tx.send(UiEvent::AvatarFailed {
-                        jid: jid_str,
-                        retryable: true,
-                    });
                     continue;
                 }
                 Lookup::NotAuthorized | Lookup::Unknown => {

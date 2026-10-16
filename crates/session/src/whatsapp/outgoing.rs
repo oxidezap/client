@@ -747,69 +747,75 @@ pub(super) fn message(
     let caption = file.caption.clone();
 
     match file.kind {
-        OutgoingMedia::Image => wa::Message {
-            image_message: MessageField::some(wa::message::ImageMessage {
-                url,
-                direct_path,
-                media_key,
-                file_sha256,
-                file_enc_sha256,
-                file_length,
-                media_key_timestamp,
-                mimetype,
-                caption,
-                width: shape.width,
-                height: shape.height,
-                jpeg_thumbnail: shape.thumbnail,
-                context_info: context.into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        OutgoingMedia::Video => wa::Message {
-            video_message: MessageField::some(wa::message::VideoMessage {
-                url,
-                direct_path,
-                media_key,
-                file_sha256,
-                file_enc_sha256,
-                file_length,
-                media_key_timestamp,
-                mimetype,
-                caption,
-                width: shape.width,
-                height: shape.height,
-                seconds: shape.duration_secs,
-                jpeg_thumbnail: shape.thumbnail,
+        OutgoingMedia::Image => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.image_message = MessageField::some({
+                let mut constructed: wa::message::ImageMessage = Default::default();
+                constructed.url = url;
+                constructed.direct_path = direct_path;
+                constructed.media_key = media_key;
+                constructed.file_sha256 = file_sha256;
+                constructed.file_enc_sha256 = file_enc_sha256;
+                constructed.file_length = file_length;
+                constructed.media_key_timestamp = media_key_timestamp;
+                constructed.mimetype = mimetype;
+                constructed.caption = caption;
+                constructed.width = shape.width;
+                constructed.height = shape.height;
+                constructed.jpeg_thumbnail = shape.thumbnail;
+                constructed.context_info = context.into();
+                constructed
+            });
+            constructed
+        }
+        OutgoingMedia::Video => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.video_message = MessageField::some({
+                let mut constructed: wa::message::VideoMessage = Default::default();
+                constructed.url = url;
+                constructed.direct_path = direct_path;
+                constructed.media_key = media_key;
+                constructed.file_sha256 = file_sha256;
+                constructed.file_enc_sha256 = file_enc_sha256;
+                constructed.file_length = file_length;
+                constructed.media_key_timestamp = media_key_timestamp;
+                constructed.mimetype = mimetype;
+                constructed.caption = caption;
+                constructed.width = shape.width;
+                constructed.height = shape.height;
+                constructed.seconds = shape.duration_secs;
+                constructed.jpeg_thumbnail = shape.thumbnail;
                 // What the CDN handed back for exactly this: without it the
                 // other side downloads the whole file before the first frame.
-                streaming_sidecar: upload.streaming_sidecar,
-                context_info: context.into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        OutgoingMedia::Document => wa::Message {
-            document_message: MessageField::some(wa::message::DocumentMessage {
-                url,
-                direct_path,
-                media_key,
-                file_sha256,
-                file_enc_sha256,
-                file_length,
-                media_key_timestamp,
-                mimetype,
-                caption,
+                constructed.streaming_sidecar = upload.streaming_sidecar;
+                constructed.context_info = context.into();
+                constructed
+            });
+            constructed
+        }
+        OutgoingMedia::Document => {
+            let mut constructed: wa::Message = Default::default();
+            constructed.document_message = MessageField::some({
+                let mut constructed: wa::message::DocumentMessage = Default::default();
+                constructed.url = url;
+                constructed.direct_path = direct_path;
+                constructed.media_key = media_key;
+                constructed.file_sha256 = file_sha256;
+                constructed.file_enc_sha256 = file_enc_sha256;
+                constructed.file_length = file_length;
+                constructed.media_key_timestamp = media_key_timestamp;
+                constructed.mimetype = mimetype;
+                constructed.caption = caption;
                 // Both, and they are not the same field: `file_name` is what a
                 // save writes and `title` is what the bubble prints. A
                 // document with no title draws as its URL in some clients.
-                file_name: Some(file.file_name.clone()),
-                title: Some(file.file_name.clone()),
-                context_info: context.into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
+                constructed.file_name = Some(file.file_name.clone());
+                constructed.title = Some(file.file_name.clone());
+                constructed.context_info = context.into();
+                constructed
+            });
+            constructed
+        }
     }
 }
 

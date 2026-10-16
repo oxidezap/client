@@ -8,7 +8,7 @@
 
 use oxidezap_chat_store::{MessageKind, MessageStatus};
 
-use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _, observe_str};
+use whatsapp_rust::wacore_binary::jid::{Jid, observe_str};
 use whatsapp_rust::waproto::{buffa::MessageField, whatsapp as wa};
 
 use super::WhatsAppClient;
@@ -42,18 +42,21 @@ fn edit_text_content(original: Option<&wa::Message>, text: String) -> wa::Messag
         .and_then(|message| message.extended_text_message.as_option())
         .and_then(|extended| extended.context_info.as_option());
     if let Some(context) = context {
-        wa::Message {
-            extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
-                text: Some(text),
-                context_info: MessageField::some(context.clone()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut constructed: wa::Message = Default::default();
+            constructed.extended_text_message = MessageField::some({
+                let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+                constructed.text = Some(text);
+                constructed.context_info = MessageField::some(context.clone());
+                constructed
+            });
+            constructed
         }
     } else {
-        wa::Message {
-            conversation: Some(text),
-            ..Default::default()
+        {
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some(text);
+            constructed
         }
     }
 }
@@ -98,23 +101,28 @@ impl WhatsAppClient {
             } else {
                 Some(stored.sender_jid.clone())
             };
-            let key = wa::MessageKey {
-                id: Some(message_id),
-                remote_jid: Some(chat.to_string()),
-                from_me: Some(stored.from_me),
-                participant: participant.map(|j| j.to_string()),
+            let key = {
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some(message_id);
+                constructed.remote_jid = Some(chat.to_string());
+                constructed.from_me = Some(stored.from_me);
+                constructed.participant = participant.map(|j| j.to_string());
+                constructed
             };
             let result = live
                 .client
-                .send_reaction(&chat, key, &emoji)
+                .send_reaction_raw(&chat, key, &emoji)
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&chat, result.message_id.as_str())
+            {
                 log::warn!(
                     "reaction was sent but its acknowledgement could not be tracked: {error}"
                 );
             }
-            Ok(result.message_id)
+            Ok(result.message_id.into_string())
         })
     }
 
@@ -156,10 +164,18 @@ impl WhatsAppClient {
             let content = edit_text_content(stored.message.as_deref(), new_text);
             let result = live
                 .client
-                .edit_message(chat.clone(), message_id.clone(), content.clone())
+                .edit_message_raw(
+                    chat.clone(),
+                    message_id.clone(),
+                    content.clone(),
+                    Default::default(),
+                )
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&chat, result.message_id.as_str())
+            {
                 log::warn!("edit was sent but its acknowledgement could not be tracked: {error}");
             }
             let (sent_content, timestamp_ms) =
@@ -191,7 +207,7 @@ impl WhatsAppClient {
                         .to_string(),
                 );
             }
-            Ok(result.message_id)
+            Ok(result.message_id.into_string())
         })
     }
 
@@ -243,12 +259,12 @@ impl WhatsAppClient {
                 }
                 delete_and_record(
                     async {
-                        let result = live.client.revoke_message(
+                        let result = live.client.revoke_message_raw(
                             chat.clone(),
                             message_id.clone(),
                             whatsapp_rust::send::RevokeType::Sender,
                         ).await?;
-                        if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
+                        if let Err(error) = live.chat_store.record_operation(&chat, result.message_id.as_str()) {
                             log::warn!("revoke was sent but its acknowledgement could not be tracked: {error}");
                         }
                         Ok::<_, whatsapp_rust::send::SendError>(result)
@@ -268,17 +284,20 @@ impl WhatsAppClient {
                 let (from_me, participant, timestamp) = match stored {
                     Some(stored) => (
                         stored.from_me,
-                        (!stored.from_me && chat.is_group()).then_some(stored.sender_jid),
+                        (!stored.from_me && super::participant_keyed_chat(&chat)).then_some(stored.sender_jid),
                         stored.timestamp.timestamp_millis(),
                     ),
                     None => return Err("message not found".to_string()),
                 };
+                let target = whatsapp_rust::MessageRef::new(
+                    &chat,
+                    whatsapp_rust::MessageId::new(&message_id).map_err(|e| e.to_string())?,
+                    participant.as_ref(),
+                    from_me,
+                ).map_err(|e| e.to_string())?;
                 delete_and_record(
                     live.client.chat_actions().delete_message_for_me(
-                        &chat,
-                        participant.as_ref(),
-                        &message_id,
-                        from_me,
+                        &target,
                         false,
                         Some(timestamp),
                     ),
@@ -337,13 +356,13 @@ impl WhatsAppClient {
                 .map_err(|e| e.to_string())?;
             if let Err(error) = live
                 .chat_store
-                .record_operation(&target, &result.message_id)
+                .record_operation(&target, result.message_id.as_str())
             {
                 log::warn!(
                     "message was forwarded but its acknowledgement could not be tracked: {error}"
                 );
             }
-            Ok(result.message_id)
+            Ok(result.message_id.into_string())
         })
     }
 
@@ -376,33 +395,35 @@ impl WhatsAppClient {
                 )),
                 None => None,
             };
-            let message = wa::Message {
-                list_response_message: whatsapp_rust::buffa::MessageField::some(
-                    wa::message::ListResponseMessage {
-                        title: Some(title),
-                        list_type: Some(wa::message::list_response_message::ListType::SingleSelect),
-                        single_select_reply: whatsapp_rust::buffa::MessageField::some(
-                            wa::message::list_response_message::SingleSelectReply {
-                                selected_row_id: Some(row_id),
-                            },
-                        ),
-                        context_info: context
-                            .map(whatsapp_rust::buffa::MessageField::some)
-                            .unwrap_or_default(),
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
+            let message = {
+                let mut constructed: wa::Message = Default::default();
+                constructed.list_response_message = whatsapp_rust::buffa::MessageField::some({
+                    let mut constructed: wa::message::ListResponseMessage = Default::default();
+                    constructed.title = Some(title);
+                    constructed.list_type =
+                        Some(wa::message::list_response_message::ListType::SingleSelect);
+                    constructed.single_select_reply = whatsapp_rust::buffa::MessageField::some({
+                        let mut constructed: wa::message::list_response_message::SingleSelectReply =
+                            Default::default();
+                        constructed.selected_row_id = Some(row_id);
+                        constructed
+                    });
+                    constructed.context_info = context
+                        .map(whatsapp_rust::buffa::MessageField::some)
+                        .unwrap_or_default();
+                    constructed
+                });
+                constructed
             };
             let msg_id = live.client.generate_message_id();
             live.chat_store
-                .record_operation(&chat, &msg_id)
+                .record_operation(&chat, msg_id.as_str())
                 .map_err(|error| format!("list response was not sent: {error}"))?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             live.client
-                .send_message_with_options(chat, message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
-                .map(|result| result.message_id.clone())
+                .map(|result| result.message_id.to_string())
                 .map_err(|e| e.to_string())
         })
     }
@@ -566,31 +587,37 @@ mod edit_tests {
     use super::*;
     #[test]
     fn edited_reply_retains_context_and_uses_the_sent_protocol_clock() {
-        let context = wa::ContextInfo {
-            stanza_id: Some("QUOTED".into()),
-            participant: Some("peer@example.invalid".into()),
-            quoted_message: MessageField::some(wa::Message {
-                conversation: Some("quoted".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let context = {
+            let mut constructed: wa::ContextInfo = Default::default();
+            constructed.stanza_id = Some("QUOTED".into());
+            constructed.participant = Some("peer@example.invalid".into());
+            constructed.quoted_message = MessageField::some({
+                let mut constructed: wa::Message = Default::default();
+                constructed.conversation = Some("quoted".into());
+                constructed
+            });
+            constructed
         };
-        let original = wa::Message {
-            extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
-                text: Some("original".into()),
-                context_info: MessageField::some(context.clone()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let original = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.extended_text_message = MessageField::some({
+                let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+                constructed.text = Some("original".into());
+                constructed.context_info = MessageField::some(context.clone());
+                constructed
+            });
+            constructed
         };
         let edited = edit_text_content(Some(&original), "replacement".into());
-        let sent = wa::Message {
-            protocol_message: MessageField::some(wa::message::ProtocolMessage {
-                timestamp_ms: Some(1_700_000_050_123),
-                edited_message: MessageField::some(edited),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let sent = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.protocol_message = MessageField::some({
+                let mut constructed: wa::message::ProtocolMessage = Default::default();
+                constructed.timestamp_ms = Some(1_700_000_050_123);
+                constructed.edited_message = MessageField::some(edited);
+                constructed
+            });
+            constructed
         };
         let (body, timestamp) = sent_edit_content(&sent).unwrap();
         let extended = body.extended_text_message.as_option().unwrap();

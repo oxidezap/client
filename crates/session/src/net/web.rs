@@ -185,7 +185,7 @@ impl HttpClient for BrowserHttpClient {
         .map_err(|e| anyhow!("could not read the body: {e:?}"))?;
         let body = js_sys::Uint8Array::new(&buffer).to_vec();
 
-        Ok(HttpResponse { status_code, body })
+        Ok(HttpResponse::new(status_code, body))
     }
 }
 

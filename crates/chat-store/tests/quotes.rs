@@ -18,18 +18,21 @@ use diesel::sql_types::{Integer, Nullable};
 
 /// A text reply quoting `stanza_id` by `participant`, snapshotting `quoted`.
 fn text_reply(text: &str, stanza_id: &str, participant: &str, quoted: wa::Message) -> wa::Message {
-    wa::Message {
-        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
-            text: Some(text.into()),
-            context_info: MessageField::some(wa::ContextInfo {
-                stanza_id: Some(stanza_id.into()),
-                participant: Some(participant.into()),
-                quoted_message: MessageField::some(quoted),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = MessageField::some({
+            let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+            constructed.text = Some(text.into());
+            constructed.context_info = MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some(stanza_id.into());
+                constructed.participant = Some(participant.into());
+                constructed.quoted_message = MessageField::some(quoted);
+                constructed
+            });
+            constructed
+        });
+        constructed
     }
 }
 
@@ -275,39 +278,46 @@ async fn reply_without_local_parent_keeps_inline_snapshot() {
 async fn history_sync_strips_parent_later_in_same_batch() {
     let (store, chat_store) = test_store().await;
 
-    let wmi = |id: &str, msg: wa::Message| wa::WebMessageInfo {
-        key: MessageField::some(wa::MessageKey {
-            remote_jid: Some(PEER.into()),
-            from_me: Some(false),
-            id: Some(id.into()),
-            ..Default::default()
-        }),
-        message: MessageField::from_box(Box::new(msg)),
-        message_timestamp: Some(1_700_000_000),
-        status: Some(wa::web_message_info::Status::READ),
-        ..Default::default()
+    let wmi = |id: &str, msg: wa::Message| {
+        let mut constructed: wa::WebMessageInfo = Default::default();
+        constructed.key = MessageField::some({
+            let mut constructed: wa::MessageKey = Default::default();
+            constructed.remote_jid = Some(PEER.into());
+            constructed.from_me = Some(false);
+            constructed.id = Some(id.into());
+            constructed
+        });
+        constructed.message = MessageField::from_box(Box::new(msg));
+        constructed.message_timestamp = Some(1_700_000_000);
+        constructed.status = Some(wa::web_message_info::Status::READ);
+        constructed
     };
     // Reply FIRST, parent SECOND: at insert time the parent is invisible.
-    let history = wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![wa::Conversation {
-            id: PEER.to_string(),
-            messages: vec![
-                wa::HistorySyncMsg {
-                    message: MessageField::some(wmi(
+    let history = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = PEER.to_string();
+            constructed.messages = vec![
+                {
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(wmi(
                         "H-REPLY",
                         text_reply("pong", "H-ORIG", PEER, wa::Message::text("ping")),
-                    )),
-                    ..Default::default()
+                    ));
+                    constructed
                 },
-                wa::HistorySyncMsg {
-                    message: MessageField::some(wmi("H-ORIG", wa::Message::text("ping"))),
-                    ..Default::default()
+                {
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message =
+                        MessageField::some(wmi("H-ORIG", wa::Message::text("ping")));
+                    constructed
                 },
-            ],
-            ..Default::default()
-        }],
-        ..Default::default()
+            ];
+            constructed
+        }];
+        constructed
     };
     feed(&chat_store, [history_sync_event(history)]).await;
 
@@ -443,25 +453,30 @@ async fn quote_resolves_across_historical_and_current_lids() {
 async fn history_postpass_matches_device_qualified_pending_sender() {
     let (store, chat_store) = test_store().await;
     let device_sender = format!("{}:9@s.whatsapp.net", jid(PEER).user);
-    let wmi = |id: &str, message: wa::Message| wa::WebMessageInfo {
-        key: MessageField::some(wa::MessageKey {
-            remote_jid: Some(GROUP.into()),
-            from_me: Some(false),
-            id: Some(id.into()),
-            ..Default::default()
-        }),
-        participant: Some(device_sender.clone()),
-        message: MessageField::from_box(Box::new(message)),
-        message_timestamp: Some(1_700_000_000),
-        ..Default::default()
+    let wmi = |id: &str, message: wa::Message| {
+        let mut constructed: wa::WebMessageInfo = Default::default();
+        constructed.key = MessageField::some({
+            let mut constructed: wa::MessageKey = Default::default();
+            constructed.remote_jid = Some(GROUP.into());
+            constructed.from_me = Some(false);
+            constructed.id = Some(id.into());
+            constructed
+        });
+        constructed.participant = Some(device_sender.clone());
+        constructed.message = MessageField::from_box(Box::new(message));
+        constructed.message_timestamp = Some(1_700_000_000);
+        constructed
     };
-    let history = wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![wa::Conversation {
-            id: GROUP.to_string(),
-            messages: vec![
-                wa::HistorySyncMsg {
-                    message: MessageField::some(wmi(
+    let history = {
+        let mut constructed: wa::HistorySync = Default::default();
+        constructed.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        constructed.conversations = vec![{
+            let mut constructed: wa::Conversation = Default::default();
+            constructed.id = GROUP.to_string();
+            constructed.messages = vec![
+                {
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(wmi(
                         "H-DEVICE-REPLY",
                         text_reply(
                             "pong",
@@ -469,20 +484,21 @@ async fn history_postpass_matches_device_qualified_pending_sender() {
                             &device_sender,
                             wa::Message::text("parent snapshot"),
                         ),
-                    )),
-                    ..Default::default()
+                    ));
+                    constructed
                 },
-                wa::HistorySyncMsg {
-                    message: MessageField::some(wmi(
+                {
+                    let mut constructed: wa::HistorySyncMsg = Default::default();
+                    constructed.message = MessageField::some(wmi(
                         "H-DEVICE-ORIG",
                         wa::Message::text("parent from companion"),
-                    )),
-                    ..Default::default()
+                    ));
+                    constructed
                 },
-            ],
-            ..Default::default()
-        }],
-        ..Default::default()
+            ];
+            constructed
+        }];
+        constructed
     };
     feed(&chat_store, [history_sync_event(history)]).await;
 
@@ -584,19 +600,23 @@ async fn quote_resolves_by_author_when_ids_repeat() {
 async fn media_parents_hydrate_with_kind_intact() {
     let (_store, chat_store) = test_store().await;
 
-    let image = wa::Message {
-        image_message: MessageField::some(wa::message::ImageMessage {
-            caption: Some("look".into()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let image = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.image_message = MessageField::some({
+            let mut constructed: wa::message::ImageMessage = Default::default();
+            constructed.caption = Some("look".into());
+            constructed
+        });
+        constructed
     };
-    let audio = wa::Message {
-        audio_message: MessageField::some(wa::message::AudioMessage {
-            ptt: Some(true),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let audio = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.audio_message = MessageField::some({
+            let mut constructed: wa::message::AudioMessage = Default::default();
+            constructed.ptt = Some(true);
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -692,9 +712,10 @@ async fn secret_only_envelope_is_stripped_but_message_survives() {
     let (store, chat_store) = test_store().await;
 
     let mut msg = wa::Message::text("segredo?");
-    msg.message_context_info = MessageField::some(wa::MessageContextInfo {
-        message_secret: Some(vec![7u8; 32]),
-        ..Default::default()
+    msg.message_context_info = MessageField::some({
+        let mut constructed: wa::MessageContextInfo = Default::default();
+        constructed.message_secret = Some(vec![7u8; 32]);
+        constructed
     });
     feed(
         &chat_store,
@@ -722,10 +743,11 @@ async fn secret_envelope_with_other_fields_is_kept() {
     let (store, _chat_store) = test_store().await;
 
     let mut msg = wa::Message::text("bot?");
-    msg.message_context_info = MessageField::some(wa::MessageContextInfo {
-        message_secret: Some(vec![7u8; 32]),
-        bot_metadata: MessageField::some(wa::BotMetadata::default()),
-        ..Default::default()
+    msg.message_context_info = MessageField::some({
+        let mut constructed: wa::MessageContextInfo = Default::default();
+        constructed.message_secret = Some(vec![7u8; 32]);
+        constructed.bot_metadata = MessageField::some(wa::BotMetadata::default());
+        constructed
     });
     feed(
         &_chat_store,

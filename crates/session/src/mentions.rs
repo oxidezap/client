@@ -318,16 +318,19 @@ mod tests {
     use whatsapp_rust::waproto::whatsapp::message;
 
     fn text_message(text: &str, mentioned: &[&str]) -> wa::Message {
-        wa::Message {
-            extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-                text: Some(text.to_string()),
-                context_info: buffa::MessageField::some(wa::ContextInfo {
-                    mentioned_jid: mentioned.iter().map(ToString::to_string).collect(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut constructed: wa::Message = Default::default();
+            constructed.extended_text_message = buffa::MessageField::some({
+                let mut constructed: message::ExtendedTextMessage = Default::default();
+                constructed.text = Some(text.to_string());
+                constructed.context_info = buffa::MessageField::some({
+                    let mut constructed: wa::ContextInfo = Default::default();
+                    constructed.mentioned_jid = mentioned.iter().map(ToString::to_string).collect();
+                    constructed
+                });
+                constructed
+            });
+            constructed
         }
     }
 
@@ -381,16 +384,19 @@ mod tests {
 
     #[test]
     fn a_caption_mention_lists_its_jids() {
-        let message = wa::Message {
-            image_message: buffa::MessageField::some(message::ImageMessage {
-                caption: Some("olha @559900000002".to_string()),
-                context_info: buffa::MessageField::some(wa::ContextInfo {
-                    mentioned_jid: vec!["559900000002@s.whatsapp.net".to_string()],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.image_message = buffa::MessageField::some({
+                let mut constructed: message::ImageMessage = Default::default();
+                constructed.caption = Some("olha @559900000002".to_string());
+                constructed.context_info = buffa::MessageField::some({
+                    let mut constructed: wa::ContextInfo = Default::default();
+                    constructed.mentioned_jid = vec!["559900000002@s.whatsapp.net".to_string()];
+                    constructed
+                });
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             mentioned_jids(Some(&message)),
@@ -400,9 +406,10 @@ mod tests {
 
     #[test]
     fn a_message_naming_nobody_lists_nothing() {
-        let message = wa::Message {
-            conversation: Some("bom dia".to_string()),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.conversation = Some("bom dia".to_string());
+            constructed
         };
         assert!(mentioned_jids(Some(&message)).is_empty());
     }
@@ -419,11 +426,14 @@ mod tests {
     #[test]
     fn a_mention_inside_a_wrapper_is_still_listed() {
         let inner = text_message("oi @559900000002", &["559900000002@s.whatsapp.net"]);
-        let message = wa::Message {
-            group_mentioned_message: buffa::MessageField::some(message::FutureProofMessage {
-                message: buffa::MessageField::some(inner),
-            }),
-            ..Default::default()
+        let message = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.group_mentioned_message = buffa::MessageField::some({
+                let mut constructed: message::FutureProofMessage = Default::default();
+                constructed.message = buffa::MessageField::some(inner);
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             mentioned_jids(Some(&message)),

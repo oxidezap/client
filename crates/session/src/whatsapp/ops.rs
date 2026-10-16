@@ -9,6 +9,7 @@
 use whatsapp_rust::wacore::proto_helpers::MessageExt as _;
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _};
 use whatsapp_rust::waproto::whatsapp as wa;
+use whatsapp_rust::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
 use super::WhatsAppClient;
 use super::convert::{poll_creation_of, stored_to_chat_message};
@@ -125,15 +126,12 @@ impl WhatsAppClient {
                 return Err("no session yet".to_string());
             };
             let client = &live.client;
-            if !client
-                .enable_auto_reconnect
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if !client.auto_reconnect_enabled() {
                 return Err("the WhatsApp session has ended".to_string());
             }
             // A click that arrived just after recovery must not drop a healthy
             // connection, or the calls running over it.
-            if client.is_connected() {
+            if client.is_socket_connected() {
                 return Ok(());
             }
             client.pause().await;
@@ -162,14 +160,15 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let (result, _secret) = live
+            let created = live
                 .client
                 .polls()
                 .create(&chat, &question, &options, selectable_count.max(1))
                 .await
                 .map_err(|e| e.to_string())?;
+            let result = created.send_result();
             Ok((
-                result.message_id.clone(),
+                result.message_id.to_string(),
                 whatsapp_rust::wacore::time::now_millis(),
             ))
         })
@@ -253,10 +252,13 @@ impl WhatsAppClient {
             let result = live
                 .client
                 .polls()
-                .vote(&chat, &poll_id, &creator, &secret, &names)
+                .vote_raw(&chat, &poll_id, &creator, &secret, &names)
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Err(error) = live.chat_store.record_operation(&chat, &result.message_id) {
+            if let Err(error) = live
+                .chat_store
+                .record_operation(&chat, result.message_id.as_str())
+            {
                 log::warn!(
                     "poll vote was sent but its acknowledgement could not be tracked: {error}"
                 );
@@ -349,34 +351,37 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let message = wa::Message {
-                location_message: whatsapp_rust::buffa::MessageField::some(
-                    wa::message::LocationMessage {
-                        degrees_latitude: Some(latitude),
-                        degrees_longitude: Some(longitude),
-                        name,
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
+            let message = {
+                let mut constructed: wa::Message = Default::default();
+                constructed.location_message = whatsapp_rust::buffa::MessageField::some({
+                    let mut constructed: wa::message::LocationMessage = Default::default();
+                    constructed.degrees_latitude = Some(latitude);
+                    constructed.degrees_longitude = Some(longitude);
+                    constructed.name = name;
+                    constructed
+                });
+                constructed
             };
             let client = &live.client;
             let msg_id = client.generate_message_id();
             super::record_outgoing(
                 &live.chat_store,
                 &chat,
-                &msg_id,
+                msg_id.as_str(),
                 &message,
                 &live.resolve_chat_names,
             )?;
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
-                .send_message_with_options(chat.clone(), message, options)
+                .send(whatsapp_rust::SendRequest::new(&chat, message).with_options(options))
                 .await
             {
-                Ok(_) => Ok((msg_id, whatsapp_rust::wacore::time::now_millis())),
+                Ok(_) => Ok((
+                    msg_id.into_string(),
+                    whatsapp_rust::wacore::time::now_millis(),
+                )),
                 Err(e) => {
-                    super::mark_send_failed(&live.chat_store, &chat, &msg_id);
+                    super::mark_send_failed(&live.chat_store, &chat, msg_id.as_str());
                     Err(e.to_string())
                 }
             }
@@ -403,21 +408,18 @@ impl WhatsAppClient {
                     0xFF1E_6E4F,
                     wa::message::extended_text_message::FontType::System,
                     &[],
-                    StatusSendOptions {
-                        privacy: StatusPrivacySetting::Contacts,
-                        ..Default::default()
-                    },
+                    StatusSendOptions::default().with_privacy(StatusPrivacySetting::Contacts),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
             if let Err(error) = live
                 .chat_store
-                .record_operation(&Jid::status_broadcast(), &result.message_id)
+                .record_operation(&Jid::status_broadcast(), result.message_id.as_str())
             {
                 log::warn!("status was sent but its acknowledgement could not be tracked: {error}");
             }
             Ok((
-                result.message_id.clone(),
+                result.message_id.to_string(),
                 whatsapp_rust::wacore::time::now_millis(),
             ))
         })
@@ -447,11 +449,14 @@ impl WhatsAppClient {
             let about = info.values().next().and_then(|u| u.status.clone());
             let is_business = info.values().next().is_some_and(|u| u.is_business);
             let picture_url = client
-                .contacts()
-                .get_profile_picture(&target, false)
+                .pictures()
+                .lookup(ProfilePictureRequest::new(
+                    ProfilePictureTarget::Contact(&target),
+                    ProfilePictureType::Full,
+                ))
                 .await
                 .ok()
-                .flatten()
+                .and_then(|outcome| outcome.into_found())
                 .map(|p| p.url);
             let name = live
                 .chat_store
@@ -490,11 +495,14 @@ impl WhatsAppClient {
                 .ok_or_else(|| "no profile returned".to_string())?;
             let name = user.verified_name.as_ref().and_then(|v| v.name.clone());
             let picture_url = client
-                .contacts()
-                .get_profile_picture(&target, false)
+                .pictures()
+                .lookup(ProfilePictureRequest::new(
+                    ProfilePictureTarget::Contact(&target),
+                    ProfilePictureType::Full,
+                ))
                 .await
                 .ok()
-                .flatten()
+                .and_then(|outcome| outcome.into_found())
                 .map(|p| p.url);
             Ok(ProfileView {
                 jid: target.to_string(),
@@ -535,6 +543,7 @@ impl WhatsAppClient {
                 .profile()
                 .set_push_name(&name)
                 .await
+                .map(|_| ())
                 .map_err(|e| e.to_string())
         })
     }
@@ -900,7 +909,10 @@ impl WhatsAppClient {
                 .and_then(|media| media.downloadable)
                 .ok_or_else(|| "that message carries no downloadable media".to_string())?;
             live.client
-                .download(&downloadable)
+                .download(
+                    &downloadable,
+                    whatsapp_rust::download::DownloadLimits::default(),
+                )
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -932,13 +944,20 @@ impl WhatsAppClient {
                 .media
                 .and_then(|media| media.downloadable)
                 .ok_or_else(|| "that message carries no downloadable media".to_string())?;
-            let participant = (!from_me && chat.is_group()).then_some(sender);
+            let participant = (!from_me && super::participant_keyed_chat(&chat)).then_some(sender);
             let request = whatsapp_rust::features::MediaReuploadRequest {
-                msg_id: &message_id,
-                chat_jid: &chat,
-                media_key: &downloadable.media_key,
-                is_from_me: from_me,
-                participant: participant.as_ref(),
+                target: whatsapp_rust::MessageRef::new(
+                    &chat,
+                    whatsapp_rust::MessageId::new(&message_id).map_err(|e| e.to_string())?,
+                    participant.as_ref(),
+                    from_me,
+                )
+                .map_err(|e| e.to_string())?,
+                media_key: downloadable
+                    .media_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "media key must contain 32 bytes".to_string())?,
             };
             live.client
                 .media_reupload()
@@ -1206,7 +1225,14 @@ impl WhatsAppClient {
                     continue;
                 };
                 report.requested += 1;
-                match live.client.download(&downloadable).await {
+                match live
+                    .client
+                    .download(
+                        &downloadable,
+                        whatsapp_rust::download::DownloadLimits::default(),
+                    )
+                    .await
+                {
                     Ok(bytes) => report.files.push(BackfillFile {
                         message_id,
                         chat_jid,

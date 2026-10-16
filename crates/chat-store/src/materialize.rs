@@ -292,7 +292,7 @@ fn business_text(base: &wa::Message) -> Option<&str> {
         use wa::message::buttons_response_message::Response;
         return match resp.response.as_ref() {
             Some(Response::SelectedDisplayText(text)) => Some(text.as_str()),
-            None => None,
+            _ => None,
         };
     }
     if let Some(list) = base.list_message.as_option() {
@@ -347,9 +347,10 @@ mod tests {
     use wacore::proto_helpers::MessageBuilderExt;
 
     fn key_for(id: &str) -> MessageField<wa::MessageKey> {
-        MessageField::some(wa::MessageKey {
-            id: Some(id.into()),
-            ..Default::default()
+        MessageField::some({
+            let mut constructed: wa::MessageKey = Default::default();
+            constructed.id = Some(id.into());
+            constructed
         })
     }
 
@@ -367,11 +368,14 @@ mod tests {
 
     #[test]
     fn classifies_ephemeral_wrapped_text() {
-        let msg = wa::Message {
-            ephemeral_message: MessageField::some(wa::message::FutureProofMessage {
-                message: MessageField::from_box(Box::new(wa::Message::text("secret"))),
-            }),
-            ..Default::default()
+        let msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.ephemeral_message = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::from_box(Box::new(wa::Message::text("secret")));
+                constructed
+            });
+            constructed
         };
         match classify(&msg) {
             MessageOp::Store { kind, text } => {
@@ -391,18 +395,21 @@ mod tests {
 
     #[test]
     fn classifies_hydrated_template_via_field() {
-        let msg = wa::Message {
-            template_message: MessageField::some(wa::message::TemplateMessage {
-                hydrated_template: MessageField::some(
-                    wa::message::template_message::HydratedFourRowTemplate {
-                        hydrated_content_text: Some("Dear customer, your bill is ready".into()),
-                        hydrated_footer_text: Some("footer stays display-side".into()),
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.template_message = MessageField::some({
+                let mut constructed: wa::message::TemplateMessage = Default::default();
+                constructed.hydrated_template = MessageField::some({
+                    let mut constructed: wa::message::template_message::HydratedFourRowTemplate =
+                        Default::default();
+                    constructed.hydrated_content_text =
+                        Some("Dear customer, your bill is ready".into());
+                    constructed.hydrated_footer_text = Some("footer stays display-side".into());
+                    constructed
+                });
+                constructed
+            });
+            constructed
         };
         let (kind, text) = store_result(&msg);
         assert_eq!(kind, "template");
@@ -412,17 +419,19 @@ mod tests {
     #[test]
     fn classifies_hydrated_template_via_format_oneof() {
         use wa::message::template_message::Format;
-        let msg = wa::Message {
-            template_message: MessageField::some(wa::message::TemplateMessage {
-                format: Some(Format::HydratedFourRowTemplate(Box::new(
-                    wa::message::template_message::HydratedFourRowTemplate {
-                        hydrated_content_text: Some("Your OTP is 000000".into()),
-                        ..Default::default()
-                    },
-                ))),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.template_message = MessageField::some({
+                let mut constructed: wa::message::TemplateMessage = Default::default();
+                constructed.format = Some(Format::HydratedFourRowTemplate(Box::new({
+                    let mut constructed: wa::message::template_message::HydratedFourRowTemplate =
+                        Default::default();
+                    constructed.hydrated_content_text = Some("Your OTP is 000000".into());
+                    constructed
+                })));
+                constructed
+            });
+            constructed
         };
         let (kind, text) = store_result(&msg);
         assert_eq!(kind, "template");
@@ -434,12 +443,14 @@ mod tests {
     #[test]
     fn template_without_hydrated_content_stores_with_null_text() {
         use wa::message::template_message::Format;
-        let msg = wa::Message {
-            template_message: MessageField::some(wa::message::TemplateMessage {
-                format: Some(Format::FourRowTemplate(Box::default())),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.template_message = MessageField::some({
+                let mut constructed: wa::message::TemplateMessage = Default::default();
+                constructed.format = Some(Format::FourRowTemplate(Box::default()));
+                constructed
+            });
+            constructed
         };
         let (kind, text) = store_result(&msg);
         assert_eq!(kind, "template");
@@ -448,38 +459,47 @@ mod tests {
 
     #[test]
     fn classifies_buttons_list_and_interactive_bodies() {
-        let buttons = wa::Message {
-            buttons_message: MessageField::some(wa::message::ButtonsMessage {
-                content_text: Some("Choose an option".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let buttons = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.buttons_message = MessageField::some({
+                let mut constructed: wa::message::ButtonsMessage = Default::default();
+                constructed.content_text = Some("Choose an option".into());
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             store_result(&buttons),
             ("buttons", Some("Choose an option".to_owned()))
         );
 
-        let list = wa::Message {
-            list_message: MessageField::some(wa::message::ListMessage {
-                description: Some("Pick a plan".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let list = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.list_message = MessageField::some({
+                let mut constructed: wa::message::ListMessage = Default::default();
+                constructed.description = Some("Pick a plan".into());
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             store_result(&list),
             ("list", Some("Pick a plan".to_owned()))
         );
 
-        let interactive = wa::Message {
-            interactive_message: MessageField::some(wa::message::InteractiveMessage {
-                body: MessageField::some(wa::message::interactive_message::Body {
-                    text: Some("Confirm your order".into()),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let interactive = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.interactive_message = MessageField::some({
+                let mut constructed: wa::message::InteractiveMessage = Default::default();
+                constructed.body = MessageField::some({
+                    let mut constructed: wa::message::interactive_message::Body =
+                        Default::default();
+                    constructed.text = Some("Confirm your order".into());
+                    constructed
+                });
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             store_result(&interactive),
@@ -488,57 +508,74 @@ mod tests {
     }
 
     #[test]
+    fn future_button_response_keeps_kind_without_inventing_display_text() {
+        // Message.buttonsResponseMessage is field 43. Its nested field 99
+        // represents a response arm that this generated schema does not know.
+        let bytes = [
+            0xda, 0x02, 0x09, 0x9a, 0x06, 0x06, b'f', b'u', b't', b'u', b'r', b'e',
+        ];
+        let message = waproto::codec::message_decode(&bytes).unwrap();
+        assert_eq!(store_result(&message), ("buttons_response", None));
+    }
+
+    #[test]
     fn classifies_business_response_messages() {
         use wa::message::buttons_response_message::Response;
-        let buttons_resp = wa::Message {
-            buttons_response_message: MessageField::some(wa::message::ButtonsResponseMessage {
-                response: Some(Response::SelectedDisplayText("Yes, confirm".into())),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let buttons_resp = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.buttons_response_message = MessageField::some({
+                let mut constructed: wa::message::ButtonsResponseMessage = Default::default();
+                constructed.response = Some(Response::SelectedDisplayText("Yes, confirm".into()));
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             store_result(&buttons_resp),
             ("buttons_response", Some("Yes, confirm".to_owned()))
         );
 
-        let list_resp = wa::Message {
-            list_response_message: MessageField::some(wa::message::ListResponseMessage {
-                title: Some("Basic plan".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let list_resp = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.list_response_message = MessageField::some({
+                let mut constructed: wa::message::ListResponseMessage = Default::default();
+                constructed.title = Some("Basic plan".into());
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             store_result(&list_resp),
             ("list_response", Some("Basic plan".to_owned()))
         );
 
-        let tpl_reply = wa::Message {
-            template_button_reply_message: MessageField::some(
-                wa::message::TemplateButtonReplyMessage {
-                    selected_display_text: Some("Track order".into()),
-                    ..Default::default()
-                },
-            ),
-            ..Default::default()
+        let tpl_reply = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.template_button_reply_message = MessageField::some({
+                let mut constructed: wa::message::TemplateButtonReplyMessage = Default::default();
+                constructed.selected_display_text = Some("Track order".into());
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             store_result(&tpl_reply),
             ("template_reply", Some("Track order".to_owned()))
         );
 
-        let interactive_resp = wa::Message {
-            interactive_response_message: MessageField::some(
-                wa::message::InteractiveResponseMessage {
-                    body: MessageField::some(wa::message::interactive_response_message::Body {
-                        text: Some("flow reply".into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            ),
-            ..Default::default()
+        let interactive_resp = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.interactive_response_message = MessageField::some({
+                let mut constructed: wa::message::InteractiveResponseMessage = Default::default();
+                constructed.body = MessageField::some({
+                    let mut constructed: wa::message::interactive_response_message::Body =
+                        Default::default();
+                    constructed.text = Some("flow reply".into());
+                    constructed
+                });
+                constructed
+            });
+            constructed
         };
         assert_eq!(
             store_result(&interactive_resp),
@@ -548,12 +585,14 @@ mod tests {
 
     #[test]
     fn classifies_image_with_caption() {
-        let msg = wa::Message {
-            image_message: MessageField::some(wa::message::ImageMessage {
-                caption: Some("look".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.image_message = MessageField::some({
+                let mut constructed: wa::message::ImageMessage = Default::default();
+                constructed.caption = Some("look".into());
+                constructed
+            });
+            constructed
         };
         match classify(&msg) {
             MessageOp::Store { kind, text } => {
@@ -566,16 +605,19 @@ mod tests {
 
     #[test]
     fn ptt_and_audio_are_distinct() {
-        let ptt = wa::Message {
-            audio_message: MessageField::some(wa::message::AudioMessage {
-                ptt: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let ptt = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.audio_message = MessageField::some({
+                let mut constructed: wa::message::AudioMessage = Default::default();
+                constructed.ptt = Some(true);
+                constructed
+            });
+            constructed
         };
-        let audio = wa::Message {
-            audio_message: MessageField::some(wa::message::AudioMessage::default()),
-            ..Default::default()
+        let audio = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.audio_message = MessageField::some(wa::message::AudioMessage::default());
+            constructed
         };
         assert_eq!(message_kind(&ptt), "ptt");
         assert_eq!(message_kind(&audio), "audio");
@@ -583,13 +625,15 @@ mod tests {
 
     #[test]
     fn poll_album_and_product_kinds_share_wrapper_normalization() {
-        let v5 = wa::Message {
-            poll_creation_message_v5: MessageField::some(Default::default()),
-            ..Default::default()
+        let v5 = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v5 = MessageField::some(Default::default());
+            constructed
         };
-        let v6 = wa::Message {
-            poll_creation_message_v6: MessageField::some(Default::default()),
-            ..Default::default()
+        let v6 = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_creation_message_v6 = MessageField::some(Default::default());
+            constructed
         };
         for poll in [&v5, &v6] {
             assert_eq!(message_kind(poll), "poll");
@@ -597,40 +641,50 @@ mod tests {
             assert!(supported_poll_creation_message(poll).is_none());
         }
 
-        let album = wa::Message {
-            album_message: MessageField::some(Default::default()),
-            ..Default::default()
+        let album = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.album_message = MessageField::some(Default::default());
+            constructed
         };
         assert_eq!(message_kind(&album), "album");
-        let product = wa::Message {
-            product_message: MessageField::some(Default::default()),
-            ..Default::default()
+        let product = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.product_message = MessageField::some(Default::default());
+            constructed
         };
         assert_eq!(message_kind(&product), "product");
 
-        let nested = wa::Message {
-            associated_child_message: MessageField::some(wa::message::FutureProofMessage {
-                message: MessageField::some(wa::Message {
-                    group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
-                        message: MessageField::some(album),
-                    }),
-                    ..Default::default()
-                }),
-            }),
-            ..Default::default()
+        let nested = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.associated_child_message = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.group_mentioned_message = MessageField::some({
+                        let mut constructed: wa::message::FutureProofMessage = Default::default();
+                        constructed.message = MessageField::some(album);
+                        constructed
+                    });
+                    constructed
+                });
+                constructed
+            });
+            constructed
         };
         assert_eq!(message_kind(&nested), "album");
     }
 
     #[test]
     fn classifies_reaction_add_and_remove() {
-        let add = wa::Message {
-            reaction_message: MessageField::some(wa::message::ReactionMessage {
-                key: key_for("MSG1"),
-                text: Some("👍".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let add = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.reaction_message = MessageField::some({
+                let mut constructed: wa::message::ReactionMessage = Default::default();
+                constructed.key = key_for("MSG1");
+                constructed.text = Some("👍".into());
+                constructed
+            });
+            constructed
         };
         match classify(&add) {
             MessageOp::Reaction { target_id, emoji } => {
@@ -640,13 +694,15 @@ mod tests {
             other => panic!("expected Reaction, got {other:?}"),
         }
 
-        let remove = wa::Message {
-            reaction_message: MessageField::some(wa::message::ReactionMessage {
-                key: key_for("MSG1"),
-                text: Some(String::new()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let remove = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.reaction_message = MessageField::some({
+                let mut constructed: wa::message::ReactionMessage = Default::default();
+                constructed.key = key_for("MSG1");
+                constructed.text = Some(String::new());
+                constructed
+            });
+            constructed
         };
         match classify(&remove) {
             MessageOp::Reaction { emoji, .. } => assert!(emoji.is_empty()),
@@ -656,12 +712,14 @@ mod tests {
 
     #[test]
     fn reaction_without_target_key_is_ignored() {
-        let msg = wa::Message {
-            reaction_message: MessageField::some(wa::message::ReactionMessage {
-                text: Some("👍".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.reaction_message = MessageField::some({
+                let mut constructed: wa::message::ReactionMessage = Default::default();
+                constructed.text = Some("👍".into());
+                constructed
+            });
+            constructed
         };
         assert!(matches!(classify(&msg), MessageOp::Ignore));
     }
@@ -669,32 +727,39 @@ mod tests {
     #[test]
     fn classifies_revoke_and_edit() {
         use wa::message::protocol_message::Type as ProtocolType;
-        let revoke = wa::Message {
-            protocol_message: MessageField::some(wa::message::ProtocolMessage {
-                key: key_for("MSG2"),
-                r#type: Some(ProtocolType::REVOKE),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let revoke = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.protocol_message = MessageField::some({
+                let mut constructed: wa::message::ProtocolMessage = Default::default();
+                constructed.key = key_for("MSG2");
+                constructed.r#type = Some(ProtocolType::REVOKE);
+                constructed
+            });
+            constructed
         };
         assert!(matches!(
             classify(&revoke),
             MessageOp::Revoke { target_id, .. } if target_id == "MSG2"
         ));
 
-        let edit = wa::Message {
-            protocol_message: MessageField::some(wa::message::ProtocolMessage {
-                key: key_for("MSG3"),
-                r#type: Some(ProtocolType::MESSAGE_EDIT),
-                edited_message: MessageField::from_box(Box::new(wa::Message {
-                    group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
-                        message: MessageField::some(wa::Message::text("fixed")),
-                    }),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let edit = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.protocol_message = MessageField::some({
+                let mut constructed: wa::message::ProtocolMessage = Default::default();
+                constructed.key = key_for("MSG3");
+                constructed.r#type = Some(ProtocolType::MESSAGE_EDIT);
+                constructed.edited_message = MessageField::from_box(Box::new({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.group_mentioned_message = MessageField::some({
+                        let mut constructed: wa::message::FutureProofMessage = Default::default();
+                        constructed.message = MessageField::some(wa::Message::text("fixed"));
+                        constructed
+                    });
+                    constructed
+                }));
+                constructed
+            });
+            constructed
         };
         match classify(&edit) {
             MessageOp::Edit {
@@ -715,20 +780,23 @@ mod tests {
 
     #[test]
     fn bookkeeping_only_messages_are_ignored() {
-        let skdm_only = wa::Message {
-            sender_key_distribution_message: MessageField::some(
-                wa::message::SenderKeyDistributionMessage::default(),
-            ),
-            ..Default::default()
+        let skdm_only = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.sender_key_distribution_message =
+                MessageField::some(wa::message::SenderKeyDistributionMessage::default());
+            constructed
         };
         assert!(matches!(classify(&skdm_only), MessageOp::Ignore));
 
-        let key_share = wa::Message {
-            protocol_message: MessageField::some(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::APP_STATE_SYNC_KEY_SHARE),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let key_share = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.protocol_message = MessageField::some({
+                let mut constructed: wa::message::ProtocolMessage = Default::default();
+                constructed.r#type =
+                    Some(wa::message::protocol_message::Type::APP_STATE_SYNC_KEY_SHARE);
+                constructed
+            });
+            constructed
         };
         assert!(matches!(classify(&key_share), MessageOp::Ignore));
     }
@@ -737,10 +805,13 @@ mod tests {
     fn unknown_content_with_context_info_is_still_stored() {
         // A future/unclassified bubble type often carries message_context_info
         // (msg secrets); that must not demote it to bookkeeping-only.
-        let msg = wa::Message {
-            send_payment_message: MessageField::some(wa::message::SendPaymentMessage::default()),
-            message_context_info: MessageField::some(wa::MessageContextInfo::default()),
-            ..Default::default()
+        let msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.send_payment_message =
+                MessageField::some(wa::message::SendPaymentMessage::default());
+            constructed.message_context_info =
+                MessageField::some(wa::MessageContextInfo::default());
+            constructed
         };
         match classify(&msg) {
             MessageOp::Store { kind, .. } => assert_eq!(kind, "unknown"),
@@ -748,21 +819,24 @@ mod tests {
         }
 
         // While a PURE bookkeeping payload still has no bubble.
-        let carrier_only = wa::Message {
-            sender_key_distribution_message: MessageField::some(
-                wa::message::SenderKeyDistributionMessage::default(),
-            ),
-            message_context_info: MessageField::some(wa::MessageContextInfo::default()),
-            ..Default::default()
+        let carrier_only = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.sender_key_distribution_message =
+                MessageField::some(wa::message::SenderKeyDistributionMessage::default());
+            constructed.message_context_info =
+                MessageField::some(wa::MessageContextInfo::default());
+            constructed
         };
         assert!(matches!(classify(&carrier_only), MessageOp::Ignore));
     }
 
     #[test]
     fn unclassified_but_present_content_stores_as_unknown() {
-        let msg = wa::Message {
-            send_payment_message: MessageField::some(wa::message::SendPaymentMessage::default()),
-            ..Default::default()
+        let msg = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.send_payment_message =
+                MessageField::some(wa::message::SendPaymentMessage::default());
+            constructed
         };
         match classify(&msg) {
             MessageOp::Store { kind, .. } => assert_eq!(kind, "unknown"),
@@ -776,20 +850,25 @@ mod tests {
     /// away at the next hydration having sent no receipt for either.
     #[test]
     fn a_control_carrier_is_not_a_bubble_on_either_path() {
-        let poll = wa::Message {
-            poll_update_message: MessageField::some(wa::message::PollUpdateMessage::default()),
-            ..Default::default()
+        let poll = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.poll_update_message =
+                MessageField::some(wa::message::PollUpdateMessage::default());
+            constructed
         };
         assert!(is_control_only(&poll));
         assert!(matches!(classify(&poll), MessageOp::Ignore));
 
         // And inside a wrapper `get_base_message` does not open, which is the
         // half a caller reaching for `get_base_message` alone would miss.
-        let wrapped = wa::Message {
-            group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
-                message: MessageField::some(poll),
-            }),
-            ..Default::default()
+        let wrapped = {
+            let mut constructed: wa::Message = Default::default();
+            constructed.group_mentioned_message = MessageField::some({
+                let mut constructed: wa::message::FutureProofMessage = Default::default();
+                constructed.message = MessageField::some(poll);
+                constructed
+            });
+            constructed
         };
         assert!(is_control_only(&wrapped));
 

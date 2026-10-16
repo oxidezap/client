@@ -833,10 +833,11 @@ impl ChatStore {
     ) -> Result<()> {
         self.record_revoke_target(
             chat,
-            &wa::MessageKey {
-                id: Some(target_id.to_owned()),
-                from_me: Some(true),
-                ..Default::default()
+            &{
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some(target_id.to_owned());
+                constructed.from_me = Some(true);
+                constructed
             },
             timestamp,
         )
@@ -907,9 +908,12 @@ impl ChatStore {
             .message_id(target_id.to_owned())
             .from_me(from_me)
             .timestamp(timestamp)
-            .action(Box::new(wa::sync_action_value::DeleteMessageForMeAction {
-                delete_media: Some(false),
-                message_timestamp: Some(message_timestamp_ms),
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::DeleteMessageForMeAction =
+                    Default::default();
+                constructed.delete_media = Some(false);
+                constructed.message_timestamp = Some(message_timestamp_ms);
+                constructed
             }))
             .from_full_sync(false)
             .build();
@@ -1105,7 +1109,7 @@ mod migration_tests {
     /// that already has its effect.
     #[tokio::test]
     async fn a_database_from_before_the_renumbering_is_adopted() {
-        let store = SqliteStore::new(&format!(
+        let store = SqliteStore::open(&format!(
             "file:memdb_chat_store_adopt_{}?mode=memory&cache=shared",
             std::process::id()
         ))
@@ -1179,7 +1183,7 @@ mod migration_tests {
 
     #[tokio::test]
     async fn stable_id_downgrade_round_trips_then_sender_identity_refuses() {
-        let store = SqliteStore::new(&format!(
+        let store = SqliteStore::open(&format!(
             "file:memdb_chat_store_downgrade_{}?mode=memory&cache=shared",
             std::process::id()
         ))
@@ -1375,12 +1379,22 @@ mod migration_tests {
             "file:memdb_chat_store_cascade_{}?mode=memory&cache=shared",
             std::process::id()
         );
-        let store_a = SqliteStore::new(&database).await.expect("create store A");
-        let store_b = SqliteStore::new_for_device(&database, 2)
+        let store_a = SqliteStore::open(&database).await.expect("create store A");
+        let store_b =
+            whatsapp_rust_sqlite_storage::SqliteDatabase::open(&database, Default::default())
+                .await
+                .expect("create store B")
+                .store(2);
+        store_a
+            .database()
+            .provision_device(store_a.device_id())
             .await
-            .expect("create store B");
-        store_a.create_new_device().await.expect("create device A");
-        store_b.create_new_device().await.expect("create device B");
+            .expect("create device A");
+        store_b
+            .database()
+            .provision_device(store_b.device_id())
+            .await
+            .expect("create device B");
         ChatStore::new(&store_a).await.expect("run migrations");
         use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
         store_a

@@ -50,17 +50,21 @@ async fn full_text_search_finds_and_survives_operator_input() {
     assert!(hits.len() <= 1);
 
     // Edited text re-indexes.
-    let edit = wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some("MSG-S2".into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-            edited_message: MessageField::from_box(Box::new(wa::Message::text("agora relevante"))),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let edit = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-S2".into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+            constructed.edited_message =
+                MessageField::from_box(Box::new(wa::Message::text("agora relevante")));
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -425,12 +429,14 @@ async fn a_media_search_returns_a_full_page_of_media() {
     // Two media rows where the term is rare in a long caption.
     for i in 0..2 {
         events.push(message_event(
-            wa::Message {
-                image_message: MessageField::some(wa::message::ImageMessage {
-                    caption: Some(format!("foto {}", "palavra ".repeat(30))),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.image_message = MessageField::some({
+                    let mut constructed: wa::message::ImageMessage = Default::default();
+                    constructed.caption = Some(format!("foto {}", "palavra ".repeat(30)));
+                    constructed
+                });
+                constructed
             },
             incoming_info(PEER, PEER, &format!("MSG-M{i}"), 1_700_000_100 + i),
         ));

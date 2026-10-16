@@ -9,7 +9,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 #[wasm_bindgen_test]
 async fn bot_builds_with_chat_store_durability_hook() {
-    let backend = SqliteStore::new("file:oxidezap-browser-durability?mode=memory&cache=shared")
+    let backend = SqliteStore::open("file:oxidezap-browser-durability?mode=memory&cache=shared")
         .await
         .expect("in-memory SQLite opens");
     let chat_store = ChatStore::new(&backend).await.expect("chat store opens");
@@ -20,7 +20,7 @@ async fn bot_builds_with_chat_store_durability_hook() {
         .await;
 
     if let Ok(bot) = &result {
-        bot.client().disconnect().await;
+        bot.client().shutdown().await;
     }
     chat_store.close().await.expect("chat store closes");
     result.expect("bot builds with the SQLite durability probe in a browser");

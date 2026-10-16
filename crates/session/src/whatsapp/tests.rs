@@ -107,17 +107,20 @@ async fn a_delete_waits_for_the_remote_answer_then_the_local_flush() {
 
 #[test]
 fn live_nonrenderable_fallback_uses_the_shared_message_kind() {
-    let poll = wa::Message {
-        poll_creation_message_v5: MessageField::some(Default::default()),
-        ..Default::default()
+    let poll = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.poll_creation_message_v5 = MessageField::some(Default::default());
+        constructed
     };
-    let album = wa::Message {
-        album_message: MessageField::some(Default::default()),
-        ..Default::default()
+    let album = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.album_message = MessageField::some(Default::default());
+        constructed
     };
-    let product = wa::Message {
-        product_message: MessageField::some(Default::default()),
-        ..Default::default()
+    let product = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.product_message = MessageField::some(Default::default());
+        constructed
     };
 
     assert_eq!(super::live_content_fallback(&poll, false), "[poll]");
@@ -143,7 +146,7 @@ fn book_with(store: &Arc<ChatStore>) -> NameBook {
 
 #[tokio::test]
 async fn persistent_companion_uses_manual_presence() {
-    let store = SqliteStore::new("file:oxidezap-presence-policy?mode=memory&cache=shared")
+    let store = SqliteStore::open("file:oxidezap-presence-policy?mode=memory&cache=shared")
         .await
         .expect("in-memory store");
     let bot = super::persistent_companion(whatsapp_rust::bot::Bot::builder())
@@ -233,9 +236,10 @@ fn a_contact_sync_burst_is_not_dropped_at_identity_ingress() {
             .timestamp(
                 whatsapp_rust::wacore::time::from_secs(1_700_000_100).expect("test timestamp"),
             )
-            .action(Box::new(wa::sync_action_value::ContactAction {
-                lid_jid: Some(TEST_AUTHOR.to_string()),
-                ..Default::default()
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::ContactAction = Default::default();
+                constructed.lid_jid = Some(TEST_AUTHOR.to_string());
+                constructed
             }))
             .from_full_sync(true)
             .build(),
@@ -389,13 +393,15 @@ async fn a_chatless_ack_does_not_guess_a_live_destination() {
 #[tokio::test]
 async fn hydrated_preview_labels_a_captionless_photo() {
     let (chat_store, client) = test_session("preview-photo").await;
-    let photo = wa::Message {
-        image_message: MessageField::some(wa::message::ImageMessage {
-            mimetype: Some("image/jpeg".into()),
-            jpeg_thumbnail: Some(vec![1, 2, 3]),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let photo = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.image_message = MessageField::some({
+            let mut constructed: wa::message::ImageMessage = Default::default();
+            constructed.mimetype = Some("image/jpeg".into());
+            constructed.jpeg_thumbnail = Some(vec![1, 2, 3]);
+            constructed
+        });
+        constructed
     };
     feed(&chat_store, incoming(photo, "MSG-IMG", 1_700_000_000)).await;
 
@@ -419,16 +425,19 @@ async fn hydrated_preview_labels_a_revoked_newest_message() {
         incoming(wa::Message::text("oops"), "MSG-R", 1_700_000_000),
     )
     .await;
-    let revoke = wa::Message {
-        protocol_message: MessageField::some(wa::message::ProtocolMessage {
-            key: MessageField::some(wa::MessageKey {
-                id: Some("MSG-R".into()),
-                ..Default::default()
-            }),
-            r#type: Some(wa::message::protocol_message::Type::REVOKE),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let revoke = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.protocol_message = MessageField::some({
+            let mut constructed: wa::message::ProtocolMessage = Default::default();
+            constructed.key = MessageField::some({
+                let mut constructed: wa::MessageKey = Default::default();
+                constructed.id = Some("MSG-R".into());
+                constructed
+            });
+            constructed.r#type = Some(wa::message::protocol_message::Type::REVOKE);
+            constructed
+        });
+        constructed
     };
     feed(&chat_store, incoming(revoke, "MSG-R2", 1_700_000_010)).await;
 
@@ -510,16 +519,19 @@ async fn a_hydrated_mention_names_the_contact_not_the_digits() {
         ),
     )
     .await;
-    let mention = wa::Message {
-        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-            text: Some("oi @559900000002, vem".to_string()),
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                mentioned_jid: vec![MENTIONED.to_string()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let mention = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("oi @559900000002, vem".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.mentioned_jid = vec![MENTIONED.to_string()];
+                constructed
+            });
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -557,16 +569,19 @@ async fn a_mention_of_a_stranger_hides_the_internal_digits() {
 
     const STRANGER: &str = "111222333444556@lid";
     let (chat_store, client) = test_session("mention-stranger").await;
-    let mention = wa::Message {
-        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-            text: Some("oi @111222333444556".to_string()),
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                mentioned_jid: vec![STRANGER.to_string()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let mention = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("oi @111222333444556".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.mentioned_jid = vec![STRANGER.to_string()];
+                constructed
+            });
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -621,30 +636,34 @@ async fn a_hydrated_quote_names_the_mentioned_contact() {
         ),
     )
     .await;
-    let reply = wa::Message {
-        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-            text: Some("olha isso".to_string()),
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                stanza_id: Some("MSG-ORIG".to_string()),
-                participant: Some(MENTIONED.to_string()),
-                quoted_message: buffa::MessageField::some(wa::Message {
-                    extended_text_message: buffa::MessageField::some(
-                        message::ExtendedTextMessage {
-                            text: Some("oi @559900000002, vem".to_string()),
-                            context_info: buffa::MessageField::some(wa::ContextInfo {
-                                mentioned_jid: vec![MENTIONED.to_string()],
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                    ),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("olha isso".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some("MSG-ORIG".to_string());
+                constructed.participant = Some(MENTIONED.to_string());
+                constructed.quoted_message = buffa::MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.extended_text_message = buffa::MessageField::some({
+                        let mut constructed: message::ExtendedTextMessage = Default::default();
+                        constructed.text = Some("oi @559900000002, vem".to_string());
+                        constructed.context_info = buffa::MessageField::some({
+                            let mut constructed: wa::ContextInfo = Default::default();
+                            constructed.mentioned_jid = vec![MENTIONED.to_string()];
+                            constructed
+                        });
+                        constructed
+                    });
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -701,30 +720,34 @@ async fn a_live_quote_names_the_mentioned_contact() {
         ),
     )
     .await;
-    let reply = wa::Message {
-        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-            text: Some("olha isso".to_string()),
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                stanza_id: Some("MSG-ORIG".to_string()),
-                participant: Some(MENTIONED.to_string()),
-                quoted_message: buffa::MessageField::some(wa::Message {
-                    extended_text_message: buffa::MessageField::some(
-                        message::ExtendedTextMessage {
-                            text: Some("oi @559900000002, vem".to_string()),
-                            context_info: buffa::MessageField::some(wa::ContextInfo {
-                                mentioned_jid: vec![MENTIONED.to_string()],
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                    ),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("olha isso".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some("MSG-ORIG".to_string());
+                constructed.participant = Some(MENTIONED.to_string());
+                constructed.quoted_message = buffa::MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.extended_text_message = buffa::MessageField::some({
+                        let mut constructed: message::ExtendedTextMessage = Default::default();
+                        constructed.text = Some("oi @559900000002, vem".to_string());
+                        constructed.context_info = buffa::MessageField::some({
+                            let mut constructed: wa::ContextInfo = Default::default();
+                            constructed.mentioned_jid = vec![MENTIONED.to_string()];
+                            constructed
+                        });
+                        constructed
+                    });
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        });
+        constructed
     };
     let (ui_tx, mut ui_rx) = super::ui_queue::channel(
         Arc::new(tokio::sync::Notify::new()),
@@ -772,16 +795,19 @@ async fn a_live_self_mention_uses_the_sender_push_name() {
 
     const SELF: &str = "559900000003@s.whatsapp.net";
     let (chat_store, client) = test_session("mention-self").await;
-    let mention_self = wa::Message {
-        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-            text: Some("oi @559900000003, sou eu".to_string()),
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                mentioned_jid: vec![SELF.to_string()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let mention_self = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("oi @559900000003, sou eu".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.mentioned_jid = vec![SELF.to_string()];
+                constructed
+            });
+            constructed
+        });
+        constructed
     };
     let (ui_tx, mut ui_rx) = super::ui_queue::channel(
         Arc::new(tokio::sync::Notify::new()),
@@ -868,9 +894,10 @@ async fn live_message_carries_store_notification_decision() {
             whatsapp_rust::wacore::types::events::MuteUpdate::builder()
                 .jid(TEST_GROUP.parse().expect("test JID"))
                 .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_200).unwrap())
-                .action(Box::new(wa::sync_action_value::MuteAction {
-                    muted: Some(true),
-                    ..Default::default()
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MuteAction = Default::default();
+                    constructed.muted = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
@@ -908,9 +935,10 @@ async fn live_message_carries_store_notification_decision() {
             whatsapp_rust::wacore::types::events::MuteUpdate::builder()
                 .jid(TEST_GROUP.parse().expect("test JID"))
                 .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_300).unwrap())
-                .action(Box::new(wa::sync_action_value::MuteAction {
-                    muted: Some(false),
-                    ..Default::default()
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MuteAction = Default::default();
+                    constructed.muted = Some(false);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
@@ -975,9 +1003,10 @@ async fn direct_group_mention_alerts_through_mute_and_archive() {
             whatsapp_rust::wacore::types::events::MuteUpdate::builder()
                 .jid(TEST_GROUP.parse().expect("test JID"))
                 .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_200).unwrap())
-                .action(Box::new(wa::sync_action_value::MuteAction {
-                    muted: Some(true),
-                    ..Default::default()
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MuteAction = Default::default();
+                    constructed.muted = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
@@ -990,9 +1019,11 @@ async fn direct_group_mention_alerts_through_mute_and_archive() {
             whatsapp_rust::wacore::types::events::ArchiveUpdate::builder()
                 .jid(TEST_GROUP.parse().expect("test JID"))
                 .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_200).unwrap())
-                .action(Box::new(wa::sync_action_value::ArchiveChatAction {
-                    archived: Some(true),
-                    ..Default::default()
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::ArchiveChatAction =
+                        Default::default();
+                    constructed.archived = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
@@ -1000,16 +1031,19 @@ async fn direct_group_mention_alerts_through_mute_and_archive() {
     )
     .await;
 
-    let mention = wa::Message {
-        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-            text: Some("oi @559900000001".to_string()),
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                mentioned_jid: vec![OWN.to_string()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let mention = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("oi @559900000001".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.mentioned_jid = vec![OWN.to_string()];
+                constructed
+            });
+            constructed
+        });
+        constructed
     };
     let (ui_tx, mut ui_rx) = super::ui_queue::channel(
         Arc::new(tokio::sync::Notify::new()),
@@ -1060,7 +1094,7 @@ async fn direct_group_mention_alerts_through_mute_and_archive() {
         )
         .await;
         assert!(matches!(
-            ui_rx.try_recv(),
+        ui_rx.try_recv(),
             Ok(oxidezap_core::UiEvent::MessageReceived {
                 notification_allowed: false,
                 chat_name: Some(name),
@@ -1107,22 +1141,25 @@ fn a_calls_later_stanza_is_handled_behind_its_offer() {
     let call_id = "CALL-ORDER-1";
     let peer: Jid = TEST_PEER.parse().expect("test JID");
     let at = whatsapp_rust::wacore::time::from_secs(1_700_000_000).expect("test timestamp");
-    let offer = Event::IncomingCall(Box::new(IncomingCall::new_for_test(
-        peer.clone(),
-        "STANZA-1".to_string(),
-        at,
-        CallAction::Offer {
-            call_id: call_id.to_string(),
-            call_creator: peer.clone(),
-            caller_pn: None,
-            caller_country_code: None,
-            device_class: None,
-            joinable: true,
-            is_video: false,
-            audio: Vec::new(),
-            group_jid: None,
-        },
-    )));
+    let offer = Event::IncomingCall(Box::new(
+        IncomingCall::builder()
+            .from(peer.clone())
+            .stanza_id("STANZA-1".to_string())
+            .timestamp(at)
+            .offline(false)
+            .action(CallAction::Offer {
+                call_id: call_id.to_string(),
+                call_creator: peer.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            })
+            .build(),
+    ));
     let missed = Event::MissedCall(MissedCall::new(
         peer,
         call_id.to_string(),
@@ -1238,7 +1275,7 @@ fn events_are_keyed_by_what_they_are_about() {
     let presence = whatsapp_rust::wacore::types::events::Event::Presence(
         whatsapp_rust::wacore::types::events::PresenceUpdate::builder()
             .from(TEST_PEER.parse().unwrap())
-            .unavailable(false)
+            .status(whatsapp_rust::wacore::types::presence::PresenceStatus::Available)
             .build(),
     );
     assert_eq!(
@@ -1269,22 +1306,26 @@ async fn a_quoted_author_is_filed_where_their_bubbles_are() {
     use whatsapp_rust::waproto::whatsapp::message;
 
     let (chat_store, client) = test_session("quoted-author").await;
-    let reply = wa::Message {
-        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-            text: Some("e o áudio?".to_string()),
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                stanza_id: Some("ORIGINAL".to_string()),
+    let reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("e o áudio?".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some("ORIGINAL".to_string());
                 // As a sending device spells itself.
-                participant: Some(TEST_PEER.replace('@', ":12@")),
-                quoted_message: buffa::MessageField::some(wa::Message {
-                    conversation: Some("ping".to_string()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+                constructed.participant = Some(TEST_PEER.replace('@', ":12@"));
+                constructed.quoted_message = buffa::MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.conversation = Some("ping".to_string());
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        });
+        constructed
     };
     feed(&chat_store, incoming(reply, "MSG-QUOTE", 1_700_000_000)).await;
 
@@ -1321,9 +1362,10 @@ async fn a_quoted_author_is_named_from_the_book_their_bubbles_are() {
             TEST_AUTHOR,
             TEST_AUTHOR,
             Some("Allyson"),
-            wa::Message {
-                conversation: Some("ping".to_string()),
-                ..Default::default()
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.conversation = Some("ping".to_string());
+                constructed
             },
             "MSG-ORIGINAL",
             1_700_000_000,
@@ -1332,22 +1374,26 @@ async fn a_quoted_author_is_named_from_the_book_their_bubbles_are() {
     .await;
     // Somebody else answers them in a group, and the answer is the only row
     // that group has.
-    let reply = wa::Message {
-        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
-            text: Some("e o áudio?".to_string()),
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                stanza_id: Some("MSG-ORIGINAL".to_string()),
+    let reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = buffa::MessageField::some({
+            let mut constructed: message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("e o áudio?".to_string());
+            constructed.context_info = buffa::MessageField::some({
+                let mut constructed: wa::ContextInfo = Default::default();
+                constructed.stanza_id = Some("MSG-ORIGINAL".to_string());
                 // As a sending device spells itself.
-                participant: Some(TEST_AUTHOR.replace('@', ":12@")),
-                quoted_message: buffa::MessageField::some(wa::Message {
-                    conversation: Some("ping".to_string()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+                constructed.participant = Some(TEST_AUTHOR.replace('@', ":12@"));
+                constructed.quoted_message = buffa::MessageField::some({
+                    let mut constructed: wa::Message = Default::default();
+                    constructed.conversation = Some("ping".to_string());
+                    constructed
+                });
+                constructed
+            });
+            constructed
+        });
+        constructed
     };
     feed(
         &chat_store,
@@ -1396,9 +1442,10 @@ async fn a_quote_of_your_own_message_is_left_for_the_chat_to_name() {
             TEST_PEER,
             TEST_PEER,
             Some("Eu mesmo"),
-            wa::Message {
-                conversation: Some("ping".to_string()),
-                ..Default::default()
+            {
+                let mut constructed: wa::Message = Default::default();
+                constructed.conversation = Some("ping".to_string());
+                constructed
             },
             "MSG-ORIGINAL",
             1_700_000_000,
@@ -1510,38 +1557,47 @@ fn has_quoted_snapshot(message: &wa::Message) -> bool {
 #[tokio::test]
 async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
     let store =
-        SqliteStore::new("file:oxidezap-session-quote-secondary-reads?mode=memory&cache=shared")
+        SqliteStore::open("file:oxidezap-session-quote-secondary-reads?mode=memory&cache=shared")
             .await
             .expect("in-memory store");
-    store.create_new_device().await.expect("seed device parent");
+    store
+        .database()
+        .provision_device(store.device_id())
+        .await
+        .expect("seed device parent");
     let chat_store = ChatStore::new(&store).await.expect("chat store");
-    let parent = wa::Message {
-        image_message: MessageField::some(wa::message::ImageMessage {
-            mimetype: Some("image/jpeg".into()),
-            caption: Some("original photo".into()),
-            jpeg_thumbnail: Some(vec![1, 2, 3]),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let parent = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.image_message = MessageField::some({
+            let mut constructed: wa::message::ImageMessage = Default::default();
+            constructed.mimetype = Some("image/jpeg".into());
+            constructed.caption = Some("original photo".into());
+            constructed.jpeg_thumbnail = Some(vec![1, 2, 3]);
+            constructed
+        });
+        constructed
     };
     chat_store
         .handler()
         .handle_event(Arc::new(incoming(parent.clone(), "P", 1_700_000_000)));
     chat_store.flush().await.expect("store parent");
 
-    let quoted_photo = || wa::ContextInfo {
-        stanza_id: Some("P".into()),
-        participant: Some(TEST_PEER.into()),
-        quoted_message: MessageField::some(parent.clone()),
-        ..Default::default()
+    let quoted_photo = || {
+        let mut constructed: wa::ContextInfo = Default::default();
+        constructed.stanza_id = Some("P".into());
+        constructed.participant = Some(TEST_PEER.into());
+        constructed.quoted_message = MessageField::some(parent.clone());
+        constructed
     };
-    let text_reply = wa::Message {
-        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
-            text: Some("reply".into()),
-            context_info: MessageField::some(quoted_photo()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let text_reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.extended_text_message = MessageField::some({
+            let mut constructed: wa::message::ExtendedTextMessage = Default::default();
+            constructed.text = Some("reply".into());
+            constructed.context_info = MessageField::some(quoted_photo());
+            constructed
+        });
+        constructed
     };
     chat_store
         .handler()
@@ -1555,20 +1611,24 @@ async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
                 .message_id("R".to_string())
                 .from_me(false)
                 .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_120).unwrap())
-                .action(Box::new(wa::sync_action_value::StarAction {
-                    starred: Some(true),
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::StarAction = Default::default();
+                    constructed.starred = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
         )));
     chat_store.flush().await.expect("star text reply");
-    let media_reply = wa::Message {
-        image_message: MessageField::some(wa::message::ImageMessage {
-            mimetype: Some("image/jpeg".into()),
-            context_info: MessageField::some(quoted_photo()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let media_reply = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.image_message = MessageField::some({
+            let mut constructed: wa::message::ImageMessage = Default::default();
+            constructed.mimetype = Some("image/jpeg".into());
+            constructed.context_info = MessageField::some(quoted_photo());
+            constructed
+        });
+        constructed
     };
     chat_store
         .handler()
@@ -1614,7 +1674,7 @@ async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
 }
 
 async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
-    let store = SqliteStore::new(&format!(
+    let store = SqliteStore::open(&format!(
         "file:oxidezap-session-{name}?mode=memory&cache=shared"
     ))
     .await
@@ -2105,9 +2165,11 @@ async fn a_scoped_load_skips_an_archived_chat() {
                 .timestamp(
                     whatsapp_rust::wacore::time::from_secs(1_700_000_050).expect("test timestamp"),
                 )
-                .action(Box::new(wa::sync_action_value::ArchiveChatAction {
-                    archived: Some(true),
-                    ..Default::default()
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::ArchiveChatAction =
+                        Default::default();
+                    constructed.archived = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
@@ -2299,10 +2361,11 @@ async fn a_contact_update_repairs_an_already_seen_lid_chat() {
             .timestamp(
                 whatsapp_rust::wacore::time::from_secs(1_700_000_100).expect("test timestamp"),
             )
-            .action(Box::new(wa::sync_action_value::ContactAction {
-                full_name: Some("Bia".to_string()),
-                lid_jid: Some(lid.to_string()),
-                ..Default::default()
+            .action(Box::new({
+                let mut constructed: wa::sync_action_value::ContactAction = Default::default();
+                constructed.full_name = Some("Bia".to_string());
+                constructed.lid_jid = Some(lid.to_string());
+                constructed
             }))
             .from_full_sync(false)
             .build(),
@@ -2844,9 +2907,11 @@ async fn phone_read_live_replay_does_not_notify_but_new_message_does() {
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(TEST_GROUP.parse().unwrap())
                 .timestamp(wacore::time::from_secs(1_700_000_110).unwrap())
-                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
-                    read: Some(true),
-                    ..Default::default()
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
+                        Default::default();
+                    constructed.read = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
@@ -2909,9 +2974,11 @@ async fn offline_replays_keep_phone_read_flags_without_alerting() {
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(TEST_GROUP.parse().unwrap())
                 .timestamp(wacore::time::from_secs(1_700_000_110).unwrap())
-                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
-                    read: Some(true),
-                    ..Default::default()
+                .action(Box::new({
+                    let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
+                        Default::default();
+                    constructed.read = Some(true);
+                    constructed
                 }))
                 .from_full_sync(false)
                 .build(),
@@ -2966,13 +3033,15 @@ async fn offline_replays_keep_phone_read_flags_without_alerting() {
 async fn live_and_reloaded_shared_contacts_show_the_same_details() {
     use whatsapp_rust::waproto::buffa::MessageField;
     let (store, client) = test_session("shared-contact-details").await;
-    let proto = wa::Message {
-        contact_message: MessageField::some(wa::message::ContactMessage {
-            display_name: Some("Example Alpha".into()),
-            vcard: Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let proto = {
+        let mut constructed: wa::Message = Default::default();
+        constructed.contact_message = MessageField::some({
+            let mut constructed: wa::message::ContactMessage = Default::default();
+            constructed.display_name = Some("Example Alpha".into());
+            constructed.vcard = Some("FN:Example Alpha\nTEL:+55 99 0000-0001".into());
+            constructed
+        });
+        constructed
     };
     feed(
         &store,
@@ -3020,4 +3089,35 @@ async fn live_and_reloaded_shared_contacts_show_the_same_details() {
         super::convert::stored_to_chat_message(stored).content,
         message.content
     );
+}
+
+#[test]
+fn read_ranges_skip_invalid_references_and_preserve_boundary() {
+    let group: Jid = "read-range@g.us".parse().unwrap();
+    let sender = Some("reader@s.whatsapp.net".to_string());
+    let range = read_message_range(
+        &group,
+        (
+            123,
+            vec![
+                (String::new(), false, sender.clone()),
+                ("missing-author".into(), false, None),
+                ("incoming".into(), false, sender),
+                ("outgoing".into(), true, None),
+            ],
+        ),
+    );
+    assert_eq!(range.last_message_timestamp, Some(123));
+    assert_eq!(range.messages.len(), 2);
+    let incoming = range.messages[0].key.as_option().unwrap();
+    assert_eq!(incoming.id.as_deref(), Some("incoming"));
+    assert_eq!(incoming.from_me, Some(false));
+    assert_eq!(
+        incoming.participant.as_deref(),
+        Some("reader@s.whatsapp.net")
+    );
+    let outgoing = range.messages[1].key.as_option().unwrap();
+    assert_eq!(outgoing.id.as_deref(), Some("outgoing"));
+    assert_eq!(outgoing.from_me, Some(true));
+    assert_eq!(outgoing.participant, None);
 }
