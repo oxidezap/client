@@ -7,6 +7,9 @@ pub enum ChatStoreError {
     #[error("storage error")]
     Store(#[from] StoreError),
 
+    #[error("invalid shared group history: {0}")]
+    InvalidGroupHistory(String),
+
     #[error("invalid full-text search query")]
     InvalidSearchQuery,
 

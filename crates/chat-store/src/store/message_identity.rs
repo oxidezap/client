@@ -134,6 +134,8 @@ struct StoredMessage {
     revoked: bool,
     #[diesel(sql_type = Bool)]
     local_revoke_placeholder: bool,
+    #[diesel(sql_type = Bool)]
+    received_as_shared_history: bool,
 }
 
 /// Fold rows already proven to be one author/message. Keep the oldest stable
@@ -169,6 +171,7 @@ pub(crate) fn merge_rows(
             dsl::edited_at_ms,
             dsl::revoked,
             dsl::local_revoke_placeholder,
+            dsl::received_as_shared_history,
         ))
         .load(conn)?;
     rows.sort_by_key(|row| row.id);
@@ -253,6 +256,8 @@ pub(crate) fn merge_rows(
             dsl::edited_at_ms.eq(edited_at_ms),
             dsl::revoked.eq(tombstone),
             dsl::local_revoke_placeholder.eq(rows.iter().any(|row| row.local_revoke_placeholder)),
+            dsl::received_as_shared_history
+                .eq(rows.iter().all(|row| row.received_as_shared_history)),
         ))
         .execute(conn)?;
     Ok(MessageOwner {
@@ -403,7 +408,7 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
            AND c.read_boundary_ms = 0
            AND c.read_boundary_ids IS NULL
            AND m.from_me = FALSE
-           AND m.local_revoke_placeholder = FALSE
+           AND m.local_revoke_placeholder = FALSE AND m.received_as_shared_history = FALSE AND m.kind != 'history_notice'
            AND m.timestamp_ms > ?",
     )
     .bind::<Integer, _>(device_id)
@@ -424,7 +429,7 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-               AND messages.local_revoke_placeholder = FALSE
+               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice'
          )
          WHERE chats.device_id = ?
            AND chats.unread_count = 0
@@ -435,14 +440,14 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-               AND messages.local_revoke_placeholder = FALSE
+               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice'
            )
            AND (
              SELECT COUNT(DISTINCT msg_id) FROM messages
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-               AND messages.local_revoke_placeholder = FALSE
+               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice'
                AND messages.timestamp_ms > ?
            ) <= ?",
     )

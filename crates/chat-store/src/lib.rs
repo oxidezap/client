@@ -53,6 +53,7 @@ pub use materialize::{
 };
 pub use queries::MessageReadState;
 pub use store::ChatStore;
+pub use store::shared_history::PendingHistoryBundle;
 pub use types::{
     ArrivalCursor, AvatarDescriptor, ChatArchiveFilter, ChatCursor, ChatEntry, ChatNameExpected,
     ChatNameWrite, ChatNotificationMetadata, ContactEntry, GroupHierarchyWrite, MediaRef,

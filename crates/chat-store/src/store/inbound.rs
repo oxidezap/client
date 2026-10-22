@@ -47,6 +47,16 @@ pub(super) fn apply_inbound(
 
     match classify(&inbound.message) {
         MessageOp::Store { kind, text } => {
+            if kind == "history_notice"
+                && !super::shared_history::notice_visible(
+                    conn,
+                    device_id,
+                    &inbound.message,
+                    info.source.is_from_me,
+                )?
+            {
+                return Ok(());
+            }
             // Compacted storage copy (quote snapshot dropped when the parent
             // is local, secret-only envelope stripped, large protos
             // compressed); the live message above is untouched.
@@ -81,8 +91,11 @@ pub(super) fn apply_inbound(
             // already counted) must not inflate the unread badge again — and a
             // skipped one (revoked tombstone) must not surface its content in
             // the chat preview at all.
-            let unread_delta =
-                i32::from(inserted == StoredRow::Inserted && !info.source.is_from_me);
+            let unread_delta = i32::from(
+                inserted == StoredRow::Inserted
+                    && !info.source.is_from_me
+                    && kind != "history_notice",
+            );
             if inserted != StoredRow::Skipped {
                 bump_chat(
                     conn,
@@ -172,6 +185,18 @@ pub(super) fn apply_inbound(
                 cs.chats = true;
             }
             cs.message_chats.insert(chat);
+        }
+        MessageOp::HistoryBundle => {
+            super::shared_history::persist(
+                conn,
+                device_id,
+                &chat,
+                &info.id,
+                &sender,
+                ts_ms,
+                info.source.is_from_me,
+                &inbound.message,
+            )?;
         }
         MessageOp::Ignore => {}
     }

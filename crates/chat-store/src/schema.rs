@@ -46,6 +46,7 @@ diesel::table! {
         edited_at_ms -> Nullable<BigInt>,
         revoked -> Bool,
         local_revoke_placeholder -> Bool,
+        received_as_shared_history -> Bool,
     }
 }
 

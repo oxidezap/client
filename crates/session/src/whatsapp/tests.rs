@@ -2471,6 +2471,7 @@ fn a_message_cursor_survives_the_round_trip() {
         status: oxidezap_chat_store::MessageStatus::Delivered,
         revoked: false,
         local_revoke_placeholder: false,
+        received_as_shared_history: false,
         edited_at: None,
         starred: false,
         seq: 4242,
@@ -2517,6 +2518,7 @@ fn stored_edit_state_reaches_own_and_peer_bubbles_in_direct_and_group_chats() {
                 edited_at: Some(timestamp),
                 revoked: false,
                 local_revoke_placeholder: false,
+                received_as_shared_history: false,
                 seq: 1,
             };
             let mut plain = stored.clone();
