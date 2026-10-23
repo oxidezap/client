@@ -154,6 +154,17 @@ pub(super) fn persist(
     Ok(())
 }
 
+// Compare the complete envelope: a stale completion cannot consume a different
+// attachment when a sender reuses its stanza id.
+fn complete(
+    conn: &mut SqliteConnection,
+    device: i32,
+    bundle: &PendingHistoryBundle,
+) -> QueryResult<usize> {
+    diesel::sql_query("UPDATE shared_group_history SET completed = TRUE, proto = X'' WHERE device_id = ? AND chat_jid = ? AND msg_id = ? AND sender_jid = ? AND proto = ? AND timestamp_ms = ? AND completed = FALSE")
+        .bind::<Integer,_>(device).bind::<Text,_>(&bundle.chat_jid).bind::<Text,_>(&bundle.msg_id).bind::<Text,_>(&bundle.sender_jid).bind::<Binary,_>(&bundle.proto).bind::<BigInt,_>(bundle.timestamp_ms).execute(conn)
+}
+
 pub(super) fn apply(
     conn: &mut SqliteConnection,
     device: i32,
@@ -161,11 +172,7 @@ pub(super) fn apply(
     history: Option<&wa::GroupHistory>,
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
-    // Compare the complete envelope too: a stale completion cannot consume a
-    // different attachment, even if a sender reused its stanza id.
-    let changed = diesel::sql_query("UPDATE shared_group_history SET completed = TRUE, proto = X'' WHERE device_id = ? AND chat_jid = ? AND msg_id = ? AND sender_jid = ? AND proto = ? AND timestamp_ms = ? AND completed = FALSE")
-        .bind::<Integer,_>(device).bind::<Text,_>(&bundle.chat_jid).bind::<Text,_>(&bundle.msg_id).bind::<Text,_>(&bundle.sender_jid).bind::<Binary,_>(&bundle.proto).bind::<BigInt,_>(bundle.timestamp_ms).execute(conn)?;
-    if changed == 0 {
+    if complete(conn, device, bundle)? == 0 {
         return Ok(());
     }
     let Some(history) = history else {
@@ -271,6 +278,29 @@ pub(super) fn apply(
         if crate::message_kind(content) == "unknown" && content.protocol_message.is_unset() {
             continue;
         }
+        // Aggregated reaction keys use the same sharing-account perspective
+        // as the enclosing history message. Missing/invalid keys have no author.
+        message.reactions.retain_mut(|reaction| {
+            let Some(key) = reaction.key.as_option_mut() else {
+                return false;
+            };
+            let author = if key.from_me == Some(true) {
+                Some(bundle.sender_jid.as_str())
+            } else {
+                key.participant
+                    .as_deref()
+                    .or_else(|| own.first().map(String::as_str))
+            };
+            let Some(author) =
+                author.filter(|s| s.parse::<Jid>().is_ok_and(|j| j.is_pn() || j.is_lid()))
+            else {
+                return false;
+            };
+            let author = stored_sender(author, false);
+            key.from_me = Some(own.contains(&author));
+            key.participant = Some(author);
+            true
+        });
         super::history_sync::apply_history_message(
             conn,
             device,
@@ -436,4 +466,30 @@ pub(super) fn repair_legacy(
         .bind::<BigInt, _>(head.unwrap_or(0)).bind::<Integer, _>(device)
         .bind::<Text, _>(chat).bind::<BigInt, _>(ts).execute(conn)?;
     Ok(true)
+}
+
+/// Retire covered attachment facts in the same transaction as chat deletion.
+/// Keep their keys so a redelivery or an in-flight completion cannot revive them.
+pub(super) fn retire_for_deletion(
+    conn: &mut SqliteConnection,
+    device: i32,
+    chat: &str,
+    bound: Option<&super::read_state::RangeBound>,
+) -> QueryResult<()> {
+    let pending = diesel::sql_query("SELECT chat_jid, msg_id, sender_jid, timestamp_ms, proto FROM shared_group_history WHERE device_id = ? AND chat_jid = ? AND completed = FALSE")
+        .bind::<Integer, _>(device).bind::<Text, _>(chat).load::<PendingHistoryBundle>(conn)?;
+    for bundle in pending {
+        let covered = bound.is_none_or(|bound| {
+            bundle.timestamp_ms < bound.second_start_ms
+                || (bundle.timestamp_ms <= bound.second_end_ms
+                    && bound
+                        .keys
+                        .as_ref()
+                        .is_none_or(|keys| keys.contains(&bundle.msg_id)))
+        });
+        if covered {
+            complete(conn, device, &bundle)?;
+        }
+    }
+    Ok(())
 }

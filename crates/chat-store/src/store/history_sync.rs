@@ -437,6 +437,7 @@ pub(super) fn apply_history_message(
                     new_kind,
                     &new_proto,
                     sender_timestamp_ms.unwrap_or(ts_ms),
+                    shared,
                     cs,
                 )? {
                     cs.chats = true;
@@ -456,6 +457,7 @@ pub(super) fn apply_history_message(
                     target_from_me,
                     ts_ms,
                     false,
+                    shared,
                     cs,
                 )? {
                     cs.chats = true;

@@ -408,6 +408,7 @@ pub(super) fn delete_chat_rows(
     bound: Option<&RangeBound>,
 ) -> QueryResult<()> {
     use schema::messages::dsl as m;
+    super::shared_history::retire_for_deletion(conn, device_id, chat, bound)?;
     // Every branch below deletes from the same set — this chat's rows, minus
     // the starred ones when they are spared — and differs only in the time
     // window it adds. A boxed statement is consumed by `execute`, and the

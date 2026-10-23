@@ -496,6 +496,7 @@ fn apply_writer_msg(
                 kind,
                 proto,
                 *timestamp_ms,
+                false,
                 cs,
             )? {
                 cs.chats = true;
@@ -520,6 +521,7 @@ fn apply_writer_msg(
                 *target_from_me,
                 *timestamp_ms,
                 true,
+                false,
                 cs,
             )? {
                 cs.chats = true;

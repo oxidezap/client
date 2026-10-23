@@ -533,3 +533,288 @@ async fn multi_chunk_inflation_preserves_content_and_rejects_invalid_protobuf() 
     let rows = store.messages(&jid(GROUP), None, 100).await.unwrap();
     assert_eq!(rows[0].text.as_deref().unwrap().len(), 30_000);
 }
+
+async fn review_245_deleted_pending_import(delete: bool) {
+    let (db, store) = test_store().await;
+    own(&db).await;
+    receive(&store, wa::Message::text("existing"), "LIVE").await;
+    receive(&store, bundle(&[OWN]), "BUNDLE").await;
+    let pending = store.pending_history_bundles().await.unwrap().remove(0);
+    let other_chat = "120363000000000002@g.us";
+    feed(
+        &store,
+        [message_event(
+            bundle(&[OWN]),
+            incoming_info(other_chat, PEER, "BUNDLE", AT),
+        )],
+    )
+    .await;
+    let event = if delete {
+        Event::DeleteChatUpdate(
+            wacore::types::events::DeleteChatUpdate::builder()
+                .jid(jid(GROUP))
+                .delete_media(false)
+                .timestamp(ts(AT + 1))
+                .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
+                .from_full_sync(false)
+                .build(),
+        )
+    } else {
+        Event::ClearChatUpdate(
+            wacore::types::events::ClearChatUpdate::builder()
+                .jid(jid(GROUP))
+                .delete_starred(false)
+                .delete_media(false)
+                .timestamp(ts(AT + 1))
+                .action(Box::new(wa::sync_action_value::ClearChatAction::default()))
+                .from_full_sync(false)
+                .build(),
+        )
+    };
+    feed(&store, [event]).await;
+    store.close().await.unwrap();
+    let store = ChatStore::new(&db).await.unwrap();
+    let still_pending = store
+        .pending_history_bundles()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.chat_jid == GROUP)
+        .count();
+    store
+        .apply_history_bundle(
+            &pending,
+            &compressed(vec![historical("OLD", Some(OTHER), false, AT - 10)]),
+        )
+        .unwrap();
+    store.flush().await.unwrap();
+    assert!(
+        store
+            .messages(&jid(GROUP), None, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "late completion restored cleared history"
+    );
+    if delete {
+        assert!(
+            store.chat(&jid(GROUP)).await.unwrap().is_none(),
+            "late completion recreated the deleted chat"
+        );
+    }
+    assert_eq!(
+        still_pending, 0,
+        "deletion must retire durable pending work"
+    );
+    receive(&store, bundle(&[OWN]), "BUNDLE").await;
+    let remaining = store.pending_history_bundles().await.unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "redelivery revived retired work or another chat was retired"
+    );
+    assert_eq!(remaining[0].chat_jid, other_chat);
+}
+
+#[tokio::test]
+async fn review_245_clear_blocks_late_completion_after_restart() {
+    review_245_deleted_pending_import(false).await;
+}
+#[tokio::test]
+async fn review_245_delete_blocks_late_completion_after_restart() {
+    review_245_deleted_pending_import(true).await;
+}
+
+async fn review_245_shared_placeholder(edit: bool) {
+    let (db, store) = test_store().await;
+    own(&db).await;
+    receive(&store, bundle(&[OWN]), "BUNDLE").await;
+    let pending = store.pending_history_bundles().await.unwrap().remove(0);
+    let mut operation: wa::WebMessageInfo = historical("OP", None, true, AT - 10);
+    let mut key: wa::MessageKey = Default::default();
+    key.id = Some("MISSING".into());
+    key.from_me = Some(true);
+    let mut protocol: wa::message::ProtocolMessage = Default::default();
+    protocol.key = MessageField::some(key);
+    protocol.r#type = Some(if edit {
+        wa::message::protocol_message::Type::MESSAGE_EDIT
+    } else {
+        wa::message::protocol_message::Type::REVOKE
+    });
+    if edit {
+        protocol.edited_message = MessageField::some(wa::Message::text("edited history"));
+    }
+    let mut message: wa::Message = Default::default();
+    message.protocol_message = MessageField::some(protocol);
+    operation.message = MessageField::some(message);
+    store
+        .apply_history_bundle(&pending, &compressed(vec![operation]))
+        .unwrap();
+    store.flush().await.unwrap();
+    let rows = store.messages(&jid(GROUP), None, 100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        store.chat(&jid(GROUP)).await.unwrap().unwrap().unread_count,
+        0,
+        "shared amendment created unread attention"
+    );
+    assert!(rows[0].received_as_shared_history);
+    store.reconcile_chat(&jid(GROUP)).unwrap();
+    store.flush().await.unwrap();
+    assert_eq!(
+        store.chat(&jid(GROUP)).await.unwrap().unwrap().unread_count,
+        0
+    );
+}
+#[tokio::test]
+async fn review_245_shared_edit_placeholder_stays_read() {
+    review_245_shared_placeholder(true).await;
+}
+#[tokio::test]
+async fn review_245_shared_revoke_placeholder_stays_read() {
+    review_245_shared_placeholder(false).await;
+}
+
+#[tokio::test]
+async fn review_245_sharer_reaction_can_be_replaced_and_removed_live() {
+    let (db, store) = test_store().await;
+    own(&db).await;
+    receive(&store, bundle(&[OWN]), "BUNDLE").await;
+    let pending = store.pending_history_bundles().await.unwrap().remove(0);
+    let mut message = historical("TARGET", Some(OTHER), false, AT - 20);
+    let mut key: wa::MessageKey = Default::default();
+    key.from_me = Some(true);
+    key.id = Some("REACTION".into());
+    key.remote_jid = Some(GROUP.into());
+    let mut reaction: wa::Reaction = Default::default();
+    reaction.key = MessageField::some(key);
+    reaction.text = Some("old".into());
+    reaction.sender_timestamp_ms = Some((AT - 10) * 1000);
+    message.reactions.push(reaction);
+    store
+        .apply_history_bundle(&pending, &compressed(vec![message]))
+        .unwrap();
+    store.flush().await.unwrap();
+    let imported = store.reactions(&jid(GROUP), "TARGET").await.unwrap();
+    assert_eq!(imported.len(), 1);
+    assert_eq!(
+        imported[0].sender_jid,
+        jid(PEER),
+        "sharer's reaction was imported as local"
+    );
+    for (index, emoji) in ["new", ""].into_iter().enumerate() {
+        let mut key: wa::MessageKey = Default::default();
+        key.id = Some("TARGET".into());
+        let mut reaction: wa::message::ReactionMessage = Default::default();
+        reaction.key = MessageField::some(key);
+        reaction.text = Some(emoji.into());
+        let mut message: wa::Message = Default::default();
+        message.reaction_message = MessageField::some(reaction);
+        feed(
+            &store,
+            [message_event(
+                message,
+                incoming_info(GROUP, PEER, "LIVE-REACTION", AT + index as i64),
+            )],
+        )
+        .await;
+        let rows = store.reactions(&jid(GROUP), "TARGET").await.unwrap();
+        if emoji.is_empty() {
+            assert!(rows.is_empty());
+        } else {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].emoji, emoji);
+        }
+    }
+}
+
+#[tokio::test]
+async fn review_245_ranged_clear_retires_only_covered_attachment_keys() {
+    let (db, store) = test_store().await;
+    own(&db).await;
+    for (id, at) in [
+        ("OLDER", AT - 1),
+        ("COVERED", AT),
+        ("TWIN", AT),
+        ("NEWER", AT + 1),
+    ] {
+        feed(
+            &store,
+            [message_event(
+                bundle(&[OWN]),
+                incoming_info(GROUP, PEER, id, at),
+            )],
+        )
+        .await;
+    }
+    let mut range = range_up_to(AT);
+    let mut key: wa::MessageKey = Default::default();
+    key.id = Some("COVERED".into());
+    let mut boundary: wa::sync_action_value::SyncActionMessage = Default::default();
+    boundary.key = MessageField::some(key);
+    range.as_option_mut().unwrap().messages.push(boundary);
+    let mut action: wa::sync_action_value::ClearChatAction = Default::default();
+    action.message_range = range;
+    feed(
+        &store,
+        [Event::ClearChatUpdate(
+            wacore::types::events::ClearChatUpdate::builder()
+                .jid(jid(GROUP))
+                .delete_starred(false)
+                .delete_media(false)
+                .timestamp(ts(AT + 2))
+                .action(Box::new(action))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    let pending = store.pending_history_bundles().await.unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|b| b.msg_id.as_str())
+            .collect::<Vec<_>>(),
+        ["TWIN", "NEWER"]
+    );
+}
+
+#[tokio::test]
+async fn review_245_shared_amendment_keeps_existing_live_unread_eligibility() {
+    let (db, store) = test_store().await;
+    own(&db).await;
+    receive(&store, wa::Message::text("live"), "TARGET").await;
+    receive(&store, bundle(&[OWN]), "BUNDLE").await;
+    let pending = store.pending_history_bundles().await.unwrap().remove(0);
+    let mut message = historical("EDIT", None, true, AT - 10);
+    let mut key: wa::MessageKey = Default::default();
+    key.id = Some("TARGET".into());
+    key.from_me = Some(true);
+    let mut protocol: wa::message::ProtocolMessage = Default::default();
+    protocol.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+    protocol.key = MessageField::some(key);
+    protocol.edited_message = MessageField::some(wa::Message::text("history edit"));
+    let mut content: wa::Message = Default::default();
+    content.protocol_message = MessageField::some(protocol);
+    message.message = MessageField::some(content);
+    store
+        .apply_history_bundle(&pending, &compressed(vec![message]))
+        .unwrap();
+    store.flush().await.unwrap();
+    let rows = store.messages(&jid(GROUP), None, 100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        !rows[0].received_as_shared_history,
+        "a live target was relabeled as read backfill"
+    );
+    assert_eq!(
+        store.chat(&jid(GROUP)).await.unwrap().unwrap().unread_count,
+        1
+    );
+    store.reconcile_chat(&jid(GROUP)).unwrap();
+    store.flush().await.unwrap();
+    assert_eq!(
+        store.chat(&jid(GROUP)).await.unwrap().unwrap().unread_count,
+        1
+    );
+}
