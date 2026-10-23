@@ -23,6 +23,7 @@ mod reaction;
 pub(crate) mod read_state;
 mod receipt;
 mod revoke;
+pub(crate) mod shared_history;
 mod writer;
 
 use std::sync::{Arc, Mutex};
@@ -159,6 +160,11 @@ pub(crate) enum WriterMsg {
         target_participant: Option<String>,
         emoji: String,
         timestamp_ms: i64,
+    },
+    SharedHistoryAttempt(crate::PendingHistoryBundle),
+    SharedHistory {
+        bundle: crate::PendingHistoryBundle,
+        history: Option<wa::GroupHistory>,
     },
     Reconcile(Jid),
     ReconcileAll,
@@ -450,7 +456,7 @@ struct MetadataValue {
 fn repair_unknown_message_kinds(conn: &mut diesel::SqliteConnection) -> QueryResult<()> {
     use diesel::sql_types::{BigInt, Nullable, Text};
     const KEY: &str = "message_kind_classifier";
-    const VERSION: &str = "2026-09-24-v1";
+    const VERSION: &str = "2026-10-22-v2";
     conn.transaction(|conn| {
         let version = diesel::sql_query("SELECT value FROM chat_store_meta WHERE key = ?")
             .bind::<Text, _>(KEY)
@@ -480,6 +486,16 @@ fn repair_unknown_message_kinds(conn: &mut diesel::SqliteConnection) -> QueryRes
                 else {
                     continue;
                 };
+                if shared_history::repair_legacy(
+                    conn,
+                    row.device_id,
+                    row.id,
+                    &row.chat_jid,
+                    &message,
+                )? {
+                    affected_chats.insert((row.device_id, row.chat_jid));
+                    continue;
+                }
                 let kind = crate::materialize::message_kind(&message);
                 if kind == "unknown" {
                     continue;
@@ -1191,6 +1207,14 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
+        assert!(has_table(&store, "shared_group_history").await);
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("shared-history downgrade is reversible");
+        assert!(!has_table(&store, "shared_group_history").await);
+        assert!(!has_column(&store, "messages", "received_as_shared_history").await);
         assert!(has_column(&store, "messages", "local_revoke_placeholder").await);
         store
             .shared()

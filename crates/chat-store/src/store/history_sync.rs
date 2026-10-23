@@ -172,7 +172,7 @@ fn apply_history_conversation(
         let Some(wmi) = hist_msg.message.as_option() else {
             continue;
         };
-        apply_history_message(conn, device_id, chat, wmi, cs, &mut pending_quotes)?;
+        apply_history_message(conn, device_id, chat, wmi, cs, &mut pending_quotes, false)?;
     }
     strip_pending_quotes(conn, device_id, chat, &pending_quotes)?;
     // Backfill the denormalized preview from the newest materialized row, so a
@@ -311,13 +311,14 @@ fn apply_history_conversation(
     Ok(())
 }
 
-fn apply_history_message(
+pub(super) fn apply_history_message(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
     wmi: &wa::WebMessageInfo,
     cs: &mut ChangeSet,
     pending_quotes: &mut Vec<PendingQuote>,
+    shared: bool,
 ) -> QueryResult<()> {
     let Some(key) = wmi.key.as_option() else {
         return Ok(());
@@ -348,6 +349,11 @@ fn apply_history_message(
     if let Some(message) = wmi.message.as_option() {
         match classify(message) {
             MessageOp::Store { kind, text } => {
+                if kind == "history_notice"
+                    && !super::shared_history::notice_visible(conn, device_id, message, from_me)?
+                {
+                    return Ok(());
+                }
                 // Same compaction as the live path. A parent later in this
                 // same conversation is not visible yet, so the post-pass
                 // below re-checks the replies that kept their snapshot.
@@ -381,6 +387,21 @@ fn apply_history_message(
                     },
                     cs,
                 )?;
+                if shared && stored_row == StoredRow::Inserted {
+                    use schema::messages::dsl;
+                    diesel::update(
+                        dsl::messages
+                            .filter(dsl::device_id.eq(device_id))
+                            .filter(dsl::chat_jid.eq(chat))
+                            .filter(dsl::msg_id.eq(msg_id))
+                            .filter(dsl::sender_jid.eq(
+                                crate::store::message_identity::stored_sender(sender, from_me),
+                            ))
+                            .filter(dsl::from_me.eq(from_me)),
+                    )
+                    .set(dsl::received_as_shared_history.eq(true))
+                    .execute(conn)?;
+                }
                 // A reply whose parent lands LATER in this conversation kept
                 // its inline snapshot above (the parent was not visible yet).
                 // Record it for the post-pass rather than re-reading every
@@ -440,7 +461,7 @@ fn apply_history_message(
                     cs.chats = true;
                 }
             }
-            MessageOp::Ignore => {}
+            MessageOp::HistoryBundle | MessageOp::Ignore => {}
         }
     }
 

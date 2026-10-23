@@ -34,6 +34,8 @@ pub(crate) enum MessageOp {
         target_from_me: bool,
         target_participant: Option<String>,
     },
+    /// A deliberately shared group-history attachment, persisted before ACK.
+    HistoryBundle,
     /// Protocol/bookkeeping payloads that don't belong in a chat log.
     Ignore,
 }
@@ -68,6 +70,8 @@ pub fn message_kind(message: &wa::Message) -> &'static str {
         "location"
     } else if poll_creation_message(message).is_some() {
         "poll"
+    } else if base.message_history_notice.is_set() {
+        "history_notice"
     } else if base.album_message.is_set() {
         "album"
     } else if base.product_message.is_set() {
@@ -242,6 +246,10 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
         }
     }
 
+    if base.message_history_bundle.is_set() {
+        return MessageOp::HistoryBundle;
+    }
+
     if is_control_carrier(base) {
         return MessageOp::Ignore;
     }
@@ -260,6 +268,20 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
 /// Text projection for list previews and full-text search: body text or media
 /// caption.
 pub(crate) fn extract_text(base: &wa::Message) -> Option<String> {
+    if let Some(notice) = base.message_history_notice.as_option() {
+        let metadata = notice.message_history_metadata.as_option();
+        return Some(
+            match metadata.and_then(|m| m.message_count).filter(|n| *n >= 0) {
+                Some(count) => {
+                    let receivers = metadata.map_or(0, |m| m.history_receivers.len());
+                    let messages = if count == 1 { "message" } else { "messages" };
+                    let members = if receivers == 1 { "member" } else { "members" };
+                    format!("Shared {count} earlier {messages} with {receivers} group {members}")
+                }
+                None => "Shared earlier messages with group members".into(),
+            },
+        );
+    }
     base.text_content()
         .or_else(|| base.get_caption())
         .or_else(|| business_text(base))
@@ -337,7 +359,8 @@ fn has_any_content(base: &wa::Message) -> bool {
 /// a carrier.
 #[must_use]
 pub fn is_control_only(msg: &wa::Message) -> bool {
-    is_control_carrier(normalized_message(msg))
+    let base = normalized_message(msg);
+    is_control_carrier(base) || base.message_history_bundle.is_set()
 }
 
 #[cfg(test)]

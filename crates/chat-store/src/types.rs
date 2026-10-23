@@ -24,6 +24,8 @@ pub enum MessageKind {
     Poll,
     /// Parent for a grouped album; child media rows carry their own kinds.
     Album,
+    /// A group system notice describing deliberately shared history.
+    HistoryNotice,
     /// WhatsApp product/catalog message.
     Product,
     Event,
@@ -95,6 +97,7 @@ impl MessageKind {
             Self::ViewOnce => "view_once",
             Self::Hosted => "hosted",
             Self::Bot => "bot",
+            Self::HistoryNotice => "history_notice",
             Self::Unknown => "unknown",
             Self::Other(label) => label,
         }
@@ -140,6 +143,7 @@ impl MessageKind {
             "view_once" => Self::ViewOnce,
             "hosted" => Self::Hosted,
             "bot" => Self::Bot,
+            "history_notice" => Self::HistoryNotice,
             "unknown" => Self::Unknown,
             _ => Self::Other(label),
         }
@@ -307,6 +311,8 @@ pub struct StoredMessage {
     pub revoked: bool,
     /// A locally created tombstone that never contributed to unread counts.
     pub local_revoke_placeholder: bool,
+    /// Shared history is read backfill and never contributes unread attention.
+    pub received_as_shared_history: bool,
     /// Arrival order within this store, ascending. Opaque: compare it, don't
     /// interpret it. It exists because the server's `t` is whole seconds, so
     /// two messages exchanged in the same second carry the same `timestamp`

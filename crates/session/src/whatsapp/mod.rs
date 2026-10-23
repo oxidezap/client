@@ -31,6 +31,7 @@ mod sends;
 mod history;
 /// Which events wait for which, and which never had to.
 mod lanes;
+mod shared_history;
 
 /// What a message's media is, for both the roads it arrives on.
 mod media;
@@ -1461,6 +1462,8 @@ impl WhatsAppClient {
             });
         }
 
+        shared_history::spawn(bot.client(), chat_store.clone(), stopping.clone());
+
         // Re-hydrate the UI off the store's invalidation stream instead of raw
         // client events: changes are emitted only after commit, so a reload can
         // never observe pre-commit state (no flush barrier, no dispatch-order
@@ -2226,7 +2229,7 @@ impl WhatsAppClient {
         // is a `[Media]` bubble with an unread badge, and the store writes no
         // row for it, so it vanishes at the next hydration having already
         // raised a count nothing sent a receipt for.
-        if oxidezap_chat_store::is_control_only(msg) {
+        if oxidezap_chat_store::is_control_only(msg) || base_msg.message_history_notice.is_set() {
             return;
         }
 

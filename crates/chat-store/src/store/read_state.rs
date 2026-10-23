@@ -190,6 +190,8 @@ pub(super) fn advance_read_state(
                         .and(dsl::msg_id.eq_any(&state.extra_ids))
                         .and(dsl::from_me.eq(false))
                         .and(dsl::local_revoke_placeholder.eq(false))
+                        .and(dsl::received_as_shared_history.eq(false))
+                        .and(dsl::kind.ne("history_notice"))
                         .and(dsl::timestamp_ms.gt(state.watermark_ms)),
                 )
                 .select(dsl::msg_id)
@@ -261,6 +263,8 @@ pub(super) fn count_unread(
                 .and(dsl::chat_jid.eq(chat))
                 .and(dsl::from_me.eq(false))
                 .and(dsl::local_revoke_placeholder.eq(false))
+                .and(dsl::received_as_shared_history.eq(false))
+                .and(dsl::kind.ne("history_notice"))
                 .and(dsl::timestamp_ms.gt(state.watermark_ms)),
         )
         .into_boxed();
@@ -290,6 +294,8 @@ pub(super) fn count_uncovered_incoming(
                 .and(dsl::chat_jid.eq(chat))
                 .and(dsl::from_me.eq(false))
                 .and(dsl::local_revoke_placeholder.eq(false))
+                .and(dsl::received_as_shared_history.eq(false))
+                .and(dsl::kind.ne("history_notice"))
                 .and(dsl::timestamp_ms.gt(state.watermark_ms)),
         )
         .into_boxed();

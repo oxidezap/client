@@ -28,7 +28,10 @@ pub(super) fn stored_with_unread_tail(
         .into_iter()
         .rev()
         .map(|row| {
-            let eligible = !row.from_me && !row.local_revoke_placeholder;
+            let eligible = !row.from_me
+                && !row.local_revoke_placeholder
+                && !row.received_as_shared_history
+                && row.kind != oxidezap_chat_store::MessageKind::HistoryNotice;
             let mut message = stored_to_chat_message(row);
             if eligible && remaining > 0 {
                 message.is_read = false;
@@ -77,6 +80,8 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         true
     };
     let quoted = base_message.and_then(quoted_from);
+    let system = (stored.kind == oxidezap_chat_store::MessageKind::HistoryNotice)
+        .then(|| oxidezap_core::SystemNotice::GroupChanged(content.clone()));
     ChatMessage {
         id: stored.id,
         sender: stored.sender_jid.to_string(),
@@ -99,7 +104,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         quoted,
         revoked: stored.revoked,
         edited: stored.edited_at.is_some(),
-        system: None,
+        system,
         poll,
     }
 }
@@ -279,8 +284,30 @@ mod tests {
             edited_at: None,
             revoked: false,
             local_revoke_placeholder: false,
+            received_as_shared_history: false,
             seq: 1,
         }
+    }
+
+    #[test]
+    fn shared_history_is_read_and_not_an_unknown_system_bubble() {
+        let mut historical = stored_poll_creation();
+        historical.received_as_shared_history = true;
+        let mut live = stored_poll_creation();
+        live.id = "LIVE".into();
+        let messages = stored_with_unread_tail(vec![live, historical], 1);
+        assert!(!messages[0].is_read);
+        assert!(messages[1].is_read);
+        let mut notice = stored_poll_creation();
+        notice.kind = oxidezap_chat_store::MessageKind::HistoryNotice;
+        notice.text = Some("Shared earlier messages with group members".into());
+        notice.message = None;
+        let rendered = stored_to_chat_message(notice);
+        assert!(matches!(
+            rendered.system,
+            Some(oxidezap_core::SystemNotice::GroupChanged(_))
+        ));
+        assert!(!rendered.content.contains("unknown"));
     }
 
     #[test]

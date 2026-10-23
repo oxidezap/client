@@ -61,6 +61,37 @@ pub(super) fn insert_message(
         &sender,
         changes,
     )? {
+        // A revoke that arrived first had no original position. Recover only
+        // its kind/time, never the content, after sender-scoped resolution.
+        let old_ts: i64 = dsl::messages
+            .filter(dsl::id.eq(existing.id))
+            .select(dsl::timestamp_ms)
+            .first(conn)?;
+        let repaired = diesel::update(
+            dsl::messages
+                .filter(dsl::id.eq(existing.id))
+                .filter(dsl::revoked.eq(true))
+                .filter(dsl::kind.eq("unknown"))
+                .filter(dsl::proto.is_null()),
+        )
+        .set((
+            dsl::timestamp_ms.eq(new.timestamp_ms),
+            dsl::kind.eq(new.kind),
+        ))
+        .execute(conn)?;
+        if repaired > 0 {
+            // Re-derive the activity head too when this placeholder was newest.
+            super::chat_rows::reconcile_chat_head_after_timestamp_change(
+                conn,
+                device_id,
+                new.chat_jid,
+                old_ts,
+                new.timestamp_ms,
+            )?;
+            changes.chats = true;
+            changes.message_chats.insert(new.chat_jid.to_owned());
+            return Ok(StoredRow::Skipped);
+        }
         if !new.overwrite {
             // History is a stale copy: live rows and placeholders win.
             return Ok(StoredRow::Skipped);

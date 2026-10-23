@@ -393,6 +393,12 @@ fn apply_writer_msg(
             }
             Ok(())
         }
+        WriterMsg::SharedHistoryAttempt(bundle) => {
+            super::shared_history::attempted(conn, device_id, bundle)
+        }
+        WriterMsg::SharedHistory { bundle, history } => {
+            super::shared_history::apply(conn, device_id, bundle, history.as_ref(), cs)
+        }
         WriterMsg::ReconcileAll => {
             crate::store::message_identity::reconcile_all(conn, device_id, cs)?;
             crate::lid::reconcile_known_chats(conn, device_id, cs)?;

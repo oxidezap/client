@@ -243,6 +243,7 @@ pub(crate) struct MessageRow {
     edited_at_ms: Option<i64>,
     revoked: bool,
     local_revoke_placeholder: bool,
+    received_as_shared_history: bool,
 }
 
 /// Fold an author-equivalent legacy copy for a read without hiding a
@@ -298,6 +299,8 @@ fn fold_read_duplicate(
         held.status
     };
     survivor.revoked = revoked;
+    survivor.received_as_shared_history =
+        held.received_as_shared_history && incoming.received_as_shared_history;
     survivor.local_revoke_placeholder =
         held.local_revoke_placeholder || incoming.local_revoke_placeholder;
     survivor.status = status;
@@ -492,6 +495,7 @@ impl From<MessageRow> for StoredMessage {
             edited_at: row.edited_at_ms.and_then(ms_to_utc),
             revoked: row.revoked,
             local_revoke_placeholder: row.local_revoke_placeholder,
+            received_as_shared_history: row.received_as_shared_history,
             seq: row.id,
         }
     }
@@ -937,6 +941,8 @@ impl ChatStore {
                             .and(dsl::chat_jid.eq_any(keys))
                             .and(dsl::from_me.eq(false))
                             .and(dsl::local_revoke_placeholder.eq(false))
+                            .and(dsl::received_as_shared_history.eq(false))
+                            .and(dsl::kind.ne("history_notice"))
                             .and(
                                 dsl::timestamp_ms
                                     .gt(cursor.timestamp_ms)
