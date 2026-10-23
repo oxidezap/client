@@ -16,6 +16,8 @@ use crate::store::writer::ChangeSet;
 /// edited content up front — `insert_message` skips edited rows, so the
 /// original's later arrival can't show pre-edit text. Returns whether the
 /// chat-list preview changed.
+/// `shared` marks only a newly inserted placeholder as read backfill. An
+/// existing live target keeps its original unread eligibility.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_edit(
     conn: &mut SqliteConnection,
@@ -28,6 +30,7 @@ pub(super) fn apply_edit(
     new_kind: &str,
     new_proto: &[u8],
     ts_ms: i64,
+    shared: bool,
     changes: &mut ChangeSet,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
@@ -84,6 +87,7 @@ pub(super) fn apply_edit(
                 wa::web_message_info::Status::DELIVERY_ACK as i32
             }),
             dsl::edited_at_ms.eq(Some(ts_ms)),
+            dsl::received_as_shared_history.eq(shared),
         ))
         .on_conflict_do_nothing()
         .execute(conn)?
@@ -102,7 +106,7 @@ pub(super) fn apply_edit(
             ts_ms,
             preview: new_text,
             kind: Some(new_kind),
-            unread_delta: i32::from(!from_me),
+            unread_delta: i32::from(!from_me && !shared),
         },
     )?;
     Ok(true)

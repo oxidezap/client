@@ -138,6 +138,7 @@ pub(super) fn apply_inbound(
                 new_kind,
                 &new_proto,
                 sender_timestamp_ms.unwrap_or(ts_ms),
+                false,
                 cs,
             )? {
                 cs.chats = true;
@@ -179,6 +180,7 @@ pub(super) fn apply_inbound(
                 target_sender,
                 target_from_me,
                 ts_ms,
+                false,
                 false,
                 cs,
             )? {

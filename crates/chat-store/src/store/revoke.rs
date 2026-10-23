@@ -19,6 +19,8 @@ use crate::store::writer::ChangeSet;
 /// placeholder's `status` to the column default where the edit picks one by
 /// authorship, and previews as nothing rather than as new text. What is left
 /// to share is the `bump_chat` call, which is already a function.
+/// `shared` marks only a newly inserted placeholder as read backfill. An
+/// existing live target keeps its original unread eligibility.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_revoke(
     conn: &mut SqliteConnection,
@@ -29,6 +31,7 @@ pub(super) fn apply_revoke(
     target_from_me: bool,
     ts_ms: i64,
     locally_sent: bool,
+    shared: bool,
     changes: &mut ChangeSet,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
@@ -77,6 +80,7 @@ pub(super) fn apply_revoke(
             // arrived, retain that origin separately from the target author
             // so future badge recounts cannot turn it into unread attention.
             dsl::local_revoke_placeholder.eq(locally_sent),
+            dsl::received_as_shared_history.eq(shared),
         ))
         .on_conflict_do_nothing()
         .execute(conn)?
@@ -107,7 +111,7 @@ pub(super) fn apply_revoke(
             ts_ms,
             preview: None,
             kind: None,
-            unread_delta: i32::from(!target_from_me && !locally_sent),
+            unread_delta: i32::from(!target_from_me && !locally_sent && !shared),
         },
         row_id,
     )?;

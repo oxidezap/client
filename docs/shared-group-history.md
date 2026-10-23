@@ -144,3 +144,41 @@ An earlier combined `cargo test` invocation passed 281 session tests but exhaust
 Its partial-state assertion did not fail. That test's opening path precedes the
 new downloader task, and it passed in both complete Nextest runs, including the
 final run after the pagination correction. No change to that test was made.
+
+## Post-merge review corrections
+
+Review of merged PR #246 found three reproducible gaps. Pending attachments
+survived clear/delete-chat, missing-target shared edits and revokes created
+unread placeholders, and aggregated reaction keys still described the sharing
+account's perspective. Synthetic regressions reproduce each on merged base
+`5ee0050c279987abf16c6418d9ff9c1251ce975a`.
+
+Clear/delete now retires pending attachment envelopes covered by the action's
+existing timestamp/key range in the same writer transaction. Retired keys remain
+for deduplication. A downloaded body held by an older task cannot consume that
+retired envelope after restart, and re-delivery cannot queue it again. Other
+chats and envelopes outside the action's range remain untouched. This is local
+store deletion behavior, not a claim about server-side history retention.
+
+Shared edit/revoke insertions retain the read-backfill marker and contribute no
+unread delta. Existing live targets keep their own unread eligibility. Aggregated
+reaction keys are translated before ordinary history import, allowing the
+sharing account's later live replacement/removal to address the same reaction.
+
+The same verified Web snapshot supports the reaction interpretation.
+`WAWebGroupHistorySerializationUtils.serializeSingleMessage` serializes reaction
+keys from the original message keys and sets their `unread` field false. Its
+identical factory appears in bundle `414c0febcdba83636838a75d6f3f50ef4ad2cb39dbfaa2a16e3a6ece37fc86cb`,
+bytes 436848..441175, and bundle `9b681e073f14f9d50e3dc12b456e4f980b554eff4d58827bc91c90a697e9ca38`,
+bytes 1266844..1271171. `WAWebAddonProcessMsgsUtils.parseHistorySyncMsg` forwards
+aggregates to add-on conversion in bundle `430cb8979511aada95178605faa35a8483446f677ce6d1fe0fd66333c7879eee`,
+bytes 343106..347691. The `WAWebE2EProtoUtils` key-perspective conversion is
+recorded above. No authenticated reproduction or new server contract is claimed.
+
+The final follow-up fixture (`tests/shared_history.rs`, SHA-256
+`c8acac7866197ec32a669292e6ef07c06f3ddde57b6452bbf4b6f025c2971aa6`)
+was run unchanged on the merged base: six `review_245` checks failed and the
+existing-live-target eligibility guard passed. All seven pass with the patch.
+Validation also passed formatting, chat-store Clippy with all targets/features
+and warnings denied, and the complete chat-store Nextest suite (397 passed,
+one skipped). Chat-store doctests completed with three ignored examples.
