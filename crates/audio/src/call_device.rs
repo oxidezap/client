@@ -21,7 +21,7 @@ use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer as _, Producer as _, Split as _};
 
 /// Pick the device's default config and an i16-friendly stream config.
-fn default_config(
+pub(crate) fn default_config(
     device: &cpal::Device,
     input: bool,
 ) -> Result<(cpal::StreamConfig, SampleFormat)> {
@@ -473,12 +473,12 @@ pub fn spawn_speaker() -> Result<async_channel::Sender<Vec<i16>>> {
 
 /// Counters the speaker callback publishes once per callback (never per
 /// sample), read by the diagnostics task.
-struct SpeakerCounters {
-    pops: Arc<AtomicU64>,
-    underruns: Arc<AtomicU64>,
+pub(crate) struct SpeakerCounters {
+    pub(crate) pops: Arc<AtomicU64>,
+    pub(crate) underruns: Arc<AtomicU64>,
 }
 
-fn build_output_stream<C>(
+pub(crate) fn build_output_stream<C>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     format: SampleFormat,
