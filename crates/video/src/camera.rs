@@ -1061,6 +1061,7 @@ mod negotiation_tests {
         opens: Vec<CameraFormat>,
         stops: usize,
         drops: usize,
+        unclean_drops: usize,
         fail_start: Option<CameraFormat>,
         fail_close: bool,
     }
@@ -1095,10 +1096,10 @@ mod negotiation_tests {
 
     impl Drop for Fake {
         fn drop(&mut self) {
-            assert!(self.stopped, "every negotiated device is explicitly closed");
             let mut state = self.state.borrow_mut();
             state.held = false;
             state.drops += 1;
+            state.unclean_drops += usize::from(!self.stopped);
         }
     }
 
@@ -1155,6 +1156,29 @@ mod negotiation_tests {
             )));
             assert!(requested.fulfill(&advertised).is_none());
         }
+    }
+
+    #[test]
+    fn absent_requested_size_does_not_hide_a_usable_advertised_mode() {
+        let actual = mode(800, 600, 30, FrameFormat::MJPEG);
+        let wanted = VideoQuality::default();
+        let legacy = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(mode(
+            wanted.width,
+            wanted.height,
+            wanted.fps,
+            FrameFormat::MJPEG,
+        )));
+        assert!(legacy.fulfill(&[actual]).is_none());
+        let state = Rc::new(RefCell::new(State::default()));
+        let (mut camera, quality) =
+            negotiate(wanted, factory(state.clone(), vec![actual]), |camera| {
+                mode_quality(camera.mode, wanted)
+            })
+            .unwrap();
+        assert_eq!((quality.width, quality.height, quality.fps), (800, 600, 30));
+        camera.stop_stream().unwrap();
+        drop(camera);
+        assert_eq!(state.borrow().unclean_drops, 0);
     }
 
     #[test]
@@ -1245,6 +1269,7 @@ mod negotiation_tests {
             drop(camera);
             assert!(!state.borrow().held);
             assert_eq!(state.borrow().stops, 2);
+            assert_eq!(state.borrow().unclean_drops, 0);
         }
     }
 
@@ -1274,6 +1299,7 @@ mod negotiation_tests {
         camera.stop_stream().unwrap();
         drop(camera);
         assert_eq!(state.borrow().drops, 4);
+        assert_eq!(state.borrow().unclean_drops, 0);
     }
 
     #[test]

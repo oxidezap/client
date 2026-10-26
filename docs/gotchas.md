@@ -736,8 +736,9 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   receiving it, whether or not anybody here is looking.
 - **A camera mode must be advertised as one complete tuple.** Both former
   fallback requests required MJPEG, so a YUYV/NV12-only Media Foundation
-  camera failed twice. Nokhwa's `Closest` request can also combine a nearby
-  resolution with FPS from the requested resolution. Capture now discovers
+  camera failed twice. Nokhwa's `Closest` request also looks up FPS at the
+  requested resolution after finding a nearby size, so an absent requested
+  size can reject an otherwise usable mode. Capture now discovers
   supported modes without starting a stream, filters the existing converter
   formats and H.264/RTP bounds, then opens exact advertised tuples. Resolution
   and FPS distance rank candidates; MJPEG breaks ties. Stream, conversion

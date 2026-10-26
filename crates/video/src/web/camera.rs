@@ -392,6 +392,7 @@ pub async fn open_camera_device(
     quality: VideoQuality,
     device: Option<String>,
 ) -> Result<CameraStream> {
+    let quality = quality.checked()?;
     if !is_available() {
         bail!("this browser has no VideoEncoder, so it cannot send a picture");
     }
