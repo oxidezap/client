@@ -1,6 +1,21 @@
 use std::collections::VecDeque;
 
-use oxidezap_core::{AccountId, CallState, IncomingCall};
+use oxidezap_core::{AccountId, CallDevicePreferences, CallState, IncomingCall};
+
+pub(super) async fn current_ringtone_preferences(
+    request: impl FnOnce() -> tokio::sync::oneshot::Receiver<
+        Result<oxidezap_ipc::CallDeviceReply, String>,
+    >,
+) -> Result<CallDevicePreferences, String> {
+    use oxidezap_ipc::CallDeviceReply;
+    match crate::platform::with_timeout(request(), std::time::Duration::from_secs(15)).await {
+        Some(Ok(Ok(CallDeviceReply::Preferences { preferences }))) => Ok(preferences),
+        Some(Ok(Ok(_))) => Err("the daemon returned a different device reply".into()),
+        Some(Ok(Err(reason))) => Err(reason),
+        Some(Err(_)) => Err("the connection ended before ringtone settings arrived".into()),
+        None => Err("loading ringtone settings timed out".into()),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AlertKey {
@@ -41,7 +56,9 @@ impl CallAlerts {
         if self.target.as_ref().map(|(key, _)| key) == target.as_ref().map(|(key, _)| key) {
             return false;
         }
-        if let Some((key, _)) = self.target.take() {
+        if let Some((key, _)) = self.target.take()
+            && Some(key.account) == account
+        {
             self.retire(key);
         }
         self.target = target;
@@ -69,6 +86,49 @@ impl CallAlerts {
 mod call_alert_tests {
     use super::*;
     use oxidezap_core::OutgoingCall;
+
+    #[test]
+    fn call_alert_reads_new_daemon_preferences_for_each_owner() {
+        use oxidezap_core::{CallDevicePreferences, Ringtone};
+        use std::cell::{Cell, RefCell};
+        let cached = CallDevicePreferences {
+            ringtone: Ringtone::Classic,
+            ringtone_output: Some("old-output".into()),
+            ..Default::default()
+        };
+        let stored = RefCell::new(CallDevicePreferences {
+            ringtone: Ringtone::Silent,
+            ringtone_output: Some("new-output".into()),
+            ..cached.clone()
+        });
+        let requests = Cell::new(0);
+        let request = || {
+            requests.set(requests.get() + 1);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send(Ok(oxidezap_ipc::CallDeviceReply::Preferences {
+                preferences: stored.borrow().clone(),
+            }))
+            .unwrap();
+            rx
+        };
+        let first = futures_lite::future::block_on(current_ringtone_preferences(&request)).unwrap();
+        assert_eq!(first, *stored.borrow());
+        assert_ne!(first, cached);
+        stored.borrow_mut().ringtone = Ringtone::Gentle;
+        let next = futures_lite::future::block_on(current_ringtone_preferences(request)).unwrap();
+        assert_eq!(next.ringtone, Ringtone::Gentle);
+        assert_eq!(requests.get(), 2);
+    }
+
+    #[test]
+    fn call_alert_missing_preferences_cannot_fall_back_to_a_cached_tone() {
+        let result = futures_lite::future::block_on(current_ringtone_preferences(|| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            drop(tx);
+            rx
+        }));
+        assert!(result.is_err());
+    }
 
     fn offer(id: &str) -> IncomingCall {
         IncomingCall {

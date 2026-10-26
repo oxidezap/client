@@ -19,6 +19,7 @@ struct AlertWork {
     retired: Arc<AtomicBool>,
     _task: Task<()>,
     owner: Option<IncomingCallAlert>,
+    displayed: bool,
 }
 
 impl Drop for AlertWork {
@@ -554,16 +555,39 @@ impl Calls {
     fn stop_alert(&mut self, retire: bool, cx: &App) {
         if let Some(work) = self.alert_work.take() {
             work.retired.store(retire, Ordering::Release);
-            cx.dismiss_system_notification(&work.key.tag());
+            if work.displayed {
+                cx.dismiss_system_notification(&work.key.tag());
+            }
             drop(work);
         }
     }
 
     pub(super) fn silence_alerts(&mut self, cx: &App) {
-        if let Some((key, _)) = self.alerts.target.take() {
-            self.alerts.dismiss(key.account, &key.call_id);
-        }
+        self.alerts.target = None;
         self.stop_alert(false, cx);
+    }
+
+    fn post_alert_notification(&mut self, key: &AlertKey, call: &IncomingCall, cx: &App) -> bool {
+        let Some(work) = self
+            .alert_work
+            .as_mut()
+            .filter(|work| work.key == *key && !work.cancelled.load(Ordering::Acquire))
+        else {
+            return false;
+        };
+        cx.show_system_notification(SystemNotification {
+            tag: key.tag().into(),
+            title: crate::utils::capped_name(&call.caller_name).into(),
+            body: if call.is_video {
+                "Incoming video call"
+            } else {
+                "Incoming voice call"
+            }
+            .into(),
+            actions: Vec::new(),
+        });
+        work.displayed = true;
+        true
     }
 
     fn dismiss_alert(&mut self, account: oxidezap_core::AccountId, call_id: &str) {
@@ -620,50 +644,42 @@ impl Calls {
                 };
                 let current = me
                     .update(cx, |calls, cx| {
-                        if cancel_task.load(Ordering::Acquire)
-                            || calls
-                                .alert_work
-                                .as_ref()
-                                .is_none_or(|work| work.key != task_key)
-                        {
-                            return false;
-                        }
-                        cx.show_system_notification(SystemNotification {
-                            tag: task_key.tag().into(),
-                            title: crate::utils::capped_name(&call.caller_name).into(),
-                            body: if call.is_video {
-                                "Incoming video call"
-                            } else {
-                                "Incoming voice call"
-                            }
-                            .into(),
-                            actions: Vec::new(),
-                        });
-                        true
+                        !cancel_task.load(Ordering::Acquire)
+                            && calls.post_alert_notification(&task_key, &call, cx)
                     })
                     .unwrap_or(false);
                 if !current {
                     break;
                 }
-                let preferences = loop {
-                    if cancel_task.load(Ordering::Acquire) {
-                        return;
+                let client = app
+                    .update(cx, |app, _| {
+                        app.client
+                            .as_ref()
+                            .filter(|client| client.account() == task_key.account)
+                            .map(|client| client.handle())
+                    })
+                    .ok()
+                    .flatten();
+                let preferences = match client {
+                    Some(client) => {
+                        alerts::current_ringtone_preferences(|| {
+                            client.call_devices(oxidezap_ipc::CallDeviceAction::Preferences)
+                        })
+                        .await
                     }
-                    match app.update(cx, |app, cx| {
-                        app.call_device_preferences_ready(cx)
-                            .then(|| app.call_device_preferences(cx))
-                    }) {
-                        Ok(Some(preferences)) => break preferences,
-                        Ok(None) => {
-                            crate::platform::sleep(std::time::Duration::from_millis(100)).await
-                        }
-                        Err(_) => return,
-                    }
+                    None => Err("the call's account connection is no longer available".into()),
                 };
                 let ready = cx
                     .background_spawn(async move {
-                        if let Err(error) = owner.play(preferences) {
-                            log::warn!("incoming call ringtone failed: {error:#}");
+                        match preferences {
+                            Ok(preferences) => {
+                                if let Err(error) = owner.play(preferences) {
+                                    log::warn!("incoming call ringtone failed: {error:#}");
+                                }
+                            }
+                            Err(reason) => {
+                                log::warn!("incoming call ringtone settings unavailable: {reason}")
+                            }
                         }
                         owner
                     })
@@ -687,6 +703,7 @@ impl Calls {
             retired,
             _task: task,
             owner: None,
+            displayed: false,
         });
     }
 
@@ -1626,6 +1643,43 @@ mod call_alert_review_regressions {
     use super::*;
 
     #[gpui::test]
+    fn call_alert_owner_dismisses_its_toast_while_ringtone_startup_is_pending(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_app_identity("test-call-alerts", "Call alert fixture"));
+        let calls = cx.new(|_| Calls::new());
+        let key = AlertKey {
+            account: oxidezap_core::AccountId::new(1).unwrap(),
+            call_id: "pending-output".into(),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        calls.update(cx, |calls, cx| {
+            calls.alert_work = Some(AlertWork {
+                key: key.clone(),
+                cancelled: cancelled.clone(),
+                retired: Arc::new(AtomicBool::new(false)),
+                _task: Task::ready(()),
+                owner: None,
+                displayed: false,
+            });
+            let offer = IncomingCall {
+                call_id: key.call_id.clone(),
+                caller_name: "Example".into(),
+                caller_jid: "999000@s.whatsapp.net".into(),
+                is_video: false,
+                is_offline: false,
+                received_at: wacore::time::now_utc(),
+            };
+            assert!(calls.post_alert_notification(&key, &offer, cx));
+            calls.stop_alert(false, cx);
+        });
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(cx.delivered_system_notifications().is_empty());
+        assert_eq!(cx.shown_system_notifications().len(), 1);
+        assert_eq!(cx.dismissed_system_notifications(), [key.tag()]);
+    }
+
+    #[gpui::test]
     fn call_alert_reconnect_snapshot_can_ring_again(cx: &mut gpui::TestAppContext) {
         let calls = cx.new(|_| Calls::new());
         calls.update(cx, |calls, cx| {
@@ -1670,6 +1724,7 @@ mod call_alert_review_regressions {
                 retired: Arc::new(AtomicBool::new(false)),
                 _task: Task::ready(()),
                 owner: None,
+                displayed: false,
             });
             calls.stop_alert(false, cx);
         });
@@ -1705,6 +1760,7 @@ mod call_control_tests {
                     retired: retired.clone(),
                     _task: Task::ready(()),
                     owner: None,
+                    displayed: false,
                 });
                 calls.card.set_minimized(true);
             });
