@@ -1622,6 +1622,67 @@ mod keyboard_owner_tests {
 }
 
 #[cfg(test)]
+mod call_alert_review_regressions {
+    use super::*;
+
+    #[gpui::test]
+    fn call_alert_reconnect_snapshot_can_ring_again(cx: &mut gpui::TestAppContext) {
+        let calls = cx.new(|_| Calls::new());
+        calls.update(cx, |calls, cx| {
+            let account = oxidezap_core::AccountId::new(1).unwrap();
+            calls.state.set_incoming(IncomingCall {
+                call_id: "still-ringing".into(),
+                caller_name: "Example".into(),
+                caller_jid: "999000@s.whatsapp.net".into(),
+                is_video: false,
+                is_offline: false,
+                received_at: wacore::time::now_utc(),
+            });
+            assert!(calls.alerts.follow(Some(account), &calls.state));
+            calls.silence_alerts(cx);
+            assert!(
+                calls.alerts.follow(Some(account), &calls.state),
+                "an authoritative live snapshot can restore an alert after IPC reconnects"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn call_alert_nonowner_cannot_dismiss_another_frontends_toast(cx: &mut gpui::TestAppContext) {
+        let key = AlertKey {
+            account: oxidezap_core::AccountId::new(1).unwrap(),
+            call_id: "shared".into(),
+        };
+        cx.update(|cx| {
+            cx.set_app_identity("test-call-alerts", "Call alert fixture");
+            cx.show_system_notification(SystemNotification {
+                tag: key.tag().into(),
+                title: "Example".into(),
+                body: "Incoming call".into(),
+                actions: Vec::new(),
+            });
+        });
+        let calls = cx.new(|_| Calls::new());
+        calls.update(cx, |calls, cx| {
+            calls.alert_work = Some(AlertWork {
+                key,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                retired: Arc::new(AtomicBool::new(false)),
+                _task: Task::ready(()),
+                owner: None,
+            });
+            calls.stop_alert(false, cx);
+        });
+        assert_eq!(
+            cx.delivered_system_notifications().len(),
+            1,
+            "the frontend still waiting for ownership must leave the owner's toast alone"
+        );
+        assert!(cx.dismissed_system_notifications().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod call_control_tests {
     use super::*;
 
