@@ -83,15 +83,12 @@ fn context_info(message: &wa::Message) -> Option<&wa::ContextInfo> {
         audio_message,
         document_message,
         sticker_message,
-        template_message,
-        template_button_reply_message,
-        buttons_message,
-        buttons_response_message,
-        list_message,
-        list_response_message,
-        interactive_message,
-        interactive_response_message,
     )
+    .or_else(|| {
+        oxidezap_chat_store::business_contexts(message)
+            .find(|context| context.stanza_id.is_some())
+            .or_else(|| oxidezap_chat_store::business_contexts(message).next())
+    })
 }
 
 fn quoted_kind(message: &wa::Message) -> Option<QuotedKind> {

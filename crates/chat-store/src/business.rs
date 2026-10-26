@@ -119,6 +119,50 @@ fn finish(message: &wa::Message, mut out: BusinessContent) -> BusinessContent {
     out
 }
 
+/// Contexts attached to business content, including nested interactive templates.
+/// A template can carry mentions on its outer context and quote linkage inside.
+pub fn business_contexts(message: &wa::Message) -> impl Iterator<Item = &wa::ContextInfo> {
+    let message = crate::normalized_message(message);
+    let attachment_context = business_media(message).and_then(|media| match media {
+        BusinessMedia::Image(m) => m.context_info.as_option(),
+        BusinessMedia::Video(m) => m.context_info.as_option(),
+        BusinessMedia::Document(m) => m.context_info.as_option(),
+        BusinessMedia::Location(m) => m.context_info.as_option(),
+        BusinessMedia::Thumbnail(_) => None,
+    });
+    [
+        template_of(message).and_then(|t| t.context_info.as_option()),
+        interactive_business(message).and_then(|m| m.context_info.as_option()),
+        message
+            .template_button_reply_message
+            .as_option()
+            .and_then(|m| m.context_info.as_option()),
+        message
+            .buttons_message
+            .as_option()
+            .and_then(|m| m.context_info.as_option()),
+        message
+            .buttons_response_message
+            .as_option()
+            .and_then(|m| m.context_info.as_option()),
+        message
+            .list_message
+            .as_option()
+            .and_then(|m| m.context_info.as_option()),
+        message
+            .list_response_message
+            .as_option()
+            .and_then(|m| m.context_info.as_option()),
+        message
+            .interactive_response_message
+            .as_option()
+            .and_then(|m| m.context_info.as_option()),
+        attachment_context,
+    ]
+    .into_iter()
+    .flatten()
+}
+
 pub fn business_content(message: &wa::Message) -> Option<BusinessContent> {
     let message = crate::normalized_message(message);
     if let Some(interactive) = interactive_business(message) {

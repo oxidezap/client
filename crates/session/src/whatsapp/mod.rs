@@ -2325,11 +2325,7 @@ impl WhatsAppClient {
         .await;
         let content = crate::mentions::apply_to(&mention_names, content);
         if let Some(business) = business.as_mut() {
-            business.body = content.clone();
-            business.header =
-                crate::mentions::apply_to(&mention_names, std::mem::take(&mut business.header));
-            business.footer =
-                crate::mentions::apply_to(&mention_names, std::mem::take(&mut business.footer));
+            crate::mentions::apply_business_to(&mention_names, business, &content);
         }
         let media_result = media_result.map(|mut media| {
             if let Some(caption) = media.caption.take() {

@@ -3125,3 +3125,133 @@ fn read_ranges_skip_invalid_references_and_preserve_boundary() {
     assert_eq!(outgoing.from_me, Some(true));
     assert_eq!(outgoing.participant, None);
 }
+
+/// Business mention contexts may be on the template or its interactive body.
+/// Both live projection and a durable reload must resolve the same visible text.
+#[tokio::test]
+async fn business_mentions_resolve_live_and_historical_cards() {
+    const MENTIONED: &str = "559900000002@s.whatsapp.net";
+    for interactive in [false, true] {
+        let (chat_store, client) = test_session(if interactive {
+            "business-mention-interactive"
+        } else {
+            "business-mention-hydrated"
+        })
+        .await;
+        feed(
+            &chat_store,
+            from(
+                MENTIONED,
+                MENTIONED,
+                Some("Bia"),
+                wa::Message::text("hello"),
+                "CONTACT",
+                1_700_000_000,
+            ),
+        )
+        .await;
+        let mut context = wa::ContextInfo::default();
+        context.mentioned_jid = vec![MENTIONED.into()];
+        let mut template = wa::message::TemplateMessage::default();
+        if interactive {
+            let mut body = wa::message::interactive_message::Body::default();
+            body.text = Some("Hi @559900000002".into());
+            let mut header = wa::message::interactive_message::Header::default();
+            header.title = Some("For @559900000002".into());
+            let mut footer = wa::message::interactive_message::Footer::default();
+            footer.text = Some("From @559900000002".into());
+            let mut button =
+                wa::message::interactive_message::native_flow_message::NativeFlowButton::default();
+            button.name = Some("quick_reply".into());
+            button.button_params_json = Some(r#"{"display_text":"Ask @559900000002"}"#.into());
+            let mut flow = wa::message::interactive_message::NativeFlowMessage::default();
+            flow.buttons.push(button);
+            let mut body_message = wa::message::InteractiveMessage::default();
+            body_message.body = MessageField::some(body);
+            body_message.header = MessageField::some(header);
+            body_message.footer = MessageField::some(footer);
+            body_message.context_info = MessageField::some(context);
+            body_message.interactive_message = Some(
+                wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(
+                    flow.into(),
+                ),
+            );
+            template.format = Some(
+                wa::message::template_message::Format::InteractiveMessageTemplate(
+                    body_message.into(),
+                ),
+            );
+        } else {
+            let mut hydrated = wa::message::template_message::HydratedFourRowTemplate::default();
+            hydrated.hydrated_content_text = Some("Hi @559900000002".into());
+            hydrated.hydrated_footer_text = Some("From @559900000002".into());
+            hydrated.title = Some(
+                wa::message::template_message::hydrated_four_row_template::Title::HydratedTitleText(
+                    "For @559900000002".into(),
+                ),
+            );
+            let mut reply = wa::hydrated_template_button::HydratedQuickReplyButton::default();
+            reply.display_text = Some("Ask @559900000002".into());
+            let mut button = wa::HydratedTemplateButton::default();
+            button.hydrated_button =
+                Some(wa::hydrated_template_button::HydratedButton::QuickReplyButton(reply.into()));
+            hydrated.hydrated_buttons.push(button);
+            template.hydrated_template = MessageField::some(hydrated);
+            template.context_info = MessageField::some(context);
+        }
+        let mut proto = wa::Message::default();
+        proto.template_message = MessageField::some(template);
+        for _ in 0..2 {
+            let mut wrapper = wa::message::FutureProofMessage::default();
+            wrapper.message = MessageField::some(proto);
+            proto = wa::Message::default();
+            proto.ephemeral_message = MessageField::some(wrapper);
+        }
+        feed(
+            &chat_store,
+            from(
+                TEST_GROUP,
+                TEST_PEER,
+                Some("Ana"),
+                proto.clone(),
+                "BUSINESS-MENTION",
+                1_700_000_100,
+            ),
+        )
+        .await;
+        let names = book_with(&chat_store);
+        let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(super::ui_queue::HistoryBudget::new()),
+        );
+        let info = live_info(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Ana"),
+            "BUSINESS-MENTION",
+            1_700_000_100,
+        );
+        WhatsAppClient::handle_inbound_message(&proto, &info, &client, &ui_tx, &names, false).await;
+        let oxidezap_core::UiEvent::MessageReceived { message: live, .. } =
+            ui_rx.try_recv().unwrap()
+        else {
+            panic!("business message must be published")
+        };
+        let live_card = live.business.as_ref().unwrap();
+        assert_eq!(live.content, "Hi @Bia");
+        assert_eq!(live_card.header, "For @Bia");
+        assert_eq!(live_card.footer, "From @Bia");
+        assert_eq!(live_card.buttons[0].label, "Ask @Bia");
+        let page =
+            WhatsAppClient::message_page(&chat_store, &client, &names, TEST_GROUP.into(), None, 50)
+                .await
+                .unwrap();
+        let historical = page
+            .items
+            .iter()
+            .find(|message| message.id == "BUSINESS-MENTION")
+            .unwrap();
+        assert_eq!(historical.content, live.content);
+        assert_eq!(historical.business, live.business);
+    }
+}

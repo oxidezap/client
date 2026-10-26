@@ -63,5 +63,6 @@ pub use types::{
 
 mod business;
 pub use business::{
-    BusinessMedia, business_content, business_media, hydrated_template, interactive_business,
+    BusinessMedia, business_content, business_contexts, business_media, hydrated_template,
+    interactive_business,
 };
