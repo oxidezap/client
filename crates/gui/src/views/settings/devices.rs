@@ -56,13 +56,13 @@ fn choices(
         )
     }));
     let selected = kind.value(preferences).clone();
-    if let Some(id) = &selected {
-        if !devices.iter().any(|d| &d.id == id) {
-            options.push((
-                Some(id.clone()),
-                "Saved device unavailable. Refresh or choose another device.".into(),
-            ));
-        }
+    if let Some(id) = &selected
+        && !devices.iter().any(|d| &d.id == id)
+    {
+        options.push((
+            Some(id.clone()),
+            "Saved device unavailable. Refresh or choose another device.".into(),
+        ));
     }
     group(
         label(title, m, cx),
@@ -99,6 +99,7 @@ pub fn render(
     let preferences = app.call_device_preferences(cx);
     let inventory = app.call_device_inventory(cx).cloned().unwrap_or_default();
     let busy = app.call_device_busy(cx);
+    let ready = app.call_device_preferences_ready(cx);
     let refresh = entity.clone();
     let mic_test = entity.clone();
     let speaker_test = entity.clone();
@@ -146,7 +147,7 @@ pub fn render(
             Button::new(gpui::SharedString::from(format!("camera-mode-{index}"))).label(format!("{} × {} · {} FPS", mode.width, mode.height, mode.fps)).outline().small().selected(preferences.camera_mode == mode).disabled(busy).on_click(move |_, _, cx| { let p = p.clone(); entity.update(cx, |app, cx| app.save_call_devices(p, cx)); })
         })), m))
         .child(div().text_size(m.text_small()).child(format!("Requested camera mode: {} × {} · {} FPS", preferences.camera_mode.width, preferences.camera_mode.height, preferences.camera_mode.fps)))
-        .child(Button::new("camera-preview").label(if active { "Stop camera preview" } else { "Preview camera" }).outline().disabled(busy).on_click(move |_, _, cx| preview.update(cx, |app, cx| if active { app.cancel_camera_preview(cx); } else { app.start_camera_preview(cx); })));
+        .child(Button::new("camera-preview").label(if active { "Stop camera preview" } else { "Preview camera" }).outline().disabled((busy || !ready) && !active).on_click(move |_, _, cx| preview.update(cx, |app, cx| if active { app.cancel_camera_preview(cx); } else { app.start_camera_preview(cx); })));
     if let Some(image) = app.camera_preview_image(cx) {
         content = content.child(
             img(crate::video::video_image(image))
@@ -176,7 +177,7 @@ pub fn render(
                     Button::new("confirm-device-call")
                         .label("Start call")
                         .primary()
-                        .disabled(busy)
+                        .disabled(busy || !ready)
                         .on_click(move |_, _, cx| {
                             confirm.update(cx, |app, cx| app.confirm_prepared_call(cx))
                         }),

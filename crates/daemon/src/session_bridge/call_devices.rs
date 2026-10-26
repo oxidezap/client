@@ -7,9 +7,10 @@ use oxidezap_ipc::{
     CallDeviceAction as Action, CallDeviceReply as Reply, CameraPreviewFrame, DaemonMessage,
     RequestId,
 };
+use portable_atomic::AtomicU64;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 pub(super) struct Devices {

@@ -17,6 +17,7 @@ pub(super) struct DeviceUi {
     pub pending_call: Option<(String, bool)>,
     approved_call: Option<(String, bool)>,
     pub preview: Option<CameraPreviewId>,
+    stopping: Option<CameraPreviewId>,
     pub effective: Option<CameraMode>,
     pub image: Option<Arc<RenderImage>>,
     admission: PreviewAdmission,
@@ -41,11 +42,16 @@ impl WhatsAppApp {
     }
     pub fn camera_preview_active(&self, cx: &App) -> bool {
         self.settings.read(cx).devices.preview.is_some()
+            || self.settings.read(cx).devices.stopping.is_some()
     }
     pub fn camera_preview_mode(&self, cx: &App) -> Option<CameraMode> {
         self.settings.read(cx).devices.effective
     }
 
+    #[allow(
+        dead_code,
+        reason = "Consumed by the following call controls PR in this stack"
+    )]
     pub fn take_call_setup_approval(
         &mut self,
         jid: &str,
@@ -63,6 +69,10 @@ impl WhatsAppApp {
         self.settings.read(cx).devices.pending_call.is_some()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Consumed by the following call controls PR in this stack"
+    )]
     pub fn prepare_call(&mut self, recipient_jid: String, is_video: bool, cx: &mut Context<Self>) {
         use crate::theme::ActiveProductTheme as _;
         self.close_media_viewer(cx);
@@ -84,7 +94,11 @@ impl WhatsAppApp {
             return;
         };
         let (pending, id, epoch) = self.settings.update(cx, |s, _| {
-            (s.devices.pending_call.clone(), s.devices.preview, s.epoch())
+            (
+                s.devices.pending_call.clone(),
+                s.devices.preview.or(s.devices.stopping),
+                s.epoch(),
+            )
         });
         let Some((jid, video)) = pending else {
             return;
@@ -185,7 +199,8 @@ impl WhatsAppApp {
 
     pub fn cancel_camera_preview(&mut self, cx: &mut Context<Self>) {
         let id = self.settings.update(cx, |s, cx| {
-            let id = s.devices.preview.take();
+            let id = s.devices.preview.take().or(s.devices.stopping);
+            s.devices.stopping = id;
             if let Some(id) = id {
                 s.devices.admission.cancel(id);
             }
@@ -195,11 +210,28 @@ impl WhatsAppApp {
             id
         });
         if let (Some(id), Some(client)) = (id, &self.client) {
-            let _ = client.call_devices(Action::CancelPreview { preview_id: id });
+            let waiting = client.call_devices(Action::CancelPreview { preview_id: id });
+            let settings = self.settings.clone();
+            let epoch = settings.read(cx).epoch();
+            cx.spawn(async move |_, cx| {
+                let stopped = matches!(crate::platform::with_timeout(waiting, Duration::from_secs(7)).await, Some(Ok(Ok(Reply::Stopped { .. }))));
+                settings.update(cx, |s, cx| {
+                    if s.epoch() != epoch || s.devices.stopping != Some(id) { return; }
+                    if stopped { s.devices.stopping = None; } else { s.devices.status = "Camera is still stopping. Press Stop camera preview to retry before calling.".into(); }
+                    cx.notify();
+                });
+            }).detach();
         }
     }
 
     pub fn start_camera_preview(&mut self, cx: &mut Context<Self>) {
+        if self.call_state(cx).is_busy() {
+            self.settings.update(cx, |s, cx| {
+                s.devices.status = "End the current call before opening a camera preview.".into();
+                cx.notify();
+            });
+            return;
+        }
         if self.camera_preview_active(cx) {
             return;
         }
@@ -231,7 +263,7 @@ impl WhatsAppApp {
                 let active = settings.read_with(cx, |s, _| {
                     s.epoch() == epoch && s.devices.admission.accepts(id)
                 });
-                if !matches!(active, Ok(true)) {
+                if !active {
                     break;
                 }
                 let waiting = client.call_devices(Action::PreviewFrame { preview_id: id });
@@ -242,6 +274,10 @@ impl WhatsAppApp {
                         frame,
                     }))) if preview_id == id => {
                         let image = if let Some(frame) = frame {
+                            if frame.preview_id != id {
+                                failure = Some("Preview returned a different identity".into());
+                                continue;
+                            }
                             let decoder = decoder.clone();
                             cx.background_spawn(async move {
                                 decoder
@@ -255,7 +291,7 @@ impl WhatsAppApp {
                         };
                         match image {
                             Ok(image) => {
-                                let _ = settings.update(cx, |s, cx| {
+                                settings.update(cx, |s, cx| {
                                     if s.epoch() != epoch || !s.devices.admission.accepts(id) {
                                         return;
                                     }
@@ -279,8 +315,9 @@ impl WhatsAppApp {
                 }
                 crate::platform::sleep(Duration::from_millis(30)).await;
             }
-            let _ = client.call_devices(Action::CancelPreview { preview_id: id });
-            let _ = settings.update(cx, |s, cx| {
+            let waiting = client.call_devices(Action::CancelPreview { preview_id: id });
+            let _ = crate::platform::with_timeout(waiting, Duration::from_secs(7)).await;
+            settings.update(cx, |s, cx| {
                 if s.epoch() != epoch || !s.devices.admission.accepts(id) {
                     return;
                 }
@@ -330,7 +367,7 @@ impl PreviewDecoder {
         self.started = true;
         let mut bytes = vec![0; width * height * 4];
         yuv.write_rgba8(&mut bytes);
-        for pixel in bytes.chunks_exact_mut(4) {
+        for pixel in bytes.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
         let image = image::RgbaImage::from_raw(width as u32, height as u32, bytes)
@@ -350,5 +387,58 @@ impl PreviewDecoder {
         _frame: &oxidezap_ipc::CameraPreviewFrame,
     ) -> Result<Option<Arc<RenderImage>>, String> {
         Err("Camera preview display is unavailable from this browser connection".into())
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn preview_decodes_synthetic_video_without_a_call_identity() {
+        use openh264::encoder::{Encoder, EncoderConfig};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+        let mut encoder =
+            Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new())
+                .unwrap();
+        let pixels = vec![80; 32 * 32 * 3];
+        let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (32, 32)));
+        let idr = encoder.encode(&yuv).unwrap().to_vec();
+        let delta = encoder.encode(&yuv).unwrap().to_vec();
+        let id = CameraPreviewId(31);
+        let mut decoder = PreviewDecoder::default();
+        assert!(
+            decoder
+                .decode(&oxidezap_ipc::CameraPreviewFrame {
+                    preview_id: id,
+                    data: delta.clone(),
+                    keyframe: false
+                })
+                .unwrap()
+                .is_none()
+        );
+        let mut images = usize::from(
+            decoder
+                .decode(&oxidezap_ipc::CameraPreviewFrame {
+                    preview_id: id,
+                    data: idr,
+                    keyframe: true,
+                })
+                .unwrap()
+                .is_some(),
+        );
+        images += usize::from(
+            decoder
+                .decode(&oxidezap_ipc::CameraPreviewFrame {
+                    preview_id: id,
+                    data: delta,
+                    keyframe: false,
+                })
+                .unwrap()
+                .is_some(),
+        );
+        assert!(
+            images > 0,
+            "synthetic preview must produce a renderable image"
+        );
     }
 }
