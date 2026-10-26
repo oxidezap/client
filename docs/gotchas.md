@@ -1117,8 +1117,8 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   so repeated requests and other tabs reuse that successor. Frontends clear
   their old account view before attaching to the new scope. The pairing screen
   and Account settings can return to retained history without resetting either
-  account. The selected account survives reopening; browser selection is scoped
-  to the tab and page route. A non-logout completion closes the event queue so
+  account. The selected account survives reopening; existing browser tabs keep their own selection,
+  while newly opened tabs inherit the last selection for that page route. A non-logout completion closes the event queue so
   the supervisor can restart it. Embedded successor runtimes handle completed
   reset/removal outcomes instead of retaining a stopped runtime. Explicit data
   deletion remains a separate Settings action.

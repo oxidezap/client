@@ -139,18 +139,45 @@ mod imp {
         Ok((storage, key))
     }
 
+    fn preferred() -> Result<web_sys::Storage, String> {
+        web_sys::window()
+            .ok_or("no browser window")?
+            .local_storage()
+            .map_err(|_| "local storage is unavailable")?
+            .ok_or_else(|| "local storage is unavailable".into())
+    }
+
     pub(super) fn read() -> Result<Option<String>, String> {
         let (storage, key) = storage()?;
-        storage
+        let held = storage
             .get_item(&key)
-            .map_err(|_| "could not read the selected account".into())
+            .map_err(|_| "could not read the selected account")?;
+        if held.is_some() {
+            return Ok(held);
+        }
+        // Existing tabs keep their own choice; new tabs inherit this route's preference.
+        let raw = match preferred()?
+            .get_item(&key)
+            .map_err(|_| "could not read the preferred account")?
+        {
+            Some(raw) => raw,
+            None => serde_json::to_string(&super::AccountSelection::default())
+                .map_err(|error| error.to_string())?,
+        };
+        storage
+            .set_item(&key, &raw)
+            .map_err(|_| "could not retain this tab's account")?;
+        Ok(Some(raw))
     }
 
     pub(super) fn write(raw: &str) -> Result<(), String> {
         let (storage, key) = storage()?;
         storage
             .set_item(&key, raw)
-            .map_err(|_| "could not save the selected account".into())
+            .map_err(|_| "could not save the selected account")?;
+        preferred()?
+            .set_item(&key, raw)
+            .map_err(|_| "could not save the preferred account".into())
     }
 }
 
