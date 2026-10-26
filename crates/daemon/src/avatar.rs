@@ -171,9 +171,10 @@ pub fn resolve(
                 Ok(bytes) => bytes,
                 Err(_) => {
                     if is_current(&hub, &jid, &selection) {
-                        if retryable {
-                            recorder.on_failed(&jid);
-                        }
+                        // Retryability sets the front-end cooldown, not the
+                        // resolver's lifetime. No bytes landed, so even a
+                        // terminal response must release SourceDelivered.
+                        recorder.on_failed(&jid);
                         publish_failed(&hub, &jid, retryable);
                     }
                     return;
@@ -395,6 +396,18 @@ fn accept(response: AvatarResponse) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::{AvatarResponse, accept, is_current, purge, record_selection};
     use crate::state::StateHub;
+
+    #[test]
+    fn account_teardown_rejects_a_previous_avatar_completion() {
+        let hub = StateHub::new();
+        let first = record_selection(&hub, "avatar@example.invalid", Some("one"), Some("url"));
+        hub.forget_account();
+        assert!(!is_current(&hub, "avatar@example.invalid", &first));
+        let second = record_selection(&hub, "avatar@example.invalid", Some("two"), Some("url"));
+        assert!(is_current(&hub, "avatar@example.invalid", &second));
+        assert!(!is_current(&hub, "avatar@example.invalid", &first));
+        purge(&hub);
+    }
 
     #[test]
     fn superseded_avatar_completion_is_rejected() {

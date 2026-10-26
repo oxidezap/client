@@ -160,10 +160,18 @@ pub(crate) fn get_avatar_image(key: &str) -> Option<ImageSource> {
 }
 
 pub(crate) fn put_avatar_image(key: String, image: Arc<RenderImage>, decoded_size: u64) {
-    AVATAR_IMAGES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .put(key, image, decoded_size);
+    let evicted =
+        AVATAR_IMAGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(key, image, decoded_size);
+    if evicted {
+        AVATAR_CACHE_EPOCH.fetch_add(1, portable_atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn avatar_cache_epoch() -> u64 {
+    AVATAR_CACHE_EPOCH.load(portable_atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn clear_image_sources() {
@@ -171,6 +179,7 @@ pub(crate) fn clear_image_sources() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    AVATAR_CACHE_EPOCH.fetch_add(1, portable_atomic::Ordering::Relaxed);
 }
 
 /// The media cache as a process that shares the daemon's filesystem sees it:
@@ -180,6 +189,7 @@ pub struct Directory;
 
 static AVATAR_IMAGES: std::sync::LazyLock<std::sync::Mutex<SourceCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(SourceCache::default()));
+static AVATAR_CACHE_EPOCH: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 #[derive(Default)]
 struct SourceCache {
@@ -205,7 +215,8 @@ impl SourceCache {
         })
     }
 
-    fn put(&mut self, key: String, image: Arc<RenderImage>, bytes: u64) {
+    fn put(&mut self, key: String, image: Arc<RenderImage>, bytes: u64) -> bool {
+        let mut evicted = false;
         if let Some(entry) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(entry.bytes);
         }
@@ -232,8 +243,10 @@ impl SourceCache {
             };
             if let Some(entry) = self.entries.remove(&key) {
                 self.bytes = self.bytes.saturating_sub(entry.bytes);
+                evicted = true;
             }
         }
+        evicted
     }
 
     fn clear(&mut self) {
