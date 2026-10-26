@@ -757,4 +757,107 @@ mod tests {
         assert!(f.stores.durable_pairing(f.new).await.unwrap().is_some());
         assert_eq!(f.stores.accounts().await.unwrap().len(), 1);
     }
+
+    #[tokio::test]
+    async fn open_native_consumers_receive_a_redirect_and_wire_consumers_close_without_rebinding() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let f = Fixture::new(
+            "open-consumers",
+            "100001:9@s.whatsapp.net",
+            Some("200001:9@lid"),
+        )
+        .await;
+        let old = f.registry.remove(f.old).unwrap();
+        let (commands, _idle_commands) = mpsc::channel(1);
+        let offline = Arc::new(AccountRuntime::new_with_registry(
+            f.old,
+            old.hub(),
+            old.plugins(),
+            commands,
+            Arc::clone(&f.stores),
+        ));
+        offline.set_status(AccountStatus::Error);
+        offline.lifecycle().mark_quiesced();
+        f.registry.insert(offline);
+        let (mut native, native_server) = tokio::io::duplex(64 * 1024);
+        let native_task = tokio::spawn(crate::server::serve_client_with_registry(
+            Box::new(native_server),
+            Arc::clone(&f.registry),
+        ));
+        let hello = oxidezap_ipc::Request::bare(oxidezap_ipc::ClientRequest::Hello {
+            protocol: oxidezap_ipc::PROTOCOL_VERSION,
+            scope: oxidezap_ipc::ClientScope::Account { account: f.old },
+            session_events: false,
+            owns_window: false,
+            call_video: false,
+        });
+        native
+            .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let mut native = BufReader::new(native);
+        let mut line = String::new();
+        native.read_line(&mut line).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<oxidezap_ipc::DaemonMessage>(&line).unwrap(),
+            oxidezap_ipc::DaemonMessage::Hello { .. }
+        ));
+
+        let (mut wire, wire_server) = tokio::io::duplex(64 * 1024);
+        let wire_task = tokio::spawn(crate::server::serve_client_with_registry(
+            Box::new(wire_server),
+            Arc::clone(&f.registry),
+        ));
+        let hello = oxidezap_wire::envelope::RequestEnvelope {
+            id: 1,
+            request: oxidezap_wire::request::ClientRequest::Hello {
+                protocol: oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION,
+                client_name: "synthetic".into(),
+                local_account: Some(f.old.get()),
+                account_selection: true,
+                read_only: true,
+                session_events: false,
+            },
+        };
+        wire.write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let mut wire = BufReader::new(wire);
+        line.clear();
+        wire.read_line(&mut line).await.unwrap();
+        let selected: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(selected["data"]["local_account"], f.old.get());
+
+        let snapshot = f.stores.accounts().await.unwrap();
+        assert!(
+            f.stores
+                .begin_retirement(&snapshot[0], &snapshot[1])
+                .await
+                .unwrap()
+        );
+        f.registry.restore_retirements(&f.stores).await.unwrap();
+        line.clear();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            native.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(serde_json::from_str::<oxidezap_ipc::DaemonMessage>(&line).unwrap(),
+            oxidezap_ipc::DaemonMessage::AccountRetired { account, successor } if account == f.old && successor == f.new)
+        );
+        line.clear();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), wire.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(f.registry.get(f.new).is_some());
+        native_task.await.unwrap().unwrap();
+        wire_task.await.unwrap().unwrap();
+    }
 }
