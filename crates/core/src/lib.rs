@@ -23,6 +23,7 @@ mod account;
 mod app_state;
 mod avatar;
 mod call;
+mod call_devices;
 mod calls;
 mod chat;
 mod events;
@@ -45,6 +46,7 @@ pub use app_state::{AppState, CachedQrCode, Fault, Issued, Lifetime, Recovery};
 pub use avatar::AvatarDemand;
 pub use avatar::cache_key as avatar_cache_key;
 pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
+pub use call_devices::*;
 pub use calls::{ActiveCall, Admission, CallState, Ending, Stage, WaitingCall};
 pub use chat::STATUS_BROADCAST_JID;
 pub use chat::{

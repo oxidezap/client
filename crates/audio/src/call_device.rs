@@ -21,7 +21,7 @@ use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer as _, Producer as _, Split as _};
 
 /// Pick the device's default config and an i16-friendly stream config.
-fn default_config(
+pub(crate) fn default_config(
     device: &cpal::Device,
     input: bool,
 ) -> Result<(cpal::StreamConfig, SampleFormat)> {
@@ -86,23 +86,28 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
     let want = std::env::var("WA_INPUT_DEVICE")
         .ok()
         .filter(|s| !s.is_empty());
-    let device = match &want {
-        Some(want) => {
-            let devices: Vec<cpal::Device> = host
-                .input_devices()
-                .map(|i| i.collect())
-                .unwrap_or_default();
-            devices
-                .into_iter()
-                .find(|d| {
-                    d.description()
-                        .is_ok_and(|x| x.name().contains(want.as_str()))
-                })
-                .ok_or_else(|| anyhow!("WA_INPUT_DEVICE did not match an input device"))?
+    let selected = crate::devices::call_preferences().microphone;
+    let device = if selected.is_some() {
+        crate::devices::select(selected.as_deref(), true)?
+    } else {
+        match &want {
+            Some(want) => {
+                let devices: Vec<cpal::Device> = host
+                    .input_devices()
+                    .map(|i| i.collect())
+                    .unwrap_or_default();
+                devices
+                    .into_iter()
+                    .find(|d| {
+                        d.description()
+                            .is_ok_and(|x| x.name().contains(want.as_str()))
+                    })
+                    .ok_or_else(|| anyhow!("WA_INPUT_DEVICE did not match an input device"))?
+            }
+            None => host
+                .default_input_device()
+                .ok_or_else(|| anyhow!("no default input device"))?,
         }
-        None => host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("no default input device"))?,
     };
     let (config, format) = default_config(&device, true)?;
     let src_rate = config.sample_rate;
@@ -331,10 +336,8 @@ where
 /// ring and writes the device format, duplicating mono across channels. Underrun = silence. The
 /// stream lives on a parked std thread that exits when the sender is dropped (call ended).
 pub fn spawn_speaker() -> Result<async_channel::Sender<Vec<i16>>> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow!("no default output device"))?;
+    let selected = crate::devices::call_preferences().speaker;
+    let device = crate::devices::select(selected.as_deref(), false)?;
     let (config, format) = default_config(&device, false)?;
     let dst_rate = config.sample_rate;
     let channels = config.channels as usize;
@@ -473,12 +476,12 @@ pub fn spawn_speaker() -> Result<async_channel::Sender<Vec<i16>>> {
 
 /// Counters the speaker callback publishes once per callback (never per
 /// sample), read by the diagnostics task.
-struct SpeakerCounters {
-    pops: Arc<AtomicU64>,
-    underruns: Arc<AtomicU64>,
+pub(crate) struct SpeakerCounters {
+    pub(crate) pops: Arc<AtomicU64>,
+    pub(crate) underruns: Arc<AtomicU64>,
 }
 
-fn build_output_stream<C>(
+pub(crate) fn build_output_stream<C>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     format: SampleFormat,

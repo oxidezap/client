@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+oxidezap-core = { workspace = true }
 anyhow = { workspace = true }
 async-channel = "2"
 # Portable, because `call_ending` is: the rule it states is about which half of
