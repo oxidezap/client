@@ -107,7 +107,7 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
             None => host
                 .default_input_device()
                 .ok_or_else(|| anyhow!("no default input device"))?,
-        };
+        }
     };
     let (config, format) = default_config(&device, true)?;
     let src_rate = config.sample_rate;
