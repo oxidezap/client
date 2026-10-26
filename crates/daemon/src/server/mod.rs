@@ -328,6 +328,10 @@ pub(crate) async fn serve_client_with_registry(
             // less than the stanza it turns into.
             biased;
 
+            // A replacement has a new hub and sender. End this attachment so
+            // every frontend reconnects to the registered runtime.
+            _ = commands.closed() => return Ok(()),
+
             update = updates.recv(), if !awaiting_resync => match update {
                 Ok(frame) => {
                     if attached.is_wire {
@@ -665,6 +669,13 @@ where
                             )?,
                         }),
                         ClientRequest::CreateAccount => Some(create_account(&registry, id).await?),
+                        ClientRequest::RelinkAccount { account } => Some(match id {
+                            Some(id) => match registry.relink(account).await {
+                                Ok(account) => serde_json::to_string(&DaemonMessage::AccountCreated { id, account })?,
+                                Err(error) => error_frame(Some(id), ProtocolError::Refused { detail: error.to_string() })?,
+                            },
+                            None => error_frame(None, ProtocolError::Malformed { detail: "relinking needs a request id".into() })?,
+                        }),
                         ClientRequest::ResetAccount { account } => Some(
                             change_account(
                                 &registry,

@@ -62,8 +62,12 @@ write in front of it. Two things it would land on: after a wipe it recreates
 the departed account's data under whoever pairs next, and after an ordinary
 reconnection — no wipe at all — it puts the old host's in-memory settings over
 what the new host has already written. So a store is stamped when it is taken
-and an older handle's write is refused, `Origin::storage` and `forget_all`
-both moving the stamp on. *Superseded* rather than a latch, because a page
+and an older handle's write is refused. The stamp and the stored document
+keys are scoped to the local account: opening a successor cannot inherit the
+retained account's approvals or settings, and retiring one account cannot
+invalidate another account's live handles. Legacy keys remain bound to the
+legacy account. `Origin::storage_for_account` and `forget_account` advance
+only the selected account's stamp. *Superseded* rather than a latch, because a page
 rebuilds its whole service in the same agent: a latch would leave the new host
 unable to write for the rest of the tab's life — grants rolled back, settings
 lost — while the tasks it was aimed at were the old host's.

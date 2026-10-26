@@ -309,6 +309,11 @@ impl<'a> Frames<'a> {
             // Accepted with no id: a request sent without one, which nobody
             // is waiting on an answer for.
             DaemonMessage::Accepted { id: None } => {}
+            DaemonMessage::AccountCreated { id, account } => {
+                if let Some(Awaiting::Account(tx)) = take_pending(self.pending, id) {
+                    let _ = tx.send(Ok(account));
+                }
+            }
             DaemonMessage::Error { id, error } => {
                 match id.and_then(|id| take_pending(self.pending, id)) {
                     Some(waiting) => self.fail(waiting, &Failure::from(&error)),

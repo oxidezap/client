@@ -26,6 +26,7 @@
 //! expression and the `#[cfg]` is on the two blocks themselves. A module to
 //! hold one line is ceremony; the rule starts where there is a body to name.
 
+pub(crate) mod account;
 mod activity;
 mod capabilities;
 pub mod clipboard;

@@ -27,6 +27,8 @@ const RETRY_AFTER_SECS: u64 = 15;
 /// How often the countdown redraws, which is also how precise it can be.
 const COUNTDOWN_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+pub(super) use crate::platform::account::AccountSelection;
+
 /// What the error screen is waiting on, and what it is showing.
 pub(super) struct Recovering {
     /// When the automatic retry fires, while the error screen is up.
@@ -136,9 +138,105 @@ impl Recovering {
 }
 
 impl WhatsAppApp {
+    fn save_account_selection(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.account_selection.save() {
+            self.notify_user(
+                format!("Could not remember the selected account: {error}"),
+                notices::Tone::Problem,
+                cx,
+            );
+        }
+    }
+
+    pub fn offline_recovery(&self) -> Option<OfflineRecovery> {
+        match self.app_state {
+            AppState::Offline => Some(OfflineRecovery::Reconnect),
+            AppState::OfflineLoggedOut { .. } => Some(OfflineRecovery::PairAgain),
+            _ => None,
+        }
+    }
+    pub fn has_retained_history(&self) -> bool {
+        self.account_selection.retained.is_some()
+    }
+
+    pub fn open_retained_history(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let Some(account) = self.account_selection.retained.take() else {
+            return;
+        };
+        self.event_task.take();
+        self.client.take();
+        self.clear_account_view(window, cx);
+        self.account_selection.active = account;
+        self.save_account_selection(cx);
+        self.retry_connection(cx);
+    }
+
+    pub fn pair_again_retaining_history(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let AppState::LoggedOut { message } = &self.app_state else {
+            return;
+        };
+        let message = message.clone();
+        let Some(control) = &self.control else {
+            self.notify_user(
+                "The daemon's control connection is unavailable. Reopen the app to pair again.",
+                notices::Tone::Problem,
+                cx,
+            );
+            return;
+        };
+        let old = self.account_selection.active;
+        let answer = control.relink_account(old);
+        let window = window.window_handle();
+        self.app_state = AppState::Loading;
+        cx.notify();
+        cx.spawn(async move |app: WeakEntity<Self>, cx| {
+            let result = answer.await;
+            let _ = window.update(cx, |_, window, cx| {
+                let _ = app.update(cx, |app, cx| {
+                    if app.account_selection.active != old {
+                        return;
+                    }
+                    match result {
+                        Ok(Ok(account)) => {
+                            app.event_task.take();
+                            app.client.take();
+                            app.clear_account_view(window, cx);
+                            app.account_selection = AccountSelection {
+                                active: account,
+                                retained: Some(old),
+                            };
+                            app.save_account_selection(cx);
+                            app.retry_connection(cx);
+                        }
+                        _ => {
+                            app.app_state = AppState::LoggedOut { message };
+                            app.notify_user(
+                                "Pairing could not start. Local history has been kept. Try again.",
+                                notices::Tone::Problem,
+                                cx,
+                            );
+                        }
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
     /// Retry WhatsApp through the live IPC connection. Only failure to reach
     /// that service uses the separate front-end attach recovery.
     pub fn retry_whatsapp_connection(&mut self, cx: &mut Context<Self>) {
+        if let AppState::OfflineLoggedOut { message } = &self.app_state {
+            self.app_state = AppState::LoggedOut {
+                message: message.clone(),
+            };
+            cx.notify();
+            return;
+        }
         let Some(client) = self.client.as_ref() else {
             self.retry_connection(cx);
             return;
@@ -225,7 +323,14 @@ impl WhatsAppApp {
     pub fn work_offline(&mut self, cx: &mut Context<Self>) {
         info!("Working offline; local history stays readable");
         self.recovery.update(cx, |recovering, _| recovering.stop());
-        self.app_state = AppState::Offline;
+        self.app_state = match &self.app_state {
+            AppState::LoggedOut { message } | AppState::OfflineLoggedOut { message } => {
+                AppState::OfflineLoggedOut {
+                    message: message.clone(),
+                }
+            }
+            _ => AppState::Offline,
+        };
         cx.notify();
     }
 
@@ -240,6 +345,41 @@ impl WhatsAppApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn terminal_offline_entry_keeps_history_and_survives_replayed_events(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app = cx.new(|cx| {
+            let mut app = WhatsAppApp::new(cx);
+            app.chats
+                .push(Arc::new(Chat::new("999000@s.whatsapp.net".into())));
+            app
+        });
+        app.update(cx, |app, cx| {
+            app.handle_event(UiEvent::LoggedOut("Synthetic unlink".into()), cx);
+            assert!(matches!(app.app_state, AppState::LoggedOut { .. }));
+            app.work_offline(cx);
+            app.work_offline(cx);
+            for event in [
+                UiEvent::LoggedOut("Repeated unlink".into()),
+                UiEvent::Connected,
+                UiEvent::InitComplete,
+                UiEvent::Disconnected("late".into()),
+            ] {
+                app.handle_event(event, cx);
+                assert!(matches!(app.app_state, AppState::OfflineLoggedOut { .. }));
+                assert!(!app.can_send());
+                assert_eq!(app.chats.len(), 1);
+                assert!(app.retry_countdown(cx).is_none());
+                assert!(app.reconnect_task.is_none());
+            }
+            app.retry_whatsapp_connection(cx);
+            assert!(matches!(app.app_state, AppState::LoggedOut { .. }));
+            assert!(app.reconnect_task.is_none());
+            assert_eq!(app.chats.len(), 1);
+        });
+    }
 
     #[gpui::test]
     fn a_rejected_whatsapp_retry_does_not_reattach_healthy_ipc(cx: &mut gpui::TestAppContext) {

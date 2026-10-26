@@ -30,6 +30,7 @@ pub struct Executor {
     /// a page that answered "still closing" because it had not yielded yet
     /// would refuse every wipe there is.
     done: Rc<tokio::sync::Notify>,
+    owned: Rc<OwnedTasks>,
 }
 
 impl Executor {
@@ -41,6 +42,7 @@ impl Executor {
         Ok(Self {
             finished: Rc::new(Cell::new(false)),
             done: Rc::new(tokio::sync::Notify::new()),
+            owned: Rc::default(),
         })
     }
 
@@ -55,8 +57,9 @@ impl Executor {
     ) -> std::io::Result<()> {
         let finished = self.finished.clone();
         let done = self.done.clone();
+        let owned = Rc::clone(&self.owned);
         oxidezap_platform::spawn(async move {
-            future.await;
+            OWNER.scope(owned, future).await;
             finished.set(true);
             done.notify_waiters();
         });
@@ -66,7 +69,7 @@ impl Executor {
     /// A handle for spawning onto the page's loop from somewhere else later.
     #[allow(dead_code)]
     pub fn spawner(&self) -> Spawner {
-        Spawner
+        Spawner(Rc::clone(&self.owned))
     }
 
     /// Spawn a task on the page's loop, owned by this session.
@@ -78,7 +81,7 @@ impl Executor {
         &self,
         future: impl Future<Output = T> + MaybeSend + 'static,
     ) -> Task<T> {
-        spawn_owned(future)
+        spawn_in(Rc::clone(&self.owned), future)
     }
 
     /// Wait for the session's future to end, up to `timeout`.
@@ -114,10 +117,9 @@ impl Executor {
                 // and one of them holding the store is what turns a wipe into
                 // a deletion under a live connection. They stop when the
                 // session tells them to; this is where that is waited for.
-                while Outstanding::any() {
-                    let drained = DRAINED.with(|drained| Rc::clone(drained));
-                    let waited = drained.notified();
-                    if !Outstanding::any() {
+                while self.owned.any() {
+                    let waited = self.owned.drained.notified();
+                    if !self.owned.any() {
                         break;
                     }
                     waited.await;
@@ -126,7 +128,7 @@ impl Executor {
             deadline,
         )
         .await;
-        self.finished.get() && !Outstanding::any()
+        self.finished.get() && !self.owned.any()
     }
 }
 
@@ -259,12 +261,11 @@ thread_local! {
 /// than the executor is a camera reporting that it died, and a page has no
 /// camera. Present so the interface is one interface.
 ///
-/// Carries nothing, because there is nothing to carry: a page has one loop
-/// and `spawn_local` finds it from anywhere on the agent. See the desktop
-/// half, where a runtime has to be named.
+/// Carries this executor's task group, so callbacks outside its main future
+/// still join the correct account during teardown.
 #[derive(Clone, Default)]
 #[allow(dead_code)]
-pub struct Spawner;
+pub struct Spawner(Rc<OwnedTasks>);
 
 #[allow(dead_code)]
 impl Spawner {
@@ -273,7 +274,7 @@ impl Spawner {
         &self,
         future: impl Future<Output = T> + MaybeSend + 'static,
     ) -> Task<T> {
-        spawn_owned(future)
+        spawn_in(Rc::clone(&self.0), future)
     }
 }
 
@@ -304,67 +305,48 @@ pub fn spawn<T: MaybeSend + 'static>(
 pub fn spawn_owned<T: MaybeSend + 'static>(
     future: impl Future<Output = T> + MaybeSend + 'static,
 ) -> Task<T> {
+    let owned = OWNER.try_with(Rc::clone).unwrap_or_default();
+    spawn_in(owned, future)
+}
+
+fn spawn_in<T: MaybeSend + 'static>(
+    owned: Rc<OwnedTasks>,
+    future: impl Future<Output = T> + MaybeSend + 'static,
+) -> Task<T> {
     let (tx, rx) = futures_channel::oneshot::channel();
-    let counted = Outstanding::enter();
+    owned.count.set(owned.count.get() + 1);
+    let counted = Outstanding(Rc::clone(&owned));
     oxidezap_platform::spawn(async move {
         let _outstanding = counted;
-        let _ = tx.send(future.await);
+        let _ = tx.send(OWNER.scope(owned, future).await);
     });
     Task(rx)
 }
 
-// How many spawned tasks are still running on this agent.
-//
-// A desktop session ends by dropping the runtime it was built on, and every
-// task on it goes at the same moment — so "the session has finished" and "its
-// work has finished" are one fact there. Here they are two: `spawn_local`
-// hands a future to the page's loop and forgets it, so `run_client` can
-// return while tasks it started are still awaiting things.
-//
-// That difference reaches exactly one caller, and the caller is the one that
-// matters most: the answer to "may this account's database be deleted now".
-// A task still holding the store when the file goes is a wipe racing a live
-// connection.
-thread_local! {
-    static OUTSTANDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Woken when the count reaches zero.
-    static DRAINED: Rc<tokio::sync::Notify> = Rc::new(tokio::sync::Notify::new());
+tokio::task_local! {
+    static OWNER: Rc<OwnedTasks>;
 }
 
-/// One spawned task's presence in the count, released when it is dropped.
-///
-/// A guard rather than a decrement at the end of the future, because a future
-/// that panics or is dropped part-way still has to leave the count — and a
-/// count that only ever goes up would make every later teardown wait out its
-/// whole grace period.
-struct Outstanding;
+#[derive(Default)]
+struct OwnedTasks {
+    count: Cell<usize>,
+    drained: tokio::sync::Notify,
+}
 
-impl Outstanding {
-    /// Join the count, for as long as the returned guard lives.
-    fn enter() -> Self {
-        OUTSTANDING.with(|count| count.set(count.get() + 1));
-        Self
-    }
-
-    /// Whether anything spawned here is still running.
-    fn any() -> bool {
-        OUTSTANDING.with(std::cell::Cell::get) > 0
+impl OwnedTasks {
+    fn any(&self) -> bool {
+        self.count.get() > 0
     }
 }
+
+struct Outstanding(Rc<OwnedTasks>);
 
 impl Drop for Outstanding {
-    /// Leave the count, and wake [`Executor::join`] if this was the last one.
-    ///
-    /// The whole mechanism is this drop: a task that panics, or is dropped
-    /// part-way, leaves the count exactly as one that ran to completion does.
     fn drop(&mut self) {
-        let left = OUTSTANDING.with(|count| {
-            let left = count.get().saturating_sub(1);
-            count.set(left);
-            left
-        });
+        let left = self.0.count.get().saturating_sub(1);
+        self.0.count.set(left);
         if left == 0 {
-            DRAINED.with(|drained| drained.notify_waiters());
+            self.0.drained.notify_waiters();
         }
     }
 }
@@ -411,4 +393,43 @@ impl<T> Future for Task<T> {
 /// with a signature that matches.
 pub async fn let_go<T: MaybeSend + 'static>(value: T) {
     drop(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    async fn joining_one_account_does_not_wait_for_another_accounts_children() {
+        let mut retained = Executor::new().unwrap();
+        let mut successor = Executor::new().unwrap();
+        let (release, held) = futures_channel::oneshot::channel::<()>();
+        let (started, ready) = futures_channel::oneshot::channel();
+        retained
+            .start("retained", async move {
+                spawn_owned(async move {
+                    let nested = spawn_owned(async move {
+                        let _ = started.send(());
+                        let _ = held.await;
+                    });
+                    let _ = nested.await;
+                });
+            })
+            .unwrap();
+        ready.await.unwrap();
+        successor.start("successor", async {}).unwrap();
+        assert!(successor.join(Duration::from_secs(1)).await);
+        let (release_callback, callback_held) = futures_channel::oneshot::channel::<()>();
+        let callback = successor.spawner().spawn(async move {
+            let _ = callback_held.await;
+        });
+        assert!(!successor.join(Duration::from_millis(1)).await);
+        release_callback.send(()).unwrap();
+        callback.await.unwrap();
+        assert!(successor.join(Duration::from_secs(1)).await);
+        assert!(!retained.join(Duration::from_millis(1)).await);
+        release.send(()).unwrap();
+        assert!(retained.join(Duration::from_secs(1)).await);
+    }
 }

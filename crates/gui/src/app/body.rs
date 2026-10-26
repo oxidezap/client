@@ -55,18 +55,23 @@ impl Render for Body {
                 match &app.app_state {
                     AppState::Loading => render_loading_view(cx).into_any_element(),
                     AppState::Connecting => render_connecting_view(cx).into_any_element(),
-                    AppState::WaitingForPairing { qr_code, pair_code } => {
-                        render_pairing_view(qr_code.as_ref(), pair_code.clone(), cx)
-                            .into_any_element()
-                    }
+                    AppState::WaitingForPairing { qr_code, pair_code } => render_pairing_view(
+                        qr_code.as_ref(),
+                        pair_code.clone(),
+                        app.has_retained_history().then(|| entity.clone()),
+                        cx,
+                    )
+                    .into_any_element(),
                     AppState::Syncing => render_syncing_view(cx).into_any_element(),
-                    AppState::Connected | AppState::Offline if app.showing_settings(cx) => {
+                    AppState::Connected | AppState::Offline | AppState::OfflineLoggedOut { .. }
+                        if app.showing_settings(cx) =>
+                    {
                         if gpui_base::TextSelection::has_selection(window, cx) {
                             super::clear_window_message_selection(window, cx);
                         }
                         render_settings_view(app, window, cx).into_any_element()
                     }
-                    AppState::Connected | AppState::Offline => {
+                    AppState::Connected | AppState::Offline | AppState::OfflineLoggedOut { .. } => {
                         render_connected_view(app, window, cx).into_any_element()
                     }
                     AppState::Error(fault) => render_error_view(

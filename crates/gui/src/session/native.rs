@@ -37,8 +37,8 @@ const READER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Returns the events it will publish. The daemon reloads history for a
 /// client that asks for events, so the chats arrive without being asked
 /// for separately.
-pub(super) fn connect() -> std::io::Result<(Session, Events)> {
-    connect_over(connect_or_start()?)
+pub(super) fn connect(account: oxidezap_core::AccountId) -> std::io::Result<(Session, Events)> {
+    connect_over_account(connect_or_start()?, account)
 }
 
 /// The control plane, over the same socket the account connection uses.
@@ -79,7 +79,15 @@ pub(super) fn connect_control() -> std::io::Result<(Session, Events)> {
 /// of its own and watch what dropping the session does to a *real* reader.
 /// The alternative is asserting that `Drop` was called, which is the one
 /// thing that was never in doubt.
+#[cfg(test)]
 fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
+    connect_over_account(endpoint, oxidezap_core::AccountId::LEGACY)
+}
+
+fn connect_over_account(
+    endpoint: Endpoint,
+    account: oxidezap_core::AccountId,
+) -> std::io::Result<(Session, Events)> {
     let (reader, writer) = endpoint.split()?;
     // Taken before the reader is handed to its thread, because after that
     // there is nothing left to ask.
@@ -92,12 +100,14 @@ fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
         pending,
         pictures,
         recover,
-    } = attach::begin(
+    } = attach::begin_for_account(
         Link::over_stream(writer),
         Arc::new(Directory),
+        account,
         // Said rather than left to the default: this is the client the
         // daemon's `ShowWindow` is for, and a front end that stays quiet
         // about it is one the daemon has to guess about.
+        true,
         true,
     )?;
 

@@ -625,6 +625,7 @@ impl ClientRequest {
             self,
             Self::ListAccounts
                 | Self::CreateAccount
+                | Self::RelinkAccount { .. }
                 | Self::ResetAccount { .. }
                 | Self::RemoveAccount { .. }
                 | Self::SetLogLevel { .. }
@@ -951,6 +952,11 @@ pub enum ClientRequest {
     /// opens an [`ClientScope::Account`] connection to it and pairs exactly
     /// as it would a first install.
     CreateAccount,
+    /// Keep a logged-out account intact and return its separate pairing account.
+    /// Repeated requests return the same account through `AccountCreated`.
+    RelinkAccount {
+        account: oxidezap_core::AccountId,
+    },
     /// Reset one account while retaining its id: every credential, chat and
     /// piece of local state this account holds is purged, and a fresh
     /// session under the same id is ready to pair again once the old one has

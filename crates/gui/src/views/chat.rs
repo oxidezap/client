@@ -8,7 +8,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Icon, IconName};
 
-use crate::app::{Destination, MessageListCache, WhatsAppApp};
+use crate::app::{Destination, MessageListCache, OfflineRecovery, WhatsAppApp};
 use crate::components::{
     ChatListProps, EmptyState, InputAreaView, PluginContext, ProductIcon, StatusListProps,
     StatusSelection, StatusViewProps, ViewerProps, parts, plugin_ui, render_call_card,
@@ -230,7 +230,8 @@ pub fn render_connected_view(
     // Read-only: the user stopped waiting for a connection. The composer is
     // replaced rather than disabled in place, because the interesting part is
     // the way out, not the field.
-    let is_offline = app.is_offline();
+    let offline_recovery = app.offline_recovery();
+    let is_offline = offline_recovery.is_some();
     // "(You)" on the conversation with your own number, as on its list row.
     let is_own_number = open_chat
         .as_deref()
@@ -306,7 +307,7 @@ pub fn render_connected_view(
                         search_bar,
                         input_area,
                         can_send,
-                        is_offline,
+                        offline_recovery,
                         is_own_number,
                         plugin_actions,
                         media: media.clone(),
@@ -376,7 +377,7 @@ struct ChatAreaProps<'a> {
     input_area: Option<Entity<InputAreaView>>,
     /// Whether anything can be sent from here at all.
     can_send: bool,
-    is_offline: bool,
+    offline_recovery: Option<OfflineRecovery>,
     /// Whether the open conversation is with this account's own number.
     is_own_number: bool,
     /// What plugins want in the conversation's header, already rendered.
@@ -406,7 +407,7 @@ fn render_chat_area(
         search_bar,
         input_area,
         can_send,
-        is_offline,
+        offline_recovery,
         is_own_number,
         plugin_actions,
         media,
@@ -478,8 +479,8 @@ fn render_chat_area(
                     )
                 }))
                 .map(|el| {
-                    if is_offline {
-                        el.child(render_offline_strip(entity.clone(), metrics, cx))
+                    if let Some(recovery) = offline_recovery {
+                        el.child(render_offline_strip(entity.clone(), recovery, metrics, cx))
                     } else {
                         el.children(input_area)
                     }
@@ -502,9 +503,11 @@ fn render_chat_area(
 /// and stops. What the reader needs is why, and the way back.
 pub(crate) fn render_offline_strip(
     entity: Entity<WhatsAppApp>,
+    recovery: OfflineRecovery,
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    let terminal = matches!(recovery, OfflineRecovery::PairAgain);
     div()
         .flex_shrink_0()
         .flex()
@@ -526,11 +529,19 @@ pub(crate) fn render_offline_strip(
                 .min_w_0()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().muted_foreground)
-                .child("Offline. Your messages stay readable. Reconnect to send."),
+                .child(if terminal {
+                    "Logged out. Only messages and media stored locally are available."
+                } else {
+                    "Offline. Your messages stay readable. Reconnect to send."
+                }),
         )
         .child(
             Button::new("reconnect")
-                .label("Reconnect")
+                .label(if terminal {
+                    "Session options"
+                } else {
+                    "Reconnect"
+                })
                 .ghost()
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {

@@ -58,7 +58,7 @@ pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc
     Arc::new(
         Plugins::start(
             modules,
-            Arc::new(Origin::storage()),
+            Arc::new(Origin::storage_for_account(hub.account_id())),
             Arc::new(Bridge { commands }),
             sink,
         )
@@ -68,14 +68,9 @@ pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc
 
 /// See [`super::reload`].
 ///
-/// `account_id` is unused here: a page's plugin state lives in `localStorage`
-/// behind [`Origin`], which is not yet keyed by account (the multi-account
-/// plan's section 13.3 names this as pending). The parameter exists so the
-/// platform split stays one function the caller names rather than a `cfg` at
-/// every call — see `crates/daemon/src/plugins/mod.rs`'s header.
 pub(super) async fn reload(
     plugins: &Arc<Plugins>,
-    _account_id: oxidezap_core::AccountId,
+    account_id: oxidezap_core::AccountId,
 ) -> Reloaded {
     // Handed over as a future rather than as values, and that is not style:
     // `Origin::storage()` *stamps* the origin's storage, retiring every
@@ -109,7 +104,7 @@ pub(super) async fn reload(
             // with it: taking one retires every older handle, so a scan that
             // failed would leave the running generation writing through a
             // store it no longer owns.
-            let state: Arc<dyn Backing> = Arc::new(Origin::storage());
+            let state: Arc<dyn Backing> = Arc::new(Origin::storage_for_account(account_id));
             Some((modules, state))
         })
         .await

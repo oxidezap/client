@@ -9,6 +9,24 @@ use super::*;
 impl WhatsAppApp {
     /// Handle a single UI event
     pub(super) fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
+        if matches!(
+            self.app_state,
+            AppState::LoggedOut { .. } | AppState::OfflineLoggedOut { .. }
+        ) && matches!(
+            event,
+            UiEvent::InitComplete
+                | UiEvent::Connected
+                | UiEvent::PairSuccess
+                | UiEvent::QrCode { .. }
+                | UiEvent::PairCode { .. }
+                | UiEvent::Disconnected(_)
+                | UiEvent::IncomingCall(_)
+                | UiEvent::OutgoingCallStarted { .. }
+                | UiEvent::CallAccepted(_)
+                | UiEvent::CallAnswered { .. }
+        ) {
+            return;
+        }
         match event {
             UiEvent::InitComplete => {
                 self.app_state = AppState::Connecting;
@@ -232,6 +250,10 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::LoggedOut(message) => {
+                if matches!(&self.app_state, AppState::OfflineLoggedOut { .. }) {
+                    return;
+                }
+                self.recovery.update(cx, |recovering, _| recovering.stop());
                 self.leave_connected_view(None, cx);
                 self.invalidate_document_downloads();
                 self.app_state = AppState::LoggedOut { message };

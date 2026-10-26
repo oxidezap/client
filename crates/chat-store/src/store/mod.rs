@@ -22,6 +22,7 @@ mod message_rows;
 mod reaction;
 pub(crate) mod read_state;
 mod receipt;
+mod recovery;
 mod revoke;
 pub(crate) mod shared_history;
 mod writer;
@@ -1207,6 +1208,13 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
+        assert!(has_table(&store, "session_recovery").await);
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("session-recovery downgrade is reversible");
+        assert!(!has_table(&store, "session_recovery").await);
         assert!(has_table(&store, "shared_group_history").await);
         store
             .shared()

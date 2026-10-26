@@ -179,6 +179,10 @@ pub enum AppState {
     /// would draw a bubble the daemon has no session to send — pending for
     /// ever, with the failure logged where nobody looks.
     Offline,
+    /// Explicit local access after a terminal credential rejection.
+    OfflineLoggedOut {
+        message: String,
+    },
     Error(Fault),
     /// This window may not hold the account, and no amount of waiting
     /// changes that.
@@ -196,8 +200,8 @@ pub enum AppState {
     },
     /// The server ended the session (401 and friends). Distinct from
     /// [`Error`](Self::Error) because retrying is useless: the stored
-    /// credentials are dead and only a fresh pairing can recover, which means
-    /// wiping local state rather than reconnecting with it.
+    /// credentials are dead. Local history remains readable; a fresh pairing
+    /// uses a separate account instead of replacing the retained data.
     LoggedOut {
         message: String,
     },

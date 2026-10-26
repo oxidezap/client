@@ -712,6 +712,16 @@ fn bridge(outcome: CommandOutcome) -> (Commands, tokio::task::JoinHandle<Option<
     (tx, task)
 }
 
+fn live_bridge() -> (Commands, tokio::task::JoinHandle<()>) {
+    let (commands, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(MAX_CLIENTS);
+    let task = tokio::spawn(async move {
+        while let Some(command) = receiver.recv().await {
+            let _ = command.reply.send(CommandOutcome::Accepted);
+        }
+    });
+    (commands, task)
+}
+
 /// The follow-up this replaced: these parsed and were answered
 /// `Unsupported`. They now reach the session.
 #[tokio::test]
@@ -988,7 +998,7 @@ async fn a_shutdown_is_acknowledged_before_it_is_carried_out() {
 async fn a_malformed_frame_is_answered_and_does_not_end_the_connection() {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let hub = connected_hub();
-    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let (commands, _taken) = live_bridge();
 
     let served = tokio::spawn(serve_client(
         server,
@@ -1216,7 +1226,7 @@ async fn a_hello_that_is_not_text_is_answered_rather_than_dropped() {
 async fn a_client_that_wants_only_summaries_stays_connected() {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let hub = connected_hub();
-    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let (commands, _taken) = live_bridge();
 
     let served = tokio::spawn(serve_client(
         server,
@@ -1264,7 +1274,7 @@ async fn a_client_that_wants_only_summaries_stays_connected() {
 async fn a_client_that_asked_for_events_receives_them() {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let hub = connected_hub();
-    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let (commands, _taken) = live_bridge();
 
     let served = tokio::spawn(serve_client(
         server,
@@ -1639,7 +1649,7 @@ async fn removing_a_plugin_is_answered_without_the_session() {
 
 #[tokio::test]
 async fn an_ensure_avatars_request_dispatches_to_session_bridge() {
-    let hub = StateHub::new();
+    let hub = connected_hub();
     let (commands, taken) = bridge(CommandOutcome::Accepted);
     let (outbox, mut answers) = answers();
 
@@ -2379,4 +2389,80 @@ async fn wire_list_accounts_answers_directly() {
     let frame = ans.frame.expect("a direct answer");
     let parsed: ResponseEnvelope = serde_json::from_str(&frame).expect("a wire envelope");
     assert!(matches!(parsed.result, ResponseResult::Ok { .. }));
+}
+
+#[tokio::test]
+async fn terminal_offline_requests_never_reach_the_session_channel() {
+    let hub = StateHub::new();
+    hub.apply(crate::state::Change::live(
+        oxidezap_ipc::DaemonEvent::ConnectionChanged(oxidezap_ipc::ConnectionState::LoggedOut {
+            message: "synthetic unlink".into(),
+        }),
+    ));
+    let (commands, mut received) = tokio::sync::mpsc::channel(8);
+    let destination = outbox();
+    let actions = vec![
+        Action::EnsureAvatars(vec![]),
+        Action::Wire {
+            id: 2,
+            request: oxidezap_wire::request::ClientRequest::GetProfile {
+                jid: Some("999000@s.whatsapp.net".into()),
+            },
+            answer_to: destination.clone(),
+        },
+        Action::SendText(oxidezap_ipc::SendText {
+            jid: "999000@s.whatsapp.net".into(),
+            text: "must stay local".into(),
+            local_id: None,
+            quoted: None,
+        }),
+    ];
+    for action in actions {
+        assert!(matches!(
+            super::requests::dispatch(&hub, &commands, action).await,
+            Err(ProtocolError::NoSession { .. })
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn replacing_an_account_runtime_closes_old_frontend_attachments() {
+    let registry = AccountRegistry::new();
+    let (commands, receiver) = tokio::sync::mpsc::channel(MAX_CLIENTS);
+    assert!(registry.insert(Arc::new(AccountRuntime::new(
+        oxidezap_core::AccountId::LEGACY,
+        connected_hub(),
+        no_plugins(),
+        commands,
+    ))));
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(Box::new(server), registry));
+    let request = Request::bare(ClientRequest::Hello {
+        protocol: PROTOCOL_VERSION,
+        scope: ClientScope::Account {
+            account: oxidezap_core::AccountId::LEGACY,
+        },
+        session_events: false,
+        owns_window: false,
+        call_video: false,
+    });
+    client
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+    drop(receiver);
+    tokio::time::timeout(std::time::Duration::from_secs(1), served)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    line.clear();
+    assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
 }

@@ -156,7 +156,12 @@ pub fn resolve(
         let recorder = recorder.clone();
         async move {
             let _guard = InFlightGuard(in_flight_key);
-            let response = match fetch(&source).await {
+            if !hub.connection().is_connected() {
+                recorder.on_failed(&jid);
+                publish_failed(&hub, &jid, false);
+                return;
+            }
+            let response = match fetch(&source, &hub).await {
                 Ok(response) => response,
                 Err(_) => {
                     if is_current(&hub, &jid, &selection) {
@@ -346,15 +351,21 @@ pub(super) fn has_selection(hub: &StateHub, jid: &str) -> bool {
         .contains_key(&(hub.id(), jid.to_owned()))
 }
 
-async fn fetch(url: &str) -> anyhow::Result<AvatarResponse> {
+async fn fetch(url: &str, hub: &Arc<StateHub>) -> anyhow::Result<AvatarResponse> {
     #[cfg(not(target_family = "wasm"))]
     {
         let url = url.to_string();
-        let (status, body) = oxidezap_session::unblock(move || native::fetch(&url)).await??;
+        let hub = Arc::clone(hub);
+        let (status, body) = oxidezap_session::unblock(move || {
+            anyhow::ensure!(hub.connection().is_connected(), "WhatsApp is offline");
+            native::fetch(&url)
+        })
+        .await??;
         Ok(AvatarResponse { status, body })
     }
     #[cfg(target_family = "wasm")]
     {
+        anyhow::ensure!(hub.connection().is_connected(), "WhatsApp is offline");
         let (status, body) = web::fetch(url).await?;
         Ok(AvatarResponse { status, body })
     }
@@ -396,6 +407,18 @@ fn accept(response: AvatarResponse) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::{AvatarResponse, accept, is_current, purge, record_selection};
     use crate::state::StateHub;
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn an_offline_avatar_miss_opens_no_http_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/synthetic-avatar", listener.local_addr().unwrap());
+        assert!(super::fetch(&url, &StateHub::new()).await.is_err());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
 
     #[test]
     fn account_teardown_rejects_a_previous_avatar_completion() {

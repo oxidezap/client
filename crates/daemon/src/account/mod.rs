@@ -179,8 +179,18 @@ impl AccountRuntime {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EmbeddedNext {
+    Reset,
+    Removed,
+    Restart,
+    Finished,
+}
+
 /// Registry of account runtimes and the control-plane snapshot they publish.
 pub struct AccountRegistry {
+    relink: tokio::sync::Mutex<()>,
+    construction: tokio::sync::Mutex<()>,
     accounts: RwLock<HashMap<AccountId, Arc<AccountRuntime>>>,
     overview: watch::Sender<Arc<AccountsSnapshot>>,
     /// The supervisor spawning and respawning runtimes into this registry,
@@ -193,7 +203,7 @@ pub struct AccountRegistry {
     /// and that function threading a second `Arc` alongside this one. `None`
     /// on a registry nothing has attached a supervisor to (a focused test
     /// exercising `AccountRuntime`/`AccountRegistry` directly, or
-    /// `embedded.rs`, which builds its one runtime by hand) and on wasm,
+    /// `embedded.rs`, which uses local account supervision) and on wasm,
     /// where `AccountSupervisor` does not exist at all.
     #[cfg(not(target_family = "wasm"))]
     supervisor: std::sync::OnceLock<std::sync::Weak<AccountSupervisor>>,
@@ -207,6 +217,8 @@ impl AccountRegistry {
             accounts: Vec::new(),
         }));
         Arc::new(Self {
+            relink: tokio::sync::Mutex::new(()),
+            construction: tokio::sync::Mutex::new(()),
             accounts: RwLock::new(HashMap::new()),
             overview,
             #[cfg(not(target_family = "wasm"))]
@@ -260,6 +272,125 @@ impl AccountRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&id)
             .cloned()
+    }
+
+    /// Retain the rejected account and reuse one separate pairing slot across retries.
+    pub async fn relink(self: &Arc<Self>, id: AccountId) -> Result<AccountId> {
+        let _guard = self.relink.lock().await;
+        let old = self
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("account not found"))?;
+        anyhow::ensure!(
+            matches!(
+                old.hub.connection(),
+                oxidezap_ipc::ConnectionState::LoggedOut { .. }
+            ),
+            "this account has not been logged out"
+        );
+        let successor = old.stores.pairing_successor(id).await?;
+        if self.get(successor).is_none() {
+            self.start_account(successor, Arc::clone(&old.stores)).await;
+        }
+        Ok(successor)
+    }
+
+    pub(crate) async fn start_account(self: &Arc<Self>, id: AccountId, stores: Arc<StoreRegistry>) {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(supervisor) = self.supervisor() {
+            supervisor.spawn(id).await;
+            return;
+        }
+        let Some((mut runtime, mut receiver)) =
+            self.build_embedded_account(id, Arc::clone(&stores)).await
+        else {
+            return;
+        };
+        let registry = Arc::clone(self);
+        oxidezap_session::spawn(async move {
+            let mut failures = 0u32;
+            loop {
+                let outcome = registry
+                    .run(runtime, receiver, crate::shutdown::requested())
+                    .await;
+                let next = match outcome {
+                    Ok(exit) => registry.finish_embedded_exit(id, exit),
+                    Err(error) => {
+                        log::error!("account {} ended: {error}", id.get());
+                        EmbeddedNext::Restart
+                    }
+                };
+                match next {
+                    EmbeddedNext::Reset => failures = 0,
+                    EmbeddedNext::Removed | EmbeddedNext::Finished => break,
+                    EmbeddedNext::Restart => {
+                        if failures >= 3 {
+                            registry.set_status(id, AccountStatus::Error);
+                            break;
+                        }
+                        failures += 1;
+                        tokio::select! {
+                            _ = oxidezap_session::sleep(std::time::Duration::from_secs(u64::from(failures))) => {},
+                            _ = crate::shutdown::requested() => break,
+                        }
+                        registry.remove(id);
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    _ = crate::shutdown::requested() => break,
+                    _ = std::future::ready(()) => {},
+                }
+                let Some(next) = registry
+                    .build_embedded_account(id, Arc::clone(&stores))
+                    .await
+                else {
+                    break;
+                };
+                (runtime, receiver) = next;
+            }
+        });
+    }
+
+    async fn build_embedded_account(
+        self: &Arc<Self>,
+        id: AccountId,
+        stores: Arc<StoreRegistry>,
+    ) -> Option<(Arc<AccountRuntime>, mpsc::Receiver<SessionCommand>)> {
+        let _construction = self.construction.lock().await;
+        if self.get(id).is_some() {
+            return None;
+        }
+        let hub = StateHub::for_account(id);
+        let (commands, receiver) = mpsc::channel(crate::server::MAX_CLIENTS);
+        let plugins = crate::plugins::start(&hub, commands.clone()).await;
+        let runtime = Arc::new(AccountRuntime::new_with_registry(
+            id, hub, plugins, commands, stores,
+        ));
+        assert!(self.insert(Arc::clone(&runtime)));
+        Some((runtime, receiver))
+    }
+
+    fn finish_embedded_exit(
+        &self,
+        id: AccountId,
+        exit: session_bridge::AccountExit,
+    ) -> EmbeddedNext {
+        use session_bridge::AccountExit;
+        match exit {
+            AccountExit::ResetCompleted => {
+                self.remove(id);
+                EmbeddedNext::Reset
+            }
+            AccountExit::RemoveCompleted => {
+                self.remove(id);
+                EmbeddedNext::Removed
+            }
+            AccountExit::SessionEnded => EmbeddedNext::Restart,
+            AccountExit::SessionLoggedOut
+            | AccountExit::Stopped
+            | AccountExit::ResetIncomplete
+            | AccountExit::RemoveIncomplete => EmbeddedNext::Finished,
+        }
     }
 
     /// Remove one runtime after its teardown has completed.
@@ -369,10 +500,8 @@ impl AccountRegistry {
 /// `Send`, and a page's own plugin host
 /// (`crate::plugins::web::start`) is built from `wasm-bindgen` closures that
 /// are deliberately not — there is exactly one thread in a browser tab, so
-/// nothing there needs to cross one. `embedded.rs` keeps building its one
-/// account inline for exactly that reason; the multi-account *web* registry
-/// the plan's section 8 asks for needs its own, `MaybeSend`-compatible
-/// supervision, not this one taught to tolerate `!Send`.
+/// nothing there needs to cross one. Embedded accounts use the local lifecycle
+/// loop in [`AccountRegistry::start_account`] instead.
 #[cfg(not(target_family = "wasm"))]
 pub struct AccountSupervisor {
     registry: Arc<AccountRegistry>,
@@ -692,14 +821,9 @@ impl AccountSupervisor {
 
     /// Build, register and start driving a fresh runtime for `id`.
     ///
-    /// `id` must not already have a runtime registered — the daemon's own
-    /// startup loop and `CreateAccount`'s handler are the only two callers,
-    /// and both know the id they are about to spawn has no runtime yet: the
-    /// first because it just listed `StoreRegistry::accounts()`, the second
-    /// because `StoreRegistry::create_account()` just allocated the id fresh.
-    /// A reset's respawn (in [`Self::handle_exit`] below) removes the old
-    /// runtime from the registry immediately before calling back in here, so
-    /// it never finds one already registered either.
+    /// Concurrent startup and replacement requests share the registry's
+    /// construction lock. If another caller has registered this account,
+    /// return that runtime rather than constructing a second plugin host.
     ///
     /// Returns once the runtime is registered and its task has been handed to
     /// the scheduler — not once a session has connected, which can take
@@ -736,6 +860,10 @@ impl AccountSupervisor {
         id: AccountId,
         hub: Arc<StateHub>,
     ) -> Arc<AccountRuntime> {
+        let _construction = self.registry.construction.lock().await;
+        if let Some(runtime) = self.registry.get(id) {
+            return runtime;
+        }
         let (commands, command_rx) = mpsc::channel(self.command_capacity);
         // Before the plugins load, and before anything reads the account's
         // plugin state: a pre-multi-account install kept its approvals and
@@ -1287,6 +1415,136 @@ mod tests {
             |_| {},
         )));
         Arc::new(AccountRuntime::new(id, hub, plugins, commands))
+    }
+
+    #[tokio::test]
+    async fn concurrent_frontends_reuse_the_retained_accounts_pairing_successor() {
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:relink-frontends-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let old = stores.create_account().await.unwrap();
+        let backend = stores.store(old).await.unwrap();
+        stores.prepare_chat_schema(&backend).await.unwrap();
+        let history = oxidezap_chat_store::ChatStore::new_prepared(&backend)
+            .await
+            .unwrap();
+        history
+            .record_logout("Synthetic unlink".into())
+            .await
+            .unwrap();
+        let next = stores.pairing_successor(old).await.unwrap();
+        let registry = AccountRegistry::new();
+        let mut receivers = Vec::new();
+        for id in [old, next] {
+            let hub = StateHub::for_account(id);
+            if id == old {
+                hub.apply(crate::state::Change::live(
+                    oxidezap_ipc::DaemonEvent::ConnectionChanged(
+                        oxidezap_ipc::ConnectionState::LoggedOut {
+                            message: "Synthetic unlink".into(),
+                        },
+                    ),
+                ));
+            }
+            let (commands, receiver) = tokio::sync::mpsc::channel(1);
+            receivers.push(receiver);
+            let plugins = Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+                |_| {},
+            )));
+            assert!(registry.insert(Arc::new(AccountRuntime::new_with_registry(
+                id,
+                hub,
+                plugins,
+                commands,
+                Arc::clone(&stores)
+            ))));
+        }
+        let (first, second) = tokio::join!(registry.relink(old), registry.relink(old));
+        assert_eq!(first.unwrap(), next);
+        assert_eq!(second.unwrap(), next);
+        assert_eq!(registry.snapshot().accounts.len(), 2);
+        assert_eq!(stores.accounts().await.unwrap().len(), 2);
+        assert!(matches!(
+            registry.get(old).unwrap().hub.connection(),
+            oxidezap_ipc::ConnectionState::LoggedOut { .. }
+        ));
+        assert!(registry.relink(next).await.is_err());
+        assert!(
+            receivers
+                .iter_mut()
+                .all(|receiver| receiver.try_recv().is_err())
+        );
+        history.close().await.unwrap();
+    }
+
+    #[test]
+    fn embedded_completed_lifecycle_retires_the_old_runtime_only_after_success() {
+        use super::EmbeddedNext;
+        use crate::session_bridge::AccountExit;
+        let registry = AccountRegistry::new();
+        let id = AccountId::new(2).unwrap();
+        let old = runtime(2);
+        assert!(registry.insert(Arc::clone(&old)));
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::ResetIncomplete),
+            EmbeddedNext::Finished
+        );
+        assert!(Arc::ptr_eq(&registry.get(id).unwrap(), &old));
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::ResetCompleted),
+            EmbeddedNext::Reset
+        );
+        assert!(registry.get(id).is_none());
+        let replacement = runtime(2);
+        assert!(registry.insert(Arc::clone(&replacement)));
+        assert!(!Arc::ptr_eq(&replacement, &old));
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::RemoveCompleted),
+            EmbeddedNext::Removed
+        );
+        assert!(registry.get(id).is_none());
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::SessionEnded),
+            EmbeddedNext::Restart
+        );
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::SessionLoggedOut),
+            EmbeddedNext::Finished
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn concurrent_supervisor_construction_reuses_one_runtime() {
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:concurrent-construction-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let supervisor = super::AccountSupervisor::with_shutdown(
+            Arc::clone(&registry),
+            stores,
+            4,
+            super::RestartPolicy::production(),
+            || std::future::ready(()),
+        );
+        let id = AccountId::new(2).unwrap();
+        let (first, second) = tokio::join!(supervisor.spawn(id), supervisor.spawn(id));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(registry.runtimes().len(), 1);
+        let (_, ensured) = tokio::join!(
+            supervisor.handle_exit(super::AccountRun {
+                id,
+                exit: crate::session_bridge::AccountExit::ResetCompleted,
+                ran_for: std::time::Duration::from_secs(1),
+            }),
+            supervisor.spawn(id),
+        );
+        assert!(!Arc::ptr_eq(&first, &ensured));
+        assert!(Arc::ptr_eq(&registry.get(id).unwrap(), &ensured));
+        assert_eq!(registry.runtimes().len(), 1);
+        supervisor.join_all().await;
     }
 
     #[test]

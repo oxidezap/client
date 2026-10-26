@@ -296,6 +296,7 @@ impl From<&oxidezap_ipc::ProtocolError> for Failure {
 /// is waiting, and a send that was refused becomes the failure the message it
 /// drew is already able to render.
 enum Awaiting {
+    Account(oneshot::Sender<Result<oxidezap_core::AccountId, String>>),
     /// A message mutation whose result must reach the action that opened it.
     Mutation(oneshot::Sender<Result<(), Failure>>),
     Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, Failure>>),
@@ -370,6 +371,7 @@ impl Awaiting {
     /// Whether nobody is listening for this any more.
     fn is_abandoned(&self) -> bool {
         match self {
+            Self::Account(tx) => tx.is_closed(),
             Self::Mutation(tx) => tx.is_closed(),
             Self::Download(tx) => tx.is_closed(),
             Self::Storage(tx) => tx.is_closed(),
@@ -404,6 +406,9 @@ impl Awaiting {
     fn failed(self, failure: &Failure, events: Option<&ReaderSink>) {
         let detail = failure.detail.as_str();
         match self {
+            Self::Account(tx) => {
+                let _ = tx.send(Err(detail.to_string()));
+            }
             Self::CallDevices(tx) => {
                 let _ = tx.send(Err(detail.to_string()));
             }
@@ -829,14 +834,14 @@ impl Session {
     /// # Errors
     ///
     /// Nothing is listening and nothing could be made to listen.
-    pub async fn connect() -> std::io::Result<(Self, Events)> {
+    async fn connect(account: oxidezap_core::AccountId) -> std::io::Result<(Self, Events)> {
         #[cfg(not(target_family = "wasm"))]
         {
-            native::connect()
+            native::connect(account)
         }
         #[cfg(target_family = "wasm")]
         {
-            web::connect().await
+            web::connect(account).await
         }
     }
 
@@ -903,16 +908,19 @@ impl Session {
     /// # Errors
     ///
     /// As [`Self::connect`].
-    pub async fn attach(cx: &mut gpui::AsyncApp) -> std::io::Result<(Self, Events)> {
+    pub async fn attach(
+        account: oxidezap_core::AccountId,
+        cx: &mut gpui::AsyncApp,
+    ) -> std::io::Result<(Self, Events)> {
         #[cfg(not(target_family = "wasm"))]
         {
             use gpui::AppContext as _;
-            cx.background_spawn(Self::connect()).await
+            cx.background_spawn(Self::connect(account)).await
         }
         #[cfg(target_family = "wasm")]
         {
             let _ = cx;
-            Self::connect().await
+            Self::connect(account).await
         }
     }
 
@@ -1701,6 +1709,18 @@ impl SessionHandle {
     pub fn forget_session(&self) {
         self.conn.media.clear_cached();
         self.tell(ClientRequest::ForgetSession);
+    }
+
+    pub fn relink_account(
+        &self,
+        account: oxidezap_core::AccountId,
+    ) -> oneshot::Receiver<Result<oxidezap_core::AccountId, String>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::RelinkAccount { account },
+            Awaiting::Account(tx),
+        );
+        rx
     }
 
     /// Ask what the store and the media cache occupy.

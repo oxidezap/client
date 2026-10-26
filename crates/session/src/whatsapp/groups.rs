@@ -19,6 +19,11 @@ use super::WhatsAppClient;
 use super::history::own_jids;
 use crate::exec::Task;
 
+enum RosterRead {
+    CacheOnly,
+    AllowNetwork,
+}
+
 impl WhatsAppClient {
     /// Everyone in `jid`, named the way every other surface names them.
     ///
@@ -33,6 +38,19 @@ impl WhatsAppClient {
     /// returned nameless: drawing a stranger is the renderer's job, here for
     /// the reason it is everywhere else in this crate.
     pub fn group_roster(&self, jid: String) -> Task<Result<GroupRoster, String>> {
+        self.group_roster_from(jid, RosterRead::AllowNetwork)
+    }
+
+    /// Read durable membership without a routing lookup or network fallback.
+    pub fn cached_group_roster(&self, jid: String) -> Task<Result<GroupRoster, String>> {
+        self.group_roster_from(jid, RosterRead::CacheOnly)
+    }
+
+    fn group_roster_from(
+        &self,
+        jid: String,
+        source: RosterRead,
+    ) -> Task<Result<GroupRoster, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
             let group: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
@@ -42,12 +60,28 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let info = live
-                .client
-                .groups()
-                .routing_info(&group)
-                .await
-                .map_err(|e| e.to_string())?;
+            let info = match source {
+                RosterRead::AllowNetwork => live
+                    .client
+                    .groups()
+                    .routing_info(&group)
+                    .await
+                    .map_err(|error| error.to_string())?,
+                RosterRead::CacheOnly => {
+                    let bytes = live
+                        .client
+                        .persistence_manager()
+                        .backend()
+                        .get_group_metadata(&group.to_string())
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or("Group members are not cached locally; WhatsApp is offline")?;
+                    std::sync::Arc::new(
+                        serde_json::from_slice::<wacore::client::context::GroupRoutingInfo>(&bytes)
+                            .map_err(|error| error.to_string())?,
+                    )
+                }
+            };
             // Both of this account's addresses, because a group addresses its
             // members by LID or by number depending on how it was created,
             // and "You" has to be recognised under either.
@@ -586,5 +620,58 @@ mod tests {
         for raw in ["", "123", "+1 (99) 9"] {
             assert!(parse_participant(raw).is_err(), "{raw} was accepted");
         }
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod local_roster_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_members_and_misses_never_run_the_bot() {
+        let stores = std::sync::Arc::new(crate::StoreRegistry::new(format!(
+            "file:cached-roster-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let account = stores.create_account().await.unwrap();
+        let mut client =
+            WhatsAppClient::new_for_account_with_registry(account, stores.clone()).unwrap();
+        let _events = client.take_events().unwrap();
+        let (bot, live, _) = WhatsAppClient::open_session(
+            &stores,
+            account,
+            &client.ui_sender,
+            &client.session,
+            super::super::chat_names::ChatNameResolveSignal::new(),
+        )
+        .await
+        .unwrap();
+        let group = "999000@g.us";
+        let member: Jid = "999000000001@s.whatsapp.net".parse().unwrap();
+        let info = wacore::client::context::GroupRoutingInfo::new(
+            vec![member.clone()],
+            wacore::types::message::AddressingMode::Pn,
+        );
+        live.client
+            .persistence_manager()
+            .backend()
+            .put_group_metadata(group, &serde_json::to_vec(&info).unwrap())
+            .await
+            .unwrap();
+        let roster = client
+            .cached_group_roster(group.into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(roster.members.len(), 1);
+        assert_eq!(roster.members[0].jid, member.to_string());
+        let missing = client
+            .cached_group_roster("999001@g.us".into())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(missing.contains("not cached locally"));
+        bot.client().shutdown().await;
+        client.close(std::time::Duration::from_secs(1)).await;
     }
 }

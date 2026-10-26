@@ -1103,8 +1103,30 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   answer stand over the success that came after it. Agreement costs nothing,
   because a call state that does not change sends no frame.
 - **Logout is not a disconnect.** A server 401 means the stored credentials are
-  dead; reconnecting with them loops forever. `AppState::LoggedOut` exists to
-  force the only real recovery: wipe local state, pair again.
+  dead. The classified completion from `Bot::run` must reach the daemon even
+  when no `LoggedOut` callback was delivered. The terminal verdict is stored
+  with the account before publication, and reopening it hydrates history
+  without starting the network supervisor. The account's local command loop
+  stays available while its network workers stop. `AppState::LoggedOut`
+  offers explicit local access, represented by `OfflineLoggedOut`, or a new
+  pairing. Queued connection events cannot revive the rejected link.
+  The daemon refuses network actions, including avatar and group cache misses;
+  media downloads may return an account-scoped cache hit but refuse a miss.
+  `RelinkAccount` is a control request shared by native and embedded daemons.
+  It retains the old account and records one separate successor for pairing,
+  so repeated requests and other tabs reuse that successor. Frontends clear
+  their old account view before attaching to the new scope. The pairing screen
+  and Account settings can return to retained history without resetting either
+  account. The selected account survives reopening; existing browser tabs keep their own selection,
+  while newly opened tabs inherit the last selection for that page route. A non-logout completion closes the event queue so
+  the supervisor can restart it. The embedded service restores every stored account before serving connections,
+  retains its origin claim across individual account resets, and prepares the
+  shared browser VFS once per registry. Browser executor joins count only
+  their own account tasks, including nested owned work. Account attachments
+  close when their command receiver ends so open tabs reattach after runtime
+  replacement. Saved selections are namespaced by the effective daemon. Embedded runtimes handle completed
+  reset/removal outcomes instead of retaining a stopped runtime. Explicit data
+  deletion remains a separate Settings action.
 - **The store is one file.** Device identity, Signal state and chat history all
   live in the same SQLite database, and chat rows are keyed by device id. A
   partial wipe orphans everything behind the new device, so

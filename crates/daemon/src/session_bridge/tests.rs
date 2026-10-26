@@ -559,7 +559,7 @@ fn a_ringing_call_is_state_a_new_window_can_attach_to() {
 /// so a snapshot taken after the next pairing opened with the previous
 /// account's identity and chat list.
 #[test]
-fn a_logout_takes_the_account_out_of_the_next_snapshot() {
+fn a_logout_preserves_account_history_in_the_next_snapshot() {
     let mut bridge = bridge();
     bridge.observe(loaded(vec![stored_chat(
         "1@s.whatsapp.net",
@@ -575,12 +575,34 @@ fn a_logout_takes_the_account_out_of_the_next_snapshot() {
 
     bridge.observe(UiEvent::LoggedOut("the server said no".into()));
 
-    assert!(bridge.hub.chat("1@s.whatsapp.net").is_none());
-    assert!(bridge.hub.store_backed_chat_jids().is_empty());
+    assert!(bridge.hub.chat("1@s.whatsapp.net").is_some());
+    assert!(!bridge.hub.store_backed_chat_jids().is_empty());
+    assert!(matches!(
+        bridge.hub.connection(),
+        oxidezap_ipc::ConnectionState::LoggedOut { .. }
+    ));
     assert!(
         bridge.reads().boundary("1@s.whatsapp.net").is_none(),
         "and nothing this account taught the read tracker survives it"
     );
+}
+
+#[test]
+fn terminal_logout_cannot_be_overwritten_by_queued_reconnect_events() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::LoggedOut("synthetic unlink".into()));
+    for event in [
+        UiEvent::InitComplete,
+        UiEvent::Connected,
+        UiEvent::PairSuccess,
+        UiEvent::Disconnected("late disconnect".into()),
+    ] {
+        bridge.observe(event);
+        assert!(matches!(
+            bridge.hub.connection(),
+            oxidezap_ipc::ConnectionState::LoggedOut { .. }
+        ));
+    }
 }
 
 /// Nothing on the session side ends a call when the socket dies, so the

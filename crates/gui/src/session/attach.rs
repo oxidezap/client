@@ -66,6 +66,7 @@ pub(super) struct Attached {
 ///
 /// The hello could not be written, which means the connection was gone before
 /// it began.
+#[cfg(test)]
 pub(super) fn begin(
     link: Link,
     media: Arc<dyn MediaCache>,
