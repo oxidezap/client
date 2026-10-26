@@ -2,7 +2,34 @@
 use anyhow::Result;
 use oxidezap_core::{CallDevice, Ringtone};
 
-pub use imp::{RingtonePlayback, enumerate_audio_devices, start_ringtone};
+pub use imp::{
+    RingtonePlayback, enumerate_audio_devices, start_ringtone, start_ringtone_cancellable,
+};
+
+static CALL_PREFERENCES: std::sync::RwLock<oxidezap_core::CallDevicePreferences> =
+    std::sync::RwLock::new(oxidezap_core::CallDevicePreferences {
+        microphone: None,
+        speaker: None,
+        ringtone_output: None,
+        camera: None,
+        camera_mode: oxidezap_core::CameraMode {
+            width: 640,
+            height: 480,
+            fps: 30,
+        },
+        ringtone: Ringtone::Classic,
+    });
+
+pub fn set_call_preferences(preferences: oxidezap_core::CallDevicePreferences) {
+    *CALL_PREFERENCES.write().unwrap_or_else(|e| e.into_inner()) = preferences;
+}
+
+pub fn call_preferences() -> oxidezap_core::CallDevicePreferences {
+    CALL_PREFERENCES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 /// A deterministic, quiet two-tone signal with a silent interval.
 pub fn ringtone_sample(tone: Ringtone, frame: u64, rate: u32) -> i16 {
@@ -85,7 +112,14 @@ mod imp {
     }
 
     pub fn start_ringtone(output: Option<String>, tone: Ringtone) -> Result<RingtonePlayback> {
-        let stop = Arc::new(AtomicBool::new(false));
+        start_ringtone_cancellable(output, tone, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn start_ringtone_cancellable(
+        output: Option<String>,
+        tone: Ringtone,
+        stop: Arc<AtomicBool>,
+    ) -> Result<RingtonePlayback> {
         let guard = RingtonePlayback(stop.clone());
         if tone == Ringtone::Silent {
             return Ok(guard);
@@ -93,6 +127,9 @@ mod imp {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let opened = (|| -> Result<_> {
+                if stop.load(Ordering::Acquire) {
+                    anyhow::bail!("ringtone cancelled");
+                }
                 let device = select(output.as_deref(), false)?;
                 let (config, format) = crate::call_device::default_config(&device, false)?;
                 let (producer, consumer) =
@@ -113,6 +150,9 @@ mod imp {
                     },
                     on_error,
                 )?;
+                if stop.load(Ordering::Acquire) {
+                    anyhow::bail!("ringtone cancelled");
+                }
                 stream.play()?;
                 Ok((stream, config.sample_rate, producer))
             })();
@@ -149,6 +189,16 @@ mod imp {
     pub fn enumerate_audio_devices() -> Result<(Vec<CallDevice>, Vec<CallDevice>)> {
         anyhow::bail!("Device inventory is unavailable from this browser connection")
     }
+    pub fn start_ringtone_cancellable(
+        output: Option<String>,
+        tone: Ringtone,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<RingtonePlayback> {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("ringtone cancelled");
+        }
+        start_ringtone(output, tone)
+    }
     pub fn start_ringtone(_output: Option<String>, tone: Ringtone) -> Result<RingtonePlayback> {
         if tone == Ringtone::Silent {
             Ok(RingtonePlayback)
@@ -170,3 +220,6 @@ mod tests {
         assert!((0..16000).all(|i| ringtone_sample(Ringtone::Silent, i, 16000) == 0));
     }
 }
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use imp::select;
