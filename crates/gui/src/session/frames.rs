@@ -160,6 +160,12 @@ impl<'a> Frames<'a> {
     #[allow(clippy::too_many_lines)]
     pub(super) fn apply(&mut self, message: DaemonMessage) -> ControlFlow<()> {
         match message {
+            DaemonMessage::CallDevices { id, result } => {
+                if let Some(Awaiting::CallDevices(tx)) = take_pending(self.pending, id) {
+                    let _ = tx.send(result);
+                }
+            }
+
             // The first frame, and the only one that describes where things
             // already stand. A window opened while the daemon was already
             // linked hears nothing else about the account it is attached to:

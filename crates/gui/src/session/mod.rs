@@ -301,6 +301,7 @@ enum Awaiting {
     Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, Failure>>),
     /// What this account occupies on disk, for the Storage pane.
     Storage(oneshot::Sender<StorageUsage>),
+    CallDevices(oneshot::Sender<Result<oxidezap_ipc::CallDeviceReply, String>>),
     /// A message drawn before it was sent. On refusal it has to stop being
     /// pending, and the front end is the side that knows which bubble it is.
     Send {
@@ -372,6 +373,7 @@ impl Awaiting {
             Self::Mutation(tx) => tx.is_closed(),
             Self::Download(tx) => tx.is_closed(),
             Self::Storage(tx) => tx.is_closed(),
+            Self::CallDevices(tx) => tx.is_closed(),
             Self::Acted(tx) => tx.is_closed(),
             Self::Installed { tell, .. } => tell.is_closed(),
             Self::Removed(tx) => tx.is_closed(),
@@ -402,6 +404,9 @@ impl Awaiting {
     fn failed(self, failure: &Failure, events: Option<&ReaderSink>) {
         let detail = failure.detail.as_str();
         match self {
+            Self::CallDevices(tx) => {
+                let _ = tx.send(Err(detail.to_string()));
+            }
             Self::Mutation(tx) => {
                 let _ = tx.send(Err(failure.clone()));
             }
@@ -1702,6 +1707,18 @@ impl SessionHandle {
     ///
     /// The daemon measures, because it is the only process that owns either
     /// path. The answer arrives under this request's id.
+    pub fn call_devices(
+        &self,
+        action: oxidezap_ipc::CallDeviceAction,
+    ) -> oneshot::Receiver<Result<oxidezap_ipc::CallDeviceReply, String>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::CallDevices(action),
+            Awaiting::CallDevices(tx),
+        );
+        rx
+    }
+
     pub fn storage_usage(&self) -> oneshot::Receiver<StorageUsage> {
         let (tx, rx) = oneshot::channel();
         self.ask(ClientRequest::StorageUsage, Awaiting::Storage(tx));

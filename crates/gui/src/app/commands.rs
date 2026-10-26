@@ -282,6 +282,7 @@ impl WhatsAppApp {
         // directory reads in another process, and a pane that starts on
         // "measuring…" every time is worse than one that is already right.
         self.refresh_storage_usage(cx);
+        self.refresh_call_devices(cx);
         // And the plugin folder, for the same reason and on the same
         // terms: it is a request to the process that holds it, answered
         // whenever that process gets to it.
@@ -297,6 +298,12 @@ impl WhatsAppApp {
         else {
             return;
         };
+        self.cancel_camera_preview(cx);
+        self.settings
+            .update(cx, |settings, _| settings.devices.pending_call = None);
+        if section == SettingsSection::AudioVideo {
+            self.refresh_call_devices(cx);
+        }
         if section == SettingsSection::Storage {
             // Re-measured on arrival: a download since the pane was last
             // open has changed the number it is about to show.
@@ -313,6 +320,7 @@ impl WhatsAppApp {
     /// The draft was applied live as it was edited, so closing is not a
     /// discard — `revert_theme` is the way back.
     pub fn close_settings(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cancel_camera_preview(cx);
         let closed = self.settings.update(cx, |settings, cx| settings.close(cx));
         if closed {
             cx.notify();

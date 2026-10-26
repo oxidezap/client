@@ -3,7 +3,8 @@ use anyhow::Result;
 use oxidezap_core::{CallDevice, Ringtone};
 
 pub use imp::{
-    RingtonePlayback, enumerate_audio_devices, start_ringtone, start_ringtone_cancellable,
+    RingtonePlayback, enumerate_audio_devices, open_test_microphone, start_ringtone,
+    start_ringtone_cancellable,
 };
 
 static CALL_PREFERENCES: std::sync::RwLock<oxidezap_core::CallDevicePreferences> =
@@ -65,6 +66,12 @@ mod imp {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
+    }
+
+    pub async fn open_test_microphone() -> Result<async_channel::Receiver<Vec<i16>>> {
+        tokio::task::spawn_blocking(crate::call_device::spawn_mic)
+            .await
+            .map_err(|e| anyhow!("microphone setup failed: {e}"))?
     }
 
     pub fn enumerate_audio_devices() -> Result<(Vec<CallDevice>, Vec<CallDevice>)> {
@@ -305,6 +312,10 @@ mod imp {
 mod imp {
     use super::*;
     pub struct RingtonePlayback;
+    pub async fn open_test_microphone() -> Result<async_channel::Receiver<Vec<i16>>> {
+        anyhow::bail!("Microphone testing is unavailable from this browser connection")
+    }
+
     pub fn enumerate_audio_devices() -> Result<(Vec<CallDevice>, Vec<CallDevice>)> {
         anyhow::bail!("Device inventory is unavailable from this browser connection")
     }
@@ -340,5 +351,22 @@ mod tests {
             assert!((16000..48000).all(|i| ringtone_sample(tone, i, 16000) == 0));
         }
         assert!((0..16000).all(|i| ringtone_sample(Ringtone::Silent, i, 16000) == 0));
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn cancelled_startup_never_looks_up_an_output() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(
+            start_ringtone_cancellable(Some("invalid-id".into()), Ringtone::Classic, cancelled)
+                .is_err()
+        );
+    }
+    #[test]
+    fn silent_ringtone_does_not_need_an_audio_device() {
+        assert!(start_ringtone(Some("invalid-id".into()), Ringtone::Silent).is_ok());
     }
 }

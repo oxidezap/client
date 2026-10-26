@@ -152,6 +152,23 @@ pub(super) async fn handle_request(
         ClientRequest::VotePoll(request) => {
             acted(dispatch(hub, commands, Action::VotePoll(request)).await)
         }
+        ClientRequest::CallDevices(request) => {
+            let id = match addressed(id, "a device request needs an id") {
+                Ok(id) => id,
+                Err(answer) => return answer,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::CallDevices {
+                    id,
+                    request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
         ClientRequest::Call(action) => acted(dispatch(hub, commands, Action::Call(action)).await),
         // The bytes come back as `Downloaded` under this id, seconds later,
         // from the task the action spawns.

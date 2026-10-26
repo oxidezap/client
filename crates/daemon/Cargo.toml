@@ -21,6 +21,8 @@ async-trait = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 log = { workspace = true }
 
+oxidezap-audio = { workspace = true }
+oxidezap-video = { workspace = true }
 oxidezap-core = { workspace = true }
 oxidezap-ipc = { workspace = true, features = ["legacy-protocol"] }
 # The log level, which a front end can change while this process runs: the

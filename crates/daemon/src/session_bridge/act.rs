@@ -1751,6 +1751,14 @@ impl Bridge {
                 }
                 CommandOutcome::Accepted
             }
+            Action::CallDevices {
+                id,
+                request,
+                answer_to,
+            } => {
+                self.devices.request(id, request, answer_to);
+                CommandOutcome::Accepted
+            }
             Action::Download {
                 id,
                 request: oxidezap_ipc::Download { media },

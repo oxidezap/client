@@ -402,6 +402,10 @@ pub enum DaemonMessage {
     },
     /// What this account occupies on disk, answering
     /// [`ClientRequest::StorageUsage`].
+    CallDevices {
+        id: RequestId,
+        result: Result<CallDeviceReply, String>,
+    },
     Storage {
         id: RequestId,
         /// The shared store: the database and its journal files.
@@ -997,6 +1001,7 @@ pub enum ClientRequest {
     /// because it is one piece of state with two values.
     Typing(Typing),
     Call(CallAction),
+    CallDevices(CallDeviceAction),
     /// Fetch media the daemon has not cached yet.
     ///
     /// The one request whose answer is neither a state change nor an
@@ -1240,6 +1245,59 @@ pub type RequestId = u64;
 /// Something to do with a call. Grouped rather than flattened into
 /// [`ClientRequest`] because they share a lifecycle and a call id, and a front
 /// end handling one handles all of them.
+/// Device work belongs to the session owner, independent from call signaling.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum CallDeviceAction {
+    Preferences,
+    Inventory,
+    Save {
+        preferences: oxidezap_core::CallDevicePreferences,
+    },
+    TestMicrophone,
+    TestSpeaker,
+    TestRingtone,
+    StartPreview {
+        preview_id: oxidezap_core::CameraPreviewId,
+    },
+    PreviewFrame {
+        preview_id: oxidezap_core::CameraPreviewId,
+    },
+    CancelPreview {
+        preview_id: oxidezap_core::CameraPreviewId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum CallDeviceReply {
+    Preferences {
+        preferences: oxidezap_core::CallDevicePreferences,
+    },
+    Settings {
+        settings: oxidezap_core::CallDeviceSettings,
+    },
+    Tested {
+        detail: String,
+    },
+    Preview {
+        preview_id: oxidezap_core::CameraPreviewId,
+        mode: Option<oxidezap_core::CameraMode>,
+        frame: Option<CameraPreviewFrame>,
+    },
+    Stopped {
+        preview_id: oxidezap_core::CameraPreviewId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CameraPreviewFrame {
+    pub preview_id: oxidezap_core::CameraPreviewId,
+    #[serde(with = "oxidezap_core::base64")]
+    pub data: Vec<u8>,
+    pub keyframe: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "call", rename_all = "snake_case")]
 pub enum CallAction {
@@ -2254,5 +2312,53 @@ mod tests {
         );
         let parsed: DaemonMessage = serde_json::from_str(&line).expect("avatar failed is readable");
         assert_eq!(parsed, msg);
+    }
+}
+
+#[cfg(test)]
+mod device_contract_tests {
+    use super::*;
+    #[test]
+    fn device_and_preview_wire_frames_have_independent_identity() {
+        let preview_id = oxidezap_core::CameraPreviewId(42);
+        for action in [
+            CallDeviceAction::Inventory,
+            CallDeviceAction::Save {
+                preferences: Default::default(),
+            },
+            CallDeviceAction::TestMicrophone,
+            CallDeviceAction::TestSpeaker,
+            CallDeviceAction::TestRingtone,
+            CallDeviceAction::StartPreview { preview_id },
+            CallDeviceAction::PreviewFrame { preview_id },
+            CallDeviceAction::CancelPreview { preview_id },
+        ] {
+            let request = ClientRequest::CallDevices(action);
+            let encoded = serde_json::to_string(&request).unwrap();
+            assert!(!encoded.contains("call_id"));
+            assert_eq!(
+                serde_json::from_str::<ClientRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+        let response = DaemonMessage::CallDevices {
+            id: 7,
+            result: Ok(CallDeviceReply::Preview {
+                preview_id,
+                mode: Some(oxidezap_core::CameraMode::default()),
+                frame: Some(CameraPreviewFrame {
+                    preview_id,
+                    data: vec![0, 0, 0, 1, 0x65],
+                    keyframe: true,
+                }),
+            }),
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("AAAAAWU="));
+        assert!(!encoded.contains("call_id"));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&encoded).unwrap(),
+            response
+        );
     }
 }
