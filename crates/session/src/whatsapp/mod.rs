@@ -9,6 +9,7 @@ mod chat_names;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 pub use calls::{OutgoingAcceptCase, outgoing_accept_events};
 
+mod completion;
 /// A stored row and a composed quote, read as the other side's shape.
 mod convert;
 
@@ -1284,6 +1285,34 @@ impl WhatsAppClient {
         );
         crate::exec::breathe().await;
 
+        let (_local_over, local_stopping) = tokio::sync::watch::channel(());
+        Self::spawn_history_reloader(
+            chat_store.subscribe(),
+            chat_store.clone(),
+            &bot,
+            &ui_tx,
+            reload.clone(),
+            history_budget.clone(),
+            names.clone(),
+            local_stopping,
+        );
+
+        match chat_store.logout_message().await {
+            Ok(Some(message)) => {
+                let _ = ui_tx.send(UiEvent::LoggedOut(message));
+                shutdown.notified().await;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = ui_tx.send(UiEvent::Error(format!(
+                    "Cannot read this account's recovery state: {error}"
+                )));
+                shutdown.notified().await;
+                return;
+            }
+        }
+
         // The chat store materializes history straight off the event bus.
         // detach: the store materializes for the whole session, so the
         // subscription must outlive this scope rather than unregister on drop.
@@ -1340,6 +1369,7 @@ impl WhatsAppClient {
             let avatar_signal = resolve_avatars.clone();
             let names_signal = resolve_chat_names.clone();
             let names_on_drop = resolve_chat_names.clone();
+            let logout_store = chat_store.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
                 // The dispatch loop's own handle. The one below is moved into
@@ -1358,7 +1388,14 @@ impl WhatsAppClient {
                         let reload = reload.clone();
                         let resolve_avatars = avatar_signal.clone();
                         let resolve_chat_names = names_signal.clone();
+                        let logout_store = logout_store.clone();
                         async move {
+                            if let Event::LoggedOut(logged_out) = &*event {
+                                let message = logout_message(logged_out);
+                                if let Err(error) = logout_store.record_logout(message).await {
+                                    error!("could not persist the logged-out state: {error}");
+                                }
+                            }
                             Self::handle_event(
                                 event,
                                 client,
@@ -1469,16 +1506,6 @@ impl WhatsAppClient {
         // never observe pre-commit state (no flush barrier, no dispatch-order
         // dependency), and the debounce coalesces history-sync bursts into one
         // reload. HistoryLoaded merges, so re-sending is safe.
-        Self::spawn_history_reloader(
-            chat_store.subscribe(),
-            chat_store.clone(),
-            &bot,
-            &ui_tx,
-            reload,
-            history_budget,
-            names.clone(),
-            stopping.clone(),
-        );
 
         // The picture lifecycle, kept apart from history on purpose. It handles
         // explicit demands from the viewport, overscan, active chat header, and
@@ -1518,7 +1545,22 @@ impl WhatsAppClient {
             // left to try — and returning quietly left a window sitting on
             // "Connecting to WhatsApp" with a console that had stopped saying
             // anything at all, which reads as a hang rather than as a stop.
-            reason = bot.run() => info!("the WhatsApp session ended: {reason:?}"),
+            reason = bot.run() => {
+                info!("the WhatsApp session ended: {reason:?}");
+                // Stop the network workers before making retained history available.
+                drop(_session_over);
+                if let Some(event) = completion::completion_event(&reason) {
+                    if let UiEvent::LoggedOut(message) = &event
+                        && let Err(error) = chat_store.record_logout(message.clone()).await
+                    {
+                        error!("could not persist the logged-out state: {error}");
+                    }
+                    let _ = ui_tx.send(event);
+                }
+                client.shutdown().await;
+                // The daemon still serves local queries through the existing account.
+                shutdown.notified().await;
+            },
             _ = shutdown.notified() => {
                 // Graceful stop: flushes state and closes the transport. The
                 // dropped run future is not awaited out instead, because a

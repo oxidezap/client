@@ -38,6 +38,20 @@ impl Bridge {
     /// Folding does not touch the client, so this stays testable without a
     /// store: what it cannot do itself it returns, and the run loop performs.
     pub(super) fn observe(&mut self, mut event: UiEvent) -> Answer {
+        if self.hub.is_logged_out()
+            && matches!(
+                event,
+                UiEvent::InitComplete
+                    | UiEvent::Connected
+                    | UiEvent::PairSuccess
+                    | UiEvent::Disconnected(_)
+                    | UiEvent::Error(_)
+                    | UiEvent::QrCode { .. }
+                    | UiEvent::PairCode { .. }
+            )
+        {
+            return Answer::Nothing;
+        }
         // Before the fold below, while the hub still holds the pre-state:
         // the log records what happened, and folding first would only say
         // what remains.
@@ -153,14 +167,7 @@ impl Bridge {
                 self.hub.calls(|s| {
                     s.end_all();
                 });
-                // And everything keyed to the account leaves with it. An
-                // account reset is a departure: a snapshot taken after the
-                // next pairing would otherwise open with the old identity, the
-                // old chat list, and a stage the new account's front end reads
-                // as a call that just ended — writing the previous account's
-                // call into this one's history.
                 if matches!(event, UiEvent::LoggedOut(_)) {
-                    self.hub.forget_account();
                     self.reads().forget_all();
                 }
             }

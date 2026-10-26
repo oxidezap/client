@@ -22,6 +22,7 @@ mod message_rows;
 mod reaction;
 pub(crate) mod read_state;
 mod receipt;
+mod recovery;
 mod revoke;
 pub(crate) mod shared_history;
 mod writer;

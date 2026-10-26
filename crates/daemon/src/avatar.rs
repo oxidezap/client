@@ -156,6 +156,11 @@ pub fn resolve(
         let recorder = recorder.clone();
         async move {
             let _guard = InFlightGuard(in_flight_key);
+            if !hub.connection().is_connected() {
+                recorder.on_failed(&jid);
+                publish_failed(&hub, &jid, false);
+                return;
+            }
             let response = match fetch(&source).await {
                 Ok(response) => response,
                 Err(_) => {

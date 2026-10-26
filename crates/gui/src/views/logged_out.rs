@@ -21,7 +21,7 @@ pub fn render_logged_out_view(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
-    let pair_entity = entity;
+    let pair_entity = entity.clone();
 
     centered_view("logged-out-screen", metrics.space_xxl())
         .child(parts::hero_icon(
@@ -47,17 +47,30 @@ pub fn render_logged_out_view(
             ),
         )
         .child(
-            div().flex().items_center().gap(metrics.space_lg()).child(
-                // Outline, not filled: this is irreversible, and a filled
-                // primary would make it the obvious thing to click.
-                Button::new("logged-out-pair-again")
-                    .label("Clear data and pair again")
-                    .danger()
-                    .outline()
-                    .cursor_pointer()
-                    .on_click(move |_, window, cx| {
-                        pair_entity.update(cx, |this, cx| this.reset_and_pair_again(window, cx));
-                    }),
-            ),
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.space_lg())
+                .child(
+                    Button::new("logged-out-offline")
+                        .label("Read local history offline")
+                        .primary()
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |this, cx| this.work_offline(cx));
+                        }),
+                )
+                .child(
+                    // Outline, not filled: this is irreversible, and a filled
+                    // primary would make it the obvious thing to click.
+                    Button::new("logged-out-pair-again")
+                        .label("Clear data and pair again")
+                        .danger()
+                        .outline()
+                        .cursor_pointer()
+                        .on_click(move |_, window, cx| {
+                            pair_entity
+                                .update(cx, |this, cx| this.reset_and_pair_again(window, cx));
+                        }),
+                ),
         )
 }
