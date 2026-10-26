@@ -240,6 +240,8 @@ jobs:
       # is where the transport tests live, because they need both ends of it.
       - name: Test the platform-sensitive crates
         run: cargo test -p oxidezap-ipc -p oxidezap-daemon -p oxidezap-core -p oxidezap-video -p oxidezap-session --all-features
+      - name: Test avatar cache recovery without a display
+        run: cargo test -p oxidezap-gui --all-features session::avatar::tests
 
   # The web half, run in a browser rather than checked.
   #

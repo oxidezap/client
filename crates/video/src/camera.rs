@@ -1193,6 +1193,41 @@ mod negotiation_tests {
     }
 
     #[test]
+    fn a_canceled_background_open_drops_its_late_stream_and_releases_capture() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let release_open = Arc::new(std::sync::Barrier::new(2));
+        let gate = release_open.clone();
+        let (released_tx, released) = std::sync::mpsc::sync_channel(1);
+        let opening = runtime.spawn_blocking(move || {
+            gate.wait();
+            let (tx, frames) = async_channel::bounded(QUEUE_DEPTH);
+            let control = CameraControl::default();
+            let running = control.clone();
+            let thread = std::thread::spawn(move || {
+                while !running.0.stop.load(Ordering::Relaxed) && !tx.is_closed() {
+                    std::thread::yield_now();
+                }
+                released_tx.send(()).unwrap();
+            });
+            CameraStream {
+                frames,
+                control,
+                thread: Some(thread),
+                quality: VideoQuality::default(),
+            }
+        });
+        // The async caller canceled while the blocking camera open was still
+        // pending. Tokio must drop its eventual output, invoking stream teardown.
+        drop(opening);
+        release_open.wait();
+        released
+            .recv_timeout(Duration::from_secs(5))
+            .expect("late capture must close");
+    }
+
+    #[test]
     fn raw_only_camera_negotiates_without_mjpeg_and_reports_effective_mode() {
         for input in [FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::GRAY] {
             let state = Rc::new(RefCell::new(State::default()));
