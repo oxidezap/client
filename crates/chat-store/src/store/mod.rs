@@ -1208,14 +1208,10 @@ mod migration_tests {
         use diesel::sqlite::Sqlite;
         let migrations: Vec<Box<dyn Migration<Sqlite>>> =
             MIGRATIONS.migrations().map_err(StoreError::Migration)?;
+        // Diesel strips the directory date's hyphens in the shared ledger.
         let target = migrations
             .iter()
-            .find(|migration| {
-                migration
-                    .name()
-                    .to_string()
-                    .ends_with("_account_retirement")
-            })
+            .find(|migration| migration.name().version().to_string() == "20261026000001")
             .expect("the account retirement migration is embedded")
             .name()
             .version()
