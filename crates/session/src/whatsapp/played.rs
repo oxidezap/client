@@ -134,7 +134,7 @@ where
         return Ok(());
     };
     if store
-        .audio_played_receipt_sent(message.seq)
+        .audio_played_receipt_sent(message)
         .await
         .map_err(|e| e.to_string())?
     {
@@ -232,7 +232,7 @@ mod tests {
         )
         .await;
         assert!(failed.is_err());
-        assert!(!store.audio_played_receipt_sent(message.seq).await.unwrap());
+        assert!(!store.audio_played_receipt_sent(&message).await.unwrap());
         for _ in 0..3 {
             observe_playback(
                 &store,
@@ -267,7 +267,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!store.audio_played_receipt_sent(message.seq).await.unwrap());
+        assert!(!store.audio_played_receipt_sent(&message).await.unwrap());
         assert_eq!(
             store
                 .message(&message.chat_jid, &message.id)

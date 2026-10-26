@@ -182,7 +182,6 @@ pub(crate) enum WriterMsg {
         msg_id: String,
     },
     AudioPlayed {
-        row_id: i64,
         chat: String,
         message_id: String,
         sender: String,
@@ -774,7 +773,7 @@ impl ChatStore {
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
-    /// Record local playback separately from successful receipt transmission.
+    /// Record local playback separately from receipt transport submission.
     /// Use `flush` before treating either write as durable.
     pub fn record_audio_played(
         &self,
@@ -783,7 +782,6 @@ impl ChatStore {
     ) -> Result<()> {
         self.tx
             .send(WriterMsg::AudioPlayed {
-                row_id: message.seq,
                 chat: message.chat_jid.to_non_ad_string(),
                 message_id: message.id.clone(),
                 sender: message.sender_jid.to_non_ad_string(),

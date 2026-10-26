@@ -1007,14 +1007,14 @@ async fn local_audio_playback_and_transport_submission_have_separate_durable_sta
             .status,
         MessageStatus::Played
     );
-    assert!(!store.audio_played_receipt_sent(row.seq).await.unwrap());
+    assert!(!store.audio_played_receipt_sent(&row).await.unwrap());
     store.record_audio_played(&row, true).unwrap();
     store.record_audio_played(&row, false).unwrap();
     store.flush().await.unwrap();
-    assert!(store.audio_played_receipt_sent(row.seq).await.unwrap());
+    assert!(store.audio_played_receipt_sent(&row).await.unwrap());
     // Reopen the projection over the same synthetic database.
     let reopened = ChatStore::new(&_db).await.unwrap();
-    assert!(reopened.audio_played_receipt_sent(row.seq).await.unwrap());
+    assert!(reopened.audio_played_receipt_sent(&row).await.unwrap());
     assert_eq!(
         reopened
             .message(&jid(PEER), "LOCAL-PLAY")
@@ -1049,10 +1049,10 @@ async fn audio_playback_writes_cannot_cross_accounts_or_mark_own_audio() {
     stale_identity.id = "REPLACED-ROW".into();
     store.record_audio_played(&stale_identity, true).unwrap();
     store.flush().await.unwrap();
-    assert!(!store.audio_played_receipt_sent(incoming.seq).await.unwrap());
+    assert!(!store.audio_played_receipt_sent(&incoming).await.unwrap());
     other.record_audio_played(&incoming, true).unwrap();
     other.flush().await.unwrap();
-    assert!(!other.audio_played_receipt_sent(incoming.seq).await.unwrap());
+    assert!(!other.audio_played_receipt_sent(&incoming).await.unwrap());
     assert_ne!(
         store
             .message(&jid(PEER), "ISOLATED")
@@ -1064,7 +1064,7 @@ async fn audio_playback_writes_cannot_cross_accounts_or_mark_own_audio() {
     );
     store.record_audio_played(&incoming, true).unwrap();
     store.flush().await.unwrap();
-    assert!(!other.audio_played_receipt_sent(incoming.seq).await.unwrap());
+    assert!(!other.audio_played_receipt_sent(&incoming).await.unwrap());
     store
         .record_outgoing(
             &jid(PEER),
@@ -1081,7 +1081,7 @@ async fn audio_playback_writes_cannot_cross_accounts_or_mark_own_audio() {
         .unwrap();
     store.record_audio_played(&own, true).unwrap();
     store.flush().await.unwrap();
-    assert!(!store.audio_played_receipt_sent(own.seq).await.unwrap());
+    assert!(!store.audio_played_receipt_sent(&own).await.unwrap());
     assert_ne!(
         store
             .own_message(&jid(PEER), "OWN-AUDIO")
@@ -1121,4 +1121,52 @@ async fn linked_play_refuses_an_ambiguous_group_id() {
     let rows = store.messages(&jid(GROUP), None, 10).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row.status != MessageStatus::Played));
+}
+
+#[tokio::test]
+async fn played_submission_survives_pn_lid_duplicate_row_fusion() {
+    let (db, store) = test_store().await;
+    feed(
+        &store,
+        [
+            message_event(
+                wa::Message::text("synthetic pn"),
+                incoming_info(PEER, PEER, "MERGED-PLAY", 100),
+            ),
+            message_event(
+                wa::Message::text("synthetic lid"),
+                incoming_info(PEER_LID, PEER_LID, "MERGED-PLAY", 100),
+            ),
+        ],
+    )
+    .await;
+    let pn = store
+        .message(&jid(PEER), "MERGED-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    let lid = store
+        .message(&jid(PEER_LID), "MERGED-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(pn.seq, lid.seq);
+    store.record_audio_played(&lid, true).unwrap();
+    store.flush().await.unwrap();
+    add_lid_mapping(&db).await;
+    store.reconcile_chat(&jid(PEER)).unwrap();
+    store.flush().await.unwrap();
+    let merged = store
+        .message(&jid(PEER), "MERGED-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.status, MessageStatus::Played);
+    assert!(store.audio_played_receipt_sent(&merged).await.unwrap());
+    assert!(store.audio_played_receipt_sent(&pn).await.unwrap());
+    assert!(store.audio_played_receipt_sent(&lid).await.unwrap());
+    // An observation captured before fusion still targets the proven message.
+    store.record_audio_played(&lid, true).unwrap();
+    store.flush().await.unwrap();
+    assert!(store.audio_played_receipt_sent(&merged).await.unwrap());
 }

@@ -1649,8 +1649,14 @@ impl ChatStore {
 
     /// Whether this account already submitted the played receipt or learned it
     /// from a linked device. Local-only playback does not set this bit.
-    pub async fn audio_played_receipt_sent(&self, row_id: i64) -> Result<bool> {
+    pub async fn audio_played_receipt_sent(&self, message: &StoredMessage) -> Result<bool> {
+        if message.from_me {
+            return Ok(false);
+        }
         let device_id = self.device_id();
+        let chat = message.chat_jid.to_non_ad_string();
+        let sender = message.sender_jid.to_non_ad_string();
+        let id = message.id.clone();
         self.db()
             .read(move |conn| {
                 #[derive(diesel::QueryableByName)]
@@ -1658,15 +1664,28 @@ impl ChatStore {
                     #[diesel(sql_type = diesel::sql_types::BigInt)]
                     count: i64,
                 }
-                diesel::sql_query(
-                    "SELECT count(*) AS count FROM audio_played_receipts \
-                     WHERE device_id = ? AND message_row_id = ?",
-                )
-                .bind::<diesel::sql_types::Integer, _>(device_id)
-                .bind::<diesel::sql_types::BigInt, _>(row_id)
-                .get_result::<Count>(conn)
-                .map(|row| row.count > 0)
-                .map_err(db_err)
+                let aliases =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                for chat in aliases {
+                    let rows = crate::store::message_identity::matching_rows(
+                        conn, device_id, &chat, &id, false, &sender,
+                    )
+                    .map_err(db_err)?;
+                    for row in rows {
+                        let count = diesel::sql_query(
+                            "SELECT count(*) AS count FROM audio_played_receipts \
+                             WHERE device_id = ? AND message_row_id = ?",
+                        )
+                        .bind::<diesel::sql_types::Integer, _>(device_id)
+                        .bind::<diesel::sql_types::BigInt, _>(row.id)
+                        .get_result::<Count>(conn)
+                        .map_err(db_err)?;
+                        if count.count > 0 {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
             })
             .await
             .map_err(Into::into)
