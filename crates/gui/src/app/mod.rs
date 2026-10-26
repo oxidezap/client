@@ -2865,7 +2865,7 @@ impl WhatsAppApp {
             // not to the next list reusing the window selection layer.
             clear_window_message_selection(window, cx);
         }
-        self.stop_current_media();
+        self.stop_user_media();
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on
         // the newly selected chat instead.

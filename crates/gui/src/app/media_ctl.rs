@@ -236,7 +236,13 @@ impl WhatsAppApp {
             self.sweep_retained_media_keeping(Some(message_id), cx);
         }
     }
-    /// Stop any currently playing media. Does NOT call cx.notify().
+    /// Preserve a successful short play before a user switch clears its evidence.
+    pub(super) fn stop_user_media(&mut self) {
+        self.observe_audio_playback();
+        self.stop_current_media();
+    }
+
+    /// Discard playback during teardown or failed preparation, without notifying the UI.
     pub(super) fn stop_current_media(&mut self) {
         self.audio_player.stop();
         // A stopped tick may still be between its sleep and `entity.update`.
@@ -277,7 +283,7 @@ impl WhatsAppApp {
     /// must not start sound behind the chat list, Settings, or Status.
     pub(super) fn cancel_hidden_media_autoplay(&mut self) {
         if self.audio_preparation.is_some() {
-            self.stop_current_media();
+            self.stop_user_media();
         } else {
             self.pending_media_request = None;
         }
@@ -529,7 +535,7 @@ impl WhatsAppApp {
         was_playing: bool,
         cx: &mut Context<Self>,
     ) {
-        self.stop_current_media();
+        self.stop_user_media();
         self.pending_media_request = Some(message_id.clone());
         self.audio_player.set_speed(self.playback_speed);
         // On the web this must happen synchronously while the click still has
@@ -754,7 +760,7 @@ impl WhatsAppApp {
 
         // Stop any current playback, video included: a playing video must not
         // keep running underneath the download.
-        self.stop_current_media();
+        self.stop_user_media();
         self.pending_media_request = Some(message_id.clone());
 
         let msg_id = message_id.clone();
@@ -1327,7 +1333,7 @@ impl WhatsAppApp {
                 // this video's own paused audio and it would come back mute.
                 let owns_audio = self.audio.message_id() == Some(message_id.as_str());
                 if !self.active_media.is_playing(&message_id) && !owns_audio {
-                    self.stop_current_media();
+                    self.stop_user_media();
                 }
                 self.pending_media_request = Some(message_id.clone());
 
@@ -1438,7 +1444,7 @@ impl WhatsAppApp {
         let playing = self.playing_video_id().map(str::to_string);
 
         // Stop any currently playing media (mutual exclusion)
-        self.stop_current_media();
+        self.stop_user_media();
         self.pending_media_request = Some(message_id.clone());
 
         // Evict old video players if the cache is full, sparing the one that

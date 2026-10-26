@@ -101,7 +101,7 @@ impl WhatsAppApp {
         self.viewer.update(cx, |state, cx| state.open(viewer, cx));
         // A photo and a voice note both want the speakers; opening one stops
         // the other rather than talking over it.
-        self.stop_current_media();
+        self.stop_user_media();
         // The arrow keys follow in `sync_overlay_focus`, on this same frame —
         // and, unlike focusing here, they are handed back when the viewer
         // goes away, however it goes away.
