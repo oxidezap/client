@@ -280,7 +280,6 @@ impl WhatsAppApp {
         // directory reads in another process, and a pane that starts on
         // "measuring…" every time is worse than one that is already right.
         self.refresh_storage_usage(cx);
-        self.refresh_call_devices(cx);
         // And the plugin folder, for the same reason and on the same
         // terms: it is a request to the process that holds it, answered
         // whenever that process gets to it.

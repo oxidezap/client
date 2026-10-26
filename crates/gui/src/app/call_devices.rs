@@ -23,6 +23,7 @@ pub(super) struct DeviceUi {
     pub busy: bool,
     pub preferences_ready: bool,
     pub pending_call: Option<(String, bool)>,
+    pub preview_after_inventory: bool,
     approved_call: Option<(String, bool)>,
     pub preview: Option<CameraPreviewId>,
     stopping: Option<CameraPreviewId>,
@@ -30,9 +31,26 @@ pub(super) struct DeviceUi {
     pub image: Option<Arc<RenderImage>>,
     admission: PreviewAdmission,
     request: usize,
+    refresh_after_request: bool,
 }
 
 impl DeviceUi {
+    fn may_save(&self) -> bool {
+        self.preferences_ready && !self.busy
+    }
+    fn begin_request(&mut self, refresh: bool) -> Option<usize> {
+        if self.busy {
+            self.refresh_after_request |= refresh;
+            return None;
+        }
+        self.request = self.request.wrapping_add(1);
+        self.busy = true;
+        Some(self.request)
+    }
+    fn finish_request(&mut self, succeeded: bool) -> bool {
+        self.busy = false;
+        std::mem::take(&mut self.refresh_after_request) && succeeded
+    }
     fn finish_preview(&mut self, id: CameraPreviewId, stopped: bool, failure: Option<String>) {
         if !self.admission.accepts(id) {
             return;
@@ -109,12 +127,10 @@ impl WhatsAppApp {
         state.section = super::settings::SettingsSection::AudioVideo;
         self.settings.update(cx, |settings, cx| {
             settings.devices.pending_call = Some((recipient_jid, is_video));
+            settings.devices.preview_after_inventory = is_video;
             settings.show(state, cx);
         });
         self.refresh_call_devices(cx);
-        if is_video {
-            self.start_camera_preview(cx);
-        }
         cx.notify();
     }
 
@@ -158,6 +174,9 @@ impl WhatsAppApp {
         self.device_request(Action::Preferences, cx);
     }
     pub fn refresh_call_devices(&mut self, cx: &mut Context<Self>) {
+        if self.camera_preview_active(cx) {
+            return;
+        }
         self.device_request(Action::Inventory, cx);
     }
     pub fn save_call_devices(
@@ -165,6 +184,16 @@ impl WhatsAppApp {
         preferences: CallDevicePreferences,
         cx: &mut Context<Self>,
     ) {
+        if !self.settings.read(cx).devices.may_save() {
+            self.settings.update(cx, |s, cx| {
+                if !s.devices.preferences_ready {
+                    s.devices.status =
+                        "Refresh saved device settings before making changes.".into();
+                }
+                cx.notify();
+            });
+            return;
+        }
         self.cancel_camera_preview(cx);
         self.device_request(Action::Save { preferences }, cx);
     }
@@ -186,23 +215,36 @@ impl WhatsAppApp {
             });
             return;
         };
-        let waiting = client.call_devices(action);
+        let is_save = matches!(&action, Action::Save { .. });
+        let is_refresh = matches!(&action, Action::Inventory | Action::Preferences);
         let settings = self.settings.clone();
         let epoch = settings.read(cx).epoch();
         let request = settings.update(cx, |s, cx| {
-            s.devices.request = s.devices.request.wrapping_add(1);
-            s.devices.busy = true;
+            let request = s.devices.begin_request(is_refresh)?;
             s.devices.status = "Working…".into();
             cx.notify();
-            s.devices.request
+            Some(request)
         });
-        cx.spawn(async move |_, cx| {
+        let Some(request) = request else {
+            return;
+        };
+        let waiting = client.call_devices(action);
+        cx.spawn(async move |entity, cx| {
             let answer = crate::platform::with_timeout(waiting, Duration::from_secs(15)).await;
-            settings.update(cx, |s, cx| {
+            let (refresh, preview) = settings.update(cx, |s, cx| {
                 if s.epoch() != epoch || s.devices.request != request {
-                    return;
+                    return (false, false);
                 }
-                s.devices.busy = false;
+                let succeeded = matches!(
+                    &answer,
+                    Some(Ok(Ok(Reply::Preferences { .. }
+                        | Reply::Settings { .. }
+                        | Reply::Tested { .. })))
+                );
+                if is_save && !succeeded {
+                    s.devices.preferences_ready = false;
+                }
+                let inventory_finished = matches!(&answer, Some(Ok(Ok(Reply::Settings { .. }))));
                 match answer {
                     Some(Ok(Ok(Reply::Preferences { preferences }))) => {
                         s.call_devices = preferences;
@@ -222,8 +264,21 @@ impl WhatsAppApp {
                             "Device request did not finish. Refresh devices and try again.".into()
                     }
                 }
+                let preview = inventory_finished
+                    && std::mem::take(&mut s.devices.preview_after_inventory)
+                    && s.is_open()
+                    && s.devices
+                        .pending_call
+                        .as_ref()
+                        .is_some_and(|(_, video)| *video);
                 cx.notify();
+                (s.devices.finish_request(succeeded), preview)
             });
+            if preview {
+                let _ = entity.update(cx, |app, cx| app.start_camera_preview(cx));
+            } else if refresh {
+                let _ = entity.update(cx, |app, cx| app.refresh_call_devices(cx));
+            }
         })
         .detach();
     }
@@ -366,6 +421,31 @@ impl WhatsAppApp {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+    #[test]
+    fn unloaded_preferences_cannot_be_saved() {
+        let mut ui = DeviceUi::default();
+        assert!(!ui.may_save());
+        ui.preferences_ready = true;
+        assert!(ui.may_save());
+        ui.busy = true;
+        assert!(!ui.may_save());
+    }
+    #[test]
+    fn refresh_waits_for_the_save_reply_and_does_not_hide_failure() {
+        let mut ui = DeviceUi::default();
+        let save_request = ui.begin_request(false).unwrap();
+        assert!(ui.begin_request(true).is_none());
+        assert_eq!(ui.request, save_request);
+        assert!(ui.busy);
+        assert!(
+            !ui.finish_request(false),
+            "failure must remain visible instead of starting refresh"
+        );
+        assert!(!ui.busy);
+        ui.begin_request(false).unwrap();
+        assert!(ui.begin_request(true).is_none());
+        assert!(ui.finish_request(true), "a successful save can now refresh");
+    }
     #[test]
     fn failed_cleanup_retains_stopping_ownership_and_retry() {
         let mut ui = DeviceUi::default();

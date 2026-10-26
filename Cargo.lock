@@ -6490,6 +6490,7 @@ dependencies = [
  "oxidezap-ipc",
  "oxidezap-logging",
  "oxidezap-platform",
+ "oxidezap-video",
  "portable-atomic",
  "qrcode",
  "rust-embed",

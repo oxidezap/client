@@ -126,7 +126,7 @@ pub(super) async fn load_preferences() {
 fn preferences_readable() -> Result<(), String> {
     if let Some(error) = &*PREFERENCE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) {
         Err(format!(
-            "Could not load saved call devices: {error}. Save a selection to replace it."
+            "Could not load saved call devices: {error}. Fix the saved configuration and refresh devices."
         ))
     } else {
         Ok(())
