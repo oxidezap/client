@@ -1115,6 +1115,11 @@ impl WhatsAppApp {
             false
         };
 
+        if is_video && !self.take_call_setup_approval(&recipient_jid, is_video, cx) {
+            self.prepare_call(recipient_jid, is_video, cx);
+            return;
+        }
+
         let recipient_name = self
             .find_chat(&recipient_jid)
             .map(|chat| chat.name.clone())
