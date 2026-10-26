@@ -632,6 +632,23 @@ impl WhatsAppApp {
             return;
         }
 
+        if self
+            .calls
+            .read(cx)
+            .state()
+            .incoming()
+            .is_some_and(|call| call.is_video)
+            && self.camera_preview_active(cx)
+        {
+            self.cancel_camera_preview(cx);
+            self.notify_user(
+                "Camera preview is still stopping. Answer again when it closes.",
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+            return;
+        }
+
         let Some(call) = self.calls.update(cx, |calls, _| calls.take_incoming()) else {
             return;
         };
@@ -964,6 +981,9 @@ impl WhatsAppApp {
     pub(super) fn adopt_calls(&mut self, mut calls: CallState, cx: &mut Context<Self>) {
         if self.is_offline() {
             calls.end_all();
+        }
+        if calls.is_busy() && self.camera_preview_active(cx) {
+            self.cancel_camera_preview(cx);
         }
         // Named here rather than inside the entity, because a caller's name
         // comes from this window's chat list.
