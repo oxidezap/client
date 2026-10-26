@@ -15,9 +15,8 @@ use gpui::{Pixels, Point, Size, px};
 /// One window's presentation of whatever call is up.
 #[derive(Debug, Clone, Default)]
 pub struct CallCard {
-    /// Collapsed to a pill. Survives the call it was set during: a user who
-    /// minimises every call means it.
-    minimized: bool,
+    /// Window-local presentation, reset when the call ends.
+    presentation: Presentation,
     /// Where the card was dragged to, as an offset from its default corner.
     /// Kept across calls for the same reason.
     offset: Point<Pixels>,
@@ -40,9 +39,30 @@ pub struct CallCard {
     measured: Rc<Cell<Size<Pixels>>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Presentation {
+    #[default]
+    Floating,
+    Minimized,
+    Maximized,
+}
+
 impl CallCard {
     pub fn is_minimized(&self) -> bool {
-        self.minimized
+        self.presentation == Presentation::Minimized
+    }
+
+    pub fn is_maximized(&self) -> bool {
+        self.presentation == Presentation::Maximized
+    }
+
+    pub fn toggle_maximized(&mut self) {
+        self.presentation = if self.is_maximized() {
+            Presentation::Floating
+        } else {
+            Presentation::Maximized
+        };
+        self.end_drag();
     }
 
     /// Where the card has been dragged to.
@@ -58,7 +78,12 @@ impl CallCard {
     }
 
     pub fn set_minimized(&mut self, minimized: bool) {
-        self.minimized = minimized;
+        self.presentation = if minimized {
+            Presentation::Minimized
+        } else {
+            Presentation::Floating
+        };
+        self.end_drag();
     }
 
     /// The call went away.
@@ -67,7 +92,7 @@ impl CallCard {
     /// swallow the next one's ring; the dragged position is deliberate and
     /// stays.
     pub fn call_ended(&mut self) {
-        self.minimized = false;
+        self.presentation = Presentation::Floating;
         self.drag_anchor = None;
     }
 
@@ -78,7 +103,9 @@ impl CallCard {
 
     /// The pointer went down on the drag handle.
     pub fn begin_drag(&mut self, at: Point<Pixels>) {
-        self.drag_anchor = Some(at);
+        if !self.is_maximized() {
+            self.drag_anchor = Some(at);
+        }
     }
 
     /// The pointer moved while dragging. Returns whether the card moved.
@@ -161,6 +188,33 @@ impl CallCard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maximizing_restores_the_dragged_position_and_never_reopens_collapsed() {
+        let mut card = measured_card();
+        card.drag_by(Point {
+            x: px(-40.0),
+            y: px(60.0),
+        });
+        let offset = card.offset();
+        card.begin_drag(Point::default());
+        card.toggle_maximized();
+        assert!(card.is_maximized());
+        assert!(!card.is_dragging());
+        card.begin_drag(Point::default());
+        assert!(!card.is_dragging());
+        card.toggle_maximized();
+        assert_eq!(card.offset(), offset);
+        card.toggle_maximized();
+        card.set_minimized(true);
+        assert!(!card.is_maximized());
+        card.set_minimized(false);
+        assert!(!card.is_maximized());
+        card.toggle_maximized();
+        card.call_ended();
+        assert!(!card.is_maximized());
+        assert_eq!(card.offset(), offset);
+    }
 
     #[test]
     fn a_minimised_card_reopens_for_the_next_call() {

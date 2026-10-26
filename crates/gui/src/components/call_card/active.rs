@@ -11,7 +11,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
+use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::parts;
@@ -19,19 +19,22 @@ use crate::components::{Avatar, ProductIcon};
 use crate::theme::Metrics;
 use oxidezap_core::ActiveCall;
 
-/// The card header shown while a call is live: a dot, a label, and the two
-/// window controls.
+/// The header and window controls for a live call.
 pub fn live_header(
     label: String,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    maximized: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let minimize_entity = entity.clone();
+    let maximize_entity = entity.clone();
     let end_entity = entity;
 
     div()
         .flex()
+        .debug_selector(|| "call-live-header".into())
+        .flex_shrink_0()
         .items_center()
         .justify_between()
         .px(metrics.space_xl())
@@ -41,6 +44,8 @@ pub fn live_header(
         .child(
             div()
                 .flex()
+                .min_w_0()
+                .flex_1()
                 .items_center()
                 .gap(metrics.space_md())
                 .font_family(cx.theme().mono_font_family.clone())
@@ -52,12 +57,32 @@ pub fn live_header(
                         .rounded_full()
                         .bg(cx.theme().primary),
                 )
-                .child(label),
+                .child(parts::one_line().child(label)),
         )
         .child(
             div()
                 .flex()
                 .gap(metrics.space_xxs())
+                .flex_shrink_0()
+                .child(
+                    Button::new("call-maximize")
+                        .icon(if maximized {
+                            IconName::Minimize
+                        } else {
+                            IconName::Maximize
+                        })
+                        .ghost()
+                        .xsmall()
+                        .tooltip(if maximized {
+                            "Restore call view"
+                        } else {
+                            "Maximize call view"
+                        })
+                        .cursor_pointer()
+                        .on_click(move |_, _window, cx| {
+                            maximize_entity.update(cx, |app, cx| app.toggle_call_maximized(cx));
+                        }),
+                )
                 .child(
                     Button::new("call-minimize")
                         .icon(ProductIcon::MinimizeCard)
@@ -89,6 +114,7 @@ pub fn active_audio(
     metrics: Metrics,
     asked_for_video: bool,
     camera_coming_on: bool,
+    maximized: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     div()
@@ -98,6 +124,7 @@ pub fn active_audio(
             "on call".to_string(),
             entity.clone(),
             metrics,
+            maximized,
             cx,
         ))
         .child(

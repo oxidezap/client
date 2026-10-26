@@ -38,7 +38,7 @@ pub mod keyboard;
 pub mod launch;
 pub mod lifecycle;
 pub mod log_store;
-mod notifications;
+pub(crate) mod notifications;
 pub mod picker;
 pub mod plugins;
 pub mod prefs;
