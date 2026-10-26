@@ -144,6 +144,21 @@ impl RuntimeLifecycle {
             .disposition
     }
 
+    /// Reserve a quiesced old runtime before persisting a retirement intent.
+    /// An intermediate successor may itself have a pending predecessor.
+    pub(crate) fn start_retirement(&self) -> bool {
+        let mut state = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_quiesced() || state.disposition.is_some() || state.pins != 0 {
+            return false;
+        }
+        state.disposition = Some(AccountDisposition::Remove);
+        self.mark_stopping();
+        true
+    }
+
     pub(crate) fn pin(&self) -> Option<LifecyclePin> {
         let mut state = self
             .disposition

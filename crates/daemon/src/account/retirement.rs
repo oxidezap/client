@@ -3,7 +3,10 @@ use oxidezap_session::{StoredAccount, same_account_identity};
 
 impl AccountRegistry {
     pub fn has_retirement(&self, id: AccountId) -> bool {
-        self.retirements.borrow().iter().any(|(old, _)| *old == id)
+        self.retired_ids
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&id)
     }
 
     pub fn retirement_target(&self, id: AccountId) -> Option<AccountId> {
@@ -27,6 +30,21 @@ impl AccountRegistry {
     }
 
     pub async fn restore_retirements(&self, stores: &StoreRegistry) -> Result<()> {
+        self.restore_retirements_with(stores, |target| async move {
+            Ok(stores.durable_pairing(target).await?)
+        })
+        .await
+    }
+
+    async fn restore_retirements_with<F, Fut>(
+        &self,
+        stores: &StoreRegistry,
+        pairing: F,
+    ) -> Result<()>
+    where
+        F: Fn(AccountId) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<StoredAccount>>>,
+    {
         let records = stores.retirements().await?;
         let all: Vec<_> = records
             .iter()
@@ -37,6 +55,7 @@ impl AccountRegistry {
                 ))
             })
             .collect();
+        let retired_ids = all.iter().map(|(old, _)| *old).collect();
         let mut redirects = Vec::new();
         let mut proofs = HashMap::new();
         let mut pending = std::collections::HashSet::new();
@@ -45,7 +64,11 @@ impl AccountRegistry {
             let Some(target) = final_target(old, &all) else {
                 continue;
             };
-            let Ok(Some(stored)) = stores.durable_pairing(target).await else {
+            if !record.complete {
+                pending.insert(target);
+            }
+            // A failed read must leave the previous protection snapshot intact.
+            let Some(stored) = pairing(target).await? else {
                 continue;
             };
             let proof = StoredAccount {
@@ -60,10 +83,11 @@ impl AccountRegistry {
             }
             redirects.push((old, target));
             proofs.insert(old, proof);
-            if !record.complete {
-                pending.insert(target);
-            }
         }
+        *self
+            .retired_ids
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = retired_ids;
         *self
             .retirement_proofs
             .write()
@@ -186,13 +210,29 @@ impl AccountRegistry {
             if !live_identity_matches(&successor, &new) || !same_account_identity(old, &new) {
                 continue;
             }
-            if stores.begin_retirement(old, &new).await? {
-                self.restore_retirements(stores).await?;
-                let outcome = runtime
-                    .lifecycle()
-                    .set_disposition(AccountDisposition::Remove);
-                if outcome == session_bridge::DispositionOutcome::Conflict {
-                    continue;
+            let old_lifecycle = runtime.lifecycle();
+            if !old_lifecycle.start_retirement() {
+                continue;
+            }
+            match stores.begin_retirement(old, &new).await {
+                Ok(true) => {
+                    // Protect both sides immediately after commit, including
+                    // when refreshing the full journal encounters a read error.
+                    self.retired_ids
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(old.id);
+                    self.retirement_pending
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(next);
+                    lifecycle.reserve_retirement_successor(true);
+                    self.restore_retirements(stores).await?;
+                }
+                Ok(false) => old_lifecycle.retry_failed_disposition(AccountDisposition::Remove),
+                Err(error) => {
+                    old_lifecycle.retry_failed_disposition(AccountDisposition::Remove);
+                    return Err(error.into());
                 }
             }
         }
@@ -865,9 +905,58 @@ mod tests {
             });
         assert_eq!(f.registry.retirement_target(f.old), None);
         f.registry.restore_retirements(&f.stores).await.unwrap();
-        assert!(!f.registry.has_retirement(f.old));
+        assert!(f.registry.has_retirement(f.old));
         assert!(f.stores.durable_pairing(f.new).await.unwrap().is_some());
         assert_eq!(f.stores.accounts().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unreadable_or_incomplete_successors_keep_retirement_protections() {
+        let f = Fixture::new(
+            "protection-read-error",
+            "100001:9@s.whatsapp.net",
+            Some("200001:9@lid"),
+        )
+        .await;
+        let accounts = f.stores.accounts().await.unwrap();
+        assert!(
+            f.stores
+                .begin_retirement(&accounts[0], &accounts[1])
+                .await
+                .unwrap()
+        );
+        f.registry.restore_retirements(&f.stores).await.unwrap();
+        let result = f
+            .registry
+            .restore_retirements_with(&f.stores, |_| async {
+                anyhow::bail!("synthetic storage read failure")
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(f.registry.has_retirement(f.old));
+        assert_eq!(f.registry.retirement_target(f.old), Some(f.new));
+        assert!(f.registry.get(f.new).unwrap().lifecycle().pin().is_some());
+        f.registry
+            .restore_retirements_with(&f.stores, |_| async { Ok(None) })
+            .await
+            .unwrap();
+        assert!(f.registry.has_retirement(f.old));
+        assert_eq!(f.registry.retirement_target(f.old), None);
+        assert!(
+            f.registry
+                .retirement_pending
+                .read()
+                .unwrap()
+                .contains(&f.new)
+        );
+        assert_eq!(
+            f.registry
+                .get(f.new)
+                .unwrap()
+                .lifecycle()
+                .set_disposition(AccountDisposition::Remove),
+            session_bridge::DispositionOutcome::Conflict
+        );
     }
 
     #[tokio::test]

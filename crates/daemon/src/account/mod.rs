@@ -197,6 +197,7 @@ pub struct AccountRegistry {
     overview: watch::Sender<Arc<AccountsSnapshot>>,
     retirements: watch::Sender<Vec<(AccountId, AccountId)>>,
     retirement_proofs: RwLock<HashMap<AccountId, oxidezap_session::StoredAccount>>,
+    retired_ids: RwLock<std::collections::HashSet<AccountId>>,
     retirement_pending: RwLock<std::collections::HashSet<AccountId>>,
     retirement_ready: RwLock<std::collections::HashSet<AccountId>>,
     /// The supervisor spawning and respawning runtimes into this registry,
@@ -229,6 +230,7 @@ impl AccountRegistry {
             overview,
             retirements: watch::channel(Vec::new()).0,
             retirement_proofs: RwLock::new(HashMap::new()),
+            retired_ids: RwLock::new(std::collections::HashSet::new()),
             retirement_pending: RwLock::new(std::collections::HashSet::new()),
             retirement_ready: RwLock::new(std::collections::HashSet::new()),
             #[cfg(not(target_family = "wasm"))]
@@ -635,6 +637,7 @@ pub struct AccountSupervisor {
     /// and cannot interleave with the reaper's own view of which accounts are
     /// live — see [`SupervisorCommand`].
     commands: mpsc::UnboundedSender<SupervisorCommand>,
+    active_runs: watch::Sender<std::collections::HashSet<AccountId>>,
     /// Set once by [`Self::join_all`], read by [`Self::handle_exit`] (a
     /// completed reset must not respawn into a daemon that is leaving) and by
     /// [`Self::create_and_spawn`] (refuse a `CreateAccount` that arrives
@@ -734,6 +737,7 @@ impl RestartPolicy {
 /// session that eventually dropped from a login that never got off the ground.
 #[cfg(not(target_family = "wasm"))]
 struct AccountRun {
+    terminal_cleanup: bool,
     id: AccountId,
     exit: session_bridge::AccountExit,
     ran_for: std::time::Duration,
@@ -820,6 +824,7 @@ impl AccountSupervisor {
             restart,
             command_capacity,
             commands,
+            active_runs: watch::channel(std::collections::HashSet::new()).0,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             failures: FailureCounts::default(),
@@ -1070,7 +1075,18 @@ impl AccountSupervisor {
     /// fix for this type's old deadlock.
     async fn handle_exit(self: &Arc<Self>, run: AccountRun) {
         use session_bridge::AccountExit;
-        let AccountRun { id, exit, ran_for } = run;
+        let AccountRun {
+            id,
+            exit,
+            ran_for,
+            terminal_cleanup,
+        } = run;
+        if terminal_cleanup {
+            return;
+        }
+        self.active_runs.send_modify(|active| {
+            active.remove(&id);
+        });
         // A session that ran long enough was healthy, whatever ended it: the
         // next failure starts the backoff over rather than continuing a run of
         // attempts that may be minutes old.
@@ -1127,7 +1143,17 @@ impl AccountSupervisor {
                 );
                 self.registry.set_status(id, AccountStatus::Error);
             }
-            AccountExit::SessionEnded => self.recover(id),
+            AccountExit::SessionEnded => {
+                if self
+                    .registry
+                    .get(id)
+                    .is_some_and(|runtime| runtime.is_stopping())
+                {
+                    self.registry.set_status(id, AccountStatus::Error);
+                } else {
+                    self.recover(id);
+                }
+            }
             AccountExit::Stopped => {
                 // A process-wide shutdown, or a command channel nothing can
                 // send on again. Left registered with whatever terminal status
@@ -1197,7 +1223,11 @@ impl AccountSupervisor {
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        if self.registry.get(id).is_none() {
+        if self
+            .registry
+            .get(id)
+            .is_none_or(|runtime| runtime.is_stopping())
+        {
             return;
         }
         // Bumped here too: this restart is the generation a later timer would
@@ -1237,7 +1267,7 @@ impl AccountSupervisor {
         Fut: std::future::Future<Output = session_bridge::AccountExit>,
     {
         let _relink = self.registry.relink.lock().await;
-        if self.registry.retirement_target(id).is_some() {
+        if self.registry.has_retirement(id) {
             return LifecycleOutcome::NoAccount;
         }
         let Some(runtime) = self.registry.get(id) else {
@@ -1386,6 +1416,9 @@ impl AccountSupervisor {
                 runtime,
                 command_rx,
             } => {
+                self.active_runs.send_modify(|active| {
+                    active.insert(runtime.id());
+                });
                 tasks.spawn(Self::run_task(Arc::clone(self), runtime, command_rx));
             }
             SupervisorCommand::RestartDue { id, generation } => {
@@ -1451,10 +1484,43 @@ impl AccountSupervisor {
                 }
                 // No live session to ask — a logout, an exhausted recovery, or
                 // a pending restart whose runtime has no task yet. Finish the
-                // storage mutation here, where the supervisor is the authority
-                // on whether anything is still writing.
-                let outcome = self.finish_terminal(id, disposition).await;
-                let _ = reply.send(outcome);
+                // mutation in a tracked task, after any old session has been
+                // joined. The reaper must keep serving other accounts while
+                // media leases or external cleanup are still draining.
+                if runtime.lifecycle().set_disposition(disposition)
+                    == session_bridge::DispositionOutcome::Conflict
+                {
+                    let _ = reply.send(LifecycleOutcome::Incomplete);
+                    return;
+                }
+                self.bump_generation(id);
+                let mut active = self.active_runs.subscribe();
+                let was_running = active.borrow().contains(&id);
+                let supervisor = Arc::clone(self);
+                tasks.spawn(async move {
+                    while active.borrow_and_update().contains(&id) {
+                        if active.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    // Joining the old task precedes any terminal mutation.
+                    // A failed close is not permission to remove its storage.
+                    if !was_running || runtime.lifecycle().is_quiesced() {
+                        supervisor.finish_terminal(id, disposition).await;
+                    } else {
+                        log::warn!(
+                            "account {} did not quiesce; terminal cleanup deferred",
+                            id.get()
+                        );
+                    }
+                    AccountRun {
+                        terminal_cleanup: true,
+                        id,
+                        exit: session_bridge::AccountExit::Stopped,
+                        ran_for: std::time::Duration::ZERO,
+                    }
+                });
+                let _ = reply.send(LifecycleOutcome::Accepted);
             }
         }
     }
@@ -1486,6 +1552,7 @@ impl AccountSupervisor {
             }
         };
         AccountRun {
+            terminal_cleanup: false,
             id,
             exit,
             ran_for: started.elapsed(),
@@ -1688,6 +1755,7 @@ mod tests {
         assert_eq!(registry.runtimes().len(), 1);
         let (_, ensured) = tokio::join!(
             supervisor.handle_exit(super::AccountRun {
+                terminal_cleanup: false,
                 id,
                 exit: crate::session_bridge::AccountExit::ResetCompleted,
                 ran_for: std::time::Duration::from_secs(1),
@@ -1784,6 +1852,7 @@ mod tests {
 
         fn run(id: i32, exit: AccountExit) -> AccountRun {
             AccountRun {
+                terminal_cleanup: false,
                 id: AccountId::new(id).unwrap(),
                 exit,
                 ran_for: std::time::Duration::from_secs(1),
@@ -1934,6 +2003,7 @@ mod tests {
             async move {
                 supervisor
                     .handle_exit(AccountRun {
+                        terminal_cleanup: false,
                         id: AccountId::LEGACY,
                         exit: crate::session_bridge::AccountExit::ResetCompleted,
                         ran_for: std::time::Duration::from_secs(1),
@@ -2008,6 +2078,7 @@ mod tests {
         assert!(registry.insert(runtime(1)));
         supervisor
             .handle_exit(AccountRun {
+                terminal_cleanup: false,
                 id: AccountId::LEGACY,
                 exit: crate::session_bridge::AccountExit::RemoveCompleted,
                 ran_for: std::time::Duration::from_secs(1),
@@ -2092,6 +2163,9 @@ mod tests {
             LifecycleOutcome::Accepted,
             "a terminal account's removal must run directly, not fail on a dead channel"
         );
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.join_all())
+            .await
+            .expect("terminal cleanup must finish");
         assert!(
             registry.get(id).is_none(),
             "the completed removal drops the runtime"
@@ -2105,9 +2179,55 @@ mod tests {
                 .any(|account| account.id == id),
             "and the device row is really gone"
         );
+    }
 
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.join_all()).await;
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn pending_terminal_cleanup_does_not_block_the_supervisor() {
+        use super::{AccountSupervisor, LifecycleOutcome, RestartPolicy};
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:terminal-join-wait-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let old = AccountId::new(2000000001).unwrap();
+        let other = AccountId::new(2000000002).unwrap();
+        let old_runtime = runtime(old.get());
+        let other_runtime = runtime(other.get());
+        registry.insert(Arc::clone(&old_runtime));
+        registry.insert(Arc::clone(&other_runtime));
+        let supervisor = AccountSupervisor::with_shutdown(
+            registry,
+            stores,
+            4,
+            RestartPolicy::production(),
+            || std::future::ready(()),
+        );
+        supervisor.active_runs.send_modify(|active| {
+            active.insert(old);
+        });
+        let pin = other_runtime.lifecycle().pin().unwrap();
+        assert_eq!(
+            supervisor.remove_account(old).await,
+            LifecycleOutcome::Accepted
+        );
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            supervisor.remove_account(other),
+        )
+        .await
+        .expect("joining an old task must not block another account's request");
+        assert_eq!(answer, LifecycleOutcome::Incomplete);
+        drop(pin);
+        // Simulate an old task that joined without proving a successful close.
+        // No storage or external cleanup is permitted in this case.
+        supervisor.active_runs.send_modify(|active| {
+            active.remove(&old);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor.join_all())
+            .await
+            .expect("tracked terminal task must finish");
+        assert!(supervisor.registry.get(old).is_some());
     }
 
     #[cfg(not(target_family = "wasm"))]

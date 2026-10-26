@@ -315,34 +315,45 @@ async fn serve(
             )
             .await;
         };
-        // A staging upload is the one write this endpoint takes, and it reads
-        // from the buffered reader rather than the socket: the head was read
-        // a byte at a time but a client may send head and body in one
-        // segment, so the first of the payload can already be sitting in the
-        // buffer. Reading the raw stream would drop exactly that much.
-        //
-        // `PUT` and nothing else, because the preflight in [`http`]
-        // advertises exactly this list: taking a method the browser is told it may not
-        // use is a route no page can reach, and one the next reader has to
-        // work out is dead.
-        if request.method == "PUT" {
-            let key = key.to_string();
-            return crate::media::http::receive(
-                &mut stream,
-                &key,
-                origin.as_deref(),
-                request.content_length,
-            )
-            .await;
-        }
-        // The other half of staging: a send abandoned before the request ran
-        // leaves a payload nothing will ever read, and staged uploads are
-        // deliberately spared by the cache sweep, so without this they stay
-        // until the account is wiped. Narrowed the same way the write is.
-        if request.method == "DELETE" {
-            return crate::media::http::discard(stream.get_mut(), key, origin.as_deref()).await;
-        }
-        return crate::media::http::serve(stream.get_mut(), key, origin.as_deref()).await;
+        // Bound the entire transfer, including socket writes, so a stalled
+        // peer cannot hold the account's cleanup lease indefinitely.
+        let transfer = async {
+            // A staging upload is the one write this endpoint takes, and it reads
+            // from the buffered reader rather than the socket: the head was read
+            // a byte at a time but a client may send head and body in one
+            // segment, so the first of the payload can already be sitting in the
+            // buffer. Reading the raw stream would drop exactly that much.
+            //
+            // `PUT` and nothing else, because the preflight in [`http`]
+            // advertises exactly this list: taking a method the browser is told it may not
+            // use is a route no page can reach, and one the next reader has to
+            // work out is dead.
+            if request.method == "PUT" {
+                let key = key.to_string();
+                crate::media::http::receive(
+                    &mut stream,
+                    &key,
+                    origin.as_deref(),
+                    request.content_length,
+                )
+                .await
+            }
+            // The other half of staging: a send abandoned before the request ran
+            // leaves a payload nothing will ever read, and staged uploads are
+            // deliberately spared by the cache sweep, so without this they stay
+            // until the account is wiped. Narrowed the same way the write is.
+            else if request.method == "DELETE" {
+                crate::media::http::discard(stream.get_mut(), key, origin.as_deref()).await
+            } else {
+                crate::media::http::serve(stream.get_mut(), key, origin.as_deref()).await
+            }
+        };
+        return oxidezap_session::with_timeout(transfer, std::time::Duration::from_secs(30))
+            .await
+            .unwrap_or_else(|| {
+                log::warn!("account media transfer timed out");
+                Ok(())
+            });
     }
 
     respond(
