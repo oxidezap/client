@@ -87,10 +87,7 @@ impl WhatsAppApp {
                                 if let Some(message) =
                                     chat.messages.iter_mut().find(|m| m.id == key.1)
                                 {
-                                    message.revoked = true;
-                                    message.content = "[Message deleted]".to_owned();
-                                    message.media = None;
-                                    message.quoted = None;
+                                    message.mark_revoked();
                                     if newest {
                                         chat.last_message = Some("[Message deleted]".to_owned());
                                     }

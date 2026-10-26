@@ -1,5 +1,6 @@
 //! Display-only choices: rendering never performs a business action.
-use crate::components::{BubbleText, render_rich_text};
+use crate::components::rich_text_selection::{MessageSelection, MessageTextSegment};
+use crate::components::{BubbleText, render_message_segment};
 use crate::theme::Metrics;
 use gpui::{
     App, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div,
@@ -13,8 +14,8 @@ use std::sync::Arc;
 pub(crate) struct BusinessText {
     header: BubbleText,
     footer: BubbleText,
-    header_key: Arc<str>,
-    footer_key: Arc<str>,
+    header_key: MessageSelection,
+    footer_key: MessageSelection,
     header_id: SharedString,
     footer_id: SharedString,
     button_ids: Arc<[SharedString]>,
@@ -24,8 +25,14 @@ impl BusinessText {
         Self {
             header: BubbleText::of(&content.header),
             footer: BubbleText::of(&content.footer),
-            header_key: format!("business-header-{id}").into(),
-            footer_key: format!("business-footer-{id}").into(),
+            header_key: MessageSelection {
+                message_id: Arc::from(id),
+                segment: MessageTextSegment::Header,
+            },
+            footer_key: MessageSelection {
+                message_id: Arc::from(id),
+                segment: MessageTextSegment::Footer,
+            },
             header_id: format!("business-header-{id}").into(),
             footer_id: format!("business-footer-{id}").into(),
             button_ids: content
@@ -63,9 +70,9 @@ pub(super) fn render_header(
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .when_some(parsed, |el, parsed| {
             el.when(!parsed.header.is_empty(), |el| {
-                el.child(render_rich_text(
+                el.child(render_message_segment(
                     &parsed.header,
-                    Arc::clone(&parsed.header_key),
+                    parsed.header_key.clone(),
                     order.saturating_mul(3),
                     cx,
                 ))
@@ -95,9 +102,9 @@ pub(super) fn render_footer(
         .text_color(cx.theme().muted_foreground)
         .when_some(parsed, |el, parsed| {
             el.when(!parsed.footer.is_empty(), |el| {
-                el.child(render_rich_text(
+                el.child(render_message_segment(
                     &parsed.footer,
-                    Arc::clone(&parsed.footer_key),
+                    parsed.footer_key.clone(),
                     order.saturating_mul(3).saturating_add(2),
                     cx,
                 ))

@@ -20,7 +20,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 
-use crate::components::rich_text_selection::SelectableRichText;
+use crate::components::rich_text_selection::{MessageSelection, SelectableRichText};
 use crate::theme::ActiveProductTheme as _;
 
 use oxidezap_core::{Emphasis, LinkSpan, find_links_in, parse_rich_text};
@@ -146,6 +146,15 @@ pub fn render_rich_text(
     document_order: u64,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    render_message_segment(parsed, selection_key.into(), document_order, cx)
+}
+
+pub(crate) fn render_message_segment(
+    parsed: &BubbleText,
+    selection_key: MessageSelection,
+    document_order: u64,
+    cx: &App,
+) -> impl IntoElement + use<> {
     if !parsed.links.is_empty() {
         return render_with_links(parsed, selection_key, document_order, cx).into_any_element();
     }
@@ -227,7 +236,7 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
 /// the parent; only the link ink comes from the theme.
 fn render_with_links(
     parsed: &BubbleText,
-    selection_key: Arc<str>,
+    selection_key: MessageSelection,
     document_order: u64,
     cx: &App,
 ) -> impl IntoElement + use<> {

@@ -199,6 +199,16 @@ impl ChatMessage {
         self.is_from_me && self.status.is_failed()
     }
 
+    /// Apply an accepted deletion without retaining displayable original content.
+    pub fn mark_revoked(&mut self) {
+        self.revoked = true;
+        self.content = "[Message deleted]".into();
+        self.media = None;
+        self.quoted = None;
+        self.poll = None;
+        self.business = None;
+    }
+
     /// What sending this again would put on the wire, if anything.
     ///
     /// One question with one answer, asked by the bubble to decide whether to

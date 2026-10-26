@@ -23,6 +23,50 @@ use gpui_base::{
 };
 use gpui_component::ActiveTheme as _;
 
+/// Segment identity is separate from the owning message's durable ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MessageTextSegment {
+    Header,
+    Body,
+    Footer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MessageSelection {
+    pub message_id: Arc<str>,
+    pub segment: MessageTextSegment,
+}
+impl From<Arc<str>> for MessageSelection {
+    fn from(message_id: Arc<str>) -> Self {
+        Self {
+            message_id,
+            segment: MessageTextSegment::Body,
+        }
+    }
+}
+impl MessageSelection {
+    pub fn document_order(&self, message_index: usize) -> u64 {
+        (message_index as u64)
+            .saturating_mul(3)
+            .saturating_add(match self.segment {
+                MessageTextSegment::Header => 0,
+                MessageTextSegment::Body => 1,
+                MessageTextSegment::Footer => 2,
+            })
+    }
+    pub fn source_text<'a>(&self, message: &'a oxidezap_core::ChatMessage) -> Option<&'a str> {
+        if message.revoked || message.system.is_some() || message.poll.is_some() {
+            return None;
+        }
+        let text = match self.segment {
+            MessageTextSegment::Body => &message.content,
+            MessageTextSegment::Header => &message.business.as_ref()?.header,
+            MessageTextSegment::Footer => &message.business.as_ref()?.footer,
+        };
+        (!text.is_empty()).then_some(text.as_str())
+    }
+}
+
 struct RetainedSelection {
     handle: TextSelectionHandle,
     text: SharedString,
@@ -53,7 +97,7 @@ struct LinkPress {
 
 /// Holds participants by message identity until their selection ends.
 #[derive(Default)]
-struct RichTextSelectionRegistry(HashMap<(gpui::WindowId, Arc<str>), RetainedParticipant>);
+struct RichTextSelectionRegistry(HashMap<(gpui::WindowId, MessageSelection), RetainedParticipant>);
 
 impl Global for RichTextSelectionRegistry {}
 
@@ -74,7 +118,7 @@ fn retained_selection(handle: TextSelectionHandle, text: &SharedString) -> Retai
 pub(crate) fn active_selection_message_snapshots(
     window_id: gpui::WindowId,
     cx: &App,
-) -> Vec<(String, SharedString, u64)> {
+) -> Vec<(MessageSelection, SharedString, u64)> {
     if !cx.has_global::<RichTextSelectionRegistry>() {
         return Vec::new();
     }
@@ -86,7 +130,7 @@ pub(crate) fn active_selection_message_snapshots(
         })
         .map(|((_, message_id), participant)| {
             (
-                message_id.to_string(),
+                message_id.clone(),
                 participant.text.clone(),
                 participant.document_order,
             )
@@ -96,7 +140,7 @@ pub(crate) fn active_selection_message_snapshots(
 
 fn record_selection_bounds(
     window_id: gpui::WindowId,
-    message_id: &Arc<str>,
+    message_id: &MessageSelection,
     bounds: Bounds<Pixels>,
     cx: &mut App,
 ) {
@@ -104,7 +148,7 @@ fn record_selection_bounds(
         && let Some(participant) = cx
             .global_mut::<RichTextSelectionRegistry>()
             .0
-            .get_mut(&(window_id, Arc::clone(message_id)))
+            .get_mut(&(window_id, message_id.clone()))
     {
         participant.last_bounds = Some(bounds);
     }
@@ -112,13 +156,13 @@ fn record_selection_bounds(
 
 fn track_selection_handle(
     window_id: gpui::WindowId,
-    message_id: &Arc<str>,
+    message_id: &MessageSelection,
     handle: &TextSelectionHandle,
     text: &SharedString,
     document_order: u64,
     cx: &mut App,
 ) {
-    let key = (window_id, Arc::clone(message_id));
+    let key = (window_id, message_id.clone());
     if handle.snapshot(cx).is_some() {
         if !cx.has_global::<RichTextSelectionRegistry>() {
             cx.set_global(RichTextSelectionRegistry::default());
@@ -302,7 +346,7 @@ pub(super) struct SelectableRichText {
     styled_text: StyledText,
     links: Vec<Range<usize>>,
     link_targets: Arc<[SharedString]>,
-    selection_key: Arc<str>,
+    selection_key: MessageSelection,
     document_order: u64,
 }
 
@@ -313,7 +357,7 @@ impl SelectableRichText {
         styled_text: StyledText,
         links: Vec<Range<usize>>,
         link_targets: Arc<[SharedString]>,
-        selection_key: Arc<str>,
+        selection_key: impl Into<MessageSelection>,
         document_order: u64,
     ) -> Self {
         Self {
@@ -322,7 +366,7 @@ impl SelectableRichText {
             styled_text,
             links,
             link_targets,
-            selection_key,
+            selection_key: selection_key.into(),
             document_order,
         }
     }
@@ -688,7 +732,7 @@ impl Element for SelectableRichText {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let window_id = window.window_handle().window_id();
-        let registry_key = (window_id, Arc::clone(&self.selection_key));
+        let registry_key = (window_id, self.selection_key.clone());
         let registry_participant = cx
             .has_global::<RichTextSelectionRegistry>()
             .then(|| {

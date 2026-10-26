@@ -105,4 +105,29 @@ mod tests {
             "a business body must not become a button response or resend"
         );
     }
+    #[test]
+    fn accepted_revoke_discards_business_text_and_choices() {
+        let mut message =
+            crate::ChatMessage::new_outgoing("synthetic".into(), "original body".into());
+        message.business = Some(BusinessContent {
+            kind: BusinessKind::Template,
+            header: "original header".into(),
+            body: "original body".into(),
+            footer: "original footer".into(),
+            buttons: vec![BusinessButton {
+                label: "original choice".into(),
+                action: BusinessAction::Reply,
+            }],
+            notice: None,
+        });
+        message.mark_revoked();
+        assert!(message.revoked);
+        assert!(message.business.is_none());
+        assert_eq!(message.preview_text(), "[Message deleted]");
+        assert!(
+            !serde_json::to_string(&message)
+                .unwrap()
+                .contains("original")
+        );
+    }
 }
