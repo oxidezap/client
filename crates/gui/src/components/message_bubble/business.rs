@@ -50,10 +50,13 @@ pub(super) fn render_header(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    let id = parsed
+        .map(|p| p.header_id.clone())
+        .unwrap_or_else(|| "business-header-unavailable".into());
+    let selector = id.clone();
     div()
-        .id(parsed
-            .map(|p| p.header_id.clone())
-            .unwrap_or_else(|| "business-header-unavailable".into()))
+        .id(id)
+        .debug_selector(move || selector.to_string())
         .min_w_0()
         .text_size(metrics.text_body())
         .text_color(cx.theme().foreground)
@@ -77,10 +80,13 @@ pub(super) fn render_footer(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    let id = parsed
+        .map(|p| p.footer_id.clone())
+        .unwrap_or_else(|| "business-footer-unavailable".into());
+    let selector = id.clone();
     div()
-        .id(parsed
-            .map(|p| p.footer_id.clone())
-            .unwrap_or_else(|| "business-footer-unavailable".into()))
+        .id(id)
+        .debug_selector(move || selector.to_string())
         .flex()
         .flex_col()
         .min_w_0()
@@ -98,11 +104,14 @@ pub(super) fn render_footer(
             })
         })
         .children(content.buttons.iter().enumerate().map(|(ix, button)| {
+            let id = parsed
+                .and_then(|p| p.button_ids.get(ix))
+                .cloned()
+                .unwrap_or_else(|| format!("business-choice-{ix}").into());
+            let selector = id.clone();
             div()
-                .id(parsed
-                    .and_then(|p| p.button_ids.get(ix))
-                    .cloned()
-                    .unwrap_or_else(|| format!("business-choice-{ix}").into()))
+                .id(id)
+                .debug_selector(move || selector.to_string())
                 .flex()
                 .flex_col()
                 .min_w_0()
