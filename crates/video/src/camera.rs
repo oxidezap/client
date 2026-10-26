@@ -29,7 +29,7 @@ use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, CameraInfo, FrameFormat, RequestedFormat,
-    RequestedFormatType, Resolution,
+    RequestedFormatType,
 };
 use portable_atomic::{AtomicBool, Ordering};
 use wacore::time::Instant;
@@ -156,7 +156,12 @@ impl Drop for CameraStream {
 /// Returns once the device is open and configured, so a caller that is about
 /// to answer a video call learns *here* that there is no camera — rather than
 /// accepting one and then having nothing to send.
-pub fn open(quality: VideoQuality) -> Result<CameraStream> {
+pub fn open(quality: VideoQuality, device: Option<String>) -> Result<CameraStream> {
+    let quality = quality.checked()?;
+    let index = device
+        .map(|id| parse_device(&id))
+        .transpose()?
+        .unwrap_or_else(configured_device);
     // After the authorization, not before: on macOS nothing else in the
     // library may run until `nokhwa_initialize` has answered, so an
     // inventory read first can report an empty backend over cameras that
@@ -180,7 +185,7 @@ pub fn open(quality: VideoQuality) -> Result<CameraStream> {
         let control = Arc::clone(&control.0);
         std::thread::Builder::new()
             .name("oxidezap-camera".to_string())
-            .spawn(move || run(quality, &control, &frames_tx, &ready_tx))
+            .spawn(move || run(quality, &index, &control, &frames_tx, &ready_tx))
             .context("spawning the camera thread")?
     };
 
@@ -248,18 +253,19 @@ type Ready = std::sync::mpsc::SyncSender<Result<VideoQuality>>;
 
 fn run(
     quality: VideoQuality,
+    index: &CameraIndex,
     control: &Control,
     frames: &async_channel::Sender<EncodedFrame>,
     ready: &Ready,
 ) {
     log::debug!(
-        "requesting native camera {}x{} @ {} fps MJPEG, {} kbps",
+        "requesting native camera {}x{} @ {} fps, {} kbps",
         quality.width,
         quality.height,
         quality.fps,
         quality.bitrate_kbps,
     );
-    let opened = match start(quality) {
+    let opened = match start(quality, index) {
         Ok(opened) => opened,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -496,40 +502,242 @@ struct Opened {
     quality: VideoQuality,
 }
 
-/// A mode every webcam has had for twenty years, for a camera whose closest
-/// match to what was asked for is one a peer could not decode.
-const FALLBACK: VideoQuality = VideoQuality {
-    width: 640,
-    height: 480,
-    fps: 15,
-    bitrate_kbps: 600,
-};
+// Order breaks ties between otherwise equivalent modes. MJPEG preserves the
+// existing preference, but is not a requirement on cameras exposing raw video.
+const INPUT_FORMATS: &[FrameFormat] = &[
+    FrameFormat::MJPEG,
+    FrameFormat::YUYV,
+    FrameFormat::NV12,
+    FrameFormat::GRAY,
+    FrameFormat::RAWRGB,
+    FrameFormat::RAWBGR,
+];
 
-/// Open the camera at something a video call may actually offer.
-///
-/// The mode a backend picks is *near* what was asked for, not what was asked
-/// for: a camera with no 720p20 answers with whatever it does have, and that
-/// can be 1080p — past the Level 3.1 a call is bounded by — or a frame rate
-/// that does not divide the RTP clock, which would silently truncate the
-/// timestamp stride and drift the stream against its own timestamps. So the
-/// mode that came back is checked like any other input, and a camera that
-/// cannot meet it is asked again for something every device has.
-fn start(wanted: VideoQuality) -> Result<Opened> {
-    match start_at(wanted) {
-        Ok(opened) => Ok(opened),
-        Err(first) => {
-            log::warn!(
-                "reopening the camera at {}x{}: {first:#}",
-                FALLBACK.width,
-                FALLBACK.height
+trait CaptureDevice {
+    fn formats(&mut self) -> Result<Vec<CameraFormat>>;
+    fn start_stream(&mut self) -> Result<()>;
+    fn stop_stream(&mut self) -> Result<()>;
+}
+
+impl CaptureDevice for Camera {
+    fn formats(&mut self) -> Result<Vec<CameraFormat>> {
+        advertised_formats::read(self)
+    }
+    fn start_stream(&mut self) -> Result<()> {
+        Ok(self.open_stream()?)
+    }
+    fn stop_stream(&mut self) -> Result<()> {
+        Ok(Camera::stop_stream(self)?)
+    }
+}
+
+// Nokhwa 0.10.11's AVFoundation compatible_list_by_resolution filters with
+// `!= fourcc`. Its aggregate API therefore loses or relabels native tuples.
+// Use the same direct format source as its constructor on that platform.
+#[cfg(target_os = "macos")]
+mod advertised_formats {
+    use super::*;
+    pub fn read(camera: &mut Camera) -> Result<Vec<CameraFormat>> {
+        let device = nokhwa_bindings_macos::AVCaptureDevice::new(camera.index())?;
+        Ok(device.supported_formats()?)
+    }
+}
+#[cfg(not(target_os = "macos"))]
+mod advertised_formats {
+    use super::*;
+    use nokhwa::utils::Resolution;
+    use std::collections::HashMap;
+
+    pub fn read(camera: &mut Camera) -> Result<Vec<CameraFormat>> {
+        // Media Foundation's compatible_fourcc stops after two formats.
+        // Ask for every converter input instead of using that aggregate API.
+        collect(|input| Ok(camera.compatible_list_by_resolution(input)?))
+    }
+
+    fn collect(
+        mut read: impl FnMut(FrameFormat) -> Result<HashMap<Resolution, Vec<u32>>>,
+    ) -> Result<Vec<CameraFormat>> {
+        let mut modes = Vec::new();
+        let mut errors = Vec::new();
+        for input in INPUT_FORMATS {
+            match read(*input) {
+                Ok(resolutions) => {
+                    for (resolution, rates) in resolutions {
+                        modes.extend(
+                            rates
+                                .into_iter()
+                                .map(|fps| CameraFormat::new(resolution, *input, fps)),
+                        );
+                    }
+                }
+                // Unsupported pixel formats may be errors on some backends.
+                Err(error) => errors.push(format!("{input}: {error:#}")),
+            }
+        }
+        if errors.len() == INPUT_FORMATS.len() {
+            bail!("listing camera formats failed: {}", errors.join("; "));
+        }
+        Ok(modes)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_third_pixel_format_remains_available_after_two_unusable_formats() {
+            let advertised = [
+                CameraFormat::new(Resolution::new(1280, 720), FrameFormat::MJPEG, 60),
+                CameraFormat::new(Resolution::new(1920, 1080), FrameFormat::YUYV, 30),
+                CameraFormat::new(Resolution::new(640, 480), FrameFormat::NV12, 30),
+            ];
+            let wanted = VideoQuality::default();
+            assert!(
+                candidates(advertised[..2].to_vec(), wanted).is_empty(),
+                "the legacy two-format aggregate hides the only usable input"
             );
-            start_at(VideoQuality {
-                bitrate_kbps: wanted.bitrate_kbps.min(FALLBACK.bitrate_kbps),
-                ..FALLBACK
+            let mut queried = Vec::new();
+            let complete = collect(|input| {
+                queried.push(input);
+                let mut resolutions: HashMap<Resolution, Vec<u32>> = HashMap::new();
+                for mode in advertised.iter().filter(|mode| mode.format() == input) {
+                    resolutions
+                        .entry(mode.resolution())
+                        .or_default()
+                        .push(mode.frame_rate());
+                }
+                if resolutions.is_empty() {
+                    bail!("fake unsupported pixel format");
+                }
+                Ok(resolutions)
             })
-            .map_err(|second| second.context(format!("{first:#}")))
+            .unwrap();
+            assert_eq!(queried, INPUT_FORMATS);
+            assert_eq!(candidates(complete, wanted), vec![advertised[2]]);
         }
     }
+}
+
+fn mode_quality(format: CameraFormat, wanted: VideoQuality) -> Result<VideoQuality> {
+    VideoQuality {
+        width: format.resolution().width(),
+        height: format.resolution().height(),
+        fps: format.frame_rate(),
+        bitrate_kbps: wanted.bitrate_kbps,
+    }
+    .checked()
+}
+
+fn candidates(formats: Vec<CameraFormat>, wanted: VideoQuality) -> Vec<CameraFormat> {
+    let mut formats: Vec<_> = formats
+        .into_iter()
+        .filter(|format| {
+            INPUT_FORMATS.contains(&format.format()) && mode_quality(*format, wanted).is_ok()
+        })
+        .collect();
+    formats.sort_by_key(|format| {
+        let res = format.resolution();
+        (
+            u64::from(res.width().abs_diff(wanted.width)).pow(2)
+                + u64::from(res.height().abs_diff(wanted.height)).pow(2),
+            format.frame_rate().abs_diff(wanted.fps),
+            INPUT_FORMATS
+                .iter()
+                .position(|input| *input == format.format()),
+            *format,
+        )
+    });
+    formats.dedup();
+    formats
+}
+
+// Discovery opens no stream and retains no device as a cache. Each failed
+// attempt is stopped and dropped before the factory is called again.
+fn negotiate<C: CaptureDevice, T>(
+    wanted: VideoQuality,
+    mut open: impl FnMut(RequestedFormatType, &[FrameFormat]) -> Result<C>,
+    mut prepare: impl FnMut(&C) -> Result<T>,
+) -> Result<(C, T)> {
+    let mut errors = Vec::new();
+    let mut available = None;
+    for input in INPUT_FORMATS {
+        match open(RequestedFormatType::None, &[*input]) {
+            Ok(mut device) => {
+                let formats = device.formats();
+                let closed = device.stop_stream();
+                drop(device);
+                closed.context("closing camera after mode discovery")?;
+                match formats {
+                    Ok(formats) => {
+                        available = Some(formats);
+                        break;
+                    }
+                    Err(error) => errors.push(format!("listing modes: {error:#}")),
+                }
+            }
+            Err(error) => errors.push(format!("discovering {input}: {error:#}")),
+        }
+    }
+    let available = available.ok_or_else(|| anyhow!("no camera modes: {}", errors.join("; ")))?;
+    let modes = candidates(available, wanted);
+    if modes.is_empty() {
+        bail!("camera advertises no supported mode within video call limits");
+    }
+    for mode in modes {
+        let mut device = match open(RequestedFormatType::Exact(mode), INPUT_FORMATS) {
+            Ok(device) => device,
+            Err(error) => {
+                errors.push(format!("opening {mode}: {error:#}"));
+                continue;
+            }
+        };
+        let prepared = device.start_stream().and_then(|()| prepare(&device));
+        match prepared {
+            Ok(prepared) => return Ok((device, prepared)),
+            Err(error) => {
+                errors.push(format!("preparing {mode}: {error:#}"));
+                let closed = device.stop_stream();
+                drop(device);
+                closed.context("closing camera before retry")?;
+            }
+        }
+    }
+    bail!("camera negotiation failed: {}", errors.join("; "))
+}
+
+fn start(wanted: VideoQuality, index: &CameraIndex) -> Result<Opened> {
+    let (camera, (converter, encoder, quality)) = negotiate(
+        wanted,
+        |request, formats| {
+            Camera::new(
+                index.clone(),
+                RequestedFormat::with_formats(request, formats),
+            )
+            .with_context(|| format!("opening camera {index}"))
+        },
+        |camera| {
+            let (converter, quality) = prepare(camera, wanted)?;
+            let encoder = H264Encoder::new(quality)?;
+            Ok((converter, encoder, quality))
+        },
+    )?;
+    log::info!(
+        "camera {index} open: {}x{} @ {} fps, {} in, H.264 at {} kbps; requested {}x{} @ {} fps",
+        quality.width,
+        quality.height,
+        quality.fps,
+        format_name(camera.camera_format().format()),
+        quality.bitrate_kbps,
+        wanted.width,
+        wanted.height,
+        wanted.fps,
+    );
+    Ok(Opened {
+        camera,
+        converter,
+        encoder,
+        quality,
+    })
 }
 
 /// What the device settled on, refused if a call could not carry it.
@@ -540,6 +748,12 @@ fn start(wanted: VideoQuality) -> Result<Opened> {
 /// streaming into nothing.
 fn prepare(camera: &Camera, wanted: VideoQuality) -> Result<(Frames, VideoQuality)> {
     let format = camera.camera_format();
+    if !INPUT_FORMATS.contains(&format.format()) {
+        bail!(
+            "camera selected unsupported {}",
+            format_name(format.format())
+        );
+    }
     let (width, height) = (
         format.resolution().width() as usize,
         format.resolution().height() as usize,
@@ -563,60 +777,6 @@ fn prepare(camera: &Camera, wanted: VideoQuality) -> Result<(Frames, VideoQualit
     .checked()
     .context("opened at a mode a call cannot carry")?;
     Ok((converter, quality))
-}
-
-fn start_at(wanted: VideoQuality) -> Result<Opened> {
-    let index = configured_device();
-    let requested =
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(CameraFormat::new(
-            Resolution::new(wanted.width, wanted.height),
-            // nokhwa's closest match requires this format; only size and FPS vary.
-            FrameFormat::MJPEG,
-            wanted.fps,
-        )));
-    let mut camera =
-        Camera::new(index.clone(), requested).with_context(|| format!("opening camera {index}"))?;
-    camera
-        .open_stream()
-        .with_context(|| format!("starting the stream on camera {index}"))?;
-
-    // Every way out of the checks below closes the stream on the way, because
-    // the one caller that sees a failure reopens the same device immediately
-    // and a backend still holding it fails that open rather than queueing
-    // behind it.
-    let prepared = prepare(&camera, wanted).inspect_err(|_| {
-        if let Err(e) = camera.stop_stream() {
-            log::warn!("the camera did not close cleanly after a refused mode: {e}");
-        }
-    });
-    let (converter, quality) = prepared.with_context(|| format!("camera {index}"))?;
-    let format = camera.camera_format();
-    let encoder = H264Encoder::new(quality)?;
-    log::info!(
-        "camera {index} open: {}x{} @ {} fps, {} in, H.264 out at {} kbps; \
-         requested {}x{} @ {} fps MJPEG",
-        quality.width,
-        quality.height,
-        quality.fps,
-        format_name(format.format()),
-        quality.bitrate_kbps,
-        wanted.width,
-        wanted.height,
-        wanted.fps,
-    );
-    if quality.fps > wanted.fps {
-        log::warn!(
-            "camera selected {} fps above requested {}; preserving negotiated cadence and RTP stride",
-            quality.fps,
-            wanted.fps,
-        );
-    }
-    Ok(Opened {
-        camera,
-        converter,
-        encoder,
-        quality,
-    })
 }
 
 fn convert_and_encode(
@@ -658,6 +818,107 @@ fn read_planar(buffer: &nokhwa::Buffer, planes: &mut I420Buffer) -> Result<()> {
         FrameFormat::GRAY => planes.read_gray(buffer.buffer()),
         other => bail!("camera changed to {} mid-stream", format_name(other)),
     }
+}
+
+fn parse_device(id: &str) -> Result<CameraIndex> {
+    if let Some(index) = id.strip_prefix("index:") {
+        return Ok(CameraIndex::Index(
+            index.parse().context("invalid camera index")?,
+        ));
+    }
+    if let Some(name) = id.strip_prefix("name:").filter(|name| !name.is_empty()) {
+        return Ok(CameraIndex::String(name.to_string()));
+    }
+    bail!("unknown camera device ID")
+}
+
+// Media Foundation resolves a symbolic link on every open, so unplugging a
+// camera cannot redirect a saved choice to the device now occupying its index.
+#[cfg(target_os = "windows")]
+mod device_identity {
+    use super::*;
+    pub fn index(info: &CameraInfo) -> CameraIndex {
+        if info.misc().is_empty() {
+            info.index().clone()
+        } else {
+            CameraIndex::String(info.misc())
+        }
+    }
+}
+#[cfg(not(target_os = "windows"))]
+mod device_identity {
+    use super::*;
+    pub fn index(info: &CameraInfo) -> CameraIndex {
+        info.index().clone()
+    }
+}
+
+pub fn enumerate() -> Result<Vec<crate::CameraDevice>> {
+    enumerate_with(
+        authorize,
+        || nokhwa::query(ApiBackend::Auto).context("enumerating cameras"),
+        probe_formats,
+    )
+}
+
+fn probe_formats(index: &CameraIndex) -> Result<Vec<CameraFormat>> {
+    let mut errors = Vec::new();
+    for input in INPUT_FORMATS {
+        let inputs = [*input];
+        let request = RequestedFormat::with_formats(RequestedFormatType::None, &inputs);
+        match Camera::new(index.clone(), request) {
+            Ok(mut camera) => {
+                let formats = CaptureDevice::formats(&mut camera);
+                let closed = camera.stop_stream();
+                drop(camera);
+                closed.context("closing camera inventory probe")?;
+                return formats;
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    bail!("camera modes unavailable: {}", errors.join("; "))
+}
+
+fn enumerate_with(
+    initialize: impl FnOnce() -> Result<()>,
+    query: impl FnOnce() -> Result<Vec<CameraInfo>>,
+    mut formats: impl FnMut(&CameraIndex) -> Result<Vec<CameraFormat>>,
+) -> Result<Vec<crate::CameraDevice>> {
+    // AVFoundation requires initialization before even querying the backend.
+    // Refused or unanswered access is an error, not an empty inventory.
+    initialize()?;
+    let devices = query()?;
+    let mut result = Vec::with_capacity(devices.len());
+    for (position, info) in devices.into_iter().enumerate() {
+        let index = device_identity::index(&info);
+        let id = match &index {
+            CameraIndex::Index(index) => format!("index:{index}"),
+            CameraIndex::String(name) => format!("name:{name}"),
+        };
+        // A busy device still belongs in inventory. Only its modes are missing.
+        let available = formats(&index).unwrap_or_else(|error| {
+            log::debug!("camera {index} inventory modes unavailable: {error:#}");
+            Vec::new()
+        });
+        let mut modes: Vec<_> = candidates(available, VideoQuality::default())
+            .into_iter()
+            .map(|format| crate::CameraMode {
+                width: format.resolution().width(),
+                height: format.resolution().height(),
+                fps: format.frame_rate(),
+            })
+            .collect();
+        modes.sort();
+        modes.dedup();
+        result.push(crate::CameraDevice {
+            id,
+            label: info.human_name(),
+            is_default: position == 0,
+            modes,
+        });
+    }
+    Ok(result)
 }
 
 /// Which camera to open.
@@ -720,6 +981,7 @@ pub fn is_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{FAILURES_BEFORE_LOST, Failures};
+    use nokhwa::utils::Resolution;
 
     /// One bad frame is not a broken camera, and neither are many with good
     /// ones between them: what says the device is gone is a run.
@@ -895,6 +1157,363 @@ mod tests {
                 assert_eq!(actual.data, expected.data);
                 assert_eq!(actual.keyframe, expected.keyframe);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    use nokhwa::utils::Resolution;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct State {
+        held: bool,
+        opens: Vec<CameraFormat>,
+        stops: usize,
+        drops: usize,
+        unclean_drops: usize,
+        fail_start: Option<CameraFormat>,
+        fail_close: bool,
+    }
+
+    struct Fake {
+        state: Rc<RefCell<State>>,
+        advertised: Vec<CameraFormat>,
+        mode: CameraFormat,
+        stopped: bool,
+    }
+
+    impl CaptureDevice for Fake {
+        fn formats(&mut self) -> Result<Vec<CameraFormat>> {
+            Ok(self.advertised.clone())
+        }
+        fn start_stream(&mut self) -> Result<()> {
+            if self.state.borrow().fail_start == Some(self.mode) {
+                bail!("fake stream refused");
+            }
+            Ok(())
+        }
+        fn stop_stream(&mut self) -> Result<()> {
+            self.stopped = true;
+            let mut state = self.state.borrow_mut();
+            state.stops += 1;
+            if state.fail_close {
+                bail!("fake cleanup failed");
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            let mut state = self.state.borrow_mut();
+            state.held = false;
+            state.drops += 1;
+            state.unclean_drops += usize::from(!self.stopped);
+        }
+    }
+
+    fn mode(width: u32, height: u32, fps: u32, input: FrameFormat) -> CameraFormat {
+        CameraFormat::new(Resolution::new(width, height), input, fps)
+    }
+
+    fn factory(
+        state: Rc<RefCell<State>>,
+        advertised: Vec<CameraFormat>,
+    ) -> impl FnMut(RequestedFormatType, &[FrameFormat]) -> Result<Fake> {
+        move |request, formats| {
+            assert!(
+                !state.borrow().held,
+                "previous attempt must release the device"
+            );
+            let mode = RequestedFormat::with_formats(request, formats)
+                .fulfill(&advertised)
+                .ok_or_else(|| anyhow!("fake unsupported format"))?;
+            if matches!(request, RequestedFormatType::Exact(_)) {
+                assert!(
+                    advertised.contains(&mode),
+                    "never invent a resolution/FPS pair"
+                );
+                state.borrow_mut().opens.push(mode);
+            }
+            state.borrow_mut().held = true;
+            Ok(Fake {
+                state: state.clone(),
+                advertised: advertised.clone(),
+                mode,
+                stopped: false,
+            })
+        }
+    }
+
+    #[test]
+    fn inventory_initializes_before_query_and_preserves_native_mode_pairs() {
+        let stage = std::cell::Cell::new(0);
+        let listed = enumerate_with(
+            || {
+                stage.set(1);
+                Ok(())
+            },
+            || {
+                assert_eq!(stage.get(), 1);
+                stage.set(2);
+                Ok(vec![CameraInfo::new(
+                    "Synthetic camera",
+                    "",
+                    "",
+                    CameraIndex::Index(0),
+                )])
+            },
+            |_| {
+                assert_eq!(stage.get(), 2);
+                // Different pixel formats need not share resolution or FPS.
+                Ok(vec![
+                    mode(640, 480, 30, FrameFormat::YUYV),
+                    mode(1280, 720, 20, FrameFormat::MJPEG),
+                ])
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            listed[0].modes,
+            vec![
+                crate::CameraMode {
+                    width: 640,
+                    height: 480,
+                    fps: 30
+                },
+                crate::CameraMode {
+                    width: 1280,
+                    height: 720,
+                    fps: 20
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn refused_inventory_access_never_queries_or_probes_devices() {
+        let result = enumerate_with(
+            || bail!("synthetic access refused"),
+            || panic!("query before authorization"),
+            |_| panic!("probe before authorization"),
+        );
+        assert!(result.unwrap_err().to_string().contains("access refused"));
+    }
+
+    #[test]
+    fn reproduces_both_legacy_mjpeg_attempts_failing_on_a_raw_camera() {
+        let advertised = [mode(640, 480, 30, FrameFormat::YUYV)];
+        for wanted in [
+            VideoQuality::default(),
+            VideoQuality {
+                width: 640,
+                height: 480,
+                fps: 15,
+                bitrate_kbps: 600,
+            },
+        ] {
+            let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(mode(
+                wanted.width,
+                wanted.height,
+                wanted.fps,
+                FrameFormat::MJPEG,
+            )));
+            assert!(requested.fulfill(&advertised).is_none());
+        }
+    }
+
+    #[test]
+    fn absent_requested_size_does_not_hide_a_usable_advertised_mode() {
+        let actual = mode(800, 600, 30, FrameFormat::MJPEG);
+        let wanted = VideoQuality::default();
+        let legacy = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(mode(
+            wanted.width,
+            wanted.height,
+            wanted.fps,
+            FrameFormat::MJPEG,
+        )));
+        assert!(legacy.fulfill(&[actual]).is_none());
+        let state = Rc::new(RefCell::new(State::default()));
+        let (mut camera, quality) =
+            negotiate(wanted, factory(state.clone(), vec![actual]), |camera| {
+                mode_quality(camera.mode, wanted)
+            })
+            .unwrap();
+        assert_eq!((quality.width, quality.height, quality.fps), (800, 600, 30));
+        camera.stop_stream().unwrap();
+        drop(camera);
+        assert_eq!(state.borrow().unclean_drops, 0);
+    }
+
+    #[test]
+    fn stopping_or_dropping_a_stream_joins_capture_and_allows_reopen() {
+        let held = Arc::new(AtomicBool::new(false));
+        for explicit in [true, false, true] {
+            let (tx, frames) = async_channel::bounded(QUEUE_DEPTH);
+            let control = CameraControl::default();
+            let running = control.clone();
+            let device = held.clone();
+            assert!(!device.swap(true, Ordering::SeqCst));
+            let thread = std::thread::spawn(move || {
+                while !running.0.stop.load(Ordering::Relaxed) && !tx.is_closed() {
+                    std::thread::yield_now();
+                }
+                device.store(false, Ordering::SeqCst);
+            });
+            let stream = CameraStream {
+                frames,
+                control,
+                thread: Some(thread),
+                quality: VideoQuality::default(),
+            };
+            let receiver = stream.frames();
+            if explicit {
+                stream.stop_now();
+            } else {
+                drop(stream);
+            }
+            assert!(
+                !held.load(Ordering::SeqCst),
+                "teardown waits for device release"
+            );
+            assert!(receiver.is_closed());
+        }
+    }
+
+    #[test]
+    fn a_canceled_background_open_drops_its_late_stream_and_releases_capture() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let release_open = Arc::new(std::sync::Barrier::new(2));
+        let gate = release_open.clone();
+        let (released_tx, released) = std::sync::mpsc::sync_channel(1);
+        let opening = runtime.spawn_blocking(move || {
+            gate.wait();
+            let (tx, frames) = async_channel::bounded(QUEUE_DEPTH);
+            let control = CameraControl::default();
+            let running = control.clone();
+            let thread = std::thread::spawn(move || {
+                while !running.0.stop.load(Ordering::Relaxed) && !tx.is_closed() {
+                    std::thread::yield_now();
+                }
+                released_tx.send(()).unwrap();
+            });
+            CameraStream {
+                frames,
+                control,
+                thread: Some(thread),
+                quality: VideoQuality::default(),
+            }
+        });
+        // The async caller canceled while the blocking camera open was still
+        // pending. Tokio must drop its eventual output, invoking stream teardown.
+        drop(opening);
+        release_open.wait();
+        released
+            .recv_timeout(Duration::from_secs(5))
+            .expect("late capture must close");
+    }
+
+    #[test]
+    fn raw_only_camera_negotiates_without_mjpeg_and_reports_effective_mode() {
+        for input in [FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::GRAY] {
+            let state = Rc::new(RefCell::new(State::default()));
+            let actual = mode(640, 480, 30, input);
+            let wanted = VideoQuality::default();
+            let (mut camera, quality) =
+                negotiate(wanted, factory(state.clone(), vec![actual]), |device| {
+                    mode_quality(device.mode, wanted)
+                })
+                .unwrap();
+            assert_eq!((quality.width, quality.height, quality.fps), (640, 480, 30));
+            assert_eq!(quality.timestamp_stride(), 3000);
+            assert_eq!(state.borrow().opens, vec![actual]);
+            camera.stop_stream().unwrap();
+            drop(camera);
+            assert!(!state.borrow().held);
+            assert_eq!(state.borrow().stops, 2);
+            assert_eq!(state.borrow().unclean_drops, 0);
+        }
+    }
+
+    #[test]
+    fn stream_and_prepare_failures_release_before_trying_another_advertised_mode() {
+        let first = mode(1280, 720, 20, FrameFormat::MJPEG);
+        let second = mode(1280, 720, 20, FrameFormat::YUYV);
+        let third = mode(640, 480, 15, FrameFormat::NV12);
+        let state = Rc::new(RefCell::new(State {
+            fail_start: Some(first),
+            ..State::default()
+        }));
+        let (mut camera, quality) = negotiate(
+            VideoQuality::default(),
+            factory(state.clone(), vec![third, second, first, first]),
+            |device| {
+                if device.mode == second {
+                    bail!("fake encoder failure");
+                }
+                mode_quality(device.mode, VideoQuality::default())
+            },
+        )
+        .unwrap();
+        assert_eq!(state.borrow().opens, vec![first, second, third]);
+        assert_eq!(state.borrow().stops, 3); // probe plus two failed attempts
+        assert_eq!((quality.width, quality.height, quality.fps), (640, 480, 15));
+        camera.stop_stream().unwrap();
+        drop(camera);
+        assert_eq!(state.borrow().drops, 4);
+        assert_eq!(state.borrow().unclean_drops, 0);
+    }
+
+    #[test]
+    fn filters_invalid_modes_without_synthesizing_a_fallback() {
+        let valid = mode(800, 600, 30, FrameFormat::YUYV);
+        let advertised = vec![
+            mode(1920, 1080, 30, FrameFormat::MJPEG),
+            mode(640, 480, 29, FrameFormat::MJPEG),
+            mode(641, 480, 30, FrameFormat::NV12),
+            mode(0, 480, 30, FrameFormat::GRAY),
+            valid,
+            valid,
+        ];
+        assert_eq!(candidates(advertised, VideoQuality::default()), vec![valid]);
+    }
+
+    #[test]
+    fn all_failures_and_cleanup_failure_leave_no_device_cached() {
+        for fail_close in [false, true] {
+            let input = mode(640, 480, 30, FrameFormat::NV12);
+            let state = Rc::new(RefCell::new(State {
+                fail_close,
+                ..State::default()
+            }));
+            let opened = negotiate(
+                VideoQuality::default(),
+                factory(state.clone(), vec![input]),
+                |_| -> Result<()> {
+                    bail!("fake device removed");
+                },
+            );
+            assert!(opened.is_err());
+            assert!(!state.borrow().held);
+            assert_eq!(state.borrow().opens.len(), usize::from(!fail_close));
+        }
+    }
+
+    #[test]
+    fn saved_ids_round_trip_and_do_not_accept_unknown_namespaces() {
+        assert_eq!(parse_device("index:3").unwrap(), CameraIndex::Index(3));
+        assert_eq!(
+            parse_device("name:device-link").unwrap(),
+            CameraIndex::String("device-link".into())
+        );
+        for id in ["3", "name:", "index:invalid", "index:4294967296"] {
+            assert!(parse_device(id).is_err());
         }
     }
 }

@@ -6637,6 +6637,7 @@ dependencies = [
  "js-sys",
  "log",
  "nokhwa",
+ "nokhwa-bindings-macos",
  "openh264",
  "oxidezap-platform",
  "portable-atomic",

@@ -34,6 +34,12 @@ openh264 = "0.9"
 # Only to get the blocking open and the blocking close off a runtime thread.
 tokio = { workspace = true, features = ["rt"] }
 
+# Read AVFoundation's actual tuples directly: nokhwa 0.10.11's aggregate
+# format lookup inverts its pixel-format filter. This crate is already used
+# transitively by nokhwa; no new backend or registry package is introduced.
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa-bindings-macos = "0.2.4"
+
 [target.'cfg(target_family = "wasm")'.dependencies]
 # The one place a browser timer is armed; `/clippy.toml` bans the spelling
 # everywhere else. This crate used to hand-roll its own because the seam was

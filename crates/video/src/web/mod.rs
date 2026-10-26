@@ -35,4 +35,6 @@
 
 mod camera;
 
-pub use camera::{CameraControl, CameraStream, is_available, open_camera};
+pub use camera::{
+    CameraControl, CameraStream, enumerate_cameras, is_available, open_camera, open_camera_device,
+};

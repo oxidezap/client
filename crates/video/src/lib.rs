@@ -28,15 +28,14 @@ mod encoder;
 #[cfg(target_family = "wasm")]
 mod web;
 
-// The same four names on both. `camera::open` used to be a fifth, exported
-// only here: the blocking open the wrapper below wraps, with no web twin and
-// no caller outside this file, so a crate that offers `open_camera` on both
-// platforms also offered a second way in on one of them. It stays inside
-// `camera`, where the wrapper reaches it.
+// Both backends expose the same capture and inventory operations. The
+// synchronous native open stays private; callers use the async wrapper.
 #[cfg(not(target_family = "wasm"))]
 pub use camera::{CameraControl, CameraStream, is_available};
 #[cfg(target_family = "wasm")]
-pub use web::{CameraControl, CameraStream, is_available, open_camera};
+pub use web::{
+    CameraControl, CameraStream, enumerate_cameras, is_available, open_camera, open_camera_device,
+};
 
 /// Open the camera, off the caller's thread.
 ///
@@ -50,9 +49,43 @@ pub use web::{CameraControl, CameraStream, is_available, open_camera};
 /// If no camera can be opened at `quality`.
 #[cfg(not(target_family = "wasm"))]
 pub async fn open_camera(quality: VideoQuality) -> anyhow::Result<CameraStream> {
-    tokio::task::spawn_blocking(move || camera::open(quality))
+    open_camera_device(quality, None).await
+}
+
+/// Open the selected device. Device IDs come from [`enumerate_cameras`].
+#[cfg(not(target_family = "wasm"))]
+pub async fn open_camera_device(
+    quality: VideoQuality,
+    device: Option<String>,
+) -> anyhow::Result<CameraStream> {
+    tokio::task::spawn_blocking(move || camera::open(quality, device))
         .await
         .map_err(|e| anyhow::anyhow!("camera task failed: {e}"))?
+}
+
+/// One advertised capture mode, independent of the call's encoder bitrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CameraMode {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+/// A device inventory entry. IDs are opaque and passed back unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraDevice {
+    pub id: String,
+    pub label: String,
+    pub is_default: bool,
+    pub modes: Vec<CameraMode>,
+}
+
+/// Enumerate cameras and their usable modes without starting capture.
+#[cfg(not(target_family = "wasm"))]
+pub async fn enumerate_cameras() -> anyhow::Result<Vec<CameraDevice>> {
+    tokio::task::spawn_blocking(camera::enumerate)
+        .await
+        .map_err(|e| anyhow::anyhow!("camera inventory task failed: {e}"))?
 }
 
 /// One encoded access unit.

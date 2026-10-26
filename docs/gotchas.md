@@ -713,9 +713,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   draw what it is sending. What crosses the socket is therefore *both*
   directions of the call, as H.264 access units: 16 KiB a frame against 3.5
   MiB of pixels, and the front end already carries a decoder for the video it
-  plays in a conversation. The open takes the first device unless
-  `OXIDEZAP_CAMERA` names an index or a backend-specific name — which is the
-  answer when index 0 is a virtual camera with nothing behind it, and the log
+  plays in a conversation. A saved camera preference supplies the device and
+  requested mode for the next open. Without one, the open takes the first
+  device unless `OXIDEZAP_CAMERA` names an index or a backend-specific name.
+  That override handles a virtual camera occupying index 0, and the log
   line next to every open (`cameras in reach`) says what there was to choose
   from. Sending the self-view as the very stream the peer
   receives costs one more decode and no second encode, and is the only form
@@ -734,6 +735,30 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   gate is read before a frame is built, because building one copies an access
   unit out of the encoder's buffer — for a call that runs, and a peer that is
   receiving it, whether or not anybody here is looking.
+- **A camera mode must be advertised as one complete tuple.** Both former
+  fallback requests required MJPEG, so a YUYV/NV12-only Media Foundation
+  camera failed twice. Nokhwa's `Closest` request also looks up FPS at the
+  requested resolution after finding a nearby size, so an absent requested
+  size can reject an otherwise usable mode. Capture now discovers
+  supported modes without starting a stream, filters the existing converter
+  formats and H.264/RTP bounds, then opens exact advertised tuples. Resolution
+  and FPS distance rank candidates; MJPEG breaks ties. Stream, conversion
+  setup and encoder failures stop and drop that attempt before another open.
+  The returned quality is the effective capture cadence, including fallback.
+  Inventory retains metadata only. Windows device IDs use Media Foundation's
+  symbolic link, resolved again at open, rather than a saved ordinal.
+  A settings preview owns the same encoded stream through `CameraPreview`,
+  with a `CameraPreviewId` independent of calls. Stopping or dropping its
+  owner releases capture. The bridge must discard a canceled open's late
+  completion and stop it before publishing or opening a replacement.
+  Inventory authorizes AVFoundation before the first query. On macOS the
+  format list comes directly from `AVCaptureDevice::supported_formats` because
+  nokhwa 0.10.11's aggregate API inverts its pixel-format filter and relabels
+  the remaining tuples. Other platforms query every supported converter
+  format explicitly: Media Foundation's aggregate API stops at two pixel
+  formats and can hide a later usable mode.
+  Hardware removal ends the existing capture and owner; a later open queries
+  the current modes again. Tests use a fake backend and channels, not hardware.
 - **Everything on the video path drops, and every drop asks for a keyframe.**
   A frame that cannot be delivered now is worth nothing later, so every queue
   from the encoder to the pane is short and every send is a `try_send`. What

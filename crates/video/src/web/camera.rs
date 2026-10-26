@@ -384,6 +384,15 @@ impl CameraStream {
 /// If the browser has no encoder, if the camera is refused or busy, or if the
 /// encoder will not take Constrained Baseline at these numbers.
 pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
+    open_camera_device(quality, None).await
+}
+
+/// Open a browser device by its opaque inventory ID.
+pub async fn open_camera_device(
+    quality: VideoQuality,
+    device: Option<String>,
+) -> Result<CameraStream> {
+    let quality = quality.checked()?;
     if !is_available() {
         bail!("this browser has no VideoEncoder, so it cannot send a picture");
     }
@@ -406,7 +415,7 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
 
     // Armed before anything else can fail: from here to `Held` the camera is
     // open, and every `?` below would otherwise leave it that way.
-    let guard = open_device(&window, quality).await?;
+    let guard = open_device(&window, quality, device.as_deref()).await?;
     // MediaStream::clone duplicates tracks, not just the JS handle. Borrow so
     // the preview and ended handlers use the tracks the guard will stop.
     let stream = guard.0.as_ref().expect("just armed");
@@ -616,7 +625,11 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
 /// `ideal` rather than `exact`: a device that cannot do 720p20 should give
 /// what it has rather than refuse, and the encoder scales what it is handed.
 /// An `exact` constraint here is a call that fails on a webcam.
-async fn open_device(window: &web_sys::Window, quality: VideoQuality) -> Result<CameraGuard> {
+async fn open_device(
+    window: &web_sys::Window,
+    quality: VideoQuality,
+    device: Option<&str>,
+) -> Result<CameraGuard> {
     let devices = window
         .navigator()
         .media_devices()
@@ -634,6 +647,13 @@ async fn open_device(window: &web_sys::Window, quality: VideoQuality) -> Result<
             &wasm_bindgen::JsValue::from_f64(value),
         );
         let _ = js_sys::Reflect::set(&video, &wasm_bindgen::JsValue::from_str(name), &ideal);
+    }
+    if let Some(device) = device {
+        let exact = js_sys::Object::new();
+        js_sys::Reflect::set(&exact, &"exact".into(), &device.into())
+            .map_err(|e| anyhow!("setting camera device: {}", describe(&e)))?;
+        js_sys::Reflect::set(&video, &"deviceId".into(), &exact)
+            .map_err(|e| anyhow!("setting camera constraint: {}", describe(&e)))?;
     }
     let constraints = web_sys::MediaStreamConstraints::new();
     constraints.set_video(&video);
@@ -1046,4 +1066,44 @@ fn describe(value: &wasm_bindgen::JsValue) -> String {
         .map(|e| String::from(e.message()))
         .or_else(|| value.as_string())
         .unwrap_or_else(|| format!("{value:?}"))
+}
+
+/// Read browser inventory without requesting camera access. Before permission,
+/// labels may be empty and browsers do not expose supported modes here.
+pub async fn enumerate_cameras() -> Result<Vec<crate::CameraDevice>> {
+    let devices = web_sys::window()
+        .ok_or_else(|| anyhow!("no window to enumerate cameras from"))?
+        .navigator()
+        .media_devices()
+        .map_err(|e| anyhow!("no media devices: {}", describe(&e)))?;
+    let listed = devices
+        .enumerate_devices()
+        .map_err(|e| anyhow!("enumerating cameras: {}", describe(&e)))?;
+    let listed = wasm_bindgen_futures::JsFuture::from(listed)
+        .await
+        .map_err(|e| anyhow!("enumerating cameras: {}", describe(&e)))?;
+    let mut cameras = Vec::new();
+    for device in js_sys::Array::from(&listed).iter() {
+        let field = |name: &str| {
+            js_sys::Reflect::get(&device, &name.into())
+                .ok()
+                .and_then(|value| value.as_string())
+                .unwrap_or_default()
+        };
+        if field("kind") != "videoinput" {
+            continue;
+        }
+        let id = field("deviceId");
+        // An empty ID cannot be selected until browser permission is granted.
+        if id.is_empty() {
+            continue;
+        }
+        cameras.push(crate::CameraDevice {
+            id,
+            label: field("label"),
+            is_default: cameras.is_empty(),
+            modes: Vec::new(),
+        });
+    }
+    Ok(cameras)
 }
