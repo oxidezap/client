@@ -24,6 +24,7 @@ mod reaction;
 pub(crate) mod read_state;
 mod receipt;
 mod recovery;
+pub(crate) mod retirement;
 mod revoke;
 pub(crate) mod shared_history;
 mod writer;
@@ -1222,6 +1223,40 @@ mod migration_tests {
         result
     }
 
+    /// Isolate this migration's downgrade edge from later independent
+    /// migrations, rather than assuming a fixed latest version or count.
+    fn rewind_to_retirement_migration(
+        conn: &mut diesel::SqliteConnection,
+    ) -> std::result::Result<(), StoreError> {
+        use diesel::migration::{Migration, MigrationSource};
+        use diesel::sqlite::Sqlite;
+        let migrations: Vec<Box<dyn Migration<Sqlite>>> =
+            MIGRATIONS.migrations().map_err(StoreError::Migration)?;
+        // Diesel strips the directory date's hyphens in the shared ledger.
+        let target = migrations
+            .iter()
+            .find(|migration| migration.name().version().to_string() == "20261026000001")
+            .expect("the account retirement migration is embedded")
+            .name()
+            .version()
+            .as_owned();
+        loop {
+            let applied = conn.applied_migrations().map_err(StoreError::Migration)?;
+            assert!(
+                applied.contains(&target),
+                "retirement migration must remain applied"
+            );
+            let newer = migrations.iter().any(|migration| {
+                let version = migration.name().version();
+                version > target && applied.contains(&version)
+            });
+            if !newer {
+                return Ok(());
+            }
+            revert_last_chat_migration(conn)?;
+        }
+    }
+
     #[tokio::test]
     async fn stable_id_downgrade_round_trips_then_sender_identity_refuses() {
         let store = SqliteStore::open(&format!(
@@ -1231,18 +1266,28 @@ mod migration_tests {
         .await
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
+        store
+            .shared()
+            .run(rewind_to_retirement_migration)
+            .await
+            .expect("isolate the retirement downgrade edge");
 
+        assert!(has_table(&store, "account_retirement").await);
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("an empty retirement journal downgrade is reversible");
+        assert!(!has_table(&store, "account_retirement").await);
         assert!(has_table(&store, "session_recovery").await);
-        // Newer metadata migrations must be reverted before this older schema edge.
-        while has_table(&store, "session_recovery").await {
-            store
-                .shared()
-                .run(revert_last_chat_migration)
-                .await
-                .expect("downgrade through session recovery is reversible");
-        }
+        // The version-targeted retirement rewind already removed newer metadata.
         assert!(!has_table(&store, "audio_played_pending").await);
         assert!(!has_table(&store, "audio_played_receipts").await);
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("session recovery downgrade is reversible");
         assert!(!has_table(&store, "session_recovery").await);
         assert!(has_table(&store, "shared_group_history").await);
         store
@@ -1368,6 +1413,44 @@ mod migration_tests {
             .expect_err("irreversible migration must reject downgrade");
         assert!(error.to_string().contains("migration"));
         assert_eq!(table_count(&store).await, 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_downgrade_preserves_pending_cleanup_and_completed_redirects() {
+        let store = SqliteStore::open(&format!(
+            "file:retirement-downgrade-{}?mode=memory&cache=shared",
+            std::process::id()
+        ))
+        .await
+        .unwrap();
+        ChatStore::prepare(&store).await.unwrap();
+        store
+            .shared()
+            .run(rewind_to_retirement_migration)
+            .await
+            .expect("isolate the retirement downgrade edge");
+        store.shared().run(|conn| {
+            diesel::sql_query("INSERT INTO account_retirement (old_id, successor, pn, lid) VALUES (1, 2, '100001@s.whatsapp.net', '200001@lid')").execute(conn).map(|_| ()).map_err(crate::error::db_err)
+        }).await.unwrap();
+        for complete in [false, true] {
+            if complete {
+                ChatStore::finish_account_retirement(&store, 1)
+                    .await
+                    .unwrap();
+            }
+            store
+                .shared()
+                .run(revert_last_chat_migration)
+                .await
+                .expect_err("journal records cannot be silently discarded by downgrade");
+            let records = ChatStore::account_retirements(&store).await.unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].complete, complete);
+            assert!(
+                !has_table(&store, "retirement_downgrade_guard").await,
+                "failed migration must roll back its guard table"
+            );
+        }
     }
 
     async fn table_count(store: &SqliteStore) -> i64 {

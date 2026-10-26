@@ -19,6 +19,26 @@ impl Default for AccountSelection {
 }
 
 impl AccountSelection {
+    /// Apply only an explicit daemon retirement. Unrelated and stale events
+    /// cannot change this window's chosen identity.
+    pub fn retire(&mut self, account: AccountId, successor: AccountId) -> Option<bool> {
+        if successor.get() <= account.get() {
+            return None;
+        }
+        let active = self.active == account;
+        let retained = self.retained == Some(account);
+        if !active && !retained {
+            return None;
+        }
+        if active {
+            self.active = successor;
+        }
+        if retained || self.retained == Some(self.active) {
+            self.retained = None;
+        }
+        Some(active)
+    }
+
     pub fn load() -> Self {
         if cfg!(test) {
             return Self::default();
@@ -291,6 +311,43 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retirement_reconciles_each_windows_active_and_retained_references() {
+        let old = AccountId::LEGACY;
+        let next = AccountId::new(2).unwrap();
+        let final_id = AccountId::new(3).unwrap();
+        let mut offline = AccountSelection {
+            active: old,
+            retained: None,
+        };
+        let mut paired = AccountSelection {
+            active: next,
+            retained: Some(old),
+        };
+        assert_eq!(offline.retire(old, next), Some(true));
+        assert_eq!(paired.retire(old, next), Some(false));
+        assert_eq!(offline, paired);
+        assert_eq!(paired.retained, None);
+        assert_eq!(offline.retire(next, final_id), Some(true));
+        assert_eq!(
+            offline.retire(old, next),
+            None,
+            "stale event must not move selection backwards"
+        );
+        assert_eq!(
+            offline.retire(final_id, old),
+            None,
+            "invalid cycle must be ignored"
+        );
+        let raw = serde_json::to_string(&offline).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AccountSelection>(&raw)
+                .unwrap()
+                .active,
+            final_id
+        );
+    }
 
     #[test]
     fn a_reloaded_selection_keeps_the_active_and_retained_accounts_distinct() {

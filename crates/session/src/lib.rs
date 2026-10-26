@@ -19,7 +19,9 @@ mod whatsapp;
 pub use whatsapp::{OutgoingAcceptCase, outgoing_accept_events};
 
 pub use exec::{Cancelled, Task, sleep, spawn, unblock, with_timeout};
-pub use store::{StoreRegistry, StoredAccount};
+pub use store::{
+    StoreRegistry, StoredAccount, is_durable as store_is_durable, same_account_identity,
+};
 pub use video::{CameraPreview, set_camera_preferences};
 pub use whatsapp::{
     AvatarRecorder, BackfillFile, BackfillReport, ChannelView, ContactCheckView, ContactView,

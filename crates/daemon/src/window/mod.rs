@@ -101,6 +101,25 @@ impl Toggle {
         self.click_at(hub, Instant::now());
     }
 
+    /// Toggle all current account windows as one daemon-wide gesture.
+    pub fn click_every(&mut self, hubs: Vec<std::sync::Arc<StateHub>>) {
+        let now = Instant::now();
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < SAME_GESTURE)
+        {
+            return;
+        }
+        self.last = Some(now);
+        if hubs.iter().any(|hub| hub.windows_attached()) {
+            for hub in hubs {
+                hide(&hub);
+            }
+        } else {
+            show_every(hubs);
+        }
+    }
+
     /// [`Self::click`], at a moment the caller names. Split so a test can
     /// place two clicks a known distance apart without sleeping between
     /// them.

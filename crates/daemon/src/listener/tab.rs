@@ -200,8 +200,10 @@ fn accept(
     let staged: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
 
     let (client, server) = tokio::io::duplex(PIPE);
+    let serving_registry = Arc::clone(&registry);
     oxidezap_session::spawn(async move {
-        if let Err(e) = crate::server::serve_client_with_registry(Box::new(server), registry).await
+        if let Err(e) =
+            crate::server::serve_client_with_registry(Box::new(server), serving_registry).await
         {
             log::debug!("a tab disconnected: {e}");
         }
@@ -234,7 +236,7 @@ fn accept(
     // refused the connection, which is the one symptom that reached a
     // console — from the *asking* tab, naming a frame it had sent perfectly
     // well. Nothing about it pointed here.
-    let handling = handler(&frames, &requests, &staged);
+    let handling = handler(&frames, &requests, &staged, Arc::clone(&registry));
     frames.set_onmessage(Some(handling.as_ref().unchecked_ref()));
     let open = Rc::new(RefCell::new(Some(Connection {
         channel: frames.clone(),
@@ -344,6 +346,7 @@ fn handler(
     frames: &BroadcastChannel,
     requests: &tokio::sync::mpsc::UnboundedSender<String>,
     staged: &Rc<RefCell<HashSet<String>>>,
+    registry: Arc<AccountRegistry>,
 ) -> Closure<dyn FnMut(MessageEvent)> {
     let frames = frames.clone();
     let requests = requests.clone();
@@ -406,6 +409,16 @@ fn handler(
                 ) else {
                     return;
                 };
+                let account =
+                    oxidezap_ipc::account_id_of(&key).unwrap_or(oxidezap_core::AccountId::LEGACY);
+                if registry
+                    .get(account)
+                    .is_none_or(|runtime| runtime.is_stopping())
+                    || registry.retirement_target(account).is_some()
+                {
+                    let _ = post_failure(&frames, "staged", id, "account is unavailable");
+                    return;
+                }
                 let _ = match crate::media::put_owned(&key, bytes) {
                     Ok(_) => {
                         staged.borrow_mut().insert(key);

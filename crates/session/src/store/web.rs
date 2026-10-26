@@ -145,7 +145,7 @@ pub async fn prepare() -> Result<(), String> {
 /// backends differ in exactly the place durability is decided: one accepts
 /// the pragma that describes when a write has landed, and the other has no
 /// disk at the moment of the write to describe.
-fn is_durable() -> bool {
+pub fn is_durable() -> bool {
     STORE.with(|cell| matches!(cell.get(), Some(Backend::Durable(_))))
 }
 

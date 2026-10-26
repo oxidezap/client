@@ -55,6 +55,8 @@ fn attached(session_events: bool, owns_window: bool, call_video: bool) -> Attach
         read_only: false,
         is_wire: false,
         wire_hello_id: None,
+        wire_account: None,
+        account_selection: false,
     }
 }
 
@@ -1332,6 +1334,8 @@ async fn a_wire_client_that_lags_is_disconnected_rather_than_stalled() {
     let wire_hello = serde_json::to_string(&RequestEnvelope {
         id: 1,
         request: WireRequest::Hello {
+            local_account: None,
+            account_selection: false,
             protocol: oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION,
             client_name: "test".into(),
             read_only: false,
@@ -1899,6 +1903,8 @@ async fn wire_hello_and_diagnostics_flow() {
     let wire_hello = serde_json::to_string(&RequestEnvelope {
         id: 1,
         request: WireRequest::Hello {
+            local_account: None,
+            account_selection: false,
             protocol: oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION,
             client_name: "test-client".into(),
             read_only: true,
@@ -2504,4 +2510,82 @@ async fn offline_and_terminal_audio_observations_reach_only_the_local_action() {
         assert!(!action.needs_network());
         assert!(!hub.connection().is_connected());
     }
+}
+
+#[tokio::test]
+async fn scoped_wire_hello_confirms_successor_and_never_rebinds_after_selection_changes() {
+    use oxidezap_wire::{
+        envelope::{RequestEnvelope, ResponseEnvelope, ResponseResult},
+        request::ClientRequest as WireRequest,
+        response::DaemonResponse as WireResponse,
+    };
+    let registry = AccountRegistry::new();
+    let successor = oxidezap_core::AccountId::new(2).unwrap();
+    let hub = StateHub::for_account(successor);
+    hub.apply(crate::state::Change::live(
+        oxidezap_ipc::DaemonEvent::ConnectionChanged(oxidezap_ipc::ConnectionState::Connected),
+    ));
+    let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+    registry.insert(Arc::new(AccountRuntime::new(
+        successor,
+        Arc::clone(&hub),
+        no_plugins(),
+        commands,
+    )));
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let served = tokio::spawn(serve_client_with_registry(
+        Box::new(server),
+        Arc::clone(&registry),
+    ));
+    let hello = RequestEnvelope {
+        id: 1,
+        request: WireRequest::Hello {
+            protocol: oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION,
+            client_name: "synthetic".into(),
+            local_account: None,
+            account_selection: true,
+            read_only: true,
+            session_events: false,
+        },
+    };
+    client
+        .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(serde_json::from_str::<ResponseEnvelope>(&line).unwrap().result,
+        ResponseResult::Ok { payload } if *payload == WireResponse::AccountSelected { local_account: 2 })
+    );
+
+    // A different account now owns a window. The established connection still
+    // reads the selected successor, rather than following a new default.
+    let other_id = oxidezap_core::AccountId::new(3).unwrap();
+    let other = StateHub::for_account(other_id);
+    let _window = other.attach_window();
+    let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+    registry.insert(Arc::new(AccountRuntime::new(
+        other_id,
+        other,
+        no_plugins(),
+        commands,
+    )));
+    let request = RequestEnvelope {
+        id: 2,
+        request: WireRequest::GetStatus,
+    };
+    reader
+        .get_mut()
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        matches!(serde_json::from_str::<ResponseEnvelope>(&line).unwrap().result,
+        ResponseResult::Ok { payload } if matches!(*payload, WireResponse::Status(ref status) if status.state == "connected"))
+    );
+    served.abort();
 }

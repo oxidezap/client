@@ -27,6 +27,12 @@ pub enum ClientRequest {
     Hello {
         protocol: u32,
         client_name: String,
+        /// Local SQLite account within this daemon, independent of its profile/socket.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_account: Option<i32>,
+        /// Require account-selection acknowledgement before any business request.
+        #[serde(default)]
+        account_selection: bool,
         read_only: bool,
         session_events: bool,
     },

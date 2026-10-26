@@ -143,17 +143,19 @@ pub(super) struct Attached {
     pub(super) is_wire: bool,
     /// Wire hello request ID.
     pub(super) wire_hello_id: Option<u64>,
+    pub(super) wire_account: Option<i32>,
+    pub(super) account_selection: bool,
 }
 
 impl Attached {
-    /// A wire-protocol client, bound to the daemon's default account.
-    ///
-    /// The wire hello predates account scoping and carries no account: the CLI
-    /// reaches whichever daemon owns the socket it connected to. On a
-    /// multi-account daemon that is the legacy slot, which every install has
-    /// and which a fresh one allocates first; a wire client that wants another
-    /// local account is a follow-up, not a wire field yet.
-    pub(super) fn wire(session_events: bool, read_only: bool, wire_hello_id: Option<u64>) -> Self {
+    /// Wire account selection is resolved once against the registry before attachment.
+    pub(super) fn wire(
+        session_events: bool,
+        read_only: bool,
+        wire_hello_id: Option<u64>,
+        wire_account: Option<i32>,
+        account_selection: bool,
+    ) -> Self {
         Self {
             session_events,
             scope: ClientScope::Account {
@@ -164,6 +166,8 @@ impl Attached {
             read_only,
             is_wire: true,
             wire_hello_id,
+            wire_account,
+            account_selection,
         }
     }
 }
@@ -179,11 +183,19 @@ pub(super) fn check_hello(line: &str) -> Result<Attached, Option<String>> {
             oxidezap_wire::request::ClientRequest::Hello {
                 protocol,
                 client_name: _,
+                local_account,
+                account_selection,
                 read_only,
                 session_events,
             } => {
                 if protocol == oxidezap_wire::envelope::CURRENT_PROTOCOL_VERSION {
-                    Ok(Attached::wire(session_events, read_only, Some(env.id)))
+                    Ok(Attached::wire(
+                        session_events,
+                        read_only,
+                        Some(env.id),
+                        local_account,
+                        account_selection,
+                    ))
                 } else {
                     let err = oxidezap_wire::envelope::ResponseEnvelope {
                         id: Some(env.id),
@@ -232,6 +244,8 @@ pub(super) fn check_hello(line: &str) -> Result<Attached, Option<String>> {
             read_only: false,
             is_wire: false,
             wire_hello_id: None,
+            wire_account: None,
+            account_selection: false,
         }),
         ClientRequest::Hello { protocol, .. } => Err(always(
             id,
