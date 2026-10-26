@@ -120,16 +120,13 @@ mod imp {
         tone: Ringtone,
         stop: Arc<AtomicBool>,
     ) -> Result<RingtonePlayback> {
-        let guard = RingtonePlayback(stop.clone());
         if tone == Ringtone::Silent {
-            return Ok(guard);
+            return Ok(RingtonePlayback(stop));
         }
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let opened = (|| -> Result<_> {
-                if stop.load(Ordering::Acquire) {
-                    anyhow::bail!("ringtone cancelled");
-                }
+        start_worker(
+            stop,
+            Duration::from_secs(5),
+            move |stop| {
                 let device = select(output.as_deref(), false)?;
                 let (config, format) = crate::call_device::default_config(&device, false)?;
                 let (producer, consumer) =
@@ -155,30 +152,152 @@ mod imp {
                 }
                 stream.play()?;
                 Ok((stream, config.sample_rate, producer))
-            })();
-            let Ok((_stream, rate, mut producer)) = opened else {
-                let _ = ready_tx.send(Err(anyhow!("ringtone output could not start")));
-                return;
-            };
-            let _ = ready_tx.send(Ok(()));
-            let mut frame = 0;
-            while !stop.load(Ordering::Acquire) {
-                for _ in 0..(rate / 100) {
-                    if producer
-                        .try_push(ringtone_sample(tone, frame, rate))
-                        .is_err()
-                    {
-                        break;
+            },
+            move |(_stream, rate, mut producer), stop| {
+                let mut frame = 0;
+                while !stop.load(Ordering::Acquire) {
+                    for _ in 0..(rate / 100) {
+                        if producer
+                            .try_push(ringtone_sample(tone, frame, rate))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        frame += 1;
                     }
-                    frame += 1;
+                    std::thread::park_timeout(Duration::from_millis(5));
                 }
-                std::thread::park_timeout(Duration::from_millis(5));
+            },
+        )
+    }
+
+    fn start_worker<T: 'static>(
+        stop: Arc<AtomicBool>,
+        timeout: Duration,
+        open: impl FnOnce(Arc<AtomicBool>) -> Result<T> + Send + 'static,
+        run: impl FnOnce(T, Arc<AtomicBool>) + Send + 'static,
+    ) -> Result<RingtonePlayback> {
+        let guard = RingtonePlayback(stop.clone());
+        if stop.load(Ordering::Acquire) {
+            anyhow::bail!("ringtone cancelled");
+        }
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || match open(stop.clone()) {
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+            }
+            Ok(output) => {
+                if stop.load(Ordering::Acquire) {
+                    let _ = ready_tx.send(Err(anyhow!("ringtone cancelled")));
+                    return;
+                }
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                run(output, stop);
             }
         });
         ready_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(timeout)
             .map_err(|_| anyhow!("ringtone output startup timed out"))??;
         Ok(guard)
+    }
+
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::*;
+        use std::sync::mpsc;
+        struct FakeOutput(mpsc::Sender<()>);
+        impl Drop for FakeOutput {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        #[test]
+        fn cancellation_while_opening_drops_late_output() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let token = stop.clone();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (dropped_tx, dropped_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                start_worker(
+                    token,
+                    Duration::from_secs(5),
+                    move |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(FakeOutput(dropped_tx))
+                    },
+                    |_, _| panic!("cancelled output must never run"),
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            stop.store(true, Ordering::Release);
+            release_tx.send(()).unwrap();
+            assert!(worker.join().unwrap().is_err());
+            dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        #[test]
+        fn startup_timeout_disowns_the_output_that_finishes_later() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let token = stop.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (dropped_tx, dropped_rx) = mpsc::channel();
+            let result = start_worker(
+                token,
+                Duration::from_millis(10),
+                move |_| {
+                    release_rx.recv().unwrap();
+                    Ok(FakeOutput(dropped_tx))
+                },
+                |_, _| panic!("timed out output must never run"),
+            );
+            assert!(result.is_err());
+            assert!(stop.load(Ordering::Acquire));
+            release_tx.send(()).unwrap();
+            dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        #[test]
+        fn dropping_successful_playback_releases_its_output() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (dropped_tx, dropped_rx) = mpsc::channel();
+            let playback = start_worker(
+                stop.clone(),
+                Duration::from_secs(5),
+                move |_| Ok(FakeOutput(dropped_tx)),
+                |output, stop| {
+                    let _output = output;
+                    while !stop.load(Ordering::Acquire) {
+                        std::thread::park_timeout(Duration::from_millis(1));
+                    }
+                },
+            )
+            .unwrap();
+            drop(playback);
+            assert!(stop.load(Ordering::Acquire));
+            dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        #[test]
+        fn output_failure_preserves_the_original_cause() {
+            let error = start_worker::<()>(
+                Arc::new(AtomicBool::new(false)),
+                Duration::from_secs(5),
+                |_| Err(anyhow!("selected audio device is unavailable")),
+                |_, _| {},
+            )
+            .err()
+            .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("selected audio device is unavailable")
+            );
+        }
     }
 }
 
