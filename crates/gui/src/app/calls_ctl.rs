@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct AlertWork {
     key: AlertKey,
     cancelled: Arc<AtomicBool>,
+    ringtone_cancelled: Arc<AtomicBool>,
     retired: Arc<AtomicBool>,
     _task: Task<()>,
     owner: Option<IncomingCallAlert>,
@@ -25,6 +26,7 @@ struct AlertWork {
 impl Drop for AlertWork {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+        self.ringtone_cancelled.store(true, Ordering::Release);
     }
 }
 
@@ -615,19 +617,22 @@ impl Calls {
             return;
         };
         let cancelled = Arc::new(AtomicBool::new(false));
+        let ringtone_cancelled = Arc::new(AtomicBool::new(false));
         let retired = Arc::new(AtomicBool::new(false));
         let retire_task = retired.clone();
         let cancel_task = cancelled.clone();
+        let ringtone_task = ringtone_cancelled.clone();
         let task_key = key.clone();
         let task = cx.spawn(async move |me: WeakEntity<Self>, cx| {
             loop {
                 let cancel = cancel_task.clone();
+                let ringtone_cancel = ringtone_task.clone();
                 let account = task_key.account;
                 let tag = task_key.tag();
                 let retire = retire_task.clone();
                 let claimed = cx
                     .background_spawn(async move {
-                        IncomingCallAlert::claim(account, tag, cancel, retire)
+                        IncomingCallAlert::claim(account, tag, cancel, ringtone_cancel, retire)
                     })
                     .await;
                 let mut owner = match claimed {
@@ -700,6 +705,7 @@ impl Calls {
         self.alert_work = Some(AlertWork {
             key,
             cancelled,
+            ringtone_cancelled,
             retired,
             _task: task,
             owner: None,
@@ -1653,10 +1659,12 @@ mod call_alert_review_regressions {
             call_id: "pending-output".into(),
         };
         let cancelled = Arc::new(AtomicBool::new(false));
+        let ringtone_cancelled = Arc::new(AtomicBool::new(false));
         calls.update(cx, |calls, cx| {
             calls.alert_work = Some(AlertWork {
                 key: key.clone(),
                 cancelled: cancelled.clone(),
+                ringtone_cancelled: ringtone_cancelled.clone(),
                 retired: Arc::new(AtomicBool::new(false)),
                 _task: Task::ready(()),
                 owner: None,
@@ -1674,6 +1682,7 @@ mod call_alert_review_regressions {
             calls.stop_alert(false, cx);
         });
         assert!(cancelled.load(Ordering::Acquire));
+        assert!(ringtone_cancelled.load(Ordering::Acquire));
         assert!(cx.delivered_system_notifications().is_empty());
         assert_eq!(cx.shown_system_notifications().len(), 1);
         assert_eq!(cx.dismissed_system_notifications(), [key.tag()]);
@@ -1721,6 +1730,7 @@ mod call_alert_review_regressions {
             calls.alert_work = Some(AlertWork {
                 key,
                 cancelled: Arc::new(AtomicBool::new(false)),
+                ringtone_cancelled: Arc::new(AtomicBool::new(false)),
                 retired: Arc::new(AtomicBool::new(false)),
                 _task: Task::ready(()),
                 owner: None,
@@ -1757,6 +1767,7 @@ mod call_control_tests {
                 calls.alert_work = Some(AlertWork {
                     key: key.clone(),
                     cancelled: cancelled.clone(),
+                    ringtone_cancelled: Arc::new(AtomicBool::new(false)),
                     retired: retired.clone(),
                     _task: Task::ready(()),
                     owner: None,
