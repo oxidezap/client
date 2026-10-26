@@ -1048,6 +1048,8 @@ impl WhatsAppApp {
 
     /// Start a call to the specified JID.
     pub fn start_call(&mut self, recipient_jid: String, is_video: bool, cx: &mut Context<Self>) {
+        let prepared_video =
+            is_video && self.take_call_setup_approval(&recipient_jid, is_video, cx);
         // Offline is a read-only state, and the socket outlives it: the
         // "call back" under a missed call reached the daemon from a window
         // that had stopped waiting for a connection, and drew an outgoing
@@ -1115,7 +1117,7 @@ impl WhatsAppApp {
             false
         };
 
-        if is_video && !self.take_call_setup_approval(&recipient_jid, is_video, cx) {
+        if is_video && !prepared_video {
             self.prepare_call(recipient_jid, is_video, cx);
             return;
         }
