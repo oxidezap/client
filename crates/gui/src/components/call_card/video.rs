@@ -11,7 +11,10 @@
 //! no frame for a camera that is on is a camera whose first frame has not
 //! arrived — which is a second, not a state worth naming.
 
-use gpui::{App, Entity, IntoElement, ParentElement, Styled, StyledImage as _, div, img};
+use gpui::{
+    App, Entity, InteractiveElement as _, IntoElement, ParentElement, Styled, StyledImage as _,
+    div, img,
+};
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::ButtonVariants as _;
 use gpui_component::{Disableable as _, Icon, Selectable as _};
@@ -29,6 +32,7 @@ pub fn active_video(
     call: &ActiveCall,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    picture_height: gpui::Pixels,
     app: &WhatsAppApp,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -39,16 +43,25 @@ pub fn active_video(
             format!("{} · {}", call.peer_name, call.elapsed_label()),
             entity.clone(),
             metrics,
+            app.call_maximized(cx),
             cx,
         ))
-        .child(panes(
-            call,
-            app,
-            metrics,
-            metrics.call_card_width() * 0.62,
-            cx,
-        ))
+        .child(panes(call, app, metrics, picture_height, cx))
         .child(video_controls(call, entity, metrics, app, cx))
+}
+
+pub(super) fn picture_height(
+    available: gpui::Pixels,
+    controls: gpui::Pixels,
+    normal: gpui::Pixels,
+    maximized: bool,
+) -> gpui::Pixels {
+    let remaining = (available - controls).max(gpui::px(0.0));
+    if maximized {
+        remaining
+    } else {
+        normal.min(remaining)
+    }
 }
 
 /// The peer's picture with ours inset in the corner, which is how every
@@ -68,6 +81,7 @@ pub(super) fn panes(
     let local = app.call_picture(VideoStream::Local, cx).cloned();
     div()
         .relative()
+        .debug_selector(|| "call-video-panes".into())
         .m(metrics.space_lg())
         .h(height)
         .rounded(metrics.radius_lg())
@@ -184,6 +198,7 @@ pub fn active_group(
             ),
             entity.clone(),
             metrics,
+            app.call_maximized(cx),
             cx,
         ))
         .child(
@@ -268,7 +283,9 @@ fn video_controls(
 
     div()
         .w_full()
+        .debug_selector(|| "call-video-controls".into())
         .flex()
+        .flex_shrink_0()
         .items_center()
         .justify_center()
         .gap(metrics.space_lg())
@@ -332,4 +349,34 @@ fn video_controls(
                     end_entity.update(cx, |app, cx| app.hang_up(cx));
                 }),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::picture_height;
+    use gpui::px;
+
+    #[test]
+    fn video_shrinks_before_controls_when_the_viewport_shrinks() {
+        assert_eq!(
+            picture_height(px(700.0), px(180.0), px(210.0), false),
+            px(210.0)
+        );
+        assert_eq!(
+            picture_height(px(700.0), px(180.0), px(210.0), true),
+            px(520.0)
+        );
+        assert_eq!(
+            picture_height(px(220.0), px(180.0), px(210.0), false),
+            px(40.0)
+        );
+        assert_eq!(
+            picture_height(px(220.0), px(180.0), px(210.0), true),
+            px(40.0)
+        );
+        assert_eq!(
+            picture_height(px(100.0), px(180.0), px(210.0), true),
+            px(0.0)
+        );
+    }
 }

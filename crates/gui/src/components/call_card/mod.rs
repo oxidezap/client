@@ -61,7 +61,7 @@ pub fn render_call_card(
 
     // Mobile has nowhere to float a card without covering the conversation, so
     // the call becomes a banner pinned under the header instead.
-    if layout.is_mobile() {
+    if layout.is_mobile() && !card.is_maximized() {
         let waiting = state
             .waiting()
             .map(|waiting| waiting_strip(waiting.caller_name(), entity.clone(), metrics, cx));
@@ -107,7 +107,11 @@ pub fn render_call_card(
     // Clamped for drawing without disturbing what was stored: a window that
     // shrinks and grows again puts the card back where it was put.
     let inset = metrics.space_xxl();
-    let offset = card.drawn_offset(layout.viewport(), inset);
+    let offset = if card.is_maximized() {
+        gpui::Point::default()
+    } else {
+        card.drawn_offset(layout.viewport(), inset)
+    };
     // Filled in as the card is painted, and read on the next drag. One frame
     // behind only on the very first paint, when nothing is being dragged yet.
     let measurement = card.measurement();
@@ -228,11 +232,18 @@ fn expanded_card(
     let wide = stage
         .active()
         .map_or_else(|| stage.is_video(), ActiveCall::shows_video);
-    let width = if wide {
+    let available = gpui::Size {
+        width: (layout.viewport().width - metrics.space_xxl() * 2.0).max(gpui::px(0.0)),
+        height: (layout.viewport().height - metrics.space_xxl() * 2.0).max(gpui::px(0.0)),
+    };
+    let width = if card.is_maximized() {
+        available.width
+    } else if wide {
         metrics.call_card_width_wide()
     } else {
         metrics.call_card_width()
-    };
+    }
+    .min(available.width);
 
     let body = match stage {
         Stage::Incoming(call) => {
@@ -242,7 +253,24 @@ fn expanded_card(
             ringing::outgoing(call, entity.clone(), metrics, cx).into_any_element()
         }
         Stage::Active(call) if call.shows_video() => {
-            video::active_video(call, entity.clone(), metrics, app, cx).into_any_element()
+            let waiting_height = if app.call_state(cx).waiting().is_some() {
+                metrics.touch_target() + metrics.space_lg()
+            } else {
+                gpui::px(0.0)
+            };
+            let reserved = waiting_height
+                + metrics.call_drag_handle_height()
+                + metrics.touch_target()
+                + metrics.call_control()
+                + metrics.space_xl() * 4.0;
+            let picture_height = video::picture_height(
+                available.height,
+                reserved,
+                metrics.call_card_width() * 0.62,
+                card.is_maximized(),
+            );
+            video::active_video(call, entity.clone(), metrics, picture_height, app, cx)
+                .into_any_element()
         }
         Stage::Active(call) => active::active_audio(
             call,
@@ -254,6 +282,7 @@ fn expanded_card(
             // camera is on, and the seconds a device takes to open are the
             // ones the control has to account for.
             app.call_video_showing(cx),
+            card.is_maximized(),
             cx,
         )
         .into_any_element(),
@@ -276,7 +305,9 @@ fn expanded_card(
         // sits above everything and must not read as part of the page.
         .shadow_2xl()
         .overflow_hidden()
-        .child(drag_handle(card, entity.clone(), layout, metrics, cx))
+        .when(!card.is_maximized(), |el| {
+            el.child(drag_handle(card, entity.clone(), layout, metrics, cx))
+        })
         .child(body)
 }
 

@@ -1465,7 +1465,11 @@ impl WhatsAppApp {
             saved_documents: HashMap::new(),
             document_downloads_in_flight: std::collections::HashSet::new(),
             document_state_generation: 0,
-            calls: cx.new(|_| calls_ctl::Calls::new()),
+            calls: cx.new(|cx| {
+                cx.on_release(|calls: &mut calls_ctl::Calls, cx| calls.silence_alerts(cx))
+                    .detach();
+                calls_ctl::Calls::new()
+            }),
             plugins: cx.new(|_| plugins_ctl::Plugins::new()),
             search: cx.new(|_| search::Search::new()),
             name_cache: HashMap::new(),
@@ -2351,6 +2355,7 @@ impl WhatsAppApp {
     /// while an error or logout replaces it. In all three cases, controls
     /// whose work belongs to the live connection must stop here.
     fn leave_connected_view(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.calls.update(cx, |calls, cx| calls.silence_alerts(cx));
         // The window-scoped text selection outlives the conversation's rows.
         // Clear it with the rest of the connected view so Copy cannot expose
         // hidden message text after a disconnect, error, or logout. Account
@@ -3781,6 +3786,9 @@ impl WhatsAppApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.open_call_notification(tag, cx) {
+            return;
+        }
         self.latest_notification_tag = Some(tag.to_string());
         if let Some(jid) = notification_chat_jid(&self.chats, tag) {
             remove_pending_notification(&mut self.pending_notification_tags, tag);

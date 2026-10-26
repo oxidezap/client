@@ -5,6 +5,8 @@
 //! installed its response delegate, but before a message can arrive, avoids
 //! making the first incoming message race the macOS permission sheet.
 
+pub mod call_alert;
+
 /// Ask the operating system for notification authorization when it has one.
 pub fn request_authorization() {
     imp::request_authorization();

@@ -8,6 +8,25 @@ use oxidezap_core::{IncomingCall, VideoStream};
 use super::*;
 use crate::video::CallFrame;
 
+mod alerts;
+use crate::platform::notifications::call_alert::IncomingCallAlert;
+use alerts::{AlertKey, CallAlerts};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+struct AlertWork {
+    key: AlertKey,
+    cancelled: Arc<AtomicBool>,
+    retired: Arc<AtomicBool>,
+    _task: Task<()>,
+    owner: Option<IncomingCallAlert>,
+}
+
+impl Drop for AlertWork {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
 /// The newest picture of each direction of the call on screen.
 ///
 /// One frame per direction and nothing behind it. A queue here would be
@@ -128,6 +147,8 @@ pub(super) struct Calls {
     /// Repaints the call duration, and expires stale typing notices. Only
     /// alive while there is something to tick.
     tick: Option<Task<()>>,
+    alerts: CallAlerts,
+    alert_work: Option<AlertWork>,
 }
 
 impl Calls {
@@ -139,6 +160,8 @@ impl Calls {
             video_asked: None,
             muted_asked: None,
             tick: None,
+            alerts: CallAlerts::default(),
+            alert_work: None,
         }
     }
 
@@ -355,6 +378,13 @@ impl Calls {
         cx.notify();
     }
 
+    pub(super) fn toggle_maximized(&mut self, cx: &mut Context<Self>) {
+        if self.state.active().is_some() {
+            self.card.toggle_maximized();
+            cx.notify();
+        }
+    }
+
     /// Bring a minimised call back, or leave an open card alone.
     pub(super) fn unminimize(&mut self, cx: &mut Context<Self>) {
         if self.state.is_busy() {
@@ -504,6 +534,8 @@ impl Calls {
     /// record is written into the account that has just been paired —
     /// recreating a chat for the old account's peer to hold it.
     pub(super) fn forget(&mut self, cx: &mut Context<Self>) {
+        self.stop_alert(false, cx);
+        self.alerts = CallAlerts::default();
         self.state = CallState::new();
         self.card.call_ended();
         // Including the pictures: a frame of the old account's peer left in a
@@ -512,6 +544,145 @@ impl Calls {
         self.video_asked = None;
         self.muted_asked = None;
         cx.notify();
+    }
+
+    fn stop_alert(&mut self, retire: bool, cx: &App) {
+        if let Some(work) = self.alert_work.take() {
+            work.retired.store(retire, Ordering::Release);
+            cx.dismiss_system_notification(&work.key.tag());
+            drop(work);
+        }
+    }
+
+    pub(super) fn silence_alerts(&mut self, cx: &App) {
+        if let Some((key, _)) = self.alerts.target.take() {
+            self.alerts.dismiss(key.account, &key.call_id);
+        }
+        self.stop_alert(false, cx);
+    }
+
+    fn dismiss_alert(&mut self, account: oxidezap_core::AccountId, call_id: &str) {
+        self.alerts.dismiss(account, call_id);
+    }
+
+    fn sync_alert(
+        &mut self,
+        account: Option<oxidezap_core::AccountId>,
+        app: WeakEntity<WhatsAppApp>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.alerts.follow(account, &self.state) {
+            return;
+        }
+        let retire = self
+            .alert_work
+            .as_ref()
+            .is_some_and(|work| Some(work.key.account) == account);
+        self.stop_alert(retire, cx);
+        if !crate::platform::notifications::call_alert::supported() {
+            return;
+        }
+        let Some((key, call)) = self.alerts.target.clone() else {
+            return;
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let retired = Arc::new(AtomicBool::new(false));
+        let retire_task = retired.clone();
+        let cancel_task = cancelled.clone();
+        let task_key = key.clone();
+        let task = cx.spawn(async move |me: WeakEntity<Self>, cx| {
+            loop {
+                let cancel = cancel_task.clone();
+                let account = task_key.account;
+                let tag = task_key.tag();
+                let retire = retire_task.clone();
+                let claimed = cx
+                    .background_spawn(async move {
+                        IncomingCallAlert::claim(account, tag, cancel, retire)
+                    })
+                    .await;
+                let mut owner = match claimed {
+                    Ok(Some(owner)) => owner,
+                    Ok(None) if !cancel_task.load(Ordering::Acquire) => {
+                        crate::platform::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        log::warn!("cannot own the incoming call alert: {error}");
+                        break;
+                    }
+                };
+                let current = me
+                    .update(cx, |calls, cx| {
+                        if cancel_task.load(Ordering::Acquire)
+                            || calls
+                                .alert_work
+                                .as_ref()
+                                .is_none_or(|work| work.key != task_key)
+                        {
+                            return false;
+                        }
+                        cx.show_system_notification(SystemNotification {
+                            tag: task_key.tag().into(),
+                            title: crate::utils::capped_name(&call.caller_name).into(),
+                            body: if call.is_video {
+                                "Incoming video call"
+                            } else {
+                                "Incoming voice call"
+                            }
+                            .into(),
+                            actions: Vec::new(),
+                        });
+                        true
+                    })
+                    .unwrap_or(false);
+                if !current {
+                    break;
+                }
+                let preferences = loop {
+                    if cancel_task.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match app.update(cx, |app, cx| {
+                        app.call_device_preferences_ready(cx)
+                            .then(|| app.call_device_preferences(cx))
+                    }) {
+                        Ok(Some(preferences)) => break preferences,
+                        Ok(None) => {
+                            crate::platform::sleep(std::time::Duration::from_millis(100)).await
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let ready = cx
+                    .background_spawn(async move {
+                        if let Err(error) = owner.play(preferences) {
+                            log::warn!("incoming call ringtone failed: {error:#}");
+                        }
+                        owner
+                    })
+                    .await;
+                let _ = me.update(cx, |calls, _| {
+                    if !cancel_task.load(Ordering::Acquire)
+                        && let Some(work) = calls
+                            .alert_work
+                            .as_mut()
+                            .filter(|work| work.key == task_key)
+                    {
+                        work.owner = Some(ready);
+                    }
+                });
+                break;
+            }
+        });
+        self.alert_work = Some(AlertWork {
+            key,
+            cancelled,
+            retired,
+            _task: task,
+            owner: None,
+        });
     }
 
     /// Keep a one-second repaint alive while a call is up.
@@ -686,9 +857,13 @@ impl WhatsAppApp {
             return;
         };
         client.accept_call(call.call_id.as_str());
+        let account = client.account();
         let app = cx.entity().downgrade();
-        self.calls
-            .update(cx, |calls, cx| calls.accepted(&call, app, cx));
+        self.calls.update(cx, |calls, cx| {
+            calls.dismiss_alert(account, &call.call_id);
+            calls.accepted(&call, app, cx);
+        });
+        self.sync_call_alerts(cx);
     }
 
     /// Turn this window's camera on or off.
@@ -770,7 +945,11 @@ impl WhatsAppApp {
         info!("Declining waiting call {call_id}");
         if let Some(client) = &self.client {
             client.decline_call(call_id.as_str());
+            let account = client.account();
+            self.calls
+                .update(cx, |calls, _| calls.dismiss_alert(account, &call_id));
         }
+        self.sync_call_alerts(cx);
         self.record_call(ended, cx);
     }
 
@@ -790,7 +969,11 @@ impl WhatsAppApp {
         );
         if let Some(client) = &self.client {
             client.decline_call(call.call_id.as_str());
+            let account = client.account();
+            self.calls
+                .update(cx, |calls, _| calls.dismiss_alert(account, &call.call_id));
         }
+        self.sync_call_alerts(cx);
         // A refusal is not a missed call, and a local reject emits no
         // `CallEnded` to write one later — so the record is made here, saying
         // what actually happened. The mobile decline goes through `hang_up`,
@@ -832,6 +1015,15 @@ impl WhatsAppApp {
     pub fn set_call_minimized(&mut self, minimized: bool, cx: &mut Context<Self>) {
         self.calls
             .update(cx, |calls, cx| calls.set_minimized(minimized, cx));
+    }
+
+    pub fn call_maximized(&self, cx: &App) -> bool {
+        self.calls.read(cx).card().is_maximized()
+    }
+
+    pub fn toggle_call_maximized(&mut self, cx: &mut Context<Self>) {
+        self.calls
+            .update(cx, |calls, cx| calls.toggle_maximized(cx));
     }
 
     pub fn begin_call_drag(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
@@ -995,8 +1187,33 @@ impl WhatsAppApp {
         for call in ended {
             self.record_call(call, cx);
         }
+        self.sync_call_alerts(cx);
         // Fair readiness can precede this state. Its picture is still in the slot.
         self.draw_waiting_call_frames(cx);
+    }
+
+    fn sync_call_alerts(&mut self, cx: &mut Context<Self>) {
+        let account = self.client.as_ref().map(Session::account);
+        let app = cx.entity().downgrade();
+        self.calls
+            .update(cx, |calls, cx| calls.sync_alert(account, app, cx));
+    }
+
+    pub(super) fn open_call_notification(&mut self, tag: &str, cx: &mut Context<Self>) -> bool {
+        if !tag.starts_with("oxidezap-call-") {
+            return false;
+        }
+        let current = self
+            .calls
+            .read(cx)
+            .alerts
+            .target
+            .as_ref()
+            .is_some_and(|(key, _)| key.tag() == tag);
+        if current {
+            self.return_to_call(cx);
+        }
+        true
     }
 
     /// Hand the keyboard to whichever overlay should have it, and hand it
@@ -1387,6 +1604,208 @@ mod keyboard_owner_tests {
             ),
             KeyboardOwner::Root
         );
+    }
+}
+
+#[cfg(test)]
+mod call_alert_control_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn call_alert_disconnect_cancels_pending_startup_and_stale_clicks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app = cx.new(WhatsAppApp::new);
+        app.update(cx, |app, cx| {
+            let key = AlertKey {
+                account: oxidezap_core::AccountId::new(1).unwrap(),
+                call_id: "ring".into(),
+            };
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let retired = Arc::new(AtomicBool::new(false));
+            app.calls.update(cx, |calls, _| {
+                calls.alert_work = Some(AlertWork {
+                    key: key.clone(),
+                    cancelled: cancelled.clone(),
+                    retired: retired.clone(),
+                    _task: Task::ready(()),
+                    owner: None,
+                });
+                calls.card.set_minimized(true);
+            });
+            app.leave_connected_view(None, cx);
+            assert!(cancelled.load(Ordering::Acquire));
+            assert!(
+                !retired.load(Ordering::Acquire),
+                "a healthy frontend may take over after this one disconnects"
+            );
+            assert!(app.open_call_notification(&key.tag(), cx));
+            assert!(app.calls.read(cx).card().is_minimized());
+        });
+    }
+
+    #[gpui::test]
+    fn call_card_maximized_video_keeps_controls_inside_resized_windows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut cx, app) = crate::app::body::tests::connected_app_fixture(cx);
+        app.update(&mut cx, |app, cx| {
+            app.calls.update(cx, |calls, cx| {
+                calls.state.set_outgoing(OutgoingCall::new(
+                    "view",
+                    "peer@example.invalid".into(),
+                    "Example".into(),
+                    true,
+                ));
+                calls.state.connect(&"view".into());
+                calls
+                    .state
+                    .set_video(&"view".into(), VideoStream::Remote, true);
+                calls.toggle_maximized(cx);
+            });
+        });
+        for (width, height) in [(1600.0, 1100.0), (900.0, 600.0), (600.0, 500.0)] {
+            let size = gpui::size(gpui::px(width), gpui::px(height));
+            cx.simulate_resize(size);
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            for selector in [
+                "call-live-header",
+                "call-video-panes",
+                "call-video-controls",
+            ] {
+                let bounds = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("missing {selector}"));
+                assert!(
+                    bounds.left() >= gpui::px(0.0) && bounds.top() >= gpui::px(0.0),
+                    "{selector}: {bounds:?}"
+                );
+                assert!(
+                    bounds.right() <= size.width && bounds.bottom() <= size.height,
+                    "{selector}: {bounds:?}, viewport {size:?}"
+                );
+            }
+        }
+        app.update(&mut cx, |app, cx| app.toggle_call_maximized(cx));
+        cx.run_until_parked();
+        cx.read(|cx| assert!(!app.read(cx).call_maximized(cx)));
+    }
+
+    #[gpui::test]
+    fn call_card_waiting_frame_cannot_replace_the_active_preview(cx: &mut gpui::TestAppContext) {
+        let calls = cx.new(|_| Calls::new());
+        calls.update(cx, |calls, cx| {
+            calls.state.set_outgoing(OutgoingCall::new(
+                "active",
+                "999000@s.whatsapp.net".into(),
+                "Example".into(),
+                true,
+            ));
+            calls.state.connect(&"active".into());
+            calls
+                .state
+                .set_video(&"active".into(), VideoStream::Remote, true);
+            calls.state.set_incoming(IncomingCall {
+                call_id: "waiting".into(),
+                caller_name: "Another".into(),
+                caller_jid: "999001@s.whatsapp.net".into(),
+                is_video: true,
+                is_offline: false,
+                received_at: wacore::time::now_utc(),
+            });
+            let image = Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(
+                image::Frame::new(image::RgbaImage::new(1, 1)),
+                1,
+            )));
+            calls.draw_frame(
+                CallFrame {
+                    call_id: "active".into(),
+                    stream: VideoStream::Remote,
+                    image: image.clone(),
+                },
+                cx,
+            );
+            calls.draw_frame(
+                CallFrame {
+                    call_id: "waiting".into(),
+                    stream: VideoStream::Remote,
+                    image: image.clone(),
+                },
+                cx,
+            );
+            assert_eq!(
+                calls.pictures.call_id.as_deref(),
+                Some("active"),
+                "the waiting call is held, but is not the call whose panes are on screen"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn call_alert_hang_up_without_ipc_preserves_the_offer(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(WhatsAppApp::new);
+        app.update(cx, |app, cx| {
+            app.calls.update(cx, |calls, _| {
+                calls.state.set_incoming(IncomingCall {
+                    call_id: "unreachable".into(),
+                    caller_name: "Example".into(),
+                    caller_jid: "999000@s.whatsapp.net".into(),
+                    is_video: false,
+                    is_offline: false,
+                    received_at: wacore::time::now_utc(),
+                });
+            });
+            app.hang_up(cx);
+            assert!(
+                app.calls.read(cx).state().incoming().is_some(),
+                "a disconnected frontend cannot decline or record the call"
+            );
+            assert!(app.chats.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn call_card_maximize_restore_preserves_both_preview_frames(cx: &mut gpui::TestAppContext) {
+        let calls = cx.new(|_| Calls::new());
+        calls.update(cx, |calls, cx| {
+            calls.state.set_outgoing(OutgoingCall::new(
+                "preview",
+                "999000@s.whatsapp.net".into(),
+                "Example".into(),
+                true,
+            ));
+            calls.state.connect(&"preview".into());
+            calls
+                .state
+                .set_video(&"preview".into(), VideoStream::Local, true);
+            calls
+                .state
+                .set_video(&"preview".into(), VideoStream::Remote, true);
+            let image = Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(
+                image::Frame::new(image::RgbaImage::new(1, 1)),
+                1,
+            )));
+            for stream in [VideoStream::Local, VideoStream::Remote] {
+                calls.draw_frame(
+                    CallFrame {
+                        call_id: "preview".into(),
+                        stream,
+                        image: image.clone(),
+                    },
+                    cx,
+                );
+            }
+            let state = calls.state.clone();
+            calls.toggle_maximized(cx);
+            assert!(calls.card.is_maximized());
+            calls.toggle_maximized(cx);
+            assert!(!calls.card.is_maximized());
+            assert_eq!(calls.state, state);
+            for stream in [VideoStream::Local, VideoStream::Remote] {
+                assert!(Arc::ptr_eq(calls.pictures.of(stream).unwrap(), &image));
+            }
+        });
     }
 }
 
