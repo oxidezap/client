@@ -1409,3 +1409,53 @@ async fn pending_linked_plays_are_bounded_per_account() {
         vec![(1, 4096), (2, 1)]
     );
 }
+
+#[tokio::test]
+async fn authorless_linked_group_play_never_claims_the_first_materialized_author() {
+    let (_db, store) = test_store().await;
+    feed(
+        &store,
+        [receipt(
+            jid(GROUP),
+            jid(PEER),
+            &["SEPARATE-BATCHES"],
+            ReceiptType::PlayedSelf,
+            ts(101),
+        )],
+    )
+    .await;
+    feed(
+        &store,
+        [message_event(
+            synthetic_voice(),
+            incoming_info(GROUP, PEER, "SEPARATE-BATCHES", 100),
+        )],
+    )
+    .await;
+    let first = store
+        .message(&jid(GROUP), "SEPARATE-BATCHES")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.status, MessageStatus::Played);
+    assert!(!store.audio_played_receipt_sent(&first).await.unwrap());
+    feed(
+        &store,
+        [message_event(
+            synthetic_voice(),
+            incoming_info(
+                GROUP,
+                "559900000002@s.whatsapp.net",
+                "SEPARATE-BATCHES",
+                100,
+            ),
+        )],
+    )
+    .await;
+    let rows = store.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_ne!(row.status, MessageStatus::Played);
+        assert!(!store.audio_played_receipt_sent(&row).await.unwrap());
+    }
+}

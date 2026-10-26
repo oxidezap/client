@@ -2,6 +2,7 @@
 //! then resolve it after the whole writer batch, never as an outgoing job.
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Integer};
+use wacore_binary::{Jid, JidExt as _};
 
 use super::message_identity::{authors_match, merge_rows};
 use super::writer::ChangeSet;
@@ -76,6 +77,14 @@ pub(super) fn apply(
         .load(conn)?;
     for (observed_chat, id, author, ambiguous) in observations {
         if ambiguous {
+            continue;
+        }
+        if author.is_empty()
+            && observed_chat.parse::<Jid>().map_or(true, |jid| {
+                jid.is_group() || jid.is_status_broadcast() || jid.is_broadcast_list()
+            })
+        {
+            // These message keys include an author. A first arriving row cannot prove it.
             continue;
         }
         let key = pending::table.filter(
