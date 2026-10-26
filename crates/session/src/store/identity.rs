@@ -19,7 +19,7 @@ pub fn same_account_identity(old: &StoredAccount, new: &StoredAccount) -> bool {
         }
         // The parser deliberately accepts non-user and server-only JIDs too.
         // Do not let those contracts broaden account identity matching.
-        if !jid.user.bytes().all(|byte| byte.is_ascii_digit()) {
+        if jid.user.starts_with('0') || !jid.user.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
         Some(jid.to_non_ad())
@@ -55,6 +55,13 @@ mod tests {
         let old = account(1, Some("100001:7@s.whatsapp.net"), Some("200001:7@lid"));
         let new = account(2, Some("100001:12@s.whatsapp.net"), Some("200001:12@lid"));
         assert!(same_account_identity(&old, &new));
+    }
+
+    #[test]
+    fn reserved_zero_identifiers_cannot_authorize_retirement() {
+        let old = account(1, Some("0@s.whatsapp.net"), Some("0@lid"));
+        let new = account(2, Some("0@s.whatsapp.net"), Some("0@lid"));
+        assert!(!same_account_identity(&old, &new));
     }
 
     #[test]

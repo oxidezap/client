@@ -302,25 +302,70 @@ mod tests {
         registry: Arc<AccountRegistry>,
         old: AccountId,
         new: AccountId,
+        database: TempDb,
+    }
+
+    struct TempDb(std::path::PathBuf);
+    impl TempDb {
+        fn new(tag: &str) -> Self {
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            loop {
+                let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "oxidezap-relink-{tag}-{}-{sequence}.db",
+                    std::process::id()
+                ));
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(_) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create synthetic database: {error}"),
+                }
+            }
+        }
+        fn url(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut path = self.0.clone().into_os_string();
+                path.push(suffix);
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     impl Fixture {
         async fn new(tag: &str, new_pn: &str, new_lid: Option<&str>) -> Self {
-            let stores = Arc::new(StoreRegistry::new(format!(
-                "file:retirement-{tag}-{}?mode=memory&cache=shared",
-                std::process::id()
-            )));
+            let database = TempDb::new(tag);
+            let stores = Arc::new(StoreRegistry::new(database.url()));
             let old = stores.create_account().await.unwrap();
             let backend = stores.store(old).await.unwrap();
             stores.prepare_chat_schema(&backend).await.unwrap();
             let history = oxidezap_chat_store::ChatStore::new_prepared(&backend)
                 .await
                 .unwrap();
+            let peer: wacore_binary::Jid = "900001@s.whatsapp.net".parse().unwrap();
+            history
+                .record_outgoing(
+                    &peer,
+                    "RETAINED",
+                    &Default::default(),
+                    wacore::time::now_utc(),
+                )
+                .unwrap();
+            history.flush().await.unwrap();
             history
                 .record_logout("Synthetic unlink".into())
                 .await
                 .unwrap();
             let new = stores.pairing_successor(old).await.unwrap();
+            history.close().await.unwrap();
             let mut device = Device::new();
             device.pn = Some("100001:1@s.whatsapp.net".parse().unwrap());
             device.lid = Some("200001:1@lid".parse().unwrap());
@@ -356,7 +401,60 @@ mod tests {
                 registry,
                 old,
                 new,
+                database,
             }
+        }
+
+        async fn retains_history(&self) -> bool {
+            let backend = self.stores.store(self.old).await.unwrap();
+            let history = oxidezap_chat_store::ChatStore::new_prepared(&backend)
+                .await
+                .unwrap();
+            let peer: wacore_binary::Jid = "900001@s.whatsapp.net".parse().unwrap();
+            let retained = history.message(&peer, "RETAINED").await.unwrap().is_some();
+            history.close().await.unwrap();
+            retained
+        }
+
+        async fn relink_new(&self, pn: &str, lid: &str) -> AccountId {
+            let backend = self.stores.store(self.new).await.unwrap();
+            let history = oxidezap_chat_store::ChatStore::new_prepared(&backend)
+                .await
+                .unwrap();
+            history
+                .record_logout("Synthetic second unlink".into())
+                .await
+                .unwrap();
+            let final_id = self.stores.pairing_successor(self.new).await.unwrap();
+            history.close().await.unwrap();
+            let mut device = Device::new();
+            device.pn = Some(pn.parse().unwrap());
+            device.lid = Some(lid.parse().unwrap());
+            Self::pair(&mut device);
+            self.stores
+                .store(final_id)
+                .await
+                .unwrap()
+                .save(&device)
+                .await
+                .unwrap();
+            let intermediate = self.registry.get(self.new).unwrap();
+            intermediate
+                .hub()
+                .apply(crate::state::Change::live(DaemonEvent::ConnectionChanged(
+                    ConnectionState::LoggedOut {
+                        message: "Synthetic second unlink".into(),
+                    },
+                )));
+            intermediate.lifecycle().mark_quiesced();
+            intermediate.set_status(AccountStatus::Error);
+            self.registry.insert(Self::connected(
+                final_id,
+                Arc::clone(&self.stores),
+                pn,
+                Some(lid),
+            ));
+            final_id
         }
 
         fn pair(device: &mut Device) {
@@ -423,17 +521,21 @@ mod tests {
         assert_eq!(f.stores.accounts().await.unwrap().len(), 2);
 
         // A fresh daemon restores redirects before constructing old runtimes.
+        let restarted_stores = Arc::new(StoreRegistry::new(f.database.url()));
         let restarted = AccountRegistry::new();
-        restarted.restore_retirements(&f.stores).await.unwrap();
+        restarted
+            .restore_retirements(&restarted_stores)
+            .await
+            .unwrap();
         restarted.insert(Fixture::connected(
             f.new,
-            Arc::clone(&f.stores),
+            Arc::clone(&restarted_stores),
             "100001:9@s.whatsapp.net",
             Some("200001:9@lid"),
         ));
         restarted
-            .consolidate_relinks_with(&f.stores, |old, _| {
-                let stores = Arc::clone(&f.stores);
+            .consolidate_relinks_with(&restarted_stores, |old, _| {
+                let stores = Arc::clone(&restarted_stores);
                 async move {
                     stores.remove_account(old).await.unwrap();
                     session_bridge::AccountExit::RemoveCompleted
@@ -453,7 +555,7 @@ mod tests {
         );
         assert!(f.stores.retirements().await.unwrap()[0].complete);
         restarted
-            .consolidate_relinks_with(&f.stores, |_, _| async {
+            .consolidate_relinks_with(&restarted_stores, |_, _| async {
                 panic!("completed cleanup must not run twice")
             })
             .await
@@ -506,6 +608,7 @@ mod tests {
                 .unwrap();
             assert!(f.stores.retirements().await.unwrap().is_empty());
             assert_eq!(f.stores.accounts().await.unwrap().len(), 2);
+            assert!(f.retains_history().await);
         }
     }
 
@@ -586,17 +689,21 @@ mod tests {
             .await
             .unwrap();
         assert!(!f.stores.retirements().await.unwrap()[0].complete);
+        let restarted_stores = Arc::new(StoreRegistry::new(f.database.url()));
         let restarted = AccountRegistry::new();
-        restarted.restore_retirements(&f.stores).await.unwrap();
+        restarted
+            .restore_retirements(&restarted_stores)
+            .await
+            .unwrap();
         restarted.insert(Fixture::connected(
             f.new,
-            Arc::clone(&f.stores),
+            Arc::clone(&restarted_stores),
             "100001:9@s.whatsapp.net",
             Some("200001:9@lid"),
         ));
         restarted
-            .consolidate_relinks_with(&f.stores, |old, _| {
-                let stores = Arc::clone(&f.stores);
+            .consolidate_relinks_with(&restarted_stores, |old, _| {
+                let stores = Arc::clone(&restarted_stores);
                 async move {
                     stores.remove_account(old).await.unwrap();
                     session_bridge::AccountExit::RemoveCompleted
@@ -612,42 +719,9 @@ mod tests {
     #[tokio::test]
     async fn successor_chains_survive_removing_the_intermediate_account() {
         let f = Fixture::new("chain", "100001:9@s.whatsapp.net", Some("200001:9@lid")).await;
-        let backend = f.stores.store(f.new).await.unwrap();
-        let history = oxidezap_chat_store::ChatStore::new_prepared(&backend)
-            .await
-            .unwrap();
-        history
-            .record_logout("Synthetic second unlink".into())
-            .await
-            .unwrap();
-        let final_id = f.stores.pairing_successor(f.new).await.unwrap();
-        let mut device = Device::new();
-        device.pn = Some("100001:13@s.whatsapp.net".parse().unwrap());
-        device.lid = Some("200001:13@lid".parse().unwrap());
-        Fixture::pair(&mut device);
-        f.stores
-            .store(final_id)
-            .await
-            .unwrap()
-            .save(&device)
-            .await
-            .unwrap();
-        let intermediate = f.registry.get(f.new).unwrap();
-        intermediate
-            .hub()
-            .apply(crate::state::Change::live(DaemonEvent::ConnectionChanged(
-                ConnectionState::LoggedOut {
-                    message: "Synthetic second unlink".into(),
-                },
-            )));
-        intermediate.lifecycle().mark_quiesced();
-        intermediate.set_status(AccountStatus::Error);
-        f.registry.insert(Fixture::connected(
-            final_id,
-            Arc::clone(&f.stores),
-            "100001:13@s.whatsapp.net",
-            Some("200001:13@lid"),
-        ));
+        let final_id = f
+            .relink_new("100001:13@s.whatsapp.net", "200001:13@lid")
+            .await;
         for _ in 0..2 {
             f.registry
                 .consolidate_relinks_with(&f.stores, |old, _| {
@@ -716,6 +790,44 @@ mod tests {
         second.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(f.stores.durable_pairing(f.new).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn collapsing_a_successor_chain_keeps_an_earlier_different_accounts_history() {
+        let f = Fixture::new(
+            "different-parent",
+            "100002:9@s.whatsapp.net",
+            Some("200002:9@lid"),
+        )
+        .await;
+        let final_id = f
+            .relink_new("100002:13@s.whatsapp.net", "200002:13@lid")
+            .await;
+        for _ in 0..2 {
+            f.registry
+                .consolidate_relinks_with(&f.stores, |old, _| {
+                    let stores = Arc::clone(&f.stores);
+                    async move {
+                        stores.remove_account(old).await.unwrap();
+                        session_bridge::AccountExit::RemoveCompleted
+                    }
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            f.stores
+                .accounts()
+                .await
+                .unwrap()
+                .iter()
+                .map(|account| account.id)
+                .collect::<Vec<_>>(),
+            vec![f.old, final_id]
+        );
+        assert_eq!(f.registry.retirement_target(f.old), None);
+        assert_eq!(f.registry.retirement_target(f.new), Some(final_id));
+        assert!(f.retains_history().await);
     }
 
     #[tokio::test]

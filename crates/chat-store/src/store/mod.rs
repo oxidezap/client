@@ -1209,6 +1209,13 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
+        assert!(has_table(&store, "account_retirement").await);
+        store
+            .shared()
+            .run(revert_last_chat_migration)
+            .await
+            .expect("an empty retirement journal downgrade is reversible");
+        assert!(!has_table(&store, "account_retirement").await);
         assert!(has_table(&store, "session_recovery").await);
         store
             .shared()
@@ -1340,6 +1347,39 @@ mod migration_tests {
             .expect_err("irreversible migration must reject downgrade");
         assert!(error.to_string().contains("migration"));
         assert_eq!(table_count(&store).await, 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_downgrade_preserves_pending_cleanup_and_completed_redirects() {
+        let store = SqliteStore::open(&format!(
+            "file:retirement-downgrade-{}?mode=memory&cache=shared",
+            std::process::id()
+        ))
+        .await
+        .unwrap();
+        ChatStore::prepare(&store).await.unwrap();
+        store.shared().run(|conn| {
+            diesel::sql_query("INSERT INTO account_retirement (old_id, successor, pn, lid) VALUES (1, 2, '100001@s.whatsapp.net', '200001@lid')").execute(conn).map(|_| ()).map_err(crate::error::db_err)
+        }).await.unwrap();
+        for complete in [false, true] {
+            if complete {
+                ChatStore::finish_account_retirement(&store, 1)
+                    .await
+                    .unwrap();
+            }
+            store
+                .shared()
+                .run(revert_last_chat_migration)
+                .await
+                .expect_err("journal records cannot be silently discarded by downgrade");
+            let records = ChatStore::account_retirements(&store).await.unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].complete, complete);
+            assert!(
+                !has_table(&store, "retirement_downgrade_guard").await,
+                "failed migration must roll back its guard table"
+            );
+        }
     }
 
     async fn table_count(store: &SqliteStore) -> i64 {

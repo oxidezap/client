@@ -1407,7 +1407,16 @@ impl AccountSupervisor {
                 // observed through the account set, exactly as the
                 // command-channel path answers.
                 if runtime.is_stopping() {
-                    let _ = reply.send(LifecycleOutcome::Accepted);
+                    let outcome = if runtime
+                        .lifecycle()
+                        .disposition()
+                        .is_some_and(|held| held != disposition)
+                    {
+                        LifecycleOutcome::Incomplete
+                    } else {
+                        LifecycleOutcome::Accepted
+                    };
+                    let _ = reply.send(outcome);
                     return;
                 }
                 // A live session owns the command channel; ask it to stop and
