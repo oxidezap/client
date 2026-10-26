@@ -182,10 +182,7 @@ impl AccountRegistry {
             let Some(runtime) = self.get(old.id) else {
                 continue;
             };
-            if runtime.status() != AccountStatus::Error
-                || !runtime.hub().is_logged_out()
-                || !runtime.lifecycle().is_quiesced()
-            {
+            if !runtime.hub().is_logged_out() {
                 continue;
             }
             let Some(next) = stores.existing_pairing_successor(old.id).await? else {
@@ -227,11 +224,12 @@ impl AccountRegistry {
                         .unwrap_or_else(|error| error.into_inner())
                         .insert(next);
                     lifecycle.reserve_retirement_successor(true);
+                    old_lifecycle.request_retirement_stop();
                     self.restore_retirements(stores).await?;
                 }
-                Ok(false) => old_lifecycle.retry_failed_disposition(AccountDisposition::Remove),
+                Ok(false) => old_lifecycle.cancel_retirement_reservation(),
                 Err(error) => {
-                    old_lifecycle.retry_failed_disposition(AccountDisposition::Remove);
+                    old_lifecycle.cancel_retirement_reservation();
                     return Err(error.into());
                 }
             }
@@ -275,14 +273,23 @@ impl AccountRegistry {
             }
             let old_lifecycle = self.get(old).map(|runtime| runtime.lifecycle());
             let hub = if let Some(runtime) = self.get(old) {
-                if !runtime.lifecycle().is_quiesced() || runtime.status() != AccountStatus::Error {
+                runtime.lifecycle().request_retirement_stop();
+                if !runtime.lifecycle().is_quiesced()
+                    || !matches!(
+                        runtime.status(),
+                        AccountStatus::Error | AccountStatus::Stopped
+                    )
+                {
                     continue;
                 }
-                if runtime
-                    .lifecycle()
-                    .set_disposition(AccountDisposition::Remove)
-                    == session_bridge::DispositionOutcome::Conflict
+                #[cfg(not(target_family = "wasm"))]
+                if self
+                    .supervisor()
+                    .is_some_and(|supervisor| supervisor.active_runs.borrow().contains(&old))
                 {
+                    continue;
+                }
+                if !runtime.lifecycle().claim_retirement_cleanup() {
                     continue;
                 }
                 runtime.hub()
@@ -649,6 +656,7 @@ mod tests {
             assert!(f.stores.retirements().await.unwrap().is_empty());
             assert_eq!(f.stores.accounts().await.unwrap().len(), 2);
             assert!(f.retains_history().await);
+            assert!(!f.registry.get(f.old).unwrap().is_stopping());
         }
     }
 
@@ -677,16 +685,63 @@ mod tests {
                     message: "Synthetic unlink".into(),
                 },
             )));
-        not_joined.set_status(AccountStatus::Error);
+        not_joined.set_status(AccountStatus::Running);
         f.registry.remove(f.old);
-        f.registry.insert(not_joined);
+        f.registry.insert(Arc::clone(&not_joined));
         f.registry
             .consolidate_relinks_with(&f.stores, |_, _| async {
                 panic!("old tasks have not joined")
             })
             .await
             .unwrap();
-        assert!(f.stores.retirements().await.unwrap().is_empty());
+        let records = f.stores.retirements().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].complete);
+        assert!(f.retains_history().await);
+        assert_eq!(not_joined.lifecycle().disposition(), None);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            not_joined.lifecycle().retirement_stop_requested(),
+        )
+        .await
+        .expect("a verified relink must stop its retained predecessor");
+
+        let supervisor = AccountSupervisor::with_shutdown(
+            Arc::clone(&f.registry),
+            Arc::clone(&f.stores),
+            4,
+            RestartPolicy::production(),
+            || std::future::ready(()),
+        );
+        supervisor.active_runs.send_modify(|active| {
+            active.insert(f.old);
+        });
+        not_joined.lifecycle().mark_quiesced();
+        not_joined.set_status(AccountStatus::Stopped);
+        f.registry
+            .consolidate_relinks_with(&f.stores, |_, _| async {
+                panic!("quiescence alone does not authorize cleanup before the task is joined")
+            })
+            .await
+            .unwrap();
+        assert!(f.retains_history().await);
+        supervisor.active_runs.send_modify(|active| {
+            active.remove(&f.old);
+        });
+        f.registry
+            .consolidate_relinks_with(&f.stores, |old, _| {
+                let stores = Arc::clone(&f.stores);
+                async move {
+                    stores.remove_account(old).await.unwrap();
+                    session_bridge::AccountExit::RemoveCompleted
+                }
+            })
+            .await
+            .unwrap();
+        assert!(f.registry.get(f.old).is_none());
+        assert!(f.stores.retirements().await.unwrap()[0].complete);
+        assert!(f.stores.durable_pairing(f.new).await.unwrap().is_some());
+        supervisor.join_all().await;
     }
 
     #[tokio::test]

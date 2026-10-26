@@ -60,6 +60,7 @@ pub struct RuntimeLifecycle {
     /// or a process-wide shutdown, leaves this `None`.
     disposition: Arc<Mutex<LifecycleState>>,
     quiesced: Arc<AtomicBool>,
+    retirement_stop: tokio::sync::watch::Sender<bool>,
     media: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -68,6 +69,7 @@ struct LifecycleState {
     disposition: Option<AccountDisposition>,
     pins: usize,
     retirement_reserved: bool,
+    retiring: bool,
 }
 
 /// Keeps a confirmed successor from being reset while its predecessor is retired.
@@ -88,6 +90,7 @@ impl RuntimeLifecycle {
             stopping: Arc::new(AtomicBool::new(false)),
             disposition: Arc::new(Mutex::new(LifecycleState::default())),
             quiesced: Arc::new(AtomicBool::new(false)),
+            retirement_stop: tokio::sync::watch::channel(false).0,
             media: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
@@ -120,7 +123,7 @@ impl RuntimeLifecycle {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match slot.disposition {
-                None if slot.pins == 0 && !slot.retirement_reserved => {
+                None if slot.pins == 0 && !slot.retirement_reserved && !slot.retiring => {
                     slot.disposition = Some(disposition);
                     DispositionOutcome::Recorded
                 }
@@ -144,16 +147,60 @@ impl RuntimeLifecycle {
             .disposition
     }
 
-    /// Reserve a quiesced old runtime before persisting a retirement intent.
-    /// An intermediate successor may itself have a pending predecessor.
+    /// Reserve the old lifecycle before committing an identity-confirmed intent.
+    /// This is not a removal disposition: teardown must retain storage.
     pub(crate) fn start_retirement(&self) -> bool {
         let mut state = self
             .disposition
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !self.is_quiesced() || state.disposition.is_some() || state.pins != 0 {
+        if state.disposition.is_some() || state.pins != 0 || state.retiring {
             return false;
         }
+        state.retiring = true;
+        self.mark_stopping();
+        true
+    }
+
+    pub(crate) fn cancel_retirement_reservation(&self) {
+        let mut state = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !*self.retirement_stop.borrow() {
+            state.retiring = false;
+            self.stopping.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn request_retirement_stop(&self) {
+        self.mark_stopping();
+        self.retirement_stop.send_replace(true);
+    }
+
+    pub(crate) async fn retirement_stop_requested(&self) {
+        let mut stop = self.retirement_stop.subscribe();
+        while !*stop.borrow_and_update() {
+            if stop.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn claim_retirement_cleanup(&self) -> bool {
+        let mut state = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_quiesced()
+            || state.pins != 0
+            || state
+                .disposition
+                .is_some_and(|held| held != AccountDisposition::Remove)
+        {
+            return false;
+        }
+        state.retiring = true;
         state.disposition = Some(AccountDisposition::Remove);
         self.mark_stopping();
         true

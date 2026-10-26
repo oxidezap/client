@@ -169,7 +169,12 @@ impl AccountRuntime {
             Arc::clone(&self.plugins),
             command_rx,
             self.lifecycle.clone(),
-            shutdown,
+            async {
+                tokio::select! {
+                    () = shutdown => {},
+                    () = self.lifecycle.retirement_stop_requested() => {},
+                }
+            },
         )
         .await;
         self.set_status(if result.is_ok() {
