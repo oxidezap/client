@@ -400,12 +400,13 @@ pub enum DaemonMessage {
         protocol: u32,
         snapshot: Box<StateSnapshot>,
     },
-    /// What this account occupies on disk, answering
-    /// [`ClientRequest::StorageUsage`].
+    /// Device work answered only to the front end that requested it.
     CallDevices {
         id: RequestId,
-        result: Result<CallDeviceReply, String>,
+        result: Result<Box<CallDeviceReply>, String>,
     },
+    /// What this account occupies on disk, answering
+    /// [`ClientRequest::StorageUsage`].
     Storage {
         id: RequestId,
         /// The shared store: the database and its journal files.
@@ -1001,7 +1002,7 @@ pub enum ClientRequest {
     /// because it is one piece of state with two values.
     Typing(Typing),
     Call(CallAction),
-    CallDevices(CallDeviceAction),
+    CallDevices(Box<CallDeviceAction>),
     /// Fetch media the daemon has not cached yet.
     ///
     /// The one request whose answer is neither a state change nor an
@@ -2336,7 +2337,7 @@ mod device_contract_tests {
             CallDeviceAction::PreviewFrame { preview_id },
             CallDeviceAction::CancelPreview { preview_id },
         ] {
-            let request = ClientRequest::CallDevices(action);
+            let request = ClientRequest::CallDevices(Box::new(action));
             let encoded = serde_json::to_string(&request).unwrap();
             assert!(!encoded.contains("call_id"));
             assert_eq!(
@@ -2346,7 +2347,7 @@ mod device_contract_tests {
         }
         let response = DaemonMessage::CallDevices {
             id: 7,
-            result: Ok(CallDeviceReply::Preview {
+            result: Ok(Box::new(CallDeviceReply::Preview {
                 preview_id,
                 mode: Some(oxidezap_core::CameraMode::default()),
                 frame: Some(CameraPreviewFrame {
@@ -2354,7 +2355,7 @@ mod device_contract_tests {
                     data: vec![0, 0, 0, 1, 0x65],
                     keyframe: true,
                 }),
-            }),
+            })),
         };
         let encoded = serde_json::to_string(&response).unwrap();
         assert!(encoded.contains("AAAAAWU="));

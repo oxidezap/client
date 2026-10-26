@@ -1713,7 +1713,7 @@ impl SessionHandle {
     ) -> oneshot::Receiver<Result<oxidezap_ipc::CallDeviceReply, String>> {
         let (tx, rx) = oneshot::channel();
         self.ask(
-            ClientRequest::CallDevices(action),
+            ClientRequest::CallDevices(Box::new(action)),
             Awaiting::CallDevices(tx),
         );
         rx

@@ -22,6 +22,7 @@ mod imp;
 use imp::{persist, read_preferences, test_microphone};
 
 static PREFERENCE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+static PREFERENCE_WRITE: Mutex<()> = Mutex::new(());
 
 pub(super) struct Devices {
     state: Arc<Mutex<State>>,
@@ -140,51 +141,68 @@ fn quality_with_environment(
         ..environment
     }
 }
-fn apply(p: CallDevicePreferences) -> Result<(), String> {
-    oxidezap_session::set_camera_preferences(p.camera.clone(), quality(&p))?;
-    oxidezap_audio::devices::set_call_preferences(p);
+fn camera_device(camera: Option<String>, saved: bool) -> Option<String> {
+    camera.or_else(|| saved.then(|| "index:0".to_owned()))
+}
+
+fn apply(p: CallDevicePreferences, saved: bool) -> Result<(), String> {
+    oxidezap_session::set_camera_preferences(camera_device(p.camera.clone(), saved), quality(&p))?;
+    if saved {
+        oxidezap_audio::devices::set_call_preferences(p);
+    } else {
+        oxidezap_audio::devices::set_call_preferences_from_defaults(p);
+    }
     Ok(())
 }
 
 fn initial_preferences(
     saved: Option<CallDevicePreferences>,
     environment: oxidezap_video::VideoQuality,
-) -> (CallDevicePreferences, bool) {
-    match saved {
-        Some(p) => (p, true),
-        None => (
-            CallDevicePreferences {
-                camera_mode: CameraMode {
-                    width: environment.width,
-                    height: environment.height,
-                    fps: environment.fps,
-                },
-                ..Default::default()
-            },
-            false,
-        ),
-    }
+) -> CallDevicePreferences {
+    saved.unwrap_or_else(|| CallDevicePreferences {
+        camera_mode: CameraMode {
+            width: environment.width,
+            height: environment.height,
+            fps: environment.fps,
+        },
+        ..Default::default()
+    })
 }
 
 pub(super) async fn load_preferences() {
-    let outcome = match oxidezap_session::unblock(read_preferences).await {
-        Ok(Ok(saved)) => {
-            let (preferences, explicit) =
-                initial_preferences(saved, oxidezap_video::VideoQuality::from_environment());
-            if explicit {
-                apply(preferences)
-            } else {
-                oxidezap_audio::devices::set_call_preferences(preferences);
-                Ok(())
-            }
+    let outcome = oxidezap_session::unblock(|| {
+        let _write = PREFERENCE_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = read_preferences().and_then(|saved| {
+            let explicit = saved.is_some();
+            apply(
+                initial_preferences(saved, oxidezap_video::VideoQuality::from_environment()),
+                explicit,
+            )
+        });
+        *PREFERENCE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
+            outcome.as_ref().err().cloned();
+        outcome
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!("call device preferences could not load: {error}"),
+        Err(error) => {
+            log::warn!("call device preferences task failed: {error}");
+            *PREFERENCE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
         }
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(e.to_string()),
-    };
-    if let Err(error) = &outcome {
-        log::warn!("call device preferences could not load: {error}");
     }
-    *PREFERENCE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = outcome.err();
+}
+
+async fn ensure_preferences_readable() -> Result<(), String> {
+    let retry = PREFERENCE_ERROR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    if retry {
+        load_preferences().await;
+    }
+    preferences_readable()
 }
 
 fn preferences_readable() -> Result<(), String> {
@@ -272,7 +290,7 @@ impl Devices {
         };
         oxidezap_session::spawn(async move {
             let _permit = permit;
-            let result = handle(state, action, &owner).await;
+            let result = handle(state, action, &owner).await.map(Box::new);
             if let Ok(frame) = serde_json::to_string(&DaemonMessage::CallDevices { id, result }) {
                 let _ = owner.send(frame).await;
             }
@@ -283,24 +301,23 @@ impl Devices {
 async fn handle(state: Arc<Mutex<State>>, action: Action, owner: &Outbox) -> Result<Reply, String> {
     match action {
         Action::Preferences => {
-            preferences_readable()?;
+            ensure_preferences_readable().await?;
             Ok(Reply::Preferences {
                 preferences: oxidezap_audio::devices::call_preferences(),
             })
         }
         Action::Inventory => {
-            preferences_readable()?;
+            ensure_preferences_readable().await?;
             Ok(Reply::Settings {
                 settings: inventory().await,
             })
         }
         Action::Save { preferences } => {
             quality(&preferences).checked().map_err(|e| e.to_string())?;
-            static SAVE: Mutex<()> = Mutex::new(());
             oxidezap_session::unblock(move || {
-                let _guard = SAVE.lock().unwrap_or_else(|e| e.into_inner());
+                let _guard = PREFERENCE_WRITE.lock().unwrap_or_else(|e| e.into_inner());
                 persist(&preferences)?;
-                apply(preferences)?;
+                apply(preferences, true)?;
                 *PREFERENCE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 Ok::<(), String>(())
             })
@@ -400,8 +417,13 @@ async fn preview(
         }
         return;
     }
-    let p = oxidezap_audio::devices::call_preferences();
-    let opened = oxidezap_session::CameraPreview::open(id, quality(&p), p.camera).await;
+    let (p, saved) = oxidezap_audio::devices::call_preferences_with_origin();
+    let opened = oxidezap_session::CameraPreview::open(
+        id,
+        quality(&p),
+        camera_device(p.camera.clone(), saved),
+    )
+    .await;
     match opened {
         Ok(preview) => {
             if cancel.load(Ordering::Acquire) || owner.is_closed() {
@@ -496,6 +518,15 @@ async fn preview(
 mod tests {
     use super::*;
     #[test]
+    fn saved_camera_default_bypasses_legacy_configuration() {
+        assert_eq!(camera_device(None, true), Some("index:0".into()));
+        assert_eq!(camera_device(None, false), None);
+        assert_eq!(
+            camera_device(Some("fixture-camera".into()), true),
+            Some("fixture-camera".into())
+        );
+    }
+    #[test]
     fn missing_preferences_preserve_environment_mode_and_bitrate() {
         let environment = oxidezap_video::VideoQuality {
             width: 800,
@@ -503,11 +534,7 @@ mod tests {
             fps: 15,
             bitrate_kbps: 987,
         };
-        let (p, explicit) = initial_preferences(None, environment);
-        assert!(
-            !explicit,
-            "an absent file must not install a camera override"
-        );
+        let p = initial_preferences(None, environment);
         assert_eq!(quality_with_environment(&p, environment), environment);
         let saved = CallDevicePreferences {
             camera_mode: CameraMode {
@@ -517,8 +544,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (p, explicit) = initial_preferences(Some(saved.clone()), environment);
-        assert!(explicit);
+        let p = initial_preferences(Some(saved.clone()), environment);
         assert_eq!(p, saved);
         assert_eq!(quality_with_environment(&p, environment).bitrate_kbps, 987);
     }

@@ -163,7 +163,7 @@ pub(super) async fn handle_request(
                 id,
                 Action::CallDevices {
                     id,
-                    request,
+                    request: *request,
                     answer_to: outbox.clone(),
                 },
             )

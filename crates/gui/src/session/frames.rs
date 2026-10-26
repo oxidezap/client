@@ -162,7 +162,7 @@ impl<'a> Frames<'a> {
         match message {
             DaemonMessage::CallDevices { id, result } => {
                 if let Some(Awaiting::CallDevices(tx)) = take_pending(self.pending, id) {
-                    let _ = tx.send(result);
+                    let _ = tx.send(result.map(|reply| *reply));
                 }
             }
 

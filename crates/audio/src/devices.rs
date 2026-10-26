@@ -7,25 +7,38 @@ pub use imp::{
     start_ringtone_cancellable,
 };
 
-static CALL_PREFERENCES: std::sync::RwLock<oxidezap_core::CallDevicePreferences> =
-    std::sync::RwLock::new(oxidezap_core::CallDevicePreferences {
-        microphone: None,
-        speaker: None,
-        ringtone_output: None,
-        camera: None,
-        camera_mode: oxidezap_core::CameraMode {
-            width: 640,
-            height: 480,
-            fps: 30,
+static CALL_PREFERENCES: std::sync::RwLock<(oxidezap_core::CallDevicePreferences, bool)> =
+    std::sync::RwLock::new((
+        oxidezap_core::CallDevicePreferences {
+            microphone: None,
+            speaker: None,
+            ringtone_output: None,
+            camera: None,
+            camera_mode: oxidezap_core::CameraMode {
+                width: 640,
+                height: 480,
+                fps: 30,
+            },
+            ringtone: Ringtone::Classic,
         },
-        ringtone: Ringtone::Classic,
-    });
+        false,
+    ));
 
 pub fn set_call_preferences(preferences: oxidezap_core::CallDevicePreferences) {
-    *CALL_PREFERENCES.write().unwrap_or_else(|e| e.into_inner()) = preferences;
+    *CALL_PREFERENCES.write().unwrap_or_else(|e| e.into_inner()) = (preferences, true);
+}
+
+/// Install launch defaults without replacing legacy input routing before the first save.
+pub fn set_call_preferences_from_defaults(preferences: oxidezap_core::CallDevicePreferences) {
+    *CALL_PREFERENCES.write().unwrap_or_else(|e| e.into_inner()) = (preferences, false);
 }
 
 pub fn call_preferences() -> oxidezap_core::CallDevicePreferences {
+    call_preferences_with_origin().0
+}
+
+/// One consistent snapshot for consumers that distinguish launch defaults from saved choices.
+pub fn call_preferences_with_origin() -> (oxidezap_core::CallDevicePreferences, bool) {
     CALL_PREFERENCES
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -59,6 +72,32 @@ mod imp {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::Duration;
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum MicrophoneChoice {
+        SystemDefault,
+        Device(String),
+        LegacyName(String),
+    }
+    fn choose_microphone(
+        device: Option<String>,
+        saved: bool,
+        legacy: Option<String>,
+    ) -> MicrophoneChoice {
+        if let Some(id) = device {
+            return MicrophoneChoice::Device(id);
+        }
+        if !saved && let Some(name) = legacy.filter(|s| !s.is_empty()) {
+            return MicrophoneChoice::LegacyName(name);
+        }
+        MicrophoneChoice::SystemDefault
+    }
+    pub(crate) fn microphone_choice(legacy: Option<String>) -> MicrophoneChoice {
+        let preferences = super::CALL_PREFERENCES
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        choose_microphone(preferences.0.microphone.clone(), preferences.1, legacy)
+    }
 
     /// Dropping this guard cancels startup as well as playback.
     pub struct RingtonePlayback(Arc<AtomicBool>);
@@ -222,6 +261,31 @@ mod imp {
         }
 
         #[test]
+        fn saved_system_default_overrides_the_legacy_environment_selection() {
+            assert_eq!(
+                choose_microphone(None, true, Some("legacy-input".into())),
+                MicrophoneChoice::SystemDefault
+            );
+        }
+        #[test]
+        fn missing_settings_preserve_the_legacy_environment_selection() {
+            assert_eq!(
+                choose_microphone(None, false, Some("legacy-input".into())),
+                MicrophoneChoice::LegacyName("legacy-input".into())
+            );
+            assert_eq!(
+                choose_microphone(None, false, None),
+                MicrophoneChoice::SystemDefault
+            );
+        }
+        #[test]
+        fn an_explicit_endpoint_wins_over_legacy_routing() {
+            assert_eq!(
+                choose_microphone(Some("fixture-id".into()), true, Some("legacy-input".into())),
+                MicrophoneChoice::Device("fixture-id".into())
+            );
+        }
+        #[test]
         fn cancellation_while_opening_drops_late_output() {
             let stop = Arc::new(AtomicBool::new(false));
             let token = stop.clone();
@@ -339,7 +403,7 @@ mod imp {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub(crate) use imp::select;
+pub(crate) use imp::{MicrophoneChoice, microphone_choice, select};
 
 #[cfg(test)]
 mod tests {

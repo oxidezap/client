@@ -77,36 +77,24 @@ pub async fn open_call_audio() -> Result<(
 /// stream lives on a parked std thread that exits when the receiver is dropped (call ended).
 pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
     let host = cpal::default_host();
-    // Honor `WA_INPUT_DEVICE` (a name substring) to override a wrong/silent default endpoint, else use
-    // the OS default. We only enumerate `input_devices()` when a name is requested: enumerating on
-    // Linux/ALSA probes the legacy OSS plugin and prints harmless "Cannot open /dev/dsp" noise to
-    // stderr (from libasound, not our logger), so the default path -- `default_input_device()`, which
-    // does not enumerate -- avoids it entirely. A no-match error stays generic so device names do
-    // not leak through logs.
-    let want = std::env::var("WA_INPUT_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let selected = crate::devices::call_preferences().microphone;
-    let device = if selected.is_some() {
-        crate::devices::select(selected.as_deref(), true)?
-    } else {
-        match &want {
-            Some(want) => {
-                let devices: Vec<cpal::Device> = host
-                    .input_devices()
-                    .map(|i| i.collect())
-                    .unwrap_or_default();
-                devices
-                    .into_iter()
-                    .find(|d| {
-                        d.description()
-                            .is_ok_and(|x| x.name().contains(want.as_str()))
-                    })
-                    .ok_or_else(|| anyhow!("WA_INPUT_DEVICE did not match an input device"))?
-            }
-            None => host
-                .default_input_device()
-                .ok_or_else(|| anyhow!("no default input device"))?,
+    // A saved choice, including System default, wins over the legacy name
+    // override. Before the first save, preserve WA_INPUT_DEVICE routing.
+    let want = std::env::var("WA_INPUT_DEVICE").ok();
+    let device = match crate::devices::microphone_choice(want) {
+        crate::devices::MicrophoneChoice::Device(id) => crate::devices::select(Some(&id), true)?,
+        crate::devices::MicrophoneChoice::SystemDefault => crate::devices::select(None, true)?,
+        crate::devices::MicrophoneChoice::LegacyName(want) => {
+            let devices: Vec<cpal::Device> = host
+                .input_devices()
+                .map(|i| i.collect())
+                .unwrap_or_default();
+            devices
+                .into_iter()
+                .find(|d| {
+                    d.description()
+                        .is_ok_and(|x| x.name().contains(want.as_str()))
+                })
+                .ok_or_else(|| anyhow!("WA_INPUT_DEVICE did not match an input device"))?
         }
     };
     let (config, format) = default_config(&device, true)?;

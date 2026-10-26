@@ -85,6 +85,33 @@ pub(super) async fn test_microphone() -> Result<Reply, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_directory() -> PathBuf {
+        static NEXT: super::super::AtomicU64 = super::super::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "oxidezap-call-devices-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+    #[test]
+    fn repaired_or_removed_configuration_can_be_loaded_again() {
+        let directory = fixture_directory();
+        let path = directory.join("call-devices.json");
+        std::fs::write(&path, b"{broken").unwrap();
+        assert!(read_at(&path).is_err());
+        let repaired = CallDevicePreferences {
+            ringtone: oxidezap_core::Ringtone::Silent,
+            microphone: Some("fixture-repaired".into()),
+            ..Default::default()
+        };
+        persist_at(&directory, &repaired).unwrap();
+        assert_eq!(read_at(&path).unwrap(), Some(repaired));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_at(&path).unwrap(), None);
+        std::fs::remove_dir(directory).unwrap();
+    }
     #[test]
     fn configuration_paths_survive_runtime_directory_cleanup() {
         assert_eq!(
@@ -107,13 +134,7 @@ mod tests {
     }
     #[test]
     fn saved_preferences_roundtrip_and_replace_previous_values() {
-        static NEXT: super::super::AtomicU64 = super::super::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "oxidezap-call-devices-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
+        let path = fixture_directory();
         let first = CallDevicePreferences {
             microphone: Some("fixture-input".into()),
             ringtone: oxidezap_core::Ringtone::Silent,
