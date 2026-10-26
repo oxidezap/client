@@ -362,9 +362,6 @@ pub(crate) async fn serve_client_with_registry(
             return Ok(());
         }
         tokio::select! {
-            changed = retirements.changed() => {
-                if changed.is_err() { return Ok(()); }
-            }
             // Normally drain published state before reading more requests, so
             // a client that floods the socket cannot starve its own event
             // stream. After a lag that inverts, because recovery comes first.
@@ -379,6 +376,11 @@ pub(crate) async fn serve_client_with_registry(
             // conversation, and a `Hangup` waiting that long is waiting
             // less than the stanza it turns into.
             biased;
+
+            changed = retirements.changed() => {
+                if changed.is_err() { return Ok(()); }
+            }
+
 
             // A replacement has a new hub and sender. End this attachment so
             // every frontend reconnects to the registered runtime.
