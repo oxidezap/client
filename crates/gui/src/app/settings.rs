@@ -194,9 +194,7 @@ impl Settings {
 
     pub(super) fn close(&mut self, cx: &mut Context<Self>) -> bool {
         if self.open.take().is_some() {
-            self.devices.pending_call = None;
-            self.devices.confirming = false;
-            self.devices.preview_after_inventory = false;
+            self.devices.cancel_prepared_call();
             cx.notify();
             return true;
         }

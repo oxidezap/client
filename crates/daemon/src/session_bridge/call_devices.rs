@@ -1,5 +1,5 @@
 //! Device work is independent of network calls and never blocks the bridge.
-use super::Outbox;
+use super::{Outbox, StateHub};
 use oxidezap_core::{
     CallDeviceInventory, CallDevicePreferences, CallDeviceSettings, CameraMode, CameraPreviewId,
 };
@@ -26,28 +26,73 @@ static PREFERENCE_WRITE: Mutex<()> = Mutex::new(());
 
 pub(super) struct Devices {
     state: Arc<Mutex<State>>,
+    runtime: u64,
     in_flight: Arc<tokio::sync::Semaphore>,
 }
+#[cfg(test)]
 impl Default for Devices {
     fn default() -> Self {
         Self {
             state: Default::default(),
+            runtime: 0,
+            in_flight: Arc::new(tokio::sync::Semaphore::new(2)),
+        }
+    }
+}
+impl Devices {
+    pub(super) fn new(hub: &Arc<StateHub>) -> Self {
+        static SHARED: std::sync::LazyLock<Arc<Mutex<State>>> =
+            std::sync::LazyLock::new(Default::default);
+        Self::with_state(SHARED.clone(), hub)
+    }
+    #[cfg(test)]
+    pub(super) fn isolated(hub: &Arc<StateHub>) -> Self {
+        Self::with_state(Default::default(), hub)
+    }
+    fn with_state(state: Arc<Mutex<State>>, hub: &Arc<StateHub>) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let runtime = NEXT.fetch_add(1, Ordering::Relaxed);
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .runtimes
+            .push((runtime, Arc::downgrade(hub)));
+        Self {
+            state,
+            runtime,
             in_flight: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 }
 impl Drop for Devices {
     fn drop(&mut self) {
-        if let Some(p) = &self.state.lock().unwrap_or_else(|e| e.into_inner()).preview {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.runtimes.retain(|(id, _)| *id != self.runtime);
+        state.transitions.retain(|id| *id != self.runtime);
+        if let Some(p) = state.preview.as_ref().filter(|p| p.runtime == self.runtime) {
             p.cancel.store(true, Ordering::Release);
         }
+    }
+}
+pub(super) struct CallAdmission {
+    state: Arc<Mutex<State>>,
+    runtime: u64,
+}
+impl Drop for CallAdmission {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .transitions
+            .retain(|id| *id != self.runtime);
     }
 }
 #[derive(Default)]
 struct State {
     preview: Option<Preview>,
     fences: Vec<PreviewFence>,
-    call_busy: bool,
+    runtimes: Vec<(u64, std::sync::Weak<StateHub>)>,
+    transitions: Vec<u64>,
 }
 struct PreviewFence {
     owner: Outbox,
@@ -86,8 +131,19 @@ impl State {
         &mut self,
         owner: &Outbox,
         id: CameraPreviewId,
+        runtime: u64,
     ) -> Result<Arc<AtomicBool>, String> {
-        if self.call_busy {
+        self.runtimes.retain(|(_, hub)| hub.strong_count() > 0);
+        if runtime != 0 && !self.runtimes.iter().any(|(id, _)| *id == runtime) {
+            return Err("Preview account runtime ended".into());
+        }
+        if !self.transitions.is_empty()
+            || self
+                .runtimes
+                .iter()
+                .filter_map(|(_, hub)| hub.upgrade())
+                .any(|hub| hub.call_state().is_busy())
+        {
             return Err("End the current call before opening a camera preview.".into());
         }
         if owner.is_closed() {
@@ -104,6 +160,7 @@ impl State {
         let cancel = Arc::new(AtomicBool::new(false));
         self.preview = Some(Preview {
             id,
+            runtime,
             owner: owner.clone(),
             cancel: cancel.clone(),
             frame: None,
@@ -117,6 +174,7 @@ impl State {
 }
 struct Preview {
     id: CameraPreviewId,
+    runtime: u64,
     owner: Outbox,
     cancel: Arc<AtomicBool>,
     frame: Option<CameraPreviewFrame>,
@@ -264,18 +322,10 @@ async fn inventory() -> CallDeviceSettings {
 }
 
 impl Devices {
-    pub(super) fn set_call_busy(&mut self, busy: bool) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .call_busy = busy;
-    }
-
-    /// Fence queued starts, including previews owned by another window.
+    /// Fence all account runtimes until the caller commits call state.
     /// Refuse until capture acknowledges stop; keep the bridge responsive.
-    pub(super) fn release_for_call(&mut self) -> Result<(), String> {
+    pub(super) fn release_for_call(&mut self) -> Result<CallAdmission, String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.call_busy = true;
         if let Some(preview) = &state.preview {
             preview.cancel.store(true, Ordering::Release);
             if !preview.finished {
@@ -284,11 +334,16 @@ impl Devices {
                 );
             }
         }
-        Ok(())
+        state.transitions.push(self.runtime);
+        Ok(CallAdmission {
+            state: self.state.clone(),
+            runtime: self.runtime,
+        })
     }
 
     pub(super) fn request(&mut self, id: RequestId, action: Action, owner: Outbox) {
         let state = self.state.clone();
+        let runtime = self.runtime;
         let permit = if matches!(
             action,
             Action::Inventory
@@ -317,7 +372,9 @@ impl Devices {
         };
         oxidezap_session::spawn(async move {
             let _permit = permit;
-            let result = handle(state, action, &owner).await.map(Box::new);
+            let result = handle_for_runtime(state, action, &owner, runtime)
+                .await
+                .map(Box::new);
             if let Ok(frame) = serde_json::to_string(&DaemonMessage::CallDevices { id, result }) {
                 let _ = owner.send(frame).await;
             }
@@ -325,7 +382,17 @@ impl Devices {
     }
 }
 
+#[cfg(test)]
 async fn handle(state: Arc<Mutex<State>>, action: Action, owner: &Outbox) -> Result<Reply, String> {
+    handle_for_runtime(state, action, owner, 0).await
+}
+
+async fn handle_for_runtime(
+    state: Arc<Mutex<State>>,
+    action: Action,
+    owner: &Outbox,
+    runtime: u64,
+) -> Result<Reply, String> {
     match action {
         Action::Preferences => {
             ensure_preferences_readable().await?;
@@ -412,7 +479,7 @@ async fn handle(state: Arc<Mutex<State>>, action: Action, owner: &Outbox) -> Res
             let cancel = state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .reserve_preview(owner, preview_id)?;
+                .reserve_preview(owner, preview_id, runtime)?;
             let state_pump = state.clone();
             let owner = owner.clone();
             oxidezap_session::spawn(async move {
@@ -593,12 +660,12 @@ mod tests {
         ));
         let mut state = state.lock().unwrap();
         assert!(
-            state.reserve_preview(&owner, id).is_err(),
+            state.reserve_preview(&owner, id, 0).is_err(),
             "late start must be refused before opening hardware"
         );
         assert!(state.preview.is_none());
         assert!(
-            state.reserve_preview(&other, id).is_ok(),
+            state.reserve_preview(&other, id, 0).is_ok(),
             "retirement belongs to its connection"
         );
     }
@@ -606,16 +673,23 @@ mod tests {
     fn preview_id_cannot_be_reused_after_completion() {
         let (owner, _rx) = tokio::sync::mpsc::channel(4);
         let mut state = State::default();
-        state.reserve_preview(&owner, CameraPreviewId(1)).unwrap();
+        state
+            .reserve_preview(&owner, CameraPreviewId(1), 0)
+            .unwrap();
         state.preview.as_mut().unwrap().finished = true;
-        assert!(state.reserve_preview(&owner, CameraPreviewId(1)).is_err());
-        assert!(state.reserve_preview(&owner, CameraPreviewId(2)).is_ok());
+        assert!(
+            state
+                .reserve_preview(&owner, CameraPreviewId(1), 0)
+                .is_err()
+        );
+        assert!(state.reserve_preview(&owner, CameraPreviewId(2), 0).is_ok());
     }
     fn fixture(owner: Outbox) -> (Arc<Mutex<State>>, Arc<AtomicBool>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let state = State {
             preview: Some(Preview {
                 id: CameraPreviewId(7),
+                runtime: 0,
                 owner,
                 cancel: cancel.clone(),
                 frame: None,
@@ -629,61 +703,81 @@ mod tests {
         (Arc::new(Mutex::new(state)), cancel)
     }
     #[test]
-    fn call_admission_fences_other_windows_until_capture_has_stopped() {
+    fn call_admission_fences_other_accounts_until_capture_has_stopped() {
+        let shared = Arc::new(Mutex::new(State::default()));
+        let hub_a = StateHub::new();
+        let hub_b = StateHub::new();
+        let a = Devices::with_state(shared.clone(), &hub_a);
+        let mut b = Devices::with_state(shared.clone(), &hub_b);
         let (owner, _rx) = tokio::sync::mpsc::channel(4);
         let (other, _rx2) = tokio::sync::mpsc::channel(4);
-        let mut devices = Devices::default();
-        let cancel = devices
-            .state
+        let cancel = shared
             .lock()
             .unwrap()
-            .reserve_preview(&owner, CameraPreviewId(1))
+            .reserve_preview(&owner, CameraPreviewId(1), a.runtime)
             .unwrap();
-        assert!(devices.release_for_call().is_err());
+        assert!(b.release_for_call().is_err());
         assert!(cancel.load(Ordering::Acquire));
         assert!(
-            devices
-                .state
+            shared
                 .lock()
                 .unwrap()
-                .reserve_preview(&other, CameraPreviewId(1))
+                .reserve_preview(&other, CameraPreviewId(1), b.runtime)
                 .is_err()
         );
-        devices
-            .state
-            .lock()
-            .unwrap()
-            .preview
-            .as_mut()
-            .unwrap()
-            .finished = true;
-        assert!(devices.release_for_call().is_ok());
-        // The reservation remains after acknowledgement, before the call is marked busy.
+        shared.lock().unwrap().preview.as_mut().unwrap().finished = true;
+        let admission = b.release_for_call().unwrap();
         assert!(
-            devices
-                .state
+            shared
                 .lock()
                 .unwrap()
-                .reserve_preview(&other, CameraPreviewId(2))
+                .reserve_preview(&other, CameraPreviewId(2), a.runtime)
                 .is_err()
         );
-        devices.set_call_busy(true);
+        hub_b.calls(|calls| {
+            calls.set_outgoing(oxidezap_core::OutgoingCall::new(
+                "fixture-call",
+                "fixture-jid".into(),
+                "Fixture".into(),
+                true,
+            ))
+        });
+        drop(admission);
         assert!(
-            devices
-                .state
+            shared
                 .lock()
                 .unwrap()
-                .reserve_preview(&other, CameraPreviewId(3))
+                .reserve_preview(&other, CameraPreviewId(3), a.runtime)
                 .is_err()
         );
-        devices.set_call_busy(false);
+        hub_b.calls(|calls| {
+            calls.end(&"fixture-call".into());
+        });
         assert!(
-            devices
-                .state
+            shared
                 .lock()
                 .unwrap()
-                .reserve_preview(&other, CameraPreviewId(4))
+                .reserve_preview(&other, CameraPreviewId(4), a.runtime)
                 .is_ok()
+        );
+        let old_runtime = b.runtime;
+        drop(b); // Teardown of B must not cancel A's replacement preview.
+        assert!(
+            !shared
+                .lock()
+                .unwrap()
+                .preview
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .reserve_preview(&owner, CameraPreviewId(5), old_runtime)
+                .is_err()
         );
     }
     #[tokio::test]

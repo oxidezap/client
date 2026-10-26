@@ -1424,8 +1424,6 @@ impl Bridge {
             return CommandOutcome::NoSession(format!("not connected: {connection:?}"));
         }
 
-        self.devices.set_call_busy(self.hub.call_state().is_busy());
-
         match action {
             Action::Wire { .. } | Action::EditMessage { .. } | Action::RevokeMessage { .. } => {
                 unreachable!("addressed actions are handled in begin_slow")
@@ -1634,6 +1632,26 @@ impl Bridge {
             // replay: `OutgoingCallStarted` only renames one that already
             // exists. A window that attaches mid-call is served this.
             Action::Call(action) => {
+                let _camera_admission = if matches!(
+                    &action,
+                    CallAction::Start { video: true, .. }
+                        | CallAction::Accept { .. }
+                        | CallAction::SetVideo { enabled: true, .. }
+                ) {
+                    match self.devices.release_for_call() {
+                        Ok(admission) => Some(admission),
+                        Err(error) => {
+                            if let CallAction::Start { placeholder_id, .. } = &action {
+                                self.hub
+                                    .calls(|calls| calls.mark_unrecorded(placeholder_id));
+                            }
+                            self.hub.republish_calls();
+                            return CommandOutcome::Refused(error);
+                        }
+                    }
+                } else {
+                    None
+                };
                 match action {
                     CallAction::Start {
                         jid,
@@ -1664,12 +1682,6 @@ impl Bridge {
                                 "a call is already up; end it before placing another".to_string(),
                             );
                         }
-                        if video && let Err(error) = self.devices.release_for_call() {
-                            self.hub
-                                .calls(|calls| calls.mark_unrecorded(&placeholder_id));
-                            self.hub.republish_calls();
-                            return CommandOutcome::Refused(error);
-                        }
                         // The name off the chat list, the same place a front
                         // end would look.
                         let name = self
@@ -1691,11 +1703,6 @@ impl Bridge {
                     // for the *other* direction left the daemon publishing a
                     // ringing offer over a connected call.
                     CallAction::Accept { call_id } => {
-                        if let Err(error) = self.devices.release_for_call() {
-                            // Restore an optimistic front end's offer as well as preserving it here.
-                            self.hub.republish_calls();
-                            return CommandOutcome::Refused(error);
-                        }
                         // Answering a video call answers it with video: the
                         // offer said what kind of call this is, and the
                         // camera has to be attached before the accept goes
@@ -1756,9 +1763,6 @@ impl Bridge {
                     // agreed would be published to every other window too.
                     // The session announces what the device actually did.
                     CallAction::SetVideo { call_id, enabled } => {
-                        if enabled && let Err(error) = self.devices.release_for_call() {
-                            return CommandOutcome::Refused(error);
-                        }
                         client.set_call_video(&call_id, enabled);
                     }
                     CallAction::RequestVideoKeyframe { call_id, stream } => {

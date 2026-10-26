@@ -297,7 +297,7 @@ impl WhatsAppApp {
         };
         self.cancel_camera_preview(cx);
         self.settings
-            .update(cx, |settings, _| settings.devices.pending_call = None);
+            .update(cx, |settings, _| settings.devices.cancel_prepared_call());
         if section == SettingsSection::AudioVideo {
             self.refresh_call_devices(cx);
         }

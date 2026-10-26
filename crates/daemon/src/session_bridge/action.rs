@@ -229,7 +229,8 @@ impl Action {
             Self::Wire { request, .. } => wire_needs_network(request),
             _ => !matches!(
                 self,
-                Self::ReloadHistory
+                Self::CallDevices { .. }
+                    | Self::ReloadHistory
                     | Self::ReconnectSession
                     | Self::RefreshVideo
                     | Self::ForgetSession(_)
@@ -405,3 +406,36 @@ pub enum CommandOutcome {
 
 /// The end of the command channel the server holds.
 pub type Commands = tokio::sync::mpsc::Sender<SessionCommand>;
+
+#[cfg(test)]
+mod device_action_tests {
+    use super::*;
+    #[test]
+    fn device_preferences_and_preview_cleanup_are_available_offline() {
+        use oxidezap_ipc::CallDeviceAction;
+        let (answer_to, _rx) = tokio::sync::mpsc::channel(4);
+        for request in [
+            CallDeviceAction::Preferences,
+            CallDeviceAction::Inventory,
+            CallDeviceAction::StartPreview {
+                preview_id: oxidezap_core::CameraPreviewId(1),
+            },
+            CallDeviceAction::PreviewFrame {
+                preview_id: oxidezap_core::CameraPreviewId(1),
+            },
+            CallDeviceAction::CancelPreview {
+                preview_id: oxidezap_core::CameraPreviewId(1),
+            },
+            CallDeviceAction::TestMicrophone,
+        ] {
+            assert!(
+                !Action::CallDevices {
+                    id: 1,
+                    request,
+                    answer_to: answer_to.clone()
+                }
+                .needs_network()
+            );
+        }
+    }
+}

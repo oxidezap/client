@@ -46,6 +46,11 @@ impl DeviceUi {
             ..Default::default()
         };
     }
+    pub(super) fn cancel_prepared_call(&mut self) {
+        self.pending_call = None;
+        self.confirming = false;
+        self.preview_after_inventory = false;
+    }
     fn may_preview(&self) -> bool {
         !self.confirming && self.preview.is_none() && self.stopping.is_none()
     }
@@ -439,6 +444,29 @@ impl WhatsAppApp {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+    #[test]
+    fn closing_setup_preserves_the_approval_for_call_admission() {
+        let approval = Some(("fixture-recipient".into(), true));
+        let mut ui = DeviceUi {
+            approved_call: approval.clone(),
+            ..Default::default()
+        };
+        ui.cancel_prepared_call();
+        assert_eq!(ui.approved_call, approval);
+    }
+    #[test]
+    fn section_navigation_cancels_confirmation_without_leaving_preview_locked() {
+        let mut ui = DeviceUi {
+            confirming: true,
+            pending_call: Some(("fixture-recipient".into(), true)),
+            ..Default::default()
+        };
+        ui.cancel_prepared_call();
+        assert!(ui.pending_call.is_none());
+        assert!(ui.may_preview());
+        ui.pending_call = Some(("next-fixture".into(), true));
+        assert!(!ui.confirming);
+    }
     #[test]
     fn confirmation_keeps_preview_closed_after_the_first_stop_reply() {
         let mut ui = DeviceUi {
