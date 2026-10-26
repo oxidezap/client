@@ -245,7 +245,7 @@ jobs:
       - name: Test call alerts and video controls without hardware
         run: |
           cargo test -p oxidezap-audio --all-features devices
-          cargo test -p oxidezap-gui --all-features app::call_devices::preview_tests
+          cargo test -p oxidezap-gui --all-features app::call_devices
           cargo test -p oxidezap-gui --all-features call_alert
           cargo test -p oxidezap-gui --all-features call_card
 
