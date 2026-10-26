@@ -160,7 +160,6 @@ pub(super) struct Settings {
     /// has to say whose it is. Bumped by [`Self::forget`]; an answer whose
     /// epoch no longer matches is dropped rather than displayed.
     account_epoch: usize,
-    pub(super) call_devices: oxidezap_core::CallDevicePreferences,
 }
 
 impl Settings {
@@ -173,7 +172,6 @@ impl Settings {
             .then(oxidezap_logging::stored)
             .flatten(),
             account_epoch: 0,
-            call_devices: Default::default(),
         }
     }
 
@@ -568,11 +566,6 @@ impl WhatsAppApp {
         // repeating itself to a daemon it has just reached, and what it
         // wanted was for the level to arrive.
         let _answered = client.set_log_level(level);
-    }
-
-    /// Preferences saved for calls on this machine.
-    pub fn call_device_preferences(&self, cx: &App) -> oxidezap_core::CallDevicePreferences {
-        self.settings.read(cx).call_devices.clone()
     }
 
     /// Delete the cached media and re-measure.
