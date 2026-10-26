@@ -8,6 +8,7 @@
 //! does per event, split by the kind of event each one materializes.
 
 mod ack;
+mod audio_played;
 mod avatar;
 mod chat_names;
 mod chat_rows;
@@ -1232,11 +1233,16 @@ mod migration_tests {
         ChatStore::new(&store).await.expect("run migrations");
 
         assert!(has_table(&store, "session_recovery").await);
-        store
-            .shared()
-            .run(revert_last_chat_migration)
-            .await
-            .expect("session-recovery downgrade is reversible");
+        // Newer metadata migrations must be reverted before this older schema edge.
+        while has_table(&store, "session_recovery").await {
+            store
+                .shared()
+                .run(revert_last_chat_migration)
+                .await
+                .expect("downgrade through session recovery is reversible");
+        }
+        assert!(!has_table(&store, "audio_played_pending").await);
+        assert!(!has_table(&store, "audio_played_receipts").await);
         assert!(!has_table(&store, "session_recovery").await);
         assert!(has_table(&store, "shared_group_history").await);
         store

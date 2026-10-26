@@ -42,6 +42,7 @@ pub(crate) struct ChangeSet {
     pub(crate) chats: bool,
     pub(crate) contacts: bool,
     pub(crate) message_chats: BTreeSet<String>,
+    pub(crate) pending_audio_chats: BTreeSet<String>,
 }
 
 pub(super) async fn writer_loop(
@@ -249,6 +250,19 @@ async fn attempt_batch(
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .1 = Some(write_description(&queued.message));
                             return Err(error);
+                        }
+                    }
+                    if !cs.pending_audio_chats.is_empty()
+                        || (!cs.message_chats.is_empty()
+                            && super::audio_played::has_pending(conn, device_id)?)
+                    {
+                        let played_chats: Vec<_> = cs
+                            .message_chats
+                            .union(&cs.pending_audio_chats)
+                            .cloned()
+                            .collect();
+                        for chat in played_chats {
+                            super::audio_played::apply(conn, device_id, &chat, &mut cs)?;
                         }
                     }
                     Ok(cs)
