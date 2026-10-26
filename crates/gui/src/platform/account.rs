@@ -49,6 +49,29 @@ impl AccountSelection {
 }
 
 #[cfg(any(test, target_family = "wasm"))]
+fn selection_key(path: &str, daemon: Option<&str>) -> String {
+    let source = daemon.map(|url| url.split('?').next().unwrap_or(url));
+    match source {
+        Some(url) => format!("oxidezap:account-selection:{path}:daemon:{url}"),
+        None => format!("oxidezap:account-selection:{path}:embedded"),
+    }
+}
+
+#[test]
+fn selections_belong_to_the_effective_daemon_without_persisting_its_token() {
+    let embedded = selection_key("/app", None);
+    let a = selection_key("/app", Some("ws://localhost:9000/ipc?token=secret"));
+    let b = selection_key("/app", Some("ws://localhost:9001/ipc?token=secret"));
+    assert_ne!(embedded, a);
+    assert_ne!(a, b);
+    assert_eq!(
+        a,
+        selection_key("/app", Some("ws://localhost:9000/ipc?token=rotated"))
+    );
+    assert!(!a.contains("secret"));
+}
+
+#[cfg(any(test, target_family = "wasm"))]
 mod tab_selection {
     pub(super) trait Documents {
         fn tab(&self) -> Result<Option<String>, String>;
@@ -206,10 +229,14 @@ mod imp {
             .map_err(|_| "session storage is unavailable")?
             .ok_or("session storage is unavailable")?;
         let location = window.location();
-        let key = format!(
-            "oxidezap:account-selection:{}{}",
-            location.pathname().unwrap_or_default(),
-            location.search().unwrap_or_default()
+        let endpoint = match oxidezap_ipc::web::named_daemon() {
+            oxidezap_ipc::web::NamedDaemon::Nobody => None,
+            oxidezap_ipc::web::NamedDaemon::Named(url) => Some(url),
+            oxidezap_ipc::web::NamedDaemon::Rejected(_) => Some("rejected".to_owned()),
+        };
+        let key = super::selection_key(
+            &location.pathname().unwrap_or_default(),
+            endpoint.as_deref(),
         );
         Ok((storage, key))
     }

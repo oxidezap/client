@@ -60,6 +60,11 @@ impl Bridge {
                 }
             );
         if ended_pairing || (action.needs_network() && !self.hub.connection().is_connected()) {
+            if let Action::Call(CallAction::Start { placeholder_id, .. }) = &action {
+                self.hub
+                    .calls(|calls| calls.mark_unrecorded(placeholder_id));
+                self.hub.republish_calls();
+            }
             let _ = reply.send(CommandOutcome::NoSession(
                 "WhatsApp is offline; only local data is available".into(),
             ));
@@ -2649,6 +2654,34 @@ mod tests {
             matches!(outcome, CommandOutcome::NoSession(_)),
             "got {outcome:?}"
         );
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn the_early_offline_gate_marks_rejected_call_placeholders_unrecorded() {
+        let mut bridge = bridge();
+        let client = client();
+        let mut updates = bridge.hub.subscribe();
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        bridge
+            .execute(
+                &client,
+                SessionCommand {
+                    action: Action::Call(CallAction::Start {
+                        jid: fixtures::PEER.to_owned(),
+                        video: false,
+                        placeholder_id: "ui-refused".into(),
+                    }),
+                    reply,
+                },
+            )
+            .await;
+        assert!(matches!(
+            answered.await.unwrap(),
+            CommandOutcome::NoSession(_)
+        ));
+        assert!(bridge.hub.call_state().is_unrecorded("ui-refused"));
+        assert!(updates.try_recv().is_ok());
         client.close(Duration::from_secs(1)).await;
     }
 

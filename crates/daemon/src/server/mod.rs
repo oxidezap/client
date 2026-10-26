@@ -328,6 +328,10 @@ pub(crate) async fn serve_client_with_registry(
             // less than the stanza it turns into.
             biased;
 
+            // A replacement has a new hub and sender. End this attachment so
+            // every frontend reconnects to the registered runtime.
+            _ = commands.closed() => return Ok(()),
+
             update = updates.recv(), if !awaiting_resync => match update {
                 Ok(frame) => {
                     if attached.is_wire {

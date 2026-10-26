@@ -190,6 +190,7 @@ enum EmbeddedNext {
 /// Registry of account runtimes and the control-plane snapshot they publish.
 pub struct AccountRegistry {
     relink: tokio::sync::Mutex<()>,
+    construction: tokio::sync::Mutex<()>,
     accounts: RwLock<HashMap<AccountId, Arc<AccountRuntime>>>,
     overview: watch::Sender<Arc<AccountsSnapshot>>,
     /// The supervisor spawning and respawning runtimes into this registry,
@@ -217,6 +218,7 @@ impl AccountRegistry {
         }));
         Arc::new(Self {
             relink: tokio::sync::Mutex::new(()),
+            construction: tokio::sync::Mutex::new(()),
             accounts: RwLock::new(HashMap::new()),
             overview,
             #[cfg(not(target_family = "wasm"))]
@@ -298,8 +300,11 @@ impl AccountRegistry {
             supervisor.spawn(id).await;
             return;
         }
-        let (mut runtime, mut receiver) =
-            self.build_embedded_account(id, Arc::clone(&stores)).await;
+        let Some((mut runtime, mut receiver)) =
+            self.build_embedded_account(id, Arc::clone(&stores)).await
+        else {
+            return;
+        };
         let registry = Arc::clone(self);
         oxidezap_session::spawn(async move {
             let mut failures = 0u32;
@@ -335,9 +340,13 @@ impl AccountRegistry {
                     _ = crate::shutdown::requested() => break,
                     _ = std::future::ready(()) => {},
                 }
-                (runtime, receiver) = registry
+                let Some(next) = registry
                     .build_embedded_account(id, Arc::clone(&stores))
-                    .await;
+                    .await
+                else {
+                    break;
+                };
+                (runtime, receiver) = next;
             }
         });
     }
@@ -346,7 +355,11 @@ impl AccountRegistry {
         self: &Arc<Self>,
         id: AccountId,
         stores: Arc<StoreRegistry>,
-    ) -> (Arc<AccountRuntime>, mpsc::Receiver<SessionCommand>) {
+    ) -> Option<(Arc<AccountRuntime>, mpsc::Receiver<SessionCommand>)> {
+        let _construction = self.construction.lock().await;
+        if self.get(id).is_some() {
+            return None;
+        }
         let hub = StateHub::for_account(id);
         let (commands, receiver) = mpsc::channel(crate::server::MAX_CLIENTS);
         let plugins = crate::plugins::start(&hub, commands.clone()).await;
@@ -354,7 +367,7 @@ impl AccountRegistry {
             id, hub, plugins, commands, stores,
         ));
         assert!(self.insert(Arc::clone(&runtime)));
-        (runtime, receiver)
+        Some((runtime, receiver))
     }
 
     fn finish_embedded_exit(
@@ -808,14 +821,9 @@ impl AccountSupervisor {
 
     /// Build, register and start driving a fresh runtime for `id`.
     ///
-    /// `id` must not already have a runtime registered — the daemon's own
-    /// startup loop and `CreateAccount`'s handler are the only two callers,
-    /// and both know the id they are about to spawn has no runtime yet: the
-    /// first because it just listed `StoreRegistry::accounts()`, the second
-    /// because `StoreRegistry::create_account()` just allocated the id fresh.
-    /// A reset's respawn (in [`Self::handle_exit`] below) removes the old
-    /// runtime from the registry immediately before calling back in here, so
-    /// it never finds one already registered either.
+    /// Concurrent startup and replacement requests share the registry's
+    /// construction lock. If another caller has registered this account,
+    /// return that runtime rather than constructing a second plugin host.
     ///
     /// Returns once the runtime is registered and its task has been handed to
     /// the scheduler — not once a session has connected, which can take
@@ -852,6 +860,10 @@ impl AccountSupervisor {
         id: AccountId,
         hub: Arc<StateHub>,
     ) -> Arc<AccountRuntime> {
+        let _construction = self.registry.construction.lock().await;
+        if let Some(runtime) = self.registry.get(id) {
+            return runtime;
+        }
         let (commands, command_rx) = mpsc::channel(self.command_capacity);
         // Before the plugins load, and before anything reads the account's
         // plugin state: a pre-multi-account install kept its approvals and
@@ -1500,6 +1512,39 @@ mod tests {
             registry.finish_embedded_exit(id, AccountExit::SessionLoggedOut),
             EmbeddedNext::Finished
         );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn concurrent_supervisor_construction_reuses_one_runtime() {
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:concurrent-construction-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let supervisor = super::AccountSupervisor::with_shutdown(
+            Arc::clone(&registry),
+            stores,
+            4,
+            super::RestartPolicy::production(),
+            || std::future::ready(()),
+        );
+        let id = AccountId::new(2).unwrap();
+        let (first, second) = tokio::join!(supervisor.spawn(id), supervisor.spawn(id));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(registry.runtimes().len(), 1);
+        let (_, ensured) = tokio::join!(
+            supervisor.handle_exit(super::AccountRun {
+                id,
+                exit: crate::session_bridge::AccountExit::ResetCompleted,
+                ran_for: std::time::Duration::from_secs(1),
+            }),
+            supervisor.spawn(id),
+        );
+        assert!(!Arc::ptr_eq(&first, &ensured));
+        assert!(Arc::ptr_eq(&registry.get(id).unwrap(), &ensured));
+        assert_eq!(registry.runtimes().len(), 1);
+        supervisor.join_all().await;
     }
 
     #[test]
