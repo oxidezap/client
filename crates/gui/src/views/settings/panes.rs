@@ -30,7 +30,7 @@ pub fn render(
     let body = match section {
         SettingsSection::Account => account(app, metrics, cx),
         SettingsSection::Notifications => notifications(metrics, cx),
-        SettingsSection::AudioVideo => audio_video(metrics, cx),
+        SettingsSection::AudioVideo => super::devices::render(app, entity.clone(), metrics, cx),
         SettingsSection::Privacy => privacy(entity.clone(), metrics, cx),
         SettingsSection::Storage => storage(app, entity, metrics, cx),
         SettingsSection::Advanced => advanced(entity, metrics, cx),
@@ -418,35 +418,6 @@ fn notifications(metrics: Metrics, cx: &App) -> AnyElement {
         metrics,
     )
     .into_any_element()
-}
-
-fn audio_video(metrics: Metrics, cx: &App) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(metrics.space_xxl())
-        .child(group(
-            label("DEVICES", metrics, cx),
-            pending(
-                "Calls use the system's default input and output. Choosing a \
-                 device needs enumeration the audio layer does not expose yet.",
-                metrics,
-                cx,
-            ),
-            metrics,
-        ))
-        .child(group(
-            label("VIDEO", metrics, cx),
-            pending(
-                "The VoIP facade is audio-only and 1:1. The call card already \
-                 has the layouts for video and for groups; the controls turn on \
-                 when the library does.",
-                metrics,
-                cx,
-            ),
-            metrics,
-        ))
-        .into_any_element()
 }
 
 fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElement {

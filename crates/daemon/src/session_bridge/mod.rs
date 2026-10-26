@@ -26,6 +26,7 @@ use crate::state::StateHub;
 
 mod act;
 mod action;
+mod call_devices;
 mod call_log;
 mod externalize;
 mod read_tracker;
@@ -173,6 +174,7 @@ pub async fn run(
     let stores_for_reset = Arc::clone(&stores);
     let mut client = WhatsAppClient::new_for_account_with_registry(account_id, stores)
         .context("opening the local store")?;
+    call_devices::load_preferences().await;
     let avatar_recorder = client.avatar_recorder();
     let mut events = client
         .start()
@@ -496,6 +498,7 @@ const FORGET_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Everything the event loop carries between one event and the next.
 struct Bridge {
+    devices: call_devices::Devices,
     hub: Arc<StateHub>,
     lifecycle: RuntimeLifecycle,
     /// The plugins, fed the same events the front ends get.
@@ -540,12 +543,14 @@ impl Bridge {
         // No session behind it: these tests fold events without opening a
         // store, so every avatar descriptor write is dropped, which is the
         // honest answer for a bridge with no store to point at one.
-        Self::with_lifecycle(
+        let mut bridge = Self::with_lifecycle(
             hub,
             plugins,
             RuntimeLifecycle::new(),
             oxidezap_session::AvatarRecorder::detached(),
-        )
+        );
+        bridge.devices = call_devices::Devices::isolated(&bridge.hub);
+        bridge
     }
 
     fn with_lifecycle(
@@ -562,6 +567,7 @@ impl Bridge {
         let publisher = crate::publisher::start(Arc::clone(&hub), queue);
 
         Self {
+            devices: call_devices::Devices::new(&hub),
             hub,
             lifecycle,
             plugins,

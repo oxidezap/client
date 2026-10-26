@@ -286,7 +286,8 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 40;
+/// 41 adds addressed device settings, tests and camera previews with their own identity.
+pub const PROTOCOL_VERSION: u32 = 41;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

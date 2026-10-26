@@ -1632,6 +1632,26 @@ impl Bridge {
             // replay: `OutgoingCallStarted` only renames one that already
             // exists. A window that attaches mid-call is served this.
             Action::Call(action) => {
+                let _camera_admission = if matches!(
+                    &action,
+                    CallAction::Start { video: true, .. }
+                        | CallAction::Accept { .. }
+                        | CallAction::SetVideo { enabled: true, .. }
+                ) {
+                    match self.devices.release_for_call() {
+                        Ok(admission) => Some(admission),
+                        Err(error) => {
+                            if let CallAction::Start { placeholder_id, .. } = &action {
+                                self.hub
+                                    .calls(|calls| calls.mark_unrecorded(placeholder_id));
+                            }
+                            self.hub.republish_calls();
+                            return CommandOutcome::Refused(error);
+                        }
+                    }
+                } else {
+                    None
+                };
                 match action {
                     CallAction::Start {
                         jid,
@@ -1749,6 +1769,14 @@ impl Bridge {
                         client.request_call_video_keyframe(&call_id, stream);
                     }
                 }
+                CommandOutcome::Accepted
+            }
+            Action::CallDevices {
+                id,
+                request,
+                answer_to,
+            } => {
+                self.devices.request(id, request, answer_to);
                 CommandOutcome::Accepted
             }
             Action::Download {

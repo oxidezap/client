@@ -44,6 +44,8 @@ indexmap = "2"
 log = { workspace = true }
 
 oxidezap-audio = { workspace = true }
+# Settings validates advertised modes using the capture capability's exact codec limits.
+oxidezap-video = { workspace = true }
 oxidezap-core = { workspace = true }
 # The daemon's protocol, not the session itself: this front end has not owned
 # a WhatsApp connection since the daemon took it over.

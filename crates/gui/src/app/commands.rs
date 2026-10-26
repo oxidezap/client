@@ -38,9 +38,7 @@ impl WhatsAppApp {
         }
         // Searching from inside Settings means leaving Settings: the field
         // being focused is behind it.
-        self.settings.update(cx, |settings, cx| {
-            settings.close(cx);
-        });
+        self.close_settings(cx);
         // And so does searching from Status: the field belongs to the chat
         // list, and that list is not on screen while the status list is in its
         // slot. Focusing it there handed the keyboard to an input nothing was
@@ -297,6 +295,12 @@ impl WhatsAppApp {
         else {
             return;
         };
+        self.cancel_camera_preview(cx);
+        self.settings
+            .update(cx, |settings, _| settings.devices.cancel_prepared_call());
+        if section == SettingsSection::AudioVideo {
+            self.refresh_call_devices(cx);
+        }
         if section == SettingsSection::Storage {
             // Re-measured on arrival: a download since the pane was last
             // open has changed the number it is about to show.
@@ -313,6 +317,7 @@ impl WhatsAppApp {
     /// The draft was applied live as it was edited, so closing is not a
     /// discard — `revert_theme` is the way back.
     pub fn close_settings(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cancel_camera_preview(cx);
         let closed = self.settings.update(cx, |settings, cx| settings.close(cx));
         if closed {
             cx.notify();

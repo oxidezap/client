@@ -5,6 +5,7 @@
 //! it. Edits apply live and Escape closes it.
 
 mod appearance;
+mod devices;
 mod panes;
 
 use gpui::{

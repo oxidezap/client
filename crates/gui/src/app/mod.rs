@@ -8,6 +8,7 @@
 
 mod attaching;
 mod body;
+mod call_devices;
 mod calls;
 mod calls_ctl;
 pub mod chat_row;
@@ -3076,6 +3077,7 @@ impl WhatsAppApp {
                         // nobody, and the daemon on the other end may be a
                         // new one. Nothing is sent if nobody chose.
                         app.resend_log_level(cx);
+                        app.refresh_call_device_preferences(cx);
                     }
                     Err(e) if Session::is_settled(&e) => {
                         // A refusal, not a failure to reach anything: this

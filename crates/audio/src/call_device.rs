@@ -77,36 +77,24 @@ pub async fn open_call_audio() -> Result<(
 /// stream lives on a parked std thread that exits when the receiver is dropped (call ended).
 pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
     let host = cpal::default_host();
-    // Honor `WA_INPUT_DEVICE` (a name substring) to override a wrong/silent default endpoint, else use
-    // the OS default. We only enumerate `input_devices()` when a name is requested: enumerating on
-    // Linux/ALSA probes the legacy OSS plugin and prints harmless "Cannot open /dev/dsp" noise to
-    // stderr (from libasound, not our logger), so the default path -- `default_input_device()`, which
-    // does not enumerate -- avoids it entirely. A no-match error stays generic so device names do
-    // not leak through logs.
-    let want = std::env::var("WA_INPUT_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let selected = crate::devices::call_preferences().microphone;
-    let device = if selected.is_some() {
-        crate::devices::select(selected.as_deref(), true)?
-    } else {
-        match &want {
-            Some(want) => {
-                let devices: Vec<cpal::Device> = host
-                    .input_devices()
-                    .map(|i| i.collect())
-                    .unwrap_or_default();
-                devices
-                    .into_iter()
-                    .find(|d| {
-                        d.description()
-                            .is_ok_and(|x| x.name().contains(want.as_str()))
-                    })
-                    .ok_or_else(|| anyhow!("WA_INPUT_DEVICE did not match an input device"))?
-            }
-            None => host
-                .default_input_device()
-                .ok_or_else(|| anyhow!("no default input device"))?,
+    // A saved choice, including System default, wins over the legacy name
+    // override. Before the first save, preserve WA_INPUT_DEVICE routing.
+    let want = std::env::var("WA_INPUT_DEVICE").ok();
+    let device = match crate::devices::microphone_choice(want) {
+        crate::devices::MicrophoneChoice::Device(id) => crate::devices::select(Some(&id), true)?,
+        crate::devices::MicrophoneChoice::SystemDefault => crate::devices::select(None, true)?,
+        crate::devices::MicrophoneChoice::LegacyName(want) => {
+            let devices: Vec<cpal::Device> = host
+                .input_devices()
+                .map(|i| i.collect())
+                .unwrap_or_default();
+            devices
+                .into_iter()
+                .find(|d| {
+                    d.description()
+                        .is_ok_and(|x| x.name().contains(want.as_str()))
+                })
+                .ok_or_else(|| anyhow!("WA_INPUT_DEVICE did not match an input device"))?
         }
     };
     let (config, format) = default_config(&device, true)?;
@@ -269,6 +257,20 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
     Ok(rx)
 }
 
+fn downmix<T: cpal::Sample>(data: &[T], channels: usize, mono: &mut Vec<i16>)
+where
+    i16: cpal::FromSample<T>,
+{
+    mono.clear();
+    for frame in data.chunks(channels) {
+        let sum: i64 = frame
+            .iter()
+            .map(|&sample| i64::from(i16::from_sample(sample)))
+            .sum();
+        mono.push((sum / channels as i64) as i16);
+    }
+}
+
 fn build_input_stream<P>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -296,15 +298,7 @@ where
                 .build_input_stream(
                     config.clone(),
                     move |data: &[$t], _| {
-                        mono.clear();
-                        for frame in data.chunks(channels) {
-                            // Downmix: average the channels into one i16.
-                            let mut sum = 0i32;
-                            for &s in frame {
-                                sum += i16::from_sample(s) as i32;
-                            }
-                            mono.push((sum / channels as i32) as i16);
-                        }
+                        downmix(data, channels, &mut mono);
                         // Drop overflow: loss tolerant; the ring is full only if the drain fell behind.
                         let _ = prod.push_slice(&mono);
                     },
@@ -553,6 +547,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_formats_channels_and_rates_keep_known_pcm_in_range() {
+        let mut mono = Vec::new();
+        downmix(&[i16::MIN, i16::MAX], 1, &mut mono);
+        assert_eq!(mono, [i16::MIN, i16::MAX]);
+        downmix(&[1.0f32, 1.0, -1.0, -1.0], 2, &mut mono);
+        assert_eq!(mono, [i16::MAX, i16::MIN]);
+        downmix(&[0u16, u16::MAX], 2, &mut mono);
+        assert_eq!(mono, [0]);
+        for channels in [1, 2, 6] {
+            for rate in [16_000, 44_100, 48_000] {
+                downmix(
+                    &vec![16384i16; rate as usize / 10 * channels],
+                    channels,
+                    &mut mono,
+                );
+                let mut resampler = crate::resample::Stream::new(rate, WA_RATE);
+                let mut output = Vec::new();
+                resampler.process(&mono, &mut output);
+                assert!(!output.is_empty());
+                assert!(mono.iter().all(|sample| *sample == 16384));
+                assert!(output.iter().all(|sample| sample.unsigned_abs() < 32767));
+                // The low-pass startup may ring; measure the settled constant signal.
+                assert!(
+                    output[output.len() / 2..]
+                        .iter()
+                        .all(|sample| (i32::from(*sample) - 16384).abs() < 128)
+                );
+                assert!(rms(&output) > 15000.0);
+            }
+        }
+    }
 
     fn tone(freq: f64, rate: u32, samples: usize) -> Vec<i16> {
         (0..samples)
