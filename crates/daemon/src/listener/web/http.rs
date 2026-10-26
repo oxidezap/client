@@ -373,8 +373,16 @@ pub(crate) async fn respond(
         ));
     }
     head.push_str("\r\n");
+    write_response(stream, head.as_bytes(), body).await
+}
+
+async fn write_response(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    head: &[u8],
+    body: &[u8],
+) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(head).await?;
         stream.write_all(body).await?;
         stream.flush().await
     })
@@ -386,6 +394,26 @@ pub(crate) async fn respond(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_response_releases_its_account_media_lease() {
+        let lifecycle = std::sync::Arc::new(crate::session_bridge::RuntimeLifecycle::new());
+        let lease = lifecycle.media_lease().await.unwrap();
+        let (mut writer, _unread_peer) = tokio::io::duplex(1);
+        let transfer = tokio::spawn(async move {
+            let _lease = lease;
+            write_response(&mut writer, b"synthetic header", b"synthetic body").await
+        });
+        let cleanup_lifecycle = std::sync::Arc::clone(&lifecycle);
+        let cleanup = tokio::spawn(async move { cleanup_lifecycle.drain_media().await });
+        tokio::task::yield_now().await;
+        assert!(!transfer.is_finished());
+        assert!(!cleanup.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let error = transfer.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        drop(cleanup.await.unwrap());
+    }
 
     /// A token the tests can also write into a request.
     pub(crate) const TEST_TOKEN: &str = "0123456789abcdef";
