@@ -136,7 +136,18 @@ pub(crate) fn decode_avatar(bytes: &[u8]) -> Option<(Arc<RenderImage>, u64)> {
     if pixels > oxidezap_core::MAX_AVATAR_PIXELS {
         return None;
     }
-    let decoded_size = pixels.checked_mul(4)?;
+    // These are profile-picture previews. Keep all cache slots affordable:
+    // 256 thumbnails at 96x96 RGBA cost 9 MiB, below the 12 MiB budget.
+    // Keeping full-size decoded pictures here makes recovery evict the next
+    // demanded avatar and repeat forever on an unchanged viewport.
+    let image = if width > AVATAR_PREVIEW_EDGE || height > AVATAR_PREVIEW_EDGE {
+        image.thumbnail(AVATAR_PREVIEW_EDGE, AVATAR_PREVIEW_EDGE)
+    } else {
+        image
+    };
+    let decoded_size = u64::from(image.width())
+        .checked_mul(u64::from(image.height()))?
+        .checked_mul(4)?;
     // The `image` crate decodes to RGBA; GPUI's `RenderImage` is BGRA, and its
     // own decoder swaps the same two bytes. Skipping this renders every photo
     // with red and blue exchanged.
@@ -199,6 +210,7 @@ struct SourceCache {
 }
 
 const MAX_SOURCE_ENTRIES: usize = 256;
+const AVATAR_PREVIEW_EDGE: u32 = 96;
 
 struct SourceEntry {
     image: Arc<RenderImage>,
@@ -870,6 +882,23 @@ mod tests {
         assert_eq!(cache.entries.len(), MAX_SOURCE_ENTRIES);
         assert!(cache.get("0").is_none());
         assert!(cache.get(&MAX_SOURCE_ENTRIES.to_string()).is_some());
+    }
+
+    #[test]
+    fn avatar_previews_preserve_aspect_ratio_and_fit_the_cache_slots() {
+        for (height, expected_cost) in [(512, 96 * 48 * 4), (1024, 96 * 96 * 4)] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(1024, height)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let (image, decoded_size) = decode_avatar(bytes.get_ref()).unwrap();
+            assert_eq!(decoded_size, expected_cost);
+            assert_eq!(image.as_bytes(0).unwrap().len() as u64, decoded_size);
+            assert!(
+                decoded_size * MAX_SOURCE_ENTRIES as u64
+                    <= oxidezap_core::DECODED_IMAGE_BUDGET_BYTES
+            );
+        }
     }
 
     #[test]

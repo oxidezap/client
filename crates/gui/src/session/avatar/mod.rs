@@ -583,6 +583,16 @@ mod tests {
             assert!(!demand.need_bytes, "disk hit needs only freshness metadata");
             assert_eq!(demand.known_picture_id, chat.picture_id);
 
+            let freshness = AvatarManager::new();
+            freshness.demand_chats_windowed(&[], std::slice::from_ref(&chat));
+            assert!(freshness.is_revalidated(&chat.jid));
+            freshness.demand_chats_windowed(&[], &[]);
+            assert!(!freshness.is_revalidated(&chat.jid));
+            freshness.demand_chats_windowed(std::slice::from_ref(&chat), &[]);
+            let demands = freshness.take_demands();
+            assert_eq!(demands.len(), 1, "cancelled freshness must be retried");
+            assert!(!demands[0].need_bytes);
+
             // Real LRU eviction changes the viewport fingerprint and restores
             // from disk without requesting the image bytes again.
             let epoch = first.demand_epoch();
@@ -616,6 +626,44 @@ mod tests {
                 !path.exists(),
                 "corrupt bytes must be removed before refetch"
             );
+
+            // Four valid 1024px pictures exceed the decoded budget unless
+            // recovery retains thumbnails. They must settle in RAM together,
+            // without repeatedly invalidating the same stationary viewport.
+            let mut large = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(1024, 1024)
+                .write_to(&mut large, image::ImageFormat::Png)
+                .unwrap();
+            let large = large.into_inner();
+            let window = AvatarManager::new();
+            let mut chats = Vec::new();
+            for index in 0..4 {
+                let key = format!("avatar-large-fixture-{index}");
+                let path = oxidezap_ipc::media_path(&key).unwrap();
+                std::fs::write(&path, &large).unwrap();
+                let chat = ChatDemand {
+                    jid: format!("avatar-{index}@example.invalid"),
+                    picture_id: Some("large-picture".to_string()),
+                    cache_key: Some(key),
+                };
+                window.demand_chat(&chat);
+                assert!(!next(&window).await.need_bytes);
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    large,
+                    "disk bytes stay original"
+                );
+                chats.push(chat);
+            }
+            let epoch = window.demand_epoch();
+            for _ in 0..3 {
+                for chat in &chats {
+                    assert!(get_avatar_image(chat.cache_key.as_ref().unwrap()).is_some());
+                }
+                window.demand_chats_windowed(&chats[..2], &chats[2..]);
+                assert!(window.take_demands().is_empty());
+                assert_eq!(window.demand_epoch(), epoch, "recovery must settle");
+            }
         });
     }
 
