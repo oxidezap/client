@@ -713,9 +713,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   draw what it is sending. What crosses the socket is therefore *both*
   directions of the call, as H.264 access units: 16 KiB a frame against 3.5
   MiB of pixels, and the front end already carries a decoder for the video it
-  plays in a conversation. The open takes the first device unless
-  `OXIDEZAP_CAMERA` names an index or a backend-specific name — which is the
-  answer when index 0 is a virtual camera with nothing behind it, and the log
+  plays in a conversation. A saved camera preference supplies the device and
+  requested mode for the next open. Without one, the open takes the first
+  device unless `OXIDEZAP_CAMERA` names an index or a backend-specific name.
+  That override handles a virtual camera occupying index 0, and the log
   line next to every open (`cameras in reach`) says what there was to choose
   from. Sending the self-view as the very stream the peer
   receives costs one more decode and no second encode, and is the only form
