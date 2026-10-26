@@ -95,7 +95,7 @@ mod imp {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&temporary, raw).map_err(|error| error.to_string())?;
-        if let Err(error) = std::fs::rename(&temporary, &path) {
+        if let Err(error) = std::fs::rename(&temporary, path) {
             let _ = std::fs::remove_file(temporary);
             return Err(error.to_string());
         }

@@ -664,6 +664,12 @@ pub enum ChatOpen {
     ToPreview,
 }
 
+#[derive(Clone, Copy)]
+pub enum OfflineRecovery {
+    Reconnect,
+    PairAgain,
+}
+
 /// Main application struct
 pub struct WhatsAppApp {
     body: Option<Entity<body::Body>>,
@@ -4392,8 +4398,17 @@ impl Render for WhatsAppApp {
             && self.destination == Destination::Chats
             && self.responsive_layout(window, cx).show_chat_area()
             && self.selected_chat_jid().is_some();
-        let offline_banner = (self.is_offline() && !conversation_strip)
-            .then(|| crate::views::render_offline_strip(entity.clone(), cx.product().metrics, cx));
+        let offline_banner =
+            self.offline_recovery()
+                .filter(|_| !conversation_strip)
+                .map(|recovery| {
+                    crate::views::render_offline_strip(
+                        entity.clone(),
+                        recovery,
+                        cx.product().metrics,
+                        cx,
+                    )
+                });
         root.child(
             div()
                 .size_full()

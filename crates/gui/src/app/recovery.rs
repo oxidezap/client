@@ -148,8 +148,12 @@ impl WhatsAppApp {
         }
     }
 
-    pub fn is_terminal_offline(&self) -> bool {
-        matches!(self.app_state, AppState::OfflineLoggedOut { .. })
+    pub fn offline_recovery(&self) -> Option<OfflineRecovery> {
+        match self.app_state {
+            AppState::Offline => Some(OfflineRecovery::Reconnect),
+            AppState::OfflineLoggedOut { .. } => Some(OfflineRecovery::PairAgain),
+            _ => None,
+        }
     }
     pub fn has_retained_history(&self) -> bool {
         self.account_selection.retained.is_some()
