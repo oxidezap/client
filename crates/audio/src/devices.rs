@@ -208,6 +208,9 @@ mod imp {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use imp::select;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +223,3 @@ mod tests {
         assert!((0..16000).all(|i| ringtone_sample(Ringtone::Silent, i, 16000) == 0));
     }
 }
-
-#[cfg(not(target_family = "wasm"))]
-pub(crate) use imp::select;
