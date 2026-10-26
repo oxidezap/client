@@ -96,7 +96,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         // The store has tracked the real delivery state all along; the UI used
         // to flatten it to a bool and lose the delivered/read distinction that
         // the second tick exists to show.
-        status: if stored.from_me {
+        status: if stored.from_me || stored.status == oxidezap_chat_store::MessageStatus::Played {
             store_status(stored.status)
         } else {
             MessageStatus::default()
@@ -480,5 +480,21 @@ mod tests {
             message.quoted.expect("wrapped reply quote").message_id,
             "quoted-message"
         );
+    }
+    #[test]
+    fn incoming_played_survives_hydration_without_turning_read_into_played() {
+        let mut stored = stored_poll_creation();
+        stored.kind = oxidezap_chat_store::MessageKind::Audio;
+        for from_me in [false, true] {
+            stored.from_me = from_me;
+            stored.status = oxidezap_chat_store::MessageStatus::Played;
+            assert_eq!(
+                stored_to_chat_message(stored.clone()).status,
+                MessageStatus::Played
+            );
+        }
+        stored.from_me = false;
+        stored.status = oxidezap_chat_store::MessageStatus::Read;
+        assert_ne!(stored_to_chat_message(stored).status, MessageStatus::Played);
     }
 }

@@ -3854,21 +3854,7 @@ impl WhatsAppApp {
             return;
         };
         let advanced = if receipt_type == ReceiptType::PlayedSelf {
-            let mut changed = 0;
-            for id in &message_ids {
-                let mut matches = chat
-                    .messages
-                    .iter_mut()
-                    .filter(|message| !message.is_from_me && message.id == *id);
-                if let Some(message) = matches.next()
-                    && matches.next().is_none()
-                {
-                    let before = message.status;
-                    message.status.advance(MessageStatus::Played);
-                    changed += usize::from(before != message.status);
-                }
-            }
-            changed
+            advance_authorless_self_play(chat, &chat_jid, &message_ids)
         } else {
             chat.advance_status(&message_ids, status)
         };
@@ -4093,6 +4079,32 @@ fn receipt_status(receipt_type: ReceiptType) -> Option<MessageStatus> {
         // Retries, errors and sender echoes say nothing about delivery.
         _ => None,
     }
+}
+
+// The live event has no original-author field. Participant-keyed plays must
+// arrive through confirmed store hydration instead of a currently unique row.
+fn advance_authorless_self_play(chat: &mut Chat, chat_jid: &str, ids: &[String]) -> usize {
+    let Ok(jid) = chat_jid.parse::<Jid>() else {
+        return 0;
+    };
+    if !(jid.is_pn() || jid.is_lid() || jid.is_newsletter()) {
+        return 0;
+    }
+    let mut changed = 0;
+    for id in ids {
+        let mut matches = chat
+            .messages
+            .iter_mut()
+            .filter(|message| !message.is_from_me && message.id == *id);
+        if let Some(message) = matches.next()
+            && matches.next().is_none()
+        {
+            let before = message.status;
+            message.status.advance(MessageStatus::Played);
+            changed += usize::from(before != message.status);
+        }
+    }
+    changed
 }
 
 /// The newest message in `chat` that the daemon can also name.
@@ -5868,5 +5880,44 @@ mod decoded_image_budget {
         );
         // And it still binds on the entry above the floor.
         assert!(over_budget(far_over, MIN_DECODED_IMAGES + 1));
+    }
+}
+
+#[cfg(test)]
+mod linked_play_tests {
+    use super::*;
+
+    #[test]
+    fn live_authorless_group_play_never_claims_a_loaded_row() {
+        let mut chat = Chat::new("120363000000000001@g.us".into());
+        let mut incoming = ChatMessage::new_incoming(
+            "same-id".into(),
+            "5511000000002@s.whatsapp.net".into(),
+            "voice".into(),
+        );
+        incoming.status = MessageStatus::Read;
+        chat.messages.push(incoming);
+        assert_eq!(
+            advance_authorless_self_play(&mut chat, "120363000000000001@g.us", &["same-id".into()]),
+            0
+        );
+        assert_eq!(chat.messages[0].status, MessageStatus::Read);
+        assert_eq!(
+            advance_authorless_self_play(
+                &mut chat,
+                "5511000000002@s.whatsapp.net",
+                &["same-id".into()]
+            ),
+            1
+        );
+        assert_eq!(chat.messages[0].status, MessageStatus::Played);
+        assert_eq!(
+            advance_authorless_self_play(
+                &mut chat,
+                "5511000000002@s.whatsapp.net",
+                &["same-id".into()]
+            ),
+            0
+        );
     }
 }

@@ -313,6 +313,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn played_incoming_survives_store_reopen_and_ui_hydration() {
+        let (db, store, message) = fixture(false, true).await;
+        observe_playback(
+            &store,
+            &message,
+            None::<fn() -> std::future::Ready<Result<(), String>>>,
+        )
+        .await
+        .unwrap();
+        drop(store);
+        let reopened = ChatStore::new(&db).await.unwrap();
+        let row = reopened
+            .message(&message.chat_jid, &message.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let hydrated = super::super::convert::stored_to_chat_message(row);
+        assert!(!hydrated.is_from_me);
+        assert_eq!(hydrated.status, oxidezap_core::MessageStatus::Played);
+    }
+
+    #[tokio::test]
     async fn own_and_ordinary_audio_do_not_emit_receipts() {
         let (_db, store, mut message) = fixture(false, true).await;
         message.from_me = true;
