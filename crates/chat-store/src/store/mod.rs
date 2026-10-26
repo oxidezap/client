@@ -1199,6 +1199,44 @@ mod migration_tests {
         result
     }
 
+    /// Isolate this migration's downgrade edge from later independent
+    /// migrations, rather than assuming a fixed latest version or count.
+    fn rewind_to_retirement_migration(
+        conn: &mut diesel::SqliteConnection,
+    ) -> std::result::Result<(), StoreError> {
+        use diesel::migration::{Migration, MigrationSource};
+        use diesel::sqlite::Sqlite;
+        let migrations: Vec<Box<dyn Migration<Sqlite>>> =
+            MIGRATIONS.migrations().map_err(StoreError::Migration)?;
+        let target = migrations
+            .iter()
+            .find(|migration| {
+                migration
+                    .name()
+                    .to_string()
+                    .ends_with("_account_retirement")
+            })
+            .expect("the account retirement migration is embedded")
+            .name()
+            .version()
+            .as_owned();
+        loop {
+            let applied = conn.applied_migrations().map_err(StoreError::Migration)?;
+            assert!(
+                applied.contains(&target),
+                "retirement migration must remain applied"
+            );
+            let newer = migrations.iter().any(|migration| {
+                let version = migration.name().version();
+                version > target && applied.contains(&version)
+            });
+            if !newer {
+                return Ok(());
+            }
+            revert_last_chat_migration(conn)?;
+        }
+    }
+
     #[tokio::test]
     async fn stable_id_downgrade_round_trips_then_sender_identity_refuses() {
         let store = SqliteStore::open(&format!(
@@ -1208,6 +1246,11 @@ mod migration_tests {
         .await
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
+        store
+            .shared()
+            .run(rewind_to_retirement_migration)
+            .await
+            .expect("isolate the retirement downgrade edge");
 
         assert!(has_table(&store, "account_retirement").await);
         store
@@ -1358,6 +1401,11 @@ mod migration_tests {
         .await
         .unwrap();
         ChatStore::prepare(&store).await.unwrap();
+        store
+            .shared()
+            .run(rewind_to_retirement_migration)
+            .await
+            .expect("isolate the retirement downgrade edge");
         store.shared().run(|conn| {
             diesel::sql_query("INSERT INTO account_retirement (old_id, successor, pn, lid) VALUES (1, 2, '100001@s.whatsapp.net', '200001@lid')").execute(conn).map(|_| ()).map_err(crate::error::db_err)
         }).await.unwrap();
