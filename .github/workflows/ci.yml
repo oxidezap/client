@@ -242,6 +242,10 @@ jobs:
         run: cargo test -p oxidezap-ipc -p oxidezap-daemon -p oxidezap-core -p oxidezap-video -p oxidezap-session --all-features
       - name: Test avatar cache recovery without a display
         run: cargo test -p oxidezap-gui --all-features session::avatar::tests
+      - name: Test call alerts and video controls without hardware
+        run: |
+          cargo test -p oxidezap-gui --all-features call_alert
+          cargo test -p oxidezap-gui --all-features call_card
 
   # The web half, run in a browser rather than checked.
   #
