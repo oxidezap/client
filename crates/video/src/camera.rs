@@ -521,13 +521,32 @@ trait CaptureDevice {
 
 impl CaptureDevice for Camera {
     fn formats(&mut self) -> Result<Vec<CameraFormat>> {
-        Ok(self.compatible_camera_formats()?)
+        advertised_formats::read(self)
     }
     fn start_stream(&mut self) -> Result<()> {
         Ok(self.open_stream()?)
     }
     fn stop_stream(&mut self) -> Result<()> {
         Ok(Camera::stop_stream(self)?)
+    }
+}
+
+// Nokhwa 0.10.11's AVFoundation compatible_list_by_resolution filters with
+// `!= fourcc`. Its aggregate API therefore loses or relabels native tuples.
+// Use the same direct format source as its constructor on that platform.
+#[cfg(target_os = "macos")]
+mod advertised_formats {
+    use super::*;
+    pub fn read(camera: &mut Camera) -> Result<Vec<CameraFormat>> {
+        let device = nokhwa_bindings_macos::AVCaptureDevice::new(camera.index())?;
+        Ok(device.supported_formats()?)
+    }
+}
+#[cfg(not(target_os = "macos"))]
+mod advertised_formats {
+    use super::*;
+    pub fn read(camera: &mut Camera) -> Result<Vec<CameraFormat>> {
+        Ok(camera.compatible_camera_formats()?)
     }
 }
 
@@ -767,7 +786,41 @@ mod device_identity {
 }
 
 pub fn enumerate() -> Result<Vec<crate::CameraDevice>> {
-    let devices = nokhwa::query(ApiBackend::Auto).context("enumerating cameras")?;
+    enumerate_with(
+        authorize,
+        || nokhwa::query(ApiBackend::Auto).context("enumerating cameras"),
+        probe_formats,
+    )
+}
+
+fn probe_formats(index: &CameraIndex) -> Result<Vec<CameraFormat>> {
+    let mut errors = Vec::new();
+    for input in INPUT_FORMATS {
+        let inputs = [*input];
+        let request = RequestedFormat::with_formats(RequestedFormatType::None, &inputs);
+        match Camera::new(index.clone(), request) {
+            Ok(mut camera) => {
+                let formats = CaptureDevice::formats(&mut camera);
+                let closed = camera.stop_stream();
+                drop(camera);
+                closed.context("closing camera inventory probe")?;
+                return formats;
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    bail!("camera modes unavailable: {}", errors.join("; "))
+}
+
+fn enumerate_with(
+    initialize: impl FnOnce() -> Result<()>,
+    query: impl FnOnce() -> Result<Vec<CameraInfo>>,
+    mut formats: impl FnMut(&CameraIndex) -> Result<Vec<CameraFormat>>,
+) -> Result<Vec<crate::CameraDevice>> {
+    // AVFoundation requires initialization before even querying the backend.
+    // Refused or unanswered access is an error, not an empty inventory.
+    initialize()?;
+    let devices = query()?;
     let mut result = Vec::with_capacity(devices.len());
     for (position, info) in devices.into_iter().enumerate() {
         let index = device_identity::index(&info);
@@ -775,28 +828,19 @@ pub fn enumerate() -> Result<Vec<crate::CameraDevice>> {
             CameraIndex::Index(index) => format!("index:{index}"),
             CameraIndex::String(name) => format!("name:{name}"),
         };
-        let mut modes = Vec::new();
-        // Some devices can be listed while another application has them open.
-        // Preserve their identity even when querying modes fails. No stream is
-        // started, and the probe is dropped before returning the inventory.
-        for input in INPUT_FORMATS {
-            let inputs = [*input];
-            let request = RequestedFormat::with_formats(RequestedFormatType::None, &inputs);
-            if let Ok(mut camera) = Camera::new(index.clone(), request) {
-                if let Ok(formats) = camera.compatible_camera_formats() {
-                    modes = candidates(formats, VideoQuality::default())
-                        .into_iter()
-                        .map(|format| crate::CameraMode {
-                            width: format.resolution().width(),
-                            height: format.resolution().height(),
-                            fps: format.frame_rate(),
-                        })
-                        .collect();
-                }
-                let _ = camera.stop_stream();
-                break;
-            }
-        }
+        // A busy device still belongs in inventory. Only its modes are missing.
+        let available = formats(&index).unwrap_or_else(|error| {
+            log::debug!("camera {index} inventory modes unavailable: {error:#}");
+            Vec::new()
+        });
+        let mut modes: Vec<_> = candidates(available, VideoQuality::default())
+            .into_iter()
+            .map(|format| crate::CameraMode {
+                width: format.resolution().width(),
+                height: format.resolution().height(),
+                fps: format.frame_rate(),
+            })
+            .collect();
         modes.sort();
         modes.dedup();
         result.push(crate::CameraDevice {
@@ -1135,6 +1179,61 @@ mod negotiation_tests {
                 stopped: false,
             })
         }
+    }
+
+    #[test]
+    fn inventory_initializes_before_query_and_preserves_native_mode_pairs() {
+        let stage = std::cell::Cell::new(0);
+        let listed = enumerate_with(
+            || {
+                stage.set(1);
+                Ok(())
+            },
+            || {
+                assert_eq!(stage.get(), 1);
+                stage.set(2);
+                Ok(vec![CameraInfo::new(
+                    "Synthetic camera",
+                    "",
+                    "",
+                    CameraIndex::Index(0),
+                )])
+            },
+            |_| {
+                assert_eq!(stage.get(), 2);
+                // Different pixel formats need not share resolution or FPS.
+                Ok(vec![
+                    mode(640, 480, 30, FrameFormat::YUYV),
+                    mode(1280, 720, 20, FrameFormat::MJPEG),
+                ])
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            listed[0].modes,
+            vec![
+                crate::CameraMode {
+                    width: 640,
+                    height: 480,
+                    fps: 30
+                },
+                crate::CameraMode {
+                    width: 1280,
+                    height: 720,
+                    fps: 20
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn refused_inventory_access_never_queries_or_probes_devices() {
+        let result = enumerate_with(
+            || bail!("synthetic access refused"),
+            || panic!("query before authorization"),
+            |_| panic!("probe before authorization"),
+        );
+        assert!(result.unwrap_err().to_string().contains("access refused"));
     }
 
     #[test]
