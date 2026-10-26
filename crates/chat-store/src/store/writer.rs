@@ -600,6 +600,7 @@ fn apply_writer_msg(
                     cs.message_chats.insert(chat.clone());
                 }
             }
+            Ok(())
         }
         WriterMsg::StatusWatched { chat, msg_ids } => {
             // Routed like every other write that targets a row. The broadcast

@@ -44,6 +44,17 @@ impl PendingAudioPreparation {
     }
 }
 
+fn audio_receipt_chat(chats: &[Arc<Chat>], id: &str) -> Option<String> {
+    let mut rows = chats.iter().flat_map(|chat| {
+        chat.messages
+            .iter()
+            .filter(move |message| message.id == id)
+            .map(move |message| (chat, message))
+    });
+    let (chat, message) = rows.next()?;
+    (!message.is_from_me && rows.next().is_none()).then(|| chat.jid.clone())
+}
+
 fn media_identity(data: &Arc<Vec<u8>>) -> usize {
     Arc::as_ptr(data) as usize
 }
@@ -443,15 +454,11 @@ impl WhatsAppApp {
         let ActiveMedia::Audio { message_id } = &self.active_media else {
             return;
         };
-        let Some(chat) = self.chats.iter().find(|chat| {
-            chat.messages
-                .iter()
-                .any(|m| m.id == *message_id && !m.is_from_me)
-        }) else {
+        let Some(chat) = audio_receipt_chat(&self.chats, message_id) else {
             return;
         };
         if let Some(client) = &self.client {
-            client.mark_audio_played(chat.jid.clone(), message_id.clone());
+            client.mark_audio_played(chat, message_id.clone());
         }
     }
 
@@ -1673,6 +1680,32 @@ async fn hand_to_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_receipt_identity_refuses_own_or_cross_chat_id_collisions() {
+        let mut first = Chat::new("559900000001@s.whatsapp.net".into());
+        first.messages.push(ChatMessage::new_incoming(
+            "VOICE".into(),
+            "sender".into(),
+            String::new(),
+        ));
+        assert_eq!(
+            audio_receipt_chat(&[Arc::new(first.clone())], "VOICE"),
+            Some(first.jid.clone())
+        );
+        let mut second = Chat::new("111000011112222@lid".into());
+        second
+            .messages
+            .push(ChatMessage::new_outgoing("VOICE".into(), String::new()));
+        assert_eq!(
+            audio_receipt_chat(&[Arc::new(second.clone())], "VOICE"),
+            None
+        );
+        assert_eq!(
+            audio_receipt_chat(&[Arc::new(first), Arc::new(second)], "VOICE"),
+            None
+        );
+    }
 
     fn pending(epoch: usize, position: f32, was_playing: bool) -> PendingAudioPreparation {
         PendingAudioPreparation {

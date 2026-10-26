@@ -25,6 +25,10 @@ fn eligible(message: &StoredMessage) -> bool {
                 || message
                     .message
                     .as_deref()
+                    .is_some_and(MessageExt::is_view_once)
+                || message
+                    .message
+                    .as_deref()
                     .map(oxidezap_chat_store::normalized_message)
                     .and_then(|m| m.audio_message.as_option())
                     .and_then(|m| m.context_info.as_option())
@@ -65,7 +69,6 @@ impl WhatsAppClient {
                 &live.chat_store,
                 &message,
                 send.then_some(|| async {
-                    let id = MessageId::new(message.id.clone()).map_err(|e| e.to_string())?;
                     let chat: Jid = live
                         .names
                         .chat_key(&live.client, &message.chat_jid)
@@ -74,20 +77,41 @@ impl WhatsAppClient {
                         .parse()
                         .map_err(|e| format!("Invalid receipt chat: {e}"))?;
                     let participant = participant_keyed_chat(&chat).then_some(&message.sender_jid);
-                    let target = MessageRef::new(&chat, id, participant, false)
-                        .map_err(|e| e.to_string())?;
                     if !send_allowed() {
                         return Err("WhatsApp went offline; playback was recorded locally".into());
                     }
-                    live.client
-                        .mark_message_played(&target)
-                        .await
-                        .map_err(|e| e.to_string())
+                    send_played(&live.client, &chat, participant, &message.id).await
                 }),
             )
             .await
         })
     }
+}
+
+async fn send_played(
+    client: &Client,
+    chat: &Jid,
+    participant: Option<&Jid>,
+    id: &str,
+) -> Result<(), String> {
+    // MessageRef accepts user/group chats. The existing raw API also supports newsletters.
+    if chat.is_newsletter() {
+        return client
+            .mark_as_played(chat, None, &[id])
+            .await
+            .map_err(|e| e.to_string());
+    }
+    let target = MessageRef::new(
+        chat,
+        MessageId::new(id).map_err(|e| e.to_string())?,
+        participant,
+        false,
+    )
+    .map_err(|e| e.to_string())?;
+    client
+        .mark_message_played(&target)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 struct InFlight {
@@ -153,7 +177,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use whatsapp_rust::wacore::types::events::InboundMessage;
     use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
-    use whatsapp_rust_sqlite_storage::SqliteStore;
 
     #[test]
     fn linked_play_is_not_reinterpreted_as_a_recipient_play() {
@@ -320,6 +343,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newsletter_origin_and_view_once_audio_follow_the_official_eligibility_guards() {
+        let (_db, _store, mut message) = fixture(false, false).await;
+        assert!(!eligible(&message));
+        let mut proto = message.message.take().unwrap();
+        proto.audio_message.as_option_mut().unwrap().view_once = Some(true);
+        message.message = Some(proto);
+        assert!(eligible(&message));
+        let mut proto = message.message.take().unwrap();
+        let audio = proto.audio_message.as_option_mut().unwrap();
+        audio.view_once = None;
+        let mut context = wa::ContextInfo::default();
+        context.forwarded_newsletter_message_info =
+            whatsapp_rust::buffa::MessageField::some(Default::default());
+        audio.context_info = whatsapp_rust::buffa::MessageField::some(context);
+        message.message = Some(proto);
+        assert!(eligible(&message));
+        message.from_me = true;
+        assert!(!eligible(&message));
+        message.from_me = false;
+        message.message = None;
+        message.chat_jid = "120363000000000002@newsletter".parse().unwrap();
+        assert!(eligible(&message));
+        message.revoked = true;
+        assert!(!eligible(&message));
+    }
+
+    #[tokio::test]
     async fn group_uses_original_participant_and_direct_drops_it() {
         for group in [false, true] {
             let (_db, _store, message) = fixture(group, true).await;
@@ -408,14 +458,16 @@ mod wire_tests {
             let waiter = client.wait_for_sent_node(NodeFilter::tag("receipt"));
             let chat: Jid = chat.parse().unwrap();
             let sender: Jid = "111000011113333@lid".parse().unwrap();
-            let target = MessageRef::new(
-                &chat,
-                MessageId::new("SYNTHETIC-AUDIO").unwrap(),
-                participant.then_some(&sender),
-                false,
-            )
-            .unwrap();
-            assert!(client.mark_message_played(&target).await.is_err());
+            assert!(
+                send_played(
+                    &client,
+                    &chat,
+                    participant.then_some(&sender),
+                    "SYNTHETIC-AUDIO"
+                )
+                .await
+                .is_err()
+            );
             let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
                 .await
                 .expect("core constructed the receipt before rejecting the absent socket")
