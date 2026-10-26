@@ -42,6 +42,65 @@ use oxidezap_video::{CameraStream, EncodedFrame, VideoQuality};
 use crate::exec::Task;
 use whatsapp_rust::voip::{VideoFrame, VideoSource};
 
+type CameraPreference = (Option<String>, VideoQuality);
+static CAMERA_PREFERENCE: std::sync::Mutex<Option<CameraPreference>> = std::sync::Mutex::new(None);
+
+/// Save the selection for the next call camera. A live stream keeps its
+/// negotiated cadence until it is explicitly stopped and reopened.
+pub fn set_camera_preferences(camera: Option<String>, quality: VideoQuality) -> Result<(), String> {
+    let quality = quality.checked().map_err(|error| error.to_string())?;
+    *CAMERA_PREFERENCE
+        .lock()
+        .map_err(|_| "camera preferences lock poisoned")? = Some((camera, quality));
+    Ok(())
+}
+
+fn camera_preferences() -> CameraPreference {
+    CAMERA_PREFERENCE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+        .unwrap_or_else(|| (None, VideoQuality::from_environment()))
+}
+
+/// A settings preview owns capture independently of every call. The bridge
+/// tags each access unit with this preview's ID, and discards stale owners.
+pub struct CameraPreview {
+    id: oxidezap_core::CameraPreviewId,
+    camera: CameraStream,
+}
+
+impl CameraPreview {
+    /// Open a preview. Dropping this future cannot publish a late completion.
+    pub async fn open(
+        id: oxidezap_core::CameraPreviewId,
+        quality: VideoQuality,
+        device: Option<String>,
+    ) -> Result<Self, String> {
+        let camera = oxidezap_video::open_camera_device(quality, device)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(Self { id, camera })
+    }
+
+    pub fn id(&self) -> oxidezap_core::CameraPreviewId {
+        self.id
+    }
+    pub fn quality(&self) -> VideoQuality {
+        self.camera.quality()
+    }
+    pub fn frames(&self) -> async_channel::Receiver<EncodedFrame> {
+        self.camera.frames()
+    }
+    pub fn request_keyframe(&self) {
+        self.camera.control().request_keyframe();
+    }
+    /// Wait until capture has released the device before opening a replacement.
+    pub async fn stop(self) {
+        self.camera.stop().await;
+    }
+}
+
 /// Where finished frames go on their way to whoever draws them.
 ///
 /// Bounded and dropped from rather than blocked on: this is a stream, and the
@@ -452,8 +511,8 @@ pub(crate) async fn open(
     lost: CameraLost,
     picture_lost: PictureLost,
 ) -> Result<(LocalVideo, Endpoints), String> {
-    let quality = VideoQuality::from_environment();
-    let camera = oxidezap_video::open_camera(quality)
+    let (device, quality) = camera_preferences();
+    let camera = oxidezap_video::open_camera_device(quality, device)
         .await
         .map_err(|e| format!("{e:#}"))?;
     let stride = camera.quality().timestamp_stride();
