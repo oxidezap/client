@@ -93,7 +93,11 @@ impl AvatarManager {
     }
 
     pub fn demand_epoch(&self) -> u64 {
-        self.demand_epoch.load(Ordering::Relaxed)
+        // The viewport fingerprint must stop matching when decoded images
+        // disappear, even when the rows and their durable keys stay the same.
+        self.demand_epoch
+            .load(Ordering::Relaxed)
+            .wrapping_add(crate::session::media::avatar_cache_epoch())
     }
 
     pub fn bump_demand_epoch(&self) -> u64 {
@@ -181,9 +185,26 @@ impl AvatarManager {
             .pending_demands
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let mut cancelled = Vec::new();
         pending.retain(|jid, (_demand, priority)| {
-            *priority == DemandPriority::High || active_jids.contains(jid)
+            let keep = *priority == DemandPriority::High || active_jids.contains(jid);
+            if !keep {
+                cancelled.push(jid.clone());
+            }
+            keep
         });
+        drop(pending);
+        // These requests never left the queue. Release their reservations so
+        // scrolling back can ask again, including freshness-only demands.
+        let mut network = self
+            .network_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut revalidated = self.revalidated.lock().unwrap_or_else(|e| e.into_inner());
+        for jid in cancelled {
+            network.remove(&jid);
+            revalidated.remove(&jid);
+        }
     }
 
     fn demand_one(&self, chat: &ChatDemand, priority: DemandPriority) {
@@ -498,6 +519,154 @@ impl AvatarManager {
 mod tests {
     use super::*;
 
+    // Run the real native storage and manager together in a separate process:
+    // changing a process-wide runtime path in a parallel test would risk the
+    // user's cache, and clearing the shared RAM cache would race other tests.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_cache_recovers_after_remount_eviction_and_corruption() {
+        const ROOT: &str = "OXIDEZAP_AVATAR_TEST_ROOT";
+        let Some(root) = std::env::var_os(ROOT) else {
+            let root = std::env::temp_dir()
+                .join(format!("oxidezap-avatar-lifecycle-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "session::avatar::tests::native_cache_recovers_after_remount_eviction_and_corruption",
+                    "--nocapture",
+                ])
+                .env(ROOT, &root)
+                .env("XDG_RUNTIME_DIR", &root)
+                .env("LOCALAPPDATA", &root)
+                .env("OXIDEZAP_ACCOUNT", "avatar-fixture")
+                .status()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(status.success(), "isolated avatar lifecycle failed");
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let key = "avatar-lifecycle-fixture";
+        let path = oxidezap_ipc::media_path(key).unwrap();
+        assert!(
+            path.starts_with(&root),
+            "fixture must not use the user's cache"
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, bytes.into_inner()).unwrap();
+        let chat = ChatDemand {
+            jid: "avatar@example.invalid".to_string(),
+            picture_id: Some("picture-1".to_string()),
+            cache_key: Some(key.to_string()),
+        };
+        smol::block_on(async {
+            async fn next(manager: &AvatarManager) -> AvatarDemand {
+                let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let mut demands = manager.take_demands();
+                    if !demands.is_empty() {
+                        assert_eq!(demands.len(), 1);
+                        return demands.remove(0);
+                    }
+                    assert!(Instant::now() < deadline, "avatar demand did not complete");
+                    crate::platform::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+            let first = AvatarManager::new();
+            first.demand_chat(&chat);
+            let demand = next(&first).await;
+            assert!(!demand.need_bytes, "disk hit needs only freshness metadata");
+            assert_eq!(demand.known_picture_id, chat.picture_id);
+
+            let freshness = AvatarManager::new();
+            freshness.demand_chats_windowed(&[], std::slice::from_ref(&chat));
+            assert!(freshness.is_revalidated(&chat.jid));
+            freshness.demand_chats_windowed(&[], &[]);
+            assert!(!freshness.is_revalidated(&chat.jid));
+            freshness.demand_chats_windowed(std::slice::from_ref(&chat), &[]);
+            let demands = freshness.take_demands();
+            assert_eq!(demands.len(), 1, "cancelled freshness must be retried");
+            assert!(!demands[0].need_bytes);
+
+            // Real LRU eviction changes the viewport fingerprint and restores
+            // from disk without requesting the image bytes again.
+            let epoch = first.demand_epoch();
+            let (image, _) = decode_avatar(&std::fs::read(&path).unwrap()).unwrap();
+            put_avatar_image(
+                "avatar-fixture-pressure".to_string(),
+                image,
+                oxidezap_core::DECODED_IMAGE_BUDGET_BYTES,
+            );
+            assert!(get_avatar_image(key).is_none());
+            assert_ne!(first.demand_epoch(), epoch);
+            let remounted = AvatarManager::new();
+            remounted.demand_chat(&chat);
+            assert!(!next(&remounted).await.need_bytes);
+
+            clear_image_sources();
+            std::fs::remove_file(&path).unwrap();
+            let reopened = AvatarManager::new();
+            reopened.demand_chat(&chat);
+            let missing = next(&reopened).await;
+            assert!(missing.need_bytes && missing.cache_miss);
+            assert!(missing.known_picture_id.is_none());
+
+            std::fs::write(&path, b"corrupt avatar fixture").unwrap();
+            let corrupt = AvatarManager::new();
+            corrupt.demand_chat(&chat);
+            let replacement = next(&corrupt).await;
+            assert!(replacement.need_bytes && replacement.cache_miss);
+            assert!(replacement.known_picture_id.is_none());
+            assert!(
+                !path.exists(),
+                "corrupt bytes must be removed before refetch"
+            );
+
+            // Four valid 1024px pictures exceed the decoded budget unless
+            // recovery retains thumbnails. They must settle in RAM together,
+            // without repeatedly invalidating the same stationary viewport.
+            let mut large = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(1024, 1024)
+                .write_to(&mut large, image::ImageFormat::Png)
+                .unwrap();
+            let large = large.into_inner();
+            let window = AvatarManager::new();
+            let mut chats = Vec::new();
+            for index in 0..4 {
+                let key = format!("avatar-large-fixture-{index}");
+                let path = oxidezap_ipc::media_path(&key).unwrap();
+                std::fs::write(&path, &large).unwrap();
+                let chat = ChatDemand {
+                    jid: format!("avatar-{index}@example.invalid"),
+                    picture_id: Some("large-picture".to_string()),
+                    cache_key: Some(key),
+                };
+                window.demand_chat(&chat);
+                assert!(!next(&window).await.need_bytes);
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    large,
+                    "disk bytes stay original"
+                );
+                chats.push(chat);
+            }
+            let epoch = window.demand_epoch();
+            for _ in 0..3 {
+                for chat in &chats {
+                    assert!(get_avatar_image(chat.cache_key.as_ref().unwrap()).is_some());
+                }
+                window.demand_chats_windowed(&chats[..2], &chats[2..]);
+                assert!(window.take_demands().is_empty());
+                assert_eq!(window.demand_epoch(), epoch, "recovery must settle");
+            }
+        });
+    }
+
     #[test]
     fn demands_deduplicate_in_flight() {
         let manager = AvatarManager::new();
@@ -732,6 +901,34 @@ mod tests {
         let end_bot = (bot_range.end + 10).min(total_rows);
         assert_eq!(start_bot, 485);
         assert_eq!(end_bot, 500);
+    }
+
+    #[test]
+    fn scrolling_back_requeues_an_unsent_overscan_avatar() {
+        let manager = AvatarManager::new();
+        let chat = ChatDemand {
+            jid: "scroll@example.invalid".to_string(),
+            picture_id: None,
+            cache_key: None,
+        };
+        manager.demand_chats_windowed(&[], std::slice::from_ref(&chat));
+        assert!(manager.is_in_flight(&chat.jid));
+        manager.demand_chats_windowed(&[], &[]);
+        assert!(!manager.is_in_flight(&chat.jid));
+        assert!(manager.take_demands().is_empty());
+
+        manager.demand_chats_windowed(std::slice::from_ref(&chat), &[]);
+        let demands = manager.take_demands();
+        assert_eq!(demands.len(), 1, "remount must retry the cancelled request");
+        assert_eq!(demands[0].jid, chat.jid);
+        assert!(demands[0].need_bytes);
+
+        // Once dispatched, scrolling away must not cancel an active fetch.
+        manager.demand_chats_windowed(&[], &[]);
+        manager.demand_chat(&chat);
+        assert!(manager.take_demands().is_empty());
+        manager.on_avatar_ready(&chat.jid, "");
+        assert!(!manager.is_in_flight(&chat.jid));
     }
 
     #[test]
