@@ -161,6 +161,20 @@ impl StoreRegistry {
         })
     }
 
+    pub async fn existing_pairing_successor(
+        &self,
+        id: AccountId,
+    ) -> Result<Option<AccountId>, oxidezap_chat_store::ChatStoreError> {
+        let store = self.store(id).await?;
+        oxidezap_chat_store::ChatStore::pairing_successor(&store)
+            .await?
+            .map(|raw| {
+                AccountId::new(raw)
+                    .map_err(|error| StoreError::Validation(error.to_string()).into())
+            })
+            .transpose()
+    }
+
     /// Allocate one separate pairing account. The daemon serializes this operation.
     pub async fn pairing_successor(
         &self,
@@ -177,6 +191,97 @@ impl StoreRegistry {
                 Ok(next)
             }
         }
+    }
+
+    /// Read and validate the complete persisted paired device, never the live cache.
+    /// Relaxed browser storage cannot prove ordinary-write durability.
+    pub async fn durable_pairing(
+        &self,
+        id: AccountId,
+    ) -> Result<Option<StoredAccount>, StoreError> {
+        use wacore::store::traits::DeviceStore as _;
+        if !super::is_durable() {
+            return Ok(None);
+        }
+        let store = self.store(id).await?;
+        let Some(device) = store.load().await? else {
+            return Ok(None);
+        };
+        let Some(account) = device.account.as_deref() else {
+            return Ok(None);
+        };
+        // PairUtils::do_pair_crypto verifies the account signature and adds
+        // the companion signature before this container is persisted. A PN
+        // alone, or a partially saved container, is not a durability proof.
+        if account
+            .account_signature_key
+            .as_ref()
+            .is_none_or(|bytes| bytes.len() != 32)
+            || account
+                .account_signature
+                .as_ref()
+                .is_none_or(|bytes| bytes.len() != 64)
+            || account
+                .device_signature
+                .as_ref()
+                .is_none_or(|bytes| bytes.len() != 64)
+        {
+            return Ok(None);
+        }
+        let Some(details) = account.details.as_deref() else {
+            return Ok(None);
+        };
+        let Ok(details) = whatsapp_rust::waproto::codec::adv_device_identity_decode(details) else {
+            return Ok(None);
+        };
+        if details.key_index.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(StoredAccount {
+            id,
+            jid: device.pn.map(|jid| jid.to_string()),
+            lid: device.lid.map(|jid| jid.to_string()),
+            push_name: device.push_name,
+            linked: true,
+        }))
+    }
+
+    pub async fn retirements(
+        &self,
+    ) -> Result<Vec<oxidezap_chat_store::AccountRetirement>, oxidezap_chat_store::ChatStoreError>
+    {
+        let store = self.store(AccountId::LEGACY).await?;
+        self.prepare_chat_schema(&store).await?;
+        oxidezap_chat_store::ChatStore::account_retirements(&store).await
+    }
+
+    pub async fn begin_retirement(
+        &self,
+        old: &StoredAccount,
+        new: &StoredAccount,
+    ) -> Result<bool, oxidezap_chat_store::ChatStoreError> {
+        if !super::is_durable() || !super::same_account_identity(old, new) {
+            return Ok(false);
+        }
+        let store = self.store(old.id).await?;
+        oxidezap_chat_store::ChatStore::begin_account_retirement(
+            &store,
+            old.id.get(),
+            new.id.get(),
+            old.jid.clone().unwrap_or_default(),
+            old.lid.clone().unwrap_or_default(),
+            new.jid.clone().unwrap_or_default(),
+            new.lid.clone().unwrap_or_default(),
+        )
+        .await
+    }
+
+    pub async fn finish_retirement(
+        &self,
+        old: AccountId,
+    ) -> Result<(), oxidezap_chat_store::ChatStoreError> {
+        let store = self.store(old).await?;
+        oxidezap_chat_store::ChatStore::finish_account_retirement(&store, old.get()).await
     }
 
     /// Wipe one account's WhatsApp state and start it over under the same id.
@@ -202,7 +307,14 @@ impl StoreRegistry {
     /// The caller must have already stopped every live session/writer bound to
     /// `id` before calling this. See the module-level note.
     pub async fn remove_account(&self, id: AccountId) -> Result<(), StoreError> {
+        use wacore::store::traits::DeviceStore as _;
         let base = self.base().await?;
+        // A retirement journal outlives this row. A restart after the delete
+        // but before its completion marker must not resurrect the device or
+        // fail cleanup merely because the atomic row purge already committed.
+        if !base.store(id.as_i32()).exists().await? {
+            return Ok(());
+        }
         base.remove_device(id.as_i32()).await?;
         Ok(())
     }

@@ -159,6 +159,39 @@ impl WhatsAppApp {
         self.account_selection.retained.is_some()
     }
 
+    pub(super) fn account_retired(
+        &mut self,
+        account: oxidezap_core::AccountId,
+        successor: oxidezap_core::AccountId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.account_selection.retire(account, successor) else {
+            return;
+        };
+        self.save_account_selection(cx);
+        if active {
+            self.event_task.take();
+            self.client.take();
+            self.app_state = AppState::Loading;
+            if let Some(window) = self.account_window {
+                cx.spawn(async move |app: WeakEntity<Self>, cx| {
+                    let _ = window.update(cx, |_, window, cx| {
+                        let _ = app.update(cx, |app, cx| {
+                            // A newer retirement can arrive while this window update waits.
+                            if app.account_selection.active != successor {
+                                return;
+                            }
+                            app.clear_account_view(window, cx);
+                            app.retry_connection(cx);
+                        });
+                    });
+                })
+                .detach();
+            }
+        }
+        cx.notify();
+    }
+
     pub fn open_retained_history(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
         let Some(account) = self.account_selection.retained.take() else {
             return;

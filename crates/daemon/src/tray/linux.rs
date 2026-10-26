@@ -8,7 +8,8 @@ use ksni::{
     menu::StandardItem,
 };
 
-use crate::state::{StateHub, TrayState};
+use super::TrayHub;
+use crate::state::TrayState;
 
 /// The themed name the icon takes while something is waiting to be read.
 ///
@@ -24,7 +25,7 @@ struct Item {
     /// pure observer; its menu items and a click on it are the one place it
     /// speaks back — and the one thing it asks, whether a window is
     /// attached, is what the first item is named from.
-    hub: Arc<StateHub>,
+    hub: Arc<TrayHub>,
     /// What a click on the icon does, and when the last one was: a double
     /// click arrives as two, and the second must not undo the first.
     click: crate::window::Toggle,
@@ -97,7 +98,7 @@ impl KsniTray for Item {
     /// `crate::window::Toggle`, which is also what keeps a double click,
     /// which arrives as two of these, from hiding and then reopening.
     fn activate(&mut self, _x: i32, _y: i32) {
-        self.click.click(&self.hub);
+        self.click.click_every(self.hub.hubs());
     }
 
     /// The host is about to open the menu.
@@ -137,7 +138,7 @@ impl KsniTray for Item {
                 // front end decides what going away means for it. See
                 // `crate::window::hide`.
                 activate: Box::new(|item: &mut Self| {
-                    crate::window::hide(&item.hub);
+                    item.hub.hide();
                 }),
                 ..Default::default()
             }
@@ -149,7 +150,7 @@ impl KsniTray for Item {
                 // when nobody is attached, which is the state the tray is
                 // most often clicked in. See `crate::window::show`.
                 activate: Box::new(|item: &mut Self| {
-                    crate::window::show(&item.hub);
+                    item.hub.show();
                 }),
                 ..Default::default()
             }
@@ -192,7 +193,7 @@ impl super::Tray for LinuxTray {
     }
 }
 
-pub async fn start(hub: Arc<StateHub>) -> Result<Box<dyn super::Tray>> {
+pub async fn start(hub: Arc<TrayHub>) -> Result<Box<dyn super::Tray>> {
     let item = Item {
         state: TrayState {
             connected: false,
@@ -217,7 +218,7 @@ mod tests {
     fn item(connected: bool, unread: u32) -> Item {
         Item {
             state: TrayState { connected, unread },
-            hub: StateHub::new(),
+            hub: TrayHub::new(crate::account::AccountRegistry::new()),
             click: crate::window::Toggle::default(),
         }
     }

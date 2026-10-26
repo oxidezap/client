@@ -363,6 +363,11 @@ pub enum ClientScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMessage {
+    /// A durable relink redirect. Scoped consumers must explicitly reattach.
+    AccountRetired {
+        account: oxidezap_core::AccountId,
+        successor: oxidezap_core::AccountId,
+    },
     /// The first frame on a control connection.
     ControlHello {
         protocol: u32,

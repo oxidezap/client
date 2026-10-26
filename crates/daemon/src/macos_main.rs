@@ -14,7 +14,7 @@ use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-use crate::state::StateHub;
+use crate::tray::TrayHub;
 use crate::tray::macos::MacTray;
 
 /// Run the daemon with the tray on this thread.
@@ -24,7 +24,7 @@ use crate::tray::macos::MacTray;
 /// is a warning rather than a failure — the daemon is useful headless, the
 /// way it is on a bare window manager — and the runloop is pumped either
 /// way, so the two paths cannot drift.
-pub fn run(runtime: tokio::runtime::Runtime, hub: Arc<StateHub>) -> Result<()> {
+pub fn run(runtime: tokio::runtime::Runtime, hub: Arc<TrayHub>) -> Result<()> {
     // The daemon owns an AppKit status item, not a user-facing application.
     // `LSUIElement` is the launch-time declaration; setting the same policy
     // explicitly also covers the unbundled executable the GUI starts and

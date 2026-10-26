@@ -9,7 +9,8 @@ fn cli() -> Command {
     command
         .env_remove("OXIDEZAP_ACCOUNT")
         .env_remove("OXIDEZAP_SOCKET")
-        .env_remove("OXIDEZAP_READONLY");
+        .env_remove("OXIDEZAP_READONLY")
+        .env_remove("OXIDEZAP_LOCAL_ACCOUNT");
     command
 }
 
@@ -370,10 +371,10 @@ fn export_continues_from_the_daemon_cursor() {
         let mut writer = stream;
         let mut line = String::new();
 
-        // Handshake: any request is answered with an Ack.
+        // The daemon confirms the account before receiving business requests.
         reader.read_line(&mut line).expect("hello");
         writer
-            .write_all(b"{\"id\":1,\"status\":\"ok\",\"type\":\"ack\"}\n")
+            .write_all(b"{\"id\":1,\"status\":\"ok\",\"type\":\"account_selected\",\"data\":{\"local_account\":2}}\n")
             .expect("answer hello");
 
         let mut page = 0;
@@ -451,4 +452,53 @@ fn export_continues_from_the_daemon_cursor() {
         requests[1], cursor,
         "the second page must continue from the daemon cursor, not a message id"
     );
+}
+/// A daemon predating account selection ignores unknown hello fields. Its Ack
+/// must never authorize a send against the historical account by accident.
+#[cfg(unix)]
+#[test]
+fn an_old_daemon_cannot_silently_ignore_local_account_selection() {
+    use std::io::{BufRead as _, Write as _};
+    let dir = std::env::temp_dir().join(format!("oxi-old-hello-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let hello: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(hello["params"]["local_account"], 2);
+        assert_eq!(hello["params"]["account_selection"], true);
+        reader
+            .get_mut()
+            .write_all(b"{\"id\":1,\"status\":\"ok\",\"type\":\"ack\"}\n")
+            .unwrap();
+        line.clear();
+        assert_eq!(
+            reader.read_line(&mut line).unwrap(),
+            0,
+            "no business request may follow an unconfirmed selection"
+        );
+    });
+    let output = cli()
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--local-account",
+            "2",
+            "--json",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "account_selection_unsupported");
+    server.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
 }
