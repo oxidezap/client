@@ -1202,20 +1202,17 @@ impl WhatsAppApp {
     /// Drain the control connection's events.
     ///
     /// The control plane carries no account state, so there is nothing to
-    /// apply. What this task is for is the *request table*: the answers to
-    /// `SetLogLevel`, a plugin install, a removal and a listing are resolved
-    /// by the reader as it runs, and the one-shot receivers the callers hold
-    /// only fire while it does. The events themselves are dropped.
+    /// apply. The reader resolves global requests and forwards explicit account
+    /// retirements so active and retained selections survive cleanup and restart.
     fn spawn_control_reader(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(event) = ui_rx.recv().await {
-                if let FromDaemon::AccountRetired { account, successor } = event {
-                    if entity
+                if let FromDaemon::AccountRetired { account, successor } = event
+                    && entity
                         .update(cx, |app, cx| app.account_retired(account, successor, cx))
                         .is_err()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
             }
         })

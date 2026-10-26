@@ -33,11 +33,18 @@ impl TrayHub {
     }
 
     pub fn hubs(&self) -> Vec<Arc<StateHub>> {
+        self.current_hubs(true)
+    }
+
+    fn current_hubs(&self, include_closing_windows: bool) -> Vec<Arc<StateHub>> {
         let hubs: Vec<_> = self
             .registry
             .runtimes()
             .into_iter()
-            .filter(|runtime| !runtime.is_stopping())
+            .filter(|runtime| {
+                !runtime.is_stopping()
+                    || (include_closing_windows && runtime.hub().windows_attached())
+            })
             .map(|runtime| runtime.hub())
             .collect();
         if hubs.is_empty() {
@@ -61,7 +68,7 @@ impl TrayHub {
 
     fn publish(&self) {
         let values: Vec<_> = self
-            .hubs()
+            .current_hubs(false)
             .iter()
             .map(|hub| hub.watch_tray().borrow().clone())
             .collect();
@@ -78,13 +85,15 @@ impl TrayHub {
 
     pub async fn follow(self: Arc<Self>) {
         let mut accounts = self.registry.subscribe();
+        let mut retirements = self.registry.watch_retirements();
         let (changed, mut changes) = mpsc::channel(1);
         let mut watchers = tokio::task::JoinSet::new();
         loop {
             watchers.abort_all();
             while watchers.join_next().await.is_some() {}
             accounts.borrow_and_update();
-            for hub in self.hubs() {
+            retirements.borrow_and_update();
+            for hub in self.current_hubs(false) {
                 let mut state = hub.watch_tray();
                 let changed = changed.clone();
                 watchers.spawn(async move {
@@ -97,6 +106,10 @@ impl TrayHub {
             self.publish();
             loop {
                 tokio::select! {
+                    result = retirements.changed() => {
+                        if result.is_err() { return; }
+                        break;
+                    }
                     result = accounts.changed() => {
                         if result.is_err() { return; }
                         break;

@@ -1102,6 +1102,12 @@ impl AccountSupervisor {
                 self.registry.remove(id);
             }
             AccountExit::ResetIncomplete | AccountExit::RemoveIncomplete => {
+                if let Some(runtime) = self.registry.get(id)
+                    && runtime.lifecycle().is_quiesced()
+                    && let Some(disposition) = runtime.lifecycle().disposition()
+                {
+                    runtime.lifecycle().retry_failed_disposition(disposition);
+                }
                 // The teardown already logged exactly why the storage
                 // mutation did not run. Left registered, untouched: the
                 // user can still act on this account, and respawning or
@@ -1213,6 +1219,23 @@ impl AccountSupervisor {
         id: AccountId,
         disposition: AccountDisposition,
     ) -> LifecycleOutcome {
+        self.finish_terminal_with(id, disposition, |hub| {
+            let stores = Arc::clone(&self.stores);
+            async move { session_bridge::finish_forget(id, &stores, &hub, disposition).await }
+        })
+        .await
+    }
+
+    async fn finish_terminal_with<F, Fut>(
+        self: &Arc<Self>,
+        id: AccountId,
+        disposition: AccountDisposition,
+        cleanup: F,
+    ) -> LifecycleOutcome
+    where
+        F: FnOnce(Arc<StateHub>) -> Fut,
+        Fut: std::future::Future<Output = session_bridge::AccountExit>,
+    {
         let _relink = self.registry.relink.lock().await;
         if self.registry.retirement_target(id).is_some() {
             return LifecycleOutcome::NoAccount;
@@ -1228,8 +1251,9 @@ impl AccountSupervisor {
         // Invalidate any restart timer before touching storage: it must not
         // resurrect an account this request is retiring or resetting.
         self.bump_generation(id);
-        let exit =
-            session_bridge::finish_forget(id, &self.stores, &runtime.hub(), disposition).await;
+        let lifecycle = runtime.lifecycle();
+        let _media = lifecycle.drain_media().await;
+        let exit = cleanup(runtime.hub()).await;
         use session_bridge::AccountExit;
         match exit {
             AccountExit::ResetCompleted => {
@@ -1247,7 +1271,10 @@ impl AccountSupervisor {
             }
             // The teardown's own logs say why; the row is untouched, which is
             // a state the user can act on again.
-            _ => LifecycleOutcome::Incomplete,
+            _ => {
+                runtime.lifecycle().retry_failed_disposition(disposition);
+                LifecycleOutcome::Incomplete
+            }
         }
     }
 
@@ -2072,6 +2099,64 @@ mod tests {
 
         let _ =
             tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.join_all()).await;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn a_temporary_terminal_cleanup_failure_does_not_report_a_permanent_in_flight_operation()
+    {
+        use super::{AccountSupervisor, LifecycleOutcome, RestartPolicy};
+        use crate::session_bridge::{AccountDisposition, AccountExit};
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:terminal-cleanup-retry-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let old = stores.create_account().await.unwrap();
+        let other = stores.create_account().await.unwrap();
+        let runtime = runtime(old.get());
+        registry.insert(Arc::clone(&runtime));
+        let supervisor = AccountSupervisor::with_shutdown(
+            Arc::clone(&registry),
+            Arc::clone(&stores),
+            4,
+            RestartPolicy::production(),
+            || Box::pin(std::future::ready(())),
+        );
+        let failed = supervisor
+            .finish_terminal_with(old, AccountDisposition::Remove, |_| async {
+                AccountExit::RemoveIncomplete
+            })
+            .await;
+        assert_eq!(failed, LifecycleOutcome::Incomplete);
+        assert!(
+            !runtime.is_stopping(),
+            "the reaper must not short-circuit the next request as already in flight"
+        );
+        assert_eq!(runtime.lifecycle().disposition(), None);
+        assert_eq!(stores.accounts().await.unwrap().len(), 2);
+        let retried = supervisor
+            .finish_terminal_with(old, AccountDisposition::Remove, |_| {
+                let stores = Arc::clone(&stores);
+                async move {
+                    stores.remove_account(old).await.unwrap();
+                    AccountExit::RemoveCompleted
+                }
+            })
+            .await;
+        assert_eq!(retried, LifecycleOutcome::Accepted);
+        assert!(registry.get(old).is_none());
+        assert_eq!(
+            stores
+                .accounts()
+                .await
+                .unwrap()
+                .iter()
+                .map(|account| account.id)
+                .collect::<Vec<_>>(),
+            vec![other]
+        );
+        supervisor.join_all().await;
     }
 
     /// A restart that fires after the account was removed is a no-op: the

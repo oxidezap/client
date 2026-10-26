@@ -158,6 +158,19 @@ impl RuntimeLifecycle {
         })
     }
 
+    /// Only after terminal cleanup returned: there is no operation left in
+    /// flight, so a temporary failure must permit an explicit retry.
+    pub(crate) fn retry_failed_disposition(&self, expected: AccountDisposition) {
+        let mut state = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.disposition == Some(expected) {
+            state.disposition = None;
+            self.stopping.store(false, Ordering::SeqCst);
+        }
+    }
+
     pub(crate) fn reserve_retirement_successor(&self, reserved: bool) {
         self.disposition
             .lock()
@@ -400,6 +413,7 @@ pub async fn run(
             );
             disposition.incomplete()
         } else {
+            let _media = bridge.lifecycle.drain_media().await;
             finish_forget(account_id, &stores_for_reset, &bridge.hub, disposition).await
         }
     } else if stopping || commands_closed {

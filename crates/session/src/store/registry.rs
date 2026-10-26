@@ -207,7 +207,34 @@ impl StoreRegistry {
         let Some(device) = store.load().await? else {
             return Ok(None);
         };
-        if device.account.is_none() {
+        let Some(account) = device.account.as_deref() else {
+            return Ok(None);
+        };
+        // PairUtils::do_pair_crypto verifies the account signature and adds
+        // the companion signature before this container is persisted. A PN
+        // alone, or a partially saved container, is not a durability proof.
+        if account
+            .account_signature_key
+            .as_ref()
+            .is_none_or(|bytes| bytes.len() != 32)
+            || account
+                .account_signature
+                .as_ref()
+                .is_none_or(|bytes| bytes.len() != 64)
+            || account
+                .device_signature
+                .as_ref()
+                .is_none_or(|bytes| bytes.len() != 64)
+        {
+            return Ok(None);
+        }
+        let Some(details) = account.details.as_deref() else {
+            return Ok(None);
+        };
+        let Ok(details) = whatsapp_rust::waproto::codec::adv_device_identity_decode(details) else {
+            return Ok(None);
+        };
+        if details.key_index.is_none() {
             return Ok(None);
         }
         Ok(Some(StoredAccount {

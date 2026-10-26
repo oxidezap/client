@@ -45,7 +45,7 @@ impl AccountRegistry {
             let Some(target) = final_target(old, &all) else {
                 continue;
             };
-            let Some(stored) = stores.durable_pairing(target).await? else {
+            let Ok(Some(stored)) = stores.durable_pairing(target).await else {
                 continue;
             };
             let proof = StoredAccount {
@@ -180,7 +180,7 @@ impl AccountRegistry {
             if !successor.hub().connection().is_connected() {
                 continue;
             }
-            let Some(new) = stores.durable_pairing(next).await? else {
+            let Ok(Some(new)) = stores.durable_pairing(next).await else {
                 continue;
             };
             if !live_identity_matches(&successor, &new) || !same_account_identity(old, &new) {
@@ -220,7 +220,7 @@ impl AccountRegistry {
             let Some(_pin) = lifecycle.pin() else {
                 continue;
             };
-            let Some(new) = stores.durable_pairing(next).await? else {
+            let Ok(Some(new)) = stores.durable_pairing(next).await else {
                 continue;
             };
             let proof = StoredAccount {
@@ -324,12 +324,12 @@ mod tests {
             let mut device = Device::new();
             device.pn = Some("100001:1@s.whatsapp.net".parse().unwrap());
             device.lid = Some("200001:1@lid".parse().unwrap());
-            device.account = Some(Arc::new(Default::default()));
+            Fixture::pair(&mut device);
             backend.save(&device).await.unwrap();
             let mut next_device = Device::new();
             next_device.pn = Some(new_pn.parse().unwrap());
             next_device.lid = new_lid.map(|value| value.parse().unwrap());
-            next_device.account = Some(Arc::new(Default::default()));
+            Fixture::pair(&mut next_device);
             stores
                 .store(new)
                 .await
@@ -357,6 +357,19 @@ mod tests {
                 old,
                 new,
             }
+        }
+
+        fn pair(device: &mut Device) {
+            let account = device
+                .account
+                .get_or_insert_with(|| Arc::new(Default::default()));
+            let account = Arc::make_mut(account);
+            // Synthetic protobuf ADVDeviceIdentity { key_index: 1 } and
+            // structurally complete signatures. No real identity or keys.
+            account.details = Some(vec![0x18, 0x01]);
+            account.account_signature_key = Some(vec![1; 32]);
+            account.account_signature = Some(vec![2; 64]);
+            account.device_signature = Some(vec![3; 64]);
         }
 
         fn runtime(id: AccountId, stores: Arc<StoreRegistry>) -> Arc<AccountRuntime> {
@@ -448,6 +461,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_retirement_retries_on_the_same_runtime_without_daemon_restart() {
+        let f = Fixture::new(
+            "same-runtime-retry",
+            "100001:9@s.whatsapp.net",
+            Some("200001:9@lid"),
+        )
+        .await;
+        f.registry
+            .consolidate_relinks_with(&f.stores, |_, _| async {
+                session_bridge::AccountExit::RemoveIncomplete
+            })
+            .await
+            .unwrap();
+        assert!(f.registry.get(f.old).unwrap().is_stopping());
+        f.registry
+            .consolidate_relinks_with(&f.stores, |old, _| {
+                let stores = Arc::clone(&f.stores);
+                async move {
+                    stores.remove_account(old).await.unwrap();
+                    session_bridge::AccountExit::RemoveCompleted
+                }
+            })
+            .await
+            .unwrap();
+        assert!(f.registry.get(f.old).is_none());
+        assert!(f.stores.retirements().await.unwrap()[0].complete);
+        assert!(f.stores.durable_pairing(f.new).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn conflicting_or_incomplete_identity_never_commits_retirement() {
         for (tag, pn, lid) in [
             ("different", "100002@s.whatsapp.net", Some("200002@lid")),
@@ -481,7 +524,7 @@ mod tests {
             .unwrap();
         assert!(f.stores.retirements().await.unwrap().is_empty());
 
-        device.account = Some(Arc::new(Default::default()));
+        Fixture::pair(&mut device);
         store.save(&device).await.unwrap();
         let not_joined = Fixture::runtime(f.old, Arc::clone(&f.stores));
         not_joined
@@ -581,7 +624,7 @@ mod tests {
         let mut device = Device::new();
         device.pn = Some("100001:13@s.whatsapp.net".parse().unwrap());
         device.lid = Some("200001:13@lid".parse().unwrap());
-        device.account = Some(Arc::new(Default::default()));
+        Fixture::pair(&mut device);
         f.stores
             .store(final_id)
             .await
@@ -666,12 +709,52 @@ mod tests {
             }
         };
         let (first, second) = tokio::join!(
-            f.registry.consolidate_relinks_with(&f.stores, &cleanup),
-            f.registry.consolidate_relinks_with(&f.stores, &cleanup),
+            f.registry.consolidate_relinks_with(&f.stores, cleanup),
+            f.registry.consolidate_relinks_with(&f.stores, cleanup),
         );
         first.unwrap();
         second.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(f.stores.durable_pairing(f.new).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_completed_redirect_cannot_select_a_replaced_whatsapp_identity() {
+        let f = Fixture::new(
+            "replaced-target",
+            "100001:9@s.whatsapp.net",
+            Some("200001:9@lid"),
+        )
+        .await;
+        f.registry
+            .consolidate_relinks_with(&f.stores, |old, _| {
+                let stores = Arc::clone(&f.stores);
+                async move {
+                    stores.remove_account(old).await.unwrap();
+                    session_bridge::AccountExit::RemoveCompleted
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(f.registry.retirement_target(f.old), Some(f.new));
+        let store = f.stores.store(f.new).await.unwrap();
+        let mut replacement = store.load().await.unwrap().unwrap();
+        replacement.pn = Some("100002@s.whatsapp.net".parse().unwrap());
+        replacement.lid = Some("200002@lid".parse().unwrap());
+        store.save(&replacement).await.unwrap();
+        f.registry
+            .get(f.new)
+            .unwrap()
+            .hub()
+            .set_account(AccountIdentity {
+                name: None,
+                jid: Some("100002@s.whatsapp.net".into()),
+                lid: Some("200002@lid".into()),
+            });
+        assert_eq!(f.registry.retirement_target(f.old), None);
+        f.registry.restore_retirements(&f.stores).await.unwrap();
+        assert!(!f.registry.has_retirement(f.old));
+        assert!(f.stores.durable_pairing(f.new).await.unwrap().is_some());
+        assert_eq!(f.stores.accounts().await.unwrap().len(), 1);
     }
 }
