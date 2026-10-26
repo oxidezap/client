@@ -110,6 +110,7 @@ pub(crate) fn chat_to_dto(chat: oxidezap_core::Chat) -> ChatDto {
 }
 
 pub(crate) fn chat_message_to_dto(chat_jid: &str, msg: ChatMessage) -> MessageDto {
+    let summary = msg.business.as_ref().map(|b| b.summary());
     let (kind, media) = if msg.revoked {
         ("revoked", None)
     } else if let Some(media) = &msg.media {
@@ -154,6 +155,17 @@ pub(crate) fn chat_message_to_dto(chat_jid: &str, msg: ChatMessage) -> MessageDt
         ("text", None)
     };
 
+    let kind = if msg.revoked {
+        kind
+    } else {
+        msg.business.as_ref().map_or(kind, |b| match b.kind {
+            oxidezap_core::BusinessKind::Template => "template",
+            oxidezap_core::BusinessKind::Buttons => "buttons",
+            oxidezap_core::BusinessKind::List => "list",
+            oxidezap_core::BusinessKind::Interactive => "interactive",
+            oxidezap_core::BusinessKind::Response => "business_response",
+        })
+    };
     let status = match msg.status {
         oxidezap_core::MessageStatus::Pending => "pending",
         oxidezap_core::MessageStatus::Sent => "sent",
@@ -180,7 +192,9 @@ pub(crate) fn chat_message_to_dto(chat_jid: &str, msg: ChatMessage) -> MessageDt
         sender_jid: msg.sender,
         from_me: msg.is_from_me,
         timestamp_ms: msg.timestamp.timestamp_millis(),
-        text: if msg.content.is_empty() {
+        text: if let Some(summary) = summary {
+            Some(summary)
+        } else if msg.content.is_empty() {
             None
         } else {
             Some(msg.content)

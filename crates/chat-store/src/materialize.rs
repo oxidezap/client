@@ -80,7 +80,7 @@ pub fn message_kind(message: &wa::Message) -> &'static str {
         "event"
     } else if base.group_invite_message.is_set() {
         "group_invite"
-    } else if base.template_message.is_set() {
+    } else if base.template_message.is_set() || base.highly_structured_message.is_set() {
         "template"
     } else if base.template_button_reply_message.is_set() {
         "template_reply"
@@ -130,20 +130,35 @@ pub(crate) fn unavailable_kind(unavailable_type: UnavailableType) -> Option<&'st
 /// Repeating the pass handles valid nested combinations (for example a group
 /// mention around an associated child around a future-proof poll).
 pub fn normalized_message(message: &wa::Message) -> &wa::Message {
-    let mut base = message.get_base_message();
-    loop {
-        let inner = [
-            &base.group_mentioned_message,
-            &base.associated_child_message,
-            &base.poll_creation_message_v4,
-        ]
-        .into_iter()
-        .find_map(|wrapper| wrapper.as_option().and_then(|w| w.message.as_option()));
+    let mut base = message;
+    // A finite budget also handles malformed, deeply nested carriers without
+    // unbounded projection work. Each pass borrows the next message.
+    for _ in 0..32 {
+        let inner = base
+            .device_sent_message
+            .as_option()
+            .and_then(|w| w.message.as_option())
+            .or_else(|| {
+                [
+                    &base.ephemeral_message,
+                    &base.view_once_message,
+                    &base.view_once_message_v2,
+                    &base.view_once_message_v2_extension,
+                    &base.document_with_caption_message,
+                    &base.edited_message,
+                    &base.group_mentioned_message,
+                    &base.associated_child_message,
+                    &base.poll_creation_message_v4,
+                ]
+                .into_iter()
+                .find_map(|w| w.as_option().and_then(|w| w.message.as_option()))
+            });
         match inner {
-            Some(inner) if !std::ptr::eq(inner, base) => base = inner.get_base_message(),
-            _ => return base,
+            Some(inner) => base = inner,
+            None => return base,
         }
     }
+    base
 }
 
 /// Shared poll-creation detector for classification and storage compaction.
@@ -282,54 +297,18 @@ pub(crate) fn extract_text(base: &wa::Message) -> Option<String> {
             },
         );
     }
+    if let Some(business) = crate::business_content(base) {
+        let body = if business.body.is_empty() {
+            business.header
+        } else {
+            business.body
+        };
+        return (!body.is_empty()).then_some(body);
+    }
     base.text_content()
         .or_else(|| base.get_caption())
-        .or_else(|| business_text(base))
         .map(str::to_owned)
         .or_else(|| crate::shared_contacts_text(base))
-}
-
-/// Body text of the business content carriers. Extraction mirrors WA Web's
-/// per-type parsers; footers/buttons stay display-side (readable from the proto).
-fn business_text(base: &wa::Message) -> Option<&str> {
-    if let Some(tpl) = base.template_message.as_option() {
-        use wa::message::template_message::Format;
-        // WA Web reads hydratedTemplate ?? format's hydratedFourRowTemplate.
-        return tpl
-            .hydrated_template
-            .as_option()
-            .or_else(|| match tpl.format.as_ref() {
-                Some(Format::HydratedFourRowTemplate(t)) => Some(t.as_ref()),
-                _ => None,
-            })
-            .and_then(|t| t.hydrated_content_text.as_deref());
-    }
-    if let Some(reply) = base.template_button_reply_message.as_option() {
-        return reply.selected_display_text.as_deref();
-    }
-    if let Some(buttons) = base.buttons_message.as_option() {
-        return buttons.content_text.as_deref();
-    }
-    if let Some(resp) = base.buttons_response_message.as_option() {
-        use wa::message::buttons_response_message::Response;
-        return match resp.response.as_ref() {
-            Some(Response::SelectedDisplayText(text)) => Some(text.as_str()),
-            _ => None,
-        };
-    }
-    if let Some(list) = base.list_message.as_option() {
-        return list.description.as_deref();
-    }
-    if let Some(resp) = base.list_response_message.as_option() {
-        return resp.title.as_deref();
-    }
-    if let Some(interactive) = base.interactive_message.as_option() {
-        return interactive.body.as_option().and_then(|b| b.text.as_deref());
-    }
-    if let Some(resp) = base.interactive_response_message.as_option() {
-        return resp.body.as_option().and_then(|b| b.text.as_deref());
-    }
-    None
 }
 
 /// Whether the unwrapped message carries anything a chat log should show.

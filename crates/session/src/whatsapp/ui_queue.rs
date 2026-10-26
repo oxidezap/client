@@ -571,6 +571,22 @@ fn message_bytes(message: &oxidezap_core::ChatMessage) -> usize {
             .map(string_bytes)
             .unwrap_or_default()
         + string_bytes(&message.content)
+        + message.business.as_ref().map_or(0, |business| {
+            string_bytes(&business.header)
+                + string_bytes(&business.body)
+                + string_bytes(&business.footer)
+                + business
+                    .notice
+                    .as_deref()
+                    .map(string_bytes)
+                    .unwrap_or_default()
+                + business.buttons.capacity() * std::mem::size_of::<oxidezap_core::BusinessButton>()
+                + business
+                    .buttons
+                    .iter()
+                    .map(|button| string_bytes(&button.label))
+                    .sum::<usize>()
+        })
         + media
         + message
             .reactions
@@ -903,5 +919,66 @@ mod tests {
             receiver.try_recv(),
             Ok(UiEvent::HistoryLoaded { .. })
         ));
+    }
+    #[test]
+    fn business_allocations_enforce_history_budget_and_reduce_page_size() {
+        use oxidezap_core::{
+            BusinessAction, BusinessButton, BusinessContent, BusinessKind, Chat, ChatMessage,
+        };
+        for field in ["header", "body", "footer", "notice", "buttons"] {
+            let mut chat = Chat::new("example@lid".into());
+            chat.messages.push(ChatMessage::new_incoming(
+                "synthetic".into(),
+                "example@lid".into(),
+                "OK".into(),
+            ));
+            let mut event = UiEvent::HistoryLoaded {
+                chats: vec![chat],
+                complete: true,
+                next: None,
+            };
+            assert!(
+                estimated_bytes(&event) < 2048,
+                "small body fits before adding {field}"
+            );
+            let mut business = BusinessContent {
+                kind: BusinessKind::Template,
+                header: String::new(),
+                body: String::new(),
+                footer: String::new(),
+                buttons: vec![],
+                notice: None,
+            };
+            match field {
+                "header" => business.header = "h".repeat(4096),
+                "body" => business.body = "b".repeat(4096),
+                "footer" => business.footer = "f".repeat(4096),
+                "notice" => business.notice = Some("n".repeat(4096)),
+                "buttons" => {
+                    business.buttons = (0..8)
+                        .map(|_| BusinessButton {
+                            label: "c".repeat(512),
+                            action: BusinessAction::Reply,
+                        })
+                        .collect()
+                }
+                _ => unreachable!(),
+            }
+            let UiEvent::HistoryLoaded { chats, .. } = &mut event else {
+                unreachable!()
+            };
+            chats[0].messages[0].business = Some(business);
+            let recovery = Arc::new(Notify::new());
+            let budget = Arc::new(HistoryBudget::new());
+            let (sender, mut receiver) =
+                channel_with_limits(recovery, budget.clone(), 4, 4, 2048, MAX_DATA_AGE);
+            assert!(
+                sender.send(event).is_err(),
+                "{field} must count towards the queue budget"
+            );
+            assert_eq!(budget.limits(), (50, 25));
+            assert_eq!(sender.stats().dropped_recoverable, 1);
+            assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        }
     }
 }

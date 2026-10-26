@@ -2293,11 +2293,13 @@ impl WhatsAppClient {
         // `[Media]` bubble until the next reload rehydrates it from the
         // store. Same extraction the stored path uses, so the two agree.
         let poll = poll_of(base_msg);
+        let mut business = oxidezap_chat_store::business_content(base_msg);
 
         // Extract text content
-        let content = base_msg
-            .text_content()
-            .map(|s| s.to_string())
+        let content = business
+            .as_ref()
+            .map(|b| b.body.clone())
+            .or_else(|| base_msg.text_content().map(str::to_owned))
             .or_else(|| base_msg.get_caption().map(|s| s.to_string()))
             .or_else(|| oxidezap_chat_store::shared_contacts_text(base_msg))
             .or_else(|| poll.as_ref().map(|poll| poll.question.clone()))
@@ -2320,6 +2322,9 @@ impl WhatsAppClient {
         )
         .await;
         let content = crate::mentions::apply_to(&mention_names, content);
+        if let Some(business) = business.as_mut() {
+            crate::mentions::apply_business_to(&mention_names, business, &content);
+        }
         let media_result = media_result.map(|mut media| {
             if let Some(caption) = media.caption.take() {
                 media.caption = Some(crate::mentions::apply_to(&mention_names, caption));
@@ -2350,6 +2355,7 @@ impl WhatsAppClient {
             edited: false,
             system: None,
             poll,
+            business,
         };
 
         if let Some(media) = media_result {

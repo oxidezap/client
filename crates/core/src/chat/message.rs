@@ -65,6 +65,9 @@ pub struct ChatMessage {
     /// on. `None` on every other message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<PollContent>,
+    /// Display-only template, interactive card or business response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business: Option<crate::BusinessContent>,
 }
 
 /// What a failed message can be sent again as.
@@ -128,6 +131,7 @@ impl ChatMessage {
             edited: false,
             system: None,
             poll: None,
+            business: None,
         }
     }
 
@@ -160,6 +164,7 @@ impl ChatMessage {
             edited: false,
             system: None,
             poll: None,
+            business: None,
         }
     }
 
@@ -194,6 +199,16 @@ impl ChatMessage {
         self.is_from_me && self.status.is_failed()
     }
 
+    /// Apply an accepted deletion without retaining displayable original content.
+    pub fn mark_revoked(&mut self) {
+        self.revoked = true;
+        self.content = "[Message deleted]".into();
+        self.media = None;
+        self.quoted = None;
+        self.poll = None;
+        self.business = None;
+    }
+
     /// What sending this again would put on the wire, if anything.
     ///
     /// One question with one answer, asked by the bubble to decide whether to
@@ -211,7 +226,7 @@ impl ChatMessage {
         // message would send the caption without the file. Failed media has
         // no resendable form here — the echo of a video holds no bytes — so
         // it offers no retry rather than a wrong one.
-        if self.media.is_none() && !self.content.is_empty() {
+        if self.business.is_none() && self.media.is_none() && !self.content.is_empty() {
             return Some(Resend::Text(&self.content));
         }
         // A voice note has no text and is not therefore beyond recovery: the
@@ -229,6 +244,12 @@ impl ChatMessage {
     /// - For text-only messages: the message content
     /// - For media messages: "[MediaType] caption" or just "[MediaType]"
     pub fn preview_text(&self) -> String {
+        if let Some(business) = &self.business {
+            if !self.content.is_empty() {
+                return self.content.clone();
+            }
+            return business.summary();
+        }
         if let Some(poll) = &self.poll {
             return format!("\u{1f4ca} {}", poll.question);
         }
