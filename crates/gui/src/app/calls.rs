@@ -15,8 +15,7 @@ use gpui::{Pixels, Point, Size, px};
 /// One window's presentation of whatever call is up.
 #[derive(Debug, Clone, Default)]
 pub struct CallCard {
-    /// Collapsed to a pill. Survives the call it was set during: a user who
-    /// minimises every call means it.
+    /// Window-local presentation, reset when the call ends.
     presentation: Presentation,
     /// Where the card was dragged to, as an offset from its default corner.
     /// Kept across calls for the same reason.

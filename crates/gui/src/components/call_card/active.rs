@@ -19,8 +19,7 @@ use crate::components::{Avatar, ProductIcon};
 use crate::theme::Metrics;
 use oxidezap_core::ActiveCall;
 
-/// The card header shown while a call is live: a dot, a label, and the two
-/// window controls.
+/// The header and window controls for a live call.
 pub fn live_header(
     label: String,
     entity: Entity<WhatsAppApp>,

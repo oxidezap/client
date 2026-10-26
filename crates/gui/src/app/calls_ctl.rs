@@ -1615,7 +1615,7 @@ mod keyboard_owner_tests {
 }
 
 #[cfg(test)]
-mod call_alert_control_tests {
+mod call_control_tests {
     use super::*;
 
     #[gpui::test]
