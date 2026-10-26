@@ -31,7 +31,11 @@ async fn terminal_recovery_is_account_scoped_and_does_not_require_a_bot() {
     let backend = SqliteStore::open("file:oxidezap-browser-terminal?mode=memory&cache=shared")
         .await
         .unwrap();
+    let database = backend.database();
+    let backend = database.create_device().await.unwrap();
+    let other = database.create_device().await.unwrap();
     let history = ChatStore::new(&backend).await.unwrap();
+    let other_history = ChatStore::new_prepared(&other).await.unwrap();
     assert!(history.logout_message().await.unwrap().is_none());
     history
         .record_logout("Synthetic unlink".into())
@@ -50,4 +54,6 @@ async fn terminal_recovery_is_account_scoped_and_does_not_require_a_bot() {
         Some("Synthetic unlink")
     );
     history.close().await.unwrap();
+    assert!(other_history.logout_message().await.unwrap().is_none());
+    other_history.close().await.unwrap();
 }

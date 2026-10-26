@@ -1550,7 +1550,9 @@ impl WhatsAppClient {
                 info!("the WhatsApp session ended: {reason:?}");
                 // Stop the network workers before making retained history available.
                 drop(_session_over);
+                let mut retain_local = false;
                 if let Some(event) = completion::completion_event(&reason) {
+                    retain_local = matches!(event, UiEvent::LoggedOut(_));
                     if let UiEvent::LoggedOut(message) = &event
                         && let Err(error) = chat_store.record_logout(message.clone()).await
                     {
@@ -1559,8 +1561,17 @@ impl WhatsAppClient {
                     let _ = ui_tx.send(event);
                 }
                 client.shutdown().await;
-                // The daemon still serves local queries through the existing account.
-                shutdown.notified().await;
+                if let Ok(Some(message)) = chat_store.logout_message().await {
+                    retain_local = true;
+                    let _ = ui_tx.send(UiEvent::LoggedOut(message));
+                }
+                if retain_local {
+                    shutdown.notified().await;
+                } else {
+                    // Other owners keep sender clones; an explicit close lets the
+                    // daemon drain the final event and restart this account.
+                    ui_tx.close();
+                }
             },
             _ = shutdown.notified() => {
                 // Graceful stop: flushes state and closes the transport. The

@@ -6,6 +6,9 @@
 //! the whole of that rule.
 
 use super::Backing;
+use oxidezap_core::AccountId;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 /// The origin's own key-value storage. Web only.
 ///
@@ -23,26 +26,36 @@ use super::Backing;
 pub struct Origin {
     /// Which handle this is. See [`LIVE`].
     stamp: u64,
+    account: AccountId,
 }
 
 impl Origin {
     /// Documents under [`PREFIX`], for the host being built now.
     ///
-    /// Taking one retires every handle given out before it. See [`LIVE`].
+    /// Taking one retires the older handles for the same account. See [`LIVE`].
     #[must_use]
     pub fn storage() -> Self {
+        Self::storage_for_account(AccountId::LEGACY)
+    }
+
+    #[must_use]
+    pub fn storage_for_account(account: AccountId) -> Self {
         Self {
-            stamp: LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
+            stamp: advance(account),
+            account,
         }
     }
 
-    fn key(name: &str) -> String {
-        format!("{PREFIX}{name}")
+    fn key(&self, name: &str) -> String {
+        format!("{}{name}", prefix(self.account))
     }
 
-    /// Whether this handle is the one the page is using now.
     fn live(&self) -> bool {
-        self.stamp == LIVE.load(std::sync::atomic::Ordering::SeqCst)
+        LIVE.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&self.account)
+            .copied()
+            == Some(self.stamp)
     }
 
     /// The origin's store, or `None` where the browser refuses it — a
@@ -54,7 +67,7 @@ impl Origin {
 
 impl Backing for Origin {
     fn read(&self, name: &str, max: usize) -> Option<Vec<u8>> {
-        let held = Self::local()?.get_item(&Self::key(name)).ok().flatten()?;
+        let held = Self::local()?.get_item(&self.key(name)).ok().flatten()?;
         // Asked of what came back rather than before it, which is the honest
         // difference from a file: `getItem` has already allocated the string
         // by the time anything here can look at it. The bound still does its
@@ -64,7 +77,7 @@ impl Backing for Origin {
         if held.len() > max {
             log::warn!(
                 "{} is larger than it may be; starting empty",
-                Self::key(name)
+                self.key(name)
             );
             return None;
         }
@@ -100,7 +113,7 @@ impl Backing for Origin {
         // and no temporary name to clean up. The quota is the failure to
         // expect, and it arrives here rather than being discovered later.
         storage
-            .set_item(&Self::key(name), held)
+            .set_item(&self.key(name), held)
             .map_err(|e| format!("{e:?}"))
     }
 
@@ -118,12 +131,12 @@ impl Backing for Origin {
         }
         let storage = Self::local().ok_or_else(|| "this page has no storage".to_owned())?;
         storage
-            .remove_item(&Self::key(name))
+            .remove_item(&self.key(name))
             .map_err(|e| format!("{e:?}"))
     }
 
     fn describe(&self, name: &str) -> String {
-        format!("{} in this browser's storage", Self::key(name))
+        format!("{} in this browser's storage", self.key(name))
     }
 }
 
@@ -147,9 +160,24 @@ impl Origin {
     /// caller wipes the credentials only once this has said yes.
     #[must_use]
     pub fn forget_all() -> bool {
+        Self::forget(None)
+    }
+
+    #[must_use]
+    pub fn forget_account(account: AccountId) -> bool {
+        Self::forget(Some(account))
+    }
+
+    fn forget(account: Option<AccountId>) -> bool {
         // Moved on before anything is removed, so a write racing this one is
         // refused rather than landing behind it. See `Backing::write`.
-        LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(account) = account {
+            advance(account);
+        } else {
+            for stamp in LIVE.lock().unwrap_or_else(|p| p.into_inner()).values_mut() {
+                *stamp = stamp.wrapping_add(1);
+            }
+        }
         let Some(storage) = Self::local() else {
             // Not "there was nothing to retire". This browser refused the
             // store *now*, and refusing it is not the same fact as its being
@@ -193,7 +221,7 @@ impl Origin {
             // not a failure: nothing removes from this storage but the lines
             // below, and they have not run yet.
             if let Some(key) = key
-                && key.starts_with(PREFIX)
+                && owns_key(account, &key)
             {
                 ours.push(key);
             }
@@ -205,17 +233,31 @@ impl Origin {
 /// What every document this host keeps is named under.
 const PREFIX: &str = "oxidezap.plugin.";
 
-/// Which handle the page is writing through now.
-///
-/// Bumped by [`Origin::storage`], so taking a handle retires every one given
-/// out before it, and by [`Origin::forget_all`], so a departure retires the
-/// handle that was live when it happened. One counter for both, because they
-/// are one question: is this store still the page's?
-///
-/// Page-wide rather than state on the store, because what it records is about
-/// the page — a host has been replaced — and every handle from before it is
-/// stale whoever is holding it.
-///
-/// Through `portable-atomic`, like every other 64-bit atomic here: a page is
-/// a 32-bit target, and there is no native 64-bit atomic on one.
-static LIVE: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+fn prefix(account: AccountId) -> String {
+    if account == AccountId::LEGACY {
+        PREFIX.to_owned()
+    } else {
+        format!("{PREFIX}account:{}:", account.get())
+    }
+}
+
+fn owns_key(account: Option<AccountId>, key: &str) -> bool {
+    match account {
+        None => key.starts_with(PREFIX),
+        Some(AccountId::LEGACY) => {
+            key.starts_with(PREFIX) && !key.starts_with(&format!("{PREFIX}account:"))
+        }
+        Some(account) => key.starts_with(&prefix(account)),
+    }
+}
+
+fn advance(account: AccountId) -> u64 {
+    let mut generations = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let stamp = generations.entry(account).or_default();
+    *stamp = stamp.wrapping_add(1);
+    *stamp
+}
+
+// Each account retires only its own handles; another account may remain open.
+static LIVE: LazyLock<Mutex<HashMap<AccountId, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));

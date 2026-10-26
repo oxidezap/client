@@ -505,6 +505,7 @@ pub(crate) fn render_offline_strip(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    let terminal = entity.read(cx).is_terminal_offline();
     div()
         .flex_shrink_0()
         .flex()
@@ -526,11 +527,19 @@ pub(crate) fn render_offline_strip(
                 .min_w_0()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().muted_foreground)
-                .child("Offline. Your messages stay readable. Reconnect to send."),
+                .child(if terminal {
+                    "Logged out. Only messages and media stored locally are available."
+                } else {
+                    "Offline. Your messages stay readable. Reconnect to send."
+                }),
         )
         .child(
             Button::new("reconnect")
-                .label("Reconnect")
+                .label(if terminal {
+                    "Session options"
+                } else {
+                    "Reconnect"
+                })
                 .ghost()
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {

@@ -242,3 +242,47 @@ async fn a_page_reloads_its_plugins_from_its_own_folder() {
     );
     empty_the_folder().await;
 }
+
+#[wasm_bindgen_test]
+fn plugin_authority_and_settings_are_isolated_between_retained_and_successor_accounts() {
+    use oxidezap_plugin_host::{Backing, Origin};
+    let a = oxidezap_core::AccountId::new(900001).unwrap();
+    let b = oxidezap_core::AccountId::new(900002).unwrap();
+    assert!(Origin::forget_account(a));
+    assert!(Origin::forget_account(b));
+    let retained = Origin::storage_for_account(a);
+    retained.write("approvals.json", b"retained-grant").unwrap();
+    retained
+        .write("settings.fixture.json", b"private-settings")
+        .unwrap();
+    let successor = Origin::storage_for_account(b);
+    assert!(successor.read("approvals.json", 1024).is_none());
+    assert!(successor.read("settings.fixture.json", 1024).is_none());
+    successor
+        .write("approvals.json", b"successor-grant")
+        .unwrap();
+    retained
+        .write("settings.fixture.json", b"retained-update")
+        .unwrap();
+    let replacement = Origin::storage_for_account(a);
+    assert!(retained.write("approvals.json", b"stale").is_err());
+    assert!(retained.remove("approvals.json").is_err());
+    assert_eq!(
+        replacement.read("approvals.json", 1024).unwrap(),
+        b"retained-grant"
+    );
+    assert_eq!(
+        successor.read("approvals.json", 1024).unwrap(),
+        b"successor-grant"
+    );
+    assert!(Origin::forget_account(a));
+    assert!(
+        replacement
+            .write("settings.fixture.json", b"stale")
+            .is_err()
+    );
+    successor
+        .write("settings.fixture.json", b"still-live")
+        .unwrap();
+    assert!(Origin::forget_account(b));
+}

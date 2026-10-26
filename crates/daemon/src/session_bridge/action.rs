@@ -239,6 +239,7 @@ impl Action {
                     | Self::LoadChats { .. }
                     | Self::RefreshAvatars
                     | Self::Download { .. }
+                    | Self::GroupMembers { .. }
             ),
         }
     }

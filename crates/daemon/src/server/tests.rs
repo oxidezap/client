@@ -2393,13 +2393,6 @@ async fn terminal_offline_requests_never_reach_the_session_channel() {
     let destination = outbox();
     let actions = vec![
         Action::EnsureAvatars(vec![]),
-        Action::GroupMembers {
-            id: 1,
-            request: oxidezap_ipc::GroupMembers {
-                jid: "999000@g.us".into(),
-            },
-            answer_to: destination.clone(),
-        },
         Action::Wire {
             id: 2,
             request: oxidezap_wire::request::ClientRequest::GetProfile {

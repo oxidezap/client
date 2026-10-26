@@ -1402,7 +1402,7 @@ impl WhatsAppApp {
             chats: Vec::new(),
             selected_chat: None,
             client: None,
-            account_selection: recovery::AccountSelection::default(),
+            account_selection: recovery::AccountSelection::load(),
             incoming_file_epoch: 0,
             incoming_file_reading: false,
             paste_preview: None,

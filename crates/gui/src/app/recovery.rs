@@ -27,19 +27,7 @@ const RETRY_AFTER_SECS: u64 = 15;
 /// How often the countdown redraws, which is also how precise it can be.
 const COUNTDOWN_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
-pub(super) struct AccountSelection {
-    pub active: oxidezap_core::AccountId,
-    pub retained: Option<oxidezap_core::AccountId>,
-}
-
-impl Default for AccountSelection {
-    fn default() -> Self {
-        Self {
-            active: oxidezap_core::AccountId::LEGACY,
-            retained: None,
-        }
-    }
-}
+pub(super) use crate::platform::account::AccountSelection;
 
 /// What the error screen is waiting on, and what it is showing.
 pub(super) struct Recovering {
@@ -150,6 +138,19 @@ impl Recovering {
 }
 
 impl WhatsAppApp {
+    fn save_account_selection(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.account_selection.save() {
+            self.notify_user(
+                format!("Could not remember the selected account: {error}"),
+                notices::Tone::Problem,
+                cx,
+            );
+        }
+    }
+
+    pub fn is_terminal_offline(&self) -> bool {
+        matches!(self.app_state, AppState::OfflineLoggedOut { .. })
+    }
     pub fn has_retained_history(&self) -> bool {
         self.account_selection.retained.is_some()
     }
@@ -162,6 +163,7 @@ impl WhatsAppApp {
         self.client.take();
         self.clear_account_view(window, cx);
         self.account_selection.active = account;
+        self.save_account_selection(cx);
         self.retry_connection(cx);
     }
 
@@ -203,6 +205,7 @@ impl WhatsAppApp {
                                 active: account,
                                 retained: Some(old),
                             };
+                            app.save_account_selection(cx);
                             app.retry_connection(cx);
                         }
                         _ => {
@@ -223,6 +226,13 @@ impl WhatsAppApp {
     /// Retry WhatsApp through the live IPC connection. Only failure to reach
     /// that service uses the separate front-end attach recovery.
     pub fn retry_whatsapp_connection(&mut self, cx: &mut Context<Self>) {
+        if let AppState::OfflineLoggedOut { message } = &self.app_state {
+            self.app_state = AppState::LoggedOut {
+                message: message.clone(),
+            };
+            cx.notify();
+            return;
+        }
         let Some(client) = self.client.as_ref() else {
             self.retry_connection(cx);
             return;
@@ -360,6 +370,10 @@ mod tests {
                 assert!(app.retry_countdown(cx).is_none());
                 assert!(app.reconnect_task.is_none());
             }
+            app.retry_whatsapp_connection(cx);
+            assert!(matches!(app.app_state, AppState::LoggedOut { .. }));
+            assert!(app.reconnect_task.is_none());
+            assert_eq!(app.chats.len(), 1);
         });
     }
 

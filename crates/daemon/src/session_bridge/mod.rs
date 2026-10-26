@@ -458,12 +458,9 @@ fn approvals_retired(account_id: oxidezap_core::AccountId) -> bool {
     // separate on a desktop are one call here. What survives is what survives
     // there — the modules themselves.
     //
-    // Not yet account-scoped there (the multi-account plan's section 13.3
-    // names this as pending), so this account's id goes unused on that half of
-    // the split.
     #[cfg(target_family = "wasm")]
     {
-        oxidezap_plugin_host::Origin::forget_all()
+        oxidezap_plugin_host::Origin::forget_account(account_id)
     }
     #[cfg(not(target_family = "wasm"))]
     {

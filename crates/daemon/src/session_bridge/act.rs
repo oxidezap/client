@@ -385,7 +385,11 @@ impl Bridge {
                     let _ = reply.send(too_busy());
                     return None;
                 };
-                let roster = client.group_roster(jid);
+                let roster = if self.hub.connection().is_connected() {
+                    client.group_roster(jid)
+                } else {
+                    client.cached_group_roster(jid)
+                };
                 oxidezap_session::spawn(async move {
                     let answer = match roster.await {
                         Ok(Ok(roster)) => Ok(DaemonMessage::GroupMembers { id, roster }),

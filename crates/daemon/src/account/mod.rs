@@ -179,6 +179,14 @@ impl AccountRuntime {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EmbeddedNext {
+    Reset,
+    Removed,
+    Restart,
+    Finished,
+}
+
 /// Registry of account runtimes and the control-plane snapshot they publish.
 pub struct AccountRegistry {
     relink: tokio::sync::Mutex<()>,
@@ -290,6 +298,55 @@ impl AccountRegistry {
             supervisor.spawn(id).await;
             return;
         }
+        let (mut runtime, mut receiver) =
+            self.build_embedded_account(id, Arc::clone(&stores)).await;
+        let registry = Arc::clone(self);
+        oxidezap_session::spawn(async move {
+            let mut failures = 0u32;
+            loop {
+                let outcome = registry
+                    .run(runtime, receiver, crate::shutdown::requested())
+                    .await;
+                let next = match outcome {
+                    Ok(exit) => registry.finish_embedded_exit(id, exit),
+                    Err(error) => {
+                        log::error!("account {} ended: {error}", id.get());
+                        EmbeddedNext::Restart
+                    }
+                };
+                match next {
+                    EmbeddedNext::Reset => failures = 0,
+                    EmbeddedNext::Removed | EmbeddedNext::Finished => break,
+                    EmbeddedNext::Restart => {
+                        if failures >= 3 {
+                            registry.set_status(id, AccountStatus::Error);
+                            break;
+                        }
+                        failures += 1;
+                        tokio::select! {
+                            _ = oxidezap_session::sleep(std::time::Duration::from_secs(u64::from(failures))) => {},
+                            _ = crate::shutdown::requested() => break,
+                        }
+                        registry.remove(id);
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    _ = crate::shutdown::requested() => break,
+                    _ = std::future::ready(()) => {},
+                }
+                (runtime, receiver) = registry
+                    .build_embedded_account(id, Arc::clone(&stores))
+                    .await;
+            }
+        });
+    }
+
+    async fn build_embedded_account(
+        self: &Arc<Self>,
+        id: AccountId,
+        stores: Arc<StoreRegistry>,
+    ) -> (Arc<AccountRuntime>, mpsc::Receiver<SessionCommand>) {
         let hub = StateHub::for_account(id);
         let (commands, receiver) = mpsc::channel(crate::server::MAX_CLIENTS);
         let plugins = crate::plugins::start(&hub, commands.clone()).await;
@@ -297,15 +354,30 @@ impl AccountRegistry {
             id, hub, plugins, commands, stores,
         ));
         assert!(self.insert(Arc::clone(&runtime)));
-        let registry = Arc::clone(self);
-        oxidezap_session::spawn(async move {
-            if let Err(error) = registry
-                .run(runtime, receiver, crate::shutdown::requested())
-                .await
-            {
-                log::error!("account {} ended: {error}", id.get());
+        (runtime, receiver)
+    }
+
+    fn finish_embedded_exit(
+        &self,
+        id: AccountId,
+        exit: session_bridge::AccountExit,
+    ) -> EmbeddedNext {
+        use session_bridge::AccountExit;
+        match exit {
+            AccountExit::ResetCompleted => {
+                self.remove(id);
+                EmbeddedNext::Reset
             }
-        });
+            AccountExit::RemoveCompleted => {
+                self.remove(id);
+                EmbeddedNext::Removed
+            }
+            AccountExit::SessionEnded => EmbeddedNext::Restart,
+            AccountExit::SessionLoggedOut
+            | AccountExit::Stopped
+            | AccountExit::ResetIncomplete
+            | AccountExit::RemoveIncomplete => EmbeddedNext::Finished,
+        }
     }
 
     /// Remove one runtime after its teardown has completed.
@@ -1394,6 +1466,42 @@ mod tests {
                 .all(|receiver| receiver.try_recv().is_err())
         );
         history.close().await.unwrap();
+    }
+
+    #[test]
+    fn embedded_completed_lifecycle_retires_the_old_runtime_only_after_success() {
+        use super::EmbeddedNext;
+        use crate::session_bridge::AccountExit;
+        let registry = AccountRegistry::new();
+        let id = AccountId::new(2).unwrap();
+        let old = runtime(2);
+        assert!(registry.insert(Arc::clone(&old)));
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::ResetIncomplete),
+            EmbeddedNext::Finished
+        );
+        assert!(Arc::ptr_eq(&registry.get(id).unwrap(), &old));
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::ResetCompleted),
+            EmbeddedNext::Reset
+        );
+        assert!(registry.get(id).is_none());
+        let replacement = runtime(2);
+        assert!(registry.insert(Arc::clone(&replacement)));
+        assert!(!Arc::ptr_eq(&replacement, &old));
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::RemoveCompleted),
+            EmbeddedNext::Removed
+        );
+        assert!(registry.get(id).is_none());
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::SessionEnded),
+            EmbeddedNext::Restart
+        );
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::SessionLoggedOut),
+            EmbeddedNext::Finished
+        );
     }
 
     #[test]

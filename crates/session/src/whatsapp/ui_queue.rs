@@ -172,6 +172,14 @@ fn channel_with_limits(
 }
 
 impl Sender {
+    pub(super) fn close(&self) {
+        self.inner
+            .state
+            .lock()
+            .expect("UI event queue poisoned")
+            .closed = true;
+        self.inner.wake.notify_waiters();
+    }
     pub(super) fn signal_control_overflow(&self) {
         let mut state = self.inner.state.lock().expect("UI event queue poisoned");
         state.control_overflow = true;
@@ -654,6 +662,23 @@ fn event_strings(event: &UiEvent) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_completion_drains_the_last_event_despite_other_sender_owners() {
+        let (sender, mut receiver, _) =
+            test_channel(8, 4, 4096, std::time::Duration::from_secs(60));
+        let retained_owner = sender.clone();
+        sender
+            .send(UiEvent::Disconnected("completed".into()))
+            .unwrap();
+        sender.close();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(UiEvent::Disconnected(_))
+        ));
+        assert!(receiver.recv().await.is_none());
+        assert!(retained_owner.send(UiEvent::Connected).is_err());
+    }
 
     fn test_channel(
         max_items: usize,
