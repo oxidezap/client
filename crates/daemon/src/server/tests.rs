@@ -621,7 +621,7 @@ fn a_daemon_before_manual_whatsapp_retry_is_rejected() {
         DaemonMessage::Error {
             error: ProtocolError::VersionMismatch {
                 client: 39,
-                daemon: 40
+                daemon: PROTOCOL_VERSION
             },
             ..
         }

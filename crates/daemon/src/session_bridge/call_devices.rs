@@ -45,6 +45,70 @@ impl Drop for Devices {
 #[derive(Default)]
 struct State {
     preview: Option<Preview>,
+    fences: Vec<PreviewFence>,
+}
+struct PreviewFence {
+    owner: Outbox,
+    started: u64,
+    retired: u64,
+}
+impl State {
+    fn fence(&mut self, owner: &Outbox) -> &mut PreviewFence {
+        self.fences.retain(|f| !f.owner.is_closed());
+        let index = self
+            .fences
+            .iter()
+            .position(|f| f.owner.same_channel(owner))
+            .unwrap_or_else(|| {
+                self.fences.push(PreviewFence {
+                    owner: owner.clone(),
+                    started: 0,
+                    retired: 0,
+                });
+                self.fences.len() - 1
+            });
+        &mut self.fences[index]
+    }
+    fn retire(&mut self, owner: &Outbox, id: CameraPreviewId) {
+        let fence = self.fence(owner);
+        fence.retired = fence.retired.max(id.0);
+        if let Some(p) = self
+            .preview
+            .as_ref()
+            .filter(|p| p.owner.same_channel(owner) && p.id.0 <= id.0)
+        {
+            p.cancel.store(true, Ordering::Release);
+        }
+    }
+    fn reserve_preview(
+        &mut self,
+        owner: &Outbox,
+        id: CameraPreviewId,
+    ) -> Result<Arc<AtomicBool>, String> {
+        if owner.is_closed() {
+            return Err("Preview connection is closed".into());
+        }
+        let fence = self.fence(owner);
+        if id.0 <= fence.retired || id.0 <= fence.started {
+            return Err("Preview identity was already stopped or used".into());
+        }
+        if self.preview.as_ref().is_some_and(|p| !p.finished) {
+            return Err("A camera preview is already open. Close it first.".into());
+        }
+        self.fence(owner).started = id.0;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.preview = Some(Preview {
+            id,
+            owner: owner.clone(),
+            cancel: cancel.clone(),
+            frame: None,
+            mode: None,
+            failure: None,
+            finished: false,
+            waiting_keyframe: true,
+        });
+        Ok(cancel)
+    }
 }
 struct Preview {
     id: CameraPreviewId,
@@ -266,21 +330,15 @@ async fn handle(state: Arc<Mutex<State>>, action: Action, owner: &Outbox) -> Res
         }
         Action::TestMicrophone => test_microphone().await,
         Action::CancelPreview { preview_id } => {
-            {
-                let state = state.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(p) = state
-                    .preview
-                    .as_ref()
-                    .filter(|p| p.id == preview_id && p.owner.same_channel(owner))
-                {
-                    p.cancel.store(true, Ordering::Release);
-                }
-            }
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retire(owner, preview_id);
             for _ in 0..50 {
                 let finished = {
                     let state = state.lock().unwrap_or_else(|e| e.into_inner());
                     !state.preview.as_ref().is_some_and(|p| {
-                        p.id == preview_id && p.owner.same_channel(owner) && !p.finished
+                        p.id.0 <= preview_id.0 && p.owner.same_channel(owner) && !p.finished
                     })
                 };
                 if finished {
@@ -307,23 +365,10 @@ async fn handle(state: Arc<Mutex<State>>, action: Action, owner: &Outbox) -> Res
             })
         }
         Action::StartPreview { preview_id } => {
-            let cancel = Arc::new(AtomicBool::new(false));
-            {
-                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-                if state.preview.as_ref().is_some_and(|p| !p.finished) {
-                    return Err("A camera preview is already open. Close it first.".into());
-                }
-                state.preview = Some(Preview {
-                    id: preview_id,
-                    owner: owner.clone(),
-                    cancel: cancel.clone(),
-                    frame: None,
-                    mode: None,
-                    failure: None,
-                    finished: false,
-                    waiting_keyframe: true,
-                });
-            }
+            let cancel = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reserve_preview(owner, preview_id)?;
             let state_pump = state.clone();
             let owner = owner.clone();
             oxidezap_session::spawn(async move {
@@ -344,6 +389,17 @@ async fn preview(
     owner: Outbox,
     cancel: Arc<AtomicBool>,
 ) {
+    if cancel.load(Ordering::Acquire) || owner.is_closed() {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = state
+            .preview
+            .as_mut()
+            .filter(|p| p.id == id && p.owner.same_channel(&owner))
+        {
+            p.finished = true;
+        }
+        return;
+    }
     let p = oxidezap_audio::devices::call_preferences();
     let opened = oxidezap_session::CameraPreview::open(id, quality(&p), p.camera).await;
     match opened {
@@ -466,6 +522,42 @@ mod tests {
         assert_eq!(p, saved);
         assert_eq!(quality_with_environment(&p, environment).bitrate_kbps, 987);
     }
+    #[tokio::test]
+    async fn stopped_acknowledgement_fences_a_start_that_has_not_run_yet() {
+        let (owner, _rx) = tokio::sync::mpsc::channel(4);
+        let (other, _rx2) = tokio::sync::mpsc::channel(4);
+        let state = Arc::new(Mutex::new(State::default()));
+        let id = CameraPreviewId(1);
+        assert!(matches!(
+            handle(
+                state.clone(),
+                Action::CancelPreview { preview_id: id },
+                &owner
+            )
+            .await
+            .unwrap(),
+            Reply::Stopped { .. }
+        ));
+        let mut state = state.lock().unwrap();
+        assert!(
+            state.reserve_preview(&owner, id).is_err(),
+            "late start must be refused before opening hardware"
+        );
+        assert!(state.preview.is_none());
+        assert!(
+            state.reserve_preview(&other, id).is_ok(),
+            "retirement belongs to its connection"
+        );
+    }
+    #[test]
+    fn preview_id_cannot_be_reused_after_completion() {
+        let (owner, _rx) = tokio::sync::mpsc::channel(4);
+        let mut state = State::default();
+        state.reserve_preview(&owner, CameraPreviewId(1)).unwrap();
+        state.preview.as_mut().unwrap().finished = true;
+        assert!(state.reserve_preview(&owner, CameraPreviewId(1)).is_err());
+        assert!(state.reserve_preview(&owner, CameraPreviewId(2)).is_ok());
+    }
     fn fixture(owner: Outbox) -> (Arc<Mutex<State>>, Arc<AtomicBool>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let state = State {
@@ -479,6 +571,7 @@ mod tests {
                 finished: true,
                 waiting_keyframe: true,
             }),
+            ..Default::default()
         };
         (Arc::new(Mutex::new(state)), cancel)
     }
@@ -500,7 +593,7 @@ mod tests {
         handle(
             state.clone(),
             Action::CancelPreview {
-                preview_id: CameraPreviewId(8),
+                preview_id: CameraPreviewId(6),
             },
             &owner,
         )

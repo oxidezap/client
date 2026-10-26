@@ -278,7 +278,7 @@ impl Settings {
     /// the one on screen.
     fn depart(&mut self) {
         self.storage = None;
-        self.devices = Default::default();
+        self.devices.depart();
         self.account_epoch = self.account_epoch.wrapping_add(1);
     }
 

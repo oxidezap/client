@@ -35,6 +35,16 @@ pub(super) struct DeviceUi {
 }
 
 impl DeviceUi {
+    pub(super) fn depart(&mut self) {
+        if let Some(id) = self.preview.or(self.stopping) {
+            self.admission.cancel(id);
+        }
+        let admission = std::mem::take(&mut self.admission);
+        *self = Self {
+            admission,
+            ..Default::default()
+        };
+    }
     fn may_save(&self) -> bool {
         self.preferences_ready && !self.busy
     }
@@ -421,6 +431,16 @@ impl WhatsAppApp {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+    #[test]
+    fn forgetting_settings_preserves_monotonic_preview_ids() {
+        let mut ui = DeviceUi::default();
+        let first = ui.admission.begin().unwrap();
+        ui.preview = Some(first);
+        ui.depart();
+        let second = ui.admission.begin().unwrap();
+        assert!(second.0 > first.0);
+        assert!(!ui.admission.accepts(first));
+    }
     #[test]
     fn unloaded_preferences_cannot_be_saved() {
         let mut ui = DeviceUi::default();

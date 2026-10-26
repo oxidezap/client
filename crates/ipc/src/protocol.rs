@@ -1257,6 +1257,8 @@ pub enum CallDeviceAction {
     TestMicrophone,
     TestSpeaker,
     TestRingtone,
+    /// Allocate increasing IDs per connection with PreviewAdmission. Stopping
+    /// an ID also fences every earlier ID so queued starts cannot reopen it.
     StartPreview {
         preview_id: oxidezap_core::CameraPreviewId,
     },
