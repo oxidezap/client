@@ -308,7 +308,7 @@ mod tests {
     struct TempDb(std::path::PathBuf);
     impl TempDb {
         fn new(tag: &str) -> Self {
-            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static SEQUENCE: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
             loop {
                 let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let path = std::env::temp_dir().join(format!(
