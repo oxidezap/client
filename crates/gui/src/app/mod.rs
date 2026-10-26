@@ -4687,10 +4687,22 @@ mod tests {
                 gpui::Modifiers::default(),
             );
             assert_eq!(
-                visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+                visual.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    let snapshots =
+                        crate::components::rich_text_selection::active_selection_message_snapshots(
+                            window.window_handle().window_id(),
+                            cx,
+                        );
+                    assert_eq!(snapshots.len(), 1);
+                    assert_eq!(snapshots[0].0.message_id.as_ref(), "test-message");
+                    assert_eq!(snapshots[0].0.segment, segment);
+                    gpui_base::TextSelection::selected_text(window, cx)
+                }),
                 "alpha "
             );
-            visual.update(|window, cx| {
+            // Daemon events invalidate without holding a Window lease.
+            visual.cx.update(|cx| {
                 app_entity.as_ref().unwrap().update(cx, |app, cx| {
                     app.find_chat_mut(jid)
                         .unwrap()
@@ -4703,13 +4715,14 @@ mod tests {
                     app.invalidate_message_cache(jid, cx);
                     app.invalidate_message_cache(jid, cx);
                 });
-                window.draw(cx).clear(cx);
             });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
             assert_eq!(
-                visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
+                visual.update(gpui_base::TextSelection::selected_text),
                 "alpha "
             );
-            visual.update(|window, cx| {
+            // Daemon events invalidate without holding a Window lease.
+            visual.cx.update(|cx| {
                 app_entity.as_ref().unwrap().update(cx, |app, cx| {
                     let business = app.find_chat_mut(jid).unwrap().messages[0]
                         .business
@@ -4722,12 +4735,9 @@ mod tests {
                     }
                     app.invalidate_message_cache(jid, cx);
                 });
-                window.draw(cx).clear(cx);
             });
-            assert_eq!(
-                visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx)),
-                ""
-            );
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(visual.update(gpui_base::TextSelection::selected_text), "");
         }
     }
 
