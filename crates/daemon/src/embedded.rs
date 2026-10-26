@@ -20,10 +20,8 @@ use std::sync::Arc;
 
 use tokio::io::DuplexStream;
 
-use crate::account::{AccountRegistry, AccountRuntime};
+use crate::account::AccountRegistry;
 use crate::server;
-use crate::session_bridge;
-use crate::state::StateHub;
 use oxidezap_core::AccountId;
 use oxidezap_session::StoreRegistry;
 
@@ -52,7 +50,7 @@ const PIPE: usize = 1 << 18;
 /// because on the side this exists for there is no process to end that is
 /// not the tab itself.
 pub async fn start() -> Result<DuplexStream, StartFailed> {
-    let (_, _, _, registry) = service().await?;
+    let registry = service().await?;
 
     let (client, server) = tokio::io::duplex(PIPE);
     oxidezap_session::spawn(async move {
@@ -72,240 +70,123 @@ pub async fn start() -> Result<DuplexStream, StartFailed> {
     Ok(client)
 }
 
-// The service this page runs, started once.
-//
-// A page has one session, as a machine has one daemon, and a front end
-// reconnecting is not a reason to start another. Held per agent rather than
-// globally because that is the scope it is true in — and because the claim is
-// a browser object that belongs to the agent that took it.
+// The origin claim outlives every individual account runtime and connection.
 thread_local! {
     static SERVICE: RefCell<Option<Service>> = const { RefCell::new(None) };
-    /// Whether a session's bridge has been spawned and has not returned.
-    ///
-    /// Not the same question as "is its command channel open", which is what
-    /// [`running`] used to ask: `session_bridge::run` drops the receiver
-    /// *first* and then joins the plugins, joins the publisher and deletes
-    /// the database. Between those, the channel reads closed while the
-    /// account is still being taken apart.
-    static RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether a bridge is between dropping its commands and returning.
-///
-/// The window "clear data and pair again" runs in, on the side the front end
-/// cannot see: it sends the command and reconnects at once, and what it must
-/// not be handed is a fresh session opening the database the old one is
-/// deleting.
-fn tearing_down() -> bool {
-    RUNNING.with(std::cell::Cell::get)
-}
-
-/// What one page's daemon consists of, minus the connections.
 struct Service {
-    hub: Arc<StateHub>,
-    commands: session_bridge::Commands,
-    /// The account, claimed. Released when the page goes, which the browser
-    /// does for us: a Web Lock does not outlive the agent that holds it.
     _claim: crate::claim::Claim,
-    /// The plugin host, which on a page holds nothing.
-    ///
-    /// Built and carried rather than skipped: every front end asks the same
-    /// protocol the same questions, and a page answering "no plugins" out of
-    /// a real host is the same answer a desktop daemon with an empty folder
-    /// gives. See [`crate::plugins::start`] for why it is empty here.
-    plugins: Arc<oxidezap_plugin_host::Plugins>,
-    /// The account-local runtime, including its lifecycle state.
-    runtime: Arc<AccountRuntime>,
-    /// The registry shared by every embedded control/account connection.
     registry: Arc<AccountRegistry>,
-
-    /// The other tabs of this origin, served.
-    ///
-    /// This tab won the account's lock, which makes it the daemon; the tabs
-    /// that lost it are front ends with no session, which is what a desktop
-    /// window has always been. Held here rather than detached because it has
-    /// to stop exactly when this service does — a tab whose session has been
-    /// torn down has nothing to serve, and going on answering asks would hand
-    /// the next tab a hub nothing will update again.
     #[cfg(target_family = "wasm")]
     _tabs: Option<crate::listener::tab::Serving>,
 }
 
-/// Start this page's session if it is not already running, and hand back what
-/// a connection needs to talk to it.
-async fn service() -> Result<
-    (
-        Arc<StateHub>,
-        Arc<oxidezap_plugin_host::Plugins>,
-        session_bridge::Commands,
-        Arc<AccountRegistry>,
-    ),
-    StartFailed,
-> {
-    if let Some(running) = running()? {
-        return Ok(running);
+async fn service() -> Result<Arc<AccountRegistry>, StartFailed> {
+    if let Some(registry) = running() {
+        return Ok(registry);
     }
-
-    // Before anything opens the store, and held for as long as the page is.
-    // Two of these on one origin would preload the same database, write it
-    // back independently, and advance the same Signal state from two places —
-    // the losing writer's chats gone, its ratchets no longer decrypting. See
-    // [`crate::claim`].
     let claim = crate::claim::take().await.map_err(StartFailed::Claimed)?;
-
-    // Asked again, because the answer above took an await to get and this
-    // agent runs other tasks in the meantime. Two `start`s racing would
-    // otherwise both build a session, and the second would be the one every
-    // later connection got — over a store the first one has open.
-    if let Some(running) = running()? {
+    if let Some(registry) = running() {
         drop(claim);
-        return Ok(running);
+        return Ok(registry);
     }
 
-    let hub = StateHub::for_account(AccountId::LEGACY);
-
-    // The bridge must never be cancelled: it owns the session, and a future
-    // dropped mid-await cannot wait for anything. So it watches for a stop
-    // rather than being raced against one.
-    let stopped = async { crate::shutdown::requested().await };
-
-    // Bounded, and sized as the daemon sizes it: a connection waits for its
-    // command's answer before reading the next request, so at most one command
-    // per connection is ever outstanding.
-    let (commands, command_rx) = tokio::sync::mpsc::channel(server::MAX_CLIENTS);
-
-    // After the command channel, because a plugin acts through it, and before
-    // the session, because a plugin subscribed to messages must not miss the
-    // ones that arrive while it is still loading. The order is the binary's
-    // order, kept even though a page's host is empty: this is the one place
-    // the two daemons could quietly diverge, and the difference between them
-    // is meant to be what `plugins::start` says it is and nothing else.
-    let plugins = crate::plugins::start(&hub, commands.clone()).await;
-
-    // Raised before the bridge exists and lowered only once it has returned,
-    // which is a longer span than the command channel measures — see
-    // [`tearing_down`].
-    RUNNING.with(|running| running.set(true));
     let registry = AccountRegistry::new();
     let stores = Arc::new(StoreRegistry::new(oxidezap_session::resolve_database_path()));
-    let runtime = Arc::new(AccountRuntime::new_with_registry(
-        AccountId::LEGACY,
-        Arc::clone(&hub),
-        Arc::clone(&plugins),
-        commands.clone(),
-        stores,
-    ));
-    assert!(registry.insert(Arc::clone(&runtime)));
-    oxidezap_session::spawn({
-        let registry = Arc::clone(&registry);
-        let runtime = Arc::clone(&runtime);
-        async move {
-            let outcome = registry.run(runtime, command_rx, stopped).await;
-            // After `run`, not inside it: what this says is "the teardown is
-            // over", and the teardown is the last thing `run` does.
-            RUNNING.with(|running| running.set(false));
-            outcome
-        }
-    });
+    let stored = stores
+        .accounts()
+        .await
+        .map_err(|error| StartFailed::Storage(error.to_string()))?;
+    for id in startup_accounts(stored.into_iter().map(|account| account.id)) {
+        registry.start_account(id, Arc::clone(&stores)).await;
+    }
 
-    // After the session, and only in the tab that has one. What this
-    // announces is exactly what has just become true — there is a daemon in
-    // this origin — and announcing it before the bridge existed would invite
-    // a front end onto a hub with nothing behind it.
     #[cfg(target_family = "wasm")]
     let tabs = match crate::listener::tab::serve(&registry) {
         Ok(serving) => Some(serving),
-        Err(e) => {
-            // Not fatal, and deliberately not an error the window sees: this
-            // tab holds the account and draws it either way. What is lost is
-            // the second tab, which finds nobody answering and says so.
-            log::warn!("this tab cannot serve the others: {e}");
+        Err(error) => {
+            log::warn!("this tab cannot serve the others: {error}");
             None
         }
     };
-
     SERVICE.with(|cell| {
         *cell.borrow_mut() = Some(Service {
-            hub: Arc::clone(&hub),
-            commands: commands.clone(),
             _claim: claim,
-            plugins: Arc::clone(&plugins),
-            runtime: Arc::clone(&runtime),
             registry: Arc::clone(&registry),
             #[cfg(target_family = "wasm")]
             _tabs: tabs,
         });
     });
-    Ok((hub, plugins, commands, registry))
+    Ok(registry)
 }
 
-/// This page's session, if it has one that is still listening.
-///
-/// A bridge that has stopped — a shutdown, an account reset — leaves a sender
-/// nobody is reading. Reusing it would accept every command into a channel
-/// with no receiver, so the page would look connected and answer nothing.
-/// Forgetting it here lets the next session build a fresh one over the claim
-/// this page already holds — which is the page's for as long as the page is,
-/// and not something a session hands back between two of its own.
-type Running = (
-    Arc<StateHub>,
-    Arc<oxidezap_plugin_host::Plugins>,
-    session_bridge::Commands,
-    Arc<AccountRegistry>,
-);
+fn startup_accounts(accounts: impl Iterator<Item = AccountId>) -> Vec<AccountId> {
+    let mut ids: Vec<_> = accounts.collect();
+    if ids.is_empty() {
+        ids.push(AccountId::LEGACY);
+    }
+    ids
+}
 
-fn running() -> Result<Option<Running>, StartFailed> {
+fn running() -> Option<Arc<AccountRegistry>> {
     SERVICE.with(|cell| {
-        let mut slot = cell.borrow_mut();
-
-        let closed = slot.as_ref().is_some_and(|s| s.commands.is_closed());
-
-        // Closed, but not finished. `run` drops the command receiver before
-        // it joins the plugins, joins the publisher and wipes the store, so
-        // a closed channel is the *start* of the teardown rather than proof
-        // of its end. Forgetting the entry here would skip the guard below
-        // and hand the next caller a session that opens the database the old
-        // one is in the middle of deleting.
-        if closed && tearing_down() {
-            return Err(StartFailed::Stopping);
-        }
-
-        // Gone: the bridge exited, so its receiver is dropped. Forgetting the
-        // entry is what lets the next caller build a fresh session; the claim
-        // it will run under is this one, because the account did not stop
-        // being this page's when its bridge did.
-        if closed {
-            *slot = None;
-        }
-
-        // Going: `ForgetSession` has been accepted and the session is closing
-        // and wiping, which it does with its command channel still open. This
-        // is the window "clear data and pair again" runs in — the front end
-        // sends the command and reconnects at once — and handing back this
-        // service would serve the new pipe the account that is being deleted,
-        // out of a hub nothing will update again.
-        //
-        // Not forgotten, because the store is still open behind it: handing
-        // this page a second session here would start one over a database the
-        // first has not let go of. So the honest answer is neither the old
-        // service nor a new one, but "ask again in a moment" — which is what
-        // the front end's ordinary reconnect already does.
-        if slot
+        cell.borrow()
             .as_ref()
-            .is_some_and(|service| service.runtime.is_stopping())
-        {
-            return Err(StartFailed::Stopping);
-        }
-
-        Ok(slot.as_ref().map(|running| {
-            (
-                Arc::clone(&running.hub),
-                Arc::clone(&running.plugins),
-                running.commands.clone(),
-                Arc::clone(&running.registry),
-            )
-        }))
+            .map(|service| Arc::clone(&service.registry))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn origin_service_survives_account_runtime_removal() {
+        let registry = AccountRegistry::new();
+        let successor = AccountId::new(2).unwrap();
+        for id in [AccountId::LEGACY, successor] {
+            let (commands, receiver) = tokio::sync::mpsc::channel(1);
+            let runtime = Arc::new(crate::account::AccountRuntime::new(
+                id,
+                crate::state::StateHub::for_account(id),
+                Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+                    |_| {},
+                ))),
+                commands,
+            ));
+            assert!(registry.insert(runtime));
+            drop(receiver);
+        }
+        SERVICE.with(|cell| {
+            assert!(cell.borrow().is_none());
+            *cell.borrow_mut() = Some(Service {
+                _claim: crate::claim::Claim,
+                registry: Arc::clone(&registry),
+            });
+        });
+        assert!(Arc::ptr_eq(&running().unwrap(), &registry));
+        assert!(registry.remove(AccountId::LEGACY).is_some());
+        let service = running().unwrap();
+        assert!(Arc::ptr_eq(&service, &registry));
+        assert!(service.get(successor).is_some());
+        SERVICE.with(|cell| *cell.borrow_mut() = None);
+    }
+
+    #[test]
+    fn cold_start_restores_retained_and_successor_accounts() {
+        let successor = AccountId::new(2).unwrap();
+        assert_eq!(
+            startup_accounts([AccountId::LEGACY, successor].into_iter()),
+            vec![AccountId::LEGACY, successor]
+        );
+        assert_eq!(startup_accounts([successor].into_iter()), vec![successor]);
+        assert_eq!(
+            startup_accounts(std::iter::empty()),
+            vec![AccountId::LEGACY]
+        );
+    }
 }
 
 /// Wait until this tab is the one holding the account.
@@ -333,7 +214,7 @@ pub use crate::claim::Promotion;
 
 /// Why a session did not start here.
 ///
-/// One variant today and the distinction is the whole reason the type exists:
+/// A refused origin claim differs from a database opening failure:
 /// a refused claim is **settled**. Another tab holds this account, and asking
 /// again in ten seconds cannot change that — only the person closing the
 /// other tab can. A front end that retries it anyway does the thing
@@ -345,20 +226,14 @@ pub enum StartFailed {
     /// Something else already holds this account. The string says who, as far
     /// as the platform can tell, and is written for the person reading it.
     Claimed(String),
-    /// This page's own session is closing — it has been told to forget the
-    /// account — and the next one cannot start until it has.
-    ///
-    /// The opposite of [`Claimed`](Self::Claimed) in the one way that
-    /// matters: asking again *is* what fixes it, so this must not reach the
-    /// window as a settled refusal.
-    Stopping,
+    /// The retained account database could not be opened.
+    Storage(String),
 }
 
 impl std::fmt::Display for StartFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Claimed(who) => f.write_str(who),
-            Self::Stopping => f.write_str("the previous session is still closing"),
+            Self::Claimed(who) | Self::Storage(who) => f.write_str(who),
         }
     }
 }

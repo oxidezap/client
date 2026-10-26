@@ -48,6 +48,7 @@ pub struct StoredAccount {
 pub struct StoreRegistry {
     database_path: String,
     chat_schema: Arc<OnceCell<()>>,
+    prepared: Arc<OnceCell<()>>,
     /// Opened once. Every account store shares this database's connection
     /// pools and write permits, so concurrent account writers cannot deadlock
     /// by upgrading independent read transactions on the same physical file.
@@ -65,14 +66,23 @@ impl std::fmt::Debug for StoreRegistry {
 }
 
 impl StoreRegistry {
-    /// Create a registry for the already-prepared shared database.
+    /// Create a registry that prepares and opens the shared database on first use.
     #[must_use]
     pub fn new(database_path: impl Into<String>) -> Self {
         Self {
             database_path: database_path.into(),
             chat_schema: Arc::new(OnceCell::new()),
+            prepared: Arc::new(OnceCell::new()),
             base: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// Install and preload the platform store once across all account runtimes.
+    pub async fn prepare(&self) -> Result<(), String> {
+        self.prepared
+            .get_or_try_init(crate::store::prepare)
+            .await
+            .map(|_| ())
     }
 
     /// The database URL/path passed to each account-scoped store.
@@ -101,6 +111,7 @@ impl StoreRegistry {
     async fn base(&self) -> Result<&Database, StoreError> {
         self.base
             .get_or_try_init(|| async {
+                self.prepare().await.map_err(StoreError::Validation)?;
                 crate::store::open_for_account(&self.database_path, AccountId::LEGACY)
                     .await
                     .map(|store| store.database())

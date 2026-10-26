@@ -1096,7 +1096,7 @@ impl WhatsAppClient {
         // not a failure anybody would see: a browser without its VFS opens a
         // database in memory quite happily and loses the account when the tab
         // closes.
-        if let Err(e) = crate::store::prepare().await {
+        if let Err(e) = stores.prepare().await {
             error!("Failed to prepare the store: {e}");
             let _ = ui_tx.send(UiEvent::Error(format!("Database error: {e}")));
             return None;

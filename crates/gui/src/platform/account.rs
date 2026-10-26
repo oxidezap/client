@@ -48,6 +48,81 @@ impl AccountSelection {
     }
 }
 
+#[cfg(any(test, target_family = "wasm"))]
+mod tab_selection {
+    pub(super) trait Documents {
+        fn tab(&self) -> Result<Option<String>, String>;
+        fn preferred(&self) -> Result<Option<String>, String>;
+        fn write_tab(&self, raw: &str) -> Result<(), String>;
+        fn write_preferred(&self, raw: &str) -> Result<(), String>;
+    }
+
+    pub(super) fn restore(documents: &impl Documents) -> Result<Option<String>, String> {
+        if let Some(raw) = documents.tab()? {
+            return Ok(Some(raw));
+        }
+        let raw = match documents.preferred()? {
+            Some(raw) => raw,
+            None => serde_json::to_string(&super::AccountSelection::default())
+                .map_err(|error| error.to_string())?,
+        };
+        documents.write_tab(&raw)?;
+        Ok(Some(raw))
+    }
+
+    pub(super) fn save(documents: &impl Documents, raw: &str) -> Result<(), String> {
+        documents.write_tab(raw)?;
+        documents.write_preferred(raw)
+    }
+
+    #[test]
+    fn reloads_keep_each_tabs_choice_and_new_sessions_inherit_the_preference() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        struct Tab {
+            held: RefCell<Option<String>>,
+            preferred: Rc<RefCell<Option<String>>>,
+        }
+        impl Documents for Tab {
+            fn tab(&self) -> Result<Option<String>, String> {
+                Ok(self.held.borrow().clone())
+            }
+            fn preferred(&self) -> Result<Option<String>, String> {
+                Ok(self.preferred.borrow().clone())
+            }
+            fn write_tab(&self, raw: &str) -> Result<(), String> {
+                *self.held.borrow_mut() = Some(raw.into());
+                Ok(())
+            }
+            fn write_preferred(&self, raw: &str) -> Result<(), String> {
+                *self.preferred.borrow_mut() = Some(raw.into());
+                Ok(())
+            }
+        }
+        let preferred = Rc::new(RefCell::new(None));
+        let new_tab = || Tab {
+            held: RefCell::new(None),
+            preferred: preferred.clone(),
+        };
+        let active = |tab: &Tab| {
+            serde_json::from_str::<super::AccountSelection>(&restore(tab).unwrap().unwrap())
+                .unwrap()
+                .active
+        };
+        let first = new_tab();
+        assert_eq!(active(&first), oxidezap_core::AccountId::LEGACY);
+        let second = new_tab();
+        save(&second, r#"{"active":2,"retained":1}"#).unwrap();
+        assert_eq!(active(&first), oxidezap_core::AccountId::LEGACY);
+        assert_eq!(active(&second), oxidezap_core::AccountId::new(2).unwrap());
+        let third = new_tab();
+        assert_eq!(active(&third), oxidezap_core::AccountId::new(2).unwrap());
+        save(&second, r#"{"active":1,"retained":null}"#).unwrap();
+        assert_eq!(active(&third), oxidezap_core::AccountId::new(2).unwrap());
+        assert_eq!(active(&new_tab()), oxidezap_core::AccountId::LEGACY);
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 mod imp {
     use portable_atomic::{AtomicU64, Ordering};
@@ -147,37 +222,42 @@ mod imp {
             .ok_or_else(|| "local storage is unavailable".into())
     }
 
+    struct BrowserDocuments {
+        storage: web_sys::Storage,
+        key: String,
+    }
+
+    impl super::tab_selection::Documents for BrowserDocuments {
+        fn tab(&self) -> Result<Option<String>, String> {
+            self.storage
+                .get_item(&self.key)
+                .map_err(|_| "could not read the selected account".into())
+        }
+        fn preferred(&self) -> Result<Option<String>, String> {
+            preferred()?
+                .get_item(&self.key)
+                .map_err(|_| "could not read the preferred account".into())
+        }
+        fn write_tab(&self, raw: &str) -> Result<(), String> {
+            self.storage
+                .set_item(&self.key, raw)
+                .map_err(|_| "could not retain this tab's account".into())
+        }
+        fn write_preferred(&self, raw: &str) -> Result<(), String> {
+            preferred()?
+                .set_item(&self.key, raw)
+                .map_err(|_| "could not save the preferred account".into())
+        }
+    }
+
     pub(super) fn read() -> Result<Option<String>, String> {
         let (storage, key) = storage()?;
-        let held = storage
-            .get_item(&key)
-            .map_err(|_| "could not read the selected account")?;
-        if held.is_some() {
-            return Ok(held);
-        }
-        // Existing tabs keep their own choice; new tabs inherit this route's preference.
-        let raw = match preferred()?
-            .get_item(&key)
-            .map_err(|_| "could not read the preferred account")?
-        {
-            Some(raw) => raw,
-            None => serde_json::to_string(&super::AccountSelection::default())
-                .map_err(|error| error.to_string())?,
-        };
-        storage
-            .set_item(&key, &raw)
-            .map_err(|_| "could not retain this tab's account")?;
-        Ok(Some(raw))
+        super::tab_selection::restore(&BrowserDocuments { storage, key })
     }
 
     pub(super) fn write(raw: &str) -> Result<(), String> {
         let (storage, key) = storage()?;
-        storage
-            .set_item(&key, raw)
-            .map_err(|_| "could not save the selected account")?;
-        preferred()?
-            .set_item(&key, raw)
-            .map_err(|_| "could not save the preferred account".into())
+        super::tab_selection::save(&BrowserDocuments { storage, key }, raw)
     }
 }
 

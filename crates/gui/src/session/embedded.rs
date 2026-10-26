@@ -179,11 +179,8 @@ async fn take_or_attach(control: bool, account: oxidezap_core::AccountId) -> std
     for attempt in 0..ATTEMPTS {
         match oxidezap_daemon::embedded::start().await {
             Ok(pipe) => return Ok(Held::Session(pipe)),
-            Err(oxidezap_daemon::embedded::StartFailed::Stopping) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    oxidezap_daemon::embedded::StartFailed::Stopping.to_string(),
-                ));
+            Err(oxidezap_daemon::embedded::StartFailed::Storage(error)) => {
+                return Err(std::io::Error::other(error));
             }
             Err(oxidezap_daemon::embedded::StartFailed::Claimed(who)) => {
                 refused = who;

@@ -1119,7 +1119,9 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   and Account settings can return to retained history without resetting either
   account. The selected account survives reopening; existing browser tabs keep their own selection,
   while newly opened tabs inherit the last selection for that page route. A non-logout completion closes the event queue so
-  the supervisor can restart it. Embedded successor runtimes handle completed
+  the supervisor can restart it. The embedded service restores every stored account before serving connections,
+  retains its origin claim across individual account resets, and prepares the
+  shared browser VFS once per registry. Embedded runtimes handle completed
   reset/removal outcomes instead of retaining a stopped runtime. Explicit data
   deletion remains a separate Settings action.
 - **The store is one file.** Device identity, Signal state and chat history all

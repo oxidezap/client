@@ -202,7 +202,7 @@ pub struct AccountRegistry {
     /// and that function threading a second `Arc` alongside this one. `None`
     /// on a registry nothing has attached a supervisor to (a focused test
     /// exercising `AccountRuntime`/`AccountRegistry` directly, or
-    /// `embedded.rs`, which builds its one runtime by hand) and on wasm,
+    /// `embedded.rs`, which uses local account supervision) and on wasm,
     /// where `AccountSupervisor` does not exist at all.
     #[cfg(not(target_family = "wasm"))]
     supervisor: std::sync::OnceLock<std::sync::Weak<AccountSupervisor>>,
@@ -487,10 +487,8 @@ impl AccountRegistry {
 /// `Send`, and a page's own plugin host
 /// (`crate::plugins::web::start`) is built from `wasm-bindgen` closures that
 /// are deliberately not — there is exactly one thread in a browser tab, so
-/// nothing there needs to cross one. `embedded.rs` keeps building its one
-/// account inline for exactly that reason; the multi-account *web* registry
-/// the plan's section 8 asks for needs its own, `MaybeSend`-compatible
-/// supervision, not this one taught to tolerate `!Send`.
+/// nothing there needs to cross one. Embedded accounts use the local lifecycle
+/// loop in [`AccountRegistry::start_account`] instead.
 #[cfg(not(target_family = "wasm"))]
 pub struct AccountSupervisor {
     registry: Arc<AccountRegistry>,
