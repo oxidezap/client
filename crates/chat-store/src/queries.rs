@@ -1972,7 +1972,7 @@ impl ChatStore {
             .db()
             .read(move |conn| {
                 dsl::avatar_descriptors
-                    .filter(dsl::device_id.eq(device_id))
+                    .filter(dsl::device_id.eq(device_id).and(dsl::picture_id.ne("")))
                     .select((
                         dsl::jid,
                         dsl::picture_id,
@@ -2005,8 +2005,8 @@ impl ChatStore {
     /// the way every other keyed read here is, so the parameter ceiling is the
     /// same one.
     ///
-    /// Keys are compared as stored: `jid.to_string()` on both sides, which is
-    /// what the writer files and what a hydrated chat carries.
+    /// Resolve PN/LID aliases in a batch. The newest selection wins, including
+    /// removal, while its original cache key keeps existing bytes addressable.
     pub async fn avatar_descriptors_for(&self, jids: &[String]) -> Result<Vec<AvatarDescriptor>> {
         use schema::avatar_descriptors::dsl;
         let device_id = self.device_id();
@@ -2014,25 +2014,55 @@ impl ChatStore {
         let rows: Vec<(String, String, String, i64)> = self
             .db()
             .read(move |conn| {
-                let mut rows = Vec::new();
-                for page in keys.chunks(BIND_CHUNK) {
-                    rows.extend(
-                        dsl::avatar_descriptors
-                            .filter(
-                                dsl::device_id
-                                    .eq(device_id)
-                                    .and(dsl::jid.eq_any(page.to_vec())),
-                            )
-                            .select((
-                                dsl::jid,
-                                dsl::picture_id,
-                                dsl::cache_key,
-                                dsl::updated_at_ms,
-                            ))
-                            .load(conn)
-                            .map_err(db_err)?,
-                    );
+                let aliases = crate::lid::chat_key_candidates_batch(conn, device_id, &keys)
+                    .map_err(db_err)?;
+                let mut candidates: Vec<String> = aliases.values().flatten().cloned().collect();
+                candidates.sort();
+                candidates.dedup();
+                let mut by_jid: HashMap<String, (String, String, i64, i64)> = HashMap::new();
+                for page in candidates.chunks(BIND_CHUNK) {
+                    let rows: Vec<(String, String, String, i64, i64)> = dsl::avatar_descriptors
+                        .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq_any(page)))
+                        .select((
+                            dsl::jid,
+                            dsl::picture_id,
+                            dsl::cache_key,
+                            dsl::updated_at_ms,
+                            dsl::seq,
+                        ))
+                        .load(conn)
+                        .map_err(db_err)?;
+                    for (jid, picture, cache, updated, seq) in rows {
+                        by_jid.insert(jid, (picture, cache, updated, seq));
+                    }
                 }
+                let rows = keys
+                    .iter()
+                    .filter_map(|key| {
+                        let descriptor = aliases
+                            .get(key)?
+                            .iter()
+                            .filter_map(|alias| {
+                                by_jid
+                                    .get(alias)
+                                    .map(|descriptor| (descriptor, alias == key))
+                            })
+                            .max_by_key(|((picture, _, updated, seq), canonical)| {
+                                (*seq, picture.is_empty(), *updated, *canonical)
+                            })?
+                            .0;
+                        // Tombstones participate in ordering across aliases, then
+                        // disappear from the public descriptor API.
+                        (!descriptor.0.is_empty()).then(|| {
+                            (
+                                key.clone(),
+                                descriptor.0.clone(),
+                                descriptor.1.clone(),
+                                descriptor.2,
+                            )
+                        })
+                    })
+                    .collect();
                 Ok(rows)
             })
             .await?;

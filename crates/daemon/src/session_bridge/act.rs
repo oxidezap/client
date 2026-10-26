@@ -1949,13 +1949,36 @@ impl Bridge {
         let Some(permit) = self.permit() else {
             return too_busy();
         };
-        let bytes = client.download_downloadable_media(media);
-        oxidezap_session::spawn(async move {
-            let result = finish_download(bytes.await, |bytes| {
-                account_media.put_owned(&local_key, bytes)
+        let epoch = account_media.epoch();
+        let Some((received, owner)) = self.downloads.subscribe(key, epoch) else {
+            return too_busy();
+        };
+        if let Some(owner) = owner {
+            let bytes = client.download_downloadable_media(media);
+            oxidezap_session::spawn(async move {
+                let result = finish_download(bytes.await, |bytes| {
+                    account_media.put_since(epoch, &local_key, &bytes)
+                });
+                owner.finish(result);
             });
-            // The same rule as a page: an answer nobody delivered leaves the
-            // asker waiting on it forever. See `answer_now`.
+        }
+        oxidezap_session::spawn(async move {
+            let result = received
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ProtocolError::NoSession {
+                        detail: "the shared download stopped".into(),
+                    })
+                })
+                .and_then(|key| {
+                    account_media
+                        .claim(&key)
+                        .then_some(key)
+                        .ok_or_else(|| ProtocolError::Failed {
+                            detail: "cached media was cleared before delivery".into(),
+                            retryable: true,
+                        })
+                });
             answer_now(&answer_to, downloaded(id, result));
             drop(permit);
         });

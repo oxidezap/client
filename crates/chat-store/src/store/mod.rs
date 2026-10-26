@@ -307,6 +307,9 @@ pub struct ChatStore {
     tx: WriterSender,
     changes: broadcast::Sender<StoreChange>,
     skip_hook_committed: Arc<std::sync::atomic::AtomicBool>,
+    // One active writer per account. Restarted daemon tokens must outrank
+    // selections and removals committed by the previous runtime.
+    avatar_seq_base: u64,
 }
 
 struct ChatStoreHandler {
@@ -575,15 +578,26 @@ impl ChatStore {
     pub async fn new_prepared(store: &SqliteStore) -> Result<Arc<Self>> {
         let db = store.shared();
         let device_id = store.device_id();
-        db.run(move |conn| {
-            conn.transaction::<_, diesel::result::Error, _>(|conn| {
-                let mut changes = ChangeSet::default();
-                crate::store::message_identity::reconcile_startup(conn, device_id, &mut changes)?;
-                Ok(())
+        let avatar_seq_base = db
+            .run(move |conn| {
+                conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                    let mut changes = ChangeSet::default();
+                    crate::store::message_identity::reconcile_startup(
+                        conn,
+                        device_id,
+                        &mut changes,
+                    )?;
+                    avatar::compact(conn, device_id)?;
+                    use crate::schema::avatar_descriptors::dsl;
+                    let highest: Option<i64> = dsl::avatar_descriptors
+                        .filter(dsl::device_id.eq(device_id))
+                        .select(diesel::dsl::max(dsl::seq))
+                        .first(conn)?;
+                    Ok(highest.unwrap_or(0).max(0) as u64)
+                })
+                .map_err(crate::error::db_err)
             })
-            .map_err(crate::error::db_err)
-        })
-        .await?;
+            .await?;
 
         let (queue_tx, rx) = mpsc::unbounded_channel();
         let rejected = Arc::new(Mutex::new(false));
@@ -601,6 +615,7 @@ impl ChatStore {
             tx,
             changes: changes.clone(),
             skip_hook_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            avatar_seq_base,
         });
         crate::spawn::spawn(writer_loop(db, device_id, rx, changes));
         Ok(this)
@@ -839,6 +854,7 @@ impl ChatStore {
         cache_key: impl Into<String>,
         seq: u64,
     ) -> Result<()> {
+        let seq = self.avatar_sequence(seq)?;
         self.tx
             .send(WriterMsg::Avatar {
                 jid: jid.clone(),
@@ -854,12 +870,22 @@ impl ChatStore {
     /// `seq` orders this against records: a removal from an older resolution
     /// must not delete a newer picture.
     pub fn clear_avatar(&self, jid: &Jid, seq: u64) -> Result<()> {
+        let seq = self.avatar_sequence(seq)?;
         self.tx
             .send(WriterMsg::AvatarCleared {
                 jid: jid.clone(),
                 seq,
             })
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
+    }
+
+    fn avatar_sequence(&self, seq: u64) -> Result<u64> {
+        self.avatar_seq_base
+            .checked_add(seq)
+            .filter(|seq| *seq <= i64::MAX as u64)
+            .ok_or_else(|| {
+                ChatStoreError::Store(StoreError::Validation("avatar sequence exhausted".into()))
+            })
     }
 
     /// Record a sender revoke this client just sent for one of its own

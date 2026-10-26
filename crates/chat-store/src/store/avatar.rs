@@ -7,10 +7,69 @@
 //! waiting for the network.
 
 use diesel::prelude::*;
-use diesel::query_dsl::methods::FilterDsl as _;
 use wacore_binary::Jid;
 
 use crate::schema;
+
+const ORDER_FLOOR: &str = "__oxidezap_avatar_order_floor__";
+const MAX_TOMBSTONES: i64 = 256;
+
+/// A fixed watermark protects compacted removals. An older insert for an
+/// absent descriptor is conservatively refused; its caller can retry with a
+/// new resolution. Existing rows still use their per-chat sequence guard.
+fn order_floor(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<i64> {
+    use schema::avatar_descriptors::dsl;
+    dsl::avatar_descriptors
+        .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(ORDER_FLOOR)))
+        .select(dsl::seq)
+        .first::<i64>(conn)
+        .optional()
+        .map(|seq| seq.unwrap_or(-1))
+}
+
+pub(super) fn compact(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
+    use schema::avatar_descriptors::dsl;
+    let count: i64 = dsl::avatar_descriptors
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::picture_id.eq(""))
+                .and(dsl::jid.ne(ORDER_FLOOR)),
+        )
+        .count()
+        .get_result(conn)?;
+    if count <= MAX_TOMBSTONES {
+        return Ok(());
+    }
+    let highest: Option<i64> = dsl::avatar_descriptors
+        .filter(dsl::device_id.eq(device_id).and(dsl::picture_id.eq("")))
+        .select(diesel::dsl::max(dsl::seq))
+        .first(conn)?;
+    let floor = highest.unwrap_or(0).max(order_floor(conn, device_id)?);
+    diesel::insert_into(dsl::avatar_descriptors)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::jid.eq(ORDER_FLOOR),
+            dsl::picture_id.eq(""),
+            dsl::cache_key.eq(""),
+            dsl::updated_at_ms.eq(0i64),
+            dsl::seq.eq(floor),
+        ))
+        .on_conflict((dsl::device_id, dsl::jid))
+        .do_update()
+        .set(dsl::seq.eq(floor))
+        .execute(conn)?;
+    diesel::delete(diesel::QueryDsl::filter(
+        dsl::avatar_descriptors,
+        dsl::device_id
+            .eq(device_id)
+            .and(dsl::picture_id.eq(""))
+            .and(dsl::jid.ne(ORDER_FLOOR))
+            .and(dsl::seq.le(floor)),
+    ))
+    .execute(conn)
+    .map(|_| ())
+}
 
 /// Store a chat's picture, unless a newer resolution already won.
 ///
@@ -31,7 +90,23 @@ pub(super) fn upsert(
     let jid = jid.to_string();
     let now_ms = wacore::time::now_utc().timestamp_millis();
     let seq = i64::try_from(seq).unwrap_or(i64::MAX);
-    diesel::insert_into(dsl::avatar_descriptors)
+    if !picture_id.is_empty() && seq <= order_floor(conn, device_id)? {
+        let present = dsl::avatar_descriptors
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::jid.eq(&jid))
+                    .and(dsl::picture_id.ne("")),
+            )
+            .select(dsl::seq)
+            .first::<i64>(conn)
+            .optional()?
+            .is_some();
+        if !present {
+            return Ok(());
+        }
+    }
+    let update = diesel::insert_into(dsl::avatar_descriptors)
         .values((
             dsl::device_id.eq(device_id),
             dsl::jid.eq(&jid),
@@ -47,12 +122,14 @@ pub(super) fn upsert(
             dsl::cache_key.eq(cache_key),
             dsl::updated_at_ms.eq(now_ms),
             dsl::seq.eq(seq),
-        ))
-        // The stale write loses: a commit that lands after a newer resolution
-        // must not move the row back.
-        .filter(dsl::seq.lt(seq))
-        .execute(conn)
-        .map(|_| ())
+        ));
+    // A delayed write must not replace a newer selection.
+    diesel::query_dsl::methods::FilterDsl::filter(update, dsl::seq.lt(seq)).execute(conn)?;
+    if picture_id.is_empty() {
+        compact(conn, device_id)
+    } else {
+        Ok(())
+    }
 }
 
 /// Drop a chat's descriptor, unless a newer resolution already replaced it.
@@ -66,14 +143,12 @@ pub(super) fn delete(
     jid: &Jid,
     seq: u64,
 ) -> QueryResult<()> {
-    let jid = jid.to_string();
-    let seq = i64::try_from(seq).unwrap_or(i64::MAX);
-    let victims = diesel::QueryDsl::filter(
-        schema::avatar_descriptors::table,
-        schema::avatar_descriptors::device_id
-            .eq(device_id)
-            .and(schema::avatar_descriptors::jid.eq(jid))
-            .and(schema::avatar_descriptors::seq.lt(seq)),
-    );
-    diesel::delete(victims).execute(conn).map(|_| ())
+    // Keep the ordering barrier after removal. Physically deleting the row
+    // lets a delayed older insert recreate a picture that was removed.
+    for key in crate::lid::chat_key_candidates(conn, device_id, &jid.to_string())? {
+        if let Ok(alias) = key.parse::<Jid>() {
+            upsert(conn, device_id, &alias, "", "", seq)?;
+        }
+    }
+    Ok(())
 }

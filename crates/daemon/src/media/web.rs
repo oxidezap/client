@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::{Wipe, is_staged_upload};
+use super::{Wipe, is_disposable};
 
 /// How much media the page may hold before the oldest is dropped.
 ///
@@ -325,14 +325,21 @@ pub(super) fn delete_for(prefix: &str, scope: Wipe) -> Result<()> {
 /// *next* write's sweep sees it as an ordinary claimed entry and may drop it
 /// then. The map therefore holds at most the budget plus whatever single
 /// thing arrived last.
+const MAX_CACHE_ENTRIES: usize = 4096;
+
 fn sweep(cache: &mut Cache, arriving: &str) {
     let reclaimable: u64 = cache
         .entries
         .iter()
-        .filter(|(name, _)| !is_staged_upload(name))
+        .filter(|(name, _)| is_disposable(name))
         .map(|(_, entry)| entry.bytes.len() as u64)
         .sum();
-    if reclaimable <= CACHE_BUDGET_BYTES {
+    let mut count = cache
+        .entries
+        .keys()
+        .filter(|name| is_disposable(name))
+        .count();
+    if reclaimable <= CACHE_BUDGET_BYTES && count <= MAX_CACHE_ENTRIES {
         return;
     }
 
@@ -343,7 +350,7 @@ fn sweep(cache: &mut Cache, arriving: &str) {
     let mut oldest: Vec<(String, bool, u64, u64)> = cache
         .entries
         .iter()
-        .filter(|(name, _)| !is_staged_upload(name) && name.as_str() != arriving)
+        .filter(|(name, _)| is_disposable(name) && name.as_str() != arriving)
         .map(|(name, entry)| {
             (
                 name.clone(),
@@ -355,9 +362,9 @@ fn sweep(cache: &mut Cache, arriving: &str) {
         .collect();
     oldest.sort_by_key(|(_, claimed, touched, _)| (*claimed, *touched));
 
-    let mut over = reclaimable - CACHE_BUDGET_BYTES;
+    let mut over = reclaimable.saturating_sub(CACHE_BUDGET_BYTES);
     for (name, claimed, _, size) in oldest {
-        if over == 0 {
+        if over == 0 && count <= MAX_CACHE_ENTRIES {
             break;
         }
         if claimed {
@@ -367,6 +374,7 @@ fn sweep(cache: &mut Cache, arriving: &str) {
             );
         }
         cache.entries.remove(&name);
+        count -= 1;
         cache.held = cache.held.saturating_sub(size);
         over = over.saturating_sub(size);
     }

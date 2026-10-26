@@ -263,6 +263,7 @@ async fn stage_to_disk(path: &std::path::Path, key: &str, body: &[u8]) -> Result
         super::STAGING_PARTIAL_PREFIX,
         STAGING_SEQUENCE.fetch_add(1, portable_atomic::Ordering::Relaxed)
     ));
+    let _writing = super::track_write(partial.clone());
     let staged = async {
         write_new(&partial, body).await?;
         tokio::fs::rename(&partial, path).await

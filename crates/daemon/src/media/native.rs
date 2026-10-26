@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::{IN_PROGRESS_PREFIX, Wipe, is_in_progress, is_staged_upload, is_staging_partial};
+use super::{IN_PROGRESS_PREFIX, Wipe, is_disposable, is_in_progress, is_staging_partial};
 
 /// How much media the cache may hold before the oldest is dropped.
 ///
@@ -25,16 +25,9 @@ use super::{IN_PROGRESS_PREFIX, Wipe, is_in_progress, is_staged_upload, is_stagi
 /// image it has ever shown.
 const CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
-/// How long a staged payload may sit unsent before it is treated as
-/// abandoned.
-///
-/// The gap this closes is the one that has no other end: a staged upload is
-/// spared the budget because it is the only copy of something somebody is
-/// waiting to send, so nothing else in the daemon will ever remove it. The
-/// send that names it arrives milliseconds after the upload, which makes any
-/// large number a safe one, and six hours is chosen to be obviously past a
-/// slow network rather than tuned to anything.
-const STALE_UPLOAD: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+/// Grace for incomplete uploads whose writer is no longer active. Completed
+/// staged payloads are retained until consumed or explicitly discarded.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
 /// Bytes written since the last sweep before another one runs.
 ///
@@ -42,6 +35,8 @@ const STALE_UPLOAD: std::time::Duration = std::time::Duration::from_secs(6 * 60 
 /// files in a burst; doing it per write would make attaching a front end
 /// quadratic in the size of the account.
 const SWEEP_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CACHE_FILES: usize = 8192;
+const SWEEP_INTERVAL_WRITES: u64 = 256;
 
 /// Claim `key` for a delivery, if it is here.
 ///
@@ -121,6 +116,7 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     // and died mid-write is the one honest way to meet one, so it is unlinked
     // once — the link and not its target — and the create tried again.
     let temp = dir.join(format!("{IN_PROGRESS_PREFIX}{}", write_ticket()));
+    let _writing = track_write(temp.clone());
     write_new(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
     // The rename happens under the wipe lock, which every entry point in
     // `media` takes before calling here: the file is either wholly before a
@@ -129,9 +125,8 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     // there costs one refetch, since media the renderer does not have is
     // drawn as an offer to download. See `claim`.
     if let Err(e) = std::fs::rename(&temp, &path) {
-        // Windows will not rename onto an existing file, and two clients
-        // asking for the same uncached media both miss the check above. The
-        // other write winning is a cache hit, not a failure — the bytes are
+        // A competing writer may have already installed the same payload.
+        // A complete content-addressed winner is a cache hit; the bytes are
         // content-addressed, so whatever is there is what this was going to
         // put there.
         let _ = std::fs::remove_file(&temp);
@@ -141,7 +136,7 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
         return Ok(key.to_string());
     }
 
-    sweep_occasionally(dir, bytes.len() as u64);
+    sweep_occasionally(dir, bytes.len() as u64, &path);
     Ok(key.to_string())
 }
 
@@ -289,8 +284,8 @@ async fn reclaim_abandoned_writes() {
     };
     let walked = oxidezap_session::unblock(move || {
         prepare_dir(&dir)?;
-        reclaim_abandoned_writes_in(&dir);
-        anyhow::Ok(())
+        let _wipe = super::WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        sweep(&dir)
     })
     .await;
     match walked {
@@ -328,6 +323,28 @@ pub async fn reclaim_abandoned_writes_periodically() {
     }
 }
 
+static ACTIVE_WRITES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+pub(crate) struct WriteGuard(PathBuf);
+
+pub(crate) fn track_write(path: PathBuf) -> WriteGuard {
+    ACTIVE_WRITES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.clone());
+    WriteGuard(path)
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        ACTIVE_WRITES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 /// The walk itself, for a caller that already has the directory and a thread
 /// to do it on.
 fn reclaim_abandoned_writes_in(dir: &std::path::Path) {
@@ -338,18 +355,19 @@ fn reclaim_abandoned_writes_in(dir: &std::path::Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Two allowances rather than one, because the two say different
-        // things. A staged upload waits on a send somebody asked for and may
-        // sit through a reconnect; a `w-` file is a download this process was
-        // in the middle of, so one older than the grace is a write whose
-        // writer is gone — there is no second daemon to come back for it.
-        let allowance = if is_staged_upload(&name) || is_staging_partial(&name) {
-            STALE_UPLOAD
+        // A partial upload can be retried; a completed staged recording may
+        // be its only copy, so age alone never makes that file disposable.
+        let allowance = if is_staging_partial(&name) {
+            STALE_PARTIAL
         } else if is_in_progress(&name) {
             super::IN_PROGRESS_GRACE
         } else {
             continue;
         };
+        let active = ACTIVE_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        if active.contains(&entry.path()) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
             continue;
@@ -407,16 +425,20 @@ mod walks {
 static SINCE_SWEEP: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 /// Drop the oldest files once enough has been written to be worth looking.
-fn sweep_occasionally(dir: &std::path::Path, written: u64) {
+static WRITES_SINCE_SWEEP: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+fn sweep_occasionally(dir: &std::path::Path, written: u64, arriving: &std::path::Path) {
     use std::sync::atomic::Ordering;
 
     let before = SINCE_SWEEP.fetch_add(written, Ordering::Relaxed);
-    if before + written < SWEEP_INTERVAL_BYTES {
+    let writes = WRITES_SINCE_SWEEP.fetch_add(1, Ordering::Relaxed);
+    if before.saturating_add(written) < SWEEP_INTERVAL_BYTES && writes + 1 < SWEEP_INTERVAL_WRITES {
         return;
     }
     SINCE_SWEEP.store(0, Ordering::Relaxed);
+    WRITES_SINCE_SWEEP.store(0, Ordering::Relaxed);
 
-    if let Err(e) = sweep(dir) {
+    if let Err(e) = sweep_with_limits(dir, Some(arriving), CACHE_BUDGET_BYTES, MAX_CACHE_FILES) {
         // Not fatal: a cache that is too big is worse than one that is
         // exactly right, and better than a daemon that stopped.
         log::warn!("could not trim the media cache: {e}");
@@ -549,60 +571,185 @@ pub(super) fn delete_for(prefix: &str, scope: Wipe) -> Result<()> {
 
 /// Delete oldest-first until the cache is under budget.
 fn sweep(dir: &std::path::Path) -> Result<()> {
+    sweep_with_limits(dir, None, CACHE_BUDGET_BYTES, MAX_CACHE_FILES)
+}
+
+fn sweep_with_limits(
+    dir: &std::path::Path,
+    arriving: Option<&std::path::Path>,
+    budget: u64,
+    limit: usize,
+) -> Result<()> {
     reclaim_abandoned_writes_in(dir);
-    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    // Keep only candidates that survived the limits so far. Recovery from
+    // an older unbounded directory must not build an unbounded metadata list.
+    let mut files = std::collections::BinaryHeap::new();
     let mut total = 0u64;
+    let mut count = 0usize;
+    let mut removal_error = None;
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
             continue;
         }
-        // Everything but a staged upload is evictable, which is more than
-        // `Wipe::Cache` names: the `m-` files an older build left behind are
-        // orphans with nothing else to clear them — `message_key` says as much
-        // — and `cache_usage` bills the directory by every file in it, so the
-        // budget has to be enforced over the same set. A staged upload is the
-        // exception because it is the only copy of a voice note somebody is
-        // waiting to have sent, and it never counted toward the budget it
-        // would be dropped for: `put` is what feeds the sweep, and an upload
-        // is written by the front end, not through it.
-        // Spared the budget, and reclaimed on age by
-        // `reclaim_abandoned_writes_in`, which this calls first so a sweep also
-        // does the sweeping somebody reading only this function would expect
-        // it to. A partial is spared on the same terms and for a sharper
-        // reason: it is being written right now, so dropping it breaks the
-        // rename it is on its way to and fails a send because the cache
-        // happened to be full. A download in progress is the third of the
-        // same kind — the bytes are not there yet and whoever asked for them
-        // is waiting — and the three differ only in who is writing.
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_staged_upload(&name) || is_staging_partial(&name) || is_in_progress(&name) {
+        if !is_disposable(&name) {
             continue;
         }
-        let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
         total = total.saturating_add(meta.len());
-        files.push((age, meta.len(), entry.path()));
+        count += 1;
+        let path = entry.path();
+        if arriving != Some(path.as_path()) {
+            files.push(std::cmp::Reverse((
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                meta.len(),
+                path,
+            )));
+        }
+        while total > budget || count > limit {
+            let Some(std::cmp::Reverse((_, len, path))) = files.pop() else {
+                break;
+            };
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    count -= 1;
+                    total = total.saturating_sub(len);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    count -= 1;
+                    total = total.saturating_sub(len);
+                }
+                Err(error) => {
+                    removal_error.get_or_insert(error);
+                }
+            }
+        }
     }
-    if total <= CACHE_BUDGET_BYTES {
-        return Ok(());
+    if let Some(error) = removal_error {
+        return Err(error).context("reclaiming disposable media");
     }
 
-    files.sort_by_key(|(age, ..)| *age);
-    for (_, len, path) in files {
-        if total <= CACHE_BUDGET_BYTES {
-            break;
-        }
-        if std::fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(len);
-        }
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readers_observe_complete_payloads_or_cache_misses_during_replacement_and_eviction() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-read-evict-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f-current");
+        let payload_a = vec![1u8; 4096];
+        let payload_b = vec![2u8; 8192];
+        std::fs::write(&path, &payload_a).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = std::sync::Arc::clone(&stop);
+        let reader_path = path.clone();
+        let (started, running) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            assert_eq!(std::fs::read(&reader_path).unwrap(), vec![1u8; 4096]);
+            started.send(()).unwrap();
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match std::fs::read(&reader_path) {
+                    Ok(bytes) => assert!(bytes == vec![1u8; 4096] || bytes == vec![2u8; 8192]),
+                    Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+                }
+            }
+        });
+        running.recv().unwrap();
+        for i in 0..16 {
+            let _wipe = super::super::WIPE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let temp = dir.join(format!("w-replace-{i}"));
+            let _writing = track_write(temp.clone());
+            write_new(&temp, if i % 2 == 0 { &payload_b } else { &payload_a }).unwrap();
+            std::fs::rename(&temp, &path).unwrap();
+            sweep_with_limits(&dir, None, 0, 0).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bounded_sweep_preserves_saved_staged_and_arriving_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-budget-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "a42-f-old",
+            "a42-d-old",
+            "a42-a-old",
+            "m-legacy",
+            "saved-document",
+            "a42-u-unsent",
+            "u-install",
+        ] {
+            std::fs::write(dir.join(name), b"synthetic").unwrap();
+        }
+        let arriving = dir.join("a42-f-arriving");
+        std::fs::write(&arriving, b"larger than the fixture budget").unwrap();
+        sweep_with_limits(&dir, Some(&arriving), 1, 1).unwrap();
+        for name in [
+            "saved-document",
+            "a42-u-unsent",
+            "u-install",
+            "a42-f-arriving",
+        ] {
+            assert!(dir.join(name).exists(), "preserve {name}");
+        }
+        for name in ["a42-f-old", "a42-d-old", "a42-a-old", "m-legacy"] {
+            assert!(!dir.join(name).exists(), "reclaim {name}");
+        }
+        // Count limits also reclaim zero-byte files after restart.
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("f-empty-{i}")), b"").unwrap();
+        }
+        sweep_with_limits(&dir, None, u64::MAX, 2).unwrap();
+        let count = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| is_disposable(&entry.file_name().to_string_lossy()))
+            .count();
+        assert_eq!(count, 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn aged_active_write_is_preserved_then_reclaimed_after_its_owner_retires() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-active-write-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w-synthetic");
+        let writing = track_write(path.clone());
+        std::fs::write(&path, b"partial cache bytes").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        reclaim_abandoned_writes_in(&dir);
+        assert!(path.exists());
+        drop(writing);
+        reclaim_abandoned_writes_in(&dir);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A burst of cache writes reads the directory no times at all.
     ///
@@ -657,6 +804,7 @@ mod tests {
         // directory legitimately, and this is counting the walks that are not
         // legitimate.
         SINCE_SWEEP.store(0, std::sync::atomic::Ordering::Relaxed);
+        WRITES_SINCE_SWEEP.store(0, std::sync::atomic::Ordering::Relaxed);
 
         let before = walks::so_far();
         for key in &keys {
@@ -711,14 +859,9 @@ mod tests {
         );
     }
 
-    /// A staged payload is spared the budget, and not spared for ever.
-    ///
-    /// Nothing else in the daemon removes one: the sweep is the only thing
-    /// that looks at the directory and it was told to look away from these.
-    /// So a send that never came, or an upload whose answer was lost while
-    /// the write landed anyway, left a file until the account was wiped.
+    /// An old completed payload can still be the only copy of an unsent note.
     #[test]
-    fn a_staged_upload_that_was_never_sent_is_reclaimed() {
+    fn a_staged_upload_is_preserved_even_when_old() {
         // The same shape the tests below use: a named directory rather than
         // a crate added for one case.
         let dir = std::env::temp_dir().join(format!(
@@ -744,7 +887,7 @@ mod tests {
             .expect("the staged file")
             .modified()
             .expect("an mtime")
-            - super::STALE_UPLOAD
+            - super::STALE_PARTIAL
             - std::time::Duration::from_secs(60);
         std::fs::File::options()
             .write(true)
@@ -756,7 +899,10 @@ mod tests {
         super::sweep(&dir).expect("the sweep runs");
 
         assert!(fresh.exists(), "a payload a send is still coming for");
-        assert!(!stale.exists(), "one no send ever came for");
+        assert!(
+            stale.exists(),
+            "age cannot prove an unsent payload is disposable"
+        );
         assert!(
             cached.exists(),
             "and the cache is under budget, so nothing there is touched"
@@ -791,7 +937,7 @@ mod tests {
             .expect("the partial")
             .modified()
             .expect("an mtime")
-            - super::STALE_UPLOAD
+            - super::STALE_PARTIAL
             - std::time::Duration::from_secs(60);
         std::fs::File::options()
             .write(true)

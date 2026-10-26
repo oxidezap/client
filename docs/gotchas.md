@@ -1838,6 +1838,19 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   advances the generation so visible chats are revalidated once per connect, but
   does not trigger an eager full pass.
 
+  Live picture events outrank history hydration, including a history read
+  captured before a replacement or removal. A completed local disk/blob read
+  only wakes the renderer; it never selects a picture. Persistent reads are
+  retired per chat when a new picture or removal arrives.
+
+  Descriptor reads resolve PN/LID aliases in a batch and keep the stored
+  byte key. At most 256 removal tombstones and one account watermark protect
+  ordering; compaction conservatively refuses an older insert for an absent
+  descriptor. A caller verifies the committed descriptor before publishing and
+  can retry with a newer resolution. Reopening starts sequences above persisted
+  watermarks. A partial index bounds the removal bookkeeping query; no user
+  history or retained media is removed.
+
   Avatars use a multi-tier cache:
   1. Memory tier: Decoded GPUI `ImageSource` in `AVATAR_IMAGES` LRU cache,
      bounded by `DECODED_IMAGE_BUDGET_BYTES` (accounting only for decoded bytes).
@@ -1851,6 +1864,12 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   4. Cache eviction & logout: Logging out wipes account cache storage and
      rotates the account scope (128-bit hex); clearing media cache evicts blobs
      without destroying durable descriptors.
+
+  The browser's persistent avatar index is bounded by bytes and entry count.
+  Web Locks serialize mutations across tabs; a persisted generation rejects
+  writes captured before a clear. The first cache opening and interrupted
+  mutations rebuild the derived index from stored blobs. Browsers without
+  Web Locks retain cache reads and bypass new persistent writes.
 
   `HistoryLoaded` carries whatever the durable descriptors already
   said and never waits on an IQ. Ordinary contacts, groups and channels go

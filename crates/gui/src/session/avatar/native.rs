@@ -46,6 +46,7 @@ pub async fn write_persistent(
     _key: &str,
     _bytes: &[u8],
     _account: Option<oxidezap_core::AccountId>,
+    _stamp: u64,
 ) -> Result<(), String> {
     // Daemon already persists media atomically; no redundant write needed on native.
     Ok(())

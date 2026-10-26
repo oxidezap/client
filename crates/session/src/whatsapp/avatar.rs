@@ -15,7 +15,7 @@
 //! picture id and the signed source the daemon fetches, and never the bytes
 //! or the URL in state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use log::debug;
@@ -136,6 +136,7 @@ pub(super) enum AvatarResolutionState {
 
 #[derive(Default)]
 pub(super) struct Resolver {
+    order: VecDeque<String>,
     asked: HashMap<String, (u64, AvatarResolutionState)>,
 }
 
@@ -170,6 +171,15 @@ impl Resolver {
     }
 
     fn mark(&mut self, jid: &str, generation: u64, state: AvatarResolutionState) {
+        const MAX_TRACKED: usize = 4096;
+        if !self.asked.contains_key(jid) {
+            if self.asked.len() >= MAX_TRACKED
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.asked.remove(&oldest);
+            }
+            self.order.push_back(jid.to_string());
+        }
         let entry = self
             .asked
             .entry(jid.to_string())
@@ -188,8 +198,19 @@ impl Resolver {
     }
 
     pub(super) fn mark_failed(&mut self, jid: &str) {
+        if matches!(
+            self.asked.get(jid),
+            Some((_, AvatarResolutionState::MetadataKnown))
+        ) {
+            self.asked.remove(jid);
+            self.order.retain(|key| key != jid);
+            return;
+        }
         if let Some((_, state)) = self.asked.get_mut(jid)
-            && *state == AvatarResolutionState::SourceDelivered
+            && matches!(
+                *state,
+                AvatarResolutionState::SourceDelivered | AvatarResolutionState::NotFound
+            )
         {
             *state = AvatarResolutionState::MetadataKnown;
         }
@@ -202,6 +223,7 @@ impl Resolver {
     /// named are gone.
     pub(super) fn forget_all(&mut self) {
         self.asked.clear();
+        self.order.clear();
     }
 }
 
@@ -375,6 +397,12 @@ pub(super) async fn resolve(
                 ),
                 Lookup::Unchanged => {
                     resolver.mark(&jid_str, generation, AvatarResolutionState::MetadataKnown);
+                    if need_bytes {
+                        let _ = ui_tx.send(UiEvent::AvatarFailed {
+                            jid: jid_str,
+                            retryable: true,
+                        });
+                    }
                     continue;
                 }
                 Lookup::NotAuthorized | Lookup::Unknown => {
@@ -555,6 +583,15 @@ mod tests {
         assert!(resolver.needs("a@s.whatsapp.net", 1, true, false));
     }
 
+    #[test]
+    fn failed_metadata_persistence_permits_a_fresh_metadata_lookup() {
+        let mut resolver = Resolver::new();
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::MetadataKnown);
+        resolver.mark_failed("a@s.whatsapp.net");
+        assert!(resolver.needs("a@s.whatsapp.net", 1, false, false));
+        assert!(resolver.order.is_empty());
+    }
+
     /// A metadata-only Unchanged lookup records MetadataKnown, so a subsequent byte demand proceeds.
     #[test]
     fn metadata_only_unchanged_lookup_permits_subsequent_byte_demand() {
@@ -602,6 +639,33 @@ mod tests {
         );
         assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
         assert!(!resolver.needs("a@s.whatsapp.net", 1, false, true));
+    }
+
+    #[test]
+    fn a_failed_durable_removal_releases_the_negative_resolution_for_retry() {
+        let mut resolver = Resolver::new();
+        resolver.mark("retry@example.invalid", 1, AvatarResolutionState::NotFound);
+        assert!(!resolver.needs("retry@example.invalid", 1, true, true));
+        resolver.mark_failed("retry@example.invalid");
+        assert!(resolver.needs("retry@example.invalid", 1, true, true));
+    }
+
+    #[test]
+    fn resolver_tracking_is_bounded_and_forgetting_releases_its_ordering_index() {
+        let mut resolver = Resolver::new();
+        for i in 0..5000 {
+            resolver.mark(
+                &format!("peer-{i}@example.invalid"),
+                1,
+                AvatarResolutionState::BytesReady,
+            );
+        }
+        assert_eq!(resolver.asked.len(), 4096);
+        assert_eq!(resolver.order.len(), 4096);
+        assert!(resolver.needs("peer-0@example.invalid", 1, true, false));
+        assert!(!resolver.needs("peer-4999@example.invalid", 1, true, false));
+        resolver.forget_all();
+        assert!(resolver.order.is_empty());
     }
 
     #[test]

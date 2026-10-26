@@ -6526,6 +6526,7 @@ dependencies = [
  "oxidezap-wire",
  "portable-atomic",
  "rustix 1.1.4",
+ "serde",
  "serde_json",
  "sha1 0.11.0",
  "tokio",

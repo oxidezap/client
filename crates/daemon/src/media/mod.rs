@@ -28,6 +28,8 @@ pub(crate) mod http;
 /// what made every staged upload pay for a walk.
 #[cfg(not(target_family = "wasm"))]
 pub use platform::reclaim_abandoned_writes_periodically;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use platform::track_write;
 
 /// Make the cache directory this account's alone, before anything writes into
 /// it. Called at startup and by every writer; native only, for the reason the
@@ -172,6 +174,17 @@ impl Wipe {
             }
         }
     }
+}
+
+/// Only these producer-owned names are disposable. Unknown files and saved
+/// payloads are never reclaimed by a generic cache budget.
+pub(super) fn is_disposable(key: &str) -> bool {
+    let local = oxidezap_ipc::key_local_name(key);
+    ["f-", "d-", "a-", "m-"]
+        .iter()
+        .any(|prefix| local.starts_with(prefix))
+        && !is_in_progress(key)
+        && !is_staged_upload(key)
 }
 
 /// Account-bound view over the shared media cache.
@@ -926,3 +939,7 @@ mod tests {
         );
     }
 }
+
+// Reuse the existing browser runner to exercise the GUI's storage without GPUI.
+#[cfg(all(test, target_family = "wasm"))]
+mod avatar_web_tests;

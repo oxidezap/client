@@ -148,6 +148,8 @@ pub enum FromDaemon {
     Account(Option<oxidezap_ipc::AccountIdentity>),
     /// A profile picture is ready in the daemon media cache.
     Avatar { jid: String, key: String },
+    /// A local cache read completed. It cannot change the selected picture.
+    AvatarLoaded,
     /// An avatar resolution, download, or materialization failed.
     AvatarFailed { jid: String, retryable: bool },
     /// Every plugin the daemon has loaded, and what each wants drawn.
@@ -1784,9 +1786,9 @@ impl SessionHandle {
         self.conn.account
     }
 
-    /// Publish an avatar ready notification to the UI event sink.
-    pub fn notify_avatar_ready(&self, jid: String, key: String) {
-        let _ = self.conn.events.try_send(FromDaemon::Avatar { jid, key });
+    /// Wake the UI after a local decode, without selecting a different picture.
+    pub fn notify_avatar_loaded(&self) {
+        let _ = self.conn.events.try_send(FromDaemon::AvatarLoaded);
     }
 
     /// Publish an avatar failed notification to the UI event sink.

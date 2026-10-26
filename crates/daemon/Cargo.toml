@@ -109,6 +109,8 @@ web-sys = { version = "0.3", features = [
     "StorageManager",
     "Window",
     "Headers",
+    # The shared GUI avatar storage is exercised in the browser test runner.
+    "Cache", "CacheStorage", "Request", "Blob", "Storage",
     "RequestInit",
     "Response",
 ] }
@@ -120,6 +122,7 @@ web-sys = { version = "0.3", features = [
 # the review rounds all green. See `plugins/web/tests.rs`.
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
+serde = { workspace = true }
 
 [dev-dependencies]
 oxidezap-chat-store = { workspace = true }
