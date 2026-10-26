@@ -167,6 +167,8 @@ async fn run(hub: Arc<tray::TrayHub>) -> Result<()> {
     let registry = hub.registry();
     let tray_updates = tokio::spawn(Arc::clone(&hub).follow());
     let stores = Arc::new(StoreRegistry::new(oxidezap_session::resolve_database_path()));
+    registry.restore_retirements(&stores).await?;
+    let relink_updates = tokio::spawn(Arc::clone(&registry).follow_relinks(Arc::clone(&stores)));
     let supervisor = AccountSupervisor::new(
         Arc::clone(&registry),
         Arc::clone(&stores),
@@ -182,7 +184,9 @@ async fn run(hub: Arc<tray::TrayHub>) -> Result<()> {
         },
         Ok(existing) => {
             for account in existing {
-                supervisor.spawn(account.id).await;
+                if !registry.has_retirement(account.id) {
+                    supervisor.spawn(account.id).await;
+                }
             }
         }
         Err(e) => {
@@ -260,6 +264,7 @@ async fn run(hub: Arc<tray::TrayHub>) -> Result<()> {
     // than gated on which branch above returned.
     shutdown::request("daemon exiting");
     tray_updates.abort();
+    relink_updates.abort();
     // While that drains, a repeated signal escalates rather than queues
     // behind it: the teardown has joins without a deadline, and a second
     // signal is somebody saying the first one is taking too long.

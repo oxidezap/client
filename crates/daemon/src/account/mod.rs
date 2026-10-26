@@ -13,6 +13,8 @@
 //! reimplementing the same construction `main.rs` used to do once, inline,
 //! for the one account a single-account daemon ever had.
 
+mod retirement;
+
 use std::collections::HashMap;
 #[cfg(not(target_family = "wasm"))]
 use std::future::Future;
@@ -193,6 +195,10 @@ pub struct AccountRegistry {
     construction: tokio::sync::Mutex<()>,
     accounts: RwLock<HashMap<AccountId, Arc<AccountRuntime>>>,
     overview: watch::Sender<Arc<AccountsSnapshot>>,
+    retirements: watch::Sender<Vec<(AccountId, AccountId)>>,
+    retirement_proofs: RwLock<HashMap<AccountId, oxidezap_session::StoredAccount>>,
+    retirement_pending: RwLock<std::collections::HashSet<AccountId>>,
+    retirement_ready: RwLock<std::collections::HashSet<AccountId>>,
     /// The supervisor spawning and respawning runtimes into this registry,
     /// if one exists. `Weak`, not `Arc`: `AccountSupervisor` already holds an
     /// `Arc<AccountRegistry>`, so a strong pointer back would be a reference
@@ -221,6 +227,10 @@ impl AccountRegistry {
             construction: tokio::sync::Mutex::new(()),
             accounts: RwLock::new(HashMap::new()),
             overview,
+            retirements: watch::channel(Vec::new()).0,
+            retirement_proofs: RwLock::new(HashMap::new()),
+            retirement_pending: RwLock::new(std::collections::HashSet::new()),
+            retirement_ready: RwLock::new(std::collections::HashSet::new()),
             #[cfg(not(target_family = "wasm"))]
             supervisor: std::sync::OnceLock::new(),
         })
@@ -246,6 +256,12 @@ impl AccountRegistry {
         use std::collections::hash_map::Entry;
 
         let id = runtime.id();
+        runtime.lifecycle().reserve_retirement_successor(
+            self.retirement_pending
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(&id),
+        );
         let inserted = match self
             .accounts
             .write()
@@ -277,6 +293,9 @@ impl AccountRegistry {
     /// Retain the rejected account and reuse one separate pairing slot across retries.
     pub async fn relink(self: &Arc<Self>, id: AccountId) -> Result<AccountId> {
         let _guard = self.relink.lock().await;
+        if let Some(successor) = self.retirement_target(id) {
+            return Ok(successor);
+        }
         let old = self
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("account not found"))?;
@@ -357,6 +376,9 @@ impl AccountRegistry {
         stores: Arc<StoreRegistry>,
     ) -> Option<(Arc<AccountRuntime>, mpsc::Receiver<SessionCommand>)> {
         let _construction = self.construction.lock().await;
+        if self.has_retirement(id) {
+            return None;
+        }
         if self.get(id).is_some() {
             return None;
         }
@@ -386,10 +408,13 @@ impl AccountRegistry {
                 EmbeddedNext::Removed
             }
             AccountExit::SessionEnded => EmbeddedNext::Restart,
-            AccountExit::SessionLoggedOut
-            | AccountExit::Stopped
-            | AccountExit::ResetIncomplete
-            | AccountExit::RemoveIncomplete => EmbeddedNext::Finished,
+            AccountExit::SessionLoggedOut => {
+                self.set_status(id, AccountStatus::Error);
+                EmbeddedNext::Finished
+            }
+            AccountExit::Stopped | AccountExit::ResetIncomplete | AccountExit::RemoveIncomplete => {
+                EmbeddedNext::Finished
+            }
         }
     }
 
@@ -442,7 +467,7 @@ impl AccountRegistry {
         let runtimes: Vec<_> = self
             .runtimes()
             .into_iter()
-            .filter(|runtime| !runtime.is_stopping())
+            .filter(|runtime| !runtime.is_stopping() && !self.has_retirement(runtime.id()))
             .collect();
         if let Some(raw) = explicit {
             let id = AccountId::new(raw).map_err(|error| error.to_string())?;
@@ -1188,9 +1213,18 @@ impl AccountSupervisor {
         id: AccountId,
         disposition: AccountDisposition,
     ) -> LifecycleOutcome {
+        let _relink = self.registry.relink.lock().await;
+        if self.registry.retirement_target(id).is_some() {
+            return LifecycleOutcome::NoAccount;
+        }
         let Some(runtime) = self.registry.get(id) else {
             return LifecycleOutcome::NoAccount;
         };
+        if runtime.lifecycle().set_disposition(disposition)
+            == session_bridge::DispositionOutcome::Conflict
+        {
+            return LifecycleOutcome::Incomplete;
+        }
         // Invalidate any restart timer before touching storage: it must not
         // resurrect an account this request is retiring or resetting.
         self.bump_generation(id);
@@ -1363,9 +1397,21 @@ impl AccountSupervisor {
                         reply: answered,
                     })
                     .await;
-                if sent.is_ok() && matches!(accepted.await, Ok(CommandOutcome::Accepted)) {
-                    let _ = reply.send(LifecycleOutcome::Accepted);
-                    return;
+                if sent.is_ok() {
+                    match accepted.await {
+                        Ok(CommandOutcome::Accepted) => {
+                            let _ = reply.send(LifecycleOutcome::Accepted);
+                            return;
+                        }
+                        Ok(_) => {
+                            // A live runtime refused the request, for example
+                            // because consolidation pinned its valid session.
+                            // Refusal is never permission for terminal cleanup.
+                            let _ = reply.send(LifecycleOutcome::Incomplete);
+                            return;
+                        }
+                        Err(_) => {}
+                    }
                 }
                 // No live session to ask — a logout, an exhausted recovery, or
                 // a pending restart whose runtime has no task yet. Finish the

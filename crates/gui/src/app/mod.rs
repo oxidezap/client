@@ -760,6 +760,7 @@ pub struct WhatsAppApp {
     /// a later archived page), so resolving only against `chats` at click time
     /// would silently lose the action.
     notification_window: Option<gpui::AnyWindowHandle>,
+    account_window: Option<gpui::AnyWindowHandle>,
     /// The window the send-confirmation modal builds its caption field in.
     /// An editor entity needs a live `Window` at construction, and the modal
     /// opens from event continuations that only hold the app — the same
@@ -1206,11 +1207,18 @@ impl WhatsAppApp {
     /// by the reader as it runs, and the one-shot receivers the callers hold
     /// only fire while it does. The events themselves are dropped.
     fn spawn_control_reader(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(
-            async move |_: WeakEntity<Self>, _cx| {
-                while ui_rx.recv().await.is_some() {}
-            },
-        )
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(event) = ui_rx.recv().await {
+                if let FromDaemon::AccountRetired { account, successor } = event {
+                    if entity
+                        .update(cx, |app, cx| app.account_retired(account, successor, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        })
     }
 
     /// The control plane if this window has one.
@@ -1227,6 +1235,9 @@ impl WhatsAppApp {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(message) = ui_rx.recv().await {
                 let result = match message {
+                    FromDaemon::AccountRetired { account, successor } => {
+                        entity.update(cx, |app, cx| app.account_retired(account, successor, cx))
+                    }
                     FromDaemon::Session(event) => entity.update(cx, |app, cx| {
                         // The two events that carry media, and so the only
                         // two that can leave this window holding more of it
@@ -1427,6 +1438,7 @@ impl WhatsAppApp {
             window_activation: None,
             notified_messages: IndexMap::new(),
             notification_window: None,
+            account_window: None,
             modal_window: None,
             pending_notification_tags: VecDeque::new(),
             latest_notification_tag: None,
@@ -2173,6 +2185,7 @@ impl WhatsAppApp {
     }
 
     fn observe_window_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.account_window = Some(window.window_handle());
         if self.window_activation.is_some() {
             return;
         }

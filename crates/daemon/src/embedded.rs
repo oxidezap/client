@@ -94,13 +94,30 @@ async fn service() -> Result<Arc<AccountRegistry>, StartFailed> {
 
     let registry = AccountRegistry::new();
     let stores = Arc::new(StoreRegistry::new(oxidezap_session::resolve_database_path()));
+    registry
+        .restore_retirements(&stores)
+        .await
+        .map_err(|error| StartFailed::Storage(error.to_string()))?;
     let stored = stores
         .accounts()
         .await
         .map_err(|error| StartFailed::Storage(error.to_string()))?;
-    for id in startup_accounts(stored.into_iter().map(|account| account.id)) {
-        registry.start_account(id, Arc::clone(&stores)).await;
+    let ids = if stored.is_empty() {
+        vec![
+            stores
+                .create_account()
+                .await
+                .map_err(|error| StartFailed::Storage(error.to_string()))?,
+        ]
+    } else {
+        startup_accounts(stored.into_iter().map(|account| account.id))
+    };
+    for id in ids {
+        if !registry.has_retirement(id) {
+            registry.start_account(id, Arc::clone(&stores)).await;
+        }
     }
+    oxidezap_session::spawn(Arc::clone(&registry).follow_relinks(Arc::clone(&stores)));
 
     #[cfg(target_family = "wasm")]
     let tabs = match crate::listener::tab::serve(&registry) {
@@ -122,11 +139,7 @@ async fn service() -> Result<Arc<AccountRegistry>, StartFailed> {
 }
 
 fn startup_accounts(accounts: impl Iterator<Item = AccountId>) -> Vec<AccountId> {
-    let mut ids: Vec<_> = accounts.collect();
-    if ids.is_empty() {
-        ids.push(AccountId::LEGACY);
-    }
-    ids
+    accounts.collect()
 }
 
 fn running() -> Option<Arc<AccountRegistry>> {
@@ -184,7 +197,7 @@ mod tests {
         assert_eq!(startup_accounts([successor].into_iter()), vec![successor]);
         assert_eq!(
             startup_accounts(std::iter::empty()),
-            vec![AccountId::LEGACY]
+            Vec::<AccountId>::new()
         );
     }
 }

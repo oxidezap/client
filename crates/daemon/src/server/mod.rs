@@ -196,6 +196,7 @@ pub(crate) async fn serve_client_with_registry(
         }
     };
 
+    let mut retirements = registry.watch_retirements();
     if attached.is_wire && (attached.account_selection || attached.wire_account.is_some()) {
         match registry.resolve_wire_account(attached.wire_account) {
             Ok(account) => attached.scope = oxidezap_ipc::ClientScope::Account { account },
@@ -217,6 +218,19 @@ pub(crate) async fn serve_client_with_registry(
             return serve_control_client(reader, writer, registry).await;
         }
         oxidezap_ipc::ClientScope::Account { account } => {
+            if let Some(successor) = registry.retirement_target(account) {
+                if !attached.is_wire {
+                    write_line(
+                        &mut writer,
+                        &serde_json::to_string(&DaemonMessage::AccountRetired {
+                            account,
+                            successor,
+                        })?,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
             let Some(runtime) = registry.get(account) else {
                 let frame = error_frame(
                     None,
@@ -334,7 +348,23 @@ pub(crate) async fn serve_client_with_registry(
     let mut awaiting_resync = false;
 
     loop {
+        if let Some(successor) = registry.retirement_target(hub.account_id()) {
+            if !attached.is_wire {
+                write_line(
+                    &mut writer,
+                    &serde_json::to_string(&DaemonMessage::AccountRetired {
+                        account: hub.account_id(),
+                        successor,
+                    })?,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         tokio::select! {
+            changed = retirements.changed() => {
+                if changed.is_err() { return Ok(()); }
+            }
             // Normally drain published state before reading more requests, so
             // a client that floods the socket cannot starve its own event
             // stream. After a lag that inverts, because recovery comes first.
@@ -631,11 +661,22 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut accounts = registry.subscribe();
+    let mut retirements = registry.watch_retirements();
     let hello = serde_json::to_string(&DaemonMessage::ControlHello {
         protocol: PROTOCOL_VERSION,
         accounts: (*registry.snapshot()).clone(),
     })?;
     write_line(&mut writer, &hello).await?;
+    let redirects = retirements.borrow_and_update().clone();
+    for (account, _) in redirects {
+        if let Some(successor) = registry.retirement_target(account) {
+            write_line(
+                &mut writer,
+                &serde_json::to_string(&DaemonMessage::AccountRetired { account, successor })?,
+            )
+            .await?;
+        }
+    }
     let mut buf = Vec::with_capacity(1024);
     // The control plane's own out-of-band answers — a plugin install, listing
     // or removal is disk work, and a control connection still pushes
@@ -648,6 +689,15 @@ where
             // Out-of-band answers first, so a plugin install/removal/listing
             // lands as soon as it is ready rather than behind a state push.
             Some(frame) = inbox.recv() => write_line(&mut writer, &frame).await?,
+            changed = retirements.changed() => {
+                if changed.is_err() { return Ok(()); }
+                let redirects = retirements.borrow_and_update().clone();
+                for (account, _) in redirects {
+                    if let Some(successor) = registry.retirement_target(account) {
+                        write_line(&mut writer, &serde_json::to_string(&DaemonMessage::AccountRetired { account, successor })?).await?;
+                    }
+                }
+            }
             changed = accounts.changed() => {
                 if changed.is_err() {
                     return Ok(());

@@ -886,3 +886,43 @@ async fn work_in_flight_is_capped_rather_than_queued() {
         "permits come back when the work they paid for is over"
     );
 }
+#[test]
+fn a_successor_pin_refuses_reset_without_stopping_the_valid_session() {
+    let lifecycle = RuntimeLifecycle::new();
+    let pin = lifecycle.pin().unwrap();
+    assert_eq!(
+        lifecycle.set_disposition(AccountDisposition::Reset),
+        DispositionOutcome::Conflict
+    );
+    assert!(!lifecycle.is_stopping());
+    assert_eq!(lifecycle.disposition(), None);
+    drop(pin);
+    assert_eq!(
+        lifecycle.set_disposition(AccountDisposition::Reset),
+        DispositionOutcome::Recorded
+    );
+    assert!(lifecycle.is_stopping());
+    assert!(lifecycle.pin().is_none());
+}
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(start_paused = true)]
+async fn retirement_drains_existing_media_and_rejects_new_writers() {
+    let lifecycle = RuntimeLifecycle::new();
+    let upload = lifecycle.media_lease().await.unwrap();
+    assert_eq!(
+        lifecycle.set_disposition(AccountDisposition::Remove),
+        DispositionOutcome::Recorded
+    );
+    assert!(lifecycle.media_lease().await.is_none());
+    let drain = lifecycle.drain_media();
+    tokio::pin!(drain);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut drain)
+            .await
+            .is_err()
+    );
+    drop(upload);
+    let _exclusive = tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+        .await
+        .unwrap();
+}

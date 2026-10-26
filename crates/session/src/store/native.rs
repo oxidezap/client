@@ -28,6 +28,11 @@ pub async fn prepare() -> Result<(), String> {
     Ok(())
 }
 
+/// Native SQLite commits complete through the platform filesystem VFS.
+pub fn is_durable() -> bool {
+    true
+}
+
 /// Delete the local session: device identity, Signal state and chat history
 /// all live in the one SQLite file.
 ///

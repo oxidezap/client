@@ -23,6 +23,7 @@ mod reaction;
 pub(crate) mod read_state;
 mod receipt;
 mod recovery;
+pub(crate) mod retirement;
 mod revoke;
 pub(crate) mod shared_history;
 mod writer;
