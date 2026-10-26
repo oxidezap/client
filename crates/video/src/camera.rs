@@ -780,7 +780,8 @@ pub fn enumerate() -> Result<Vec<crate::CameraDevice>> {
         // Preserve their identity even when querying modes fails. No stream is
         // started, and the probe is dropped before returning the inventory.
         for input in INPUT_FORMATS {
-            let request = RequestedFormat::with_formats(RequestedFormatType::None, &[*input]);
+            let inputs = [*input];
+            let request = RequestedFormat::with_formats(RequestedFormatType::None, &inputs);
             if let Ok(mut camera) = Camera::new(index.clone(), request) {
                 if let Ok(formats) = camera.compatible_camera_formats() {
                     modes = candidates(formats, VideoQuality::default())
