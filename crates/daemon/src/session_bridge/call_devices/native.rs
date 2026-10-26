@@ -59,6 +59,10 @@ pub(super) async fn test_microphone() -> Result<Reply, String> {
     let mic = oxidezap_audio::devices::open_test_microphone()
         .await
         .map_err(|e| e.to_string())?;
+    measure_microphone(mic).await
+}
+
+async fn measure_microphone(mic: async_channel::Receiver<Vec<i16>>) -> Result<Reply, String> {
     let mut peak = 0u16;
     for _ in 0..25 {
         match oxidezap_session::with_timeout(mic.recv(), std::time::Duration::from_millis(200))
@@ -85,6 +89,39 @@ pub(super) async fn test_microphone() -> Result<Reply, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn measured(frame: Vec<i16>) -> String {
+        let (tx, rx) = async_channel::bounded(25);
+        for _ in 0..25 {
+            tx.send(frame.clone()).await.unwrap();
+        }
+        let Reply::Tested { detail } = measure_microphone(rx).await.unwrap() else {
+            panic!("wrong reply");
+        };
+        detail
+    }
+    #[tokio::test]
+    async fn pcm_silence_known_signal_and_full_scale_are_measured() {
+        assert!(measured(vec![0; 960]).await.contains("silence"));
+        assert!(measured(vec![0, 16384, -8192]).await.contains("50%"));
+        assert!(measured(vec![i16::MIN, i16::MAX]).await.contains("100%"));
+    }
+    #[tokio::test]
+    async fn lost_device_fails_and_cancelled_measurement_releases_the_receiver() {
+        let (tx, rx) = async_channel::bounded(1);
+        drop(tx);
+        assert!(
+            measure_microphone(rx)
+                .await
+                .unwrap_err()
+                .contains("stopped")
+        );
+        let (tx, rx) = async_channel::bounded(1);
+        let task = tokio::spawn(measure_microphone(rx));
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(tx.is_closed());
+    }
     fn fixture_directory() -> PathBuf {
         static NEXT: super::super::AtomicU64 = super::super::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(

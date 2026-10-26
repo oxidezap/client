@@ -25,6 +25,7 @@ pub(super) struct DeviceUi {
     pub pending_call: Option<(String, bool)>,
     pub preview_after_inventory: bool,
     approved_call: Option<(String, bool)>,
+    pub confirming: bool,
     pub preview: Option<CameraPreviewId>,
     stopping: Option<CameraPreviewId>,
     pub effective: Option<CameraMode>,
@@ -44,6 +45,9 @@ impl DeviceUi {
             admission,
             ..Default::default()
         };
+    }
+    fn may_preview(&self) -> bool {
+        !self.confirming && self.preview.is_none() && self.stopping.is_none()
     }
     fn may_save(&self) -> bool {
         self.preferences_ready && !self.busy
@@ -148,7 +152,11 @@ impl WhatsAppApp {
         let Some(client) = self.client.as_ref().map(|c| c.handle()) else {
             return;
         };
+        if self.settings.read(cx).devices.confirming {
+            return;
+        }
         let (pending, id, epoch) = self.settings.update(cx, |s, _| {
+            s.devices.confirming = s.devices.pending_call.is_some();
             (
                 s.devices.pending_call.clone(),
                 s.devices.preview.or(s.devices.stopping),
@@ -165,14 +173,14 @@ impl WhatsAppApp {
                 let waiting = client.call_devices(Action::CancelPreview { preview_id: id });
                 if !matches!(crate::platform::with_timeout(waiting, Duration::from_secs(7)).await, Some(Ok(Ok(Reply::Stopped { .. })))) {
                     let _ = entity.update(cx, |app, cx| {
-                        app.settings.update(cx, |s, cx| { s.devices.status = "Camera has not finished stopping. Try again before placing the call.".into(); cx.notify(); });
+                        app.settings.update(cx, |s, cx| { if s.epoch() != epoch || s.devices.pending_call.as_ref() != Some(&(jid.clone(), video)) { return; } s.devices.confirming = false; s.devices.status = "Camera has not finished stopping. Try again before placing the call.".into(); cx.notify(); });
                     });
                     return;
                 }
             }
             let _ = entity.update(cx, |app, cx| {
                 if app.settings.read(cx).epoch() != epoch || app.settings.read(cx).devices.pending_call.as_ref() != Some(&(jid.clone(), video)) { return; }
-                app.settings.update(cx, |s, cx| { s.devices.pending_call = None; s.devices.approved_call = Some((jid.clone(), video)); s.close(cx); });
+                app.settings.update(cx, |s, cx| { s.devices.confirming = false; s.devices.pending_call = None; s.devices.approved_call = Some((jid.clone(), video)); s.close(cx); });
                 app.start_call(jid, video, cx);
             });
         }).detach();
@@ -328,7 +336,7 @@ impl WhatsAppApp {
             });
             return;
         }
-        if self.camera_preview_active(cx) {
+        if !self.settings.read(cx).devices.may_preview() {
             return;
         }
         let Some(client) = self.client.as_ref().map(|c| c.handle()) else {
@@ -431,6 +439,19 @@ impl WhatsAppApp {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+    #[test]
+    fn confirmation_keeps_preview_closed_after_the_first_stop_reply() {
+        let mut ui = DeviceUi {
+            confirming: true,
+            stopping: Some(CameraPreviewId(1)),
+            ..Default::default()
+        };
+        assert!(!ui.may_preview());
+        ui.stopping = None; // The independent cancellation task has acknowledged release.
+        assert!(!ui.may_preview()); // Confirmation is still waiting for its own reply.
+        ui.confirming = false;
+        assert!(ui.may_preview());
+    }
     #[test]
     fn forgetting_settings_preserves_monotonic_preview_ids() {
         let mut ui = DeviceUi::default();

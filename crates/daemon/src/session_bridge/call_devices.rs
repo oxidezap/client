@@ -47,6 +47,7 @@ impl Drop for Devices {
 struct State {
     preview: Option<Preview>,
     fences: Vec<PreviewFence>,
+    call_busy: bool,
 }
 struct PreviewFence {
     owner: Outbox,
@@ -86,6 +87,9 @@ impl State {
         owner: &Outbox,
         id: CameraPreviewId,
     ) -> Result<Arc<AtomicBool>, String> {
+        if self.call_busy {
+            return Err("End the current call before opening a camera preview.".into());
+        }
         if owner.is_closed() {
             return Err("Preview connection is closed".into());
         }
@@ -260,6 +264,29 @@ async fn inventory() -> CallDeviceSettings {
 }
 
 impl Devices {
+    pub(super) fn set_call_busy(&mut self, busy: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .call_busy = busy;
+    }
+
+    /// Fence queued starts, including previews owned by another window.
+    /// Refuse until capture acknowledges stop; keep the bridge responsive.
+    pub(super) fn release_for_call(&mut self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.call_busy = true;
+        if let Some(preview) = &state.preview {
+            preview.cancel.store(true, Ordering::Release);
+            if !preview.finished {
+                return Err(
+                    "Camera is still stopping. Try the call again when preview closes.".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn request(&mut self, id: RequestId, action: Action, owner: Outbox) {
         let state = self.state.clone();
         let permit = if matches!(
@@ -600,6 +627,64 @@ mod tests {
             ..Default::default()
         };
         (Arc::new(Mutex::new(state)), cancel)
+    }
+    #[test]
+    fn call_admission_fences_other_windows_until_capture_has_stopped() {
+        let (owner, _rx) = tokio::sync::mpsc::channel(4);
+        let (other, _rx2) = tokio::sync::mpsc::channel(4);
+        let mut devices = Devices::default();
+        let cancel = devices
+            .state
+            .lock()
+            .unwrap()
+            .reserve_preview(&owner, CameraPreviewId(1))
+            .unwrap();
+        assert!(devices.release_for_call().is_err());
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(
+            devices
+                .state
+                .lock()
+                .unwrap()
+                .reserve_preview(&other, CameraPreviewId(1))
+                .is_err()
+        );
+        devices
+            .state
+            .lock()
+            .unwrap()
+            .preview
+            .as_mut()
+            .unwrap()
+            .finished = true;
+        assert!(devices.release_for_call().is_ok());
+        // The reservation remains after acknowledgement, before the call is marked busy.
+        assert!(
+            devices
+                .state
+                .lock()
+                .unwrap()
+                .reserve_preview(&other, CameraPreviewId(2))
+                .is_err()
+        );
+        devices.set_call_busy(true);
+        assert!(
+            devices
+                .state
+                .lock()
+                .unwrap()
+                .reserve_preview(&other, CameraPreviewId(3))
+                .is_err()
+        );
+        devices.set_call_busy(false);
+        assert!(
+            devices
+                .state
+                .lock()
+                .unwrap()
+                .reserve_preview(&other, CameraPreviewId(4))
+                .is_ok()
+        );
     }
     #[tokio::test]
     async fn cancellation_is_scoped_to_owner_and_preview_identity() {

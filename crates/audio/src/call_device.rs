@@ -257,6 +257,20 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
     Ok(rx)
 }
 
+fn downmix<T: cpal::Sample>(data: &[T], channels: usize, mono: &mut Vec<i16>)
+where
+    i16: cpal::FromSample<T>,
+{
+    mono.clear();
+    for frame in data.chunks(channels) {
+        let sum: i64 = frame
+            .iter()
+            .map(|&sample| i64::from(i16::from_sample(sample)))
+            .sum();
+        mono.push((sum / channels as i64) as i16);
+    }
+}
+
 fn build_input_stream<P>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -284,15 +298,7 @@ where
                 .build_input_stream(
                     config.clone(),
                     move |data: &[$t], _| {
-                        mono.clear();
-                        for frame in data.chunks(channels) {
-                            // Downmix: average the channels into one i16.
-                            let mut sum = 0i32;
-                            for &s in frame {
-                                sum += i16::from_sample(s) as i32;
-                            }
-                            mono.push((sum / channels as i32) as i16);
-                        }
+                        downmix(data, channels, &mut mono);
                         // Drop overflow: loss tolerant; the ring is full only if the drain fell behind.
                         let _ = prod.push_slice(&mono);
                     },
@@ -541,6 +547,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_formats_channels_and_rates_keep_known_pcm_in_range() {
+        let mut mono = Vec::new();
+        downmix(&[i16::MIN, i16::MAX], 1, &mut mono);
+        assert_eq!(mono, [i16::MIN, i16::MAX]);
+        downmix(&[1.0f32, 1.0, -1.0, -1.0], 2, &mut mono);
+        assert_eq!(mono, [i16::MAX, i16::MIN]);
+        downmix(&[0u16, u16::MAX], 2, &mut mono);
+        assert_eq!(mono, [0]);
+        for channels in [1, 2, 6] {
+            for rate in [16_000, 44_100, 48_000] {
+                downmix(
+                    &vec![16384i16; rate as usize / 10 * channels],
+                    channels,
+                    &mut mono,
+                );
+                let mut resampler = crate::resample::Stream::new(rate, WA_RATE);
+                let mut output = Vec::new();
+                resampler.process(&mono, &mut output);
+                assert!(!output.is_empty());
+                assert!(mono.iter().all(|sample| *sample == 16384));
+                assert!(output.iter().all(|sample| sample.unsigned_abs() < 32767));
+                // The low-pass startup may ring; measure the settled constant signal.
+                assert!(
+                    output[output.len() / 2..]
+                        .iter()
+                        .all(|sample| (i32::from(*sample) - 16384).abs() < 128)
+                );
+                assert!(rms(&output) > 15000.0);
+            }
+        }
+    }
 
     fn tone(freq: f64, rate: u32, samples: usize) -> Vec<i16> {
         (0..samples)
