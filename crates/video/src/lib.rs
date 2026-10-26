@@ -28,11 +28,8 @@ mod encoder;
 #[cfg(target_family = "wasm")]
 mod web;
 
-// The same four names on both. `camera::open` used to be a fifth, exported
-// only here: the blocking open the wrapper below wraps, with no web twin and
-// no caller outside this file, so a crate that offers `open_camera` on both
-// platforms also offered a second way in on one of them. It stays inside
-// `camera`, where the wrapper reaches it.
+// Both backends expose the same capture and inventory operations. The
+// synchronous native open stays private; callers use the async wrapper.
 #[cfg(not(target_family = "wasm"))]
 pub use camera::{CameraControl, CameraStream, is_available};
 #[cfg(target_family = "wasm")]

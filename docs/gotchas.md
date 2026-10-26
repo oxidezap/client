@@ -734,6 +734,23 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   gate is read before a frame is built, because building one copies an access
   unit out of the encoder's buffer — for a call that runs, and a peer that is
   receiving it, whether or not anybody here is looking.
+- **A camera mode must be advertised as one complete tuple.** Both former
+  fallback requests required MJPEG, so a YUYV/NV12-only Media Foundation
+  camera failed twice. Nokhwa's `Closest` request can also combine a nearby
+  resolution with FPS from the requested resolution. Capture now discovers
+  supported modes without starting a stream, filters the existing converter
+  formats and H.264/RTP bounds, then opens exact advertised tuples. Resolution
+  and FPS distance rank candidates; MJPEG breaks ties. Stream, conversion
+  setup and encoder failures stop and drop that attempt before another open.
+  The returned quality is the effective capture cadence, including fallback.
+  Inventory retains metadata only. Windows device IDs use Media Foundation's
+  symbolic link, resolved again at open, rather than a saved ordinal.
+  A settings preview owns the same encoded stream through `CameraPreview`,
+  with a `CameraPreviewId` independent of calls. Stopping or dropping its
+  owner releases capture. The bridge must discard a canceled open's late
+  completion and stop it before publishing or opening a replacement.
+  Hardware removal ends the existing capture and owner; a later open queries
+  the current modes again. Tests use a fake backend and channels, not hardware.
 - **Everything on the video path drops, and every drop asks for a keyframe.**
   A frame that cannot be delivered now is worth nothing later, so every queue
   from the encoder to the pane is short and every send is a `try_send`. What
