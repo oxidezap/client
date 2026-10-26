@@ -162,3 +162,14 @@ diesel::allow_tables_to_appear_in_same_query!(
     message_identity_repair_pending,
     contact_name_removals
 );
+
+diesel::table! {
+    audio_played_pending (device_id, chat_jid, msg_id, author_jid) {
+        device_id -> Integer,
+        chat_jid -> Text,
+        msg_id -> Text,
+        author_jid -> Text,
+        received_at_ms -> BigInt,
+        ambiguous -> Bool,
+    }
+}

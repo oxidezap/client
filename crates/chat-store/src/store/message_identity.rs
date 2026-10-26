@@ -15,7 +15,7 @@ use crate::types::MessageStatus;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MessageOwner {
-    pub(super) id: i64,
+    pub(crate) id: i64,
     pub(super) sender_jid: String,
     pub(super) from_me: bool,
 }
@@ -66,7 +66,7 @@ pub(crate) fn authors_match(
 }
 
 /// Message rows with this stanza id which belong to the supplied author.
-pub(super) fn matching_rows(
+pub(crate) fn matching_rows(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
@@ -228,6 +228,13 @@ pub(crate) fn merge_rows(
         .filter_map(|row| (row.id != survivor_id).then_some(row.id))
         .collect();
     if !duplicates.is_empty() {
+        // Submission follows the proven message identity when its duplicate row is removed.
+        for duplicate in &duplicates {
+            diesel::sql_query("INSERT OR IGNORE INTO audio_played_receipts (device_id, message_row_id) SELECT device_id, ? FROM audio_played_receipts WHERE device_id = ? AND message_row_id = ?")
+                .bind::<BigInt,_>(survivor_id)
+                .bind::<Integer,_>(device_id)
+                .bind::<BigInt,_>(*duplicate).execute(conn)?;
+        }
         diesel::delete(dsl::messages.filter(dsl::id.eq_any(duplicates))).execute(conn)?;
     }
     diesel::update(dsl::messages.filter(dsl::id.eq(survivor_id)))

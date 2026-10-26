@@ -36,6 +36,7 @@ mod shared_history;
 
 /// What a message's media is, for both the roads it arrives on.
 mod media;
+mod played;
 
 /// What a picked file becomes on the wire: its shape, and the message that
 /// carries it.
@@ -687,6 +688,7 @@ pub struct WhatsAppClient {
     /// session is alive, so an async completion cannot accidentally write to a
     /// different account after a front-end switch.
     account_id: AccountId,
+    played_gate: Arc<std::sync::Mutex<HashSet<i64>>>,
     /// Shared registry for the physical database and one chat migration run.
     stores: Arc<StoreRegistry>,
     /// Where the session's work runs: a runtime on a thread of its own on a
@@ -797,6 +799,7 @@ impl WhatsAppClient {
         let (ui_sender, ui_events) = ui_queue::channel(reload.clone(), history_budget.clone());
         Ok(Self {
             account_id,
+            played_gate: Arc::new(std::sync::Mutex::new(HashSet::new())),
             stores,
             exec: Executor::new()?,
             ui_sender,
@@ -2019,12 +2022,7 @@ impl WhatsAppClient {
                 // Delivered used to be dropped here, which is why the
                 // second tick never appeared: only Read and Played reached
                 // the UI, so a message went from one tick straight to blue.
-                let Some(dominated_type) = (match &receipt.r#type {
-                    ReceiptType::Delivered => Some(ReceiptType::Delivered),
-                    ReceiptType::Read | ReceiptType::ReadSelf => Some(ReceiptType::Read),
-                    ReceiptType::Played | ReceiptType::PlayedSelf => Some(ReceiptType::Played),
-                    _ => None,
-                }) else {
+                let Some(dominated_type) = played::receipt_for_ui(&receipt.r#type) else {
                     return;
                 };
 

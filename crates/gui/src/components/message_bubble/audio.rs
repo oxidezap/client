@@ -79,6 +79,7 @@ impl AudioLoadState {
 pub(super) fn render_audio_player(
     media_content: MediaContent,
     message_id: String,
+    listened: Option<&'static str>,
     is_playing: bool,
     // Progress only means anything for the clip that is actually loaded; a
     // second voice note in the same conversation must not borrow its
@@ -142,6 +143,9 @@ pub(super) fn render_audio_player(
                 // Counts up while playing, shows the total at rest — the same
                 // number a listener wants at each moment.
                 .child(format_clock(elapsed.or(duration)))
+                .when_some(listened, |el, label| {
+                    el.child(div().text_color(cx.theme().ring).child(label))
+                })
                 .children(state.status().map(|status| {
                     div()
                         .text_size(metrics.text_micro())
@@ -514,5 +518,34 @@ mod tests {
     fn an_unknown_length_shows_a_placeholder_not_zero() {
         assert_eq!(format_clock(None), "--:--");
         assert_eq!(format_clock(Some(14)), "0:14");
+    }
+}
+
+/// A read tick never means audio was heard; direction names whose play it was.
+pub(super) fn played_label(
+    from_me: bool,
+    status: oxidezap_core::MessageStatus,
+) -> Option<&'static str> {
+    (status == oxidezap_core::MessageStatus::Played).then_some(if from_me {
+        "Played by recipient"
+    } else {
+        "Listened"
+    })
+}
+
+#[cfg(test)]
+mod played_indicator_tests {
+    use super::*;
+    use oxidezap_core::MessageStatus;
+
+    #[test]
+    fn indicator_distinguishes_local_or_linked_play_from_recipient_receipt() {
+        assert_eq!(played_label(false, MessageStatus::Read), None);
+        assert_eq!(played_label(true, MessageStatus::Read), None);
+        assert_eq!(played_label(false, MessageStatus::Played), Some("Listened"));
+        assert_eq!(
+            played_label(true, MessageStatus::Played),
+            Some("Played by recipient")
+        );
     }
 }

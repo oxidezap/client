@@ -42,6 +42,7 @@ pub(crate) struct ChangeSet {
     pub(crate) chats: bool,
     pub(crate) contacts: bool,
     pub(crate) message_chats: BTreeSet<String>,
+    pub(crate) pending_audio_chats: BTreeSet<String>,
 }
 
 pub(super) async fn writer_loop(
@@ -249,6 +250,19 @@ async fn attempt_batch(
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .1 = Some(write_description(&queued.message));
                             return Err(error);
+                        }
+                    }
+                    if !cs.pending_audio_chats.is_empty()
+                        || (!cs.message_chats.is_empty()
+                            && super::audio_played::has_pending(conn, device_id)?)
+                    {
+                        let played_chats: Vec<_> = cs
+                            .message_chats
+                            .union(&cs.pending_audio_chats)
+                            .cloned()
+                            .collect();
+                        for chat in played_chats {
+                            super::audio_played::apply(conn, device_id, &chat, &mut cs)?;
                         }
                     }
                     Ok(cs)
@@ -574,6 +588,33 @@ fn apply_writer_msg(
         }
         WriterMsg::GroupHierarchies(writes) => {
             crate::store::group_hierarchy::apply_group_hierarchies(conn, device_id, writes, cs)
+        }
+        WriterMsg::AudioPlayed {
+            chat,
+            message_id,
+            sender,
+            receipt_sent,
+        } => {
+            use schema::messages::dsl;
+            let chat = route_chat(conn, device_id, chat.clone(), cs)?;
+            let rows = super::message_identity::matching_rows(
+                conn, device_id, &chat, message_id, false, sender,
+            )?;
+            for row in rows {
+                let changed =
+                    diesel::update(dsl::messages.filter(dsl::id.eq(row.id).and(dsl::status.lt(5))))
+                        .set(dsl::status.eq(5))
+                        .execute(conn)?;
+                if *receipt_sent {
+                    diesel::sql_query("INSERT OR IGNORE INTO audio_played_receipts (device_id, message_row_id) VALUES (?, ?)")
+                        .bind::<diesel::sql_types::Integer,_>(device_id)
+                        .bind::<diesel::sql_types::BigInt,_>(row.id).execute(conn)?;
+                }
+                if changed > 0 {
+                    cs.message_chats.insert(chat.clone());
+                }
+            }
+            Ok(())
         }
         WriterMsg::StatusWatched { chat, msg_ids } => {
             // Routed like every other write that targets a row. The broadcast

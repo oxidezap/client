@@ -8,6 +8,7 @@
 //! does per event, split by the kind of event each one materializes.
 
 mod ack;
+mod audio_played;
 mod avatar;
 mod chat_names;
 mod chat_rows;
@@ -181,6 +182,12 @@ pub(crate) enum WriterMsg {
     SendFailed {
         chat: Jid,
         msg_id: String,
+    },
+    AudioPlayed {
+        chat: String,
+        message_id: String,
+        sender: String,
+        receipt_sent: bool,
     },
     StatusWatched {
         chat: Jid,
@@ -768,6 +775,23 @@ impl ChatStore {
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 
+    /// Record local playback separately from receipt transport submission.
+    /// Use `flush` before treating either write as durable.
+    pub fn record_audio_played(
+        &self,
+        message: &crate::StoredMessage,
+        receipt_sent: bool,
+    ) -> Result<()> {
+        self.tx
+            .send(WriterMsg::AudioPlayed {
+                chat: message.chat_jid.to_non_ad_string(),
+                message_id: message.id.clone(),
+                sender: message.sender_jid.to_non_ad_string(),
+                receipt_sent,
+            })
+            .map_err(|e| ChatStoreError::Store(StoreError::Validation(e.to_string())))
+    }
+
     /// Record that these status updates have been watched on this device.
     ///
     /// The same place WhatsApp Web keeps it — the message's own ack moved to
@@ -1256,11 +1280,14 @@ mod migration_tests {
             .expect("an empty retirement journal downgrade is reversible");
         assert!(!has_table(&store, "account_retirement").await);
         assert!(has_table(&store, "session_recovery").await);
+        // The version-targeted retirement rewind already removed newer metadata.
+        assert!(!has_table(&store, "audio_played_pending").await);
+        assert!(!has_table(&store, "audio_played_receipts").await);
         store
             .shared()
             .run(revert_last_chat_migration)
             .await
-            .expect("session-recovery downgrade is reversible");
+            .expect("session recovery downgrade is reversible");
         assert!(!has_table(&store, "session_recovery").await);
         assert!(has_table(&store, "shared_group_history").await);
         store

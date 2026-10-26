@@ -171,6 +171,7 @@ pub(crate) fn chat_message_to_dto(chat_jid: &str, msg: ChatMessage) -> MessageDt
         oxidezap_core::MessageStatus::Sent => "sent",
         oxidezap_core::MessageStatus::Delivered => "delivered",
         oxidezap_core::MessageStatus::Read => "read",
+        oxidezap_core::MessageStatus::Played => "played",
         oxidezap_core::MessageStatus::Failed => "failed",
     };
 

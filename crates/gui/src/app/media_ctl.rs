@@ -44,6 +44,17 @@ impl PendingAudioPreparation {
     }
 }
 
+fn audio_receipt_chat(chats: &[Arc<Chat>], id: &str) -> Option<String> {
+    let mut rows = chats.iter().flat_map(|chat| {
+        chat.messages
+            .iter()
+            .filter(move |message| message.id == id)
+            .map(move |message| (chat, message))
+    });
+    let (chat, message) = rows.next()?;
+    (!message.is_from_me && rows.next().is_none()).then(|| chat.jid.clone())
+}
+
 fn media_identity(data: &Arc<Vec<u8>>) -> usize {
     Arc::as_ptr(data) as usize
 }
@@ -225,7 +236,13 @@ impl WhatsAppApp {
             self.sweep_retained_media_keeping(Some(message_id), cx);
         }
     }
-    /// Stop any currently playing media. Does NOT call cx.notify().
+    /// Preserve a successful short play before a user switch clears its evidence.
+    pub(super) fn stop_user_media(&mut self) {
+        self.observe_audio_playback();
+        self.stop_current_media();
+    }
+
+    /// Discard playback during teardown or failed preparation, without notifying the UI.
     pub(super) fn stop_current_media(&mut self) {
         self.audio_player.stop();
         // A stopped tick may still be between its sleep and `entity.update`.
@@ -266,7 +283,7 @@ impl WhatsAppApp {
     /// must not start sound behind the chat list, Settings, or Status.
     pub(super) fn cancel_hidden_media_autoplay(&mut self) {
         if self.audio_preparation.is_some() {
-            self.stop_current_media();
+            self.stop_user_media();
         } else {
             self.pending_media_request = None;
         }
@@ -436,18 +453,36 @@ impl WhatsAppApp {
     /// pass and left the button, the clock and the waveform frozen for the
     /// whole note. `is_loading` is that gap, and it is false everywhere the
     /// decoder is synchronous.
+    fn observe_audio_playback(&mut self) {
+        if !self.audio_player.take_started() {
+            return;
+        }
+        let ActiveMedia::Audio { message_id } = &self.active_media else {
+            return;
+        };
+        let Some(chat) = audio_receipt_chat(&self.chats, message_id) else {
+            return;
+        };
+        if let Some(client) = &self.client {
+            client.mark_audio_played(chat, message_id.clone());
+        }
+    }
+
     pub(super) fn ensure_playback_tick(&mut self, cx: &mut Context<Self>) {
         if self.playback_tick.is_some() {
             return;
         }
         let epoch = self.playback_epoch;
+        let account = self.client.as_ref().map(|client| client.account());
         self.playback_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
                 // ~15fps: the playhead only has to look continuous, and a
                 // voice note is not worth a frame-rate repaint of the list.
                 crate::platform::sleep(std::time::Duration::from_millis(66)).await;
                 let running = entity.update(cx, |app, cx| {
-                    if app.playback_epoch != epoch {
+                    if app.playback_epoch != epoch
+                        || app.client.as_ref().map(|client| client.account()) != account
+                    {
                         return false;
                     }
                     // The browser's `play_prepared` returns before
@@ -458,6 +493,7 @@ impl WhatsAppApp {
                     if !app.audio_player.is_loading() {
                         app.audio_preparation = None;
                     }
+                    app.observe_audio_playback();
                     let playing = app.audio_player.is_playing();
                     if playing {
                         cx.notify();
@@ -499,7 +535,7 @@ impl WhatsAppApp {
         was_playing: bool,
         cx: &mut Context<Self>,
     ) {
-        self.stop_current_media();
+        self.stop_user_media();
         self.pending_media_request = Some(message_id.clone());
         self.audio_player.set_speed(self.playback_speed);
         // On the web this must happen synchronously while the click still has
@@ -572,6 +608,7 @@ impl WhatsAppApp {
                                     if app.playback_epoch == completion_epoch
                                         && app.active_media.is_playing(&completed_id)
                                     {
+                                        app.observe_audio_playback();
                                         app.active_media = ActiveMedia::None;
                                         info!("Audio playback completed");
                                         cx.notify();
@@ -723,7 +760,7 @@ impl WhatsAppApp {
 
         // Stop any current playback, video included: a playing video must not
         // keep running underneath the download.
-        self.stop_current_media();
+        self.stop_user_media();
         self.pending_media_request = Some(message_id.clone());
 
         let msg_id = message_id.clone();
@@ -1296,7 +1333,7 @@ impl WhatsAppApp {
                 // this video's own paused audio and it would come back mute.
                 let owns_audio = self.audio.message_id() == Some(message_id.as_str());
                 if !self.active_media.is_playing(&message_id) && !owns_audio {
-                    self.stop_current_media();
+                    self.stop_user_media();
                 }
                 self.pending_media_request = Some(message_id.clone());
 
@@ -1407,7 +1444,7 @@ impl WhatsAppApp {
         let playing = self.playing_video_id().map(str::to_string);
 
         // Stop any currently playing media (mutual exclusion)
-        self.stop_current_media();
+        self.stop_user_media();
         self.pending_media_request = Some(message_id.clone());
 
         // Evict old video players if the cache is full, sparing the one that
@@ -1649,6 +1686,32 @@ async fn hand_to_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_receipt_identity_refuses_own_or_cross_chat_id_collisions() {
+        let mut first = Chat::new("559900000001@s.whatsapp.net".into());
+        first.messages.push(ChatMessage::new_incoming(
+            "VOICE".into(),
+            "sender".into(),
+            String::new(),
+        ));
+        assert_eq!(
+            audio_receipt_chat(&[Arc::new(first.clone())], "VOICE"),
+            Some(first.jid.clone())
+        );
+        let mut second = Chat::new("111000011112222@lid".into());
+        second
+            .messages
+            .push(ChatMessage::new_outgoing("VOICE".into(), String::new()));
+        assert_eq!(
+            audio_receipt_chat(&[Arc::new(second.clone())], "VOICE"),
+            None
+        );
+        assert_eq!(
+            audio_receipt_chat(&[Arc::new(first), Arc::new(second)], "VOICE"),
+            None
+        );
+    }
 
     fn pending(epoch: usize, position: f32, was_playing: bool) -> PendingAudioPreparation {
         PendingAudioPreparation {

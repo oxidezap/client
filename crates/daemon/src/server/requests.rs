@@ -260,6 +260,9 @@ pub(super) async fn handle_request(
         ClientRequest::MarkRead(request) => {
             acted(dispatch(hub, commands, Action::MarkRead(request)).await)
         }
+        ClientRequest::MarkAudioPlayed(request) => {
+            acted(dispatch(hub, commands, Action::MarkAudioPlayed(request)).await)
+        }
         ClientRequest::MarkStatusWatched(request) => {
             acted(dispatch(hub, commands, Action::MarkStatusWatched(request)).await)
         }

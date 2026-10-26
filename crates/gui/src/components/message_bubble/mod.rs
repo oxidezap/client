@@ -302,6 +302,10 @@ pub fn render_message_bubble(
                                             decoded_image: props.decoded_image.clone(),
                                             audio: props.audio,
                                             playback_speed: props.playback_speed,
+                                            listened: audio::played_label(
+                                                message.is_from_me,
+                                                message.status,
+                                            ),
                                             is_downloading: props.is_downloading,
                                             is_preparing: props.is_preparing,
                                             saved_document_path: props.saved_document_path.clone(),

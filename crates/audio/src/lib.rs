@@ -29,6 +29,7 @@ mod encoder;
 /// Opus packets, in the OGG stream WhatsApp expects. The container is not the
 /// codec, and only the codec was ever the problem here.
 mod ogg_opus;
+mod playback_start;
 mod player;
 mod recorder;
 mod resample;

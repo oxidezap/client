@@ -60,7 +60,9 @@ fn ticks(
         MessageStatus::Delivered => (ProductIcon::CheckCheck.into(), quiet),
         // The one state that earns colour: it is the answer to "did they see
         // it", which is the question the ticks exist for.
-        MessageStatus::Read => (ProductIcon::CheckCheck.into(), cx.theme().ring),
+        MessageStatus::Read | MessageStatus::Played => {
+            (ProductIcon::CheckCheck.into(), cx.theme().ring)
+        }
         MessageStatus::Failed => (Icon::new(IconName::TriangleAlert), cx.theme().danger),
     };
 

@@ -40,6 +40,27 @@ pub(super) fn apply_receipt(
             // be keyed by either identity (or split) — route to where it lives
             // so the read state lands on the real rows, not a stray twin.
             let chat = route_chat(conn, device_id, chat, cs)?;
+            if receipt.r#type == ReceiptType::PlayedSelf {
+                let author = if receipt.source.chat.is_pn() || receipt.source.chat.is_lid() {
+                    chat.clone()
+                } else {
+                    receipt
+                        .source
+                        .recipient
+                        .as_ref()
+                        .map(|jid| jid.to_non_ad_string())
+                        .unwrap_or_default()
+                };
+                super::audio_played::observe(
+                    conn,
+                    device_id,
+                    &chat,
+                    &message_ids,
+                    &author,
+                    ts_ms,
+                    cs,
+                )?;
+            }
             // Read on another of our devices — up to the covered messages.
             // WA read state is "read up to X": the boundary is the newest
             // covered row (falling back to the receipt's own timestamp).

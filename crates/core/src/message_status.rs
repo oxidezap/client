@@ -24,8 +24,11 @@ pub enum MessageStatus {
     Sent,
     /// It reached the recipient's device.
     Delivered,
-    /// The recipient opened the conversation, or played the voice note.
+    /// The recipient opened the conversation.
     Read,
+    /// Incoming audio was listened to here or on a linked device; outgoing
+    /// audio has a played receipt from its recipient.
+    Played,
     /// The send attempt failed. Terminal until the user retries, which starts
     /// a new message rather than moving this one.
     Failed,
@@ -38,7 +41,10 @@ impl MessageStatus {
     /// failed send says something true about *this device*, and calling it
     /// read would claim a message was seen that never left.
     pub fn has_left_this_device(self) -> bool {
-        matches!(self, Self::Sent | Self::Delivered | Self::Read)
+        matches!(
+            self,
+            Self::Sent | Self::Delivered | Self::Read | Self::Played
+        )
     }
 
     /// Move to `next` unless that would undo progress.
@@ -68,7 +74,7 @@ impl MessageStatus {
     /// Whether the recipient has seen it — the state the ticks paint in the
     /// accent colour.
     pub fn is_read(self) -> bool {
-        matches!(self, Self::Read)
+        matches!(self, Self::Read | Self::Played)
     }
 
     /// A short label for assistive technology and tooltips, so the state is
@@ -79,6 +85,7 @@ impl MessageStatus {
             Self::Sent => "Sent",
             Self::Delivered => "Delivered",
             Self::Read => "Read",
+            Self::Played => "Listened",
             Self::Failed => "Not sent",
         }
     }
@@ -125,5 +132,21 @@ mod tests {
         let mut status = Delivered;
         status.advance(Delivered);
         assert_eq!(status, Delivered);
+    }
+}
+
+#[cfg(test)]
+mod played_tests {
+    use super::MessageStatus;
+
+    #[test]
+    fn played_keeps_read_ticks_but_survives_stale_read_and_delivery() {
+        let mut status = MessageStatus::Read;
+        status.advance(MessageStatus::Played);
+        status.advance(MessageStatus::Read);
+        status.advance(MessageStatus::Delivered);
+        assert_eq!(status, MessageStatus::Played);
+        assert!(status.is_read());
+        assert_eq!(status.label(), "Listened");
     }
 }

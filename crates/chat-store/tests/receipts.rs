@@ -925,3 +925,537 @@ async fn migration_folds_device_suffixed_rows() {
         [("111000011112222@lid", 4), ("222000011112222@lid", 4)]
     );
 }
+
+#[tokio::test]
+async fn self_play_is_distinct_from_read_and_survives_duplicate_and_stale_reads() {
+    let (_db, store) = test_store().await;
+    feed(
+        &store,
+        [message_event(
+            wa::Message::text("voice fixture"),
+            incoming_info(PEER, PEER, "VOICE", 100),
+        )],
+    )
+    .await;
+    feed(
+        &store,
+        [receipt(
+            jid(PEER),
+            jid(PEER),
+            &["VOICE"],
+            ReceiptType::ReadSelf,
+            ts(101),
+        )],
+    )
+    .await;
+    assert_ne!(
+        store
+            .message(&jid(PEER), "VOICE")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+    for ty in [
+        ReceiptType::PlayedSelf,
+        ReceiptType::PlayedSelf,
+        ReceiptType::ReadSelf,
+    ] {
+        feed(
+            &store,
+            [receipt(jid(PEER), jid(PEER), &["VOICE"], ty, ts(101))],
+        )
+        .await;
+    }
+    assert_eq!(
+        store
+            .message(&jid(PEER), "VOICE")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+}
+
+#[tokio::test]
+async fn local_audio_playback_and_transport_submission_have_separate_durable_state() {
+    let (_db, store) = test_store().await;
+    feed(
+        &store,
+        [message_event(
+            wa::Message::text("voice fixture"),
+            incoming_info(PEER, PEER, "LOCAL-PLAY", 100),
+        )],
+    )
+    .await;
+    let row = store
+        .message(&jid(PEER), "LOCAL-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    // Offline playback or a transport failure records the observation but never a send.
+    store.record_audio_played(&row, false).unwrap();
+    store.flush().await.unwrap();
+    assert_eq!(
+        store
+            .message(&jid(PEER), "LOCAL-PLAY")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+    assert!(!store.audio_played_receipt_sent(&row).await.unwrap());
+    store.record_audio_played(&row, true).unwrap();
+    store.record_audio_played(&row, false).unwrap();
+    store.flush().await.unwrap();
+    assert!(store.audio_played_receipt_sent(&row).await.unwrap());
+    // Reopen the projection over the same synthetic database.
+    let reopened = ChatStore::new(&_db).await.unwrap();
+    assert!(reopened.audio_played_receipt_sent(&row).await.unwrap());
+    assert_eq!(
+        reopened
+            .message(&jid(PEER), "LOCAL-PLAY")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+}
+
+#[tokio::test]
+async fn audio_playback_writes_cannot_cross_accounts_or_mark_own_audio() {
+    let (db, store) = test_store().await;
+    let db_b = db.database().store(2);
+    db.database().provision_device(2).await.unwrap();
+    let other = ChatStore::new(&db_b).await.unwrap();
+    feed(
+        &store,
+        [message_event(
+            wa::Message::text("synthetic"),
+            incoming_info(PEER, PEER, "ISOLATED", 100),
+        )],
+    )
+    .await;
+    let incoming = store
+        .message(&jid(PEER), "ISOLATED")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stale_identity = incoming.clone();
+    stale_identity.id = "REPLACED-ROW".into();
+    store.record_audio_played(&stale_identity, true).unwrap();
+    store.flush().await.unwrap();
+    assert!(!store.audio_played_receipt_sent(&incoming).await.unwrap());
+    other.record_audio_played(&incoming, true).unwrap();
+    other.flush().await.unwrap();
+    assert!(!other.audio_played_receipt_sent(&incoming).await.unwrap());
+    assert_ne!(
+        store
+            .message(&jid(PEER), "ISOLATED")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+    store.record_audio_played(&incoming, true).unwrap();
+    store.flush().await.unwrap();
+    assert!(!other.audio_played_receipt_sent(&incoming).await.unwrap());
+    store
+        .record_outgoing(
+            &jid(PEER),
+            "OWN-AUDIO",
+            &wa::Message::text("synthetic own"),
+            ts(102),
+        )
+        .unwrap();
+    store.flush().await.unwrap();
+    let own = store
+        .own_message(&jid(PEER), "OWN-AUDIO")
+        .await
+        .unwrap()
+        .unwrap();
+    store.record_audio_played(&own, true).unwrap();
+    store.flush().await.unwrap();
+    assert!(!store.audio_played_receipt_sent(&own).await.unwrap());
+    assert_ne!(
+        store
+            .own_message(&jid(PEER), "OWN-AUDIO")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+}
+
+#[tokio::test]
+async fn linked_play_refuses_an_ambiguous_group_id() {
+    let (_db, store) = test_store().await;
+    let authors = ["559900000001@s.whatsapp.net", "111000011112222@lid"];
+    feed(
+        &store,
+        authors.map(|author| {
+            message_event(
+                wa::Message::text("synthetic"),
+                incoming_info(GROUP, author, "COLLIDING-PLAY", 100),
+            )
+        }),
+    )
+    .await;
+    feed(
+        &store,
+        [receipt(
+            jid(GROUP),
+            jid("559900000003@s.whatsapp.net"),
+            &["COLLIDING-PLAY"],
+            ReceiptType::PlayedSelf,
+            ts(101),
+        )],
+    )
+    .await;
+    let rows = store.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status != MessageStatus::Played));
+}
+
+#[tokio::test]
+async fn played_submission_survives_pn_lid_duplicate_row_fusion() {
+    let (db, store) = test_store().await;
+    feed(
+        &store,
+        [
+            message_event(
+                wa::Message::text("synthetic pn"),
+                incoming_info(PEER, PEER, "MERGED-PLAY", 100),
+            ),
+            message_event(
+                wa::Message::text("synthetic lid"),
+                incoming_info(PEER_LID, PEER_LID, "MERGED-PLAY", 100),
+            ),
+        ],
+    )
+    .await;
+    let pn = store
+        .message(&jid(PEER), "MERGED-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    let lid = store
+        .message(&jid(PEER_LID), "MERGED-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(pn.seq, lid.seq);
+    store.record_audio_played(&lid, true).unwrap();
+    store.flush().await.unwrap();
+    add_lid_mapping(&db).await;
+    store.reconcile_chat(&jid(PEER)).unwrap();
+    store.flush().await.unwrap();
+    let merged = store
+        .message(&jid(PEER), "MERGED-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.status, MessageStatus::Played);
+    assert!(store.audio_played_receipt_sent(&merged).await.unwrap());
+    assert!(store.audio_played_receipt_sent(&pn).await.unwrap());
+    assert!(store.audio_played_receipt_sent(&lid).await.unwrap());
+    // An observation captured before fusion still targets the proven message.
+    store.record_audio_played(&lid, true).unwrap();
+    store.flush().await.unwrap();
+    assert!(store.audio_played_receipt_sent(&merged).await.unwrap());
+}
+
+fn synthetic_voice() -> wa::Message {
+    let mut audio = wa::message::AudioMessage::default();
+    audio.ptt = Some(true);
+    let mut message = wa::Message::default();
+    message.audio_message = MessageField::some(audio);
+    message
+}
+
+#[tokio::test]
+async fn early_linked_play_survives_reopen_and_pn_lid_materialization() {
+    let (db, store) = test_store().await;
+    feed(
+        &store,
+        [receipt(
+            jid(PEER),
+            jid(PEER),
+            &["EARLY-PLAY"],
+            ReceiptType::PlayedSelf,
+            ts(101),
+        )],
+    )
+    .await;
+    add_lid_mapping(&db).await;
+    let reopened = ChatStore::new(&db).await.unwrap();
+    feed(
+        &reopened,
+        [message_event(
+            synthetic_voice(),
+            incoming_info(PEER_LID, PEER_LID, "EARLY-PLAY", 100),
+        )],
+    )
+    .await;
+    let message = reopened
+        .message(&jid(PEER), "EARLY-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.status, MessageStatus::Played);
+    assert!(reopened.audio_played_receipt_sent(&message).await.unwrap());
+    feed(
+        &reopened,
+        [receipt(
+            jid(PEER_LID),
+            jid(PEER_LID),
+            &["EARLY-PLAY"],
+            ReceiptType::ReadSelf,
+            ts(102),
+        )],
+    )
+    .await;
+    assert_eq!(
+        reopened
+            .message(&jid(PEER), "EARLY-PLAY")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+}
+
+#[tokio::test]
+async fn early_linked_play_applies_to_a_later_history_message() {
+    let (_db, store) = test_store().await;
+    feed(
+        &store,
+        [receipt(
+            jid(PEER),
+            jid(PEER),
+            &["HISTORY-PLAY"],
+            ReceiptType::PlayedSelf,
+            ts(101),
+        )],
+    )
+    .await;
+    let mut key = wa::MessageKey::default();
+    key.remote_jid = Some(PEER.into());
+    key.id = Some("HISTORY-PLAY".into());
+    key.from_me = Some(false);
+    let mut info = wa::WebMessageInfo::default();
+    info.key = MessageField::some(key);
+    info.message = MessageField::some(synthetic_voice());
+    info.message_timestamp = Some(100);
+    let mut entry = wa::HistorySyncMsg::default();
+    entry.message = MessageField::some(info);
+    let mut conversation = wa::Conversation::default();
+    conversation.id = PEER.into();
+    conversation.messages = vec![entry];
+    let mut history = wa::HistorySync::default();
+    history.sync_type = wa::history_sync::HistorySyncType::RECENT;
+    history.conversations = vec![conversation];
+    feed(&store, [history_sync_event(history)]).await;
+    let message = store
+        .message(&jid(PEER), "HISTORY-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.status, MessageStatus::Played);
+    assert!(store.audio_played_receipt_sent(&message).await.unwrap());
+}
+
+#[tokio::test]
+async fn early_group_play_rejects_ambiguous_authors_in_the_materialization_batch() {
+    let (_db, store) = test_store().await;
+    feed(
+        &store,
+        [receipt(
+            jid(GROUP),
+            jid(PEER),
+            &["EARLY-COLLISION"],
+            ReceiptType::PlayedSelf,
+            ts(101),
+        )],
+    )
+    .await;
+    // Commit both authors atomically, like a reconnect/history batch.
+    let batch: Vec<_> = [PEER, "559900000002@s.whatsapp.net"]
+        .into_iter()
+        .map(|author| {
+            InboundMessage::builder()
+                .message(Arc::new(synthetic_voice()))
+                .info(Arc::new(incoming_info(
+                    GROUP,
+                    author,
+                    "EARLY-COLLISION",
+                    100,
+                )))
+                .build()
+        })
+        .collect();
+    store.commit_inbound_batch(&batch).await.unwrap();
+    let rows = store.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status != MessageStatus::Played));
+    for row in rows {
+        assert!(!store.audio_played_receipt_sent(&row).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn known_group_author_is_preserved_while_waiting_for_its_message() {
+    let (_db, store) = test_store().await;
+    let target = "559900000002@s.whatsapp.net";
+    let Event::Receipt(mut observed) = receipt(
+        jid(GROUP),
+        jid(PEER),
+        &["AUTHOR-PLAY"],
+        ReceiptType::PlayedSelf,
+        ts(101),
+    ) else {
+        unreachable!()
+    };
+    observed.source.recipient = Some(jid(target));
+    feed(&store, [Event::Receipt(observed)]).await;
+    feed(
+        &store,
+        [message_event(
+            synthetic_voice(),
+            incoming_info(GROUP, PEER, "AUTHOR-PLAY", 100),
+        )],
+    )
+    .await;
+    assert_ne!(
+        store
+            .message(&jid(GROUP), "AUTHOR-PLAY")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+    feed(
+        &store,
+        [message_event(
+            synthetic_voice(),
+            incoming_info(GROUP, target, "AUTHOR-PLAY", 100),
+        )],
+    )
+    .await;
+    let rows = store.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(
+            row.status == MessageStatus::Played,
+            row.sender_jid == jid(target)
+        );
+        assert_eq!(
+            store.audio_played_receipt_sent(&row).await.unwrap(),
+            row.sender_jid == jid(target)
+        );
+    }
+}
+
+#[tokio::test]
+async fn pending_linked_plays_are_bounded_per_account() {
+    let (db, store) = test_store().await;
+    let db_b = db.database().store(2);
+    db.database().provision_device(2).await.unwrap();
+    let other = ChatStore::new(&db_b).await.unwrap();
+    feed(
+        &other,
+        [receipt(
+            jid(PEER),
+            jid(PEER),
+            &["OTHER-ACCOUNT"],
+            ReceiptType::PlayedSelf,
+            ts(100),
+        )],
+    )
+    .await;
+    let ids: Vec<String> = (0..4097).map(|id| format!("UNMATERIALIZED-{id}")).collect();
+    feed(
+        &store,
+        ids.chunks(128).map(|chunk| {
+            let ids: Vec<_> = chunk.iter().map(String::as_str).collect();
+            receipt(jid(PEER), jid(PEER), &ids, ReceiptType::PlayedSelf, ts(101))
+        }),
+    )
+    .await;
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        device_id: i32,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    let counts: Vec<Count> = db.shared().read(|conn| {
+        diesel::sql_query("SELECT device_id, count(*) AS count FROM audio_played_pending GROUP BY device_id ORDER BY device_id")
+            .load(conn).map_err(db_err)
+    }).await.unwrap();
+    assert_eq!(
+        counts
+            .iter()
+            .map(|row| (row.device_id, row.count))
+            .collect::<Vec<_>>(),
+        vec![(1, 4096), (2, 1)]
+    );
+}
+
+#[tokio::test]
+async fn authorless_linked_group_play_never_claims_the_first_materialized_author() {
+    let (_db, store) = test_store().await;
+    feed(
+        &store,
+        [receipt(
+            jid(GROUP),
+            jid(PEER),
+            &["SEPARATE-BATCHES"],
+            ReceiptType::PlayedSelf,
+            ts(101),
+        )],
+    )
+    .await;
+    feed(
+        &store,
+        [message_event(
+            synthetic_voice(),
+            incoming_info(GROUP, PEER, "SEPARATE-BATCHES", 100),
+        )],
+    )
+    .await;
+    let first = store
+        .message(&jid(GROUP), "SEPARATE-BATCHES")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.status, MessageStatus::Played);
+    assert!(!store.audio_played_receipt_sent(&first).await.unwrap());
+    feed(
+        &store,
+        [message_event(
+            synthetic_voice(),
+            incoming_info(
+                GROUP,
+                "559900000002@s.whatsapp.net",
+                "SEPARATE-BATCHES",
+                100,
+            ),
+        )],
+    )
+    .await;
+    let rows = store.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_ne!(row.status, MessageStatus::Played);
+        assert!(!store.audio_played_receipt_sent(&row).await.unwrap());
+    }
+}

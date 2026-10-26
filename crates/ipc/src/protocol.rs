@@ -856,6 +856,14 @@ pub struct MarkRead {
     pub through_message_id: Option<String>,
 }
 
+/// A successful audio playback observed by a front end. Routing and media
+/// eligibility are checked against the account store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkAudioPlayed {
+    pub jid: String,
+    pub message_id: String,
+}
+
 /// Status updates that have been watched. See
 /// [`ClientRequest::MarkStatusWatched`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1047,6 +1055,8 @@ pub enum ClientRequest {
     /// when this is not the message it would name in a snapshot right now, and
     /// the client resends after catching up.
     MarkRead(MarkRead),
+    /// Record actual playback; offline observations are local only.
+    MarkAudioPlayed(MarkAudioPlayed),
     /// Remember that these status updates have been watched.
     ///
     /// Not a [`MarkRead`](Self::MarkRead) for the broadcast: that one clears a
@@ -2375,5 +2385,25 @@ mod device_contract_tests {
             serde_json::from_str::<DaemonMessage>(&encoded).unwrap(),
             response
         );
+    }
+}
+
+#[cfg(test)]
+mod audio_played_tests {
+    use super::*;
+
+    #[test]
+    fn playback_observation_carries_identity_without_frontend_routing_claims() {
+        let request = ClientRequest::MarkAudioPlayed(MarkAudioPlayed {
+            jid: "120363000000000001@g.us".into(),
+            message_id: "SYNTHETIC-AUDIO".into(),
+        });
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ClientRequest>(&json).unwrap(),
+            request
+        );
+        assert!(json.contains("mark_audio_played"));
+        assert!(!json.contains("participant"));
     }
 }

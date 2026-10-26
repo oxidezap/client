@@ -1345,6 +1345,13 @@ impl SessionHandle {
         })));
     }
 
+    /// Report playback after the audio sink advances.
+    pub fn mark_audio_played(&self, jid: String, message_id: String) {
+        self.tell(ClientRequest::MarkAudioPlayed(
+            oxidezap_ipc::MarkAudioPlayed { jid, message_id },
+        ));
+    }
+
     /// Mark a chat read up to the message the UI is looking at.
     ///
     /// One request where the old client took two: the daemon owns the read
