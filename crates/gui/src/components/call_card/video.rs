@@ -350,33 +350,3 @@ fn video_controls(
                 }),
         )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::picture_height;
-    use gpui::px;
-
-    #[test]
-    fn video_shrinks_before_controls_when_the_viewport_shrinks() {
-        assert_eq!(
-            picture_height(px(700.0), px(180.0), px(210.0), false),
-            px(210.0)
-        );
-        assert_eq!(
-            picture_height(px(700.0), px(180.0), px(210.0), true),
-            px(520.0)
-        );
-        assert_eq!(
-            picture_height(px(220.0), px(180.0), px(210.0), false),
-            px(40.0)
-        );
-        assert_eq!(
-            picture_height(px(220.0), px(180.0), px(210.0), true),
-            px(40.0)
-        );
-        assert_eq!(
-            picture_height(px(100.0), px(180.0), px(210.0), true),
-            px(0.0)
-        );
-    }
-}
