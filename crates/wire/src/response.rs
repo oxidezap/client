@@ -14,6 +14,10 @@ use crate::envelope::PageCursor;
 pub enum DaemonResponse {
     /// Generic confirmation of an acknowledged action.
     Ack,
+    /// The immutable local account selected for this connection.
+    AccountSelected {
+        local_account: i32,
+    },
     /// Connection and account status.
     Status(ConnectionStatusDto),
 

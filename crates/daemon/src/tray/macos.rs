@@ -15,7 +15,8 @@ use tokio::sync::watch;
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::state::{StateHub, TrayState};
+use super::TrayHub;
+use crate::state::TrayState;
 
 const OPEN_ID: &str = "oxidezap-open";
 const HIDE_ID: &str = "oxidezap-hide";
@@ -35,7 +36,7 @@ pub struct MacTray {
 impl MacTray {
     /// Build the icon and paint the current state. Call on the main thread:
     /// anywhere else AppKit answers `NotMainThread`.
-    pub fn start(hub: &StateHub) -> Result<Self, String> {
+    pub fn start(hub: &TrayHub) -> Result<Self, String> {
         // Read before building, like every other tray: the icon must be
         // right the moment it appears, not only after the next change.
         let mut watch = hub.watch_tray();
@@ -53,7 +54,7 @@ impl MacTray {
     /// picks arrived since the last one. The caller runs the runloop around
     /// this — without it there is nothing to drain, since AppKit dispatches
     /// to this thread alone.
-    pub fn pump(&mut self, hub: &StateHub) {
+    pub fn pump(&mut self, hub: &TrayHub) {
         // Latest only: several updates between pumps collapse into one
         // repaint, which is what keeps a burst of receipts from repainting
         // the icon once per message. A dead hub means the daemon is going
@@ -75,7 +76,7 @@ impl MacTray {
                     ..
                 }
             ) {
-                self.click.click(hub);
+                self.click.click_every(hub.hubs());
             }
         }
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
@@ -85,8 +86,8 @@ impl MacTray {
                 // Either published to nobody is harmless, which is what
                 // makes fixed items safe where Linux renames one item for
                 // what it would do.
-                OPEN_ID => crate::window::show(hub),
-                HIDE_ID => crate::window::hide(hub),
+                OPEN_ID => hub.show(),
+                HIDE_ID => hub.hide(),
                 QUIT_ID => crate::shutdown::request("tray menu"),
                 _ => {}
             }

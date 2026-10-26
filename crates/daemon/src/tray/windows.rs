@@ -24,7 +24,8 @@ use anyhow::{Context, Result};
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::state::{StateHub, TrayState};
+use super::TrayHub;
+use crate::state::TrayState;
 
 /// How often the tray thread wakes to drain menu and click events while no
 /// state update is waiting.
@@ -40,7 +41,7 @@ const QUIT_ID: &str = "oxidezap-quit";
 /// once that thread has the icon up, or an error when the notification area
 /// would not take it — which the daemon logs and carries on without, like
 /// every other tray failure.
-pub async fn start(hub: Arc<StateHub>) -> Result<Box<dyn super::Tray>> {
+pub async fn start(hub: Arc<TrayHub>) -> Result<Box<dyn super::Tray>> {
     // Rendered before the icon appears, like the Linux tray: the icon must
     // be right the moment it shows, not only after the next change.
     let initial = hub.watch_tray().borrow_and_update().clone();
@@ -78,7 +79,7 @@ impl super::Tray for WindowsTray {
 
 /// Build the icon and run it until the daemon goes away.
 fn run(
-    hub: Arc<StateHub>,
+    hub: Arc<TrayHub>,
     initial: TrayState,
     states: Receiver<TrayState>,
     ready: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -121,7 +122,7 @@ fn build(initial: &TrayState) -> Result<TrayIcon, String> {
 }
 
 /// Drain state updates and tray events until the daemon drops the handle.
-fn pump(hub: Arc<StateHub>, tray: TrayIcon, states: Receiver<TrayState>) {
+fn pump(hub: Arc<TrayHub>, tray: TrayIcon, states: Receiver<TrayState>) {
     let mut click = crate::window::Toggle::default();
     let tray_events = TrayIconEvent::receiver();
     let menu_events = tray_icon::menu::MenuEvent::receiver();
@@ -149,7 +150,7 @@ fn pump(hub: Arc<StateHub>, tray: TrayIcon, states: Receiver<TrayState>) {
                     ..
                 }
             ) {
-                click.click(&hub);
+                click.click_every(hub.hubs());
             }
         }
         while let Ok(event) = menu_events.try_recv() {
@@ -160,8 +161,8 @@ fn pump(hub: Arc<StateHub>, tray: TrayIcon, states: Receiver<TrayState>) {
                 // makes fixed items safe where Linux renames one item for
                 // what it would do: a stale label there can at worst do
                 // nothing, and here there is no stale label at all.
-                OPEN_ID => crate::window::show(&hub),
-                HIDE_ID => crate::window::hide(&hub),
+                OPEN_ID => hub.show(),
+                HIDE_ID => hub.hide(),
                 QUIT_ID => crate::shutdown::request("tray menu"),
                 _ => {}
             }

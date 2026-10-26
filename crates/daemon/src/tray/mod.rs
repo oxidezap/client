@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::state::{StateHub, TrayState};
+use crate::state::TrayState;
+mod accounts;
+pub use accounts::TrayHub;
 
 /// The dot the icon-less platforms paint. Shared rather than once per tray,
 /// so no two platforms can disagree about which state gets which colour.
@@ -45,7 +47,7 @@ pub trait Tray: Send {
 }
 
 /// Start a tray and keep it following the hub until the returned handle drops.
-pub async fn spawn(hub: Arc<StateHub>) -> Result<TrayHandle> {
+pub async fn spawn(hub: Arc<TrayHub>) -> Result<TrayHandle> {
     let tray = platform_tray(Arc::clone(&hub)).await?;
     let mut watch = hub.watch_tray();
 
@@ -83,12 +85,12 @@ impl Drop for TrayHandle {
 }
 
 #[cfg(target_os = "linux")]
-async fn platform_tray(hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
+async fn platform_tray(hub: Arc<TrayHub>) -> Result<Box<dyn Tray>> {
     linux::start(hub).await
 }
 
 #[cfg(target_os = "windows")]
-async fn platform_tray(hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
+async fn platform_tray(hub: Arc<TrayHub>) -> Result<Box<dyn Tray>> {
     windows::start(hub).await
 }
 
@@ -97,11 +99,11 @@ async fn platform_tray(hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
 /// itself and pumps it from its runloop. Bailing keeps [`spawn`] compiling
 /// on every platform while saying where the real one lives.
 #[cfg(target_os = "macos")]
-async fn platform_tray(_hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
+async fn platform_tray(_hub: Arc<TrayHub>) -> Result<Box<dyn Tray>> {
     anyhow::bail!("the macOS tray lives on the main thread; see tray::macos")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-async fn platform_tray(_hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
+async fn platform_tray(_hub: Arc<TrayHub>) -> Result<Box<dyn Tray>> {
     anyhow::bail!("no tray implementation for this platform yet")
 }

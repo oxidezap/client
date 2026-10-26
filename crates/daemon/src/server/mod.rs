@@ -177,7 +177,7 @@ pub(crate) async fn serve_client_with_registry(
     // a task and a descriptor and given nothing back. A peer that connects
     // and says nothing would otherwise sit here for as long as it liked, and
     // a reconnect loop doing it would take the listener down with it.
-    let attached = match oxidezap_session::with_timeout(
+    let mut attached = match oxidezap_session::with_timeout(
         handshake(&mut reader, &mut writer, &mut buf),
         HANDSHAKE_TIMEOUT,
     )
@@ -195,6 +195,22 @@ pub(crate) async fn serve_client_with_registry(
             return Ok(());
         }
     };
+
+    if attached.is_wire && (attached.account_selection || attached.wire_account.is_some()) {
+        match registry.resolve_wire_account(attached.wire_account) {
+            Ok(account) => attached.scope = oxidezap_ipc::ClientScope::Account { account },
+            Err(detail) => {
+                let response = oxidezap_wire::envelope::ResponseEnvelope {
+                    id: attached.wire_hello_id,
+                    result: oxidezap_wire::envelope::ResponseResult::Error {
+                        error: oxidezap_wire::error::ApiError::invalid_request(detail),
+                    },
+                };
+                write_line(&mut writer, &serde_json::to_string(&response)?).await?;
+                return Ok(());
+            }
+        }
+    }
 
     let (hub, plugins, commands) = match attached.scope {
         oxidezap_ipc::ClientScope::Control => {
@@ -288,7 +304,13 @@ pub(crate) async fn serve_client_with_registry(
         let resp = oxidezap_wire::envelope::ResponseEnvelope {
             id: attached.wire_hello_id,
             result: oxidezap_wire::envelope::ResponseResult::Ok {
-                payload: Box::new(oxidezap_wire::response::DaemonResponse::Ack),
+                payload: Box::new(if attached.account_selection {
+                    oxidezap_wire::response::DaemonResponse::AccountSelected {
+                        local_account: hub.account_id().get(),
+                    }
+                } else {
+                    oxidezap_wire::response::DaemonResponse::Ack
+                }),
             },
         };
         write_line(&mut writer, &serde_json::to_string(&resp)?).await?;

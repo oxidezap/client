@@ -17,10 +17,12 @@
 //! opens a connection, because installing a VFS after the fact does not move
 //! a database that is already open.
 
+mod identity;
 #[cfg_attr(target_family = "wasm", path = "web.rs")]
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 mod registry;
+pub use identity::same_account_identity;
 
 pub use platform::{database_path, open_for_account, prepare, wipe};
 pub use registry::{StoreRegistry, StoredAccount};

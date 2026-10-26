@@ -437,6 +437,34 @@ impl AccountRegistry {
         runtimes
     }
 
+    /// Resolve once, never switch an established wire connection to another identity.
+    pub fn resolve_wire_account(&self, explicit: Option<i32>) -> Result<AccountId, String> {
+        let runtimes: Vec<_> = self
+            .runtimes()
+            .into_iter()
+            .filter(|runtime| !runtime.is_stopping())
+            .collect();
+        if let Some(raw) = explicit {
+            let id = AccountId::new(raw).map_err(|error| error.to_string())?;
+            return runtimes
+                .iter()
+                .any(|runtime| runtime.id() == id)
+                .then_some(id)
+                .ok_or_else(|| format!("local account {id} is unavailable"));
+        }
+        let candidates: Vec<_> = runtimes
+            .iter()
+            .map(|runtime| {
+                (
+                    runtime.id(),
+                    runtime.hub().windows_attached(),
+                    runtime.hub().connection().is_connected(),
+                )
+            })
+            .collect();
+        select_wire_account(&candidates)
+    }
+
     /// Drive one registered runtime while publishing lifecycle transitions.
     pub async fn run(
         &self,
@@ -482,6 +510,53 @@ impl AccountRegistry {
         accounts.sort_by_key(|account| account.id.get());
         self.overview
             .send_replace(Arc::new(AccountsSnapshot { accounts }));
+    }
+}
+
+fn select_wire_account(candidates: &[(AccountId, bool, bool)]) -> Result<AccountId, String> {
+    for eligible in [
+        candidates
+            .iter()
+            .filter(|(_, window, _)| *window)
+            .collect::<Vec<_>>(),
+        candidates
+            .iter()
+            .filter(|(_, _, connected)| *connected)
+            .collect(),
+        candidates.iter().collect(),
+    ] {
+        match eligible.as_slice() {
+            [only] => return Ok(only.0),
+            [] => {}
+            _ => {
+                return Err(
+                    "multiple local accounts are available; pass --local-account <id>".into(),
+                );
+            }
+        }
+    }
+    Err("no local account is available".into())
+}
+
+#[cfg(test)]
+mod wire_selection_tests {
+    use super::*;
+    #[test]
+    fn resolves_successor_without_legacy_and_refuses_ambiguous_identity() {
+        let a = AccountId::new(2).unwrap();
+        let b = AccountId::new(3).unwrap();
+        assert_eq!(select_wire_account(&[(a, false, true)]), Ok(a));
+        assert_eq!(
+            select_wire_account(&[(AccountId::LEGACY, false, false), (a, false, true)]),
+            Ok(a)
+        );
+        assert_eq!(
+            select_wire_account(&[(a, true, false), (b, false, true)]),
+            Ok(a)
+        );
+        assert!(select_wire_account(&[(a, false, true), (b, false, true)]).is_err());
+        assert!(select_wire_account(&[(a, true, true), (b, true, true)]).is_err());
+        assert!(select_wire_account(&[]).is_err());
     }
 }
 
@@ -835,12 +910,8 @@ impl AccountSupervisor {
     /// The same, using an already-built hub instead of building one
     /// internally.
     ///
-    /// The one caller this exists for is the daemon's own bootstrap: on
-    /// macOS the tray is built on the main thread, from a `StateHub` that has
-    /// to exist before the async runtime starts spawning anything at all
-    /// (see `macos_main`), so `main` builds it first and hands it in here
-    /// rather than [`Self::spawn`] building a second, disconnected one that
-    /// nobody would ever publish to.
+    /// Useful when an embedded caller already owns an account hub. The tray
+    /// uses the registry and no longer requires a pre-built legacy hub.
     ///
     /// # Panics
     ///
