@@ -28,7 +28,7 @@ pub fn render(
     cx: &App,
 ) -> AnyElement {
     let body = match section {
-        SettingsSection::Account => account(app, metrics, cx),
+        SettingsSection::Account => account(app, entity, metrics, cx),
         SettingsSection::Notifications => notifications(metrics, cx),
         SettingsSection::AudioVideo => super::devices::render(app, entity.clone(), metrics, cx),
         SettingsSection::Privacy => privacy(entity.clone(), metrics, cx),
@@ -370,7 +370,12 @@ fn pending(text: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement +
         )
 }
 
-fn account(app: &WhatsAppApp, metrics: Metrics, cx: &App) -> AnyElement {
+fn account(
+    app: &WhatsAppApp,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> AnyElement {
     let account = app.account_summary();
 
     let mut lines = vec![(
@@ -398,7 +403,20 @@ fn account(app: &WhatsAppApp, metrics: Metrics, cx: &App) -> AnyElement {
 
     group(
         label("LINKED DEVICE", metrics, cx),
-        card(lines, metrics, cx),
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_lg())
+            .child(card(lines, metrics, cx))
+            .when(app.has_retained_history(), |this| {
+                this.child(
+                    Button::new("account-retained-history")
+                        .label("Open retained history")
+                        .on_click(move |_, window, cx| {
+                            entity.update(cx, |app, cx| app.open_retained_history(window, cx));
+                        }),
+                )
+            }),
         metrics,
     )
     .into_any_element()

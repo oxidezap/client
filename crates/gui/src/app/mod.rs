@@ -690,6 +690,7 @@ pub struct WhatsAppApp {
     selected_chat: Option<String>,
     /// WhatsApp client wrapper
     client: Option<Session>,
+    account_selection: recovery::AccountSelection,
     /// The daemon's control plane, beside the account connection.
     ///
     /// A second connection carrying the requests that belong to the process
@@ -1401,6 +1402,7 @@ impl WhatsAppApp {
             chats: Vec::new(),
             selected_chat: None,
             client: None,
+            account_selection: recovery::AccountSelection::default(),
             incoming_file_epoch: 0,
             incoming_file_reading: false,
             paste_preview: None,
@@ -1791,7 +1793,9 @@ impl WhatsAppApp {
             // described as a connection still being attempted.
             status: match self.app_state {
                 AppState::Connected => "linked device · synced".to_string(),
-                AppState::Offline => "linked device · offline".to_string(),
+                AppState::Offline | AppState::OfflineLoggedOut { .. } => {
+                    "local history · offline".to_string()
+                }
                 _ => "linked device · reconnecting".to_string(),
             },
             is_healthy: connected,
@@ -2242,7 +2246,7 @@ impl WhatsAppApp {
     /// draft is the one that bites — text composed under the old account
     /// reappearing in the composer of the new one, ready to be sent to
     /// someone it was never written for.
-    fn forget_account_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn clear_account_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The microphone and the speaker belong to the account too. This is
         // the same departure a disconnect or a logout makes — the connected
         // view is going away — and skipping it left capture running with no
@@ -2301,10 +2305,7 @@ impl WhatsAppApp {
         self.avatar_manager.clear();
         self.avatar_manager.set_session(None);
         self.last_avatar_window_fingerprint = None;
-        let old_scope = crate::session::avatar::rotate_account_scope();
-        crate::session::avatar::spawn_task(async move {
-            crate::session::avatar::delete_account_storage(old_scope).await;
-        });
+        let _ = crate::session::avatar::rotate_account_scope();
         self.sticker_validation.borrow_mut().clear();
         self.timeline_anchor = None;
         // Composed text, and the reply bar it may be answering.
@@ -2471,7 +2472,10 @@ impl WhatsAppApp {
 
     /// Whether the user chose to stop waiting and read what is here.
     pub fn is_offline(&self) -> bool {
-        matches!(self.app_state, AppState::Offline)
+        matches!(
+            self.app_state,
+            AppState::Offline | AppState::OfflineLoggedOut { .. }
+        )
     }
 
     /// Get the selected chat JID
@@ -3017,7 +3021,8 @@ impl WhatsAppApp {
         let asked = dying.is_some();
         drop(dying);
 
-        self.forget_account_state(window, cx);
+        let old_scope = crate::session::avatar::active_account();
+        self.clear_account_view(window, cx);
 
         if !asked {
             self.app_state = AppState::Error(crate::session::Fault::unreachable(
@@ -3026,6 +3031,10 @@ impl WhatsAppApp {
             cx.notify();
             return;
         }
+
+        crate::session::avatar::spawn_task(async move {
+            crate::session::avatar::delete_account_storage(old_scope).await;
+        });
 
         // Reconnecting rides straight into the same retry loop a cold start
         // uses: the old daemon is still closing the database it has just been
@@ -3054,8 +3063,9 @@ impl WhatsAppApp {
 
         // A failure routes back to the error screen, where retry stays
         // available.
+        let account = self.account_selection.active;
         self.reconnect_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let connected = Session::attach(cx).await;
+            let connected = Session::attach(account, cx).await;
             // The control plane, best effort and alongside: a daemon that
             // answers the account connection answers this one too, and one
             // that does not leaves the account plane usable with the global
@@ -4322,7 +4332,10 @@ impl Render for WhatsAppApp {
 
         // Whether this frame draws the app rather than a screen on the way to
         // it, computed before the borrow below.
-        let connected = matches!(self.app_state, AppState::Connected | AppState::Offline);
+        let connected = matches!(
+            self.app_state,
+            AppState::Connected | AppState::Offline | AppState::OfflineLoggedOut { .. }
+        );
 
         let paste_preview = self.paste_preview.as_ref().map(|preview| {
             render_paste_preview(

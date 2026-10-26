@@ -33,7 +33,10 @@ impl WhatsAppApp {
         // there, and focusing it anyway handed the keyboard to something
         // outside the frame, which is a window that has stopped listening.
         // Unreachable before the shortcut worked without a click.
-        if !matches!(self.app_state, AppState::Connected | AppState::Offline) {
+        if !matches!(
+            self.app_state,
+            AppState::Connected | AppState::Offline | AppState::OfflineLoggedOut { .. }
+        ) {
             return;
         }
         // Searching from inside Settings means leaving Settings: the field
@@ -257,7 +260,10 @@ impl WhatsAppApp {
         // the connection finished and then already open. Harmless while the
         // only route was a click on a screen that has no such control, and
         // not once the shortcut works before the first click.
-        if !matches!(self.app_state, AppState::Connected | AppState::Offline) {
+        if !matches!(
+            self.app_state,
+            AppState::Connected | AppState::Offline | AppState::OfflineLoggedOut { .. }
+        ) {
             return;
         }
         // Settings replaces the conversation surface. A media fetch may keep

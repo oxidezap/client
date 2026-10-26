@@ -150,6 +150,24 @@ impl StoreRegistry {
         })
     }
 
+    /// Allocate one separate pairing account. The daemon serializes this operation.
+    pub async fn pairing_successor(
+        &self,
+        id: AccountId,
+    ) -> Result<AccountId, oxidezap_chat_store::ChatStoreError> {
+        let store = self.store(id).await?;
+        match oxidezap_chat_store::ChatStore::pairing_successor(&store).await? {
+            Some(id) => Ok(AccountId::new(id)
+                .map_err(|_| StoreError::Validation("invalid pairing account".into()))?),
+            None => {
+                let next = self.create_account().await?;
+                oxidezap_chat_store::ChatStore::record_pairing_successor(&store, next.as_i32())
+                    .await?;
+                Ok(next)
+            }
+        }
+    }
+
     /// Wipe one account's WhatsApp state and start it over under the same id.
     ///
     /// # Caller obligation
@@ -347,6 +365,80 @@ mod tests {
             .map(|account| account.id)
             .collect();
         assert_eq!(listed, vec![b, c]);
+    }
+
+    #[tokio::test]
+    async fn relinking_retains_history_and_reuses_an_isolated_account_after_reload() {
+        let db = TempDb::new("relink");
+        let registry = StoreRegistry::new(db.url());
+        let old = registry.create_account().await.unwrap();
+        let store = registry.store(old).await.unwrap();
+        registry.prepare_chat_schema(&store).await.unwrap();
+        let history = oxidezap_chat_store::ChatStore::new_prepared(&store)
+            .await
+            .unwrap();
+        let peer: whatsapp_rust::wacore_binary::Jid =
+            "999000000001@s.whatsapp.net".parse().unwrap();
+        history
+            .record_outgoing(
+                &peer,
+                "RETAINED",
+                &whatsapp_rust::waproto::whatsapp::Message::default(),
+                wacore::time::now_utc(),
+            )
+            .unwrap();
+        history.flush().await.unwrap();
+        history
+            .record_logout("Synthetic unlink".into())
+            .await
+            .unwrap();
+        let next = registry.pairing_successor(old).await.unwrap();
+        assert_ne!(old, next);
+        assert_eq!(registry.pairing_successor(old).await.unwrap(), next);
+        assert!(history.message(&peer, "RETAINED").await.unwrap().is_some());
+        let new_store = registry.store(next).await.unwrap();
+        let new_history = oxidezap_chat_store::ChatStore::new_prepared(&new_store)
+            .await
+            .unwrap();
+        assert!(
+            new_history
+                .message(&peer, "RETAINED")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(new_history.logout_message().await.unwrap().is_none());
+        new_history
+            .record_outgoing(
+                &peer,
+                "NEW-ACCOUNT",
+                &whatsapp_rust::waproto::whatsapp::Message::default(),
+                wacore::time::now_utc(),
+            )
+            .unwrap();
+        new_history.flush().await.unwrap();
+        assert!(
+            history
+                .message(&peer, "NEW-ACCOUNT")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        history.close().await.unwrap();
+        new_history.close().await.unwrap();
+        let reopened = StoreRegistry::new(db.url());
+        assert_eq!(reopened.pairing_successor(old).await.unwrap(), next);
+        assert_eq!(reopened.accounts().await.unwrap().len(), 2);
+        let retained_store = reopened.store(old).await.unwrap();
+        let retained = oxidezap_chat_store::ChatStore::new_prepared(&retained_store)
+            .await
+            .unwrap();
+        assert_eq!(
+            retained.logout_message().await.unwrap().as_deref(),
+            Some("Synthetic unlink")
+        );
+        assert!(retained.message(&peer, "RETAINED").await.unwrap().is_some());
+        retained.close().await.unwrap();
     }
 
     /// Resetting an account keeps its id but clears everything the account

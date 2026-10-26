@@ -40,8 +40,10 @@ use super::sink::Events;
 /// No tab answered. That is not a refusal and must not be drawn as one: the
 /// tab that would have answered has closed, and the caller's next move is to
 /// take the account itself.
-pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
-    connect_scoped(false).await
+pub(super) async fn connect(
+    account: oxidezap_core::AccountId,
+) -> std::io::Result<(Session, Events)> {
+    connect_scoped(false, account).await
 }
 
 /// The control plane, onto the tab holding the account.
@@ -50,10 +52,13 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
 /// that runs the session is the daemon, so it is the peer that answers the
 /// process-wide requests.
 pub(super) async fn connect_control() -> std::io::Result<(Session, Events)> {
-    connect_scoped(true).await
+    connect_scoped(true, oxidezap_core::AccountId::LEGACY).await
 }
 
-async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
+async fn connect_scoped(
+    control: bool,
+    account: oxidezap_core::AccountId,
+) -> std::io::Result<(Session, Events)> {
     log::info!("another tab holds this account; attaching to it");
 
     let connection = tab::connect().await.map_err(|e| {
@@ -103,7 +108,7 @@ async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
         // browser, with no tray and nothing to relay. What the answer decides
         // that matters is the video path: a call's frames are published to
         // front ends that have somewhere to draw them, and this one does.
-        attach::begin_for_account(link, cache, oxidezap_core::AccountId::LEGACY, true, true)?
+        attach::begin_for_account(link, cache, account, true, true)?
     };
 
     // The account, when it becomes this tab's.

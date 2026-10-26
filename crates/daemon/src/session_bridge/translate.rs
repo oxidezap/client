@@ -48,6 +48,10 @@ impl Bridge {
                     | UiEvent::Error(_)
                     | UiEvent::QrCode { .. }
                     | UiEvent::PairCode { .. }
+                    | UiEvent::IncomingCall(_)
+                    | UiEvent::OutgoingCallStarted { .. }
+                    | UiEvent::CallAccepted(_)
+                    | UiEvent::CallAnswered { .. }
             )
         {
             return Answer::Nothing;

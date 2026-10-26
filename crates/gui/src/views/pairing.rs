@@ -46,11 +46,19 @@ pub fn generate_qr_png(data: &str) -> Option<Vec<u8>> {
 pub fn render_pairing_view(
     qr_code: Option<&Issued<CachedQrCode>>,
     pair_code: Option<Issued<String>>,
+    retained: Option<gpui::Entity<crate::app::WhatsAppApp>>,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
 
     centered_view("pairing-screen", metrics.space_xxl())
+        .children(retained.map(|entity| {
+            gpui_component::button::Button::new("pairing-retained-history")
+                .label("Back to retained history")
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |app, cx| app.open_retained_history(window, cx));
+                })
+        }))
         .child(
             div()
                 .flex()

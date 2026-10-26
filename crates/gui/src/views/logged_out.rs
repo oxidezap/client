@@ -1,9 +1,6 @@
 //! Server-ended session view.
 //!
-//! Deliberately not the error view: there is no "retry" here, because retrying
-//! replays the credentials the server just rejected. The only way forward is
-//! to drop local state and pair again — so the copy says what that costs, and
-//! offers to save the history first.
+//! Retained history remains local. A new pairing has a separate account identity.
 
 use gpui::{App, Entity, IntoElement, ParentElement, Styled, div};
 use gpui_component::ActiveTheme as _;
@@ -32,17 +29,13 @@ pub fn render_logged_out_view(
             cx,
         ))
         .child(
-            // A third line under the headline and its body, which is why this
-            // is the one screen that keeps hold of the block: what pairing
-            // again costs belongs with the sentence explaining why it is the
-            // only way forward, not beside the button that does it.
             parts::screen_message("Session ended", message.to_string(), cx).child(
                 div()
                     .text_size(metrics.text_small())
                     .text_color(parts::subtle(cx))
                     .child(
-                        "Pairing again clears this device's local data — messages, \
-                         contacts and keys — and starts a new link from the QR code.",
+                        "Read retained messages and cached media locally. WhatsApp requests are blocked offline. \
+                         Pairing again uses a separate local account and keeps this history.",
                     ),
             ),
         )
@@ -60,16 +53,13 @@ pub fn render_logged_out_view(
                         }),
                 )
                 .child(
-                    // Outline, not filled: this is irreversible, and a filled
-                    // primary would make it the obvious thing to click.
                     Button::new("logged-out-pair-again")
-                        .label("Clear data and pair again")
-                        .danger()
+                        .label("Pair again")
                         .outline()
                         .cursor_pointer()
                         .on_click(move |_, window, cx| {
                             pair_entity
-                                .update(cx, |this, cx| this.reset_and_pair_again(window, cx));
+                                .update(cx, |this, cx| this.pair_again_retaining_history(window, cx));
                         }),
                 ),
         )

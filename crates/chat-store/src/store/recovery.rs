@@ -11,6 +11,45 @@ struct Logout {
 }
 
 impl ChatStore {
+    /// The separate local account allocated for this account's next pairing.
+    pub async fn pairing_successor(
+        store: &whatsapp_rust_sqlite_storage::SqliteStore,
+    ) -> Result<Option<i32>> {
+        #[derive(QueryableByName)]
+        struct Successor {
+            #[diesel(sql_type = diesel::sql_types::Nullable<Integer>)]
+            successor: Option<i32>,
+        }
+        let device_id = store.device_id();
+        Ok(store
+            .shared()
+            .run(move |conn| {
+                diesel::sql_query("SELECT successor FROM session_recovery WHERE device_id = ?")
+                    .bind::<Integer, _>(device_id)
+                    .get_result::<Successor>(conn)
+                    .optional()
+                    .map(|row| row.and_then(|row| row.successor))
+                    .map_err(db_err)
+            })
+            .await?)
+    }
+
+    pub async fn record_pairing_successor(
+        store: &whatsapp_rust_sqlite_storage::SqliteStore,
+        successor: i32,
+    ) -> Result<()> {
+        let device_id = store.device_id();
+        store.shared().run(move |conn| {
+            diesel::sql_query("UPDATE session_recovery SET successor = ? WHERE device_id = ? AND successor IS NULL")
+                .bind::<Integer, _>(successor)
+                .bind::<Integer, _>(device_id)
+                .execute(conn)
+                .and_then(|count| if count == 1 { Ok(()) } else { Err(diesel::result::Error::NotFound) })
+                .map_err(db_err)
+        }).await?;
+        Ok(())
+    }
+
     /// The server's terminal rejection, retained with this account's history.
     pub async fn logout_message(&self) -> Result<Option<String>> {
         let device_id = self.device_id;

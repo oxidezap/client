@@ -237,6 +237,8 @@ impl Action {
                     | Self::MarkStatusWatched(_)
                     | Self::LoadMessages { .. }
                     | Self::LoadChats { .. }
+                    | Self::RefreshAvatars
+                    | Self::Download { .. }
             ),
         }
     }

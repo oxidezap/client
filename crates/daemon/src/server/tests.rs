@@ -1639,7 +1639,7 @@ async fn removing_a_plugin_is_answered_without_the_session() {
 
 #[tokio::test]
 async fn an_ensure_avatars_request_dispatches_to_session_bridge() {
-    let hub = StateHub::new();
+    let hub = connected_hub();
     let (commands, taken) = bridge(CommandOutcome::Accepted);
     let (outbox, mut answers) = answers();
 
@@ -2379,4 +2379,49 @@ async fn wire_list_accounts_answers_directly() {
     let frame = ans.frame.expect("a direct answer");
     let parsed: ResponseEnvelope = serde_json::from_str(&frame).expect("a wire envelope");
     assert!(matches!(parsed.result, ResponseResult::Ok { .. }));
+}
+
+#[tokio::test]
+async fn terminal_offline_requests_never_reach_the_session_channel() {
+    let hub = StateHub::new();
+    hub.apply(crate::state::Change::live(
+        oxidezap_ipc::DaemonEvent::ConnectionChanged(oxidezap_ipc::ConnectionState::LoggedOut {
+            message: "synthetic unlink".into(),
+        }),
+    ));
+    let (commands, mut received) = tokio::sync::mpsc::channel(8);
+    let destination = outbox();
+    let actions = vec![
+        Action::EnsureAvatars(vec![]),
+        Action::GroupMembers {
+            id: 1,
+            request: oxidezap_ipc::GroupMembers {
+                jid: "999000@g.us".into(),
+            },
+            answer_to: destination.clone(),
+        },
+        Action::Wire {
+            id: 2,
+            request: oxidezap_wire::request::ClientRequest::GetProfile {
+                jid: Some("999000@s.whatsapp.net".into()),
+            },
+            answer_to: destination.clone(),
+        },
+        Action::SendText(oxidezap_ipc::SendText {
+            jid: "999000@s.whatsapp.net".into(),
+            text: "must stay local".into(),
+            local_id: None,
+            quoted: None,
+        }),
+    ];
+    for action in actions {
+        assert!(matches!(
+            super::requests::dispatch(&hub, &commands, action).await,
+            Err(ProtocolError::NoSession { .. })
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
 }

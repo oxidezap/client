@@ -122,6 +122,7 @@ web-sys = { version = "0.3", features = [
 wasm-bindgen-test = "0.3"
 
 [dev-dependencies]
+oxidezap-chat-store = { workspace = true }
 chrono = { workspace = true, features = ["std", "clock"] }
 # The same synthetic chats and messages every crate above core tests against.
 oxidezap-core = { workspace = true, features = ["fixtures"] }

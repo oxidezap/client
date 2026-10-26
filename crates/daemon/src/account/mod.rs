@@ -181,6 +181,7 @@ impl AccountRuntime {
 
 /// Registry of account runtimes and the control-plane snapshot they publish.
 pub struct AccountRegistry {
+    relink: tokio::sync::Mutex<()>,
     accounts: RwLock<HashMap<AccountId, Arc<AccountRuntime>>>,
     overview: watch::Sender<Arc<AccountsSnapshot>>,
     /// The supervisor spawning and respawning runtimes into this registry,
@@ -207,6 +208,7 @@ impl AccountRegistry {
             accounts: Vec::new(),
         }));
         Arc::new(Self {
+            relink: tokio::sync::Mutex::new(()),
             accounts: RwLock::new(HashMap::new()),
             overview,
             #[cfg(not(target_family = "wasm"))]
@@ -260,6 +262,50 @@ impl AccountRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&id)
             .cloned()
+    }
+
+    /// Retain the rejected account and reuse one separate pairing slot across retries.
+    pub async fn relink(self: &Arc<Self>, id: AccountId) -> Result<AccountId> {
+        let _guard = self.relink.lock().await;
+        let old = self
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("account not found"))?;
+        anyhow::ensure!(
+            matches!(
+                old.hub.connection(),
+                oxidezap_ipc::ConnectionState::LoggedOut { .. }
+            ),
+            "this account has not been logged out"
+        );
+        let successor = old.stores.pairing_successor(id).await?;
+        if self.get(successor).is_none() {
+            self.start_account(successor, Arc::clone(&old.stores)).await;
+        }
+        Ok(successor)
+    }
+
+    pub(crate) async fn start_account(self: &Arc<Self>, id: AccountId, stores: Arc<StoreRegistry>) {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(supervisor) = self.supervisor() {
+            supervisor.spawn(id).await;
+            return;
+        }
+        let hub = StateHub::for_account(id);
+        let (commands, receiver) = mpsc::channel(crate::server::MAX_CLIENTS);
+        let plugins = crate::plugins::start(&hub, commands.clone()).await;
+        let runtime = Arc::new(AccountRuntime::new_with_registry(
+            id, hub, plugins, commands, stores,
+        ));
+        assert!(self.insert(Arc::clone(&runtime)));
+        let registry = Arc::clone(self);
+        oxidezap_session::spawn(async move {
+            if let Err(error) = registry
+                .run(runtime, receiver, crate::shutdown::requested())
+                .await
+            {
+                log::error!("account {} ended: {error}", id.get());
+            }
+        });
     }
 
     /// Remove one runtime after its teardown has completed.
@@ -1287,6 +1333,67 @@ mod tests {
             |_| {},
         )));
         Arc::new(AccountRuntime::new(id, hub, plugins, commands))
+    }
+
+    #[tokio::test]
+    async fn concurrent_frontends_reuse_the_retained_accounts_pairing_successor() {
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:relink-frontends-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let old = stores.create_account().await.unwrap();
+        let backend = stores.store(old).await.unwrap();
+        stores.prepare_chat_schema(&backend).await.unwrap();
+        let history = oxidezap_chat_store::ChatStore::new_prepared(&backend)
+            .await
+            .unwrap();
+        history
+            .record_logout("Synthetic unlink".into())
+            .await
+            .unwrap();
+        let next = stores.pairing_successor(old).await.unwrap();
+        let registry = AccountRegistry::new();
+        let mut receivers = Vec::new();
+        for id in [old, next] {
+            let hub = StateHub::for_account(id);
+            if id == old {
+                hub.apply(crate::state::Change::live(
+                    oxidezap_ipc::DaemonEvent::ConnectionChanged(
+                        oxidezap_ipc::ConnectionState::LoggedOut {
+                            message: "Synthetic unlink".into(),
+                        },
+                    ),
+                ));
+            }
+            let (commands, receiver) = tokio::sync::mpsc::channel(1);
+            receivers.push(receiver);
+            let plugins = Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+                |_| {},
+            )));
+            assert!(registry.insert(Arc::new(AccountRuntime::new_with_registry(
+                id,
+                hub,
+                plugins,
+                commands,
+                Arc::clone(&stores)
+            ))));
+        }
+        let (first, second) = tokio::join!(registry.relink(old), registry.relink(old));
+        assert_eq!(first.unwrap(), next);
+        assert_eq!(second.unwrap(), next);
+        assert_eq!(registry.snapshot().accounts.len(), 2);
+        assert_eq!(stores.accounts().await.unwrap().len(), 2);
+        assert!(matches!(
+            registry.get(old).unwrap().hub.connection(),
+            oxidezap_ipc::ConnectionState::LoggedOut { .. }
+        ));
+        assert!(registry.relink(next).await.is_err());
+        assert!(
+            receivers
+                .iter_mut()
+                .all(|receiver| receiver.try_recv().is_err())
+        );
+        history.close().await.unwrap();
     }
 
     #[test]

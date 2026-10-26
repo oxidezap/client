@@ -51,6 +51,20 @@ impl Bridge {
     /// session and returns.
     pub(super) async fn execute(&mut self, client: &WhatsAppClient, command: SessionCommand) {
         let SessionCommand { action, reply } = command;
+        let ended_pairing = self.hub.is_logged_out()
+            && matches!(
+                &action,
+                Action::Wire {
+                    request: WireRequest::RequestPairCode { .. },
+                    ..
+                }
+            );
+        if ended_pairing || (action.needs_network() && !self.hub.connection().is_connected()) {
+            let _ = reply.send(CommandOutcome::NoSession(
+                "WhatsApp is offline; only local data is available".into(),
+            ));
+            return;
+        }
         // The store reads answer from tasks of their own; what comes back here
         // is everything else.
         let Some((action, reply)) = self.begin_slow(client, action, reply) else {
@@ -1892,6 +1906,13 @@ impl Bridge {
             return CommandOutcome::Accepted;
         }
 
+        if !self.hub.connection().is_connected() {
+            answer_now(&answer_to, downloaded(id, Err(ProtocolError::NoSession {
+                detail: "This media is not cached locally. WhatsApp downloads are unavailable offline.".into(),
+            })));
+            return CommandOutcome::Accepted;
+        }
+
         let Some(permit) = self.permit() else {
             return too_busy();
         };
@@ -2345,6 +2366,52 @@ mod tests {
 
     use super::super::tests::{bridge, loaded, message, received, saturate, stored_chat};
     use super::*;
+
+    #[tokio::test]
+    async fn offline_media_reads_hit_only_the_account_cache_and_refuse_misses() {
+        let bridge = bridge();
+        let client = client();
+        let cache = crate::media::AccountMedia::new(bridge.hub.account_id());
+        let mut hash = vec![0x71; 32];
+        hash[..4].copy_from_slice(&std::process::id().to_be_bytes());
+        let mut media = oxidezap_core::DownloadableMedia {
+            direct_path: "/synthetic-never-fetch".into(),
+            media_key: vec![0; 32],
+            file_enc_sha256: hash,
+            file_length: 3,
+            mime_type: "image/png".into(),
+            duration_secs: None,
+            download_type: wacore::download::MediaType::Image,
+        };
+        let local = crate::media::download_key(&media.file_enc_sha256).unwrap();
+        let key = cache.put_owned(&local, vec![1, 2, 3]).unwrap();
+        assert!(
+            !crate::media::AccountMedia::new(oxidezap_core::AccountId::new(2).unwrap()).claim(&key)
+        );
+        let (outbox, mut answers) = tokio::sync::mpsc::channel(4);
+        assert_eq!(
+            bridge.download(&client, 1, media.clone(), outbox.clone()),
+            CommandOutcome::Accepted
+        );
+        assert!(matches!(
+            serde_json::from_str::<DaemonMessage>(&answers.try_recv().unwrap()).unwrap(),
+            DaemonMessage::Downloaded { id: 1, .. }
+        ));
+        assert_eq!(crate::media::take(&key), Some(vec![1, 2, 3]));
+        media.file_enc_sha256[31] ^= 1;
+        assert_eq!(
+            bridge.download(&client, 2, media, outbox),
+            CommandOutcome::Accepted
+        );
+        assert!(matches!(
+            serde_json::from_str::<DaemonMessage>(&answers.try_recv().unwrap()).unwrap(),
+            DaemonMessage::Error {
+                id: Some(2),
+                error: ProtocolError::NoSession { .. }
+            }
+        ));
+        client.close(Duration::from_secs(1)).await;
+    }
 
     /// A session that has never been started.
     ///

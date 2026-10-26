@@ -587,6 +587,24 @@ fn a_logout_preserves_account_history_in_the_next_snapshot() {
     );
 }
 
+#[test]
+fn terminal_logout_cannot_be_overwritten_by_queued_reconnect_events() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::LoggedOut("synthetic unlink".into()));
+    for event in [
+        UiEvent::InitComplete,
+        UiEvent::Connected,
+        UiEvent::PairSuccess,
+        UiEvent::Disconnected("late disconnect".into()),
+    ] {
+        bridge.observe(event);
+        assert!(matches!(
+            bridge.hub.connection(),
+            oxidezap_ipc::ConnectionState::LoggedOut { .. }
+        ));
+    }
+}
+
 /// Nothing on the session side ends a call when the socket dies, so the
 /// stage stood: after the reconnect every new call was refused as busy,
 /// and the only cancel that could clear it named an id no window held.

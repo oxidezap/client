@@ -665,6 +665,13 @@ where
                             )?,
                         }),
                         ClientRequest::CreateAccount => Some(create_account(&registry, id).await?),
+                        ClientRequest::RelinkAccount { account } => Some(match id {
+                            Some(id) => match registry.relink(account).await {
+                                Ok(account) => serde_json::to_string(&DaemonMessage::AccountCreated { id, account })?,
+                                Err(error) => error_frame(Some(id), ProtocolError::Refused { detail: error.to_string() })?,
+                            },
+                            None => error_frame(None, ProtocolError::Malformed { detail: "relinking needs a request id".into() })?,
+                        }),
                         ClientRequest::ResetAccount { account } => Some(
                             change_account(
                                 &registry,

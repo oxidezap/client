@@ -525,6 +525,7 @@ pub(super) async fn handle_request(
         // The acknowledgement goes out first; see the caller.
         ClientRequest::ListAccounts
         | ClientRequest::CreateAccount
+        | ClientRequest::RelinkAccount { .. }
         | ClientRequest::ResetAccount { .. }
         | ClientRequest::RemoveAccount { .. } => acted(Err(ProtocolError::Refused {
             detail: "control requests require a control-scoped connection".to_string(),
@@ -534,6 +535,18 @@ pub(super) async fn handle_request(
             shutdown: true,
         },
         ClientRequest::EnsureAvatars(request) => {
+            if !hub.connection().is_connected() {
+                for item in &request.items {
+                    answer_later(
+                        outbox,
+                        serde_json::to_string(&DaemonMessage::AvatarFailed {
+                            jid: item.jid.clone(),
+                            retryable: false,
+                        })
+                        .ok(),
+                    );
+                }
+            }
             acted(dispatch(hub, commands, Action::EnsureAvatars(request.items)).await)
         }
     }

@@ -41,8 +41,10 @@ use super::sink::Events;
 /// Only a URL the browser refuses outright. A daemon that is not running
 /// arrives as a close on the event stream, which the front end already
 /// handles as a lost connection and retries.
-pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
-    connect_scoped(false).await
+pub(super) async fn connect(
+    account: oxidezap_core::AccountId,
+) -> std::io::Result<(Session, Events)> {
+    connect_scoped(false, account).await
 }
 
 /// The control plane, over the same daemon this page already reaches.
@@ -50,10 +52,13 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
 /// No account, no session events, no call video: the requests it carries are
 /// the process-wide ones. See `attach::begin_control`.
 pub(super) async fn connect_control() -> std::io::Result<(Session, Events)> {
-    connect_scoped(true).await
+    connect_scoped(true, oxidezap_core::AccountId::LEGACY).await
 }
 
-async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
+async fn connect_scoped(
+    control: bool,
+    account: oxidezap_core::AccountId,
+) -> std::io::Result<(Session, Events)> {
     // Nobody named a daemon, so there is nothing to attach to and no reason
     // to look: this page runs its own. Naming one is how somebody chooses the
     // other arrangement — a desktop daemon holds calls, survives the tab, and
@@ -92,7 +97,7 @@ async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
             return if control {
                 super::embedded::connect_control().await
             } else {
-                super::embedded::connect().await
+                super::embedded::connect(account).await
             };
         }
     };
@@ -129,7 +134,7 @@ async fn connect_scoped(control: bool) -> std::io::Result<(Session, Events)> {
     } = if control {
         attach::begin_control(link, media)?
     } else {
-        attach::begin_for_account(link, media, oxidezap_core::AccountId::LEGACY, false, false)?
+        attach::begin_for_account(link, media, account, false, false)?
     };
 
     spawn_local(async move {

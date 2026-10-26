@@ -287,7 +287,8 @@ use std::path::PathBuf;
 ///
 /// [`PairingCode`]: crate::PairingCode
 /// 41 adds addressed device settings, tests and camera previews with their own identity.
-pub const PROTOCOL_VERSION: u32 = 41;
+/// 42 adds non-destructive, idempotent relinking of a logged-out account.
+pub const PROTOCOL_VERSION: u32 = 42;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

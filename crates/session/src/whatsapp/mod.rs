@@ -1297,6 +1297,7 @@ impl WhatsAppClient {
             local_stopping,
         );
 
+        let _ = ui_tx.send(account_event(&bot.client()));
         match chat_store.logout_message().await {
             Ok(Some(message)) => {
                 let _ = ui_tx.send(UiEvent::LoggedOut(message));
