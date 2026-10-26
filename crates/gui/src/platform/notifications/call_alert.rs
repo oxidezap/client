@@ -11,6 +11,8 @@ pub fn supported() -> bool {
 pub struct IncomingCallAlert {
     ownership: imp::Owner,
     cancelled: Arc<AtomicBool>,
+    // Audio startup errors cancel this token, not notification ownership.
+    ringtone_cancelled: Arc<AtomicBool>,
     retired: Arc<AtomicBool>,
     ringtone: Option<oxidezap_audio::RingtonePlayback>,
 }
@@ -20,6 +22,7 @@ impl IncomingCallAlert {
         account: AccountId,
         tag: String,
         cancelled: Arc<AtomicBool>,
+        ringtone_cancelled: Arc<AtomicBool>,
         retired: Arc<AtomicBool>,
     ) -> std::io::Result<Option<Self>> {
         if cancelled.load(Ordering::Acquire) {
@@ -28,17 +31,30 @@ impl IncomingCallAlert {
         Ok(imp::claim(account, tag)?.map(|owner| Self {
             ownership: owner,
             cancelled,
+            ringtone_cancelled,
             retired,
             ringtone: None,
         }))
     }
 
     pub fn play(&mut self, preferences: CallDevicePreferences) -> anyhow::Result<()> {
+        self.play_with(preferences, oxidezap_audio::start_ringtone_cancellable)
+    }
+
+    fn play_with(
+        &mut self,
+        preferences: CallDevicePreferences,
+        start: impl FnOnce(
+            Option<String>,
+            oxidezap_core::Ringtone,
+            Arc<AtomicBool>,
+        ) -> anyhow::Result<oxidezap_audio::RingtonePlayback>,
+    ) -> anyhow::Result<()> {
         if !self.cancelled.load(Ordering::Acquire) {
-            self.ringtone = Some(oxidezap_audio::start_ringtone_cancellable(
+            self.ringtone = Some(start(
                 preferences.ringtone_output,
                 preferences.ringtone,
-                self.cancelled.clone(),
+                self.ringtone_cancelled.clone(),
             )?);
         }
         Ok(())
@@ -48,6 +64,7 @@ impl IncomingCallAlert {
 impl Drop for IncomingCallAlert {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+        self.ringtone_cancelled.store(true, Ordering::Release);
         self.ringtone = None;
         if self.retired.load(Ordering::Acquire) {
             self.ownership.retire();
@@ -112,6 +129,44 @@ mod imp {
     mod tests {
         use super::*;
         #[test]
+        fn call_alert_ringtone_failure_keeps_the_notification_owner() {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            };
+            let path = std::env::temp_dir().join(format!(
+                "oxidezap-call-alert-failure-{}-{}",
+                std::process::id(),
+                wacore::time::now_utc().timestamp_nanos_opt().unwrap()
+            ));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let ringtone_cancelled = Arc::new(AtomicBool::new(false));
+            let mut alert = super::super::IncomingCallAlert {
+                ownership: claim_at(&path, "ring".into()).unwrap().unwrap(),
+                cancelled: cancelled.clone(),
+                ringtone_cancelled: ringtone_cancelled.clone(),
+                retired: Arc::new(AtomicBool::new(false)),
+                ringtone: None,
+            };
+            let error = alert
+                .play_with(Default::default(), |_, _, stop| {
+                    // A failed audio opener drops its playback guard, cancelling
+                    // startup. This must not cancel the surrounding notification.
+                    stop.store(true, Ordering::Release);
+                    anyhow::bail!("fixture output unavailable")
+                })
+                .unwrap_err();
+            assert_eq!(error.to_string(), "fixture output unavailable");
+            assert!(ringtone_cancelled.load(Ordering::Acquire));
+            assert!(!cancelled.load(Ordering::Acquire));
+            assert!(claim_at(&path, "ring".into()).unwrap().is_none());
+            drop(alert);
+            assert!(cancelled.load(Ordering::Acquire));
+            assert!(claim_at(&path, "ring".into()).unwrap().is_some());
+            std::fs::remove_file(path).unwrap();
+        }
+
+        #[test]
         fn call_alert_has_one_owner_and_releases_on_close() {
             let path = std::env::temp_dir().join(format!(
                 "oxidezap-call-alert-test-{}-{}",
@@ -127,6 +182,7 @@ mod imp {
             let guard = super::super::IncomingCallAlert {
                 ownership: owner,
                 cancelled: cancelled.clone(),
+                ringtone_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 ringtone: None,
             };
