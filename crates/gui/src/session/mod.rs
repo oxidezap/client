@@ -132,6 +132,10 @@ pub struct Attachment {
 pub use oxidezap_core::Fault;
 
 pub enum FromDaemon {
+    AccountRetired {
+        account: AccountId,
+        successor: AccountId,
+    },
     /// Something the session said.
     Session(Box<UiEvent>),
     /// The calls in progress at the moment this client attached.

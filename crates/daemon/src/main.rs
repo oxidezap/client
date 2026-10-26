@@ -13,15 +13,13 @@
 
 use oxidezap_daemon::{
     account::{AccountRegistry, AccountSupervisor},
-    listener, media, server, shutdown, state, tray,
+    listener, media, server, shutdown, tray,
 };
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::state::StateHub;
-use oxidezap_core::AccountId;
 use oxidezap_session::StoreRegistry;
 
 #[cfg(target_os = "macos")]
@@ -97,7 +95,7 @@ fn main() -> Result<()> {
 
     // The hub is cheap and needs no runtime, so it is made here: on macOS
     // the tray is built from it on this thread before anything blocks.
-    let hub = StateHub::for_account(AccountId::LEGACY);
+    let hub = tray::TrayHub::new(AccountRegistry::new());
 
     // AppKit pins the menu-bar icon to the main thread (see `macos_main`):
     // there the daemon runs one thread over and this thread pumps the
@@ -108,7 +106,7 @@ fn main() -> Result<()> {
     return runtime.block_on(run(hub));
 }
 
-async fn run(hub: Arc<StateHub>) -> Result<()> {
+async fn run(hub: Arc<tray::TrayHub>) -> Result<()> {
     // Registered before anything can ask us to stop. Until these handlers
     // exist SIGTERM still has its default disposition: a service manager
     // stopping the daemon during startup would kill it on the spot, without
@@ -166,63 +164,30 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     // multi-account daemon has one running task per account, all of which
     // have to stop on the same ask, and `shutdown::requested()` already
     // broadcasts to as many waiters as are watching it.
-    let registry = AccountRegistry::new();
+    let registry = hub.registry();
+    let tray_updates = tokio::spawn(Arc::clone(&hub).follow());
     let stores = Arc::new(StoreRegistry::new(oxidezap_session::resolve_database_path()));
+    registry.restore_retirements(&stores).await?;
+    let relink_updates = tokio::spawn(Arc::clone(&registry).follow_relinks(Arc::clone(&stores)));
     let supervisor = AccountSupervisor::new(
         Arc::clone(&registry),
         Arc::clone(&stores),
         server::MAX_CLIENTS,
     );
 
-    // The hub built on this thread (see `main`) is always for
-    // `AccountId::LEGACY`: on macOS the tray already attached to it before
-    // this function ever ran, so that account's runtime is spawned through
-    // it rather than through a second, disconnected hub `spawn` would build.
-    // It is used only when a spawned account really is that id.
-    //
-    // Which ids get spawned is exactly what the shared database lists. An
-    // empty listing is *not* treated as "the legacy slot": `RemoveAccount` can
-    // retire the legacy id like any other, and a startup that recreated it
-    // would (a) silently reopen a removed account's slot and (b) resurrect the
-    // id, which upstream's `AUTOINCREMENT` allocation exists to prevent — its
-    // `PersistenceManager::new` recreates the bound `device` row whenever it
-    // is missing. So an empty database allocates its next account the same way
-    // `CreateAccount` does, which yields 1 on a genuinely fresh install and the
-    // next free id after every account has been removed.
     match stores.accounts().await {
         Ok(existing) if existing.is_empty() => match stores.create_account().await {
             Ok(id) => {
-                if id == AccountId::LEGACY {
-                    supervisor
-                        .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
-                        .await;
-                } else {
-                    supervisor.spawn(id).await;
-                }
+                supervisor.spawn(id).await;
             }
             Err(e) => log::error!("could not allocate the first account: {e:#}"),
         },
         Ok(existing) => {
             for account in existing {
-                if account.id == AccountId::LEGACY {
-                    // Still here: spawn it through the pre-built hub rather
-                    // than a second, disconnected one `spawn` would build.
-                    supervisor
-                        .spawn_with_hub(AccountId::LEGACY, Arc::clone(&hub))
-                        .await;
-                } else {
-                    // Every other account this database already knows
-                    // about, started the same way `CreateAccount` will
-                    // start a brand new one — its own hub, plugin host and
-                    // command channel, none of it shared with the legacy
-                    // slot.
+                if !registry.has_retirement(account.id) {
                     supervisor.spawn(account.id).await;
                 }
             }
-            // If `AccountId::LEGACY` was removed, it is simply absent from
-            // `existing` and nothing above spawns it — which is the whole
-            // fix: a removed id stays removed across a restart instead of
-            // this loop quietly recreating its slot.
         }
         Err(e) => {
             log::error!("could not list existing accounts at startup: {e:#}; starting with none");
@@ -298,6 +263,8 @@ async fn run(hub: Arc<StateHub>) -> Result<()> {
     // down with it), so unlike before this request is unconditional rather
     // than gated on which branch above returned.
     shutdown::request("daemon exiting");
+    tray_updates.abort();
+    relink_updates.abort();
     // While that drains, a repeated signal escalates rather than queues
     // behind it: the teardown has joins without a deadline, and a second
     // signal is somebody saying the first one is taking too long.

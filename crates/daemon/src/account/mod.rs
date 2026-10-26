@@ -13,6 +13,8 @@
 //! reimplementing the same construction `main.rs` used to do once, inline,
 //! for the one account a single-account daemon ever had.
 
+mod retirement;
+
 use std::collections::HashMap;
 #[cfg(not(target_family = "wasm"))]
 use std::future::Future;
@@ -167,7 +169,12 @@ impl AccountRuntime {
             Arc::clone(&self.plugins),
             command_rx,
             self.lifecycle.clone(),
-            shutdown,
+            async {
+                tokio::select! {
+                    () = shutdown => {},
+                    () = self.lifecycle.retirement_stop_requested() => {},
+                }
+            },
         )
         .await;
         self.set_status(if result.is_ok() {
@@ -193,6 +200,11 @@ pub struct AccountRegistry {
     construction: tokio::sync::Mutex<()>,
     accounts: RwLock<HashMap<AccountId, Arc<AccountRuntime>>>,
     overview: watch::Sender<Arc<AccountsSnapshot>>,
+    retirements: watch::Sender<Vec<(AccountId, AccountId)>>,
+    retirement_proofs: RwLock<HashMap<AccountId, oxidezap_session::StoredAccount>>,
+    retired_ids: RwLock<std::collections::HashSet<AccountId>>,
+    retirement_pending: RwLock<std::collections::HashSet<AccountId>>,
+    retirement_ready: RwLock<std::collections::HashSet<AccountId>>,
     /// The supervisor spawning and respawning runtimes into this registry,
     /// if one exists. `Weak`, not `Arc`: `AccountSupervisor` already holds an
     /// `Arc<AccountRegistry>`, so a strong pointer back would be a reference
@@ -221,6 +233,11 @@ impl AccountRegistry {
             construction: tokio::sync::Mutex::new(()),
             accounts: RwLock::new(HashMap::new()),
             overview,
+            retirements: watch::channel(Vec::new()).0,
+            retirement_proofs: RwLock::new(HashMap::new()),
+            retired_ids: RwLock::new(std::collections::HashSet::new()),
+            retirement_pending: RwLock::new(std::collections::HashSet::new()),
+            retirement_ready: RwLock::new(std::collections::HashSet::new()),
             #[cfg(not(target_family = "wasm"))]
             supervisor: std::sync::OnceLock::new(),
         })
@@ -246,6 +263,12 @@ impl AccountRegistry {
         use std::collections::hash_map::Entry;
 
         let id = runtime.id();
+        runtime.lifecycle().reserve_retirement_successor(
+            self.retirement_pending
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(&id),
+        );
         let inserted = match self
             .accounts
             .write()
@@ -277,6 +300,9 @@ impl AccountRegistry {
     /// Retain the rejected account and reuse one separate pairing slot across retries.
     pub async fn relink(self: &Arc<Self>, id: AccountId) -> Result<AccountId> {
         let _guard = self.relink.lock().await;
+        if let Some(successor) = self.retirement_target(id) {
+            return Ok(successor);
+        }
         let old = self
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("account not found"))?;
@@ -357,6 +383,9 @@ impl AccountRegistry {
         stores: Arc<StoreRegistry>,
     ) -> Option<(Arc<AccountRuntime>, mpsc::Receiver<SessionCommand>)> {
         let _construction = self.construction.lock().await;
+        if self.has_retirement(id) {
+            return None;
+        }
         if self.get(id).is_some() {
             return None;
         }
@@ -386,10 +415,13 @@ impl AccountRegistry {
                 EmbeddedNext::Removed
             }
             AccountExit::SessionEnded => EmbeddedNext::Restart,
-            AccountExit::SessionLoggedOut
-            | AccountExit::Stopped
-            | AccountExit::ResetIncomplete
-            | AccountExit::RemoveIncomplete => EmbeddedNext::Finished,
+            AccountExit::SessionLoggedOut => {
+                self.set_status(id, AccountStatus::Error);
+                EmbeddedNext::Finished
+            }
+            AccountExit::Stopped | AccountExit::ResetIncomplete | AccountExit::RemoveIncomplete => {
+                EmbeddedNext::Finished
+            }
         }
     }
 
@@ -437,6 +469,34 @@ impl AccountRegistry {
         runtimes
     }
 
+    /// Resolve once, never switch an established wire connection to another identity.
+    pub fn resolve_wire_account(&self, explicit: Option<i32>) -> Result<AccountId, String> {
+        let runtimes: Vec<_> = self
+            .runtimes()
+            .into_iter()
+            .filter(|runtime| !runtime.is_stopping() && !self.has_retirement(runtime.id()))
+            .collect();
+        if let Some(raw) = explicit {
+            let id = AccountId::new(raw).map_err(|error| error.to_string())?;
+            return runtimes
+                .iter()
+                .any(|runtime| runtime.id() == id)
+                .then_some(id)
+                .ok_or_else(|| format!("local account {id} is unavailable"));
+        }
+        let candidates: Vec<_> = runtimes
+            .iter()
+            .map(|runtime| {
+                (
+                    runtime.id(),
+                    runtime.hub().windows_attached(),
+                    runtime.hub().connection().is_connected(),
+                )
+            })
+            .collect();
+        select_wire_account(&candidates)
+    }
+
     /// Drive one registered runtime while publishing lifecycle transitions.
     pub async fn run(
         &self,
@@ -482,6 +542,53 @@ impl AccountRegistry {
         accounts.sort_by_key(|account| account.id.get());
         self.overview
             .send_replace(Arc::new(AccountsSnapshot { accounts }));
+    }
+}
+
+fn select_wire_account(candidates: &[(AccountId, bool, bool)]) -> Result<AccountId, String> {
+    for eligible in [
+        candidates
+            .iter()
+            .filter(|(_, window, _)| *window)
+            .collect::<Vec<_>>(),
+        candidates
+            .iter()
+            .filter(|(_, _, connected)| *connected)
+            .collect(),
+        candidates.iter().collect(),
+    ] {
+        match eligible.as_slice() {
+            [only] => return Ok(only.0),
+            [] => {}
+            _ => {
+                return Err(
+                    "multiple local accounts are available; pass --local-account <id>".into(),
+                );
+            }
+        }
+    }
+    Err("no local account is available".into())
+}
+
+#[cfg(test)]
+mod wire_selection_tests {
+    use super::*;
+    #[test]
+    fn resolves_successor_without_legacy_and_refuses_ambiguous_identity() {
+        let a = AccountId::new(2).unwrap();
+        let b = AccountId::new(3).unwrap();
+        assert_eq!(select_wire_account(&[(a, false, true)]), Ok(a));
+        assert_eq!(
+            select_wire_account(&[(AccountId::LEGACY, false, false), (a, false, true)]),
+            Ok(a)
+        );
+        assert_eq!(
+            select_wire_account(&[(a, true, false), (b, false, true)]),
+            Ok(a)
+        );
+        assert!(select_wire_account(&[(a, false, true), (b, false, true)]).is_err());
+        assert!(select_wire_account(&[(a, true, true), (b, true, true)]).is_err());
+        assert!(select_wire_account(&[]).is_err());
     }
 }
 
@@ -535,6 +642,9 @@ pub struct AccountSupervisor {
     /// and cannot interleave with the reaper's own view of which accounts are
     /// live — see [`SupervisorCommand`].
     commands: mpsc::UnboundedSender<SupervisorCommand>,
+    active_runs: watch::Sender<std::collections::HashSet<AccountId>>,
+    run_tasks: RwLock<HashMap<tokio::task::Id, AccountId>>,
+    failed_runs: RwLock<std::collections::HashSet<AccountId>>,
     /// Set once by [`Self::join_all`], read by [`Self::handle_exit`] (a
     /// completed reset must not respawn into a daemon that is leaving) and by
     /// [`Self::create_and_spawn`] (refuse a `CreateAccount` that arrives
@@ -634,6 +744,7 @@ impl RestartPolicy {
 /// session that eventually dropped from a login that never got off the ground.
 #[cfg(not(target_family = "wasm"))]
 struct AccountRun {
+    terminal_cleanup: bool,
     id: AccountId,
     exit: session_bridge::AccountExit,
     ran_for: std::time::Duration,
@@ -720,6 +831,9 @@ impl AccountSupervisor {
             restart,
             command_capacity,
             commands,
+            active_runs: watch::channel(std::collections::HashSet::new()).0,
+            run_tasks: RwLock::new(HashMap::new()),
+            failed_runs: RwLock::new(std::collections::HashSet::new()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             failures: FailureCounts::default(),
@@ -835,12 +949,8 @@ impl AccountSupervisor {
     /// The same, using an already-built hub instead of building one
     /// internally.
     ///
-    /// The one caller this exists for is the daemon's own bootstrap: on
-    /// macOS the tray is built on the main thread, from a `StateHub` that has
-    /// to exist before the async runtime starts spawning anything at all
-    /// (see `macos_main`), so `main` builds it first and hands it in here
-    /// rather than [`Self::spawn`] building a second, disconnected one that
-    /// nobody would ever publish to.
+    /// Useful when an embedded caller already owns an account hub. The tray
+    /// uses the registry and no longer requires a pre-built legacy hub.
     ///
     /// # Panics
     ///
@@ -974,7 +1084,22 @@ impl AccountSupervisor {
     /// fix for this type's old deadlock.
     async fn handle_exit(self: &Arc<Self>, run: AccountRun) {
         use session_bridge::AccountExit;
-        let AccountRun { id, exit, ran_for } = run;
+        let AccountRun {
+            id,
+            exit,
+            ran_for,
+            terminal_cleanup,
+        } = run;
+        if terminal_cleanup {
+            return;
+        }
+        self.run_tasks
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|_, account| *account != id);
+        self.active_runs.send_modify(|active| {
+            active.remove(&id);
+        });
         // A session that ran long enough was healthy, whatever ended it: the
         // next failure starts the backoff over rather than continuing a run of
         // attempts that may be minutes old.
@@ -1006,6 +1131,12 @@ impl AccountSupervisor {
                 self.registry.remove(id);
             }
             AccountExit::ResetIncomplete | AccountExit::RemoveIncomplete => {
+                if let Some(runtime) = self.registry.get(id)
+                    && runtime.lifecycle().is_quiesced()
+                    && let Some(disposition) = runtime.lifecycle().disposition()
+                {
+                    runtime.lifecycle().retry_failed_disposition(disposition);
+                }
                 // The teardown already logged exactly why the storage
                 // mutation did not run. Left registered, untouched: the
                 // user can still act on this account, and respawning or
@@ -1025,7 +1156,17 @@ impl AccountSupervisor {
                 );
                 self.registry.set_status(id, AccountStatus::Error);
             }
-            AccountExit::SessionEnded => self.recover(id),
+            AccountExit::SessionEnded => {
+                if self
+                    .registry
+                    .get(id)
+                    .is_some_and(|runtime| runtime.is_stopping())
+                {
+                    self.registry.set_status(id, AccountStatus::Error);
+                } else {
+                    self.recover(id);
+                }
+            }
             AccountExit::Stopped => {
                 // A process-wide shutdown, or a command channel nothing can
                 // send on again. Left registered with whatever terminal status
@@ -1095,7 +1236,11 @@ impl AccountSupervisor {
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        if self.registry.get(id).is_none() {
+        if self
+            .registry
+            .get(id)
+            .is_none_or(|runtime| runtime.is_stopping())
+        {
             return;
         }
         // Bumped here too: this restart is the generation a later timer would
@@ -1117,14 +1262,41 @@ impl AccountSupervisor {
         id: AccountId,
         disposition: AccountDisposition,
     ) -> LifecycleOutcome {
+        self.finish_terminal_with(id, disposition, |hub| {
+            let stores = Arc::clone(&self.stores);
+            async move { session_bridge::finish_forget(id, &stores, &hub, disposition).await }
+        })
+        .await
+    }
+
+    async fn finish_terminal_with<F, Fut>(
+        self: &Arc<Self>,
+        id: AccountId,
+        disposition: AccountDisposition,
+        cleanup: F,
+    ) -> LifecycleOutcome
+    where
+        F: FnOnce(Arc<StateHub>) -> Fut,
+        Fut: std::future::Future<Output = session_bridge::AccountExit>,
+    {
+        let _relink = self.registry.relink.lock().await;
+        if self.registry.has_retirement(id) {
+            return LifecycleOutcome::NoAccount;
+        }
         let Some(runtime) = self.registry.get(id) else {
             return LifecycleOutcome::NoAccount;
         };
+        if runtime.lifecycle().set_disposition(disposition)
+            == session_bridge::DispositionOutcome::Conflict
+        {
+            return LifecycleOutcome::Incomplete;
+        }
         // Invalidate any restart timer before touching storage: it must not
         // resurrect an account this request is retiring or resetting.
         self.bump_generation(id);
-        let exit =
-            session_bridge::finish_forget(id, &self.stores, &runtime.hub(), disposition).await;
+        let lifecycle = runtime.lifecycle();
+        let _media = lifecycle.drain_media().await;
+        let exit = cleanup(runtime.hub()).await;
         use session_bridge::AccountExit;
         match exit {
             AccountExit::ResetCompleted => {
@@ -1142,7 +1314,29 @@ impl AccountSupervisor {
             }
             // The teardown's own logs say why; the row is untouched, which is
             // a state the user can act on again.
-            _ => LifecycleOutcome::Incomplete,
+            _ => {
+                runtime.lifecycle().retry_failed_disposition(disposition);
+                LifecycleOutcome::Incomplete
+            }
+        }
+    }
+
+    fn handle_join_error(&self, error: tokio::task::JoinError) {
+        log::error!("an account task failed: {error}");
+        let id = self
+            .run_tasks
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&error.id());
+        if let Some(id) = id {
+            self.failed_runs
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id);
+            self.active_runs.send_modify(|active| {
+                active.remove(&id);
+            });
+            self.registry.set_status(id, AccountStatus::Error);
         }
     }
 
@@ -1193,7 +1387,7 @@ impl AccountSupervisor {
                         reaped_any = true;
                     }
                     Some(Err(e)) => {
-                        log::error!("an account task panicked: {e}");
+                        self.handle_join_error(e);
                         reaped_any = true;
                     }
                     None => {}
@@ -1231,7 +1425,7 @@ impl AccountSupervisor {
                 }
                 joined = tasks.join_next(), if !tasks.is_empty() => match joined {
                     Some(Ok(run)) => self.handle_exit(run).await,
-                    Some(Err(e)) => log::error!("an account task panicked: {e}"),
+                    Some(Err(e)) => self.handle_join_error(e),
                     None => {}
                 },
                 () = self.wake.notified(), if !self.shutting_down.load(Ordering::SeqCst) => {}
@@ -1254,7 +1448,19 @@ impl AccountSupervisor {
                 runtime,
                 command_rx,
             } => {
-                tasks.spawn(Self::run_task(Arc::clone(self), runtime, command_rx));
+                self.active_runs.send_modify(|active| {
+                    active.insert(runtime.id());
+                });
+                let id = runtime.id();
+                self.failed_runs
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&id);
+                let task = tasks.spawn(Self::run_task(Arc::clone(self), runtime, command_rx));
+                self.run_tasks
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(task.id(), id);
             }
             SupervisorCommand::RestartDue { id, generation } => {
                 self.restart_due(id, generation).await;
@@ -1268,6 +1474,18 @@ impl AccountSupervisor {
                     let _ = reply.send(LifecycleOutcome::NoAccount);
                     return;
                 };
+                // A joined panic proves termination, but not successful close.
+                // Keep storage intact until a fresh runtime can close safely.
+                if self
+                    .failed_runs
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains(&id)
+                    && !runtime.lifecycle().is_quiesced()
+                {
+                    let _ = reply.send(LifecycleOutcome::Incomplete);
+                    return;
+                }
                 // A runtime already stopping has a task that will finish the
                 // teardown and be reaped, so the operation is in flight: do
                 // not run a second storage mutation underneath it. `Accepted`
@@ -1275,7 +1493,16 @@ impl AccountSupervisor {
                 // observed through the account set, exactly as the
                 // command-channel path answers.
                 if runtime.is_stopping() {
-                    let _ = reply.send(LifecycleOutcome::Accepted);
+                    let outcome = if runtime
+                        .lifecycle()
+                        .disposition()
+                        .is_some_and(|held| held != disposition)
+                    {
+                        LifecycleOutcome::Incomplete
+                    } else {
+                        LifecycleOutcome::Accepted
+                    };
+                    let _ = reply.send(outcome);
                     return;
                 }
                 // A live session owns the command channel; ask it to stop and
@@ -1292,16 +1519,61 @@ impl AccountSupervisor {
                         reply: answered,
                     })
                     .await;
-                if sent.is_ok() && matches!(accepted.await, Ok(CommandOutcome::Accepted)) {
-                    let _ = reply.send(LifecycleOutcome::Accepted);
-                    return;
+                if sent.is_ok() {
+                    match accepted.await {
+                        Ok(CommandOutcome::Accepted) => {
+                            let _ = reply.send(LifecycleOutcome::Accepted);
+                            return;
+                        }
+                        Ok(_) => {
+                            // A live runtime refused the request, for example
+                            // because consolidation pinned its valid session.
+                            // Refusal is never permission for terminal cleanup.
+                            let _ = reply.send(LifecycleOutcome::Incomplete);
+                            return;
+                        }
+                        Err(_) => {}
+                    }
                 }
                 // No live session to ask — a logout, an exhausted recovery, or
                 // a pending restart whose runtime has no task yet. Finish the
-                // storage mutation here, where the supervisor is the authority
-                // on whether anything is still writing.
-                let outcome = self.finish_terminal(id, disposition).await;
-                let _ = reply.send(outcome);
+                // mutation in a tracked task, after any old session has been
+                // joined. The reaper must keep serving other accounts while
+                // media leases or external cleanup are still draining.
+                if runtime.lifecycle().set_disposition(disposition)
+                    == session_bridge::DispositionOutcome::Conflict
+                {
+                    let _ = reply.send(LifecycleOutcome::Incomplete);
+                    return;
+                }
+                self.bump_generation(id);
+                let mut active = self.active_runs.subscribe();
+                let was_running = active.borrow().contains(&id);
+                let supervisor = Arc::clone(self);
+                tasks.spawn(async move {
+                    while active.borrow_and_update().contains(&id) {
+                        if active.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    // Joining the old task precedes any terminal mutation.
+                    // A failed close is not permission to remove its storage.
+                    if !was_running || runtime.lifecycle().is_quiesced() {
+                        supervisor.finish_terminal(id, disposition).await;
+                    } else {
+                        log::warn!(
+                            "account {} did not quiesce; terminal cleanup deferred",
+                            id.get()
+                        );
+                    }
+                    AccountRun {
+                        terminal_cleanup: true,
+                        id,
+                        exit: session_bridge::AccountExit::Stopped,
+                        ran_for: std::time::Duration::ZERO,
+                    }
+                });
+                let _ = reply.send(LifecycleOutcome::Accepted);
             }
         }
     }
@@ -1333,6 +1605,7 @@ impl AccountSupervisor {
             }
         };
         AccountRun {
+            terminal_cleanup: false,
             id,
             exit,
             ran_for: started.elapsed(),
@@ -1535,6 +1808,7 @@ mod tests {
         assert_eq!(registry.runtimes().len(), 1);
         let (_, ensured) = tokio::join!(
             supervisor.handle_exit(super::AccountRun {
+                terminal_cleanup: false,
                 id,
                 exit: crate::session_bridge::AccountExit::ResetCompleted,
                 ran_for: std::time::Duration::from_secs(1),
@@ -1631,6 +1905,7 @@ mod tests {
 
         fn run(id: i32, exit: AccountExit) -> AccountRun {
             AccountRun {
+                terminal_cleanup: false,
                 id: AccountId::new(id).unwrap(),
                 exit,
                 ran_for: std::time::Duration::from_secs(1),
@@ -1781,6 +2056,7 @@ mod tests {
             async move {
                 supervisor
                     .handle_exit(AccountRun {
+                        terminal_cleanup: false,
                         id: AccountId::LEGACY,
                         exit: crate::session_bridge::AccountExit::ResetCompleted,
                         ran_for: std::time::Duration::from_secs(1),
@@ -1855,6 +2131,7 @@ mod tests {
         assert!(registry.insert(runtime(1)));
         supervisor
             .handle_exit(AccountRun {
+                terminal_cleanup: false,
                 id: AccountId::LEGACY,
                 exit: crate::session_bridge::AccountExit::RemoveCompleted,
                 ran_for: std::time::Duration::from_secs(1),
@@ -1939,6 +2216,9 @@ mod tests {
             LifecycleOutcome::Accepted,
             "a terminal account's removal must run directly, not fail on a dead channel"
         );
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.join_all())
+            .await
+            .expect("terminal cleanup must finish");
         assert!(
             registry.get(id).is_none(),
             "the completed removal drops the runtime"
@@ -1952,9 +2232,166 @@ mod tests {
                 .any(|account| account.id == id),
             "and the device row is really gone"
         );
+    }
 
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.join_all()).await;
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn a_joined_panic_releases_cleanup_waiters_without_authorizing_storage_removal() {
+        use super::{AccountSupervisor, LifecycleOutcome, RestartPolicy};
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:terminal-panic-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let id = stores.create_account().await.unwrap();
+        let account = runtime(id.get());
+        registry.insert(Arc::clone(&account));
+        let supervisor = AccountSupervisor::with_shutdown(
+            registry,
+            Arc::clone(&stores),
+            4,
+            RestartPolicy::production(),
+            || std::future::ready(()),
+        );
+        let failed = tokio::spawn(async { panic!("synthetic account task failure") });
+        supervisor
+            .run_tasks
+            .write()
+            .unwrap()
+            .insert(failed.id(), id);
+        supervisor.active_runs.send_modify(|active| {
+            active.insert(id);
+        });
+        assert_eq!(
+            supervisor.remove_account(id).await,
+            LifecycleOutcome::Accepted
+        );
+        supervisor.handle_join_error(failed.await.unwrap_err());
+        assert!(!supervisor.active_runs.borrow().contains(&id));
+        assert_eq!(
+            supervisor.remove_account(id).await,
+            LifecycleOutcome::Incomplete
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor.join_all())
+            .await
+            .expect("a joined panic cannot strand tracked cleanup or shutdown");
+        assert!(supervisor.registry.get(id).is_some());
+        assert!(!account.lifecycle().is_quiesced());
+        assert!(
+            stores
+                .accounts()
+                .await
+                .unwrap()
+                .iter()
+                .any(|account| account.id == id)
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn pending_terminal_cleanup_does_not_block_the_supervisor() {
+        use super::{AccountSupervisor, LifecycleOutcome, RestartPolicy};
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:terminal-join-wait-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let old = AccountId::new(2000000001).unwrap();
+        let other = AccountId::new(2000000002).unwrap();
+        let old_runtime = runtime(old.get());
+        let other_runtime = runtime(other.get());
+        registry.insert(Arc::clone(&old_runtime));
+        registry.insert(Arc::clone(&other_runtime));
+        let supervisor = AccountSupervisor::with_shutdown(
+            registry,
+            stores,
+            4,
+            RestartPolicy::production(),
+            || std::future::ready(()),
+        );
+        supervisor.active_runs.send_modify(|active| {
+            active.insert(old);
+        });
+        let pin = other_runtime.lifecycle().pin().unwrap();
+        assert_eq!(
+            supervisor.remove_account(old).await,
+            LifecycleOutcome::Accepted
+        );
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            supervisor.remove_account(other),
+        )
+        .await
+        .expect("joining an old task must not block another account's request");
+        assert_eq!(answer, LifecycleOutcome::Incomplete);
+        drop(pin);
+        // Simulate an old task that joined without proving a successful close.
+        // No storage or external cleanup is permitted in this case.
+        supervisor.active_runs.send_modify(|active| {
+            active.remove(&old);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor.join_all())
+            .await
+            .expect("tracked terminal task must finish");
+        assert!(supervisor.registry.get(old).is_some());
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn a_temporary_terminal_cleanup_failure_does_not_report_a_permanent_in_flight_operation()
+    {
+        use super::{AccountSupervisor, LifecycleOutcome, RestartPolicy};
+        use crate::session_bridge::{AccountDisposition, AccountExit};
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:terminal-cleanup-retry-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let old = stores.create_account().await.unwrap();
+        let other = stores.create_account().await.unwrap();
+        let runtime = runtime(old.get());
+        registry.insert(Arc::clone(&runtime));
+        let supervisor = AccountSupervisor::with_shutdown(
+            Arc::clone(&registry),
+            Arc::clone(&stores),
+            4,
+            RestartPolicy::production(),
+            || Box::pin(std::future::ready(())),
+        );
+        let failed = supervisor
+            .finish_terminal_with(old, AccountDisposition::Remove, |_| async {
+                AccountExit::RemoveIncomplete
+            })
+            .await;
+        assert_eq!(failed, LifecycleOutcome::Incomplete);
+        assert!(
+            !runtime.is_stopping(),
+            "the reaper must not short-circuit the next request as already in flight"
+        );
+        assert_eq!(runtime.lifecycle().disposition(), None);
+        assert_eq!(stores.accounts().await.unwrap().len(), 2);
+        let retried = supervisor
+            .finish_terminal_with(old, AccountDisposition::Remove, |_| {
+                let stores = Arc::clone(&stores);
+                async move {
+                    stores.remove_account(old).await.unwrap();
+                    AccountExit::RemoveCompleted
+                }
+            })
+            .await;
+        assert_eq!(retried, LifecycleOutcome::Accepted);
+        assert!(registry.get(old).is_none());
+        assert_eq!(
+            stores
+                .accounts()
+                .await
+                .unwrap()
+                .iter()
+                .map(|account| account.id)
+                .collect::<Vec<_>>(),
+            vec![other]
+        );
+        supervisor.join_all().await;
     }
 
     /// A restart that fires after the account was removed is a no-op: the

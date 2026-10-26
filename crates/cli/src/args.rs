@@ -22,6 +22,10 @@ pub struct OxidezapCli {
     #[usage(long, global, env = "OXIDEZAP_ACCOUNT")]
     pub account: Option<String>,
 
+    /// Select a local account inside the daemon, independently of --account
+    #[usage(long, global, env = "OXIDEZAP_LOCAL_ACCOUNT")]
+    pub local_account: Option<String>,
+
     /// Override daemon socket path
     #[usage(long, global, env = "OXIDEZAP_SOCKET")]
     pub socket: Option<String>,

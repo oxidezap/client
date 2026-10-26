@@ -291,6 +291,30 @@ async fn serve(
     }
 
     if let Some(key) = request.path.strip_prefix(&format!("{WEB_MEDIA_PATH}/")) {
+        let decoded = http::percent_decode(key);
+        let account =
+            oxidezap_ipc::account_id_of(&decoded).unwrap_or(oxidezap_core::AccountId::LEGACY);
+        let Some(runtime) = registry.get(account) else {
+            return respond(
+                stream.get_mut(),
+                404,
+                "text/plain",
+                origin.as_deref(),
+                b"account is unavailable",
+            )
+            .await;
+        };
+        let lifecycle = runtime.lifecycle();
+        let Some(_media) = lifecycle.media_lease().await else {
+            return respond(
+                stream.get_mut(),
+                404,
+                "text/plain",
+                origin.as_deref(),
+                b"account is stopping",
+            )
+            .await;
+        };
         // A staging upload is the one write this endpoint takes, and it reads
         // from the buffered reader rather than the socket: the head was read
         // a byte at a time but a client may send head and body in one
@@ -318,7 +342,18 @@ async fn serve(
         if request.method == "DELETE" {
             return crate::media::http::discard(stream.get_mut(), key, origin.as_deref()).await;
         }
-        return crate::media::http::serve(stream.get_mut(), key, origin.as_deref()).await;
+        // Only the read-only download may be cancelled as a whole. Upload
+        // and discard must finish their disk operations while holding the
+        // lease; their socket responses have their own bounded writes.
+        return oxidezap_session::with_timeout(
+            crate::media::http::serve(stream.get_mut(), key, origin.as_deref()),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_else(|| {
+            log::warn!("account media download timed out");
+            Ok(())
+        });
     }
 
     respond(

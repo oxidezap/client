@@ -58,7 +58,29 @@ pub struct RuntimeLifecycle {
     /// decides from this alone whether to respawn the id (`Reset`), drop it
     /// for good (`Remove`), or do neither — a session that ended on its own,
     /// or a process-wide shutdown, leaves this `None`.
-    disposition: Arc<Mutex<Option<AccountDisposition>>>,
+    disposition: Arc<Mutex<LifecycleState>>,
+    quiesced: Arc<AtomicBool>,
+    retirement_stop: tokio::sync::watch::Sender<bool>,
+    media: Arc<tokio::sync::RwLock<()>>,
+}
+
+#[derive(Debug, Default)]
+struct LifecycleState {
+    disposition: Option<AccountDisposition>,
+    pins: usize,
+    retirement_reserved: bool,
+    retiring: bool,
+}
+
+/// Keeps a confirmed successor from being reset while its predecessor is retired.
+pub(crate) struct LifecyclePin {
+    state: Arc<Mutex<LifecycleState>>,
+}
+impl Drop for LifecyclePin {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.pins -= 1;
+    }
 }
 
 impl RuntimeLifecycle {
@@ -66,7 +88,10 @@ impl RuntimeLifecycle {
     pub fn new() -> Self {
         Self {
             stopping: Arc::new(AtomicBool::new(false)),
-            disposition: Arc::new(Mutex::new(None)),
+            disposition: Arc::new(Mutex::new(LifecycleState::default())),
+            quiesced: Arc::new(AtomicBool::new(false)),
+            retirement_stop: tokio::sync::watch::channel(false).0,
+            media: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -97,16 +122,18 @@ impl RuntimeLifecycle {
                 .disposition
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match *slot {
-                None => {
-                    *slot = Some(disposition);
+            match slot.disposition {
+                None if slot.pins == 0 && !slot.retirement_reserved && !slot.retiring => {
+                    slot.disposition = Some(disposition);
                     DispositionOutcome::Recorded
                 }
                 Some(held) if held == disposition => DispositionOutcome::AlreadySame,
-                Some(_) => DispositionOutcome::Conflict,
+                _ => DispositionOutcome::Conflict,
             }
         };
-        self.mark_stopping();
+        if outcome != DispositionOutcome::Conflict {
+            self.mark_stopping();
+        }
         outcome
     }
 
@@ -114,10 +141,124 @@ impl RuntimeLifecycle {
     /// asked before it stopped.
     #[must_use]
     pub fn disposition(&self) -> Option<AccountDisposition> {
-        *self
-            .disposition
+        self.disposition
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .disposition
+    }
+
+    /// Reserve the old lifecycle before committing an identity-confirmed intent.
+    /// This is not a removal disposition: teardown must retain storage.
+    pub(crate) fn start_retirement(&self) -> bool {
+        let mut state = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.disposition.is_some() || state.pins != 0 || state.retiring {
+            return false;
+        }
+        state.retiring = true;
+        self.mark_stopping();
+        true
+    }
+
+    pub(crate) fn cancel_retirement_reservation(&self) {
+        let mut state = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !*self.retirement_stop.borrow() {
+            state.retiring = false;
+            self.stopping.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn request_retirement_stop(&self) {
+        self.mark_stopping();
+        self.retirement_stop.send_replace(true);
+    }
+
+    pub(crate) async fn retirement_stop_requested(&self) {
+        let mut stop = self.retirement_stop.subscribe();
+        while !*stop.borrow_and_update() {
+            if stop.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn claim_retirement_cleanup(&self) -> bool {
+        let mut state = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_quiesced()
+            || state.pins != 0
+            || state
+                .disposition
+                .is_some_and(|held| held != AccountDisposition::Remove)
+        {
+            return false;
+        }
+        state.retiring = true;
+        state.disposition = Some(AccountDisposition::Remove);
+        self.mark_stopping();
+        true
+    }
+
+    pub(crate) fn pin(&self) -> Option<LifecyclePin> {
+        let mut state = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.disposition.is_some() || self.is_stopping() {
+            return None;
+        }
+        state.pins += 1;
+        Some(LifecyclePin {
+            state: Arc::clone(&self.disposition),
+        })
+    }
+
+    /// Only after terminal cleanup returned: there is no operation left in
+    /// flight, so a temporary failure must permit an explicit retry.
+    pub(crate) fn retry_failed_disposition(&self, expected: AccountDisposition) {
+        let mut state = self
+            .disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.disposition == Some(expected) {
+            state.disposition = None;
+            self.stopping.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn reserve_retirement_successor(&self, reserved: bool) {
+        self.disposition
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retirement_reserved = reserved;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) async fn media_lease(&self) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        if self.is_stopping() {
+            return None;
+        }
+        let lease = Arc::clone(&self.media).read_owned().await;
+        (!self.is_stopping()).then_some(lease)
+    }
+
+    pub(crate) async fn drain_media(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.media).write_owned().await
+    }
+
+    pub(crate) fn mark_quiesced(&self) {
+        self.quiesced.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_quiesced(&self) -> bool {
+        self.quiesced.load(Ordering::SeqCst)
     }
 }
 
@@ -290,20 +431,16 @@ pub async fn run(
     // and refuses a write from an older one — see `plugin_host::Origin`. A
     // page can pair again without reloading, so what is refused has to be the
     // departed account's handles rather than every handle from here on.
-    {
+    let plugins_closed = {
         let plugins = Arc::clone(&bridge.plugins);
-        if oxidezap_session::unblock(move || plugins.shutdown())
-            .await
-            .is_err()
-        {
+        let result = oxidezap_session::unblock(move || plugins.shutdown()).await;
+        if result.is_err() {
             log::error!("the plugin threads did not finish");
         }
-    }
+        result.is_ok()
+    };
 
-    // Before anything is deleted, and on a blocking thread because joining
-    // one is: the publisher writes this account's media, and a wipe that
-    // starts while it is still draining its queue deletes a directory that
-    // is about to be written into again.
+    // The publisher can still write media until its task has joined.
     if let Some(publisher) = bridge.stop_publishing() {
         publisher.join().await;
     }
@@ -330,7 +467,7 @@ pub async fn run(
     // the account and take this with it.
     let logged_out = bridge.hub.is_logged_out();
     let exit = if let Some(disposition) = disposition {
-        if !closed {
+        if !closed || !plugins_closed {
             log::error!(
                 "local state was NOT reset: the session is still closing, and resetting the \
                  account from under it could let it repopulate what the reset just cleared. \
@@ -338,6 +475,7 @@ pub async fn run(
             );
             disposition.incomplete()
         } else {
+            let _media = bridge.lifecycle.drain_media().await;
             finish_forget(account_id, &stores_for_reset, &bridge.hub, disposition).await
         }
     } else if stopping || commands_closed {
@@ -351,6 +489,9 @@ pub async fn run(
         AccountExit::SessionEnded
     };
     crate::avatar::purge(&bridge.hub);
+    if closed && plugins_closed {
+        bridge.lifecycle.mark_quiesced();
+    }
     Ok(exit)
 }
 
@@ -390,6 +531,31 @@ pub async fn finish_forget(
         );
         return disposition.incomplete();
     }
+    // A plugin's own settings are this account's data too — an autoreply's
+    // "already answered these people" is a list of people — and they sit in
+    // their own directory beside the plugins rather than inside the store.
+    // Nothing is writing them any more: the caller stopped the session.
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(dir) = crate::plugins::account_state_dir(account_id)
+        && let Err(e) = std::fs::remove_dir_all(&dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        // Only the settings are at stake here: the permissions were retired
+        // before the credentials went, so nothing that survives this can let a
+        // plugin act on whoever pairs next.
+        log::error!("could not clear the plugins' stored settings: {e}");
+        return disposition.incomplete();
+    }
+    // The store is one file; the media is a directory beside it, and it is
+    // just as much this account's data. Everything, staged uploads included:
+    // the account is going, and so is anything that was going to be sent under
+    // it.
+    if let Err(e) =
+        crate::media::AccountMedia::new(hub.account_id()).wipe(crate::media::Wipe::Everything)
+    {
+        log::error!("could not clear the media cache: {e}");
+        return disposition.incomplete();
+    }
     // Purges this account's rows — upstream's and, through the `ON DELETE
     // CASCADE` the chat-store migration adds, this crate's own. Never the
     // whole-file wipe a single-account daemon used: the shared database holds
@@ -419,29 +585,6 @@ pub async fn finish_forget(
     };
     if !completed {
         return disposition.incomplete();
-    }
-    // A plugin's own settings are this account's data too — an autoreply's
-    // "already answered these people" is a list of people — and they sit in
-    // their own directory beside the plugins rather than inside the store.
-    // Nothing is writing them any more: the caller stopped the session.
-    #[cfg(not(target_family = "wasm"))]
-    if let Some(dir) = crate::plugins::account_state_dir(account_id)
-        && let Err(e) = std::fs::remove_dir_all(&dir)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        // Only the settings are at stake here: the permissions were retired
-        // before the credentials went, so nothing that survives this can let a
-        // plugin act on whoever pairs next.
-        log::error!("could not clear the plugins' stored settings: {e}");
-    }
-    // The store is one file; the media is a directory beside it, and it is
-    // just as much this account's data. Everything, staged uploads included:
-    // the account is going, and so is anything that was going to be sent under
-    // it.
-    if let Err(e) =
-        crate::media::AccountMedia::new(hub.account_id()).wipe(crate::media::Wipe::Everything)
-    {
-        log::error!("could not clear the media cache: {e}");
     }
     disposition.completed()
 }

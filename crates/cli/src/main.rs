@@ -191,6 +191,19 @@ fn main() -> ExitCode {
         }
     }
 
+    let local_account = match cli.local_account.as_deref().map(str::parse::<i32>) {
+        Some(Ok(id)) if id > 0 => Some(id),
+        None => None,
+        _ => {
+            print_error(
+                output_mode,
+                "invalid_local_account",
+                "--local-account must be a positive SQLite account id",
+            );
+            return ExitCode::from(2);
+        }
+    };
+
     // Connect, starting the daemon beside this binary when nothing is
     // listening. An explicit socket never spawns: the caller named a daemon it
     // expects to exist.
@@ -232,13 +245,28 @@ fn main() -> ExitCode {
     let handshake_req = ClientRequest::Hello {
         protocol: CURRENT_PROTOCOL_VERSION,
         client_name: "oxidezap-cli".into(),
+        local_account,
+        account_selection: true,
         read_only: cli.read_only,
         session_events,
     };
 
-    if let Err(err) = client.request(handshake_req) {
-        print_error(output_mode, &err.code, &err.message);
-        return ExitCode::from(3);
+    match client.request(handshake_req) {
+        Ok(DaemonResponse::AccountSelected {
+            local_account: selected,
+        }) if local_account.is_none_or(|requested| requested == selected) => {}
+        Ok(_) => {
+            print_error(
+                output_mode,
+                "account_selection_unsupported",
+                "daemon did not confirm local account selection; update the daemon before retrying",
+            );
+            return ExitCode::from(3);
+        }
+        Err(err) => {
+            print_error(output_mode, &err.code, &err.message);
+            return ExitCode::from(3);
+        }
     }
 
     // Execute command

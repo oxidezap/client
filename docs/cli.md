@@ -62,10 +62,22 @@ command that deletes a profile's store.
 
 ## Accounts
 
-One account is one daemon over one store: separate socket, lock, database
-and media cache. The daemon takes `--account <id>` (or `OXIDEZAP_ACCOUNT`);
+A named profile has a separate daemon socket, lock, database and media cache.
+Each daemon can hold several local WhatsApp accounts in that shared database. The daemon takes `--account <id>` (or `OXIDEZAP_ACCOUNT`);
 the CLI selects with the same flag or variable, and `--socket` overrides
 both. `--account` wins over the environment.
+
+`--local-account <positive-id>` selects the local account inside that daemon.
+It also accepts `OXIDEZAP_LOCAL_ACCOUNT`. Without it, the daemon chooses the
+only account with a window, otherwise the only connected account, otherwise
+the only available account. Multiple candidates at any step require an
+explicit id. This choice is fixed for the connection, including event streams.
+
+The CLI requires an account-selection acknowledgement before sending a
+command. An older daemon that ignores the new hello fields is refused with
+`account_selection_unsupported`. Existing wire clients that omit the new
+fields retain their legacy-account behavior. No protocol or release version
+changes are needed for this capability negotiation.
 
 An id is validated, never sanitized: `[A-Za-z0-9][A-Za-z0-9_-]*`, and
 anything else is refused with `invalid_account_id` (exit 2). Sanitizing

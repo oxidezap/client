@@ -177,7 +177,7 @@ pub(crate) async fn serve_client_with_registry(
     // a task and a descriptor and given nothing back. A peer that connects
     // and says nothing would otherwise sit here for as long as it liked, and
     // a reconnect loop doing it would take the listener down with it.
-    let attached = match oxidezap_session::with_timeout(
+    let mut attached = match oxidezap_session::with_timeout(
         handshake(&mut reader, &mut writer, &mut buf),
         HANDSHAKE_TIMEOUT,
     )
@@ -196,11 +196,41 @@ pub(crate) async fn serve_client_with_registry(
         }
     };
 
+    let mut retirements = registry.watch_retirements();
+    if attached.is_wire && (attached.account_selection || attached.wire_account.is_some()) {
+        match registry.resolve_wire_account(attached.wire_account) {
+            Ok(account) => attached.scope = oxidezap_ipc::ClientScope::Account { account },
+            Err(detail) => {
+                let response = oxidezap_wire::envelope::ResponseEnvelope {
+                    id: attached.wire_hello_id,
+                    result: oxidezap_wire::envelope::ResponseResult::Error {
+                        error: oxidezap_wire::error::ApiError::invalid_request(detail),
+                    },
+                };
+                write_line(&mut writer, &serde_json::to_string(&response)?).await?;
+                return Ok(());
+            }
+        }
+    }
+
     let (hub, plugins, commands) = match attached.scope {
         oxidezap_ipc::ClientScope::Control => {
             return serve_control_client(reader, writer, registry).await;
         }
         oxidezap_ipc::ClientScope::Account { account } => {
+            if let Some(successor) = registry.retirement_target(account) {
+                if !attached.is_wire {
+                    write_line(
+                        &mut writer,
+                        &serde_json::to_string(&DaemonMessage::AccountRetired {
+                            account,
+                            successor,
+                        })?,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
             let Some(runtime) = registry.get(account) else {
                 let frame = error_frame(
                     None,
@@ -288,7 +318,13 @@ pub(crate) async fn serve_client_with_registry(
         let resp = oxidezap_wire::envelope::ResponseEnvelope {
             id: attached.wire_hello_id,
             result: oxidezap_wire::envelope::ResponseResult::Ok {
-                payload: Box::new(oxidezap_wire::response::DaemonResponse::Ack),
+                payload: Box::new(if attached.account_selection {
+                    oxidezap_wire::response::DaemonResponse::AccountSelected {
+                        local_account: hub.account_id().get(),
+                    }
+                } else {
+                    oxidezap_wire::response::DaemonResponse::Ack
+                }),
             },
         };
         write_line(&mut writer, &serde_json::to_string(&resp)?).await?;
@@ -312,6 +348,19 @@ pub(crate) async fn serve_client_with_registry(
     let mut awaiting_resync = false;
 
     loop {
+        if let Some(successor) = registry.retirement_target(hub.account_id()) {
+            if !attached.is_wire {
+                write_line(
+                    &mut writer,
+                    &serde_json::to_string(&DaemonMessage::AccountRetired {
+                        account: hub.account_id(),
+                        successor,
+                    })?,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         tokio::select! {
             // Normally drain published state before reading more requests, so
             // a client that floods the socket cannot starve its own event
@@ -327,6 +376,11 @@ pub(crate) async fn serve_client_with_registry(
             // conversation, and a `Hangup` waiting that long is waiting
             // less than the stanza it turns into.
             biased;
+
+            changed = retirements.changed() => {
+                if changed.is_err() { return Ok(()); }
+            }
+
 
             // A replacement has a new hub and sender. End this attachment so
             // every frontend reconnects to the registered runtime.
@@ -609,11 +663,22 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut accounts = registry.subscribe();
+    let mut retirements = registry.watch_retirements();
     let hello = serde_json::to_string(&DaemonMessage::ControlHello {
         protocol: PROTOCOL_VERSION,
         accounts: (*registry.snapshot()).clone(),
     })?;
     write_line(&mut writer, &hello).await?;
+    let redirects = retirements.borrow_and_update().clone();
+    for (account, _) in redirects {
+        if let Some(successor) = registry.retirement_target(account) {
+            write_line(
+                &mut writer,
+                &serde_json::to_string(&DaemonMessage::AccountRetired { account, successor })?,
+            )
+            .await?;
+        }
+    }
     let mut buf = Vec::with_capacity(1024);
     // The control plane's own out-of-band answers — a plugin install, listing
     // or removal is disk work, and a control connection still pushes
@@ -626,6 +691,15 @@ where
             // Out-of-band answers first, so a plugin install/removal/listing
             // lands as soon as it is ready rather than behind a state push.
             Some(frame) = inbox.recv() => write_line(&mut writer, &frame).await?,
+            changed = retirements.changed() => {
+                if changed.is_err() { return Ok(()); }
+                let redirects = retirements.borrow_and_update().clone();
+                for (account, _) in redirects {
+                    if let Some(successor) = registry.retirement_target(account) {
+                        write_line(&mut writer, &serde_json::to_string(&DaemonMessage::AccountRetired { account, successor })?).await?;
+                    }
+                }
+            }
             changed = accounts.changed() => {
                 if changed.is_err() {
                     return Ok(());
