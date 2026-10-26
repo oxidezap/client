@@ -638,6 +638,8 @@ pub struct AccountSupervisor {
     /// live — see [`SupervisorCommand`].
     commands: mpsc::UnboundedSender<SupervisorCommand>,
     active_runs: watch::Sender<std::collections::HashSet<AccountId>>,
+    run_tasks: RwLock<HashMap<tokio::task::Id, AccountId>>,
+    failed_runs: RwLock<std::collections::HashSet<AccountId>>,
     /// Set once by [`Self::join_all`], read by [`Self::handle_exit`] (a
     /// completed reset must not respawn into a daemon that is leaving) and by
     /// [`Self::create_and_spawn`] (refuse a `CreateAccount` that arrives
@@ -825,6 +827,8 @@ impl AccountSupervisor {
             command_capacity,
             commands,
             active_runs: watch::channel(std::collections::HashSet::new()).0,
+            run_tasks: RwLock::new(HashMap::new()),
+            failed_runs: RwLock::new(std::collections::HashSet::new()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             failures: FailureCounts::default(),
@@ -1084,6 +1088,10 @@ impl AccountSupervisor {
         if terminal_cleanup {
             return;
         }
+        self.run_tasks
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|_, account| *account != id);
         self.active_runs.send_modify(|active| {
             active.remove(&id);
         });
@@ -1308,6 +1316,25 @@ impl AccountSupervisor {
         }
     }
 
+    fn handle_join_error(&self, error: tokio::task::JoinError) {
+        log::error!("an account task failed: {error}");
+        let id = self
+            .run_tasks
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&error.id());
+        if let Some(id) = id {
+            self.failed_runs
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id);
+            self.active_runs.send_modify(|active| {
+                active.remove(&id);
+            });
+            self.registry.set_status(id, AccountStatus::Error);
+        }
+    }
+
     /// Continuously reap finished account tasks and act on what they
     /// returned, for as long as the daemon runs — not just at final
     /// shutdown. Spawned once, by [`Self::with_shutdown`]; [`Self::join_all`]
@@ -1355,7 +1382,7 @@ impl AccountSupervisor {
                         reaped_any = true;
                     }
                     Some(Err(e)) => {
-                        log::error!("an account task panicked: {e}");
+                        self.handle_join_error(e);
                         reaped_any = true;
                     }
                     None => {}
@@ -1393,7 +1420,7 @@ impl AccountSupervisor {
                 }
                 joined = tasks.join_next(), if !tasks.is_empty() => match joined {
                     Some(Ok(run)) => self.handle_exit(run).await,
-                    Some(Err(e)) => log::error!("an account task panicked: {e}"),
+                    Some(Err(e)) => self.handle_join_error(e),
                     None => {}
                 },
                 () = self.wake.notified(), if !self.shutting_down.load(Ordering::SeqCst) => {}
@@ -1419,7 +1446,16 @@ impl AccountSupervisor {
                 self.active_runs.send_modify(|active| {
                     active.insert(runtime.id());
                 });
-                tasks.spawn(Self::run_task(Arc::clone(self), runtime, command_rx));
+                let id = runtime.id();
+                self.failed_runs
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&id);
+                let task = tasks.spawn(Self::run_task(Arc::clone(self), runtime, command_rx));
+                self.run_tasks
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(task.id(), id);
             }
             SupervisorCommand::RestartDue { id, generation } => {
                 self.restart_due(id, generation).await;
@@ -1433,6 +1469,18 @@ impl AccountSupervisor {
                     let _ = reply.send(LifecycleOutcome::NoAccount);
                     return;
                 };
+                // A joined panic proves termination, but not successful close.
+                // Keep storage intact until a fresh runtime can close safely.
+                if self
+                    .failed_runs
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains(&id)
+                    && !runtime.lifecycle().is_quiesced()
+                {
+                    let _ = reply.send(LifecycleOutcome::Incomplete);
+                    return;
+                }
                 // A runtime already stopping has a task that will finish the
                 // teardown and be reaped, so the operation is in flight: do
                 // not run a second storage mutation underneath it. `Accepted`
@@ -2178,6 +2226,59 @@ mod tests {
                 .iter()
                 .any(|account| account.id == id),
             "and the device row is really gone"
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn a_joined_panic_releases_cleanup_waiters_without_authorizing_storage_removal() {
+        use super::{AccountSupervisor, LifecycleOutcome, RestartPolicy};
+        let registry = AccountRegistry::new();
+        let stores = Arc::new(oxidezap_session::StoreRegistry::new(format!(
+            "file:terminal-panic-{}?mode=memory&cache=shared",
+            std::process::id()
+        )));
+        let id = stores.create_account().await.unwrap();
+        let account = runtime(id.get());
+        registry.insert(Arc::clone(&account));
+        let supervisor = AccountSupervisor::with_shutdown(
+            registry,
+            Arc::clone(&stores),
+            4,
+            RestartPolicy::production(),
+            || std::future::ready(()),
+        );
+        let failed = tokio::spawn(async { panic!("synthetic account task failure") });
+        supervisor
+            .run_tasks
+            .write()
+            .unwrap()
+            .insert(failed.id(), id);
+        supervisor.active_runs.send_modify(|active| {
+            active.insert(id);
+        });
+        assert_eq!(
+            supervisor.remove_account(id).await,
+            LifecycleOutcome::Accepted
+        );
+        supervisor.handle_join_error(failed.await.unwrap_err());
+        assert!(!supervisor.active_runs.borrow().contains(&id));
+        assert_eq!(
+            supervisor.remove_account(id).await,
+            LifecycleOutcome::Incomplete
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor.join_all())
+            .await
+            .expect("a joined panic cannot strand tracked cleanup or shutdown");
+        assert!(supervisor.registry.get(id).is_some());
+        assert!(!account.lifecycle().is_quiesced());
+        assert!(
+            stores
+                .accounts()
+                .await
+                .unwrap()
+                .iter()
+                .any(|account| account.id == id)
         );
     }
 
