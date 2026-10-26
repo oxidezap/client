@@ -754,7 +754,9 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   Inventory authorizes AVFoundation before the first query. On macOS the
   format list comes directly from `AVCaptureDevice::supported_formats` because
   nokhwa 0.10.11's aggregate API inverts its pixel-format filter and relabels
-  the remaining tuples. Other platforms keep their existing discovery API.
+  the remaining tuples. Other platforms query every supported converter
+  format explicitly: Media Foundation's aggregate API stops at two pixel
+  formats and can hide a later usable mode.
   Hardware removal ends the existing capture and owner; a later open queries
   the current modes again. Tests use a fake backend and channels, not hardware.
 - **Everything on the video path drops, and every drop asks for a keyframe.**

@@ -545,8 +545,76 @@ mod advertised_formats {
 #[cfg(not(target_os = "macos"))]
 mod advertised_formats {
     use super::*;
+    use nokhwa::utils::Resolution;
+    use std::collections::HashMap;
+
     pub fn read(camera: &mut Camera) -> Result<Vec<CameraFormat>> {
-        Ok(camera.compatible_camera_formats()?)
+        // Media Foundation's compatible_fourcc stops after two formats.
+        // Ask for every converter input instead of using that aggregate API.
+        collect(|input| Ok(camera.compatible_list_by_resolution(input)?))
+    }
+
+    fn collect(
+        mut read: impl FnMut(FrameFormat) -> Result<HashMap<Resolution, Vec<u32>>>,
+    ) -> Result<Vec<CameraFormat>> {
+        let mut modes = Vec::new();
+        let mut errors = Vec::new();
+        for input in INPUT_FORMATS {
+            match read(*input) {
+                Ok(resolutions) => {
+                    for (resolution, rates) in resolutions {
+                        modes.extend(
+                            rates
+                                .into_iter()
+                                .map(|fps| CameraFormat::new(resolution, *input, fps)),
+                        );
+                    }
+                }
+                // Unsupported pixel formats may be errors on some backends.
+                Err(error) => errors.push(format!("{input}: {error:#}")),
+            }
+        }
+        if errors.len() == INPUT_FORMATS.len() {
+            bail!("listing camera formats failed: {}", errors.join("; "));
+        }
+        Ok(modes)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_third_pixel_format_remains_available_after_two_unusable_formats() {
+            let advertised = [
+                CameraFormat::new(Resolution::new(1280, 720), FrameFormat::MJPEG, 60),
+                CameraFormat::new(Resolution::new(1920, 1080), FrameFormat::YUYV, 30),
+                CameraFormat::new(Resolution::new(640, 480), FrameFormat::NV12, 30),
+            ];
+            let wanted = VideoQuality::default();
+            assert!(
+                candidates(advertised[..2].to_vec(), wanted).is_empty(),
+                "the legacy two-format aggregate hides the only usable input"
+            );
+            let mut queried = Vec::new();
+            let complete = collect(|input| {
+                queried.push(input);
+                let mut resolutions: HashMap<Resolution, Vec<u32>> = HashMap::new();
+                for mode in advertised.iter().filter(|mode| mode.format() == input) {
+                    resolutions
+                        .entry(mode.resolution())
+                        .or_default()
+                        .push(mode.frame_rate());
+                }
+                if resolutions.is_empty() {
+                    bail!("fake unsupported pixel format");
+                }
+                Ok(resolutions)
+            })
+            .unwrap();
+            assert_eq!(queried, INPUT_FORMATS);
+            assert_eq!(candidates(complete, wanted), vec![advertised[2]]);
+        }
     }
 }
 
