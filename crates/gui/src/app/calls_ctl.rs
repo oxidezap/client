@@ -315,7 +315,12 @@ impl Calls {
         // `follow` has already cleared the pane for a camera that went off
         // and a frame still in flight would light it again — for good, since
         // no later state change would come to clear it a second time.
-        if !self.state.holds(&frame.call_id) || !self.state.video().is_on(frame.stream) {
+        if self
+            .state
+            .active()
+            .is_none_or(|call| call.call_id != frame.call_id)
+            || !self.state.video().is_on(frame.stream)
+        {
             return;
         }
         self.pictures.accept(frame);
@@ -975,10 +980,7 @@ impl WhatsAppApp {
         }
         self.sync_call_alerts(cx);
         // A refusal is not a missed call, and a local reject emits no
-        // `CallEnded` to write one later — so the record is made here, saying
-        // what actually happened. The mobile decline goes through `hang_up`,
-        // which records it as missed; this is the outcome the enum has been
-        // carrying unused.
+        // `CallEnded` to write one later, so record it here.
         self.record_call(
             Ended {
                 stage: Stage::Incoming(call),
@@ -995,6 +997,10 @@ impl WhatsAppApp {
     /// it — cancelling an unanswered call is not hanging up on someone — but
     /// the effect is the same and splitting it invites the two to drift.
     pub fn hang_up(&mut self, cx: &mut Context<Self>) {
+        if self.calls.read(cx).state().incoming().is_some() {
+            self.decline_call(cx);
+            return;
+        }
         let Some((stage, ended)) = self.calls.update(cx, |calls, cx| calls.end(cx)) else {
             return;
         };
@@ -1010,6 +1016,7 @@ impl WhatsAppApp {
                 Stage::Outgoing(_) | Stage::Active(_) => client.cancel_call(&call_id),
             }
         }
+        self.sync_call_alerts(cx);
     }
 
     pub fn set_call_minimized(&mut self, minimized: bool, cx: &mut Context<Self>) {
