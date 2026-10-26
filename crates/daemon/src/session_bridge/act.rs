@@ -103,6 +103,29 @@ impl Bridge {
         reply: tokio::sync::oneshot::Sender<CommandOutcome>,
     ) -> Option<(Action, tokio::sync::oneshot::Sender<CommandOutcome>)> {
         match action {
+            Action::MarkAudioPlayed(request) => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let hub = self.hub.clone();
+                let lifecycle = self.lifecycle.clone();
+                let task = client.mark_audio_played(request.jid, request.message_id, move || {
+                    hub.connection().is_connected()
+                        && !hub.is_logged_out()
+                        && !lifecycle.is_stopping()
+                });
+                oxidezap_session::spawn(async move {
+                    let outcome = match task.await {
+                        Ok(Ok(())) => CommandOutcome::Accepted,
+                        Ok(Err(error)) => CommandOutcome::Refused(error),
+                        Err(error) => CommandOutcome::Refused(error.to_string()),
+                    };
+                    let _ = reply.send(outcome);
+                    drop(permit);
+                });
+                None
+            }
             Action::EditMessage {
                 id,
                 request,
@@ -1611,7 +1634,8 @@ impl Bridge {
                 through_message_id,
             }) => self.mark_read(client, &jid, through_message_id.as_deref()),
             // Answered from a task of its own. See `begin_slow`.
-            Action::MarkStatusWatched(_)
+            Action::MarkAudioPlayed(_)
+            | Action::MarkStatusWatched(_)
             | Action::LoadMessages { .. }
             | Action::LoadChats { .. }
             | Action::GroupMembers { .. } => {

@@ -436,18 +436,40 @@ impl WhatsAppApp {
     /// pass and left the button, the clock and the waveform frozen for the
     /// whole note. `is_loading` is that gap, and it is false everywhere the
     /// decoder is synchronous.
+    fn observe_audio_playback(&mut self) {
+        if !self.audio_player.take_started() {
+            return;
+        }
+        let ActiveMedia::Audio { message_id } = &self.active_media else {
+            return;
+        };
+        let Some(chat) = self.chats.iter().find(|chat| {
+            chat.messages
+                .iter()
+                .any(|m| m.id == *message_id && !m.is_from_me)
+        }) else {
+            return;
+        };
+        if let Some(client) = &self.client {
+            client.mark_audio_played(chat.jid.clone(), message_id.clone());
+        }
+    }
+
     pub(super) fn ensure_playback_tick(&mut self, cx: &mut Context<Self>) {
         if self.playback_tick.is_some() {
             return;
         }
         let epoch = self.playback_epoch;
+        let account = self.client.as_ref().map(|client| client.account());
         self.playback_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
                 // ~15fps: the playhead only has to look continuous, and a
                 // voice note is not worth a frame-rate repaint of the list.
                 crate::platform::sleep(std::time::Duration::from_millis(66)).await;
                 let running = entity.update(cx, |app, cx| {
-                    if app.playback_epoch != epoch {
+                    if app.playback_epoch != epoch
+                        || app.client.as_ref().map(|client| client.account()) != account
+                    {
                         return false;
                     }
                     // The browser's `play_prepared` returns before
@@ -458,6 +480,7 @@ impl WhatsAppApp {
                     if !app.audio_player.is_loading() {
                         app.audio_preparation = None;
                     }
+                    app.observe_audio_playback();
                     let playing = app.audio_player.is_playing();
                     if playing {
                         cx.notify();
@@ -572,6 +595,7 @@ impl WhatsAppApp {
                                     if app.playback_epoch == completion_epoch
                                         && app.active_media.is_playing(&completed_id)
                                     {
+                                        app.observe_audio_playback();
                                         app.active_media = ActiveMedia::None;
                                         info!("Audio playback completed");
                                         cx.notify();

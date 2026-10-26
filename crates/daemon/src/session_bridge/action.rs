@@ -38,6 +38,7 @@ pub enum Action {
     SendMedia(oxidezap_ipc::SendMedia),
     SendReaction(oxidezap_ipc::SendReaction),
     MarkRead(oxidezap_ipc::MarkRead),
+    MarkAudioPlayed(oxidezap_ipc::MarkAudioPlayed),
     MarkStatusWatched(oxidezap_ipc::MarkStatusWatched),
     Typing(oxidezap_ipc::Typing),
     Call(CallAction),
@@ -234,6 +235,7 @@ impl Action {
                     | Self::ReconnectSession
                     | Self::RefreshVideo
                     | Self::ForgetSession(_)
+                    | Self::MarkAudioPlayed(_)
                     | Self::MarkStatusWatched(_)
                     | Self::LoadMessages { .. }
                     | Self::LoadChats { .. }

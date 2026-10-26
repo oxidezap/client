@@ -23,6 +23,7 @@ mod cpal_output {
     use tokio::sync::oneshot;
 
     use super::PlayerError;
+    use crate::playback_start::PlaybackStart;
 
     /// Samples ready for the output callback.
     ///
@@ -39,6 +40,7 @@ mod cpal_output {
     /// Audio player for PTT voice messages.
     pub struct AudioPlayer {
         stream: Option<Stream>,
+        started: Arc<PlaybackStart>,
         is_playing: Arc<AtomicBool>,
         position: Arc<AtomicUsize>,
         total_samples: u64,
@@ -84,6 +86,7 @@ mod cpal_output {
         pub fn new() -> Self {
             Self {
                 stream: None,
+                started: Arc::new(PlaybackStart::default()),
                 is_playing: Arc::new(AtomicBool::new(false)),
                 position: Arc::new(AtomicUsize::new(0)),
                 finished: Arc::new(AtomicBool::new(false)),
@@ -117,6 +120,11 @@ mod cpal_output {
             let (tx, rx) = oneshot::channel();
             self.completion_tx = Some(tx);
             rx
+        }
+
+        /// True once per loaded clip, after the output callback consumed samples.
+        pub fn take_started(&mut self) -> bool {
+            self.started.take(self.stream.is_some())
         }
 
         pub fn is_playing(&self) -> bool {
@@ -329,6 +337,7 @@ mod cpal_output {
                 config.sample_rate, output_channels, sample_format
             );
 
+            self.started = Arc::new(PlaybackStart::default());
             let is_playing = self.is_playing.clone();
             let position = self.position.clone();
             position.store(0, Ordering::Relaxed);
@@ -351,6 +360,7 @@ mod cpal_output {
                     is_playing,
                     finished,
                     completion_tx,
+                    self.started.clone(),
                 ),
                 SampleFormat::I16 => build_stream::<i16>(
                     &device,
@@ -360,6 +370,7 @@ mod cpal_output {
                     is_playing,
                     finished,
                     completion_tx,
+                    self.started.clone(),
                 ),
                 SampleFormat::U16 => build_stream::<u16>(
                     &device,
@@ -369,6 +380,7 @@ mod cpal_output {
                     is_playing,
                     finished,
                     completion_tx,
+                    self.started.clone(),
                 ),
                 other => Err(PlayerError::StreamError(format!(
                     "unsupported output sample format {other:?}"
@@ -400,6 +412,7 @@ mod cpal_output {
 
         pub fn stop(&mut self) {
             self.stream.take();
+            self.started = Arc::new(PlaybackStart::default());
             self.is_playing.store(false, Ordering::Relaxed);
             self.finished.store(false, Ordering::Relaxed);
             self.position.store(0, Ordering::Relaxed);
@@ -434,6 +447,7 @@ mod cpal_output {
 
     /// Build the output stream for the device's sample format, converting our
     /// f32 samples in the callback (same dispatch as call_device's speaker path).
+    #[allow(clippy::too_many_arguments)]
     fn build_stream<T: SizedSample + FromSample<f32>>(
         device: &cpal::Device,
         config: StreamConfig,
@@ -442,6 +456,7 @@ mod cpal_output {
         is_playing: Arc<AtomicBool>,
         finished: Arc<AtomicBool>,
         completion_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        started: Arc<PlaybackStart>,
     ) -> Result<Stream, PlayerError> {
         let err_is_playing = is_playing.clone();
         let err_finished = finished.clone();
@@ -451,10 +466,14 @@ mod cpal_output {
                 config,
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                     let mut pos = position.load(Ordering::Relaxed);
+                    let before = pos;
 
                     for sample in data.iter_mut() {
                         let s = if pos < audio.len() {
                             let s = audio[pos];
+                            if pos == before {
+                                started.samples(1);
+                            }
                             pos += 1;
                             s
                         } else {

@@ -1647,6 +1647,31 @@ impl ChatStore {
         Ok(messages.into_iter().next())
     }
 
+    /// Whether this account already submitted the played receipt or learned it
+    /// from a linked device. Local-only playback does not set this bit.
+    pub async fn audio_played_receipt_sent(&self, row_id: i64) -> Result<bool> {
+        let device_id = self.device_id();
+        self.db()
+            .read(move |conn| {
+                #[derive(diesel::QueryableByName)]
+                struct Count {
+                    #[diesel(sql_type = diesel::sql_types::BigInt)]
+                    count: i64,
+                }
+                diesel::sql_query(
+                    "SELECT count(*) AS count FROM audio_played_receipts \
+                     WHERE device_id = ? AND message_row_id = ?",
+                )
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .bind::<diesel::sql_types::BigInt, _>(row_id)
+                .get_result::<Count>(conn)
+                .map(|row| row.count > 0)
+                .map_err(db_err)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn message(&self, chat: &Jid, msg_id: &str) -> Result<Option<StoredMessage>> {
         self.message_by_ownership(chat, msg_id, None).await
     }

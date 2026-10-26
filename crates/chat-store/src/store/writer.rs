@@ -575,6 +575,38 @@ fn apply_writer_msg(
         WriterMsg::GroupHierarchies(writes) => {
             crate::store::group_hierarchy::apply_group_hierarchies(conn, device_id, writes, cs)
         }
+        WriterMsg::AudioPlayed {
+            row_id,
+            chat,
+            message_id,
+            sender,
+            receipt_sent,
+        } => {
+            use schema::messages::dsl;
+            let target = dsl::messages.filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::id.eq(*row_id))
+                    .and(dsl::chat_jid.eq(chat))
+                    .and(dsl::msg_id.eq(message_id))
+                    .and(dsl::sender_jid.eq(sender))
+                    .and(dsl::from_me.eq(false)),
+            );
+            let chat: Option<String> = target.select(dsl::chat_jid).first(conn).optional()?;
+            if let Some(chat) = chat {
+                let changed = diesel::update(target.filter(dsl::status.lt(5)))
+                    .set(dsl::status.eq(5))
+                    .execute(conn)?;
+                if *receipt_sent {
+                    diesel::sql_query("INSERT OR IGNORE INTO audio_played_receipts (device_id, message_row_id) VALUES (?, ?)")
+                        .bind::<diesel::sql_types::Integer,_>(device_id)
+                        .bind::<diesel::sql_types::BigInt,_>(*row_id).execute(conn)?;
+                }
+                if changed > 0 {
+                    cs.message_chats.insert(chat);
+                }
+            }
+        }
         WriterMsg::StatusWatched { chat, msg_ids } => {
             // Routed like every other write that targets a row. The broadcast
             // this is called with today routes to itself, but the method is

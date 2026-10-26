@@ -2466,3 +2466,42 @@ async fn replacing_an_account_runtime_closes_old_frontend_attachments() {
     line.clear();
     assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn offline_and_terminal_audio_observations_reach_only_the_local_action() {
+    for state in [
+        oxidezap_ipc::ConnectionState::Disconnected {
+            reason: "synthetic offline".into(),
+        },
+        oxidezap_ipc::ConnectionState::LoggedOut {
+            message: "synthetic unlink".into(),
+        },
+    ] {
+        let hub = StateHub::new();
+        hub.apply(crate::state::Change::live(
+            oxidezap_ipc::DaemonEvent::ConnectionChanged(state),
+        ));
+        let (commands, taken) = bridge(CommandOutcome::Accepted);
+        let answer = handle_request(
+            bare(ClientRequest::MarkAudioPlayed(
+                oxidezap_ipc::MarkAudioPlayed {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    message_id: "SYNTHETIC-AUDIO".into(),
+                },
+            )),
+            &hub,
+            &no_plugins(),
+            &commands,
+            &outbox(),
+        )
+        .await;
+        assert!(matches!(
+            parse(answer.frame),
+            DaemonMessage::Accepted { .. }
+        ));
+        let action = taken.await.unwrap().unwrap();
+        assert!(matches!(action, Action::MarkAudioPlayed(_)));
+        assert!(!action.needs_network());
+        assert!(!hub.connection().is_connected());
+    }
+}

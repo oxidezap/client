@@ -24,6 +24,7 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{AudioBuffer, AudioBufferSourceNode, AudioContext};
 
+use crate::playback_start::PlaybackStart;
 use crate::player::PlayerError;
 
 /// Encoded voice note waiting for the browser's asynchronous decoder.
@@ -93,6 +94,7 @@ struct Playing {
     duration: f64,
     is_playing: bool,
     finished: bool,
+    playback_start: PlaybackStart,
     /// Where a seek asked to be while the clip was still decoding, as a
     /// fraction — the duration is not known until the buffer is.
     ///
@@ -137,6 +139,7 @@ impl Default for Playing {
             duration: 0.0,
             is_playing: false,
             finished: false,
+            playback_start: PlaybackStart::default(),
             pending_seek: None,
             pending_pause: false,
             decoding: false,
@@ -186,6 +189,7 @@ impl AudioPlayer {
     /// between the two, and it is the browser's own control rather than a
     /// second implementation of one.
     pub fn set_speed(&mut self, speed: f32) {
+        self.observe_started();
         // Bank what has played at the old rate before the new one applies.
         // `offset` is measured in the clip's own seconds, so without this the
         // time already played would be re-scaled by a rate it was not played
@@ -319,6 +323,25 @@ impl AudioPlayer {
         (elapsed.clamp(0.0, state.duration)) as f32
     }
 
+    fn observe_started(&self) {
+        let now = self
+            .context
+            .as_ref()
+            .map_or(0.0, AudioContext::current_time);
+        let state = self.state.borrow();
+        state.playback_start.clock(
+            state.is_playing && state.offset < state.duration,
+            now,
+            state.started_at,
+        );
+    }
+
+    /// Report playback clock advancement once, independently of seek offsets.
+    pub fn take_started(&mut self) -> bool {
+        self.observe_started();
+        self.state.borrow().playback_start.take(true)
+    }
+
     /// How long the clip is, in its own seconds.
     ///
     /// Not divided by the speed. `elapsed_secs` already reports a position on
@@ -340,6 +363,7 @@ impl AudioPlayer {
     /// open. Refused once the clip has finished, for the same reason the
     /// native player refuses it — the caller starts it over instead.
     pub fn seek(&self, fraction: f32) -> bool {
+        self.observe_started();
         if self.state.borrow().finished {
             return false;
         }
@@ -550,6 +574,7 @@ impl AudioPlayer {
         state.offset = 0.0;
         state.duration = 0.0;
         state.finished = false;
+        state.playback_start = PlaybackStart::default();
         state.pending_seek = None;
         state.pending_pause = false;
         // Back to the default, because both entry points come through here
@@ -561,6 +586,7 @@ impl AudioPlayer {
 
     /// Stop making sound, keeping the position.
     pub fn pause(&mut self) {
+        self.observe_started();
         if !self.state.borrow().is_playing {
             // Same as `seek`: a pause asked for while the clip is decoding
             // has to be remembered, or the note starts playing on its own the
@@ -700,12 +726,18 @@ fn start(
 
     let ended = {
         let state = Rc::clone(state);
+        let context = context.clone();
         Closure::<dyn FnMut()>::new(move || {
             let completion = {
                 let mut state = state.borrow_mut();
                 if state.generation != generation || !state.is_playing {
                     return;
                 }
+                state.playback_start.clock(
+                    state.offset < state.duration,
+                    context.current_time(),
+                    state.started_at,
+                );
                 state.is_playing = false;
                 state.finished = true;
                 state.offset = state.duration;

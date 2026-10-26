@@ -3843,10 +3843,28 @@ impl WhatsAppApp {
         let Some(chat) = self.find_chat_mut(&chat_jid) else {
             return;
         };
-        let advanced = chat.advance_status(&message_ids, status);
+        let advanced = if receipt_type == ReceiptType::PlayedSelf {
+            let mut changed = 0;
+            for id in &message_ids {
+                let mut matches = chat
+                    .messages
+                    .iter_mut()
+                    .filter(|message| !message.is_from_me && message.id == *id);
+                if let Some(message) = matches.next()
+                    && matches.next().is_none()
+                {
+                    let before = message.status;
+                    message.status.advance(MessageStatus::Played);
+                    changed += usize::from(before != message.status);
+                }
+            }
+            changed
+        } else {
+            chat.advance_status(&message_ids, status)
+        };
         // A read receipt is also the peer telling us they opened the chat,
         // which clears our own unread state for the messages named.
-        let read = if status == MessageStatus::Read {
+        let read = if status.is_read() {
             chat.mark_messages_as_read(&message_ids)
         } else {
             0
@@ -4061,7 +4079,7 @@ fn receipt_status(receipt_type: ReceiptType) -> Option<MessageStatus> {
         ReceiptType::Delivered => Some(MessageStatus::Delivered),
         // Played is Read plus "and listened to it"; the ticks are the same.
         ReceiptType::Read | ReceiptType::ReadSelf => Some(MessageStatus::Read),
-        ReceiptType::Played | ReceiptType::PlayedSelf => Some(MessageStatus::Read),
+        ReceiptType::Played | ReceiptType::PlayedSelf => Some(MessageStatus::Played),
         // Retries, errors and sender echoes say nothing about delivery.
         _ => None,
     }

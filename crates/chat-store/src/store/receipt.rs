@@ -40,6 +40,38 @@ pub(super) fn apply_receipt(
             // be keyed by either identity (or split) — route to where it lives
             // so the read state lands on the real rows, not a stray twin.
             let chat = route_chat(conn, device_id, chat, cs)?;
+            if receipt.r#type == ReceiptType::PlayedSelf {
+                use schema::messages::dsl;
+                for id in &message_ids {
+                    let rows: Vec<i64> = dsl::messages
+                        .filter(
+                            dsl::device_id
+                                .eq(device_id)
+                                .and(dsl::chat_jid.eq(&chat))
+                                .and(dsl::msg_id.eq(id))
+                                .and(dsl::from_me.eq(false)),
+                        )
+                        .select(dsl::id)
+                        .load(conn)?;
+                    // The core self-receipt event carries no original group author.
+                    // Refuse an ambiguous id rather than marking both authors heard.
+                    let [row] = rows.as_slice() else {
+                        continue;
+                    };
+                    let updated = diesel::update(
+                        dsl::messages.filter(dsl::id.eq(row).and(dsl::status.lt(5))),
+                    )
+                    .set(dsl::status.eq(5))
+                    .execute(conn)?;
+                    if updated > 0 {
+                        cs.message_chats.insert(chat.clone());
+                    }
+                    diesel::sql_query("INSERT OR IGNORE INTO audio_played_receipts (device_id, message_row_id) VALUES (?, ?)")
+                        .bind::<diesel::sql_types::Integer,_>(device_id)
+                        .bind::<diesel::sql_types::BigInt,_>(*row)
+                        .execute(conn)?;
+                }
+            }
             // Read on another of our devices — up to the covered messages.
             // WA read state is "read up to X": the boundary is the newest
             // covered row (falling back to the receipt's own timestamp).

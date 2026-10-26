@@ -181,6 +181,13 @@ pub(crate) enum WriterMsg {
         chat: Jid,
         msg_id: String,
     },
+    AudioPlayed {
+        row_id: i64,
+        chat: String,
+        message_id: String,
+        sender: String,
+        receipt_sent: bool,
+    },
     StatusWatched {
         chat: Jid,
         msg_ids: Vec<String>,
@@ -765,6 +772,24 @@ impl ChatStore {
                 msg_id: msg_id.into(),
             })
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
+    }
+
+    /// Record local playback separately from successful receipt transmission.
+    /// Use `flush` before treating either write as durable.
+    pub fn record_audio_played(
+        &self,
+        message: &crate::StoredMessage,
+        receipt_sent: bool,
+    ) -> Result<()> {
+        self.tx
+            .send(WriterMsg::AudioPlayed {
+                row_id: message.seq,
+                chat: message.chat_jid.to_non_ad_string(),
+                message_id: message.id.clone(),
+                sender: message.sender_jid.to_non_ad_string(),
+                receipt_sent,
+            })
+            .map_err(|e| ChatStoreError::Store(StoreError::Validation(e.to_string())))
     }
 
     /// Record that these status updates have been watched on this device.

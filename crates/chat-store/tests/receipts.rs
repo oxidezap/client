@@ -925,3 +925,200 @@ async fn migration_folds_device_suffixed_rows() {
         [("111000011112222@lid", 4), ("222000011112222@lid", 4)]
     );
 }
+
+#[tokio::test]
+async fn self_play_is_distinct_from_read_and_survives_duplicate_and_stale_reads() {
+    let (_db, store) = test_store().await;
+    feed(
+        &store,
+        [message_event(
+            wa::Message::text("voice fixture"),
+            incoming_info(PEER, PEER, "VOICE", 100),
+        )],
+    )
+    .await;
+    feed(
+        &store,
+        [receipt(
+            jid(PEER),
+            jid(PEER),
+            &["VOICE"],
+            ReceiptType::ReadSelf,
+            ts(101),
+        )],
+    )
+    .await;
+    assert_ne!(
+        store
+            .message(&jid(PEER), "VOICE")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+    for ty in [
+        ReceiptType::PlayedSelf,
+        ReceiptType::PlayedSelf,
+        ReceiptType::ReadSelf,
+    ] {
+        feed(
+            &store,
+            [receipt(jid(PEER), jid(PEER), &["VOICE"], ty, ts(101))],
+        )
+        .await;
+    }
+    assert_eq!(
+        store
+            .message(&jid(PEER), "VOICE")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+}
+
+#[tokio::test]
+async fn local_audio_playback_and_transport_submission_have_separate_durable_state() {
+    let (_db, store) = test_store().await;
+    feed(
+        &store,
+        [message_event(
+            wa::Message::text("voice fixture"),
+            incoming_info(PEER, PEER, "LOCAL-PLAY", 100),
+        )],
+    )
+    .await;
+    let row = store
+        .message(&jid(PEER), "LOCAL-PLAY")
+        .await
+        .unwrap()
+        .unwrap();
+    // Offline playback or a transport failure records the observation but never a send.
+    store.record_audio_played(&row, false).unwrap();
+    store.flush().await.unwrap();
+    assert_eq!(
+        store
+            .message(&jid(PEER), "LOCAL-PLAY")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+    assert!(!store.audio_played_receipt_sent(row.seq).await.unwrap());
+    store.record_audio_played(&row, true).unwrap();
+    store.record_audio_played(&row, false).unwrap();
+    store.flush().await.unwrap();
+    assert!(store.audio_played_receipt_sent(row.seq).await.unwrap());
+    // Reopen the projection over the same synthetic database.
+    let reopened = ChatStore::new(&_db).await.unwrap();
+    assert!(reopened.audio_played_receipt_sent(row.seq).await.unwrap());
+    assert_eq!(
+        reopened
+            .message(&jid(PEER), "LOCAL-PLAY")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+}
+
+#[tokio::test]
+async fn audio_playback_writes_cannot_cross_accounts_or_mark_own_audio() {
+    let (db, store) = test_store().await;
+    let db_b = db.database().store(2);
+    db.database().provision_device(2).await.unwrap();
+    let other = ChatStore::new(&db_b).await.unwrap();
+    feed(
+        &store,
+        [message_event(
+            wa::Message::text("synthetic"),
+            incoming_info(PEER, PEER, "ISOLATED", 100),
+        )],
+    )
+    .await;
+    let incoming = store
+        .message(&jid(PEER), "ISOLATED")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stale_identity = incoming.clone();
+    stale_identity.id = "REPLACED-ROW".into();
+    store.record_audio_played(&stale_identity, true).unwrap();
+    store.flush().await.unwrap();
+    assert!(!store.audio_played_receipt_sent(incoming.seq).await.unwrap());
+    other.record_audio_played(&incoming, true).unwrap();
+    other.flush().await.unwrap();
+    assert!(!other.audio_played_receipt_sent(incoming.seq).await.unwrap());
+    assert_ne!(
+        store
+            .message(&jid(PEER), "ISOLATED")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+    store.record_audio_played(&incoming, true).unwrap();
+    store.flush().await.unwrap();
+    assert!(!other.audio_played_receipt_sent(incoming.seq).await.unwrap());
+    store
+        .record_outgoing(
+            &jid(PEER),
+            "OWN-AUDIO",
+            &wa::Message::text("synthetic own"),
+            ts(102),
+        )
+        .unwrap();
+    store.flush().await.unwrap();
+    let own = store
+        .own_message(&jid(PEER), "OWN-AUDIO")
+        .await
+        .unwrap()
+        .unwrap();
+    store.record_audio_played(&own, true).unwrap();
+    store.flush().await.unwrap();
+    assert!(!store.audio_played_receipt_sent(own.seq).await.unwrap());
+    assert_ne!(
+        store
+            .own_message(&jid(PEER), "OWN-AUDIO")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Played
+    );
+}
+
+#[tokio::test]
+async fn linked_play_refuses_an_ambiguous_group_id() {
+    let (_db, store) = test_store().await;
+    let authors = ["559900000001@s.whatsapp.net", "111000011112222@lid"];
+    feed(
+        &store,
+        authors.map(|author| {
+            message_event(
+                wa::Message::text("synthetic"),
+                incoming_info(GROUP, author, "COLLIDING-PLAY", 100),
+            )
+        }),
+    )
+    .await;
+    feed(
+        &store,
+        [receipt(
+            jid(GROUP),
+            jid("559900000003@s.whatsapp.net"),
+            &["COLLIDING-PLAY"],
+            ReceiptType::PlayedSelf,
+            ts(101),
+        )],
+    )
+    .await;
+    let rows = store.messages(&jid(GROUP), None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status != MessageStatus::Played));
+}

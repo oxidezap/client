@@ -159,8 +159,8 @@ fn store_status(status: oxidezap_chat_store::MessageStatus) -> MessageStatus {
         Stored::Pending => MessageStatus::Pending,
         Stored::ServerAck => MessageStatus::Sent,
         Stored::Delivered => MessageStatus::Delivered,
-        // Played is Read plus "and listened to it"; the ticks are the same.
-        Stored::Read | Stored::Played => MessageStatus::Read,
+        Stored::Read => MessageStatus::Read,
+        Stored::Played => MessageStatus::Played,
     }
 }
 

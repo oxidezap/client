@@ -33,6 +33,7 @@ pub(super) struct MediaProps {
     pub decoded_image: Option<Arc<Image>>,
     pub audio: Option<super::AudioProgress>,
     pub playback_speed: f32,
+    pub listened: Option<&'static str>,
     pub is_downloading: bool,
     pub is_preparing: bool,
     pub saved_document_path: Option<std::path::PathBuf>,
@@ -54,6 +55,7 @@ pub(super) fn render_media_content(
         decoded_image,
         audio,
         playback_speed,
+        listened,
         is_downloading,
         is_preparing,
         saved_document_path,
@@ -260,6 +262,7 @@ pub(super) fn render_media_content(
         MediaType::Audio => el.child(super::audio::render_audio_player(
             media_content,
             message_id,
+            listened,
             is_playing,
             audio,
             playback_speed,
