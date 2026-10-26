@@ -56,9 +56,14 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         .map(oxidezap_chat_store::normalized_message);
     let media = base_message.and_then(|message| media::media_of(message, None));
     let poll = base_message.and_then(poll_of);
+    let business = base_message.and_then(oxidezap_chat_store::business_content);
     let contacts = base_message.and_then(oxidezap_chat_store::shared_contacts_text);
     let content = match (&stored.text, stored.revoked) {
         (_, true) => "[Message deleted]".to_string(),
+        (_, _) if business.is_some() => business
+            .as_ref()
+            .map(|b| b.body.clone())
+            .unwrap_or_default(),
         (Some(text), _) => text.clone(),
         (None, _) if contacts.is_some() => contacts.unwrap_or_default(),
         (None, _) if poll.is_some() => poll
@@ -106,6 +111,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         edited: stored.edited_at.is_some(),
         system,
         poll,
+        business,
     }
 }
 
@@ -250,7 +256,7 @@ mod tests {
     use super::*;
     use whatsapp_rust::buffa::MessageField;
 
-    fn stored_poll_creation() -> oxidezap_chat_store::StoredMessage {
+    pub(super) fn stored_poll_creation() -> oxidezap_chat_store::StoredMessage {
         let proto = {
             let mut constructed: wa::Message = Default::default();
             constructed.poll_creation_message_v3 = MessageField::some({
@@ -480,5 +486,42 @@ mod tests {
             message.quoted.expect("wrapped reply quote").message_id,
             "quoted-message"
         );
+    }
+}
+
+#[cfg(test)]
+mod business_tests {
+    use super::*;
+    use whatsapp_rust::buffa::MessageField;
+    #[test]
+    fn older_template_rows_without_denormalized_text_reload_from_the_proto() {
+        let mut body = wa::message::interactive_message::Body::default();
+        body.text = Some("*Delivery* is ready".into());
+        let mut interactive = wa::message::InteractiveMessage::default();
+        interactive.body = MessageField::some(body);
+        let mut template = wa::message::TemplateMessage::default();
+        template.format = Some(
+            wa::message::template_message::Format::InteractiveMessageTemplate(interactive.into()),
+        );
+        let mut proto = wa::Message::default();
+        proto.template_message = MessageField::some(template);
+        let mut stored = tests::stored_poll_creation();
+        stored.kind = oxidezap_chat_store::MessageKind::Template;
+        stored.message = Some(Box::new(proto));
+        stored.text = None;
+        let projected = stored_to_chat_message(stored.clone());
+        assert_eq!(projected.content, "*Delivery* is ready");
+        assert_eq!(
+            projected.business,
+            stored
+                .message
+                .as_deref()
+                .and_then(oxidezap_chat_store::business_content)
+        );
+        stored.revoked = true;
+        let revoked = stored_to_chat_message(stored);
+        assert!(revoked.business.is_none());
+        assert!(revoked.media.is_none());
+        assert_eq!(revoked.content, "[Message deleted]");
     }
 }

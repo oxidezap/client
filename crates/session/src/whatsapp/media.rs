@@ -86,6 +86,32 @@ fn effective_sticker(msg: &wa::Message) -> Option<&wa::message::StickerMessage> 
     })
 }
 
+fn image_of(msg: &wa::Message) -> Option<&wa::message::ImageMessage> {
+    msg.image_message
+        .as_option()
+        .or_else(|| match oxidezap_chat_store::business_media(msg) {
+            Some(oxidezap_chat_store::BusinessMedia::Image(m)) => Some(m),
+            _ => None,
+        })
+}
+fn video_of(msg: &wa::Message) -> Option<&wa::message::VideoMessage> {
+    msg.ptv_message
+        .as_option()
+        .or(msg.video_message.as_option())
+        .or_else(|| match oxidezap_chat_store::business_media(msg) {
+            Some(oxidezap_chat_store::BusinessMedia::Video(m)) => Some(m),
+            _ => None,
+        })
+}
+fn document_of(msg: &wa::Message) -> Option<&wa::message::DocumentMessage> {
+    msg.document_message
+        .as_option()
+        .or_else(|| match oxidezap_chat_store::business_media(msg) {
+            Some(oxidezap_chat_store::BusinessMedia::Document(m)) => Some(m),
+            _ => None,
+        })
+}
+
 /// What it takes to fetch this media later, or `None` when the message did
 /// not carry enough to try.
 ///
@@ -165,6 +191,12 @@ pub(super) fn still_preview(
 /// thumbnail is what shows and the download metadata is what makes the full
 /// bytes retryable.
 pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<MediaContent> {
+    if let Some(oxidezap_chat_store::BusinessMedia::Thumbnail(bytes)) =
+        oxidezap_chat_store::business_media(msg)
+    {
+        return (!bytes.is_empty())
+            .then(|| MediaContent::image(Arc::new(bytes.to_vec()), "image/jpeg".into(), false));
+    }
     if let Some(sticker) = effective_sticker(msg) {
         let mime = sticker
             .mimetype
@@ -204,7 +236,7 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
         );
     }
 
-    if let Some(image) = msg.image_message.as_option() {
+    if let Some(image) = image_of(msg) {
         let mime = image
             .mimetype
             .clone()
@@ -239,11 +271,7 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
 
     // PTVs (round video notes) are the same proto type in a different field
     // and play like any other video.
-    if let Some(video) = msg
-        .ptv_message
-        .as_option()
-        .or(msg.video_message.as_option())
-    {
+    if let Some(video) = video_of(msg) {
         let downloadable = downloadable_of(
             video,
             video.mimetype.as_deref().unwrap_or("video/mp4"),
@@ -295,7 +323,7 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
     // A document is metadata all the way down — never fetched until somebody
     // saves it, and worth a row even with nothing to fetch, because its name
     // is what the bubble says.
-    if let Some(doc) = msg.document_message.as_option() {
+    if let Some(doc) = document_of(msg) {
         let mime = doc.mimetype.clone().unwrap_or_default();
         let downloadable = downloadable_of(doc, &mime, None);
         return Some(
@@ -321,8 +349,15 @@ pub(super) async fn media_now(
 ) -> Option<MediaContent> {
     let fetched = if let Some(sticker) = effective_sticker(msg) {
         fetch_now(client, sticker, "sticker", eager, sticker.file_length).await
-    } else if let Some(image) = msg.image_message.as_option() {
-        fetch_now(client, image, "image", eager, image.file_length).await
+    } else if let Some(image) = image_of(msg) {
+        fetch_now(
+            client,
+            image,
+            "image",
+            eager && oxidezap_chat_store::business_media(msg).is_none(),
+            image.file_length,
+        )
+        .await
     } else {
         None
     };
@@ -638,5 +673,25 @@ mod tests {
         let media = media_of(&message, None).expect("lottie sticker");
         assert_eq!(media.media_type, MediaType::Sticker);
         assert_eq!(media.data.as_slice(), [1]);
+    }
+}
+
+#[cfg(test)]
+mod business_tests {
+    use super::*;
+    use whatsapp_rust::buffa::MessageField;
+    #[test]
+    fn interactive_header_thumbnail_is_local_and_has_no_fetch_capability() {
+        let mut header = wa::message::interactive_message::Header::default();
+        header.media =
+            Some(wa::message::interactive_message::header::Media::JpegThumbnail(vec![1, 2, 3]));
+        let mut interactive = wa::message::InteractiveMessage::default();
+        interactive.header = MessageField::some(header);
+        let mut message = wa::Message::default();
+        message.interactive_message = MessageField::some(interactive);
+        let media = media_of(&message, None).unwrap();
+        assert_eq!(media.data.as_slice(), [1, 2, 3]);
+        assert!(media.downloadable.is_none());
+        assert!(!media.data_is_preview);
     }
 }

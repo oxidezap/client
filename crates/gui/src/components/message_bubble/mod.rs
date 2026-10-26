@@ -7,6 +7,7 @@
 //! step with a number kept elsewhere.
 
 pub mod audio;
+pub(crate) mod business;
 mod media;
 mod poll;
 mod quote;
@@ -169,7 +170,10 @@ pub fn render_message_bubble(
     // for and the only route to these commands that does not require finding a
     // control that is invisible until the pointer is already over it.
     let menu_id = message_id.clone();
-    let menu_text = message.content.clone();
+    let menu_text = message
+        .business
+        .as_ref()
+        .map_or_else(|| message.content.clone(), |business| business.summary());
     let menu_failed = can_retry;
     let menu_jid = props.chat_jid.clone();
     let now_ms = wacore::time::now_millis();
@@ -265,6 +269,14 @@ pub fn render_message_bubble(
                                 .children(message.quoted.as_ref().map(|quoted| {
                                     render_quote(quoted, entity.clone(), metrics, cx)
                                 }))
+                                .children(message.business.as_ref().map(|_| {
+                                    business::render_header(
+                                        content.business(),
+                                        props.selection_order,
+                                        metrics,
+                                        cx,
+                                    )
+                                }))
                                 .children(message.poll.as_ref().map(|poll| {
                                     render_poll(
                                         poll,
@@ -328,7 +340,10 @@ pub fn render_message_bubble(
                                                     .child(render_rich_text(
                                                         content,
                                                         ids.selection_key.clone(),
-                                                        props.selection_order,
+                                                        props
+                                                            .selection_order
+                                                            .saturating_mul(3)
+                                                            .saturating_add(1),
                                                         cx,
                                                     )),
                                             )
@@ -342,7 +357,16 @@ pub fn render_message_bubble(
                                             metrics,
                                             cx,
                                         )),
-                                ),
+                                )
+                                .children(message.business.as_ref().map(|business| {
+                                    business::render_footer(
+                                        business,
+                                        content.business(),
+                                        props.selection_order,
+                                        metrics,
+                                        cx,
+                                    )
+                                })),
                         ),
                 )
                 .when(!link_buttons.is_empty(), |el| {

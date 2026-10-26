@@ -56,6 +56,11 @@ pub(crate) async fn hydrate_mention_lists(
             continue;
         }
         msg.content = apply_to(&pairs, std::mem::take(&mut msg.content));
+        if let Some(business) = msg.business.as_mut() {
+            business.body = msg.content.clone();
+            business.header = apply_to(&pairs, std::mem::take(&mut business.header));
+            business.footer = apply_to(&pairs, std::mem::take(&mut business.footer));
+        }
         if let Some(media) = msg.media.as_mut()
             && let Some(caption) = media.caption.take()
         {

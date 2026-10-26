@@ -58,6 +58,7 @@ pub struct BubbleText {
     /// `SharedString` on every frame copied peer-controlled text with the
     /// message length, over and over, for no new information.
     link_targets: Arc<[SharedString]>,
+    business: Option<Arc<super::message_bubble::business::BusinessText>>,
 }
 
 impl BubbleText {
@@ -79,6 +80,7 @@ impl BubbleText {
                 runs: Arc::from([]),
                 links,
                 link_targets,
+                business: None,
             };
         }
         let runs = rich.runs();
@@ -87,7 +89,32 @@ impl BubbleText {
             runs: runs.into(),
             links,
             link_targets,
+            business: None,
         }
+    }
+
+    /// Parse every displayed text field once, when a timeline is rebuilt.
+    pub fn of_message(message: &oxidezap_core::ChatMessage) -> Self {
+        let mut parsed = Self::of(&message.content);
+        parsed.business = message.business.as_ref().map(|business| {
+            Arc::new(super::message_bubble::business::BusinessText::new(
+                &message.id,
+                business,
+            ))
+        });
+        if let Some(business) = &parsed.business {
+            parsed.link_targets = parsed
+                .link_targets
+                .iter()
+                .chain(business.link_targets())
+                .cloned()
+                .collect();
+        }
+        parsed
+    }
+
+    pub(crate) fn business(&self) -> Option<&super::message_bubble::business::BusinessText> {
+        self.business.as_deref()
     }
 
     /// Whether there is anything to draw. The bubble asks before it builds a

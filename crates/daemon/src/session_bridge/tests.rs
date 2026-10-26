@@ -886,3 +886,26 @@ async fn work_in_flight_is_capped_rather_than_queued() {
         "permits come back when the work they paid for is over"
     );
 }
+
+#[test]
+fn business_cli_summary_includes_labels_without_response_payloads() {
+    use oxidezap_core::{BusinessAction, BusinessButton, BusinessContent, BusinessKind};
+    let mut message = fixtures::message("template-fixture", "example@lid", "Ready");
+    message.business = Some(BusinessContent {
+        kind: BusinessKind::Template,
+        header: "Order".into(),
+        body: "Ready".into(),
+        footer: "Example shop".into(),
+        buttons: vec![BusinessButton {
+            label: "Track order".into(),
+            action: BusinessAction::OpenLink,
+        }],
+        notice: None,
+    });
+    let dto = super::wire_events::chat_message_to_dto("example@lid", message);
+    assert_eq!(dto.kind, "template");
+    assert_eq!(
+        dto.text.as_deref(),
+        Some("Order\nReady\nExample shop\nTrack order")
+    );
+}
