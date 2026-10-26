@@ -373,9 +373,13 @@ pub(crate) async fn respond(
         ));
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(body).await?;
+        stream.flush().await
+    })
+    .await
+    .context("HTTP response write timed out")??;
     Ok(())
 }
 
