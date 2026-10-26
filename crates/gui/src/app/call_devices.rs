@@ -8,6 +8,14 @@ use oxidezap_ipc::{CallDeviceAction as Action, CallDeviceReply as Reply};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(target_family = "wasm"))]
+#[path = "call_devices/native.rs"]
+mod imp;
+#[cfg(target_family = "wasm")]
+#[path = "call_devices/web.rs"]
+mod imp;
+use imp::PreviewDecoder;
+
 #[derive(Default)]
 pub(super) struct DeviceUi {
     pub inventory: Option<CallDeviceInventory>,
@@ -22,6 +30,27 @@ pub(super) struct DeviceUi {
     pub image: Option<Arc<RenderImage>>,
     admission: PreviewAdmission,
     request: usize,
+}
+
+impl DeviceUi {
+    fn finish_preview(&mut self, id: CameraPreviewId, stopped: bool, failure: Option<String>) {
+        if !self.admission.accepts(id) {
+            return;
+        }
+        self.admission.cancel(id);
+        self.preview = None;
+        self.image = None;
+        self.effective = None;
+        self.stopping = (!stopped).then_some(id);
+        self.status = if stopped {
+            failure.unwrap_or_default()
+        } else {
+            format!(
+                "{} Camera is still stopping. Press Stop camera preview to retry.",
+                failure.unwrap_or_else(|| "Preview ended.".into())
+            )
+        };
+    }
 }
 
 impl WhatsAppApp {
@@ -124,6 +153,8 @@ impl WhatsAppApp {
     }
 
     pub fn refresh_call_device_preferences(&mut self, cx: &mut Context<Self>) {
+        self.settings
+            .update(cx, |s, _| s.devices.preferences_ready = false);
         self.device_request(Action::Preferences, cx);
     }
     pub fn refresh_call_devices(&mut self, cx: &mut Context<Self>) {
@@ -316,17 +347,15 @@ impl WhatsAppApp {
                 crate::platform::sleep(Duration::from_millis(30)).await;
             }
             let waiting = client.call_devices(Action::CancelPreview { preview_id: id });
-            let _ = crate::platform::with_timeout(waiting, Duration::from_secs(7)).await;
+            let stopped = matches!(
+                crate::platform::with_timeout(waiting, Duration::from_secs(7)).await,
+                Some(Ok(Ok(Reply::Stopped { .. })))
+            );
             settings.update(cx, |s, cx| {
                 if s.epoch() != epoch || !s.devices.admission.accepts(id) {
                     return;
                 }
-                s.devices.admission.cancel(id);
-                s.devices.preview = None;
-                s.devices.image = None;
-                if let Some(e) = failure {
-                    s.devices.status = e;
-                }
+                s.devices.finish_preview(id, stopped, failure);
                 cx.notify();
             });
         })
@@ -334,111 +363,26 @@ impl WhatsAppApp {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-#[derive(Default)]
-struct PreviewDecoder {
-    decoder: Option<openh264::decoder::Decoder>,
-    started: bool,
-}
-#[cfg(not(target_family = "wasm"))]
-impl PreviewDecoder {
-    fn decode(
-        &mut self,
-        frame: &oxidezap_ipc::CameraPreviewFrame,
-    ) -> Result<Option<Arc<RenderImage>>, String> {
-        use openh264::formats::YUVSource as _;
-        if !self.started && !frame.keyframe {
-            return Ok(None);
-        }
-        if self.decoder.is_none() {
-            self.decoder = Some(openh264::decoder::Decoder::new().map_err(|e| e.to_string())?);
-        }
-        let decoder = self
-            .decoder
-            .as_mut()
-            .ok_or("Preview decoder is unavailable")?;
-        let Some(yuv) = decoder.decode(&frame.data).map_err(|e| e.to_string())? else {
-            return Ok(None);
-        };
-        let (width, height) = yuv.dimensions();
-        if width == 0 || height == 0 || width.saturating_mul(height) > 1280 * 720 {
-            return Err("Preview dimensions exceed the supported limit".into());
-        }
-        self.started = true;
-        let mut bytes = vec![0; width * height * 4];
-        yuv.write_rgba8(&mut bytes);
-        for pixel in bytes.as_chunks_mut::<4>().0 {
-            pixel.swap(0, 2);
-        }
-        let image = image::RgbaImage::from_raw(width as u32, height as u32, bytes)
-            .ok_or("Invalid preview image")?;
-        Ok(Some(Arc::new(RenderImage::new(
-            smallvec::SmallVec::from_elem(image::Frame::new(image), 1),
-        ))))
-    }
-}
-#[cfg(target_family = "wasm")]
-#[derive(Default)]
-struct PreviewDecoder;
-#[cfg(target_family = "wasm")]
-impl PreviewDecoder {
-    fn decode(
-        &mut self,
-        _frame: &oxidezap_ipc::CameraPreviewFrame,
-    ) -> Result<Option<Arc<RenderImage>>, String> {
-        Err("Camera preview display is unavailable from this browser connection".into())
-    }
-}
-
-#[cfg(all(test, not(target_family = "wasm")))]
+#[cfg(test)]
 mod preview_tests {
     use super::*;
     #[test]
-    fn preview_decodes_synthetic_video_without_a_call_identity() {
-        use openh264::encoder::{Encoder, EncoderConfig};
-        use openh264::formats::{RgbSliceU8, YUVBuffer};
-        let mut encoder =
-            Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new())
-                .unwrap();
-        let pixels = vec![80; 32 * 32 * 3];
-        let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (32, 32)));
-        let idr = encoder.encode(&yuv).unwrap().to_vec();
-        let delta = encoder.encode(&yuv).unwrap().to_vec();
-        let id = CameraPreviewId(31);
-        let mut decoder = PreviewDecoder::default();
-        assert!(
-            decoder
-                .decode(&oxidezap_ipc::CameraPreviewFrame {
-                    preview_id: id,
-                    data: delta.clone(),
-                    keyframe: false
-                })
-                .unwrap()
-                .is_none()
-        );
-        let mut images = usize::from(
-            decoder
-                .decode(&oxidezap_ipc::CameraPreviewFrame {
-                    preview_id: id,
-                    data: idr,
-                    keyframe: true,
-                })
-                .unwrap()
-                .is_some(),
-        );
-        images += usize::from(
-            decoder
-                .decode(&oxidezap_ipc::CameraPreviewFrame {
-                    preview_id: id,
-                    data: delta,
-                    keyframe: false,
-                })
-                .unwrap()
-                .is_some(),
-        );
-        assert!(
-            images > 0,
-            "synthetic preview must produce a renderable image"
-        );
+    fn failed_cleanup_retains_stopping_ownership_and_retry() {
+        let mut ui = DeviceUi::default();
+        let id = ui.admission.begin().unwrap();
+        ui.preview = Some(id);
+        ui.finish_preview(id, false, Some("Camera timed out.".into()));
+        assert_eq!(ui.stopping, Some(id));
+        assert!(ui.preview.is_none());
+        assert!(ui.status.contains("still stopping"));
+    }
+    #[test]
+    fn successful_cleanup_releases_ownership() {
+        let mut ui = DeviceUi::default();
+        let id = ui.admission.begin().unwrap();
+        ui.preview = Some(id);
+        ui.finish_preview(id, true, None);
+        assert!(ui.stopping.is_none());
+        assert!(ui.preview.is_none());
     }
 }

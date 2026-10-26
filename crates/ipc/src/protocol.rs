@@ -2322,6 +2322,7 @@ mod device_contract_tests {
     fn device_and_preview_wire_frames_have_independent_identity() {
         let preview_id = oxidezap_core::CameraPreviewId(42);
         for action in [
+            CallDeviceAction::Preferences,
             CallDeviceAction::Inventory,
             CallDeviceAction::Save {
                 preferences: Default::default(),

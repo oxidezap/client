@@ -38,9 +38,7 @@ impl WhatsAppApp {
         }
         // Searching from inside Settings means leaving Settings: the field
         // being focused is behind it.
-        self.settings.update(cx, |settings, cx| {
-            settings.close(cx);
-        });
+        self.close_settings(cx);
         // And so does searching from Status: the field belongs to the chat
         // list, and that list is not on screen while the status list is in its
         // slot. Focusing it there handed the keyboard to an input nothing was

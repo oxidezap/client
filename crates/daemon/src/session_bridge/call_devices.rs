@@ -13,6 +13,16 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(not(target_family = "wasm"))]
+#[path = "call_devices/native.rs"]
+mod imp;
+#[cfg(target_family = "wasm")]
+#[path = "call_devices/web.rs"]
+mod imp;
+use imp::{persist, read_preferences, test_microphone};
+
+static PREFERENCE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
 pub(super) struct Devices {
     state: Arc<Mutex<State>>,
     in_flight: Arc<tokio::sync::Semaphore>,
@@ -53,11 +63,17 @@ impl Drop for Preview {
 }
 
 fn quality(p: &CallDevicePreferences) -> oxidezap_video::VideoQuality {
+    quality_with_environment(p, oxidezap_video::VideoQuality::from_environment())
+}
+fn quality_with_environment(
+    p: &CallDevicePreferences,
+    environment: oxidezap_video::VideoQuality,
+) -> oxidezap_video::VideoQuality {
     oxidezap_video::VideoQuality {
         width: p.camera_mode.width,
         height: p.camera_mode.height,
         fps: p.camera_mode.fps,
-        ..Default::default()
+        ..environment
     }
 }
 fn apply(p: CallDevicePreferences) -> Result<(), String> {
@@ -66,50 +82,55 @@ fn apply(p: CallDevicePreferences) -> Result<(), String> {
     Ok(())
 }
 
+fn initial_preferences(
+    saved: Option<CallDevicePreferences>,
+    environment: oxidezap_video::VideoQuality,
+) -> (CallDevicePreferences, bool) {
+    match saved {
+        Some(p) => (p, true),
+        None => (
+            CallDevicePreferences {
+                camera_mode: CameraMode {
+                    width: environment.width,
+                    height: environment.height,
+                    fps: environment.fps,
+                },
+                ..Default::default()
+            },
+            false,
+        ),
+    }
+}
+
 pub(super) async fn load_preferences() {
-    match oxidezap_session::unblock(read_preferences).await {
-        Ok(Ok(p)) => {
-            if let Err(e) = apply(p) {
-                log::warn!("call device preferences could not apply: {e}");
+    let outcome = match oxidezap_session::unblock(read_preferences).await {
+        Ok(Ok(saved)) => {
+            let (preferences, explicit) =
+                initial_preferences(saved, oxidezap_video::VideoQuality::from_environment());
+            if explicit {
+                apply(preferences)
+            } else {
+                oxidezap_audio::devices::set_call_preferences(preferences);
+                Ok(())
             }
         }
-        Ok(Err(e)) => log::warn!("call device preferences could not load: {e}"),
-        Err(e) => log::warn!("call device preference task failed: {e}"),
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn read_preferences() -> Result<CallDevicePreferences, String> {
-    let path = oxidezap_ipc::state_dir()
-        .ok_or("no device preference directory")?
-        .join("call-devices.json");
-    match std::fs::read(path) {
-        Ok(raw) => serde_json::from_slice(&raw).map_err(|e| e.to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Ok(Err(e)) => Err(e),
         Err(e) => Err(e.to_string()),
+    };
+    if let Err(error) = &outcome {
+        log::warn!("call device preferences could not load: {error}");
     }
-}
-#[cfg(target_family = "wasm")]
-fn read_preferences() -> Result<CallDevicePreferences, String> {
-    Ok(Default::default())
+    *PREFERENCE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = outcome.err();
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn persist(p: &CallDevicePreferences) -> Result<(), String> {
-    use std::io::Write as _;
-    let directory = oxidezap_ipc::state_dir().ok_or("no device preference directory")?;
-    let bytes = serde_json::to_vec(p).map_err(|e| e.to_string())?;
-    let path = directory.join("call-devices.json");
-    let temporary = directory.join("call-devices.json.new");
-    let mut file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| e.to_string())?;
-    std::fs::rename(&temporary, path).map_err(|e| e.to_string())
-}
-#[cfg(target_family = "wasm")]
-fn persist(_p: &CallDevicePreferences) -> Result<(), String> {
-    Err("Device preferences cannot be saved from this browser connection".into())
+fn preferences_readable() -> Result<(), String> {
+    if let Some(error) = &*PREFERENCE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) {
+        Err(format!(
+            "Could not load saved call devices: {error}. Save a selection to replace it."
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 async fn inventory() -> CallDeviceSettings {
@@ -197,24 +218,32 @@ impl Devices {
 
 async fn handle(state: Arc<Mutex<State>>, action: Action, owner: &Outbox) -> Result<Reply, String> {
     match action {
-        Action::Preferences => Ok(Reply::Preferences {
-            preferences: oxidezap_audio::devices::call_preferences(),
-        }),
-        Action::Inventory => Ok(Reply::Settings {
-            settings: inventory().await,
-        }),
+        Action::Preferences => {
+            preferences_readable()?;
+            Ok(Reply::Preferences {
+                preferences: oxidezap_audio::devices::call_preferences(),
+            })
+        }
+        Action::Inventory => {
+            preferences_readable()?;
+            Ok(Reply::Settings {
+                settings: inventory().await,
+            })
+        }
         Action::Save { preferences } => {
             quality(&preferences).checked().map_err(|e| e.to_string())?;
             static SAVE: Mutex<()> = Mutex::new(());
             oxidezap_session::unblock(move || {
                 let _guard = SAVE.lock().unwrap_or_else(|e| e.into_inner());
                 persist(&preferences)?;
-                apply(preferences)
+                apply(preferences)?;
+                *PREFERENCE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                Ok::<(), String>(())
             })
             .await
             .map_err(|e| e.to_string())??;
-            Ok(Reply::Settings {
-                settings: inventory().await,
+            Ok(Reply::Preferences {
+                preferences: oxidezap_audio::devices::call_preferences(),
             })
         }
         Action::TestSpeaker | Action::TestRingtone => {
@@ -407,41 +436,36 @@ async fn preview(
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-async fn test_microphone() -> Result<Reply, String> {
-    let mic = oxidezap_audio::devices::open_test_microphone()
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut peak = 0u16;
-    for _ in 0..25 {
-        match oxidezap_session::with_timeout(mic.recv(), std::time::Duration::from_millis(200))
-            .await
-        {
-            Some(Ok(frame)) => {
-                peak = peak.max(frame.into_iter().map(i16::unsigned_abs).max().unwrap_or(0));
-            }
-            _ => return Err("Microphone stopped or did not deliver samples".into()),
-        }
-    }
-    Ok(Reply::Tested {
-        detail: if peak == 0 {
-            "Microphone returned silence. Check microphone privacy and input selection.".into()
-        } else {
-            format!(
-                "Microphone received audio, peak {}%",
-                u32::from(peak) * 100 / 32768
-            )
-        },
-    })
-}
-#[cfg(target_family = "wasm")]
-async fn test_microphone() -> Result<Reply, String> {
-    Err("Microphone testing is unavailable from this browser connection".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_preferences_preserve_environment_mode_and_bitrate() {
+        let environment = oxidezap_video::VideoQuality {
+            width: 800,
+            height: 600,
+            fps: 15,
+            bitrate_kbps: 987,
+        };
+        let (p, explicit) = initial_preferences(None, environment);
+        assert!(
+            !explicit,
+            "an absent file must not install a camera override"
+        );
+        assert_eq!(quality_with_environment(&p, environment), environment);
+        let saved = CallDevicePreferences {
+            camera_mode: CameraMode {
+                width: 640,
+                height: 480,
+                fps: 30,
+            },
+            ..Default::default()
+        };
+        let (p, explicit) = initial_preferences(Some(saved.clone()), environment);
+        assert!(explicit);
+        assert_eq!(p, saved);
+        assert_eq!(quality_with_environment(&p, environment).bitrate_kbps, 987);
+    }
     fn fixture(owner: Outbox) -> (Arc<Mutex<State>>, Arc<AtomicBool>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let state = State {
