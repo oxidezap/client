@@ -20,7 +20,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 
-use crate::components::rich_text_selection::SelectableRichText;
+use crate::components::rich_text_selection::{MessageSelection, SelectableRichText};
 use crate::theme::ActiveProductTheme as _;
 
 use oxidezap_core::{Emphasis, LinkSpan, find_links_in, parse_rich_text};
@@ -58,6 +58,7 @@ pub struct BubbleText {
     /// `SharedString` on every frame copied peer-controlled text with the
     /// message length, over and over, for no new information.
     link_targets: Arc<[SharedString]>,
+    business: Option<Arc<super::message_bubble::business::BusinessText>>,
 }
 
 impl BubbleText {
@@ -79,6 +80,7 @@ impl BubbleText {
                 runs: Arc::from([]),
                 links,
                 link_targets,
+                business: None,
             };
         }
         let runs = rich.runs();
@@ -87,7 +89,32 @@ impl BubbleText {
             runs: runs.into(),
             links,
             link_targets,
+            business: None,
         }
+    }
+
+    /// Parse every displayed text field once, when a timeline is rebuilt.
+    pub fn of_message(message: &oxidezap_core::ChatMessage) -> Self {
+        let mut parsed = Self::of(&message.content);
+        parsed.business = message.business.as_ref().map(|business| {
+            Arc::new(super::message_bubble::business::BusinessText::new(
+                &message.id,
+                business,
+            ))
+        });
+        if let Some(business) = &parsed.business {
+            parsed.link_targets = parsed
+                .link_targets
+                .iter()
+                .chain(business.link_targets())
+                .cloned()
+                .collect();
+        }
+        parsed
+    }
+
+    pub(crate) fn business(&self) -> Option<&super::message_bubble::business::BusinessText> {
+        self.business.as_deref()
     }
 
     /// Whether there is anything to draw. The bubble asks before it builds a
@@ -116,6 +143,15 @@ impl BubbleText {
 pub fn render_rich_text(
     parsed: &BubbleText,
     selection_key: Arc<str>,
+    document_order: u64,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    render_message_segment(parsed, selection_key.into(), document_order, cx)
+}
+
+pub(crate) fn render_message_segment(
+    parsed: &BubbleText,
+    selection_key: MessageSelection,
     document_order: u64,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -200,7 +236,7 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
 /// the parent; only the link ink comes from the theme.
 fn render_with_links(
     parsed: &BubbleText,
-    selection_key: Arc<str>,
+    selection_key: MessageSelection,
     document_order: u64,
     cx: &App,
 ) -> impl IntoElement + use<> {

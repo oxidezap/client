@@ -1116,10 +1116,6 @@ pub(super) fn clear_window_message_selection(window: &mut Window, cx: &mut App) 
     );
 }
 
-fn message_has_selectable_text(message: &ChatMessage) -> bool {
-    message.system.is_none() && message.poll.is_none() && !message.content.is_empty()
-}
-
 impl WhatsAppApp {
     pub fn media_cache(&self) -> Option<std::sync::Arc<dyn crate::session::MediaCache>> {
         self.client.as_ref().map(Session::media_cache)
@@ -2059,68 +2055,48 @@ impl WhatsAppApp {
                     window.window_id(),
                     cx,
                 );
-            let selected_ids: Vec<String> = selected_messages
-                .iter()
-                .map(|(message_id, _, _)| message_id.clone())
-                .collect();
-            let selection_is_stale = if selected_ids.is_empty() {
+            let selection_is_stale = if selected_messages.is_empty() {
                 false
             } else {
                 let cache = self.message_list_cache.borrow();
-                match (cache.get(chat_jid), self.find_chat(chat_jid)) {
-                    (Some(previous), Some(current)) => {
-                        let previous_by_id: HashMap<&str, (usize, &ChatMessage)> = previous
-                            .messages
-                            .iter()
-                            .enumerate()
-                            .map(|(index, message)| {
-                                (message.id.as_str(), (index, message.as_ref()))
-                            })
-                            .collect();
+                match self.find_chat(chat_jid) {
+                    Some(current) => {
                         let current_by_id: HashMap<&str, (usize, &ChatMessage)> = current
                             .messages
                             .iter()
                             .enumerate()
                             .map(|(index, message)| (message.id.as_str(), (index, message)))
                             .collect();
-                        selected_ids.iter().any(|message_id| {
-                            let (Some((old_index, old)), Some((new_index, new))) = (
-                                previous_by_id.get(message_id.as_str()),
-                                current_by_id.get(message_id.as_str()),
-                            ) else {
-                                return true;
-                            };
-                            old_index != new_index
-                                || !message_has_selectable_text(old)
-                                || !message_has_selectable_text(new)
-                                || old.content != new.content
-                                || old.revoked != new.revoked
-                        })
-                    }
-                    (None, Some(current)) => {
-                        // The render cache may already be gone, but retained
-                        // participants keep the visible text to compare against.
-                        let current_by_id: HashMap<&str, (usize, &ChatMessage)> = current
-                            .messages
-                            .iter()
-                            .enumerate()
-                            .map(|(index, message)| (message.id.as_str(), (index, message)))
-                            .collect();
+                        let previous_by_id: Option<HashMap<&str, &ChatMessage>> =
+                            cache.get(chat_jid).map(|previous| {
+                                previous
+                                    .messages
+                                    .iter()
+                                    .map(|message| (message.id.as_str(), message.as_ref()))
+                                    .collect()
+                            });
                         selected_messages.iter().any(
-                            |(message_id, selected_text, selected_order)| {
+                            |(selection, selected_text, selected_order)| {
                                 let Some((current_order, message)) =
-                                    current_by_id.get(message_id.as_str())
+                                    current_by_id.get(selection.message_id.as_ref())
                                 else {
                                     return true;
                                 };
-                                *current_order as u64 != *selected_order
-                                    || !message_has_selectable_text(message)
-                                    || crate::components::BubbleText::of(&message.content).text()
+                                let Some(source) = selection.source_text(message) else {
+                                    return true;
+                                };
+                                selection.document_order(*current_order) != *selected_order
+                                    || crate::components::BubbleText::of(source).text()
                                         != selected_text.as_ref()
+                                    || previous_by_id.as_ref().is_some_and(|previous| {
+                                        previous.get(selection.message_id.as_ref()).is_none_or(
+                                            |old| selection.source_text(old) != Some(source),
+                                        )
+                                    })
                             },
                         )
                     }
-                    _ => true,
+                    None => true,
                 }
             };
             if selection_is_stale {
@@ -4546,7 +4522,7 @@ mod tests {
 
     struct SelectionExitTestView {
         focus_handle: FocusHandle,
-        selection_key: Arc<str>,
+        selection_key: crate::components::rich_text_selection::MessageSelection,
     }
 
     impl Render for SelectionExitTestView {
@@ -4557,10 +4533,10 @@ mod tests {
                     .id("message-row")
                     .w(gpui::px(400.))
                     .h(gpui::px(40.))
-                    .child(crate::components::render_rich_text(
+                    .child(crate::components::render_message_segment(
                         &text,
                         self.selection_key.clone(),
-                        0,
+                        self.selection_key.document_order(0),
                         cx,
                     )),
             )
@@ -4596,7 +4572,7 @@ mod tests {
                 focus_handle = Some(handle.clone());
                 SelectionExitTestView {
                     focus_handle: handle,
-                    selection_key: Arc::from("test-message"),
+                    selection_key: Arc::<str>::from("test-message").into(),
                 }
             });
             gpui_component::Root::new(view, window, cx)
@@ -4647,6 +4623,135 @@ mod tests {
     }
 
     #[gpui::test]
+    fn business_segment_selection_survives_unrelated_updates_and_clears_when_changed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::components::rich_text_selection::{MessageSelection, MessageTextSegment};
+        use oxidezap_core::{BusinessContent, BusinessKind};
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        for segment in [MessageTextSegment::Header, MessageTextSegment::Footer] {
+            let jid = "peer@example.invalid";
+            let mut focus_handle = None;
+            let mut app_entity = None;
+            let (_, visual) = cx.add_window_view(|window, cx| {
+                let app = cx.new(|cx| {
+                    let mut app = WhatsAppApp::new(cx);
+                    let mut chat = Chat::new(jid.into());
+                    let mut message = ChatMessage::new_incoming(
+                        "test-message".into(),
+                        jid.into(),
+                        "different body".into(),
+                    );
+                    message.business = Some(BusinessContent {
+                        kind: BusinessKind::Template,
+                        header: "alpha beta".into(),
+                        body: "different body".into(),
+                        footer: "alpha beta".into(),
+                        buttons: vec![],
+                        notice: None,
+                    });
+                    chat.messages.push(message);
+                    let cache = MessageListCache::new(&chat.messages, false, None);
+                    app.chats.push(Arc::new(chat));
+                    app.message_list_cache
+                        .borrow_mut()
+                        .insert(jid.into(), cache);
+                    app.selected_chat = Some(jid.into());
+                    app
+                });
+                app.update(cx, |app, _| app.set_modal_window(window.window_handle()));
+                app_entity = Some(app);
+                let view = cx.new(|cx| {
+                    let handle = cx.focus_handle();
+                    focus_handle = Some(handle.clone());
+                    SelectionExitTestView {
+                        focus_handle: handle,
+                        selection_key: MessageSelection {
+                            message_id: Arc::from("test-message"),
+                            segment,
+                        },
+                    }
+                });
+                gpui_component::Root::new(view, window, cx)
+            });
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                focus_handle.as_ref().unwrap().focus(window, cx);
+            });
+            visual.simulate_mouse_down(
+                gpui::point(gpui::px(1.), gpui::px(12.)),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            visual.simulate_mouse_move(
+                gpui::point(gpui::px(58.), gpui::px(12.)),
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            visual.simulate_mouse_up(
+                gpui::point(gpui::px(58.), gpui::px(12.)),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            assert_eq!(
+                visual.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    let snapshots =
+                        crate::components::rich_text_selection::active_selection_message_snapshots(
+                            window.window_handle().window_id(),
+                            cx,
+                        );
+                    assert_eq!(snapshots.len(), 1);
+                    assert_eq!(snapshots[0].0.message_id.as_ref(), "test-message");
+                    assert_eq!(snapshots[0].0.segment, segment);
+                    gpui_base::TextSelection::selected_text(window, cx)
+                }),
+                "alpha "
+            );
+            // Daemon events invalidate without holding a Window lease.
+            visual.cx.update(|cx| {
+                app_entity.as_ref().unwrap().update(cx, |app, cx| {
+                    app.find_chat_mut(jid)
+                        .unwrap()
+                        .messages
+                        .push(ChatMessage::new_incoming(
+                            "unrelated".into(),
+                            jid.into(),
+                            "new message".into(),
+                        ));
+                    app.invalidate_message_cache(jid, cx);
+                    app.invalidate_message_cache(jid, cx);
+                });
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(
+                visual.update(gpui_base::TextSelection::selected_text),
+                "alpha "
+            );
+            // Daemon events invalidate without holding a Window lease.
+            visual.cx.update(|cx| {
+                app_entity.as_ref().unwrap().update(cx, |app, cx| {
+                    let business = app.find_chat_mut(jid).unwrap().messages[0]
+                        .business
+                        .as_mut()
+                        .unwrap();
+                    match segment {
+                        MessageTextSegment::Header => business.header = "changed".into(),
+                        MessageTextSegment::Footer => business.footer = "changed".into(),
+                        _ => unreachable!(),
+                    }
+                    app.invalidate_message_cache(jid, cx);
+                });
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(visual.update(gpui_base::TextSelection::selected_text), "");
+        }
+    }
+
+    #[gpui::test]
     fn leaving_connected_view_clears_selected_message_text(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
@@ -4663,7 +4768,7 @@ mod tests {
                 focus_handle = Some(handle.clone());
                 SelectionExitTestView {
                     focus_handle: handle,
-                    selection_key: Arc::from("test-message"),
+                    selection_key: Arc::<str>::from("test-message").into(),
                 }
             });
             gpui_component::Root::new(view, window, cx)

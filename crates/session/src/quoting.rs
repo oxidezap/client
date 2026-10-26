@@ -26,7 +26,7 @@ pub fn quoted_from(message: &wa::Message) -> Option<QuotedMessage> {
     let base = context
         .quoted_message
         .as_option()
-        .map(|quoted| quoted.get_base_message());
+        .map(oxidezap_chat_store::normalized_message);
 
     let sender = context.participant.clone().unwrap_or_default();
     Some(QuotedMessage {
@@ -38,9 +38,16 @@ pub fn quoted_from(message: &wa::Message) -> Option<QuotedMessage> {
         sender_name: String::new(),
         sender,
         preview: base
-            .and_then(|base| base.text_content().or_else(|| base.get_caption()))
-            .unwrap_or_default()
-            .to_string(),
+            .and_then(|base| {
+                oxidezap_chat_store::business_content(base)
+                    .map(|b| b.summary())
+                    .or_else(|| {
+                        base.text_content()
+                            .or_else(|| base.get_caption())
+                            .map(str::to_owned)
+                    })
+            })
+            .unwrap_or_default(),
         kind: base.and_then(quoted_kind),
     })
 }
@@ -77,9 +84,23 @@ fn context_info(message: &wa::Message) -> Option<&wa::ContextInfo> {
         document_message,
         sticker_message,
     )
+    .or_else(|| {
+        oxidezap_chat_store::business_contexts(message)
+            .find(|context| context.stanza_id.is_some())
+            .or_else(|| oxidezap_chat_store::business_contexts(message).next())
+    })
 }
 
 fn quoted_kind(message: &wa::Message) -> Option<QuotedKind> {
+    if let Some(media) = oxidezap_chat_store::business_media(message) {
+        use oxidezap_chat_store::BusinessMedia;
+        return match media {
+            BusinessMedia::Image(_) | BusinessMedia::Thumbnail(_) => Some(QuotedKind::Image),
+            BusinessMedia::Video(_) => Some(QuotedKind::Video),
+            BusinessMedia::Document(_) => Some(QuotedKind::Document),
+            BusinessMedia::Location(_) => None,
+        };
+    }
     if message.image_message.is_set() {
         Some(QuotedKind::Image)
     } else if message.video_message.is_set() || message.ptv_message.is_set() {

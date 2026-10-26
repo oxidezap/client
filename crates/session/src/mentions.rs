@@ -17,7 +17,6 @@ use std::sync::Arc;
 use oxidezap_chat_store::StoredMessage;
 use oxidezap_core::ChatMessage;
 use whatsapp_rust::client::Client;
-use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore_binary::jid::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
@@ -56,6 +55,9 @@ pub(crate) async fn hydrate_mention_lists(
             continue;
         }
         msg.content = apply_to(&pairs, std::mem::take(&mut msg.content));
+        if let Some(business) = msg.business.as_mut() {
+            apply_business_to(&pairs, business, &msg.content);
+        }
         if let Some(media) = msg.media.as_mut()
             && let Some(caption) = media.caption.take()
         {
@@ -133,6 +135,10 @@ pub(crate) fn mentioned_jids(message: Option<&wa::Message>) -> Vec<String> {
         audio_message,
         document_message,
         sticker_message,
+    );
+    jids.extend(
+        oxidezap_chat_store::business_contexts(base)
+            .flat_map(|context| context.mentioned_jid.iter().cloned()),
     );
     jids.sort();
     jids.dedup();
@@ -262,6 +268,19 @@ async fn mention_names(
     out
 }
 
+pub(crate) fn apply_business_to(
+    pairs: &[(String, String)],
+    business: &mut oxidezap_core::BusinessContent,
+    body: &str,
+) {
+    business.body = body.to_owned();
+    business.header = apply_to(pairs, std::mem::take(&mut business.header));
+    business.footer = apply_to(pairs, std::mem::take(&mut business.footer));
+    for button in &mut business.buttons {
+        button.label = apply_to(pairs, std::mem::take(&mut button.label));
+    }
+}
+
 /// The nested original a reply quotes, if it quoted one.
 ///
 /// The linkage lives on the reply body's context while the original's text
@@ -275,7 +294,7 @@ fn nested_quoted(message: Option<&wa::Message>) -> Option<&wa::Message> {
                 && let Some(context) = body.context_info.as_option()
                 && let Some(quoted) = context.quoted_message.as_option()
             {
-                return Some(quoted.get_base_message());
+                return Some(oxidezap_chat_store::normalized_message(quoted));
             }
         )+};
     }
@@ -290,7 +309,9 @@ fn nested_quoted(message: Option<&wa::Message>) -> Option<&wa::Message> {
         document_message,
         sticker_message,
     );
-    None
+    oxidezap_chat_store::business_contexts(base)
+        .find_map(|context| context.quoted_message.as_option())
+        .map(oxidezap_chat_store::normalized_message)
 }
 
 /// The message under its envelopes.
@@ -299,16 +320,7 @@ fn nested_quoted(message: Option<&wa::Message>) -> Option<&wa::Message> {
 /// inside one is still a mention, and the mention list lives on the inner
 /// body's context rather than the envelope's.
 fn peel(message: &wa::Message) -> &wa::Message {
-    for wrapper in [
-        &message.group_mentioned_message,
-        &message.associated_child_message,
-        &message.poll_creation_message_v4,
-    ] {
-        if let Some(inner) = wrapper.as_option().and_then(|w| w.message.as_option()) {
-            return inner.get_base_message();
-        }
-    }
-    message.get_base_message()
+    oxidezap_chat_store::normalized_message(message)
 }
 
 #[cfg(test)]

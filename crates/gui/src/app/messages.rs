@@ -208,10 +208,7 @@ impl MessageListCache {
             items: build_items(messages, typing.clone()).into(),
             typing,
             ids: messages.iter().map(BubbleIds::of).collect(),
-            text: messages
-                .iter()
-                .map(|message| BubbleText::of(&message.content))
-                .collect(),
+            text: messages.iter().map(BubbleText::of_message).collect(),
             messages: messages.iter().cloned().map(Arc::new).collect(),
         }
     }
@@ -304,7 +301,7 @@ mod tests {
                         chat_jid: jid.into(),
                         ids: BubbleIds::of(&message),
                         selection_order: 0,
-                        text: BubbleText::of(&message.content),
+                        text: BubbleText::of_message(&message),
                         message: Arc::new(message),
                         attempted_vote: None,
                         playing_message_id: None,
@@ -629,6 +626,44 @@ mod tests {
                 .collect(),
             total: names.len(),
             kind: oxidezap_core::ComposingKind::Text,
+        }
+    }
+    #[gpui::test]
+    fn business_headers_footers_and_unavailable_choices_render_offline(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use oxidezap_core::{BusinessAction, BusinessButton, BusinessContent, BusinessKind};
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut message = fixtures::message("BUSINESS", fixtures::PEER, "*Your order* is ready");
+        message.business = Some(BusinessContent {
+            kind: BusinessKind::Template,
+            header: "Order update".into(),
+            body: message.content.clone(),
+            footer: "_Example shop_".into(),
+            buttons: vec![BusinessButton {
+                label: "Track order".into(),
+                action: BusinessAction::OpenLink,
+            }],
+            notice: None,
+        });
+        let rows = vec![(fixtures::PEER.into(), false, message)];
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(WhatsAppApp::new);
+            let fixture = cx.new(|_| EditedBubbleFixture { app, rows });
+            gpui_component::Root::new(fixture, window, cx)
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for id in [
+            "business-header-BUSINESS",
+            "business-footer-BUSINESS",
+            "business-button-BUSINESS-0",
+        ] {
+            assert!(cx.debug_bounds(id).is_some(), "{id}");
         }
     }
 }
