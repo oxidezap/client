@@ -869,6 +869,7 @@ pub fn is_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{FAILURES_BEFORE_LOST, Failures};
+    use nokhwa::utils::Resolution;
 
     /// One bad frame is not a broken camera, and neither are many with good
     /// ones between them: what says the device is gone is a run.
