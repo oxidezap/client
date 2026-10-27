@@ -15,7 +15,7 @@
 //! picture id and the signed source the daemon fetches, and never the bytes
 //! or the URL in state.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use log::debug;
@@ -330,11 +330,19 @@ pub(super) async fn resolve(
     generation: u64,
 ) {
     let mut filtered: HashMap<String, (Jid, Option<String>, bool)> = HashMap::new();
+    let mut cached_absent = HashSet::new();
     for demand in demands {
         let Ok(jid) = demand.jid.parse::<Jid>() else {
             continue;
         };
         if lookup_is_useless(&jid) {
+            continue;
+        }
+        // A newly attached window has its own admission reservations. The
+        // daemon's negative cache must answer them even without another IQ.
+        if matches!(resolver.asked.get(&demand.jid), Some((known_generation, AvatarResolutionState::NotFound)) if *known_generation == generation)
+        {
+            cached_absent.insert(demand.jid);
             continue;
         }
         if !resolver.needs(
@@ -350,6 +358,26 @@ pub(super) async fn resolve(
             .or_insert_with(|| (jid, demand.known_picture_id.clone(), demand.need_bytes));
         if demand.need_bytes {
             entry.2 = true;
+        }
+    }
+
+    let cached: Vec<_> = cached_absent
+        .into_iter()
+        .map(|jid| oxidezap_core::AvatarResolution {
+            jid,
+            outcome: oxidezap_core::AvatarOutcome::NotFound,
+        })
+        .collect();
+    for chunk in cached.chunks(AVATAR_CONCURRENCY) {
+        // Go through the daemon's guarded removal path, preserving ordering
+        // and commit-before-readiness even if an earlier removal is pending.
+        if ui_tx
+            .send(UiEvent::AvatarsResolved {
+                resolutions: chunk.to_vec(),
+            })
+            .is_err()
+        {
+            return;
         }
     }
 
@@ -524,6 +552,60 @@ impl WhatsAppClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn reopened_frontend_gets_cached_negative_completions_without_network() {
+        let store =
+            super::super::SqliteStore::open("file:avatar-negative-replay?mode=memory&cache=shared")
+                .await
+                .unwrap();
+        let bot = super::super::persistent_companion(whatsapp_rust::bot::Bot::builder())
+            .with_backend(store)
+            .build()
+            .await
+            .unwrap();
+        let (sender, mut receiver) = super::super::ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(super::super::ui_queue::HistoryBudget::new()),
+        );
+        let mut resolver = Resolver::new();
+        let demands: Vec<_> = (0..300)
+            .map(|i| {
+                let jid = format!("reopened-{i}@s.whatsapp.net");
+                resolver.mark(&jid, 1, AvatarResolutionState::NotFound);
+                oxidezap_core::AvatarDemand {
+                    jid,
+                    known_picture_id: None,
+                    cache_key: None,
+                    need_bytes: true,
+                    cache_miss: false,
+                }
+            })
+            .collect();
+        // The bot is never connected or run. A lookup would fail, rather
+        // than producing the cached NotFound completions asserted below.
+        resolve(&bot.client(), &sender, &mut resolver, demands.clone(), 1).await;
+        let mut answered = HashSet::new();
+        while let Ok(event) = receiver.try_recv() {
+            let UiEvent::AvatarsResolved { resolutions } = event else {
+                panic!("unexpected avatar replay event")
+            };
+            for resolution in resolutions {
+                assert!(matches!(
+                    resolution.outcome,
+                    oxidezap_core::AvatarOutcome::NotFound
+                ));
+                answered.insert(resolution.jid);
+            }
+        }
+        assert_eq!(answered.len(), demands.len());
+        for demand in &demands {
+            assert!(answered.contains(&demand.jid));
+            assert!(!resolver.needs(&demand.jid, 1, true, false));
+            assert!(resolver.needs(&demand.jid, 2, true, false));
+        }
+    }
 
     #[test]
     fn a_status_broadcast_is_never_looked_up() {

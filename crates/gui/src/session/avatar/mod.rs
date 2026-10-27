@@ -446,7 +446,9 @@ impl AvatarManager {
                         known_picture_id: None,
                         cache_key: None,
                         need_bytes: true,
-                        cache_miss: false,
+                        // The daemon may remember BytesReady after the
+                        // derived descriptor was retired or never hydrated.
+                        cache_miss: true,
                     },
                     priority,
                 )
@@ -827,7 +829,12 @@ mod tests {
             cache_key: None,
         };
         manager.demand_chat(&absent);
-        assert_eq!(manager.take_demands().len(), 1);
+        let demands = manager.take_demands();
+        assert_eq!(demands.len(), 1);
+        assert!(
+            demands[0].cache_miss,
+            "an absent descriptor must supersede stale daemon readiness"
+        );
         manager.on_avatar_ready(&absent.jid, "");
         manager.demand_chat(&absent);
         assert!(!manager.is_in_flight(&absent.jid));
