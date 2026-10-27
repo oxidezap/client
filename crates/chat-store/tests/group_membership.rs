@@ -102,3 +102,34 @@ async fn membership_facts_do_not_attach_to_another_authors_same_id_message() {
         Some("synthetic peer message")
     );
 }
+
+#[tokio::test]
+async fn deleting_a_newer_message_restores_the_membership_preview() {
+    let (_store, chat_store) = test_store().await;
+    feed(&chat_store, [notice("PREVIEW", 0)]).await;
+    let before = chat_store.chats(false, 20).await.unwrap().remove(0);
+    assert!(before.last_message_preview.is_some());
+    let group = jid(GROUP);
+    chat_store
+        .record_outgoing(
+            &group,
+            "AFTER-NOTICE",
+            &wa::Message::text("synthetic newer message"),
+            ts(1_700_000_010),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    feed(
+        &chat_store,
+        [delete_for_me(
+            group,
+            "AFTER-NOTICE",
+            true,
+            ts(1_700_000_020),
+        )],
+    )
+    .await;
+    let after = chat_store.chats(false, 20).await.unwrap().remove(0);
+    assert_eq!(after.last_message_kind, Some(MessageKind::GroupMembership));
+    assert_eq!(after.last_message_preview, before.last_message_preview);
+}

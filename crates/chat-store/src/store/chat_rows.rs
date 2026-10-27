@@ -107,7 +107,8 @@ fn newest_chat_head(
     // Both halves of the pair: the same rows `messages()` draws the
     // conversation from.
     let keys = crate::lid::chat_key_candidates(conn, device_id, chat)?;
-    let newest: Option<(i64, Option<String>, String, bool)> = dsl::messages
+    type HeadRow = (i64, Option<String>, String, bool, Option<String>);
+    let newest: Option<HeadRow> = dsl::messages
         .filter(
             dsl::device_id
                 .eq(device_id)
@@ -119,23 +120,35 @@ fn newest_chat_head(
             dsl::text_content,
             dsl::kind,
             dsl::revoked,
+            dsl::group_membership,
         ))
         .first(conn)
         .optional()?;
-    Ok(newest.map(|(timestamp_ms, text, kind, revoked)| {
-        // A tombstone previews as nothing at all — its pre-revoke kind must
-        // not leak back into the chat head.
-        let (preview, kind) = if revoked {
-            (None, None)
-        } else {
-            (text, Some(kind))
-        };
-        ChatHead {
-            timestamp_ms,
-            preview,
-            kind,
-        }
-    }))
+    Ok(
+        newest.map(|(timestamp_ms, text, kind, revoked, membership)| {
+            // A tombstone previews as nothing at all — its pre-revoke kind must
+            // not leak back into the chat head.
+            let (preview, kind) = if revoked {
+                (None, None)
+            } else if kind == "group_membership" {
+                let preview = membership
+                    .as_deref()
+                    .and_then(|raw| {
+                        serde_json::from_str::<oxidezap_core::GroupMembership>(raw).ok()
+                    })
+                    .map(|event| event.summary())
+                    .unwrap_or_else(|| "Group membership changed".to_owned());
+                (Some(preview), Some(kind))
+            } else {
+                (text, Some(kind))
+            };
+            ChatHead {
+                timestamp_ms,
+                preview,
+                kind,
+            }
+        }),
+    )
 }
 
 /// Re-derive the chat-list preview from the newest remaining message (used
