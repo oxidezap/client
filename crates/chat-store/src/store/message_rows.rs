@@ -20,6 +20,8 @@ pub(super) struct NewMessage<'a> {
     /// [`crate::storage_proto`] representation of `proto` (raw vs zlib).
     pub(super) proto_codec: i32,
     pub(super) status: i32,
+    /// Explicit WebMessageInfo status, never a placeholder insertion default.
+    pub(super) history_status: Option<i32>,
     pub(super) starred: bool,
     /// Live redeliveries refresh content in place (PDO recovery replaces an
     /// `undecryptable` placeholder); history-sync copies never clobber live rows.
@@ -63,11 +65,11 @@ pub(super) fn insert_message(
     )? {
         // History content may be stale while its delivery evidence is newer.
         // Resolve sender/account identity first and keep terminal failures intact.
-        if !new.overwrite
-            && new.from_me
+        if new.from_me
+            && let Some(status) = new.history_status
             && (waproto::whatsapp::web_message_info::Status::SERVER_ACK as i32
                 ..=waproto::whatsapp::web_message_info::Status::PLAYED as i32)
-                .contains(&new.status)
+                .contains(&status)
         {
             let advanced = diesel::update(
                 dsl::messages
@@ -77,9 +79,9 @@ pub(super) fn insert_message(
                     .filter(
                         dsl::status.ne(waproto::whatsapp::web_message_info::Status::ERROR as i32),
                     )
-                    .filter(dsl::status.lt(new.status)),
+                    .filter(dsl::status.lt(status)),
             )
-            .set(dsl::status.eq(new.status))
+            .set(dsl::status.eq(status))
             .execute(conn)?;
             if advanced > 0 {
                 changes.message_chats.insert(new.chat_jid.to_owned());

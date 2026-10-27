@@ -325,3 +325,49 @@ async fn an_unowned_early_receipt_does_not_turn_server_ack_into_delivery() {
         MessageStatus::Delivered
     );
 }
+
+#[tokio::test]
+async fn own_undecryptable_fanout_is_not_recipient_delivery_evidence() {
+    for (id, acknowledged) in [("PLACEHOLDER-PENDING", false), ("PLACEHOLDER-SENT", true)] {
+        let (_db, store) = test_store().await;
+        store
+            .record_outgoing(
+                &jid(PEER),
+                id,
+                &wa::Message::text("synthetic send"),
+                ts(100),
+            )
+            .unwrap();
+        store.flush().await.unwrap();
+        if acknowledged {
+            feed(&store, [ack(id, jid(PEER))]).await;
+        }
+        let mut info = incoming_info(PEER, "5511000000099@s.whatsapp.net", id, 101);
+        info.source.is_from_me = true;
+        feed(
+            &store,
+            [Event::UndecryptableMessage(
+                wacore::types::events::UndecryptableMessage::builder()
+                    .info(Arc::new(info))
+                    .is_unavailable(false)
+                    .unavailable_type(wacore::types::events::UnavailableType::Unknown)
+                    .decrypt_fail_mode(wacore::types::events::DecryptFailMode::Show)
+                    .build(),
+            )],
+        )
+        .await;
+        assert_eq!(
+            store
+                .own_message(&jid(PEER), id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            if acknowledged {
+                MessageStatus::ServerAck
+            } else {
+                MessageStatus::Pending
+            }
+        );
+    }
+}

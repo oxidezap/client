@@ -82,6 +82,7 @@ pub(super) fn apply_inbound(
                     } else {
                         wa::web_message_info::Status::DELIVERY_ACK as i32
                     },
+                    history_status: None,
                     starred: false,
                     overwrite: true,
                 },

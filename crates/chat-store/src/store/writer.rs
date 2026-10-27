@@ -448,6 +448,7 @@ fn apply_writer_msg(
                     proto: Some(&proto_bytes),
                     proto_codec,
                     status: wa::web_message_info::Status::PENDING as i32,
+                    history_status: None,
                     starred: false,
                     overwrite: true,
                 },

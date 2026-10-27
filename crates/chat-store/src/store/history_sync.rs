@@ -381,6 +381,7 @@ pub(super) fn apply_history_message(
                             .status
                             .map(|s| s as i32)
                             .unwrap_or(wa::web_message_info::Status::PENDING as i32),
+                        history_status: wmi.status.map(|status| status as i32),
                         starred: wmi.starred.unwrap_or(false),
                         // History is the stale copy: live rows win.
                         overwrite: false,
