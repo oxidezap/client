@@ -88,7 +88,7 @@ impl ReadRecord {
     /// proof the read is stale ends the override with the reload it was
     /// waiting for still in flight, so the badge comes straight back.
     fn undermined_by(&self, message: &ChatMessage) -> bool {
-        !message.is_from_me && !message.is_read && !self.covers(message)
+        message.system.is_none() && !message.is_from_me && !message.is_read && !self.covers(message)
     }
 
     fn expired(&self) -> bool {
@@ -185,6 +185,11 @@ impl ChatReads {
     /// the duplicate and owed one receipt, and nothing reconciled them until
     /// a complete store reload.
     fn observe(&mut self, message: &ChatMessage) -> bool {
+        // Front ends bound reads by shared messages, never local/system rows.
+        // A persisted membership notice must not move that boundary forward.
+        if message.system.is_some() {
+            return false;
+        }
         let secs = message.timestamp.timestamp();
         // A backfill older than what we hold says nothing about the boundary.
         if secs > self.newest_secs {
@@ -287,9 +292,12 @@ impl ReadTracker {
                     let newest = chat
                         .messages
                         .iter()
+                        .filter(|message| message.system.is_none())
                         .map(|message| message.timestamp.timestamp())
                         .max();
-                    if newest.is_none_or(|newest| newest >= reads.newest_secs) {
+                    if chat.messages.is_empty()
+                        || newest.is_some_and(|newest| newest >= reads.newest_secs)
+                    {
                         *reads = ChatReads::default();
                     } else {
                         // An older page answers for the rows in it and for
@@ -297,7 +305,12 @@ impl ReadTracker {
                         // the receipt owed for a live message the page does
                         // not carry: the boundary still admitted a read
                         // naming it, and no receipt went out for it.
-                        reads.forget(chat.messages.iter().map(|message| message.id.as_str()));
+                        reads.forget(
+                            chat.messages
+                                .iter()
+                                .filter(|message| message.system.is_none())
+                                .map(|message| message.id.as_str()),
+                        );
                     }
                     for message in &chat.messages {
                         reads.observe(message);
@@ -379,7 +392,7 @@ impl ReadTracker {
             chat.messages
                 .iter()
                 .rev()
-                .find(|m| !m.is_from_me)
+                .find(|m| m.system.is_none() && !m.is_from_me)
                 .map_or(NOTHING_BEHIND_IT, |m| m.timestamp.timestamp())
         };
         let spent = store_agrees
@@ -1035,5 +1048,46 @@ mod tests {
         bridge.observe(loaded(Vec::new()));
         assert!(bridge.reads().boundary("1@s.whatsapp.net").is_none());
         assert!(!bridge.reads().read_through.contains_key("1@s.whatsapp.net"));
+    }
+    #[test]
+    fn membership_notice_does_not_advance_or_undermine_a_shared_read() {
+        use oxidezap_core::{GroupMembership, MembershipAction, SystemNotice};
+        let group = "120363000000000099@g.us";
+        let peer = "12025550123@s.whatsapp.net";
+        let incoming = message("unread", peer, 10, false, false);
+        let mut notice = message("group-synthetic-0", group, 20, false, true);
+        notice.system = Some(SystemNotice::GroupMembership(Box::new(GroupMembership {
+            action: MembershipAction::Add,
+            actor: None,
+            participants: Vec::new(),
+        })));
+        let notice_page = stored_chat(group, 1, vec![notice.clone()]);
+        let chat = stored_chat(group, 1, vec![incoming, notice]);
+        let mut bridge = bridge();
+        bridge.observe(loaded(vec![chat.clone()]));
+        let (boundary, read) = bridge
+            .read_plan(group, Some("unread"))
+            .expect("the GUI's newest shared message remains a valid read boundary");
+        let (secs, ids) = boundary.unwrap();
+        assert_eq!(secs, 10);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].0, "unread");
+        assert_eq!(
+            bridge.reads().take_receipts(group),
+            vec![("unread".to_owned(), peer.to_owned())]
+        );
+        bridge.reads().record_read(group, read);
+        bridge.observe(loaded(vec![chat]));
+        assert_eq!(
+            bridge.hub.chat(group).unwrap().unread,
+            0,
+            "a stale reload must not restore the badge because of the notice"
+        );
+        bridge.observe(loaded(vec![notice_page]));
+        assert!(
+            bridge.read_plan(group, Some("unread")).is_ok(),
+            "a notice-only page must preserve the shared boundary already observed"
+        );
+        assert_eq!(bridge.hub.chat(group).unwrap().unread, 0);
     }
 }
