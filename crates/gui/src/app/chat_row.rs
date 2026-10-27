@@ -432,17 +432,24 @@ mod tests {
 
     #[test]
     fn our_own_last_message_carries_its_tick() {
-        let mut chat = chat(false);
-        let mut msg = message(true, "pong");
-        msg.status = MessageStatus::Read;
-        chat.messages.push(msg);
-        let Preview::Message { status, prefix, .. } =
-            ChatRow::new(&chat, None, None, false).preview
-        else {
-            panic!("expected a message preview");
-        };
-        assert_eq!(status, Some(MessageStatus::Read));
-        assert_eq!(prefix, None, "the tick already says it is ours");
+        for expected in [
+            MessageStatus::Sent,
+            MessageStatus::Delivered,
+            MessageStatus::Read,
+            MessageStatus::Played,
+        ] {
+            let mut chat = chat(false);
+            let mut msg = message(true, "synthetic");
+            msg.status = expected;
+            chat.messages.push(msg);
+            let Preview::Message { status, prefix, .. } =
+                ChatRow::new(&chat, None, None, false).preview
+            else {
+                panic!("expected a message preview");
+            };
+            assert_eq!(status, Some(expected));
+            assert_eq!(prefix, None, "the tick already says it is ours");
+        }
     }
 
     #[test]

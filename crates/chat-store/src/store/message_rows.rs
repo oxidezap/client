@@ -61,6 +61,30 @@ pub(super) fn insert_message(
         &sender,
         changes,
     )? {
+        // History content may be stale while its delivery evidence is newer.
+        // Resolve sender/account identity first and keep terminal failures intact.
+        if !new.overwrite
+            && new.from_me
+            && (waproto::whatsapp::web_message_info::Status::SERVER_ACK as i32
+                ..=waproto::whatsapp::web_message_info::Status::PLAYED as i32)
+                .contains(&new.status)
+        {
+            let advanced = diesel::update(
+                dsl::messages
+                    .filter(dsl::id.eq(existing.id))
+                    .filter(dsl::from_me.eq(true))
+                    .filter(dsl::revoked.eq(false))
+                    .filter(
+                        dsl::status.ne(waproto::whatsapp::web_message_info::Status::ERROR as i32),
+                    )
+                    .filter(dsl::status.lt(new.status)),
+            )
+            .set(dsl::status.eq(new.status))
+            .execute(conn)?;
+            if advanced > 0 {
+                changes.message_chats.insert(new.chat_jid.to_owned());
+            }
+        }
         // A revoke that arrived first had no original position. Recover only
         // its kind/time, never the content, after sender-scoped resolution.
         let old_ts: i64 = dsl::messages
