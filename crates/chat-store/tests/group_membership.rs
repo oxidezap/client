@@ -43,6 +43,10 @@ async fn membership_facts_survive_reload_without_unread_or_duplicate_rows() {
     .await;
     let page = chat_store.messages(&jid(GROUP), None, 20).await.unwrap();
     assert_eq!(page.len(), 2);
+    assert!(
+        page.iter()
+            .all(|row| !row.from_me && row.status == MessageStatus::Read)
+    );
     let event = page[0].group_membership.as_ref().unwrap();
     assert_eq!(event.actor.as_ref().unwrap().jid, PEER);
     assert_eq!(event.participants[0].jid, PEER_LID);
@@ -54,12 +58,14 @@ async fn membership_facts_survive_reload_without_unread_or_duplicate_rows() {
     );
     drop(chat_store);
     let reopened = ChatStore::new(&store).await.unwrap();
-    assert_eq!(
-        reopened.messages(&jid(GROUP), None, 20).await.unwrap()[0]
-            .group_membership
-            .as_ref(),
-        Some(event)
+    let reloaded = reopened.messages(&jid(GROUP), None, 20).await.unwrap();
+    assert_eq!(reloaded.len(), 2);
+    assert!(
+        reloaded
+            .iter()
+            .all(|row| !row.from_me && row.status == MessageStatus::Read)
     );
+    assert_eq!(reloaded[0].group_membership.as_ref(), Some(event));
     let other_store = store.database().create_device().await.unwrap();
     let other = ChatStore::new(&other_store).await.unwrap();
     assert!(

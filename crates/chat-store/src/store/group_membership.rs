@@ -42,6 +42,7 @@ pub(super) fn apply(
             proto: None,
             proto_codec: 0,
             status: wa::web_message_info::Status::READ as i32,
+            history_status: None,
             starred: false,
             overwrite: false,
         },
