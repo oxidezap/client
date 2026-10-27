@@ -26,6 +26,7 @@ chrono = { workspace = true, features = ["std", "clock", "serde"] }
 # front end in another process receives `UiEvent` itself rather than a
 # parallel set of protocol structs that would have to be kept in step.
 serde = { workspace = true }
+phonenumber = "0.3"
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 

@@ -2462,6 +2462,7 @@ async fn a_contact_update_repairs_an_already_seen_lid_chat() {
 #[test]
 fn a_message_cursor_survives_the_round_trip() {
     let mut row = oxidezap_chat_store::StoredMessage {
+        group_membership: None,
         chat_jid: "5599000000001@s.whatsapp.net".parse().unwrap(),
         id: "3EB0".to_string(),
         sender_jid: "5599000000001@s.whatsapp.net".parse().unwrap(),
@@ -2507,6 +2508,7 @@ fn stored_edit_state_reaches_own_and_peer_bubbles_in_direct_and_group_chats() {
     for chat_jid in [PEER, GROUP] {
         for from_me in [false, true] {
             let stored = oxidezap_chat_store::StoredMessage {
+                group_membership: None,
                 chat_jid: chat_jid.parse().unwrap(),
                 id: format!("EDITED-{from_me}"),
                 sender_jid: PEER.parse().unwrap(),
@@ -3253,5 +3255,200 @@ async fn business_mentions_resolve_live_and_historical_cards() {
             .unwrap();
         assert_eq!(historical.content, live.content);
         assert_eq!(historical.business, live.business);
+    }
+}
+
+#[tokio::test]
+async fn membership_labels_refresh_from_contacts_after_persistence_and_history_reload() {
+    use oxidezap_core::SystemNotice;
+    use whatsapp_rust::wacore::stanza::groups::{GroupNotificationAction, GroupParticipantInfo};
+    use whatsapp_rust::wacore::types::events::{ContactUpdate, GroupUpdate};
+    let (store, client) = test_session("membership-labels").await;
+    let pn = "12025550123@s.whatsapp.net";
+    let lid = "111000011112222@lid";
+    let group = "120363000000000099@g.us";
+    let update = GroupUpdate::builder()
+        .group_jid(group.parse().unwrap())
+        .notification_id("MEMBERSHIP".to_owned())
+        .participant("559900000002@s.whatsapp.net".parse().unwrap())
+        .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_000).unwrap())
+        .is_lid_addressing_mode(true)
+        .action(Box::new(GroupNotificationAction::Add {
+            participants: vec![GroupParticipantInfo {
+                jid: lid.parse().unwrap(),
+                phone_number: Some(pn.parse().unwrap()),
+                display_name: Some("Event name".to_owned()),
+                r#type: None,
+                lid: None,
+                username: None,
+                join_time: None,
+                group_history_sent_state: None,
+            }],
+            reason: None,
+        }))
+        .build();
+    feed(&store, Event::GroupUpdate(update.clone())).await;
+    let names = book(); // History receives its store explicitly, even without a live book.
+    let before = WhatsAppClient::load_history(&store, &client, &names)
+        .await
+        .unwrap();
+    let row = &before
+        .chats
+        .iter()
+        .find(|c| c.jid == group)
+        .unwrap()
+        .messages[0];
+    assert!(
+        row.content.ends_with(" added Event name"),
+        "{}",
+        row.content
+    );
+    assert!(row.is_read);
+    let Some(SystemNotice::GroupMembership(original)) = &row.system else {
+        panic!("membership notice")
+    };
+    assert_eq!(original.participants[0].jid, lid);
+    for name in ["Saved member", "Renamed member"] {
+        feed(
+            &store,
+            Event::ContactUpdate(
+                ContactUpdate::builder()
+                    .jid(pn.parse().unwrap())
+                    .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_100).unwrap())
+                    .action(Box::new({
+                        let mut action: wa::sync_action_value::ContactAction = Default::default();
+                        action.full_name = Some(name.to_owned());
+                        action
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        )
+        .await;
+        let loaded = WhatsAppClient::load_history(&store, &client, &names)
+            .await
+            .unwrap();
+        let row = &loaded
+            .chats
+            .iter()
+            .find(|c| c.jid == group)
+            .unwrap()
+            .messages[0];
+        assert!(
+            row.content.ends_with(&format!(" added {name}")),
+            "{}",
+            row.content
+        );
+        assert_eq!(row.sender, group);
+        let Some(SystemNotice::GroupMembership(event)) = &row.system else {
+            panic!("membership notice")
+        };
+        assert_eq!(event.participants[0].jid, lid);
+        assert_eq!(event.participants[0].phone_jid.as_deref(), Some(pn));
+        // Durable facts still contain the original hint, never a cached label.
+        let raw = store
+            .messages(&group.parse().unwrap(), None, 10)
+            .await
+            .unwrap();
+        assert!(
+            raw[0].group_membership.as_ref().unwrap().participants[0]
+                .label
+                .is_none()
+        );
+    }
+    let (other_store, other_client) = test_session("membership-other-account").await;
+    feed(&other_store, Event::GroupUpdate(update)).await;
+    let other = WhatsAppClient::load_history(&other_store, &other_client, &book())
+        .await
+        .unwrap();
+    assert!(
+        other
+            .chats
+            .iter()
+            .find(|c| c.jid == group)
+            .unwrap()
+            .messages[0]
+            .content
+            .ends_with(" added Event name")
+    );
+}
+
+#[tokio::test]
+async fn membership_uses_a_late_local_mapping_without_replacing_wire_identity() {
+    use oxidezap_core::{GroupMembership, MembershipAction, NoticeParticipant};
+    let (store, client) = test_session("membership-late-mapping").await;
+    let names = book();
+    let lid = "111000011112333@lid";
+    let mut event = GroupMembership {
+        action: MembershipAction::Add,
+        actor: None,
+        participants: vec![NoticeParticipant {
+            jid: "111000011112333:7@lid".to_owned(),
+            phone_jid: None,
+            lid: None,
+            offered_name: None,
+            label: None,
+            is_self: false,
+            canonical_jid: None,
+        }],
+    };
+    super::membership::resolve(&client, &names, &store, &mut event).await;
+    assert_eq!(event.summary(), "Someone added Unknown contact");
+    client
+        .add_lid_pn_mapping(
+            "111000011112333",
+            "12025550123",
+            whatsapp_rust::lid_pn_cache::LearningSource::Usync,
+        )
+        .await
+        .unwrap();
+    names.forget();
+    super::membership::resolve(&client, &names, &store, &mut event).await;
+    assert_eq!(event.summary(), "Someone added +1 202-555-0123");
+    assert_eq!(event.participants[0].jid, "111000011112333:7@lid");
+    assert!(
+        event.participants[0].phone_jid.is_none(),
+        "projection must not replace the wire aliases"
+    );
+    assert_eq!(event.participants[0].canonical_jid.as_deref(), Some(lid));
+}
+
+#[tokio::test]
+async fn membership_wire_phone_outranks_a_masked_lid_contact_label() {
+    use oxidezap_core::{GroupMembership, MembershipAction, NoticeParticipant};
+    let (store, client) = test_session("membership-masked-lid-contact").await;
+    let lid = "111000011112555@lid";
+    feed(
+        &store,
+        from(
+            "120363000000000099@g.us",
+            lid,
+            Some("+1 ·· ····"),
+            wa::Message::text("synthetic"),
+            "MASKED-CONTACT",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let names = book();
+    for (offered, expected) in [
+        (None, "Someone added +1 202-555-0123"),
+        (Some("Event name"), "Someone added Event name"),
+    ] {
+        let mut event = GroupMembership {
+            action: MembershipAction::Add,
+            actor: None,
+            participants: vec![NoticeParticipant {
+                jid: lid.to_owned(),
+                phone_jid: Some("12025550123@s.whatsapp.net".to_owned()),
+                lid: None,
+                offered_name: offered.map(str::to_owned),
+                label: None,
+                is_self: false,
+                canonical_jid: None,
+            }],
+        };
+        super::membership::resolve(&client, &names, &store, &mut event).await;
+        assert_eq!(event.summary(), expected);
     }
 }

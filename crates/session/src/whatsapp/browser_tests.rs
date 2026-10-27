@@ -57,3 +57,63 @@ async fn terminal_recovery_is_account_scoped_and_does_not_require_a_bot() {
     assert!(other_history.logout_message().await.unwrap().is_none());
     other_history.close().await.unwrap();
 }
+
+#[wasm_bindgen_test]
+async fn membership_notice_reloads_with_phone_alias_in_browser() {
+    use std::sync::Arc;
+    use whatsapp_rust::wacore::stanza::groups::{GroupNotificationAction, GroupParticipantInfo};
+    use whatsapp_rust::wacore::types::events::{Event, EventHandler, GroupUpdate};
+    let backend = SqliteStore::open("file:oxidezap-browser-membership?mode=memory&cache=shared")
+        .await
+        .unwrap();
+    let store = ChatStore::new(&backend).await.unwrap();
+    let bot = crate::net::with_platform_plugins(Bot::builder())
+        .with_backend(backend)
+        .with_inbound_durability_hook(ChatStoreDurabilityHook::new(store.clone()))
+        .build()
+        .await
+        .unwrap();
+    let group = "120363000000000099@g.us";
+    let lid = "111000011112222@lid";
+    let event = GroupUpdate::builder()
+        .group_jid(group.parse().unwrap())
+        .notification_id("BROWSER-MEMBERS".to_owned())
+        .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_000).unwrap())
+        .is_lid_addressing_mode(true)
+        .action(Box::new(GroupNotificationAction::Add {
+            participants: vec![GroupParticipantInfo {
+                jid: lid.parse().unwrap(),
+                phone_number: Some("12025550123@s.whatsapp.net".parse().unwrap()),
+                display_name: None,
+                r#type: None,
+                lid: None,
+                username: None,
+                join_time: None,
+                group_history_sent_state: None,
+            }],
+            reason: None,
+        }))
+        .build();
+    store
+        .handler()
+        .handle_event(Arc::new(Event::GroupUpdate(event)));
+    store.flush().await.unwrap();
+    let names = crate::names::NameBook::new(None);
+    let loaded = super::WhatsAppClient::load_history(&store, &bot.client(), &names)
+        .await
+        .unwrap();
+    let row = &loaded
+        .chats
+        .iter()
+        .find(|c| c.jid == group)
+        .unwrap()
+        .messages[0];
+    assert_eq!(row.content, "Someone added +1 202-555-0123");
+    assert!(row.is_read);
+    let Some(oxidezap_core::SystemNotice::GroupMembership(event)) = &row.system else {
+        panic!("membership")
+    };
+    assert_eq!(event.participants[0].jid, lid);
+    bot.client().shutdown().await;
+    store.close().await.unwrap();
+}

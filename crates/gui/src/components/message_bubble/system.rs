@@ -161,6 +161,9 @@ pub fn render_system_row(
             render_call_record(*record, peer_jid, message_id, entity, metrics, cx)
                 .into_any_element()
         }
+        SystemNotice::GroupMembership(event) => {
+            render_notice(event.summary(), metrics, cx).into_any_element()
+        }
         SystemNotice::GroupChanged(text) => {
             render_notice(text.clone(), metrics, cx).into_any_element()
         }

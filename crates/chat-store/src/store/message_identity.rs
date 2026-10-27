@@ -415,7 +415,7 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
            AND c.read_boundary_ms = 0
            AND c.read_boundary_ids IS NULL
            AND m.from_me = FALSE
-           AND m.local_revoke_placeholder = FALSE AND m.received_as_shared_history = FALSE AND m.kind != 'history_notice'
+           AND m.local_revoke_placeholder = FALSE AND m.received_as_shared_history = FALSE AND m.kind != 'history_notice' AND m.kind != 'group_membership'
            AND m.timestamp_ms > ?",
     )
     .bind::<Integer, _>(device_id)
@@ -436,7 +436,7 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice'
+               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice' AND messages.kind != 'group_membership'
          )
          WHERE chats.device_id = ?
            AND chats.unread_count = 0
@@ -447,14 +447,14 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice'
+               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice' AND messages.kind != 'group_membership'
            )
            AND (
              SELECT COUNT(DISTINCT msg_id) FROM messages
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice'
+               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice' AND messages.kind != 'group_membership'
                AND messages.timestamp_ms > ?
            ) <= ?",
     )

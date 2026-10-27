@@ -3937,9 +3937,8 @@ impl WhatsAppApp {
     /// disagree with itself — the new text under the previous message's
     /// clock, still sitting at the previous message's place in the list.
     ///
-    /// The row is local to this window's session, like a call record: the
-    /// store does not hold group notifications, so there is nothing to
-    /// reload it from.
+    /// Transient notices are local to this window. Identified membership
+    /// notifications arrive through committed history instead.
     fn handle_system_notice(
         &mut self,
         chat_jid: String,

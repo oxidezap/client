@@ -31,7 +31,8 @@ pub(super) fn stored_with_unread_tail(
             let eligible = !row.from_me
                 && !row.local_revoke_placeholder
                 && !row.received_as_shared_history
-                && row.kind != oxidezap_chat_store::MessageKind::HistoryNotice;
+                && row.kind != oxidezap_chat_store::MessageKind::HistoryNotice
+                && row.kind != oxidezap_chat_store::MessageKind::GroupMembership;
             let mut message = stored_to_chat_message(row);
             if eligible && remaining > 0 {
                 message.is_read = false;
@@ -85,8 +86,23 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         true
     };
     let quoted = base_message.and_then(quoted_from);
-    let system = (stored.kind == oxidezap_chat_store::MessageKind::HistoryNotice)
-        .then(|| oxidezap_core::SystemNotice::GroupChanged(content.clone()));
+    let system = stored
+        .group_membership
+        .map(|event| oxidezap_core::SystemNotice::GroupMembership(Box::new(event)))
+        .or_else(|| match stored.kind {
+            oxidezap_chat_store::MessageKind::HistoryNotice => {
+                Some(oxidezap_core::SystemNotice::GroupChanged(content.clone()))
+            }
+            oxidezap_chat_store::MessageKind::GroupMembership => Some(
+                oxidezap_core::SystemNotice::GroupChanged("Group membership changed".to_owned()),
+            ),
+            _ => None,
+        });
+    let content = match &system {
+        Some(oxidezap_core::SystemNotice::GroupMembership(event)) => event.summary(),
+        Some(oxidezap_core::SystemNotice::GroupChanged(text)) => text.clone(),
+        _ => content,
+    };
     ChatMessage {
         id: stored.id,
         sender: stored.sender_jid.to_string(),
@@ -95,7 +111,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         is_text: stored.kind == oxidezap_chat_store::MessageKind::Text,
         timestamp: stored.timestamp,
         is_from_me: stored.from_me,
-        is_read,
+        is_read: is_read || system.is_some(),
         media,
         reactions: std::collections::HashMap::new(),
         // The store has tracked the real delivery state all along; the UI used
@@ -277,6 +293,7 @@ mod tests {
             constructed
         };
         oxidezap_chat_store::StoredMessage {
+            group_membership: None,
             chat_jid: "559900000001-1620000000@g.us".parse().unwrap(),
             id: "3EB0C".to_string(),
             sender_jid: "559900000001@s.whatsapp.net".parse().unwrap(),
@@ -555,5 +572,15 @@ mod business_tests {
         assert!(revoked.business.is_none());
         assert!(revoked.media.is_none());
         assert_eq!(revoked.content, "[Message deleted]");
+    }
+    #[test]
+    fn a_membership_row_with_missing_facts_has_an_honest_read_notice() {
+        let mut row = tests::stored_poll_creation();
+        row.kind = oxidezap_chat_store::MessageKind::GroupMembership;
+        row.message = None;
+        let messages = stored_with_unread_tail(vec![row], 1);
+        assert_eq!(messages[0].content, "Group membership changed");
+        assert!(messages[0].is_read);
+        assert!(messages[0].system.is_some());
     }
 }

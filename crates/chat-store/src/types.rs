@@ -26,6 +26,8 @@ pub enum MessageKind {
     Album,
     /// A group system notice describing deliberately shared history.
     HistoryNotice,
+    /// A locally materialized membership notification.
+    GroupMembership,
     /// WhatsApp product/catalog message.
     Product,
     Event,
@@ -98,6 +100,7 @@ impl MessageKind {
             Self::Hosted => "hosted",
             Self::Bot => "bot",
             Self::HistoryNotice => "history_notice",
+            Self::GroupMembership => "group_membership",
             Self::Unknown => "unknown",
             Self::Other(label) => label,
         }
@@ -144,6 +147,7 @@ impl MessageKind {
             "hosted" => Self::Hosted,
             "bot" => Self::Bot,
             "history_notice" => Self::HistoryNotice,
+            "group_membership" => Self::GroupMembership,
             "unknown" => Self::Unknown,
             _ => Self::Other(label),
         }
@@ -297,6 +301,7 @@ pub struct ChatNotificationMetadata {
 /// even when it doesn't.
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
+    pub group_membership: Option<oxidezap_core::GroupMembership>,
     pub chat_jid: Jid,
     pub id: String,
     pub sender_jid: Jid,

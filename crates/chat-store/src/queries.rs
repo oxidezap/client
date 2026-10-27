@@ -244,6 +244,7 @@ pub(crate) struct MessageRow {
     revoked: bool,
     local_revoke_placeholder: bool,
     received_as_shared_history: bool,
+    group_membership: Option<String>,
 }
 
 /// Fold an author-equivalent legacy copy for a read without hiding a
@@ -482,6 +483,10 @@ impl From<MessageRow> for StoredMessage {
             }
         });
         StoredMessage {
+            group_membership: row
+                .group_membership
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
             chat_jid: parse_jid(&row.chat_jid),
             id: row.msg_id,
             sender_jid: parse_jid(&row.sender_jid),
@@ -943,6 +948,7 @@ impl ChatStore {
                             .and(dsl::local_revoke_placeholder.eq(false))
                             .and(dsl::received_as_shared_history.eq(false))
                             .and(dsl::kind.ne("history_notice"))
+                            .and(dsl::kind.ne("group_membership"))
                             .and(
                                 dsl::timestamp_ms
                                     .gt(cursor.timestamp_ms)

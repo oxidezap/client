@@ -377,7 +377,7 @@ async fn build_identity<S: LidPnSource + ?Sized>(client: &S, jid: &Jid) -> ChatI
 /// it on the path that runs before the chat store exists — where an unfiltered
 /// push name of three spaces used to become somebody's name, and stay it,
 /// since a name only ever gains weight.
-fn usable_name(name: &str, has_phone: bool) -> bool {
+pub(crate) fn usable_name(name: &str, has_phone: bool) -> bool {
     !(name.trim().is_empty() || has_phone && is_masked_phone_label(name))
 }
 

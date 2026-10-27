@@ -92,6 +92,8 @@ pub enum SystemNotice {
     Call(CallRecord),
     /// A group's name, picture or membership changed.
     GroupChanged(String),
+    /// Membership identities remain separate from their current labels.
+    GroupMembership(Box<crate::GroupMembership>),
 }
 
 /// `m:ss`, or `h:mm:ss` past an hour.
