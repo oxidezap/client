@@ -16,6 +16,7 @@ mod contacts;
 mod edit;
 mod event;
 mod group_hierarchy;
+mod group_membership;
 mod history_sync;
 mod inbound;
 pub(crate) mod message_identity;

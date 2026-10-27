@@ -28,6 +28,7 @@ mod calls;
 mod chat;
 mod events;
 mod group;
+mod group_membership;
 mod links;
 mod log_level;
 mod media_budget;
@@ -39,6 +40,9 @@ mod quoted;
 mod rich_text;
 mod status;
 mod system_notice;
+pub use group_membership::{
+    GroupMembership, MembershipAction, NoticeParticipant, format_phone_jid,
+};
 mod video;
 
 pub use account::{AccountId, InvalidAccountId};

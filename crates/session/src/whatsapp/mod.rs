@@ -21,6 +21,7 @@ mod durability;
 
 /// Who is in a group, for the surfaces that name them.
 mod groups;
+mod membership;
 /// Mutations a front end asks the account to perform.
 mod mutations;
 /// Polls, profiles, contacts, channels, media fetch and history coverage.
@@ -2129,11 +2130,50 @@ impl WhatsAppClient {
             // would notice become a row; the rest is bookkeeping, and a line
             // for each would bury the conversation.
             Event::GroupUpdate(update) => {
+                if let Some(mut event) = oxidezap_core::GroupMembership::from_update(update) {
+                    // Identified notices come from the committed store, including
+                    // their first live projection. Anonymous notices have no safe
+                    // deduplication key and remain transient.
+                    if update.notification_id.as_deref().is_none_or(str::is_empty) {
+                        if let Some(store) = names.chat_store() {
+                            membership::resolve(&client, &names, store, &mut event).await;
+                        }
+                        let _ = ui_tx.send(UiEvent::SystemNotice {
+                            chat_jid: update.group_jid.to_string(),
+                            notice_id: format!(
+                                "group-anonymous-{}-{}",
+                                update.timestamp.timestamp_millis(),
+                                update.action_index
+                            ),
+                            at: update.timestamp,
+                            notice: SystemNotice::GroupMembership(Box::new(event)),
+                        });
+                    }
+                    return;
+                }
                 // A notice is a sentence about people who also have bubbles
                 // and a typing line on the same screen. Naming them from the
                 // stanza alone gave one person two names on one conversation:
                 // the push name here, the address-book name everywhere else.
                 let mut named = crate::group_notice::ResolvedNames::new();
+                if let Some(mut actor) = oxidezap_core::NoticeParticipant::actor_of(update) {
+                    if let Some(store) = names.chat_store() {
+                        membership::resolve_person(
+                            &client,
+                            &names,
+                            store,
+                            &mut actor,
+                            &history::own_jids(&client),
+                        )
+                        .await;
+                    }
+                    let label = if actor.is_self {
+                        "You".to_owned()
+                    } else {
+                        actor.label()
+                    };
+                    named.insert(actor.jid.clone(), label);
+                }
                 let mentioned = update
                     .participant
                     .iter()
@@ -2152,11 +2192,9 @@ impl WhatsAppClient {
                     // Resolved, or the same last resort every other surface
                     // falls back to: a notice naming somebody by the digits of
                     // a LID reads as a phone number that is not one.
-                    let name = match names.known(&client, &jid, None).await {
-                        Some(name) => name,
-                        None => names.identity(&client, &jid).await.fallback_name.clone(),
-                    };
-                    named.insert(key, name);
+                    if let Some(name) = names.known(&client, &jid, None).await {
+                        named.insert(key, name);
+                    }
                 }
                 let actor = crate::group_notice::actor_name(
                     update.participant.as_ref(),

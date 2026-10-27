@@ -272,6 +272,7 @@ fn body_for(last: &ChatMessage) -> String {
         return match notice {
             SystemNotice::Call(record) => record.summary(),
             SystemNotice::GroupChanged(text) => single_line(text),
+            SystemNotice::GroupMembership(event) => single_line(&event.summary()),
         };
     }
     if !last.content.is_empty() {

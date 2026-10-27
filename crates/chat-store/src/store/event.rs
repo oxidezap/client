@@ -129,6 +129,7 @@ pub(super) fn apply_event(
         // always, since a front end's list is the store's — while the
         // conversation said underneath that it had changed.
         Event::GroupUpdate(update) => {
+            super::group_membership::apply(conn, device_id, update, cs)?;
             let GroupNotificationAction::Subject { subject, .. } = &*update.action else {
                 // Every other action is people and permissions; the timeline
                 // notice says all there is to say about those.

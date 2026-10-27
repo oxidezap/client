@@ -110,9 +110,17 @@ pub(crate) fn chat_to_dto(chat: oxidezap_core::Chat) -> ChatDto {
 }
 
 pub(crate) fn chat_message_to_dto(chat_jid: &str, msg: ChatMessage) -> MessageDto {
-    let summary = msg.business.as_ref().map(|b| b.summary());
+    let summary = match &msg.system {
+        Some(oxidezap_core::SystemNotice::GroupMembership(event)) => Some(event.summary()),
+        _ => msg.business.as_ref().map(|b| b.summary()),
+    };
     let (kind, media) = if msg.revoked {
         ("revoked", None)
+    } else if matches!(
+        msg.system,
+        Some(oxidezap_core::SystemNotice::GroupMembership(_))
+    ) {
+        ("system", None)
     } else if let Some(media) = &msg.media {
         let kind = match media.media_type {
             oxidezap_core::MediaType::Image => "image",
@@ -372,6 +380,37 @@ mod tests {
         .unwrap();
         assert!(translate_wire_frame(&frame, &hub).is_none());
         assert!(translate_wire_frame("not json at all", &hub).is_none());
+    }
+
+    #[test]
+    fn membership_dto_keeps_ids_and_uses_the_shared_sentence() {
+        use oxidezap_core::{GroupMembership, MembershipAction, NoticeParticipant, SystemNotice};
+        let group = "120363000000000099@g.us";
+        let event = GroupMembership {
+            action: MembershipAction::Add,
+            actor: None,
+            participants: vec![NoticeParticipant {
+                jid: "111000011112222@lid".to_owned(),
+                phone_jid: Some("12025550123@s.whatsapp.net".to_owned()),
+                lid: None,
+                offered_name: None,
+                label: None,
+                is_self: false,
+                canonical_jid: None,
+            }],
+        };
+        let expected = event.summary();
+        let mut message = ChatMessage::new_incoming(
+            "group-synthetic-0".to_owned(),
+            group.to_owned(),
+            "old cached text".to_owned(),
+        );
+        message.system = Some(SystemNotice::GroupMembership(Box::new(event)));
+        let dto = chat_message_to_dto(group, message);
+        assert_eq!(dto.id, "group-synthetic-0");
+        assert_eq!(dto.sender_jid, group);
+        assert_eq!(dto.kind, "system");
+        assert_eq!(dto.text.as_deref(), Some(expected.as_str()));
     }
 
     /// The wire status values stay the ones the CLI documents.

@@ -899,6 +899,11 @@ impl WhatsAppClient {
         is_status: bool,
     ) {
         for msg in msgs.iter_mut() {
+            if let Some(oxidezap_core::SystemNotice::GroupMembership(event)) = &mut msg.system {
+                super::membership::resolve(client, names, chat_store, event).await;
+                msg.content = event.summary();
+                continue;
+            }
             if msg.is_from_me || msg.sender_name.is_some() {
                 continue;
             }
