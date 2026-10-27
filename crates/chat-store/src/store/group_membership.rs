@@ -1,5 +1,5 @@
 //! Store membership facts beside their timeline row, without freezing contact names.
-use super::chat_rows::{ChatBump, bump_chat};
+use super::chat_rows::{ChatBump, bump_chat_row};
 use super::message_rows::{NewMessage, StoredRow, insert_message};
 use super::writer::ChangeSet;
 use crate::schema::messages::dsl;
@@ -48,15 +48,20 @@ pub(super) fn apply(
         changes,
     )?;
     if inserted == StoredRow::Inserted {
-        diesel::update(
-            dsl::messages
-                .filter(dsl::device_id.eq(device))
-                .filter(dsl::chat_jid.eq(&chat))
-                .filter(dsl::msg_id.eq(&id)),
-        )
-        .set(dsl::group_membership.eq(json))
-        .execute(conn)?;
-        bump_chat(
+        // Stanza IDs are sender-controlled. Select the system author's row,
+        // then use its stable ID for both the facts and the preview.
+        let row_id: i64 = dsl::messages
+            .filter(dsl::device_id.eq(device))
+            .filter(dsl::chat_jid.eq(&chat))
+            .filter(dsl::msg_id.eq(&id))
+            .filter(dsl::from_me.eq(false))
+            .filter(dsl::sender_jid.eq(&chat))
+            .select(dsl::id)
+            .first(conn)?;
+        diesel::update(dsl::messages.filter(dsl::id.eq(row_id)))
+            .set(dsl::group_membership.eq(json))
+            .execute(conn)?;
+        bump_chat_row(
             conn,
             device,
             &chat,
@@ -67,6 +72,7 @@ pub(super) fn apply(
                 kind: Some("group_membership"),
                 unread_delta: 0,
             },
+            row_id,
         )?;
         changes.message_chats.insert(chat);
     }

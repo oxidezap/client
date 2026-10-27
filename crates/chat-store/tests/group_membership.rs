@@ -70,3 +70,35 @@ async fn membership_facts_survive_reload_without_unread_or_duplicate_rows() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn membership_facts_do_not_attach_to_another_authors_same_id_message() {
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("synthetic peer message"),
+                incoming_info(GROUP, PEER, "group-MEMBERS-0", 1_700_000_001),
+            ),
+            notice("MEMBERS", 0),
+        ],
+    )
+    .await;
+    let rows = chat_store.messages(&jid(GROUP), None, 20).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    let peer = rows.iter().find(|row| row.sender_jid == jid(PEER)).unwrap();
+    assert_eq!(peer.text.as_deref(), Some("synthetic peer message"));
+    assert!(peer.message.is_some());
+    assert!(peer.group_membership.is_none());
+    let system = rows
+        .iter()
+        .find(|row| row.sender_jid == jid(GROUP))
+        .unwrap();
+    assert!(system.group_membership.is_some());
+    let chats = chat_store.chats(false, 20).await.unwrap();
+    assert_eq!(
+        chats[0].last_message_preview.as_deref(),
+        Some("synthetic peer message")
+    );
+}
