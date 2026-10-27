@@ -691,6 +691,52 @@ mod tests {
         }
     }
 
+    fn expected_eviction_miss(error: &std::io::Error) -> bool {
+        // DeleteFile can leave a delete-pending name while a reader holds
+        // the last handle. CreateFile then returns ERROR_ACCESS_DENIED (5).
+        // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-deletefilew
+        error.kind() == std::io::ErrorKind::NotFound
+            || (cfg!(windows) && error.raw_os_error() == Some(5))
+    }
+
+    #[test]
+    fn eviction_misses_do_not_accept_arbitrary_permission_failures() {
+        assert!(expected_eviction_miss(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!expected_eviction_miss(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert_eq!(
+            expected_eviction_miss(&std::io::Error::from_raw_os_error(5)),
+            cfg!(windows)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_open_reader_survives_eviction_while_new_opens_miss() {
+        use std::io::Read as _;
+        let dir =
+            std::env::temp_dir().join(format!("oxidezap-delete-pending-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f-pending");
+        std::fs::write(&path, b"complete cached payload").unwrap();
+        let mut held = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let miss = std::fs::read(&path).unwrap_err();
+        assert!(
+            expected_eviction_miss(&miss),
+            "unexpected new-open error: {miss:?}"
+        );
+        let mut bytes = Vec::new();
+        held.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"complete cached payload");
+        drop(held);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn readers_observe_complete_payloads_or_cache_misses_during_replacement_and_eviction() {
         let dir = std::env::temp_dir().join(format!(
@@ -713,7 +759,10 @@ mod tests {
             while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 match std::fs::read(&reader_path) {
                     Ok(bytes) => assert!(bytes == vec![1u8; 4096] || bytes == vec![2u8; 8192]),
-                    Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+                    Err(error) => assert!(
+                        expected_eviction_miss(&error),
+                        "unexpected cache read failure: {error:?}"
+                    ),
                 }
             }
         });
