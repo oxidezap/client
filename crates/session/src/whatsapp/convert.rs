@@ -488,6 +488,22 @@ mod tests {
         );
     }
     #[test]
+    fn outgoing_delivery_evidence_survives_hydration_without_promoting_server_ack() {
+        use oxidezap_chat_store::MessageStatus as Stored;
+        let mut row = stored_poll_creation();
+        row.from_me = true;
+        for (stored, ui) in [
+            (Stored::ServerAck, MessageStatus::Sent),
+            (Stored::Delivered, MessageStatus::Delivered),
+            (Stored::Read, MessageStatus::Read),
+            (Stored::Played, MessageStatus::Played),
+        ] {
+            row.status = stored;
+            assert_eq!(stored_to_chat_message(row.clone()).delivery(), Some(ui));
+        }
+    }
+
+    #[test]
     fn incoming_played_survives_hydration_without_turning_read_into_played() {
         let mut stored = stored_poll_creation();
         stored.kind = oxidezap_chat_store::MessageKind::Audio;

@@ -71,6 +71,7 @@ pub(super) fn apply_event(
                     // No bytes, no representation.
                     proto_codec: crate::storage_proto::CODEC_RAW,
                     status: wa::web_message_info::Status::DELIVERY_ACK as i32,
+                    history_status: None,
                     starred: false,
                     overwrite: false,
                 },
