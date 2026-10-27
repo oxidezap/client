@@ -39,7 +39,7 @@ pub struct MessageDto {
     pub from_me: bool,
     pub timestamp_ms: i64,
     pub text: Option<String>,
-    /// "text", "image", "video", "audio", "document", "sticker", "poll", "reaction", "revoked", "call"
+    /// "text", "image", "video", "audio", "document", "sticker", "poll", "reaction", "revoked", "call", "system"
     pub kind: String,
     /// "pending", "sent", "delivered", "read", "failed"
     pub status: String,
