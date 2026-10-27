@@ -405,46 +405,40 @@ pub async fn write_persistent(
     Ok(())
 }
 
-pub async fn delete_account_storage(account: Option<oxidezap_core::AccountId>) {
+pub async fn delete_account_storage(
+    account: Option<oxidezap_core::AccountId>,
+) -> Result<(), String> {
     let Some(account) = account else {
-        return;
+        return Ok(());
     };
     STORAGE_GENERATION.fetch_add(1, portable_atomic::Ordering::Relaxed);
-    let Ok(_origin_guard) = super::web_lock::lock().await else {
-        return;
-    };
-    let Ok(stamp) = persistent_stamp(Some(account)).and_then(|stamp| {
-        stamp
-            .checked_add(1)
-            .ok_or_else(|| "cache generation exhausted".into())
-    }) else {
-        return;
-    };
-    let Ok(storage) = storage() else { return };
-    if storage
+    let _origin_guard = super::web_lock::lock().await?;
+    let stamp = persistent_stamp(Some(account))?
+        .checked_add(1)
+        .ok_or("cache generation exhausted")?;
+    let storage = storage()?;
+    storage
         .set_item(
             &format!("{}_generation", meta_storage_key(account)),
             &stamp.to_string(),
         )
-        .is_err()
-    {
-        return;
-    }
+        .map_err(|e| format!("{e:?}"))?;
     RECONCILED.with(|current| current.set(None));
-    let name = cache_name_for_account(account);
-    if let Some(window) = web_sys::window() {
-        if let Ok(caches) = window.caches() {
-            let _ = wasm_bindgen_futures::JsFuture::from(caches.delete(&name)).await;
-        }
-        if let Ok(Some(storage)) = window.local_storage() {
-            let _ = storage.remove_item(&meta_storage_key(account));
-        }
-    }
+    let caches = web_sys::window()
+        .ok_or("no window")?
+        .caches()
+        .map_err(|e| format!("{e:?}"))?;
+    wasm_bindgen_futures::JsFuture::from(caches.delete(&cache_name_for_account(account)))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    storage
+        .remove_item(&meta_storage_key(account))
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
 }
 
-pub async fn clear_cache_storage(account: Option<oxidezap_core::AccountId>) {
-    let target = account.or_else(active_account);
-    delete_account_storage(target).await;
+pub async fn clear_cache_storage(account: Option<oxidezap_core::AccountId>) -> Result<(), String> {
+    delete_account_storage(account.or_else(active_account)).await
 }
 
 pub async fn avatar_cache_usage(account: oxidezap_core::AccountId) -> (u64, u64) {

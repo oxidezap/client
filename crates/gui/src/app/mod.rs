@@ -3025,7 +3025,9 @@ impl WhatsAppApp {
         }
 
         crate::session::avatar::spawn_task(async move {
-            crate::session::avatar::delete_account_storage(old_scope).await;
+            if let Err(error) = crate::session::avatar::delete_account_storage(old_scope).await {
+                log::warn!("account avatar storage cleanup failed: {error}");
+            }
         });
 
         // Reconnecting rides straight into the same retry loop a cold start

@@ -96,6 +96,10 @@ pub fn put_owned(key: &str, bytes: Vec<u8>) -> Result<String> {
     store(key, bytes, 1)
 }
 
+pub fn put_owned_evictable(key: &str, bytes: Vec<u8>) -> Result<String> {
+    store(key, bytes, 0)
+}
+
 /// Cache `bytes` under `key`, droppable from the moment they land.
 ///
 /// For the eager copy of an inbound message's media, which nobody is waiting
@@ -377,5 +381,35 @@ fn sweep(cache: &mut Cache, arriving: &str) {
         count -= 1;
         cache.held = cache.held.saturating_sub(size);
         over = over.saturating_sub(size);
+    }
+}
+
+#[cfg(test)]
+mod owned_tests {
+    use super::*;
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn epoch_checked_download_transfers_allocation_without_a_claim() {
+        let account =
+            super::super::AccountMedia::new(oxidezap_core::AccountId::new(990003).unwrap());
+        account.wipe(Wipe::Cache).unwrap();
+        let epoch = account.epoch();
+        let bytes = vec![7u8; 4096];
+        let allocation = bytes.as_ptr();
+        let key = account
+            .put_owned_since(epoch, "d-owned-fixture", bytes)
+            .unwrap();
+        with(|cache| {
+            let entry = cache.entries.get(&key).unwrap();
+            assert_eq!(entry.bytes.as_ptr(), allocation);
+            assert_eq!(entry.claims, 0);
+        });
+        account.wipe(Wipe::Cache).unwrap();
+        assert!(
+            account
+                .put_owned_since(epoch, "d-stale-fixture", vec![1])
+                .is_err()
+        );
+        assert!(!has(&account.key("d-stale-fixture")));
     }
 }

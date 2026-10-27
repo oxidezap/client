@@ -71,6 +71,10 @@ pub fn put_owned(key: &str, bytes: Vec<u8>) -> Result<String> {
     put(key, &bytes)
 }
 
+pub fn put_owned_evictable(key: &str, bytes: Vec<u8>) -> Result<String> {
+    put_owned(key, bytes)
+}
+
 /// Cache `bytes` under `key`, droppable from the moment they land.
 ///
 /// The same call as [`put`] here. The distinction exists for the page, whose
@@ -515,7 +519,7 @@ pub(super) fn delete_unscoped(scope: Wipe) -> Result<()> {
         // asked, so a legacy-account wipe must not take a payload another
         // account's install is still going to consume. A pre-multi-account
         // *send* payload shares the spelling and cannot be told apart, so it is
-        // left too and collected by age in `reclaim_abandoned_writes_in`.
+        // left until its owning lifecycle consumes or explicitly removes it.
         if oxidezap_ipc::is_global_staged_key(&name) {
             continue;
         }
@@ -581,61 +585,111 @@ fn sweep_with_limits(
     limit: usize,
 ) -> Result<()> {
     reclaim_abandoned_writes_in(dir);
-    // Keep only candidates that survived the limits so far. Recovery from
-    // an older unbounded directory must not build an unbounded metadata list.
+    // First retain at most the newest `limit` candidates. Delete only after
+    // all ages are known, so read_dir order cannot favor older attachments.
     let mut files = std::collections::BinaryHeap::new();
-    let mut total = 0u64;
-    let mut count = 0usize;
-    let mut removal_error = None;
+    let mut held = 0u64;
+    let mut arriving_size = None;
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
+        if !meta.is_file() || !is_disposable(&entry.file_name().to_string_lossy()) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_disposable(&name) {
-            continue;
-        }
-        total = total.saturating_add(meta.len());
-        count += 1;
         let path = entry.path();
-        if arriving != Some(path.as_path()) {
-            files.push(std::cmp::Reverse((
-                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                meta.len(),
-                path,
-            )));
+        if arriving == Some(path.as_path()) {
+            arriving_size = Some(meta.len());
+            continue;
         }
-        while total > budget || count > limit {
-            let Some(std::cmp::Reverse((_, len, path))) = files.pop() else {
-                break;
-            };
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    count -= 1;
-                    total = total.saturating_sub(len);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    count -= 1;
-                    total = total.saturating_sub(len);
-                }
-                Err(error) => {
-                    removal_error.get_or_insert(error);
-                }
-            }
+        held = held.saturating_add(meta.len());
+        files.push(std::cmp::Reverse((
+            meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+            meta.len(),
+            path,
+        )));
+        if files.len() > limit
+            && let Some(std::cmp::Reverse((_, len, _))) = files.pop()
+        {
+            held = held.saturating_sub(len);
+        }
+    }
+    while held.saturating_add(arriving_size.unwrap_or(0)) > budget
+        || files.len() + usize::from(arriving_size.is_some()) > limit
+    {
+        let Some(std::cmp::Reverse((_, len, _))) = files.pop() else {
+            break;
+        };
+        held = held.saturating_sub(len);
+    }
+    let keep: std::collections::HashSet<_> = files
+        .into_iter()
+        .map(|std::cmp::Reverse((_, _, path))| path)
+        .collect();
+    let mut removal_error = None;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if arriving == Some(path.as_path())
+            || keep.contains(&path)
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || !is_disposable(&entry.file_name().to_string_lossy())
+        {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            removal_error.get_or_insert(error);
         }
     }
     if let Some(error) = removal_error {
         return Err(error).context("reclaiming disposable media");
     }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_uses_global_age_order_instead_of_directory_order() {
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "oxidezap-eviction-{}-{order:?}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let specs = [
+                ("f-newest", 3, 30),
+                ("f-middle", 3, 20),
+                ("f-oldest", 1, 10),
+            ];
+            for index in order {
+                let (name, size, age) = specs[index];
+                let path = dir.as_path().join(name);
+                std::fs::write(&path, vec![1; size]).unwrap();
+                let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(age)),
+                )
+                .unwrap();
+            }
+            sweep_with_limits(dir.as_path(), None, 5, 8).unwrap();
+            assert!(dir.as_path().join("f-newest").exists());
+            assert!(!dir.as_path().join("f-middle").exists());
+            assert!(!dir.as_path().join("f-oldest").exists());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
 
     #[test]
     fn readers_observe_complete_payloads_or_cache_misses_during_replacement_and_eviction() {

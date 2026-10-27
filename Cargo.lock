@@ -6520,6 +6520,7 @@ dependencies = [
  "oxidezap-core",
  "oxidezap-ipc",
  "oxidezap-logging",
+ "oxidezap-platform",
  "oxidezap-plugin-host",
  "oxidezap-session",
  "oxidezap-video",

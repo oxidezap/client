@@ -59,11 +59,29 @@ pub(super) fn compact(conn: &mut SqliteConnection, device_id: i32) -> QueryResul
         .do_update()
         .set(dsl::seq.eq(floor))
         .execute(conn)?;
+    retire_through(conn, device_id, floor)
+}
+
+/// Repair pointers left by an earlier runtime that compacted only removals.
+/// Run once at account open, rather than scanning derived pointers per removal.
+pub(super) fn recover(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
+    compact(conn, device_id)?;
+    let floor = order_floor(conn, device_id)?;
+    if floor < 0 {
+        return Ok(());
+    }
+    retire_through(conn, device_id, floor)
+}
+
+fn retire_through(conn: &mut SqliteConnection, device_id: i32, floor: i64) -> QueryResult<()> {
+    use schema::avatar_descriptors::dsl;
+    // Unknown aliases can be linked after this removal is compacted.
+    // Retire older derived picture pointers too, so they cannot resurface.
+    // Visible images and media bytes stay usable; a later lookup revalidates.
     diesel::delete(diesel::QueryDsl::filter(
         dsl::avatar_descriptors,
         dsl::device_id
             .eq(device_id)
-            .and(dsl::picture_id.eq(""))
             .and(dsl::jid.ne(ORDER_FLOOR))
             .and(dsl::seq.le(floor)),
     ))

@@ -252,6 +252,10 @@ impl AccountMedia {
         crate::media::put_since(self.account, epoch, &self.key(key), bytes)
     }
 
+    pub fn put_owned_since(self, epoch: usize, key: &str, bytes: Vec<u8>) -> Result<String> {
+        crate::media::put_owned_since(self.account, epoch, &self.key(key), bytes)
+    }
+
     pub fn put_owned(self, key: &str, bytes: Vec<u8>) -> Result<String> {
         crate::media::put_owned(&self.key(key), bytes)
     }
@@ -446,6 +450,20 @@ pub fn put_since(account: AccountId, epoch: usize, key: &str, bytes: &[u8]) -> R
         anyhow::bail!("the media cache was cleared while this was being prepared");
     }
     platform::put_evictable(key, bytes)
+}
+
+/// Transfer a completed download without copying its allocation on the web.
+pub fn put_owned_since(
+    account: AccountId,
+    epoch: usize,
+    key: &str,
+    bytes: Vec<u8>,
+) -> Result<String> {
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if current_epoch(account) != epoch {
+        anyhow::bail!("the media cache was cleared while this was being prepared");
+    }
+    platform::put_owned_evictable(key, bytes)
 }
 
 /// The epoch in force for `account`, under the wipe lock.

@@ -59,11 +59,38 @@ async fn browser_avatar_cache_recovers_metadata_and_rejects_pre_clear_writes() {
     let first = format!("a{a}-a-synthetic-first");
     let second = format!("a{a}-a-synthetic-second");
     storage::set_active_account(Some(a));
-    storage::delete_account_storage(Some(a)).await;
+    storage::delete_account_storage(Some(a)).await.unwrap();
     let stamp = storage::persistent_stamp(Some(a)).unwrap();
     storage::write_persistent(&first, b"old", Some(a), stamp)
         .await
         .unwrap();
+    assert_eq!(storage::read_persistent(&first).await.unwrap(), b"old");
+
+    // A quota failure must be visible to the clear caller. Keeping the
+    // generation unchanged also prevents pretending that old writes retired.
+    let local = web_sys::window().unwrap().local_storage().unwrap().unwrap();
+    let object: js_sys::Object = local.clone().unchecked_into();
+    let fail = wasm_bindgen::closure::Closure::wrap(Box::new(
+        move |_: wasm_bindgen::JsValue,
+              _: wasm_bindgen::JsValue|
+              -> Result<(), wasm_bindgen::JsValue> {
+            Err(js_sys::Error::new("synthetic quota exceeded").into())
+        },
+    )
+        as Box<
+            dyn FnMut(
+                wasm_bindgen::JsValue,
+                wasm_bindgen::JsValue,
+            ) -> Result<(), wasm_bindgen::JsValue>,
+        >);
+    let descriptor = js_sys::Object::new();
+    js_sys::Reflect::set(&descriptor, &"value".into(), fail.as_ref()).unwrap();
+    js_sys::Reflect::set(&descriptor, &"configurable".into(), &true.into()).unwrap();
+    assert!(js_sys::Reflect::define_property(&object, &"setItem".into(), &descriptor).unwrap());
+    assert!(storage::clear_cache_storage(Some(a)).await.is_err());
+    assert_eq!(storage::persistent_stamp(Some(a)).unwrap(), stamp);
+    js_sys::Reflect::delete_property(&object, &"setItem".into()).unwrap();
+    drop(fail);
     assert_eq!(storage::read_persistent(&first).await.unwrap(), b"old");
 
     // Exercise actual API absence in this isolated test navigator. Reads
@@ -127,7 +154,7 @@ async fn browser_avatar_cache_recovers_metadata_and_rejects_pre_clear_writes() {
     let (done, finished) = futures_channel::oneshot::channel();
     let acquired = std::rc::Rc::new(std::cell::Cell::new(false));
     let acquired_next = std::rc::Rc::clone(&acquired);
-    wasm_bindgen_futures::spawn_local(async move {
+    oxidezap_platform::spawn(async move {
         let _next = web_lock::lock().await.unwrap();
         acquired_next.set(true);
         let _ = done.send(());
@@ -143,14 +170,14 @@ async fn browser_avatar_cache_recovers_metadata_and_rejects_pre_clear_writes() {
     // Clear is already queued when an older completion requests the lock.
     let held = web_lock::lock().await.unwrap();
     let (cleared, clear_done) = futures_channel::oneshot::channel();
-    wasm_bindgen_futures::spawn_local(async move {
-        storage::delete_account_storage(Some(a)).await;
+    oxidezap_platform::spawn(async move {
+        storage::delete_account_storage(Some(a)).await.unwrap();
         let _ = cleared.send(());
     });
     oxidezap_session::sleep(std::time::Duration::from_millis(10)).await;
     let late_key = first.clone();
     let (written, write_done) = futures_channel::oneshot::channel();
-    wasm_bindgen_futures::spawn_local(async move {
+    oxidezap_platform::spawn(async move {
         let result =
             storage::write_persistent(&late_key, b"queued old bytes", Some(a), stamp).await;
         let _ = written.send(result);
@@ -167,7 +194,7 @@ async fn browser_avatar_cache_recovers_metadata_and_rejects_pre_clear_writes() {
         "pre-clear stamp cannot recreate bytes"
     );
     storage::set_active_account(Some(b));
-    storage::delete_account_storage(Some(b)).await;
+    storage::delete_account_storage(Some(b)).await.unwrap();
     storage::write_persistent(
         &first,
         b"wrong account",
@@ -221,7 +248,7 @@ async fn browser_avatar_cache_recovers_metadata_and_rejects_pre_clear_writes() {
         entries
     );
     assert_eq!(storage::read_persistent(&arriving).await.unwrap(), b"new");
-    storage::delete_account_storage(Some(a)).await;
-    storage::delete_account_storage(Some(b)).await;
+    storage::delete_account_storage(Some(a)).await.unwrap();
+    storage::delete_account_storage(Some(b)).await.unwrap();
     storage::set_active_account(None);
 }

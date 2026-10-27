@@ -587,7 +587,7 @@ impl ChatStore {
                         device_id,
                         &mut changes,
                     )?;
-                    avatar::compact(conn, device_id)?;
+                    avatar::recover(conn, device_id)?;
                     use crate::schema::avatar_descriptors::dsl;
                     let highest: Option<i64> = dsl::avatar_descriptors
                         .filter(dsl::device_id.eq(device_id))

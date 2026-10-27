@@ -1957,7 +1957,7 @@ impl Bridge {
             let bytes = client.download_downloadable_media(media);
             oxidezap_session::spawn(async move {
                 let result = finish_download(bytes.await, |bytes| {
-                    account_media.put_since(epoch, &local_key, &bytes)
+                    account_media.put_owned_since(epoch, &local_key, bytes)
                 });
                 owner.finish(result);
             });

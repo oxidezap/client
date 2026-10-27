@@ -144,31 +144,15 @@ impl WhatsAppApp {
                 self.install_chats(chats, &agreed, cx);
                 cx.notify();
             }
-            // Metadata, not bytes: the daemon turns this into fetches and
-            // publishes `AvatarReady` when a picture is cached. A front end
-            // keeps visible bytes while a replacement loads. NotFound is
-            // authoritative removal even if its durable commit needs retry.
-            // The source travels nowhere and must not be acted on here.
+            // Only the daemon's guarded readiness path can remove bytes.
+            // Metadata can arrive after newer readiness through the publisher.
             UiEvent::AvatarsResolved { resolutions } => {
                 for resolution in resolutions {
-                    let removed =
-                        matches!(&resolution.outcome, oxidezap_core::AvatarOutcome::NotFound);
-                    if let Some(chat) = self.find_chat_mut(&resolution.jid) {
-                        match resolution.outcome {
-                            oxidezap_core::AvatarOutcome::Found { picture_id, .. } => {
-                                chat.resolve_avatar(Some(picture_id));
-                            }
-                            // The chat has no picture: drop what was held so
-                            // the next state carries the placeholder.
-                            oxidezap_core::AvatarOutcome::NotFound => {
-                                chat.ready_avatar(String::new());
-                            }
-                        }
-                    }
-                    if removed {
-                        self.avatar_manager.on_avatar_ready(&resolution.jid, "");
-                        self.invalidate_chat_cache();
-                        cx.notify();
+                    if let oxidezap_core::AvatarOutcome::Found { picture_id, .. } =
+                        resolution.outcome
+                        && let Some(chat) = self.find_chat_mut(&resolution.jid)
+                    {
+                        chat.resolve_avatar(Some(picture_id));
                     }
                 }
             }
@@ -612,6 +596,18 @@ mod avatar_tests {
                     chats: vec![previous],
                     complete: false,
                     next: None,
+                },
+                cx,
+            );
+            assert_eq!(
+                app.find_chat(jid).unwrap().avatar_cache_key.as_deref(),
+                Some("a-current"),
+                "older queued removal metadata cannot clear newer readiness"
+            );
+            app.handle_event(
+                UiEvent::AvatarReady {
+                    jid: jid.into(),
+                    key: String::new(),
                 },
                 cx,
             );

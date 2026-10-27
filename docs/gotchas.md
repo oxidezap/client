@@ -1867,9 +1867,16 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
 
   The browser's persistent avatar index is bounded by bytes and entry count.
   Web Locks serialize mutations across tabs; a persisted generation rejects
-  writes captured before a clear. The first cache opening and interrupted
+  writes captured before a clear. Failure to persist that generation leaves
+  deletion refused and is reported to the clear caller. The first cache opening and interrupted
   mutations rebuild the derived index from stored blobs. Browsers without
   Web Locks retain cache reads and bypass new persistent writes.
+
+  Removal ordering is compacted after 256 tombstones. Advancing the account
+  watermark also retires older derived avatar pointers, including aliases not
+  yet linked when removal arrived. This can require revalidation after restart;
+  visible images, media bytes and message history are preserved. Delayed
+  removal metadata cannot clear bytes: only guarded daemon readiness does.
 
   `HistoryLoaded` carries whatever the durable descriptors already
   said and never waits on an IQ. Ordinary contacts, groups and channels go

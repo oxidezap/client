@@ -344,3 +344,56 @@ async fn compaction_does_not_reveal_an_older_picture_under_the_other_alias() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn aliases_learned_after_compaction_cannot_restore_removed_pictures() {
+    let (store, chat_store) = test_store().await;
+    chat_store
+        .record_avatar(&jid(PEER_LID), "unknown-alias-old", "a-old", 1)
+        .unwrap();
+    chat_store.clear_avatar(&jid(PEER), 2).unwrap();
+    force_avatar_compaction(&chat_store).await;
+    add_lid_mapping(&store).await;
+    assert!(
+        chat_store
+            .avatar_descriptors_for(&[PEER.into(), PEER_LID.into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    chat_store
+        .record_avatar(&jid(PEER_LID), "revalidated", "a-new", 1000)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store
+            .avatar_descriptors_for(&[PEER.into()])
+            .await
+            .unwrap()[0]
+            .picture_id,
+        "revalidated"
+    );
+}
+
+#[tokio::test]
+async fn reopening_retires_picture_pointers_left_below_an_existing_watermark() {
+    use diesel::RunQueryDsl;
+    let (store, chat_store) = test_store().await;
+    force_avatar_compaction(&chat_store).await;
+    let device_id = store.device_id();
+    store.shared().run(move |conn| {
+        diesel::sql_query("INSERT INTO avatar_descriptors (device_id, jid, picture_id, cache_key, updated_at_ms, seq) VALUES (?, ?, 'old-runtime', 'a-old-runtime', 0, 1)")
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>(PEER_LID)
+            .execute(conn).map(|_| ()).map_err(db_err)
+    }).await.unwrap();
+    let reopened = ChatStore::new(&store).await.unwrap();
+    add_lid_mapping(&store).await;
+    assert!(
+        reopened
+            .avatar_descriptors_for(&[PEER.into(), PEER_LID.into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -52,12 +52,16 @@ pub async fn write_persistent(
     Ok(())
 }
 
-pub async fn delete_account_storage(_account: Option<oxidezap_core::AccountId>) {
+pub async fn delete_account_storage(
+    _account: Option<oxidezap_core::AccountId>,
+) -> Result<(), String> {
     // Daemon manages file deletion on account wipe
+    Ok(())
 }
 
-pub async fn clear_cache_storage(_account: Option<oxidezap_core::AccountId>) {
+pub async fn clear_cache_storage(_account: Option<oxidezap_core::AccountId>) -> Result<(), String> {
     // Daemon manages file deletion on media cache clear
+    Ok(())
 }
 
 #[allow(dead_code)]
