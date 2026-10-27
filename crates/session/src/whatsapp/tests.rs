@@ -3412,3 +3412,43 @@ async fn membership_uses_a_late_local_mapping_without_replacing_wire_identity() 
     );
     assert_eq!(event.participants[0].canonical_jid.as_deref(), Some(lid));
 }
+
+#[tokio::test]
+async fn membership_wire_phone_outranks_a_masked_lid_contact_label() {
+    use oxidezap_core::{GroupMembership, MembershipAction, NoticeParticipant};
+    let (store, client) = test_session("membership-masked-lid-contact").await;
+    let lid = "111000011112555@lid";
+    feed(
+        &store,
+        from(
+            "120363000000000099@g.us",
+            lid,
+            Some("+1 ·· ····"),
+            wa::Message::text("synthetic"),
+            "MASKED-CONTACT",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    let names = book();
+    for (offered, expected) in [
+        (None, "Someone added +1 202-555-0123"),
+        (Some("Event name"), "Someone added Event name"),
+    ] {
+        let mut event = GroupMembership {
+            action: MembershipAction::Add,
+            actor: None,
+            participants: vec![NoticeParticipant {
+                jid: lid.to_owned(),
+                phone_jid: Some("12025550123@s.whatsapp.net".to_owned()),
+                lid: None,
+                offered_name: offered.map(str::to_owned),
+                label: None,
+                is_self: false,
+                canonical_jid: None,
+            }],
+        };
+        super::membership::resolve(&client, &names, &store, &mut event).await;
+        assert_eq!(event.summary(), expected);
+    }
+}

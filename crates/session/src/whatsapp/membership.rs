@@ -59,6 +59,7 @@ pub(super) async fn resolve_person(
         candidates.push(lid.to_non_ad());
     }
     candidates.sort_by_key(|jid| !jid.is_pn());
+    let has_phone = identity.has_phone || candidates.iter().any(Jid::is_pn);
     if own.contains(&identity.canonical_jid)
         || candidates.iter().any(|j| own.contains(&j.to_string()))
     {
@@ -72,7 +73,10 @@ pub(super) async fn resolve_person(
         for candidate in &candidates {
             let id = names.identity(client, candidate).await;
             let (name, priority) = names.resolve(store, candidate, None, &id).await;
-            if priority > 0 && best.as_ref().is_none_or(|(_, old)| priority > *old) {
+            if priority > 0
+                && crate::names::usable_name(&name, has_phone)
+                && best.as_ref().is_none_or(|(_, old)| priority > *old)
+            {
                 best = Some((name, priority));
             }
         }
