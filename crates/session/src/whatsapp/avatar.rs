@@ -333,9 +333,17 @@ pub(super) async fn resolve(
     let mut cached_absent = HashSet::new();
     for demand in demands {
         let Ok(jid) = demand.jid.parse::<Jid>() else {
+            let _ = ui_tx.send(UiEvent::AvatarFailed {
+                jid: demand.jid,
+                retryable: false,
+            });
             continue;
         };
         if lookup_is_useless(&jid) {
+            let _ = ui_tx.send(UiEvent::AvatarFailed {
+                jid: demand.jid,
+                retryable: false,
+            });
             continue;
         }
         // A newly attached window has its own admission reservations. The
@@ -600,6 +608,39 @@ mod tests {
             }
         }
         assert_eq!(answered.len(), demands.len());
+        // Filtered pseudo-chats and malformed demands also need terminal
+        // replies, otherwise they consume the same bounded admission slots.
+        let excluded = ["status@broadcast", "0@s.whatsapp.net", ""];
+        assert!(excluded[2].parse::<Jid>().is_err());
+        let skipped = excluded
+            .iter()
+            .map(|jid| oxidezap_core::AvatarDemand {
+                jid: (*jid).into(),
+                known_picture_id: None,
+                cache_key: None,
+                need_bytes: true,
+                cache_miss: true,
+            })
+            .collect();
+        resolve(&bot.client(), &sender, &mut resolver, skipped, 1).await;
+        let mut failed = HashSet::new();
+        while let Ok(event) = receiver.try_recv() {
+            let UiEvent::AvatarFailed {
+                jid,
+                retryable: false,
+            } = event
+            else {
+                panic!("expected a terminal filtered-demand failure")
+            };
+            failed.insert(jid);
+        }
+        assert_eq!(
+            failed,
+            excluded
+                .into_iter()
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        );
         for demand in &demands {
             assert!(answered.contains(&demand.jid));
             assert!(!resolver.needs(&demand.jid, 1, true, false));
