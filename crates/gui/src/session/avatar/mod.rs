@@ -12,6 +12,8 @@
 mod native;
 #[cfg(target_family = "wasm")]
 mod web;
+#[cfg(target_family = "wasm")]
+mod web_lock;
 
 #[cfg(not(target_family = "wasm"))]
 use native as imp;
@@ -44,8 +46,11 @@ pub fn save_avatar(key: &str, bytes: &[u8]) {
         let key = key.to_string();
         let bytes = bytes.to_vec();
         let account = imp::resolve_account(&key);
+        let Ok(stamp) = imp::persistent_stamp(account) else {
+            return;
+        };
         spawn_task(async move {
-            let _ = write_persistent(&key, &bytes, account).await;
+            let _ = write_persistent(&key, &bytes, account, stamp).await;
         });
     }
     #[cfg(not(target_family = "wasm"))]
@@ -70,15 +75,19 @@ pub enum DemandPriority {
     Low,
 }
 
+const MAX_TRACKED_AVATARS: usize = 2048;
+const MAX_PENDING_DEMANDS: usize = 256;
+const MAX_PERSISTENT_READS: usize = 64;
+
 static NEXT_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Central avatar manager coordinating viewport demands, persistent storage,
 /// and in-memory decoded image caching.
 #[derive(Clone, Default)]
 pub struct AvatarManager {
-    persistent_in_flight: Arc<Mutex<HashMap<String, u64>>>,
+    persistent_in_flight: Arc<Mutex<HashMap<(String, String), u64>>>,
     network_in_flight: Arc<Mutex<HashSet<String>>>,
-    revalidated: Arc<Mutex<HashSet<String>>>,
+    revalidated: Arc<Mutex<indexmap::IndexSet<String>>>,
     failed_cooldowns: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
     pending_demands: Arc<Mutex<HashMap<String, (AvatarDemand, DemandPriority)>>>,
     generation: Arc<AtomicU64>,
@@ -203,7 +212,7 @@ impl AvatarManager {
         let mut revalidated = self.revalidated.lock().unwrap_or_else(|e| e.into_inner());
         for jid in cancelled {
             network.remove(&jid);
-            revalidated.remove(&jid);
+            revalidated.shift_remove(&jid);
         }
     }
 
@@ -238,8 +247,8 @@ impl AvatarManager {
             if get_avatar_image(key).is_some() {
                 // Cache hit in RAM: check if revalidation is needed for this connection
                 let mut reval = self.revalidated.lock().unwrap_or_else(|e| e.into_inner());
-                if reval.insert(jid.clone()) {
-                    self.enqueue_demand(
+                if note_revalidation(&mut reval, jid) {
+                    let queued = self.enqueue_demand(
                         AvatarDemand {
                             jid: jid.clone(),
                             known_picture_id: chat.picture_id.clone(),
@@ -249,6 +258,9 @@ impl AvatarManager {
                         },
                         priority,
                     );
+                    if !queued {
+                        reval.shift_remove(jid);
+                    }
                 }
                 return;
             }
@@ -259,23 +271,40 @@ impl AvatarManager {
                 .persistent_in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let std::collections::hash_map::Entry::Vacant(entry) = p_flight.entry(key.clone()) {
+            if p_flight.len() >= MAX_PERSISTENT_READS {
+                return;
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                p_flight.entry((jid.clone(), key.clone()))
+            {
                 entry.insert(op_token);
                 let key_clone = key.clone();
                 let jid_clone = jid.clone();
                 let pic_id = chat.picture_id.clone();
+                let read_key = (jid.clone(), key.clone());
                 let persistent_in_flight = Arc::clone(&self.persistent_in_flight);
                 let network_in_flight = Arc::clone(&self.network_in_flight);
                 let revalidated = Arc::clone(&self.revalidated);
                 let pending_demands = Arc::clone(&self.pending_demands);
                 let session_handle = Arc::clone(&self.session);
                 let generation = Arc::clone(&self.generation);
+                let demand_epoch = Arc::clone(&self.demand_epoch);
                 let account_id = Arc::clone(&self.account_id);
                 let born_gen = generation.load(Ordering::Relaxed);
                 let born_account = *account_id.lock().unwrap_or_else(|e| e.into_inner());
 
                 spawn_task(async move {
                     let persistent_bytes = read_persistent(&key_clone).await;
+                    demand_epoch.fetch_add(1, Ordering::Relaxed);
+                    // A network selection/removal may have retired this read.
+                    if persistent_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&read_key)
+                        != Some(&op_token)
+                    {
+                        return;
+                    }
 
                     // Generation safety: discard if session/account changed while reading
                     if generation.load(Ordering::Relaxed) != born_gen
@@ -284,8 +313,8 @@ impl AvatarManager {
                         let mut p = persistent_in_flight
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        if p.get(&key_clone) == Some(&op_token) {
-                            p.remove(&key_clone);
+                        if p.get(&read_key) == Some(&op_token) {
+                            p.remove(&read_key);
                         }
                         return;
                     }
@@ -296,9 +325,11 @@ impl AvatarManager {
                             let mut p = persistent_in_flight
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            if p.get(&key_clone) == Some(&op_token) {
-                                p.remove(&key_clone);
+                            if p.get(&read_key) != Some(&op_token) {
+                                return;
                             }
+                            p.remove(&read_key);
+                            drop(p);
 
                             // Notify UI that the avatar image is ready in RAM
                             if let Some(session) = session_handle
@@ -306,12 +337,12 @@ impl AvatarManager {
                                 .unwrap_or_else(|e| e.into_inner())
                                 .as_ref()
                             {
-                                session.notify_avatar_ready(jid_clone.clone(), key_clone.clone());
+                                session.notify_avatar_loaded();
                             }
 
                             // Conditional freshness revalidation:
                             let mut reval = revalidated.lock().unwrap_or_else(|e| e.into_inner());
-                            if reval.insert(jid_clone.clone()) {
+                            if note_revalidation(&mut reval, &jid_clone) {
                                 let demand = AvatarDemand {
                                     jid: jid_clone,
                                     known_picture_id: pic_id,
@@ -345,8 +376,8 @@ impl AvatarManager {
                             let mut p = persistent_in_flight
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            if p.get(&key_clone) == Some(&op_token) {
-                                p.remove(&key_clone);
+                            if p.get(&read_key) == Some(&op_token) {
+                                p.remove(&read_key);
                             }
                             return;
                         }
@@ -357,11 +388,15 @@ impl AvatarManager {
                         let mut p = persistent_in_flight
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        if p.get(&key_clone) == Some(&op_token) {
-                            p.remove(&key_clone);
+                        if p.get(&read_key) != Some(&op_token) {
+                            return;
                         }
+                        p.remove(&read_key);
                     }
                     let mut n_flight = network_in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                    if n_flight.len() >= MAX_PENDING_DEMANDS {
+                        return;
+                    }
                     if n_flight.insert(jid_clone.clone()) {
                         let demand = AvatarDemand {
                             jid: jid_clone,
@@ -386,31 +421,54 @@ impl AvatarManager {
                 });
             }
         } else {
-            // No avatar key recorded: query WhatsApp
-            let mut n_flight = self
-                .network_in_flight
+            if self
+                .revalidated
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if n_flight.insert(jid.clone()) {
-                self.enqueue_demand(
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(jid)
+            {
+                return;
+            }
+            let reserved = {
+                let mut in_flight = self
+                    .network_in_flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if in_flight.len() >= MAX_PENDING_DEMANDS {
+                    return;
+                }
+                in_flight.insert(jid.clone())
+            };
+            if reserved
+                && !self.enqueue_demand(
                     AvatarDemand {
                         jid: jid.clone(),
                         known_picture_id: None,
                         cache_key: None,
                         need_bytes: true,
-                        cache_miss: false,
+                        // The daemon may remember BytesReady after the
+                        // derived descriptor was retired or never hydrated.
+                        cache_miss: true,
                     },
                     priority,
-                );
+                )
+            {
+                self.network_in_flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(jid);
             }
         }
     }
 
-    pub fn enqueue_demand(&self, demand: AvatarDemand, priority: DemandPriority) {
+    pub fn enqueue_demand(&self, demand: AvatarDemand, priority: DemandPriority) -> bool {
         let mut pending = self
             .pending_demands
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if pending.len() >= MAX_PENDING_DEMANDS && !pending.contains_key(&demand.jid) {
+            return false;
+        }
         pending
             .entry(demand.jid.clone())
             .and_modify(|(existing_demand, existing_priority)| {
@@ -424,6 +482,7 @@ impl AvatarManager {
                 }
             })
             .or_insert((demand, priority));
+        true
     }
 
     /// Extract all pending demands ordered by priority (high priority first).
@@ -462,20 +521,28 @@ impl AvatarManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(jid);
-        if !key.is_empty() {
-            self.persistent_in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(key);
-        }
+        self.persistent_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(pending_jid, _), _| pending_jid != jid);
         self.failed_cooldowns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(jid);
+        let mut revalidated = self.revalidated.lock().unwrap_or_else(|e| e.into_inner());
+        if key.is_empty() {
+            note_revalidation(&mut revalidated, jid);
+        } else {
+            revalidated.shift_remove(jid);
+        }
     }
 
     /// Called when an avatar lookup, download, or materialization fails.
     pub fn on_avatar_failed(&self, jid: &str, retryable: bool) -> Instant {
+        self.revalidated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shift_remove(jid);
         self.network_in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -486,10 +553,23 @@ impl AvatarManager {
             std::time::Duration::from_secs(300)
         };
         let until = Instant::now() + cooldown_duration;
-        self.failed_cooldowns
+        let mut cooldowns = self
+            .failed_cooldowns
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(jid.to_string(), (retryable, until));
+            .unwrap_or_else(|e| e.into_inner());
+        if cooldowns.len() >= MAX_TRACKED_AVATARS {
+            cooldowns.retain(|_, (_, deadline)| *deadline > Instant::now());
+            if cooldowns.len() >= MAX_TRACKED_AVATARS
+                && !cooldowns.contains_key(jid)
+                && let Some(oldest) = cooldowns
+                    .iter()
+                    .min_by_key(|(_, (_, deadline))| *deadline)
+                    .map(|(key, _)| key.clone())
+            {
+                cooldowns.remove(&oldest);
+            }
+        }
+        cooldowns.insert(jid.to_string(), (retryable, until));
         until
     }
 
@@ -503,7 +583,8 @@ impl AvatarManager {
                 .persistent_in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains_key(item)
+                .keys()
+                .any(|(jid, key)| jid == item || key == item)
     }
 
     #[cfg(test)]
@@ -513,6 +594,16 @@ impl AvatarManager {
             .unwrap_or_else(|e| e.into_inner())
             .contains(jid)
     }
+}
+
+fn note_revalidation(revalidated: &mut indexmap::IndexSet<String>, jid: &str) -> bool {
+    if revalidated.contains(jid) {
+        return false;
+    }
+    if revalidated.len() >= MAX_TRACKED_AVATARS {
+        revalidated.shift_remove_index(0);
+    }
+    revalidated.insert(jid.to_string())
 }
 
 #[cfg(test)]
@@ -730,6 +821,104 @@ mod tests {
     }
 
     #[test]
+    fn no_photo_results_release_admission_and_are_negative_cached_for_the_connection() {
+        let manager = AvatarManager::new();
+        let absent = ChatDemand {
+            jid: "absent@example.invalid".into(),
+            picture_id: None,
+            cache_key: None,
+        };
+        manager.demand_chat(&absent);
+        let demands = manager.take_demands();
+        assert_eq!(demands.len(), 1);
+        assert!(
+            demands[0].cache_miss,
+            "an absent descriptor must supersede stale daemon readiness"
+        );
+        manager.on_avatar_ready(&absent.jid, "");
+        manager.demand_chat(&absent);
+        assert!(!manager.is_in_flight(&absent.jid));
+        assert!(manager.take_demands().is_empty());
+        for i in 0..(MAX_PENDING_DEMANDS + 32) {
+            let chat = ChatDemand {
+                jid: format!("absent-{i}@example.invalid"),
+                picture_id: None,
+                cache_key: None,
+            };
+            manager.demand_chat(&chat);
+            assert_eq!(manager.take_demands().len(), 1);
+            manager.on_avatar_ready(&chat.jid, "");
+            manager.demand_chat(&chat);
+        }
+        assert!(manager.network_in_flight.lock().unwrap().is_empty());
+        manager.reset_connection();
+        manager.demand_chat(&absent);
+        assert_eq!(manager.take_demands().len(), 1);
+    }
+
+    #[test]
+    fn avatar_tracking_and_pending_admission_have_fixed_limits() {
+        let manager = AvatarManager::new();
+        for i in 0..(MAX_TRACKED_AVATARS + 32) {
+            let jid = format!("synthetic-{i}@example.invalid");
+            manager.on_avatar_failed(&jid, true);
+            note_revalidation(
+                &mut manager.revalidated.lock().unwrap(),
+                &format!("revalidated-{i}@example.invalid"),
+            );
+        }
+        assert_eq!(
+            manager.revalidated.lock().unwrap().len(),
+            MAX_TRACKED_AVATARS
+        );
+        assert_eq!(
+            manager.failed_cooldowns.lock().unwrap().len(),
+            MAX_TRACKED_AVATARS
+        );
+        for i in 0..(MAX_PENDING_DEMANDS + 32) {
+            manager.demand_chat(&ChatDemand {
+                jid: format!("pending-{i}@example.invalid"),
+                picture_id: None,
+                cache_key: None,
+            });
+        }
+        assert_eq!(
+            manager.pending_demands.lock().unwrap().len(),
+            MAX_PENDING_DEMANDS
+        );
+        assert_eq!(
+            manager.network_in_flight.lock().unwrap().len(),
+            MAX_PENDING_DEMANDS
+        );
+        for demand in manager.take_demands() {
+            manager.on_avatar_ready(&demand.jid, "");
+        }
+        manager.demand_chat(&ChatDemand {
+            jid: "after-drain@example.invalid".into(),
+            picture_id: None,
+            cache_key: None,
+        });
+        assert_eq!(manager.take_demands().len(), 1);
+    }
+
+    #[test]
+    fn replacement_and_removal_retire_older_persistent_reads_only_for_that_chat() {
+        for key in ["new-picture", ""] {
+            let manager = AvatarManager::new();
+            let mut pending = manager.persistent_in_flight.lock().unwrap();
+            pending.insert(("peer@example.invalid".into(), "old-picture".into()), 1);
+            pending.insert(("other@example.invalid".into(), "other-picture".into()), 2);
+            drop(pending);
+            manager.on_avatar_ready("peer@example.invalid", key);
+            let pending = manager.persistent_in_flight.lock().unwrap();
+            assert!(!pending.contains_key(&("peer@example.invalid".into(), "old-picture".into())));
+            assert!(
+                pending.contains_key(&("other@example.invalid".into(), "other-picture".into()))
+            );
+        }
+    }
+
+    #[test]
     fn prioritized_demands_ordering() {
         let manager = AvatarManager::new();
         manager.enqueue_demand(
@@ -782,7 +971,7 @@ mod tests {
         assert!(manager.take_demands().is_empty());
 
         // on_avatar_ready clears cooldown
-        manager.on_avatar_ready("failing@s.whatsapp.net", "");
+        manager.on_avatar_ready("failing@s.whatsapp.net", "a-synthetic-ready");
         manager.demand_chat(&chat);
         assert!(manager.is_in_flight("failing@s.whatsapp.net"));
         assert_eq!(manager.take_demands().len(), 1);

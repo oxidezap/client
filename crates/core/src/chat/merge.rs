@@ -105,9 +105,9 @@ impl Chat {
         // A hydrated avatar is the one identity a restart can restore without
         // the network: a durable descriptor read back from the store says which
         // picture belongs here and under which cache key. A load that carries
-        // none says nothing, so it must not clear what a live refresh already
-        // resolved.
-        if hydrated.avatar_loaded {
+        // none says nothing. Once live events have selected a picture, even
+        // a populated descriptor may be an older snapshot and cannot replace it.
+        if !self.avatar_live && hydrated.avatar_loaded {
             self.avatar_picture_id = hydrated.avatar_picture_id;
             self.avatar_cache_key = hydrated.avatar_cache_key;
             self.avatar_loaded = true;
@@ -494,6 +494,57 @@ mod tests {
         assert_eq!(chat.avatar_picture_id.as_deref(), Some("stored"));
         assert_eq!(chat.avatar_cache_key.as_deref(), Some("a-stored"));
         assert!(chat.avatar_loaded);
+    }
+
+    #[test]
+    fn optimistic_send_and_delayed_hydration_preserve_live_avatar() {
+        let mut chat = Chat::new("avatar@example.invalid".into());
+        let mut delayed = chat.clone();
+        delayed.avatar_picture_id = Some("old".into());
+        delayed.avatar_cache_key = Some("a-old".into());
+        delayed.avatar_loaded = true;
+        chat.resolve_avatar(Some("current".into()));
+        chat.ready_avatar("a-current".into());
+        chat.add_message(ChatMessage::new_outgoing(
+            "synthetic-send".into(),
+            "hello".into(),
+        ));
+        chat.merge_history(delayed);
+        assert_eq!(chat.avatar_picture_id.as_deref(), Some("current"));
+        assert_eq!(chat.avatar_cache_key.as_deref(), Some("a-current"));
+        assert!(
+            chat.messages
+                .iter()
+                .any(|message| message.id == "synthetic-send")
+        );
+    }
+
+    #[test]
+    fn authoritative_removal_survives_delayed_history_and_restart_is_hydratable() {
+        let mut chat = Chat::new("avatar@example.invalid".into());
+        chat.avatar_picture_id = Some("old".into());
+        chat.avatar_cache_key = Some("a-old".into());
+        chat.avatar_loaded = true;
+        let delayed = chat.clone();
+        chat.ready_avatar(String::new());
+        chat.merge_history(delayed.clone());
+        assert!(chat.avatar_picture_id.is_none());
+        assert!(chat.avatar_cache_key.is_none());
+        let mut restarted: Chat =
+            serde_json::from_str(&serde_json::to_string(&chat).unwrap()).unwrap();
+        assert!(!restarted.avatar_live);
+        restarted.merge_history(delayed);
+        assert_eq!(restarted.avatar_cache_key.as_deref(), Some("a-old"));
+    }
+
+    #[test]
+    fn metadata_revalidation_keeps_visible_bytes_until_replacement_is_ready() {
+        let mut chat = Chat::new("avatar@example.invalid".into());
+        chat.ready_avatar("a-old".into());
+        chat.resolve_avatar(Some("new".into()));
+        assert_eq!(chat.avatar_cache_key.as_deref(), Some("a-old"));
+        chat.ready_avatar("a-new".into());
+        assert_eq!(chat.avatar_cache_key.as_deref(), Some("a-new"));
     }
 
     #[test]

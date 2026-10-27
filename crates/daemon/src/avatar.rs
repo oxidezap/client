@@ -66,6 +66,40 @@ struct Selection {
 static LATEST: LazyLock<Mutex<HashMap<(u64, String), Selection>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static OBSERVED: LazyLock<Mutex<HashSet<(u64, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Retain ordering only while a completion can still arrive. A finished
+/// selection must not leave one permanent entry per contact in the daemon.
+struct SelectionGuard {
+    hub: u64,
+    jid: String,
+    token: u64,
+}
+
+impl SelectionGuard {
+    fn new(hub: &StateHub, jid: &str, selection: &Selection) -> Self {
+        Self {
+            hub: hub.id(),
+            jid: jid.to_string(),
+            token: selection.token,
+        }
+    }
+}
+
+impl Drop for SelectionGuard {
+    fn drop(&mut self) {
+        let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (self.hub, self.jid.clone());
+        if latest
+            .get(&key)
+            .is_some_and(|selection| selection.token == self.token)
+        {
+            latest.remove(&key);
+        }
+    }
+}
 
 /// Turn a resolved outcome into cached bytes and a durable descriptor.
 ///
@@ -112,6 +146,10 @@ pub fn resolve(
             let recorder = recorder.clone();
             let selection = selection.clone();
             async move {
+                let _selection_guard = SelectionGuard::new(&hub, &jid, &selection);
+                if !is_current(&hub, &jid, &selection) {
+                    return;
+                }
                 // The descriptor is rewritten and committed before the
                 // readiness is published, so a front end is never told about
                 // bytes the durable store does not yet name. A write that did
@@ -139,6 +177,7 @@ pub fn resolve(
         return;
     }
     let Some(source) = source else {
+        drop(SelectionGuard::new(hub, jid, &selection));
         return;
     };
     let in_flight_key = (hub.id(), jid.to_string(), id.clone(), selection.token);
@@ -156,6 +195,7 @@ pub fn resolve(
         let recorder = recorder.clone();
         async move {
             let _guard = InFlightGuard(in_flight_key);
+            let _selection_guard = SelectionGuard::new(&hub, &jid, &selection);
             if !hub.connection().is_connected() {
                 recorder.on_failed(&jid);
                 publish_failed(&hub, &jid, false);
@@ -238,10 +278,15 @@ fn remove(hub: &Arc<StateHub>, recorder: &AvatarRecorder, jid: &str) {
         let jid = jid.to_string();
         let recorder = recorder.clone();
         async move {
+            let _selection_guard = SelectionGuard::new(&hub, &jid, &selection);
             if !is_current(&hub, &jid, &selection) {
                 return;
             }
             if !recorder.clear(jid.clone(), selection.token).await {
+                if is_current(&hub, &jid, &selection) {
+                    recorder.on_failed(&jid);
+                    publish_failed(&hub, &jid, true);
+                }
                 return;
             }
             if !is_current(&hub, &jid, &selection) {
@@ -284,6 +329,11 @@ fn publish_failed(hub: &StateHub, jid: &str, retryable: bool) {
 }
 
 pub fn purge(hub: &StateHub) {
+    #[cfg(test)]
+    OBSERVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(id, _)| *id != hub.id());
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -300,6 +350,11 @@ fn record_selection(
     picture_id: Option<&str>,
     source: Option<&str>,
 ) -> Selection {
+    #[cfg(test)]
+    OBSERVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((hub.id(), jid.to_owned()));
     let mut latest = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -345,10 +400,10 @@ fn is_current(hub: &StateHub, jid: &str, selection: &Selection) -> bool {
 /// which is the property the history decoupling is about.
 #[cfg(test)]
 pub(super) fn has_selection(hub: &StateHub, jid: &str) -> bool {
-    LATEST
+    OBSERVED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(&(hub.id(), jid.to_owned()))
+        .contains(&(hub.id(), jid.to_owned()))
 }
 
 async fn fetch(url: &str, hub: &Arc<StateHub>) -> anyhow::Result<AvatarResponse> {
@@ -429,6 +484,23 @@ mod tests {
         let second = record_selection(&hub, "avatar@example.invalid", Some("two"), Some("url"));
         assert!(is_current(&hub, "avatar@example.invalid", &second));
         assert!(!is_current(&hub, "avatar@example.invalid", &first));
+        purge(&hub);
+    }
+
+    #[test]
+    fn completion_cleanup_releases_only_its_own_selection() {
+        let hub = StateHub::new();
+        let first = record_selection(&hub, "cleanup@example.invalid", Some("old"), Some("url"));
+        let guard = super::SelectionGuard::new(&hub, "cleanup@example.invalid", &first);
+        let newer = record_selection(&hub, "cleanup@example.invalid", Some("new"), Some("url"));
+        drop(guard);
+        assert!(is_current(&hub, "cleanup@example.invalid", &newer));
+        drop(super::SelectionGuard::new(
+            &hub,
+            "cleanup@example.invalid",
+            &newer,
+        ));
+        assert!(!is_current(&hub, "cleanup@example.invalid", &newer));
         purge(&hub);
     }
 

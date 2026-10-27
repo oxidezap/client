@@ -136,3 +136,264 @@ async fn no_source_url_is_stored() {
     );
     assert!(!rendered.to_lowercase().contains("token"));
 }
+
+#[tokio::test]
+async fn a_restarted_counter_can_replace_and_remove_a_persisted_descriptor() {
+    let (store, first) = test_store().await;
+    first
+        .record_avatar(&jid(PEER), "before", "a-before", 100)
+        .unwrap();
+    first.flush().await.unwrap();
+    let reopened = ChatStore::new(&store).await.unwrap();
+    reopened
+        .record_avatar(&jid(PEER), "after", "a-after", 1)
+        .unwrap();
+    reopened.flush().await.unwrap();
+    assert_eq!(
+        reopened.avatar_descriptors().await.unwrap()[0].picture_id,
+        "after"
+    );
+    reopened.clear_avatar(&jid(PEER), 2).unwrap();
+    reopened.flush().await.unwrap();
+    assert!(reopened.avatar_descriptors().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn removal_keeps_a_barrier_against_delayed_older_inserts() {
+    let (_store, chat_store) = test_store().await;
+    chat_store
+        .record_avatar(&jid(PEER), "before", "a-before", 1)
+        .unwrap();
+    chat_store.clear_avatar(&jid(PEER), 3).unwrap();
+    chat_store
+        .record_avatar(&jid(PEER), "stale", "a-stale", 2)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert!(chat_store.avatar_descriptors().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn learning_a_lid_keeps_the_original_cache_key_and_alias_removal_wins() {
+    let (store, chat_store) = test_store().await;
+    chat_store
+        .record_avatar(&jid(PEER), "phone-picture", "a1-a-phone-cache", 1)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    add_lid_mapping(&store).await;
+    let by_lid = chat_store
+        .avatar_descriptors_for(&[PEER_LID.into()])
+        .await
+        .unwrap();
+    assert_eq!(by_lid.len(), 1);
+    assert_eq!(by_lid[0].jid, jid(PEER_LID));
+    assert_eq!(
+        by_lid[0].cache_key, "a1-a-phone-cache",
+        "no refetch or file rename after alias discovery"
+    );
+    chat_store
+        .record_avatar(&jid(PEER_LID), "lid-picture", "a1-a-lid-cache", 2)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store
+            .avatar_descriptors_for(&[PEER.into()])
+            .await
+            .unwrap()[0]
+            .cache_key,
+        "a1-a-lid-cache"
+    );
+    chat_store.clear_avatar(&jid(PEER), 3).unwrap();
+    chat_store.flush().await.unwrap();
+    assert!(
+        chat_store
+            .avatar_descriptors_for(&[PEER_LID.into(), PEER.into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[derive(diesel::QueryableByName)]
+struct AvatarRemovalCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    rows: i64,
+}
+
+#[tokio::test]
+async fn removal_metadata_is_bounded_without_allowing_compacted_photos_to_reappear() {
+    let (store, chat_store) = test_store().await;
+    for i in 0..1024 {
+        chat_store
+            .clear_avatar(&jid(&format!("avatar-fixture-{i}@s.whatsapp.net")), i + 1)
+            .unwrap();
+        if i % 128 == 127 {
+            chat_store.flush().await.unwrap();
+        }
+    }
+    chat_store.flush().await.unwrap();
+    let count: Vec<AvatarRemovalCount> = store
+        .shared()
+        .read(|conn| {
+            diesel::sql_query(
+                "SELECT COUNT(*) AS rows FROM avatar_descriptors WHERE picture_id = ''",
+            )
+            .load(conn)
+            .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    assert!(
+        count[0].rows <= 257,
+        "at most 256 removal rows and one watermark"
+    );
+    let peer = jid("avatar-fixture-0@s.whatsapp.net");
+    chat_store
+        .record_avatar(&peer, "stale-before-compaction", "a-stale", 1)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert!(
+        chat_store
+            .avatar_descriptors_for(&[peer.to_string()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    chat_store
+        .record_avatar(&peer, "fresh-after-compaction", "a-fresh", 2048)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store
+            .avatar_descriptors_for(&[peer.to_string()])
+            .await
+            .unwrap()[0]
+            .picture_id,
+        "fresh-after-compaction"
+    );
+    let reopened = ChatStore::new(&store).await.unwrap();
+    reopened
+        .record_avatar(&peer, "fresh-after-restart", "a-restart", 1)
+        .unwrap();
+    reopened.flush().await.unwrap();
+    assert_eq!(
+        reopened
+            .avatar_descriptors_for(&[peer.to_string()])
+            .await
+            .unwrap()[0]
+            .picture_id,
+        "fresh-after-restart"
+    );
+}
+
+async fn force_avatar_compaction(chat_store: &ChatStore) {
+    for i in 0..257 {
+        chat_store
+            .clear_avatar(
+                &jid(&format!("compact-fixture-{i}@s.whatsapp.net")),
+                100 + i,
+            )
+            .unwrap();
+        if i % 128 == 127 {
+            chat_store.flush().await.unwrap();
+        }
+    }
+    chat_store.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_does_not_let_an_old_removal_admit_an_older_picture() {
+    let (_store, chat_store) = test_store().await;
+    chat_store.clear_avatar(&jid(PEER), 10).unwrap();
+    force_avatar_compaction(&chat_store).await;
+    chat_store.clear_avatar(&jid(PEER), 2).unwrap();
+    chat_store
+        .record_avatar(&jid(PEER), "stale-before-removal", "a-stale", 9)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert!(
+        chat_store
+            .avatar_descriptors_for(&[PEER.into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn compaction_does_not_reveal_an_older_picture_under_the_other_alias() {
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+    chat_store
+        .record_avatar(&jid(PEER_LID), "old-alias-picture", "a-old-alias", 1)
+        .unwrap();
+    chat_store.clear_avatar(&jid(PEER), 2).unwrap();
+    chat_store.flush().await.unwrap();
+    assert!(
+        chat_store
+            .avatar_descriptors_for(&[PEER_LID.into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    force_avatar_compaction(&chat_store).await;
+    assert!(
+        chat_store
+            .avatar_descriptors_for(&[PEER_LID.into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn aliases_learned_after_compaction_cannot_restore_removed_pictures() {
+    let (store, chat_store) = test_store().await;
+    chat_store
+        .record_avatar(&jid(PEER_LID), "unknown-alias-old", "a-old", 1)
+        .unwrap();
+    chat_store.clear_avatar(&jid(PEER), 2).unwrap();
+    force_avatar_compaction(&chat_store).await;
+    add_lid_mapping(&store).await;
+    assert!(
+        chat_store
+            .avatar_descriptors_for(&[PEER.into(), PEER_LID.into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    chat_store
+        .record_avatar(&jid(PEER_LID), "revalidated", "a-new", 1000)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store
+            .avatar_descriptors_for(&[PEER.into()])
+            .await
+            .unwrap()[0]
+            .picture_id,
+        "revalidated"
+    );
+}
+
+#[tokio::test]
+async fn reopening_retires_picture_pointers_left_below_an_existing_watermark() {
+    use diesel::RunQueryDsl;
+    let (store, chat_store) = test_store().await;
+    force_avatar_compaction(&chat_store).await;
+    let device_id = store.device_id();
+    store.shared().run(move |conn| {
+        diesel::sql_query("INSERT INTO avatar_descriptors (device_id, jid, picture_id, cache_key, updated_at_ms, seq) VALUES (?, ?, 'old-runtime', 'a-old-runtime', 0, 1)")
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>(PEER_LID)
+            .execute(conn).map(|_| ()).map_err(db_err)
+    }).await.unwrap();
+    let reopened = ChatStore::new(&store).await.unwrap();
+    add_lid_mapping(&store).await;
+    assert!(
+        reopened
+            .avatar_descriptors_for(&[PEER.into(), PEER_LID.into()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

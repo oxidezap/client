@@ -28,6 +28,8 @@ pub(crate) mod http;
 /// what made every staged upload pay for a walk.
 #[cfg(not(target_family = "wasm"))]
 pub use platform::reclaim_abandoned_writes_periodically;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use platform::track_write;
 
 /// Make the cache directory this account's alone, before anything writes into
 /// it. Called at startup and by every writer; native only, for the reason the
@@ -174,6 +176,17 @@ impl Wipe {
     }
 }
 
+/// Only these producer-owned names are disposable. Unknown files and saved
+/// payloads are never reclaimed by a generic cache budget.
+pub(super) fn is_disposable(key: &str) -> bool {
+    let local = oxidezap_ipc::key_local_name(key);
+    ["f-", "d-", "a-", "m-"]
+        .iter()
+        .any(|prefix| local.starts_with(prefix))
+        && !is_in_progress(key)
+        && !is_staged_upload(key)
+}
+
 /// Account-bound view over the shared media cache.
 ///
 /// The physical directory remains shared, but every durable cache key created
@@ -237,6 +250,10 @@ impl AccountMedia {
 
     pub fn put_since(self, epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
         crate::media::put_since(self.account, epoch, &self.key(key), bytes)
+    }
+
+    pub fn put_owned_since(self, epoch: usize, key: &str, bytes: Vec<u8>) -> Result<String> {
+        crate::media::put_owned_since(self.account, epoch, &self.key(key), bytes)
     }
 
     pub fn put_owned(self, key: &str, bytes: Vec<u8>) -> Result<String> {
@@ -433,6 +450,20 @@ pub fn put_since(account: AccountId, epoch: usize, key: &str, bytes: &[u8]) -> R
         anyhow::bail!("the media cache was cleared while this was being prepared");
     }
     platform::put_evictable(key, bytes)
+}
+
+/// Transfer a completed download without copying its allocation on the web.
+pub fn put_owned_since(
+    account: AccountId,
+    epoch: usize,
+    key: &str,
+    bytes: Vec<u8>,
+) -> Result<String> {
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if current_epoch(account) != epoch {
+        anyhow::bail!("the media cache was cleared while this was being prepared");
+    }
+    platform::put_owned_evictable(key, bytes)
 }
 
 /// The epoch in force for `account`, under the wipe lock.
@@ -926,3 +957,7 @@ mod tests {
         );
     }
 }
+
+// Reuse the existing browser runner to exercise the GUI's storage without GPUI.
+#[cfg(all(test, target_family = "wasm"))]
+mod avatar_web_tests;

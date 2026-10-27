@@ -15,7 +15,7 @@
 //! picture id and the signed source the daemon fetches, and never the bytes
 //! or the URL in state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use log::debug;
@@ -136,6 +136,7 @@ pub(super) enum AvatarResolutionState {
 
 #[derive(Default)]
 pub(super) struct Resolver {
+    order: VecDeque<String>,
     asked: HashMap<String, (u64, AvatarResolutionState)>,
 }
 
@@ -170,6 +171,15 @@ impl Resolver {
     }
 
     fn mark(&mut self, jid: &str, generation: u64, state: AvatarResolutionState) {
+        const MAX_TRACKED: usize = 4096;
+        if !self.asked.contains_key(jid) {
+            if self.asked.len() >= MAX_TRACKED
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.asked.remove(&oldest);
+            }
+            self.order.push_back(jid.to_string());
+        }
         let entry = self
             .asked
             .entry(jid.to_string())
@@ -188,8 +198,19 @@ impl Resolver {
     }
 
     pub(super) fn mark_failed(&mut self, jid: &str) {
+        if matches!(
+            self.asked.get(jid),
+            Some((_, AvatarResolutionState::MetadataKnown))
+        ) {
+            self.asked.remove(jid);
+            self.order.retain(|key| key != jid);
+            return;
+        }
         if let Some((_, state)) = self.asked.get_mut(jid)
-            && *state == AvatarResolutionState::SourceDelivered
+            && matches!(
+                *state,
+                AvatarResolutionState::SourceDelivered | AvatarResolutionState::NotFound
+            )
         {
             *state = AvatarResolutionState::MetadataKnown;
         }
@@ -202,6 +223,7 @@ impl Resolver {
     /// named are gone.
     pub(super) fn forget_all(&mut self) {
         self.asked.clear();
+        self.order.clear();
     }
 }
 
@@ -308,11 +330,27 @@ pub(super) async fn resolve(
     generation: u64,
 ) {
     let mut filtered: HashMap<String, (Jid, Option<String>, bool)> = HashMap::new();
+    let mut cached_absent = HashSet::new();
     for demand in demands {
         let Ok(jid) = demand.jid.parse::<Jid>() else {
+            let _ = ui_tx.send(UiEvent::AvatarFailed {
+                jid: demand.jid,
+                retryable: false,
+            });
             continue;
         };
         if lookup_is_useless(&jid) {
+            let _ = ui_tx.send(UiEvent::AvatarFailed {
+                jid: demand.jid,
+                retryable: false,
+            });
+            continue;
+        }
+        // A newly attached window has its own admission reservations. The
+        // daemon's negative cache must answer them even without another IQ.
+        if matches!(resolver.asked.get(&demand.jid), Some((known_generation, AvatarResolutionState::NotFound)) if *known_generation == generation)
+        {
+            cached_absent.insert(demand.jid);
             continue;
         }
         if !resolver.needs(
@@ -328,6 +366,26 @@ pub(super) async fn resolve(
             .or_insert_with(|| (jid, demand.known_picture_id.clone(), demand.need_bytes));
         if demand.need_bytes {
             entry.2 = true;
+        }
+    }
+
+    let cached: Vec<_> = cached_absent
+        .into_iter()
+        .map(|jid| oxidezap_core::AvatarResolution {
+            jid,
+            outcome: oxidezap_core::AvatarOutcome::NotFound,
+        })
+        .collect();
+    for chunk in cached.chunks(AVATAR_CONCURRENCY) {
+        // Go through the daemon's guarded removal path, preserving ordering
+        // and commit-before-readiness even if an earlier removal is pending.
+        if ui_tx
+            .send(UiEvent::AvatarsResolved {
+                resolutions: chunk.to_vec(),
+            })
+            .is_err()
+        {
+            return;
         }
     }
 
@@ -375,6 +433,12 @@ pub(super) async fn resolve(
                 ),
                 Lookup::Unchanged => {
                     resolver.mark(&jid_str, generation, AvatarResolutionState::MetadataKnown);
+                    if need_bytes {
+                        let _ = ui_tx.send(UiEvent::AvatarFailed {
+                            jid: jid_str,
+                            retryable: true,
+                        });
+                    }
                     continue;
                 }
                 Lookup::NotAuthorized | Lookup::Unknown => {
@@ -497,6 +561,93 @@ impl WhatsAppClient {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn reopened_frontend_gets_cached_negative_completions_without_network() {
+        let store =
+            super::super::SqliteStore::open("file:avatar-negative-replay?mode=memory&cache=shared")
+                .await
+                .unwrap();
+        let bot = super::super::persistent_companion(whatsapp_rust::bot::Bot::builder())
+            .with_backend(store)
+            .build()
+            .await
+            .unwrap();
+        let (sender, mut receiver) = super::super::ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(super::super::ui_queue::HistoryBudget::new()),
+        );
+        let mut resolver = Resolver::new();
+        let demands: Vec<_> = (0..300)
+            .map(|i| {
+                let jid = format!("reopened-{i}@s.whatsapp.net");
+                resolver.mark(&jid, 1, AvatarResolutionState::NotFound);
+                oxidezap_core::AvatarDemand {
+                    jid,
+                    known_picture_id: None,
+                    cache_key: None,
+                    need_bytes: true,
+                    cache_miss: false,
+                }
+            })
+            .collect();
+        // The bot is never connected or run. A lookup would fail, rather
+        // than producing the cached NotFound completions asserted below.
+        resolve(&bot.client(), &sender, &mut resolver, demands.clone(), 1).await;
+        let mut answered = HashSet::new();
+        while let Ok(event) = receiver.try_recv() {
+            let UiEvent::AvatarsResolved { resolutions } = event else {
+                panic!("unexpected avatar replay event")
+            };
+            for resolution in resolutions {
+                assert!(matches!(
+                    resolution.outcome,
+                    oxidezap_core::AvatarOutcome::NotFound
+                ));
+                answered.insert(resolution.jid);
+            }
+        }
+        assert_eq!(answered.len(), demands.len());
+        // Filtered pseudo-chats and malformed demands also need terminal
+        // replies, otherwise they consume the same bounded admission slots.
+        let excluded = ["status@broadcast", "0@s.whatsapp.net", ""];
+        assert!(excluded[2].parse::<Jid>().is_err());
+        let skipped = excluded
+            .iter()
+            .map(|jid| oxidezap_core::AvatarDemand {
+                jid: (*jid).into(),
+                known_picture_id: None,
+                cache_key: None,
+                need_bytes: true,
+                cache_miss: true,
+            })
+            .collect();
+        resolve(&bot.client(), &sender, &mut resolver, skipped, 1).await;
+        let mut failed = HashSet::new();
+        while let Ok(event) = receiver.try_recv() {
+            let UiEvent::AvatarFailed {
+                jid,
+                retryable: false,
+            } = event
+            else {
+                panic!("expected a terminal filtered-demand failure")
+            };
+            failed.insert(jid);
+        }
+        assert_eq!(
+            failed,
+            excluded
+                .into_iter()
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        );
+        for demand in &demands {
+            assert!(answered.contains(&demand.jid));
+            assert!(!resolver.needs(&demand.jid, 1, true, false));
+            assert!(resolver.needs(&demand.jid, 2, true, false));
+        }
+    }
+
     #[test]
     fn a_status_broadcast_is_never_looked_up() {
         assert!(lookup_is_useless(&"status@broadcast".parse().unwrap()));
@@ -555,6 +706,15 @@ mod tests {
         assert!(resolver.needs("a@s.whatsapp.net", 1, true, false));
     }
 
+    #[test]
+    fn failed_metadata_persistence_permits_a_fresh_metadata_lookup() {
+        let mut resolver = Resolver::new();
+        resolver.mark("a@s.whatsapp.net", 1, AvatarResolutionState::MetadataKnown);
+        resolver.mark_failed("a@s.whatsapp.net");
+        assert!(resolver.needs("a@s.whatsapp.net", 1, false, false));
+        assert!(resolver.order.is_empty());
+    }
+
     /// A metadata-only Unchanged lookup records MetadataKnown, so a subsequent byte demand proceeds.
     #[test]
     fn metadata_only_unchanged_lookup_permits_subsequent_byte_demand() {
@@ -602,6 +762,33 @@ mod tests {
         );
         assert!(!resolver.needs("a@s.whatsapp.net", 1, true, false));
         assert!(!resolver.needs("a@s.whatsapp.net", 1, false, true));
+    }
+
+    #[test]
+    fn a_failed_durable_removal_releases_the_negative_resolution_for_retry() {
+        let mut resolver = Resolver::new();
+        resolver.mark("retry@example.invalid", 1, AvatarResolutionState::NotFound);
+        assert!(!resolver.needs("retry@example.invalid", 1, true, true));
+        resolver.mark_failed("retry@example.invalid");
+        assert!(resolver.needs("retry@example.invalid", 1, true, true));
+    }
+
+    #[test]
+    fn resolver_tracking_is_bounded_and_forgetting_releases_its_ordering_index() {
+        let mut resolver = Resolver::new();
+        for i in 0..5000 {
+            resolver.mark(
+                &format!("peer-{i}@example.invalid"),
+                1,
+                AvatarResolutionState::BytesReady,
+            );
+        }
+        assert_eq!(resolver.asked.len(), 4096);
+        assert_eq!(resolver.order.len(), 4096);
+        assert!(resolver.needs("peer-0@example.invalid", 1, true, false));
+        assert!(!resolver.needs("peer-4999@example.invalid", 1, true, false));
+        resolver.forget_all();
+        assert!(resolver.order.is_empty());
     }
 
     #[test]

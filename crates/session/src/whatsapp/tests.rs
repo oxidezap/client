@@ -1511,6 +1511,53 @@ async fn a_stored_avatar_descriptor_reaches_the_chat_without_a_lookup() {
     );
 }
 
+#[tokio::test]
+async fn a_lid_avatar_survives_optimistic_send_and_store_hydration() {
+    let (chat_store, client) = test_session("avatar-alias-send").await;
+    let pn = "559900000008@s.whatsapp.net";
+    let lid = "111000011118888@lid";
+    chat_store
+        .record_avatar(
+            &pn.parse().unwrap(),
+            "picture-before-mapping",
+            "a1-a-pn-cached-bytes",
+            1,
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    client
+        .add_lid_pn_mapping(
+            "111000011118888",
+            "559900000008",
+            whatsapp_rust::lid_pn_cache::LearningSource::Usync,
+        )
+        .await
+        .expect("synthetic local mapping");
+    let mut hydrated = vec![Chat::from_store(lid.into(), "Synthetic contact".into(), 0)];
+    WhatsAppClient::attach_avatar_descriptors(&chat_store, &mut hydrated).await;
+    let mut live = hydrated.remove(0);
+    assert_eq!(
+        live.avatar_cache_key.as_deref(),
+        Some("a1-a-pn-cached-bytes")
+    );
+    live.add_message(ChatMessage::new_outgoing(
+        "synthetic-send".into(),
+        "hello".into(),
+    ));
+    let mut delayed = vec![Chat::from_store(lid.into(), "Synthetic contact".into(), 0)];
+    WhatsAppClient::attach_avatar_descriptors(&chat_store, &mut delayed).await;
+    live.merge_history(delayed.remove(0));
+    assert_eq!(
+        live.avatar_cache_key.as_deref(),
+        Some("a1-a-pn-cached-bytes")
+    );
+    assert!(
+        live.messages
+            .iter()
+            .any(|message| message.id == "synthetic-send")
+    );
+}
+
 #[derive(diesel::QueryableByName)]
 struct StoredProtoRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]

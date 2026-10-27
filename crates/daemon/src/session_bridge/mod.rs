@@ -28,6 +28,7 @@ mod act;
 mod action;
 mod call_devices;
 mod call_log;
+mod downloads;
 mod externalize;
 mod read_tracker;
 mod translate;
@@ -666,6 +667,7 @@ struct Bridge {
     publisher: Option<crate::publisher::Handle>,
     reads: Arc<Mutex<ReadTracker>>,
     in_flight: Arc<Semaphore>,
+    downloads: downloads::Downloads,
     /// The call history the wire reports: finalized calls with their
     /// outcome, fed by the same events the hub folds.
     calls: call_log::CallLog,
@@ -715,6 +717,7 @@ impl Bridge {
             publisher: Some(publisher),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            downloads: downloads::Downloads::default(),
             calls: call_log::CallLog::new(),
             avatar_recorder,
         }

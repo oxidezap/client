@@ -1297,12 +1297,12 @@ impl WhatsAppApp {
                         app.last_avatar_window_fingerprint = None;
                         app.avatar_manager.on_avatar_ready(&jid, &key);
                         if let Some(chat) = app.find_chat_mut(&jid) {
-                            chat.avatar_cache_key = (!key.is_empty()).then_some(key);
-                            chat.avatar_loaded = chat.avatar_cache_key.is_some();
+                            chat.ready_avatar(key);
                             app.invalidate_chat_cache();
                             cx.notify();
                         }
                     }),
+                    FromDaemon::AvatarLoaded => entity.update(cx, |_app, cx| cx.notify()),
                     FromDaemon::AvatarFailed { jid, retryable } => entity.update(cx, |app, _cx| {
                         app.last_avatar_window_fingerprint = None;
                         app.avatar_manager.on_avatar_failed(&jid, retryable);
@@ -3025,7 +3025,9 @@ impl WhatsAppApp {
         }
 
         crate::session::avatar::spawn_task(async move {
-            crate::session::avatar::delete_account_storage(old_scope).await;
+            if let Err(error) = crate::session::avatar::delete_account_storage(old_scope).await {
+                log::warn!("account avatar storage cleanup failed: {error}");
+            }
         });
 
         // Reconnecting rides straight into the same retry loop a cold start
@@ -3067,6 +3069,11 @@ impl WhatsAppApp {
             let _ = entity.update(cx, |app, cx| {
                 match connected {
                     Ok((client, ui_rx)) => {
+                        // A new stream may restore descriptors this window
+                        // did not observe while detached.
+                        for chat in &mut app.chats {
+                            Arc::make_mut(chat).avatar_live = false;
+                        }
                         app.event_task = Some(Self::spawn_event_task(ui_rx, cx));
                         app.avatar_manager.set_session(Some(client.handle()));
                         app.avatar_manager.flush_demands(&client);

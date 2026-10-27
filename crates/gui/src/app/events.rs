@@ -144,24 +144,15 @@ impl WhatsAppApp {
                 self.install_chats(chats, &agreed, cx);
                 cx.notify();
             }
-            // Metadata, not bytes: the daemon turns this into fetches and
-            // publishes `AvatarReady` when a picture is cached. A front end
-            // that receives it directly only learns which picture is now
-            // current; the source travels nowhere and must not be acted on
-            // here.
+            // Only the daemon's guarded readiness path can remove bytes.
+            // Metadata can arrive after newer readiness through the publisher.
             UiEvent::AvatarsResolved { resolutions } => {
                 for resolution in resolutions {
-                    if let Some(chat) = self.find_chat_mut(&resolution.jid) {
-                        match resolution.outcome {
-                            oxidezap_core::AvatarOutcome::Found { picture_id, .. } => {
-                                chat.avatar_picture_id = Some(picture_id);
-                            }
-                            // The chat has no picture: drop what was held so
-                            // the next state carries the placeholder.
-                            oxidezap_core::AvatarOutcome::NotFound => {
-                                chat.avatar_picture_id = None;
-                            }
-                        }
+                    if let oxidezap_core::AvatarOutcome::Found { picture_id, .. } =
+                        resolution.outcome
+                        && let Some(chat) = self.find_chat_mut(&resolution.jid)
+                    {
+                        chat.resolve_avatar(Some(picture_id));
                     }
                 }
             }
@@ -171,8 +162,7 @@ impl WhatsAppApp {
                     // An empty key is WhatsApp saying this chat has no
                     // picture: the placeholder is the right drawing, and any
                     // cached bytes have to stop being pointed at.
-                    chat.avatar_cache_key = (!key.is_empty()).then_some(key);
-                    chat.avatar_loaded = chat.avatar_cache_key.is_some();
+                    chat.ready_avatar(key);
                     self.invalidate_chat_cache();
                     cx.notify();
                 }
@@ -546,5 +536,82 @@ impl WhatsAppApp {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod avatar_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn optimistic_send_then_delayed_history_keeps_the_projected_avatar(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let jid = "avatar-send@example.invalid";
+        let app = cx.new(WhatsAppApp::new);
+        app.update(cx, |app, cx| {
+            let mut previous = Chat::from_store(jid.into(), "Synthetic contact".into(), 0);
+            previous.avatar_picture_id = Some("previous".into());
+            previous.avatar_cache_key = Some("a-previous".into());
+            previous.avatar_loaded = true;
+            let mut current = previous.clone();
+            current.resolve_avatar(Some("current".into()));
+            current.ready_avatar("a-current".into());
+            app.chats.push(Arc::new(current));
+            // The actual optimistic state mutation used by send_quoted. No
+            // session exists, so this fixture cannot send a network message.
+            assert!(app.client.is_none());
+            assert!(app.add_message_to_chat(
+                jid,
+                ChatMessage::new_outgoing("synthetic-send".into(), "hello".into()),
+                cx
+            ));
+            app.handle_event(
+                UiEvent::HistoryLoaded {
+                    chats: vec![previous.clone()],
+                    complete: false,
+                    next: None,
+                },
+                cx,
+            );
+            let chat = app.find_chat(jid).unwrap();
+            let row = super::super::chat_row::ChatRow::new(chat, None, None, false);
+            assert_eq!(row.avatar_key.as_deref(), Some("a-current"));
+            assert!(
+                chat.messages
+                    .iter()
+                    .any(|message| message.id == "synthetic-send")
+            );
+            app.handle_event(
+                UiEvent::AvatarsResolved {
+                    resolutions: vec![oxidezap_core::AvatarResolution {
+                        jid: jid.into(),
+                        outcome: oxidezap_core::AvatarOutcome::NotFound,
+                    }],
+                },
+                cx,
+            );
+            app.handle_event(
+                UiEvent::HistoryLoaded {
+                    chats: vec![previous],
+                    complete: false,
+                    next: None,
+                },
+                cx,
+            );
+            assert_eq!(
+                app.find_chat(jid).unwrap().avatar_cache_key.as_deref(),
+                Some("a-current"),
+                "older queued removal metadata cannot clear newer readiness"
+            );
+            app.handle_event(
+                UiEvent::AvatarReady {
+                    jid: jid.into(),
+                    key: String::new(),
+                },
+                cx,
+            );
+            assert!(app.find_chat(jid).unwrap().avatar_cache_key.is_none());
+        });
     }
 }

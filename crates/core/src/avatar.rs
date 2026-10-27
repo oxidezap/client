@@ -51,9 +51,9 @@ pub struct AvatarDemand {
     pub cache_key: Option<String>,
     #[serde(default)]
     pub need_bytes: bool,
-    /// The front end had a durable descriptor but the referenced bytes were
-    /// absent or corrupt. This is stronger than an ordinary byte demand: it
-    /// permits the long-lived daemon to replace a stale `BytesReady` result.
+    /// The front end lacks a descriptor, or its referenced bytes are absent
+    /// or corrupt. This permits the long-lived daemon to replace a stale
+    /// `BytesReady` result after another window or cache lifecycle change.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cache_miss: bool,
 }

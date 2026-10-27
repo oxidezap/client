@@ -9,7 +9,7 @@
 //!   caching is safely bypassed for that operation.
 //! - Caches from older versions (`oxidezap-avatar-v1-*`) are lazily cleaned on startup
 //!   without touching foreign origin caches.
-//! - Total cache budget is limited to ~64 MiB with LRU eviction of oldest entries,
+//! - The cache has byte and entry limits, evicting oldest stored entries,
 //!   tracked via lightweight metadata in `localStorage`.
 //!
 //! Memory safety: Since the module is built with `--shared-memory`, browser APIs
@@ -17,69 +17,21 @@
 //! into JS is copied into `js_sys::Uint8Array::from(...)`, and reads copy out
 //! using `array.to_vec()`.
 
-use std::collections::VecDeque;
-use std::sync::{LazyLock, Mutex as StdMutex, RwLock};
+use std::sync::RwLock;
 use wasm_bindgen::JsCast;
 
-const AVATAR_CACHE_BUDGET_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
-
-struct AsyncMutex {
-    state: StdMutex<AsyncMutexState>,
-}
-
-struct AsyncMutexState {
-    locked: bool,
-    waiters: VecDeque<futures_channel::oneshot::Sender<()>>,
-}
-
-impl AsyncMutex {
-    const fn new() -> Self {
-        Self {
-            state: StdMutex::new(AsyncMutexState {
-                locked: false,
-                waiters: VecDeque::new(),
-            }),
-        }
-    }
-
-    async fn lock(&self) -> AsyncMutexGuard<'_> {
-        let rx = {
-            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if !state.locked {
-                state.locked = true;
-                return AsyncMutexGuard { mutex: self };
-            }
-            let (tx, rx) = futures_channel::oneshot::channel();
-            state.waiters.push_back(tx);
-            rx
-        };
-        let _ = rx.await;
-        AsyncMutexGuard { mutex: self }
-    }
-}
-
-struct AsyncMutexGuard<'a> {
-    mutex: &'a AsyncMutex,
-}
-
-impl Drop for AsyncMutexGuard<'_> {
-    fn drop(&mut self) {
-        let mut state = self.mutex.state.lock().unwrap_or_else(|p| p.into_inner());
-        while let Some(waiter) = state.waiters.pop_front() {
-            if waiter.send(()).is_ok() {
-                return;
-            }
-        }
-        state.locked = false;
-    }
-}
-
-static CACHE_LOCK: LazyLock<AsyncMutex> = LazyLock::new(AsyncMutex::new);
+const AVATAR_CACHE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CACHE_ENTRIES: usize = 2048;
+const MAX_METADATA_BYTES: usize = 1024 * 1024;
+static STORAGE_GENERATION: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 static ACTIVE_ACCOUNT: RwLock<Option<oxidezap_core::AccountId>> = RwLock::new(None);
 
 pub fn set_active_account(account: Option<oxidezap_core::AccountId>) {
     if let Ok(mut lock) = ACTIVE_ACCOUNT.write() {
+        if *lock != account {
+            STORAGE_GENERATION.fetch_add(1, portable_atomic::Ordering::Relaxed);
+        }
         *lock = account;
     }
 }
@@ -126,37 +78,165 @@ fn meta_storage_key(account: oxidezap_core::AccountId) -> String {
     format!("oxidezap_avatar_meta_v2_a{}", account.get())
 }
 
-fn load_meta(account: oxidezap_core::AccountId) -> CacheMeta {
+fn load_meta(account: oxidezap_core::AccountId) -> Option<CacheMeta> {
     let Some(window) = web_sys::window() else {
-        return CacheMeta::default();
+        return None;
     };
     let Ok(Some(storage)) = window.local_storage() else {
-        return CacheMeta::default();
+        return None;
     };
     let key = meta_storage_key(account);
     if let Ok(Some(json)) = storage.get_item(&key) {
-        if let Ok(meta) = serde_json::from_str::<CacheMeta>(&json) {
-            return meta;
+        if json.len() <= MAX_METADATA_BYTES {
+            if let Ok(mut meta) = serde_json::from_str::<CacheMeta>(&json) {
+                if meta.entries.len() <= MAX_CACHE_ENTRIES {
+                    meta.total_bytes = meta
+                        .entries
+                        .values()
+                        .fold(0u64, |sum, entry| sum.saturating_add(entry.size));
+                    return Some(meta);
+                }
+            }
         }
     }
-    CacheMeta::default()
+    None
 }
 
-fn save_meta(account: oxidezap_core::AccountId, meta: &CacheMeta) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Ok(Some(storage)) = window.local_storage() else {
-        return;
-    };
-    let key = meta_storage_key(account);
-    if let Ok(json) = serde_json::to_string(meta) {
-        let _ = storage.set_item(&key, &json);
+fn storage() -> Result<web_sys::Storage, String> {
+    web_sys::window()
+        .ok_or("no window")?
+        .local_storage()
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or_else(|| "localStorage unavailable".into())
+}
+
+fn save_meta(account: oxidezap_core::AccountId, meta: &CacheMeta) -> Result<(), String> {
+    let json = serde_json::to_string(meta).map_err(|e| e.to_string())?;
+    storage()?
+        .set_item(&meta_storage_key(account), &json)
+        .map_err(|e| format!("{e:?}"))
+}
+
+pub fn persistent_stamp(account: Option<oxidezap_core::AccountId>) -> Result<u64, String> {
+    let account = account.ok_or("no account")?;
+    storage()?
+        .get_item(&format!("{}_generation", meta_storage_key(account)))
+        .map_err(|e| format!("{e:?}"))?
+        .map_or(Ok(0), |value| {
+            value.parse().map_err(|_| "invalid cache generation".into())
+        })
+}
+
+fn dirty_key(account: oxidezap_core::AccountId) -> String {
+    format!("{}_dirty", meta_storage_key(account))
+}
+
+fn mark_dirty(account: oxidezap_core::AccountId) -> Result<(), String> {
+    storage()?
+        .set_item(&dirty_key(account), "1")
+        .map_err(|e| format!("{e:?}"))
+}
+
+fn finish_meta(account: oxidezap_core::AccountId, meta: &CacheMeta) -> Result<(), String> {
+    save_meta(account, meta)?;
+    storage()?
+        .remove_item(&dirty_key(account))
+        .map_err(|e| format!("{e:?}"))
+}
+
+thread_local! {
+    // One remembered account, so visiting old accounts cannot grow a registry.
+    static RECONCILED: std::cell::Cell<Option<oxidezap_core::AccountId>> = const { std::cell::Cell::new(None) };
+}
+
+/// Recover once per account opening, and after an interrupted mutation. Keys and
+/// blob sizes are authoritative; localStorage is only a bounded derived index.
+async fn ensure_meta(
+    account: oxidezap_core::AccountId,
+    cache: &web_sys::Cache,
+) -> Result<CacheMeta, String> {
+    let old = load_meta(account);
+    let dirty = storage()?
+        .get_item(&dirty_key(account))
+        .map_err(|e| format!("{e:?}"))?
+        .is_some();
+    if RECONCILED.with(|current| current.get() == Some(account)) && !dirty {
+        if let Some(meta) = old {
+            return Ok(meta);
+        }
     }
+    mark_dirty(account)?;
+    let keys = wasm_bindgen_futures::JsFuture::from(cache.keys())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let keys = js_sys::Array::from(&keys);
+    let prefix = cache_url("");
+    let mut meta = CacheMeta::default();
+    for i in 0..keys.length() {
+        let request = keys
+            .get(i)
+            .dyn_into::<web_sys::Request>()
+            .map_err(|e| format!("{e:?}"))?;
+        let url = request.url();
+        let Some(key) = url.strip_prefix(&prefix) else {
+            continue;
+        };
+        let response = wasm_bindgen_futures::JsFuture::from(cache.match_with_request(&request))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        if response.is_undefined() {
+            continue;
+        }
+        let response = response
+            .dyn_into::<web_sys::Response>()
+            .map_err(|e| format!("{e:?}"))?;
+        let blob =
+            wasm_bindgen_futures::JsFuture::from(response.blob().map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+        let size = blob
+            .dyn_into::<web_sys::Blob>()
+            .map_err(|e| format!("{e:?}"))?
+            .size() as u64;
+        let last_accessed = old
+            .as_ref()
+            .and_then(|old| old.entries.get(key))
+            .map_or(u64::from(i), |entry| entry.last_accessed);
+        meta.entries.insert(
+            key.to_string(),
+            MetaEntry {
+                size,
+                last_accessed,
+            },
+        );
+        meta.total_bytes = meta.total_bytes.saturating_add(size);
+        while meta.total_bytes > AVATAR_CACHE_BUDGET_BYTES || meta.entries.len() > MAX_CACHE_ENTRIES
+        {
+            let oldest = meta
+                .entries
+                .iter()
+                .min_by_key(|(key, entry)| (entry.last_accessed, *key))
+                .map(|(key, _)| key.clone())
+                .ok_or("empty cache index")?;
+            wasm_bindgen_futures::JsFuture::from(cache.delete_with_str(&cache_url(&oldest)))
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            if let Some(entry) = meta.entries.remove(&oldest) {
+                meta.total_bytes = meta.total_bytes.saturating_sub(entry.size);
+            }
+        }
+    }
+    finish_meta(account, &meta)?;
+    RECONCILED.with(|current| current.set(Some(account)));
+    Ok(meta)
 }
 
 pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {
     let account = resolve_account(key)?;
+    if active_account() != Some(account) {
+        return None;
+    }
+    let origin = super::web_lock::lock().await.ok();
     let window = web_sys::window()?;
     let caches = window.caches().ok()?;
     let name = cache_name_for_account(account);
@@ -165,6 +245,11 @@ pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {
         .await
         .ok()?;
     let cache: web_sys::Cache = cache_val.dyn_into().ok()?;
+    if origin.is_some() {
+        // Recovery also runs for cache-only offline use. Failure to update
+        // bookkeeping must not hide otherwise readable cached bytes.
+        let _ = ensure_meta(account, &cache).await;
+    }
     let url = cache_url(key);
     let match_promise = cache.match_with_str(&url);
     let response_val = wasm_bindgen_futures::JsFuture::from(match_promise)
@@ -186,7 +271,7 @@ pub async fn delete_persistent(key: &str) -> Result<(), String> {
     let Some(account) = resolve_account(key) else {
         return Ok(());
     };
-    let _guard = CACHE_LOCK.lock().await;
+    let _origin_guard = super::web_lock::lock().await?;
     let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
     let caches = window.caches().map_err(|e| format!("{e:?}"))?;
     let name = cache_name_for_account(account);
@@ -195,14 +280,15 @@ pub async fn delete_persistent(key: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("{e:?}"))?;
     let cache: web_sys::Cache = cache_val.dyn_into().map_err(|e| format!("{e:?}"))?;
-    let url = cache_url(key);
-    let _ = wasm_bindgen_futures::JsFuture::from(cache.delete_with_str(&url)).await;
-
-    let mut meta = load_meta(account);
+    let mut meta = ensure_meta(account, &cache).await?;
+    mark_dirty(account)?;
+    wasm_bindgen_futures::JsFuture::from(cache.delete_with_str(&cache_url(key)))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     if let Some(removed) = meta.entries.remove(key) {
         meta.total_bytes = meta.total_bytes.saturating_sub(removed.size);
-        save_meta(account, &meta);
     }
+    finish_meta(account, &meta)?;
     Ok(())
 }
 
@@ -210,18 +296,23 @@ pub async fn write_persistent(
     key: &str,
     bytes: &[u8],
     account: Option<oxidezap_core::AccountId>,
+    stamp: u64,
 ) -> Result<(), String> {
+    let generation = STORAGE_GENERATION.load(portable_atomic::Ordering::Relaxed);
     let target_account = account.or_else(|| resolve_account(key));
     let Some(target_account) = target_account else {
         log::debug!("skipping persistent avatar write: no account scope for key {key}");
         return Ok(());
     };
+    if resolve_account(key) != Some(target_account) {
+        return Err("avatar key belongs to another account".into());
+    }
     if active_account() != Some(target_account) {
         log::debug!("skipping persistent avatar write for inactive account");
         return Ok(());
     }
 
-    let _guard = CACHE_LOCK.lock().await;
+    let _origin_guard = super::web_lock::lock().await?;
 
     let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
     let caches = window.caches().map_err(|e| format!("{e:?}"))?;
@@ -232,11 +323,28 @@ pub async fn write_persistent(
         .map_err(|e| format!("{e:?}"))?;
     let cache: web_sys::Cache = cache_val.dyn_into().map_err(|e| format!("{e:?}"))?;
 
+    if generation != STORAGE_GENERATION.load(portable_atomic::Ordering::Relaxed)
+        || active_account() != Some(target_account)
+    {
+        return Ok(());
+    }
     let new_size = bytes.len() as u64;
-    let mut meta = load_meta(target_account);
+    if new_size > AVATAR_CACHE_BUDGET_BYTES {
+        return Ok(());
+    }
+    if persistent_stamp(Some(target_account))? != stamp {
+        return Ok(());
+    }
+    let mut meta = ensure_meta(target_account, &cache).await?;
+    mark_dirty(target_account)?;
+    if let Some(previous) = meta.entries.remove(key) {
+        meta.total_bytes = meta.total_bytes.saturating_sub(previous.size);
+    }
 
     // Evict oldest entries if total budget exceeds AVATAR_CACHE_BUDGET_BYTES
-    if meta.total_bytes.saturating_add(new_size) > AVATAR_CACHE_BUDGET_BYTES {
+    if meta.total_bytes.saturating_add(new_size) > AVATAR_CACHE_BUDGET_BYTES
+        || meta.entries.len() >= MAX_CACHE_ENTRIES
+    {
         let mut sorted_entries: Vec<(String, u64, u64)> = meta
             .entries
             .iter()
@@ -245,14 +353,18 @@ pub async fn write_persistent(
         sorted_entries.sort_by_key(|(_, _, last_accessed)| *last_accessed);
 
         for (evicted_key, size, _) in sorted_entries {
-            if meta.total_bytes.saturating_add(new_size) <= AVATAR_CACHE_BUDGET_BYTES {
+            if meta.total_bytes.saturating_add(new_size) <= AVATAR_CACHE_BUDGET_BYTES
+                && meta.entries.len() < MAX_CACHE_ENTRIES
+            {
                 break;
             }
             if evicted_key == key {
                 continue;
             }
             let evict_url = cache_url(&evicted_key);
-            let _ = wasm_bindgen_futures::JsFuture::from(cache.delete_with_str(&evict_url)).await;
+            wasm_bindgen_futures::JsFuture::from(cache.delete_with_str(&evict_url))
+                .await
+                .map_err(|e| format!("{e:?}"))?;
             meta.entries.remove(&evicted_key);
             meta.total_bytes = meta.total_bytes.saturating_sub(size);
         }
@@ -266,6 +378,11 @@ pub async fn write_persistent(
     let blob = web_sys::Blob::new_with_u8_array_sequence(&parts).map_err(|e| format!("{e:?}"))?;
     let response =
         web_sys::Response::new_with_opt_blob(Some(&blob)).map_err(|e| format!("{e:?}"))?;
+    if generation != STORAGE_GENERATION.load(portable_atomic::Ordering::Relaxed)
+        || active_account() != Some(target_account)
+    {
+        return Ok(());
+    }
     let put_promise = cache.put_with_str(&url, &response);
     wasm_bindgen_futures::JsFuture::from(put_promise)
         .await
@@ -283,34 +400,51 @@ pub async fn write_persistent(
         meta.total_bytes = meta.total_bytes.saturating_sub(existing.size);
     }
     meta.total_bytes = meta.total_bytes.saturating_add(new_size);
-    save_meta(target_account, &meta);
+    finish_meta(target_account, &meta)?;
 
     Ok(())
 }
 
-pub async fn delete_account_storage(account: Option<oxidezap_core::AccountId>) {
+pub async fn delete_account_storage(
+    account: Option<oxidezap_core::AccountId>,
+) -> Result<(), String> {
     let Some(account) = account else {
-        return;
+        return Ok(());
     };
-    let _guard = CACHE_LOCK.lock().await;
-    let name = cache_name_for_account(account);
-    if let Some(window) = web_sys::window() {
-        if let Ok(caches) = window.caches() {
-            let _ = wasm_bindgen_futures::JsFuture::from(caches.delete(&name)).await;
-        }
-        if let Ok(Some(storage)) = window.local_storage() {
-            let _ = storage.remove_item(&meta_storage_key(account));
-        }
-    }
+    STORAGE_GENERATION.fetch_add(1, portable_atomic::Ordering::Relaxed);
+    let _origin_guard = super::web_lock::lock().await?;
+    let stamp = persistent_stamp(Some(account))?
+        .checked_add(1)
+        .ok_or("cache generation exhausted")?;
+    let storage = storage()?;
+    storage
+        .set_item(
+            &format!("{}_generation", meta_storage_key(account)),
+            &stamp.to_string(),
+        )
+        .map_err(|e| format!("{e:?}"))?;
+    RECONCILED.with(|current| current.set(None));
+    let caches = web_sys::window()
+        .ok_or("no window")?
+        .caches()
+        .map_err(|e| format!("{e:?}"))?;
+    wasm_bindgen_futures::JsFuture::from(caches.delete(&cache_name_for_account(account)))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    storage
+        .remove_item(&meta_storage_key(account))
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
 }
 
-pub async fn clear_cache_storage(account: Option<oxidezap_core::AccountId>) {
-    let target = account.or_else(active_account);
-    delete_account_storage(target).await;
+pub async fn clear_cache_storage(account: Option<oxidezap_core::AccountId>) -> Result<(), String> {
+    delete_account_storage(account.or_else(active_account)).await
 }
 
 pub async fn avatar_cache_usage(account: oxidezap_core::AccountId) -> (u64, u64) {
-    let meta = load_meta(account);
+    let Some(meta) = load_meta(account) else {
+        return (0, 0);
+    };
     (meta.total_bytes, meta.entries.len() as u64)
 }
 

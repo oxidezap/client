@@ -598,7 +598,14 @@ impl WhatsAppApp {
             if cleared.await.is_err() {
                 return;
             }
-            crate::session::avatar::clear_cache_storage(Some(account)).await;
+            if let Err(error) = crate::session::avatar::clear_cache_storage(Some(account)).await {
+                log::warn!("browser avatar cache clear failed: {error}");
+                let _ = entity.update(cx, |app, cx| {
+                    app.notify_user("Some cached profile photos could not be cleared. Free browser storage and try again.", Tone::Problem, cx);
+                    app.refresh_storage_usage(cx);
+                });
+                return;
+            }
             let _ = entity.update(cx, |app, cx| {
                 app.avatar_manager.clear();
                 app.last_avatar_window_fingerprint = None;

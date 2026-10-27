@@ -155,6 +155,10 @@ pub struct Chat {
     /// descriptor or from a metadata refresh.
     #[serde(default, skip_serializing_if = "is_false")]
     pub avatar_loaded: bool,
+    /// A live picture event outranks a hydration captured before it. Local
+    /// state only: a restarted front end restores the durable descriptor.
+    #[serde(skip)]
+    pub avatar_live: bool,
     /// Participant names in group chats (sender JID -> display name)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub participants: HashMap<String, String>,
@@ -227,9 +231,26 @@ impl Chat {
             avatar_picture_id: None,
             avatar_cache_key: None,
             avatar_loaded: false,
+            avatar_live: false,
             participants: HashMap::new(),
             messages: Vec::new(),
             from_store: false,
+        }
+    }
+
+    /// Record live metadata without blanking a picture while bytes load.
+    pub fn resolve_avatar(&mut self, picture_id: Option<String>) {
+        self.avatar_live = true;
+        self.avatar_picture_id = picture_id;
+    }
+
+    /// Install bytes, or apply an authoritative removal after its commit.
+    pub fn ready_avatar(&mut self, key: String) {
+        self.avatar_live = true;
+        self.avatar_cache_key = (!key.is_empty()).then_some(key);
+        self.avatar_loaded = self.avatar_cache_key.is_some();
+        if !self.avatar_loaded {
+            self.avatar_picture_id = None;
         }
     }
 

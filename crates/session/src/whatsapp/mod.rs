@@ -401,12 +401,19 @@ impl AvatarRecorder {
             return false;
         };
         let store = &live.chat_store;
-        if let Err(e) = store.record_avatar(&jid, picture_id, cache_key, seq) {
+        if let Err(e) = store.record_avatar(&jid, picture_id.clone(), cache_key.clone(), seq) {
             warn!("could not publish the avatar descriptor: {e}");
             return false;
         }
         match store.flush().await {
-            Ok(()) => true,
+            Ok(()) => store
+                .avatar_descriptors_for(&[jid.to_string()])
+                .await
+                .is_ok_and(|descriptors| {
+                    descriptors.iter().any(|descriptor| {
+                        descriptor.picture_id == picture_id && descriptor.cache_key == cache_key
+                    })
+                }),
             Err(e) => {
                 warn!("the avatar descriptor did not commit: {e}");
                 false
@@ -432,7 +439,10 @@ impl AvatarRecorder {
             return false;
         }
         match store.flush().await {
-            Ok(()) => true,
+            Ok(()) => store
+                .avatar_descriptors_for(&[jid.to_string()])
+                .await
+                .is_ok_and(|descriptors| descriptors.is_empty()),
             Err(e) => {
                 warn!("the avatar removal did not commit: {e}");
                 false
