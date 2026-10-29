@@ -1,43 +1,50 @@
-# Daemon memory profiling
+# Daemon memory measurements
 
-The PR currently adds regression coverage and workloads, not a measured memory
-optimization. `account_scale_paging` checks a synthetic SQLite store with 1,032
-chats, 1,653 contacts and 75,703 messages.
-
-The daemon's `session_bridge::memory_scenario` replays fixed-size synthetic text
-messages through the real bridge, read tracker and publisher, after an initial
-attach with 100 chats and eight read rows per chat. Its ordinary test
-checks badges, duplicate delivery, read receipts and the publication tail with
-and without a subscriber. Two ignored workloads each replay 75,703 messages
-across 1,032 chats, then join the publisher before finishing. The attached case
-deliberately leaves its subscriber behind during the burst to exercise backlog
-and broadcast resynchronization. It is a slow-consumer stress case, not a typical
-frontend session. No network, account database or media files are used.
-
-Compile the release test binary without executing profiling workloads:
+The harness uses fresh Linux processes, the existing release profile, `/proc`
+and `wait4`. No root, eBPF, CodSpeed, credentials or application dependencies are
+needed. Build immutable binaries on the baseline revision, then the candidate,
+using the same toolchain, runner and profile:
 
 ```sh
-cargo test -p oxidezap-daemon --release --lib --no-run
+python3 scripts/build-memory-workload.py --instrument /tmp/base-memory
+python3 scripts/build-memory-workload.py /tmp/base-timing
+# Switch to the candidate revision, keeping the same harness.
+python3 scripts/build-memory-workload.py --instrument /tmp/head-memory
+python3 scripts/build-memory-workload.py /tmp/head-timing
+python3 scripts/measure-daemon-memory.py --mode memory --base /tmp/base-memory --head /tmp/head-memory --output /tmp/memory.json
+python3 scripts/measure-daemon-memory.py --mode timing --base /tmp/base-timing --head /tmp/head-timing --output /tmp/timing.json
 ```
 
-Use the executable path Cargo reports, and run each workload separately through
-CodSpeed so their peaks are not combined:
+The driver alternates base/head order, excludes one warmup per scenario and
+reports seven isolated samples with median/min/max and raw observations. Each
+binary has a recorded SHA-256; build metadata records the compiler and revision.
+The OS file cache is warm, not forcibly cleared. Do not compare different hosts.
 
-```sh
-codspeed exec -m memory --repository oxidezap/client --name bridge-headless -- \
-  <daemon-test-binary> --exact session_bridge::memory_scenario::account_scale_memory_headless --ignored --test-threads=1
-codspeed exec -m memory --repository oxidezap/client --name bridge-attached -- \
-  <daemon-test-binary> --exact session_bridge::memory_scenario::account_scale_memory_attached --ignored --test-threads=1
-```
+The bridge workloads replay 75,703 fixed-size synthetic text messages over 1,032
+chats, after a 100-chat attach with eight read rows per chat. Cases cover unread
+traffic with/without a subscriber, already-read messages, and groups with eight
+alternating authors. The attached subscriber deliberately lags until the publisher
+drains. Assertions cover duplicate delivery, badges, receipt queries and the
+publication tail. `account_scale_paging` separately checks 1,653 contacts and
+75,703 SQLite rows; it is not part of these bridge memory numbers.
 
-Compare the same release build configuration on base and head, including walltime
-runs through CodSpeed. These workloads isolate the bridge; they do not measure
-the session's Tokio runtime, SQLite, cryptographic state, calls, media or full
-daemon RSS/PSS. A complete daemon scenario is still needed before attributing
-real-account startup or idle memory to this path.
+The opt-in `memory-profiling` feature installs a counting allocator in native
+test binaries only. It measures requested Rust heap bytes, live and peak, and
+allocation traffic across all threads. It excludes allocator metadata, C
+allocations and alignment slack. Checkpoints separate initialization, attach,
+queued sync, drained publication, detach, receipt queries and released state.
+Sampling and formatting allocate small amounts themselves. `realloc` traffic
+counts its requested new size, not the unknown amount copied by the allocator.
 
-Execution currently requires network access to the CodSpeed API, an authenticated
-profile authorized for this project, and the memory executor's eBPF capabilities
-on a supported runner. The existing CI runs correctness checks but has no
-CodSpeed profiling integration. Do not substitute virtual address size for RAM
-or report workload results as a whole-daemon measurement.
+RSS/PSS, anonymous/file/shared resident pages and the kernel's RSS high-water mark
+are reported separately. A fall in live heap without an equal RSS fall can include
+allocator retention, stacks and untracked allocations; it does not establish an
+exact allocator-retained byte count. File-backed pages are not live Rust heap.
+Timing binaries have no counting allocator or memory probes; CPU/wall values
+include process/test startup and are reported as distributions, not universal
+latency guarantees.
+
+These workloads isolate bridge bookkeeping and publication. They do not represent
+a whole authenticated daemon, cryptographic state, SQLite residency, media or
+calls. Whole-daemon startup/idle claims require a separate scenario. Production
+binaries keep their existing allocator even when the profiling feature is enabled.
