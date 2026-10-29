@@ -859,6 +859,7 @@ impl WhatsAppApp {
             client.download_downloadable_media(downloadable)
         };
 
+        self.image_downloads_in_flight.insert(message_id.clone());
         let generation = self.document_state_generation;
         let account = self.account_scope();
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -875,6 +876,7 @@ impl WhatsAppApp {
                 ) {
                     return;
                 }
+                app.image_downloads_in_flight.remove(&message_id);
                 app.finish_download(&message_id);
                 match result {
                     Ok(data) => {
@@ -971,10 +973,14 @@ impl WhatsAppApp {
         self.downloads_in_flight.remove(message_id);
     }
 
-    /// Invalidate pending document completions when logout keeps the account
-    /// identity in memory but ends the session that authorized its downloads.
+    /// Invalidate pending image/document completions when logout keeps the
+    /// account identity but ends the session that authorized its downloads.
     pub(super) fn invalidate_document_downloads(&mut self) {
         self.document_state_generation = self.document_state_generation.wrapping_add(1);
+        for id in self.image_downloads_in_flight.drain() {
+            self.downloads_in_flight.remove(&id);
+        }
+        self.channel_preview_attempts.clear();
         self.saved_documents.clear();
         self.document_downloads_in_flight.clear();
     }
@@ -1838,6 +1844,36 @@ mod tests {
         assert!(!pending.matches("voice-1", 7));
         assert!(!pending.matches("voice-2", 8));
         assert!(pending.matches("voice-1", 8));
+    }
+
+    #[gpui::test]
+    fn logout_releases_image_slots_before_rejecting_late_completions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, _| {
+            app.downloads_in_flight
+                .extend(["image".into(), "audio".into()]);
+            app.image_downloads_in_flight.insert("image".into());
+            app.channel_preview_attempts
+                .insert(("channel@newsletter".into(), "image".into()));
+            let generation = app.document_state_generation;
+            let account = app.account_scope();
+            app.invalidate_document_downloads();
+            assert!(!app.is_downloading("image"));
+            assert!(app.is_downloading("audio"));
+            assert!(app.channel_preview_attempts.is_empty());
+            assert!(!document_state_matches(
+                app.document_state_generation,
+                &app.account_scope(),
+                generation,
+                &account
+            ));
+        });
     }
 
     #[gpui::test]

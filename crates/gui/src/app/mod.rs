@@ -944,6 +944,7 @@ pub struct WhatsAppApp {
     downloads_in_flight: std::collections::HashSet<String>,
     /// At most one automatic attempt per rendered channel image in this session.
     channel_preview_attempts: std::collections::HashSet<(String, String)>,
+    image_downloads_in_flight: std::collections::HashSet<String>,
     /// Native document destinations, scoped to the account, chat and message
     /// that initiated the save. Browser handoffs never enter this map.
     saved_documents: HashMap<(String, String, String), std::path::PathBuf>,
@@ -1478,6 +1479,7 @@ impl WhatsAppApp {
             notices: cx.new(|_| notices::Notices::new()),
             downloads_in_flight: std::collections::HashSet::new(),
             channel_preview_attempts: std::collections::HashSet::new(),
+            image_downloads_in_flight: std::collections::HashSet::new(),
             saved_documents: HashMap::new(),
             document_downloads_in_flight: std::collections::HashSet::new(),
             document_state_generation: 0,
@@ -2330,6 +2332,7 @@ impl WhatsAppApp {
         self.video_players.clear();
         self.downloads_in_flight.clear();
         self.channel_preview_attempts.clear();
+        self.image_downloads_in_flight.clear();
         self.saved_documents.clear();
         self.document_downloads_in_flight.clear();
         self.document_state_generation = self.document_state_generation.wrapping_add(1);
