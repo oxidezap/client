@@ -64,7 +64,8 @@ pub enum UiEvent {
         /// `notification_title` (which may be formatted as a mention alert).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chat_name: Option<String>,
-        /// A live, committed message in a known, unmuted, unarchived chat.
+        /// A live, committed message permitted by durable conversation
+        /// policy. A mute blocks personal mentions as well.
         /// Missing from an older daemon's frame means unknown and suppresses
         /// the alert; the GUI still owns focus and duplicate filtering.
         #[serde(default)]
@@ -76,9 +77,15 @@ pub enum UiEvent {
         notification_title: Option<String>,
         /// The store's archive answer. `None` means not known (including an
         /// older daemon frame), distinct from an explicit unarchive. A live
-        /// @mention may still alert without resurrecting an archived chat.
+        /// mention in an unmuted archived chat can alert without restoring it
+        /// to the active conversation list.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_archived: Option<bool>,
+        /// Durable mute deadline in unix milliseconds, including for live
+        /// arrivals before the chat-list reload. Meaningful when archive
+        /// metadata is known; None then explicitly means unmuted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_muted_until_ms: Option<i64>,
     },
     ReceiptReceived {
         chat_jid: String,
@@ -412,6 +419,7 @@ mod notification_wire_tests {
             notification_allowed: true,
             notification_title: Some("Example group".into()),
             notification_archived: Some(true),
+            chat_muted_until_ms: None,
         };
         let mut wire = serde_json::to_value(event).unwrap();
         let fields = wire
@@ -430,6 +438,7 @@ mod notification_wire_tests {
                 chat_name: None,
                 notification_title: None,
                 notification_archived: None,
+                chat_muted_until_ms: None,
                 ..
             }
         ));

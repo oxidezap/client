@@ -8,7 +8,7 @@
 
 use oxidezap_chat_store::{MessageKind, MessageStatus};
 
-use whatsapp_rust::wacore_binary::jid::{Jid, observe_str};
+use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _, observe_str};
 use whatsapp_rust::waproto::{buffa::MessageField, whatsapp as wa};
 
 use super::WhatsAppClient;
@@ -464,11 +464,27 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            if chat.is_newsletter() {
+                if duration_secs.is_some_and(|seconds| seconds != 0) {
+                    return Err("channels support indefinite mute or unmute".to_string());
+                }
+                let muted = duration_secs != Some(0);
+                live.client
+                    .newsletter()
+                    .set_admin_mute(&chat, muted)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                live.chat_store
+                    .apply_channel_mutes(vec![(chat.to_string(), muted)])
+                    .map_err(|e| e.to_string())?;
+                return live.chat_store.flush().await.map_err(|e| e.to_string());
+            }
             let actions = live.client.chat_actions();
             match duration_secs {
                 Some(0) => actions.unmute_chat(&chat).await.map_err(|e| e.to_string()),
                 Some(secs) => {
-                    let until = whatsapp_rust::wacore::time::now_millis() + (secs as i64) * 1_000;
+                    let until = mute_deadline_ms(whatsapp_rust::wacore::time::now_millis(), secs)
+                        .ok_or_else(|| "mute duration is out of range".to_string())?;
                     actions
                         .mute_chat_until(&chat, until)
                         .await
@@ -624,5 +640,22 @@ mod edit_tests {
         assert_eq!(extended.text.as_deref(), Some("replacement"));
         assert_eq!(extended.context_info.as_option().unwrap(), &context);
         assert_eq!(timestamp, 1_700_000_050_123);
+    }
+}
+
+fn mute_deadline_ms(now_ms: i64, seconds: u64) -> Option<i64> {
+    i64::try_from(seconds)
+        .ok()?
+        .checked_mul(1_000)?
+        .checked_add(now_ms)
+}
+
+#[cfg(test)]
+mod mute_deadline_tests {
+    #[test]
+    fn duration_uses_milliseconds_and_rejects_overflow() {
+        assert_eq!(super::mute_deadline_ms(1000, 60), Some(61000));
+        assert_eq!(super::mute_deadline_ms(1000, u64::MAX), None);
+        assert_eq!(super::mute_deadline_ms(i64::MAX, 1), None);
     }
 }

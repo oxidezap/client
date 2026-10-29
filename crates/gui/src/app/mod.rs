@@ -1066,6 +1066,7 @@ pub struct WhatsAppApp {
 /// The GUI's paged chat row may not yet know any of them.
 struct IncomingMessageMetadata {
     allowed: bool,
+    muted_until_ms: Option<i64>,
     title: Option<String>,
     archived: Option<bool>,
     chat_name: Option<String>,
@@ -1099,6 +1100,11 @@ fn remove_pending_notification(queue: &mut VecDeque<String>, tag: &str) -> bool 
 }
 
 impl IncomingMessageMetadata {
+    fn with_mute(mut self, until: Option<i64>) -> Self {
+        self.muted_until_ms = until;
+        self
+    }
+
     fn new(
         allowed: bool,
         title: Option<String>,
@@ -1107,6 +1113,7 @@ impl IncomingMessageMetadata {
     ) -> Self {
         Self {
             allowed,
+            muted_until_ms: None,
             title,
             archived,
             chat_name,
@@ -3568,6 +3575,13 @@ impl WhatsAppApp {
             // Update the existing chat
             let chat = Arc::make_mut(&mut self.chats[index]);
             if let Some(archived) = metadata.archived {
+                chat.muted_until = metadata.muted_until_ms.and_then(|ms| {
+                    if ms == i64::MAX {
+                        Some(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                    } else {
+                        chrono::DateTime::from_timestamp_millis(ms)
+                    }
+                });
                 chat.archived = archived;
             }
 
@@ -3627,6 +3641,13 @@ impl WhatsAppApp {
             // an unknown answer out of the active inbox until store hydration
             // supplies an explicit state; `Some(false)` still unarchives it.
             new_chat.archived = metadata.archived.unwrap_or(true);
+            new_chat.muted_until = metadata.muted_until_ms.and_then(|ms| {
+                if ms == i64::MAX {
+                    Some(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                } else {
+                    chrono::DateTime::from_timestamp_millis(ms)
+                }
+            });
 
             // For groups: track participant
             if is_group && let Some(ref name) = sender_name {

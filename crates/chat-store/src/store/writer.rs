@@ -584,6 +584,56 @@ fn apply_writer_msg(
         WriterMsg::AvatarCleared { jid, seq } => {
             crate::store::avatar::delete(conn, device_id, jid, *seq)
         }
+        WriterMsg::ChannelMutes { writes, expected } => {
+            use diesel::prelude::*;
+            use schema::chats::dsl;
+            for (jid, muted) in writes {
+                if !jid.ends_with("@newsletter") {
+                    continue;
+                }
+                let current: Option<(Option<i64>, bool, i64)> = dsl::chats
+                    .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid)))
+                    .select((
+                        dsl::muted_until,
+                        dsl::mute_appstate_seen,
+                        dsl::mute_revision,
+                    ))
+                    .first(conn)
+                    .optional()?;
+                let (stored, seen, revision) = current.unwrap_or((None, false, 0));
+                if let Some(expected) = expected {
+                    let before = expected.get(jid).copied();
+                    // A row known at lookup time and deleted since then is
+                    // different from a genuinely unseen subscribed channel.
+                    if before.is_some() && current.is_none() {
+                        continue;
+                    }
+                    if revision != before.unwrap_or(0) {
+                        continue;
+                    }
+                }
+                let next_revision = revision.checked_add(1).ok_or_else(|| {
+                    diesel::result::Error::SerializationError("mute revision exhausted".into())
+                })?;
+                // A preference exists independently of message history. Persist
+                // it now so the first inbound message observes the same policy.
+                crate::store::chat_rows::ensure_preference_chat(conn, device_id, jid)?;
+                let until = muted.then_some(i64::MAX);
+                diesel::update(
+                    dsl::chats.filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid))),
+                )
+                .set((
+                    dsl::muted_until.eq(until),
+                    dsl::mute_appstate_seen.eq(true),
+                    dsl::mute_revision.eq(next_revision),
+                ))
+                .execute(conn)?;
+                if current.is_none() || stored != until || !seen {
+                    cs.message_chats.insert(jid.clone());
+                }
+            }
+            Ok(())
+        }
         WriterMsg::ChatNames(names) => {
             crate::store::chat_names::apply_chat_names(conn, device_id, names, cs)
         }

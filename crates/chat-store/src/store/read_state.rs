@@ -241,7 +241,10 @@ pub(super) fn clear_unread_marker(
     let cleared = diesel::update(
         chat_row(device_id, chat).filter(schema::chats::unread_count.eq(UNREAD_MARKER)),
     )
-    .set(schema::chats::unread_count.eq(unread))
+    .set((
+        schema::chats::unread_count.eq(unread),
+        schema::chats::unread_initialized.eq(true),
+    ))
     .execute(conn)?;
     if cleared > 0 {
         cs.chats = true;
@@ -335,16 +338,22 @@ pub(super) fn set_unread_count(
     unread: i32,
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
-    let stored: Option<i32> = chat_row(device_id, chat)
-        .select(schema::chats::unread_count)
+    let stored: Option<(i32, bool)> = chat_row(device_id, chat)
+        .select((
+            schema::chats::unread_count,
+            schema::chats::unread_initialized,
+        ))
         .first(conn)
         .optional()?;
-    if stored == Some(unread) {
+    if stored == Some((unread, true)) {
         return Ok(());
     }
     diesel::update(chat_row(device_id, chat))
-        .set(schema::chats::unread_count.eq(unread))
+        .set((
+            schema::chats::unread_count.eq(unread),
+            schema::chats::unread_initialized.eq(true),
+        ))
         .execute(conn)?;
-    cs.chats = true;
+    cs.chats |= stored.map(|(count, _)| count) != Some(unread);
     Ok(())
 }

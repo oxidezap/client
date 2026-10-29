@@ -188,7 +188,7 @@ impl Sender {
         self.inner.wake.notify_one();
     }
 
-    pub(super) fn send(&self, event: UiEvent) -> Result<(), UiEvent> {
+    pub(super) fn send(&self, event: UiEvent) -> Result<(), Box<UiEvent>> {
         let class = class_of(&event);
         let bytes = estimated_bytes(&event);
         let mut recover = false;
@@ -208,12 +208,12 @@ impl Sender {
                 );
             }
             self.inner.wake.notify_one();
-            return Err(event);
+            return Err(Box::new(event));
         }
         let result = {
             let mut state = self.inner.state.lock().expect("UI event queue poisoned");
             if state.closed {
-                Err(event)
+                Err(Box::new(event))
             } else {
                 purge_expired(&mut state, self.inner.max_data_age, &mut recover);
                 if let Some(index) = coalesce_index(&state, &event, class) {
@@ -235,7 +235,7 @@ impl Sender {
                         } else {
                             state.dropped_ephemeral += 1;
                         }
-                        Err(event)
+                        Err(Box::new(event))
                     }
                 } else if class == Class::Control {
                     while state.control.len() + state.data.len() >= self.inner.max_items
@@ -267,7 +267,7 @@ impl Sender {
                         Ok(())
                     } else {
                         log::warn!("dropping control UI event from full mailbox");
-                        Err(event)
+                        Err(Box::new(event))
                     }
                 } else {
                     while state.data.len() >= self.inner.max_data_items
@@ -305,7 +305,7 @@ impl Sender {
                         if old_class == Class::Control {
                             log::warn!("dropping control UI event from full mailbox");
                         }
-                        Err(event)
+                        Err(Box::new(event))
                     }
                 }
             }
@@ -767,6 +767,7 @@ mod tests {
                 notification_allowed: false,
                 notification_title: None,
                 notification_archived: None,
+                chat_muted_until_ms: None,
             })
             .unwrap();
         sender
@@ -782,6 +783,7 @@ mod tests {
                 notification_allowed: false,
                 notification_title: None,
                 notification_archived: None,
+                chat_muted_until_ms: None,
             })
             .unwrap();
         assert_eq!(sender.stats().dropped_recoverable, 1);

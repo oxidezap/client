@@ -2371,6 +2371,7 @@ fn poll_view_to_dto(poll: oxidezap_session::PollView) -> PollDto {
 /// A subscribed channel as the protocol's channel.
 fn channel_view_to_dto(channel: oxidezap_session::ChannelView) -> ChannelDto {
     ChannelDto {
+        is_muted: channel.muted,
         jid: channel.jid,
         name: channel.name,
         description: channel.description,
@@ -2984,5 +2985,29 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn channel_wire_preserves_known_mute_and_unknown_settings() {
+        for muted in [Some(true), Some(false), None] {
+            let dto = super::channel_view_to_dto(oxidezap_session::ChannelView {
+                jid: "120363000000000002@newsletter".into(),
+                name: "Example".into(),
+                muted,
+                description: None,
+                subscriber_count: 1,
+                picture_url: None,
+            });
+            assert_eq!(dto.is_muted, muted);
+            let value = serde_json::to_value(dto).unwrap();
+            if let Some(muted) = muted {
+                assert_eq!(value["is_muted"], muted);
+            } else {
+                assert!(value.get("is_muted").is_none());
+            }
+        }
+        let older: oxidezap_wire::dto::ChannelDto = serde_json::from_str(
+            r#"{"jid":"120363000000000002@newsletter","name":"Example","description":null,"subscriber_count":1,"picture_url":null}"#,
+        ).unwrap();
+        assert_eq!(older.is_muted, None);
     }
 }

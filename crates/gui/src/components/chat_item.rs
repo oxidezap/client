@@ -174,6 +174,17 @@ fn render_name_row(
                         .child(label)
                 })),
         )
+        .children(
+            row.muted_until
+                .filter(|until| *until > wacore::time::now_utc())
+                .map(|_| {
+                    div()
+                        .flex_shrink_0()
+                        .text_size(metrics.text_meta())
+                        .text_color(parts::subtle(cx))
+                        .child("Muted")
+                }),
+        )
         .children(row.pinned.then(|| {
             div()
                 .flex_shrink_0()

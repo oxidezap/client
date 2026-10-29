@@ -182,12 +182,16 @@ struct ChatRow {
     #[allow(dead_code)]
     mute_appstate_seen: bool,
     #[allow(dead_code)]
+    mute_revision: i64,
+    #[allow(dead_code)]
     archive_appstate_seen: bool,
     #[allow(dead_code)]
     name_from_address_book: bool,
     #[allow(dead_code)]
     address_book_fallback: Option<String>,
     group_hierarchy: Option<String>,
+    #[allow(dead_code)]
+    unread_initialized: bool,
 }
 
 impl From<ChatRow> for ChatEntry {
@@ -798,9 +802,8 @@ impl ChatStore {
         if rows.is_empty() {
             return Ok(None);
         }
-        let muted = rows
-            .iter()
-            .any(|(mute, _, _)| mute.is_some_and(|until| until > now_ms));
+        let muted_until_ms = rows.iter().filter_map(|(mute, _, _)| *mute).max();
+        let muted = muted_until_ms.is_some_and(|until| until > now_ms);
         let archived = rows.iter().any(|(_, archived, _)| *archived);
         let name = rows
             .into_iter()
@@ -812,10 +815,32 @@ impl ChatStore {
             });
         Ok(Some(ChatNotificationMetadata {
             muted,
+            muted_until_ms,
             archived,
             allowed: !muted && !archived,
             name,
         }))
+    }
+
+    /// Snapshot channel mute state before awaiting server metadata.
+    pub async fn channel_mute_snapshot(&self) -> Result<crate::types::ChannelMuteSnapshot> {
+        use schema::chats::dsl;
+        let device_id = self.device_id();
+        Ok(self
+            .db()
+            .read(move |conn| {
+                let rows: Vec<(String, i64)> = dsl::chats
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::jid.like("%@newsletter")),
+                    )
+                    .select((dsl::jid, dsl::mute_revision))
+                    .load(conn)
+                    .map_err(db_err)?;
+                Ok(rows.into_iter().collect())
+            })
+            .await?)
     }
 
     /// Every special chat's identity columns, in one read.

@@ -295,6 +295,7 @@ impl ChatArchiveFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatNotificationMetadata {
     pub muted: bool,
+    pub muted_until_ms: Option<i64>,
     pub archived: bool,
     pub allowed: bool,
     pub name: Option<String>,
@@ -648,3 +649,7 @@ pub enum StoreChange {
     /// Contact naming changed.
     Contacts,
 }
+
+/// Per-channel monotonic mute revision captured before a metadata request.
+/// Missing rows have revision zero, until their first observed mute decision.
+pub type ChannelMuteSnapshot = std::collections::BTreeMap<String, i64>;

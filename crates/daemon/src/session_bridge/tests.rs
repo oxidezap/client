@@ -32,6 +32,7 @@ pub(super) fn received(chat_jid: &str, message: ChatMessage, sender_name: Option
         notification_allowed: false,
         notification_title: None,
         notification_archived: None,
+        chat_muted_until_ms: None,
     }
 }
 
@@ -949,4 +950,26 @@ async fn retirement_drains_existing_media_and_rejects_new_writers() {
     let _exclusive = tokio::time::timeout(std::time::Duration::from_secs(1), drain)
         .await
         .unwrap();
+}
+
+#[test]
+fn first_live_message_carries_mute_to_tray_before_chat_hydration() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::Connected);
+    let jid = "120363000000000002@newsletter";
+    let mut event = received(jid, message("CHANNEL-MUTE", jid, 10, false, false), None);
+    if let UiEvent::MessageReceived {
+        notification_archived,
+        chat_muted_until_ms,
+        ..
+    } = &mut event
+    {
+        *notification_archived = Some(false);
+        *chat_muted_until_ms = Some(i64::MAX);
+    }
+    bridge.observe(event);
+    let summary = bridge.hub.chat(jid).unwrap();
+    assert_eq!(summary.unread, 1);
+    assert!(summary.is_muted(wacore::time::now_utc().timestamp_millis()));
+    assert_eq!(bridge.hub.watch_tray().borrow().unread, 0);
 }

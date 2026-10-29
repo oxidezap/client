@@ -124,6 +124,7 @@ pub struct ChatRow {
     pub unread: Unread,
     pub preview: Preview,
     pub pinned: bool,
+    pub muted_until: Option<DateTime<Utc>>,
 }
 
 impl ChatRow {
@@ -160,6 +161,7 @@ impl ChatRow {
             },
             preview: preview_for(chat, typing, draft, is_own_number),
             pinned: chat.pinned_at.is_some(),
+            muted_until: chat.muted_until,
         }
     }
 

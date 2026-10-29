@@ -56,10 +56,10 @@ pub use store::ChatStore;
 pub use store::retirement::AccountRetirement;
 pub use store::shared_history::PendingHistoryBundle;
 pub use types::{
-    ArrivalCursor, AvatarDescriptor, ChatArchiveFilter, ChatCursor, ChatEntry, ChatNameExpected,
-    ChatNameWrite, ChatNotificationMetadata, ContactEntry, GroupHierarchyWrite, MediaRef,
-    MessageCoverage, MessageCursor, MessageKind, MessageStatus, ReactionEntry, ReceiptEntry,
-    StoreChange, StoredMessage,
+    ArrivalCursor, AvatarDescriptor, ChannelMuteSnapshot, ChatArchiveFilter, ChatCursor, ChatEntry,
+    ChatNameExpected, ChatNameWrite, ChatNotificationMetadata, ContactEntry, GroupHierarchyWrite,
+    MediaRef, MessageCoverage, MessageCursor, MessageKind, MessageStatus, ReactionEntry,
+    ReceiptEntry, StoreChange, StoredMessage,
 };
 
 mod business;
