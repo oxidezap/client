@@ -319,6 +319,7 @@ pub(crate) fn merge_chat_metadata(
         bool,
         bool,
         Option<String>,
+        i64,
     );
     let prefs = |conn: &mut SqliteConnection, key: &str| -> QueryResult<Option<PrefRow>> {
         chat_row(device_id, key)
@@ -334,6 +335,7 @@ pub(crate) fn merge_chat_metadata(
                 dsl::archive_appstate_seen,
                 dsl::name_from_address_book,
                 dsl::address_book_fallback,
+                dsl::mute_revision,
             ))
             .first(conn)
             .optional()
@@ -344,7 +346,7 @@ pub(crate) fn merge_chat_metadata(
     let src_state = read_state(conn, device_id, src)?;
     ensure_chat(conn, device_id, dest)?;
     let dest_row = prefs(conn, dest)?.unwrap_or((
-        0, 0, None, None, false, None, None, false, false, false, None,
+        0, 0, None, None, false, None, None, false, false, false, None, 0,
     ));
     let dest_state = read_state(conn, device_id, dest)?;
 
@@ -401,6 +403,7 @@ pub(crate) fn merge_chat_metadata(
             dsl::name_from_address_book.eq(name_from_address_book),
             dsl::address_book_fallback.eq(address_book_fallback),
             dsl::mute_appstate_seen.eq(dest_row.7 || src_row.7),
+            dsl::mute_revision.eq(src_row.11.max(dest_row.11).saturating_add(1)),
             dsl::archive_appstate_seen.eq(dest_row.8 || src_row.8),
             dsl::read_boundary_ms.eq(merged.watermark_ms),
             dsl::read_boundary_ids.eq(ids_json),

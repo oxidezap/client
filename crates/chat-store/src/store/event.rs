@@ -211,24 +211,28 @@ pub(super) fn apply_event(
             };
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
-            let (stored, seen): (Option<i64>, bool) = chat_row(device_id, &chat)
+            let (stored, seen, revision): (Option<i64>, bool, i64) = chat_row(device_id, &chat)
                 .select((
                     schema::chats::muted_until,
                     schema::chats::mute_appstate_seen,
+                    schema::chats::mute_revision,
                 ))
                 .first(conn)?;
-            if stored == muted_until && seen {
-                return Ok(());
-            }
+            let next_revision = revision.checked_add(1).ok_or_else(|| {
+                diesel::result::Error::SerializationError("mute revision exhausted".into())
+            })?;
             diesel::update(chat_row(device_id, &chat))
                 .set((
                     schema::chats::muted_until.eq(muted_until),
                     schema::chats::mute_appstate_seen.eq(true),
+                    schema::chats::mute_revision.eq(next_revision),
                 ))
                 .execute(conn)?;
             // A muted row may be past the first page. Reload this identity
             // directly so the tray and existing windows receive the change.
-            cs.message_chats.insert(chat);
+            if stored != muted_until || !seen {
+                cs.message_chats.insert(chat);
+            }
             Ok(())
         }
         Event::ArchiveUpdate(update) => {

@@ -182,6 +182,8 @@ struct ChatRow {
     #[allow(dead_code)]
     mute_appstate_seen: bool,
     #[allow(dead_code)]
+    mute_revision: i64,
+    #[allow(dead_code)]
     archive_appstate_seen: bool,
     #[allow(dead_code)]
     name_from_address_book: bool,
@@ -825,19 +827,16 @@ impl ChatStore {
         Ok(self
             .db()
             .read(move |conn| {
-                let rows: Vec<(String, Option<i64>, bool)> = dsl::chats
+                let rows: Vec<(String, i64)> = dsl::chats
                     .filter(
                         dsl::device_id
                             .eq(device_id)
                             .and(dsl::jid.like("%@newsletter")),
                     )
-                    .select((dsl::jid, dsl::muted_until, dsl::mute_appstate_seen))
+                    .select((dsl::jid, dsl::mute_revision))
                     .load(conn)
                     .map_err(db_err)?;
-                Ok(rows
-                    .into_iter()
-                    .map(|(jid, until, seen)| (jid, (until, seen)))
-                    .collect())
+                Ok(rows.into_iter().collect())
             })
             .await?)
     }

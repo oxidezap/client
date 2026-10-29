@@ -646,6 +646,6 @@ pub enum StoreChange {
     Contacts,
 }
 
-/// Per-channel raw mute value and whether an explicit preference has arrived.
-/// Metadata queries compare with this pre-request snapshot before writing.
-pub type ChannelMuteSnapshot = std::collections::BTreeMap<String, (Option<i64>, bool)>;
+/// Per-channel monotonic mute revision captured before a metadata request.
+/// Missing rows have revision zero, until their first observed mute decision.
+pub type ChannelMuteSnapshot = std::collections::BTreeMap<String, i64>;

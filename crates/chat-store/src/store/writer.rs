@@ -591,31 +591,39 @@ fn apply_writer_msg(
                 if !jid.ends_with("@newsletter") {
                     continue;
                 }
+                let current: Option<(Option<i64>, bool, i64)> = dsl::chats
+                    .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid)))
+                    .select((
+                        dsl::muted_until,
+                        dsl::mute_appstate_seen,
+                        dsl::mute_revision,
+                    ))
+                    .first(conn)
+                    .optional()?;
+                let (stored, seen, revision) = current.unwrap_or((None, false, 0));
                 if let Some(expected) = expected {
-                    let Some(before) = expected.get(jid) else {
-                        continue;
-                    };
-                    let current: Option<(Option<i64>, bool)> = dsl::chats
-                        .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid)))
-                        .select((dsl::muted_until, dsl::mute_appstate_seen))
-                        .first(conn)
-                        .optional()?;
-                    if current.as_ref() != Some(before) {
+                    let before = expected.get(jid).copied().unwrap_or(0);
+                    if revision != before {
                         continue;
                     }
                 }
+                let next_revision = revision.checked_add(1).ok_or_else(|| {
+                    diesel::result::Error::SerializationError("mute revision exhausted".into())
+                })?;
+                // A preference exists independently of message history. Persist
+                // it now so the first inbound message observes the same policy.
+                crate::store::chat_rows::ensure_chat(conn, device_id, jid)?;
                 let until = muted.then_some(i64::MAX);
-                let changed = diesel::update(
+                diesel::update(
                     dsl::chats.filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid))),
                 )
-                .filter(
-                    dsl::muted_until
-                        .is_not(until)
-                        .or(dsl::mute_appstate_seen.eq(false)),
-                )
-                .set((dsl::muted_until.eq(until), dsl::mute_appstate_seen.eq(true)))
+                .set((
+                    dsl::muted_until.eq(until),
+                    dsl::mute_appstate_seen.eq(true),
+                    dsl::mute_revision.eq(next_revision),
+                ))
                 .execute(conn)?;
-                if changed > 0 {
+                if current.is_none() || stored != until || !seen {
                     cs.message_chats.insert(jid.clone());
                 }
             }

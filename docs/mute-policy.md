@@ -17,8 +17,9 @@ until reconciliation finishes.
 
 Channels also expose the viewer's `MUTE_ADMIN_ACTIVITY` setting. Subscribed-list
 and selective channel metadata lookups persist explicit true/false results;
-missing settings leave the stored value intact. Metadata writes compare against
-the pre-request state so a late response cannot revert a newer mute/unmute. `MUTE_FOLLOWER_ACTIVITY` describes
+missing settings leave the stored value intact. Metadata writes compare a
+persisted monotonic revision, so even mute/unmute/mute invalidates older answers.
+Preferences are stored before the first message creates chat history. `MUTE_FOLLOWER_ACTIVITY` describes
 admin activity alerts and is not used as the conversation mute. Channel metadata
 is refreshed by the existing resolver on connection/reconnection and explicit
 channel queries. The protocol's MuteUpdate path remains applicable to channel
