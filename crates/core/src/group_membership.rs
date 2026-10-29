@@ -150,6 +150,17 @@ impl GroupMembership {
                 }
             })
             .unwrap_or_else(|| "Someone".to_owned());
+        // A leave notice names only the actor. Resolve identity before labels
+        // so an unused participant cannot initialize phone metadata.
+        if self.action == MembershipAction::Remove
+            && self.participants.len() == 1
+            && self
+                .actor
+                .as_ref()
+                .is_some_and(|a| a.same_person(&self.participants[0]))
+        {
+            return format!("{who} left");
+        }
         let names = match self.participants.as_slice() {
             [] => "someone".to_owned(),
             [one] => one.label(),
@@ -158,15 +169,6 @@ impl GroupMembership {
         };
         match self.action {
             MembershipAction::Add => format!("{who} added {names}"),
-            MembershipAction::Remove
-                if self.participants.len() == 1
-                    && self
-                        .actor
-                        .as_ref()
-                        .is_some_and(|a| a.same_person(&self.participants[0])) =>
-            {
-                format!("{who} left")
-            }
             MembershipAction::Remove => format!("{who} removed {names}"),
             MembershipAction::Promote => format!(
                 "{who} made {names} {}",
