@@ -56,10 +56,14 @@ async fn download_media<T: Downloadable>(
     media_name: &str,
 ) -> Option<Vec<u8>> {
     info!("Downloading {}...", media_name);
-    match client
-        .download(media, whatsapp_rust::download::DownloadLimits::default())
-        .await
+    let limits = if !media.is_encrypted()
+        && media.app_info() == whatsapp_rust::wacore::download::MediaType::Image
     {
+        whatsapp_rust::download::DownloadLimits::new(EAGER_MEDIA_BYTES, EAGER_MEDIA_BYTES)
+    } else {
+        whatsapp_rust::download::DownloadLimits::default()
+    };
+    match client.download(media, limits).await {
         Ok(data) => {
             info!(
                 "{} downloaded successfully: {} bytes",
@@ -112,6 +116,17 @@ fn document_of(msg: &wa::Message) -> Option<&wa::message::DocumentMessage> {
         })
 }
 
+/// Same HTTPS/CDN boundary as the preserved Web media URL allowlist.
+fn is_media_cdn_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    host.bytes()
+        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.')
+        && (host == "whatsapp.net" || host.ends_with(".whatsapp.net"))
+}
+
 /// What it takes to fetch this media later, or `None` when the message did
 /// not carry enough to try.
 ///
@@ -127,10 +142,29 @@ fn downloadable_of<T: Downloadable>(
     mime_type: &str,
     duration_secs: Option<u32>,
 ) -> Option<DownloadableMedia> {
+    // Channels carry plaintext media. Keep its integrity hash and static URL
+    // instead of requiring E2EE fields that are absent from these messages.
+    let direct_path = media.direct_path().unwrap_or_default();
+    let static_url = media.static_url().filter(|url| is_media_cdn_url(url));
+    if direct_path.is_empty() && static_url.is_none() {
+        return None;
+    }
+    let media_key = media.media_key().unwrap_or_default();
+    let file_enc_sha256 = media.file_enc_sha256().unwrap_or_default();
+    let file_sha256 = media.file_sha256().unwrap_or_default();
+    if media_key.is_empty() {
+        if file_sha256.len() != 32 {
+            return None;
+        }
+    } else if media_key.len() != 32 || file_enc_sha256.len() != 32 {
+        return None;
+    }
     Some(DownloadableMedia {
-        direct_path: media.direct_path()?.to_string(),
-        media_key: media.media_key()?.to_vec(),
-        file_enc_sha256: media.file_enc_sha256()?.to_vec(),
+        direct_path: direct_path.to_string(),
+        media_key: media_key.to_vec(),
+        file_enc_sha256: file_enc_sha256.to_vec(),
+        file_sha256: file_sha256.to_vec(),
+        static_url: static_url.map(str::to_string),
         file_length: media.file_length().unwrap_or(0),
         mime_type: mime_type.to_string(),
         duration_secs,
@@ -380,6 +414,68 @@ mod tests {
     use super::*;
     use oxidezap_core::MediaType;
     use whatsapp_rust::buffa::MessageField;
+
+    #[test]
+    fn channel_images_keep_plaintext_download_metadata_and_fallback() {
+        for static_only in [false, true] {
+            let mut image = wa::message::ImageMessage::default();
+            image.jpeg_thumbnail = Some(vec![1, 2]);
+            image.file_sha256 = key();
+            image.file_length = Some(1024);
+            image.width = Some(1200);
+            image.height = Some(800);
+            if static_only {
+                image.static_url = Some("https://mmg.whatsapp.net/channel/image".into());
+            } else {
+                image.direct_path = Some(DIRECT_PATH.into());
+            }
+            let mut message = wa::Message::default();
+            message.image_message = MessageField::some(image);
+            let media = media_of(&message, None).unwrap();
+            assert!(media.data_is_preview);
+            assert_eq!((media.width, media.height), (Some(1200), Some(800)));
+            let dl = media.downloadable.unwrap();
+            assert!(!dl.is_encrypted());
+            assert_eq!(dl.file_sha256(), Some([7; 32].as_slice()));
+            assert!(dl.is_channel_preview_candidate());
+            let json = serde_json::to_string(&dl).unwrap();
+            let restored: DownloadableMedia = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, dl);
+            assert_eq!(restored.static_url(), dl.static_url());
+            assert_eq!(
+                media_of(&message, Some(vec![3, 4]))
+                    .unwrap()
+                    .data
+                    .as_slice(),
+                [3, 4]
+            );
+        }
+    }
+
+    #[test]
+    fn a_channel_image_requires_a_complete_integrity_hash() {
+        for hash in [None, Some(vec![]), Some(vec![7; 31])] {
+            let mut image = wa::message::ImageMessage::default();
+            image.direct_path = Some(DIRECT_PATH.into());
+            image.file_sha256 = hash;
+            assert!(downloadable_of(&image, "image/jpeg", None).is_none());
+        }
+    }
+
+    #[test]
+    fn static_media_urls_use_the_whatsapp_https_cdn() {
+        assert!(is_media_cdn_url("https://mmg.whatsapp.net/image?x=1"));
+        for url in [
+            "http://mmg.whatsapp.net/image",
+            "https://whatsapp.net.evil.test/x",
+            "https://evil.test/x",
+            "https://whatsapp.net@evil.test/x",
+            "https://evil.test@whatsapp.net/x",
+            "https://localhost/x",
+        ] {
+            assert!(!is_media_cdn_url(url), "{url}");
+        }
+    }
 
     /// Enough of a downloadable to build one: the three fields
     /// [`downloadable_of`] refuses without.

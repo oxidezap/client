@@ -82,7 +82,7 @@ impl OutgoingMedia {
     }
 }
 
-/// Information needed to download encrypted media from WhatsApp servers.
+/// Information needed to download media from WhatsApp servers.
 /// This is stored separately from the thumbnail/preview data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadableMedia {
@@ -92,6 +92,12 @@ pub struct DownloadableMedia {
     pub media_key: Vec<u8>,
     /// SHA256 of encrypted file (used for URL token)
     pub file_enc_sha256: Vec<u8>,
+    /// Plaintext hash, required for channel media without an encryption key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_sha256: Vec<u8>,
+    /// Some channel media is addressed directly instead of through a media host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_url: Option<String>,
     /// Expected file size in bytes
     pub file_length: u64,
     /// MIME type of the actual media (e.g., "video/mp4")
@@ -111,15 +117,19 @@ impl Downloadable for DownloadableMedia {
     }
 
     fn media_key(&self) -> Option<&[u8]> {
-        Some(&self.media_key)
+        (!self.media_key.is_empty()).then_some(self.media_key.as_slice())
     }
 
     fn file_enc_sha256(&self) -> Option<&[u8]> {
-        Some(&self.file_enc_sha256)
+        (!self.file_enc_sha256.is_empty()).then_some(self.file_enc_sha256.as_slice())
     }
 
     fn file_sha256(&self) -> Option<&[u8]> {
-        None // Not required for download
+        (!self.file_sha256.is_empty()).then_some(self.file_sha256.as_slice())
+    }
+
+    fn static_url(&self) -> Option<&str> {
+        self.static_url.as_deref()
     }
 
     fn file_length(&self) -> Option<u64> {
@@ -128,6 +138,30 @@ impl Downloadable for DownloadableMedia {
 
     fn app_info(&self) -> DownloadMediaType {
         self.download_type
+    }
+}
+
+/// Maximum full image fetched automatically for a channel preview.
+const CHANNEL_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
+
+impl DownloadableMedia {
+    pub const CHANNEL_PREVIEW_BYTES: u64 = CHANNEL_PREVIEW_BYTES;
+    /// A known small plaintext image may replace its inline thumbnail on render.
+    pub fn is_channel_preview_candidate(&self) -> bool {
+        self.media_key.is_empty()
+            && self.file_sha256.len() == 32
+            && self.mime_type.starts_with("image/")
+            && (1..=CHANNEL_PREVIEW_BYTES).contains(&self.file_length)
+    }
+
+    /// Identity of the bytes the downloader verifies, shared by cache lookup
+    /// and writes. Missing encryption keys must not turn channel media into E2EE.
+    pub fn content_hash(&self) -> &[u8] {
+        if self.media_key.is_empty() {
+            &self.file_sha256
+        } else {
+            &self.file_enc_sha256
+        }
     }
 }
 
@@ -480,6 +514,41 @@ pub(super) fn make_media(data: Vec<u8>, data_is_preview: bool) -> MediaContent {
 mod tests {
     use super::*;
 
+    #[test]
+    fn channel_preview_policy_and_cache_identity_survive_wire_roundtrip() {
+        let mut dl = DownloadableMedia {
+            direct_path: "/v/t62/channel".into(),
+            media_key: vec![],
+            file_enc_sha256: vec![],
+            file_sha256: vec![7; 32],
+            static_url: None,
+            file_length: 1024,
+            mime_type: "image/jpeg".into(),
+            duration_secs: None,
+            download_type: DownloadMediaType::Image,
+        };
+        assert!(dl.is_channel_preview_candidate());
+        assert!(!dl.is_encrypted());
+        assert_eq!(dl.content_hash(), [7; 32]);
+        for size in [0, CHANNEL_PREVIEW_BYTES + 1, u64::MAX] {
+            dl.file_length = size;
+            assert!(!dl.is_channel_preview_candidate());
+        }
+        dl.file_length = CHANNEL_PREVIEW_BYTES;
+        assert!(dl.is_channel_preview_candidate());
+        dl.media_key = vec![1; 32];
+        dl.file_enc_sha256 = vec![2; 32];
+        assert!(!dl.is_channel_preview_candidate());
+        assert_eq!(dl.content_hash(), [2; 32]);
+        let old_json = serde_json::to_value(&dl).unwrap();
+        let mut old_json = old_json.as_object().unwrap().clone();
+        old_json.remove("file_sha256");
+        old_json.remove("static_url");
+        let old: DownloadableMedia = serde_json::from_value(old_json.into()).unwrap();
+        assert!(old.is_encrypted());
+        assert_eq!(old.content_hash(), [2; 32]);
+    }
+
     /// The bug this predicate exists for: a status posted as a photo with
     /// music arrives as an MP4, and its poster is gone the moment the file
     /// itself is fetched. Asking only whether there were bytes handed those
@@ -491,6 +560,8 @@ mod tests {
                 direct_path: "/v/t62".to_string(),
                 media_key: Vec::new(),
                 file_enc_sha256: Vec::new(),
+                file_sha256: Vec::new(),
+                static_url: None,
                 file_length: 3,
                 mime_type: "video/mp4".to_string(),
                 duration_secs: Some(15),
@@ -564,6 +635,8 @@ mod tests {
                 direct_path: "/v/t62".to_string(),
                 media_key: vec![1],
                 file_enc_sha256: vec![2],
+                file_sha256: Vec::new(),
+                static_url: None,
                 file_length: 3,
                 mime_type: "image/jpeg".to_string(),
                 duration_secs: None,

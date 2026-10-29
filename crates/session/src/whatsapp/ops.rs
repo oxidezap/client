@@ -105,7 +105,7 @@ pub struct HistoryCoverage {
 pub struct BackfillFile {
     pub message_id: String,
     pub chat_jid: String,
-    pub file_enc_sha256: Vec<u8>,
+    pub content_hash: Vec<u8>,
     pub bytes: Vec<u8>,
 }
 
@@ -1236,7 +1236,7 @@ impl WhatsAppClient {
                     Ok(bytes) => report.files.push(BackfillFile {
                         message_id,
                         chat_jid,
-                        file_enc_sha256: downloadable.file_enc_sha256.clone(),
+                        content_hash: downloadable.content_hash().to_vec(),
                         bytes,
                     }),
                     Err(e) => {

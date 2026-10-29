@@ -187,15 +187,24 @@ impl WhatsAppApp {
 
     /// Update a message's media data (used to cache downloaded media)
     fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>, cx: &mut App) {
+        self.update_chat_media_data(None, message_id, data, cx);
+    }
+
+    fn update_chat_media_data(
+        &mut self,
+        chat_jid: Option<&str>,
+        message_id: &str,
+        data: Arc<Vec<u8>>,
+        cx: &mut App,
+    ) {
         // Locate the owning chat through shared references first. Calling
         // `Arc::make_mut` while scanning used to clone every chat in the
         // window, including unrelated conversations, whenever one download
         // completed. Only the target chat needs to become mutable.
-        let Some(chat_index) = self
-            .chats
-            .iter()
-            .position(|chat| chat.messages.iter().any(|message| message.id == message_id))
-        else {
+        let Some(chat_index) = self.chats.iter().position(|chat| {
+            chat_jid.is_none_or(|jid| chat.jid == jid)
+                && chat.messages.iter().any(|message| message.id == message_id)
+        }) else {
             return;
         };
         let mut touched: Option<String> = None;
@@ -821,6 +830,16 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
+        self.fetch_image(message_id, downloadable, true, cx);
+    }
+
+    fn fetch_image(
+        &mut self,
+        message_id: String,
+        downloadable: DownloadableMedia,
+        user_initiated: bool,
+        cx: &mut Context<Self>,
+    ) {
         // A second tap while the first is still in flight would download the
         // same bytes twice; the marker is also what the bubble reads to show
         // that something is happening.
@@ -839,17 +858,28 @@ impl WhatsAppApp {
             client.download_downloadable_media(downloadable)
         };
 
+        let chat_jid = self.selected_chat.clone();
+        let generation = self.document_state_generation;
+        let account = self.account_scope();
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let result = download_with_timeout(download_rx).await;
             // Carried out of the update rather than said inside it, because
             // `say` needs the same handle this closure is borrowing.
             let mut failed = None;
             let _ = entity.update(cx, |app, cx| {
+                if !document_state_matches(
+                    app.document_state_generation,
+                    &app.account_scope(),
+                    generation,
+                    &account,
+                ) {
+                    return;
+                }
                 app.finish_download(&message_id);
                 match result {
                     Ok(data) => {
                         info!("Image downloaded: {} bytes", data.len());
-                        app.update_message_media_data(&message_id, data, cx);
+                        app.update_chat_media_data(chat_jid.as_deref(), &message_id, data, cx);
                     }
                     Err(e) => {
                         error!("Failed to download image: {}", e);
@@ -858,11 +888,64 @@ impl WhatsAppApp {
                 }
                 cx.notify();
             });
-            if let Some(reason) = failed {
-                say(&entity, cx, reason);
+            if user_initiated && let Some(reason) = failed {
+                say_if_document_current(&entity, cx, generation, &account, reason);
             }
         })
         .detach();
+    }
+
+    /// Called only for rows the virtual list lays out. Bound concurrency and
+    /// remember failures so repainting cannot create a network retry loop.
+    pub(crate) fn improve_channel_preview(
+        &mut self,
+        chat_jid: String,
+        message_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_connected()
+            || self.downloads_in_flight.len() >= 2
+            || self.is_downloading(&message_id)
+            || self.channel_preview_attempts.len() >= 256
+            || !chat_jid.ends_with("@newsletter")
+        {
+            return;
+        }
+        let Some(chat) = self
+            .selected_chat
+            .as_ref()
+            .filter(|jid| **jid == chat_jid)
+            .and_then(|jid| self.find_chat(jid))
+        else {
+            return;
+        };
+        let Some(media) = chat
+            .messages
+            .iter()
+            .find(|m| m.id == message_id)
+            .and_then(|m| m.media.as_ref())
+        else {
+            return;
+        };
+        let Some(downloadable) = media
+            .downloadable
+            .as_ref()
+            .filter(|d| {
+                media.media_type == oxidezap_core::MediaType::Image
+                    && (media.data_is_preview || media.data.is_empty())
+                    && d.is_channel_preview_candidate()
+            })
+            .cloned()
+        else {
+            return;
+        };
+        if !self
+            .channel_preview_attempts
+            .insert((chat_jid, message_id.clone()))
+        {
+            return;
+        }
+        self.fetch_image(message_id, downloadable, false, cx);
     }
 
     /// Whether a download for this message is in flight.
@@ -1753,6 +1836,58 @@ mod tests {
         assert!(!pending.matches("voice-1", 7));
         assert!(!pending.matches("voice-2", 8));
         assert!(pending.matches("voice-1", 8));
+    }
+
+    #[gpui::test]
+    fn a_channel_image_completion_updates_only_its_own_chat(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, cx| {
+            let mut chats = Vec::new();
+            for jid in [
+                "120363000000000001@newsletter",
+                "120363000000000002@newsletter",
+            ] {
+                let mut chat = Chat::new(jid.into());
+                let mut message =
+                    ChatMessage::new_incoming("42".into(), "channel".into(), String::new());
+                message.media = Some(MediaContent::image(
+                    Arc::new(vec![1]),
+                    "image/jpeg".into(),
+                    true,
+                ));
+                chat.messages.push(message);
+                chats.push(Arc::new(chat));
+            }
+            app.chats = chats;
+            app.update_chat_media_data(
+                Some("120363000000000002@newsletter"),
+                "42",
+                Arc::new(vec![2, 3]),
+                cx,
+            );
+            assert_eq!(
+                app.chats[0].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+                [1]
+            );
+            assert_eq!(
+                app.chats[1].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+                [2, 3]
+            );
+        });
     }
 
     #[gpui::test]

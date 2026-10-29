@@ -1399,7 +1399,7 @@ impl Bridge {
                                 // name; `AccountMedia` applies the account
                                 // prefix on the way in and expects it stripped
                                 // on the way to `has`.
-                                let Some(local) = crate::media::download_key(&file.file_enc_sha256)
+                                let Some(local) = crate::media::download_key(&file.content_hash)
                                 else {
                                     continue;
                                 };
@@ -1911,7 +1911,7 @@ impl Bridge {
         // every such request would share, which answered one message's
         // download with another's bytes.
         let account_media = crate::media::AccountMedia::new(self.hub.account_id());
-        let Some(local_key) = crate::media::download_key(&media.file_enc_sha256) else {
+        let Some(local_key) = crate::media::download_key(media.content_hash()) else {
             answer_now(
                 &answer_to,
                 downloaded(
@@ -2439,7 +2439,7 @@ mod tests {
             duration_secs: None,
             download_type: wacore::download::MediaType::Image,
         };
-        let local = crate::media::download_key(&media.file_enc_sha256).unwrap();
+        let local = crate::media::download_key(media.content_hash()).unwrap();
         let key = cache.put_owned(&local, vec![1, 2, 3]).unwrap();
         assert!(
             !crate::media::AccountMedia::new(oxidezap_core::AccountId::new(2).unwrap()).claim(&key)

@@ -2708,7 +2708,14 @@ impl WhatsAppClient {
                 match client
                     .download(
                         &downloadable,
-                        whatsapp_rust::download::DownloadLimits::default(),
+                        if downloadable.is_channel_preview_candidate() {
+                            whatsapp_rust::download::DownloadLimits::new(
+                                DownloadableMedia::CHANNEL_PREVIEW_BYTES,
+                                DownloadableMedia::CHANNEL_PREVIEW_BYTES,
+                            )
+                        } else {
+                            whatsapp_rust::download::DownloadLimits::default()
+                        },
                     )
                     .await
                 {

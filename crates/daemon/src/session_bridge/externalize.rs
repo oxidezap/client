@@ -64,7 +64,7 @@ fn cache_media(
     media: &mut Option<MediaContent>,
 ) {
     let Some(media) = media else { return };
-    let local_key = crate::media::message_key(message_id);
+    let local_key = local_media_key(message_id, media);
     let key = account_media.key(&local_key);
 
     // Only the real thing is cached. A fallback thumbnail written under the
@@ -86,7 +86,7 @@ fn cache_media(
         // fetched on demand later is on this disk under a name a hydrated row
         // never looks for. It was downloaded again on every restart.
         if let Some(downloadable) = &media.downloadable
-            && let Some(by_content) = account_media.download_key(&downloadable.file_enc_sha256)
+            && let Some(by_content) = account_media.download_key(downloadable.content_hash())
             && account_media.has(&by_content)
         {
             media.cache_key = Some(by_content);
@@ -104,5 +104,48 @@ fn cache_media(
         // download it also is. A cache that cannot be written is not a reason
         // to drop a conversation.
         Err(e) => log::warn!("could not cache media for a message: {e}"),
+    }
+}
+
+// Previous clients cached channel thumbnails as full images under f-<message>.
+// Plaintext identity bypasses those entries while preserving E2EE cache keys.
+fn local_media_key(message_id: &str, media: &MediaContent) -> String {
+    media
+        .downloadable
+        .as_ref()
+        .filter(|d| d.media_key.is_empty())
+        .and_then(|d| crate::media::download_key(d.content_hash()))
+        .unwrap_or_else(|| crate::media::message_key(message_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxidezap_core::DownloadableMedia;
+
+    #[test]
+    fn channel_previews_bypass_old_message_thumbnail_cache_entries() {
+        let mut media =
+            MediaContent::image(std::sync::Arc::new(vec![1]), "image/jpeg".into(), true);
+        let dl: DownloadableMedia = serde_json::from_value(serde_json::json!({
+            "direct_path":"/v/channel", "media_key":[], "file_enc_sha256":[],
+            "file_sha256":vec![7;32], "file_length":1024, "mime_type":"image/jpeg",
+            "duration_secs":null, "download_type":"image"
+        }))
+        .unwrap();
+        media.downloadable = Some(dl);
+        let local = local_media_key("channel-image", &media);
+        assert_eq!(local, crate::media::download_key(&[7; 32]).unwrap());
+        assert_ne!(local, crate::media::message_key("channel-image"));
+        // Completing a download must keep the same identity for reloads.
+        media.adopt_full_bytes(std::sync::Arc::new(vec![2, 3]));
+        assert_eq!(local_media_key("channel-image", &media), local);
+        let dl = media.downloadable.as_mut().unwrap();
+        dl.media_key = vec![1; 32];
+        dl.file_enc_sha256 = vec![2; 32];
+        assert_eq!(
+            local_media_key("encrypted-image", &media),
+            crate::media::message_key("encrypted-image")
+        );
     }
 }
