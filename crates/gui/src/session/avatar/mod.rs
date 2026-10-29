@@ -15,6 +15,9 @@ mod web;
 #[cfg(target_family = "wasm")]
 mod web_lock;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod probe;
+
 #[cfg(not(target_family = "wasm"))]
 use native as imp;
 #[cfg(target_family = "wasm")]
@@ -27,9 +30,7 @@ use std::sync::{Arc, Mutex};
 use oxidezap_core::{AccountId, AvatarDemand};
 use wacore::time::Instant;
 
-use crate::session::media::{
-    clear_image_sources, decode_avatar, get_avatar_image, put_avatar_image,
-};
+use crate::session::media::{clear_image_sources, get_avatar_image, put_avatar_image};
 
 #[allow(unused_imports)]
 pub use imp::{
@@ -130,10 +131,12 @@ impl AvatarManager {
 
     /// Reset in-memory cache and tracking (e.g. on cache clear or account change).
     pub fn clear(&self) {
-        clear_image_sources();
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.bump_demand_epoch();
         self.reset_connection();
+        // Retire reads before clearing images. A worker publishing while
+        // reset_connection waits for its read lock is then cleared as well.
+        clear_image_sources();
     }
 
     /// Clear in-flight, revalidated, and cooldown tracking on connection restart while
@@ -181,8 +184,23 @@ impl AvatarManager {
         for chat in visible {
             self.demand_one(chat, DemandPriority::High);
         }
-        for chat in overscan {
-            self.demand_one(chat, DemandPriority::Low);
+        // A batch of local reads is scheduled asynchronously, so spawning
+        // overscan last does not ensure it runs last. Let visible disk hits
+        // reach RAM before admitting speculative local work. Completion
+        // advances demand_epoch and wakes the viewport to admit overscan.
+        let visible_loading = {
+            let reads = self
+                .persistent_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            visible
+                .iter()
+                .any(|chat| reads.keys().any(|(jid, _)| jid == &chat.jid))
+        };
+        if !visible_loading {
+            for chat in overscan {
+                self.demand_one(chat, DemandPriority::Low);
+            }
         }
 
         // Prune low-priority pending demands that are no longer in the active window
@@ -320,8 +338,30 @@ impl AvatarManager {
                     }
 
                     if let Some(bytes) = persistent_bytes {
-                        if let Some((source, decoded_size)) = decode_avatar(&bytes) {
-                            put_avatar_image(key_clone.clone(), source, decoded_size);
+                        let decoded = imp::decode_avatar(bytes, priority).await;
+                        {
+                            let mut p = persistent_in_flight
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            // A decode can outlive replacement, cache clear or
+                            // account change. Check again after the worker's
+                            // await, holding the read reservation through RAM
+                            // publication so retirement cannot overtake it.
+                            if p.get(&read_key) != Some(&op_token)
+                                || generation.load(Ordering::Relaxed) != born_gen
+                                || *account_id.lock().unwrap_or_else(|e| e.into_inner())
+                                    != born_account
+                            {
+                                if p.get(&read_key) == Some(&op_token) {
+                                    p.remove(&read_key);
+                                }
+                                return;
+                            }
+                            if let Some((source, decoded_size)) = &decoded {
+                                put_avatar_image(key_clone.clone(), source.clone(), *decoded_size);
+                            }
+                        }
+                        if decoded.is_some() {
                             let mut p = persistent_in_flight
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
@@ -330,6 +370,11 @@ impl AvatarManager {
                             }
                             p.remove(&read_key);
                             drop(p);
+                            // Disk reads can all finish while decodes are
+                            // queued. Releasing a decode also releases local
+                            // admission, so a viewport refused at the read
+                            // limit must get another fingerprint and retry.
+                            demand_epoch.fetch_add(1, Ordering::Relaxed);
 
                             // Notify UI that the avatar image is ready in RAM
                             if let Some(session) = session_handle
@@ -609,6 +654,7 @@ fn note_revalidation(revalidated: &mut indexmap::IndexSet<String>, jid: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::media::decode_avatar;
 
     // Run the real native storage and manager together in a separate process:
     // changing a process-wide runtime path in a parallel test would risk the
@@ -754,6 +800,67 @@ mod tests {
                 window.demand_chats_windowed(&chats[..2], &chats[2..]);
                 assert!(window.take_demands().is_empty());
                 assert_eq!(window.demand_epoch(), epoch, "recovery must settle");
+            }
+
+            // Force a local decode to wait behind occupied workers, then
+            // retire it. Its late result must not resurrect cleared images,
+            // select an old picture, or send freshness for a departed account.
+            for retirement in ["clear", "replacement", "account"] {
+                clear_image_sources();
+                let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (started, receiving) = std::sync::mpsc::channel();
+                let mut blockers = Vec::new();
+                let completed = native::DECODE_COMPLETED.load(std::sync::atomic::Ordering::Relaxed);
+                for _ in 0..2 {
+                    let release = release.clone();
+                    let started = started.clone();
+                    blockers.push(smol::spawn(native::decode_work(
+                        DemandPriority::High,
+                        move || {
+                            started.send(()).unwrap();
+                            while !release.load(std::sync::atomic::Ordering::Relaxed) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        },
+                    )));
+                }
+                for _ in 0..2 {
+                    receiving
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+                let retired = AvatarManager::new();
+                retired.demand_chats_windowed(&chats[..1], &chats[1..2]);
+                let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                while native::queued_decodes() == 0 {
+                    assert!(Instant::now() < deadline);
+                    crate::platform::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                assert!(
+                    !retired.is_in_flight(&chats[1].jid),
+                    "overscan must wait for visible local recovery"
+                );
+                match retirement {
+                    "clear" => retired.clear(),
+                    "replacement" => retired.on_avatar_ready(&chats[0].jid, "new-picture"),
+                    "account" => retired.set_session(None),
+                    _ => unreachable!(),
+                }
+                release.store(true, std::sync::atomic::Ordering::Relaxed);
+                for blocker in blockers {
+                    blocker.await;
+                }
+                while native::DECODE_COMPLETED.load(std::sync::atomic::Ordering::Relaxed)
+                    < completed + 3
+                {
+                    assert!(Instant::now() < deadline);
+                    crate::platform::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                assert!(
+                    get_avatar_image(chats[0].cache_key.as_ref().unwrap()).is_none(),
+                    "late decode survived {retirement}"
+                );
+                assert!(retired.take_demands().is_empty());
             }
         });
     }

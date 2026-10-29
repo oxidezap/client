@@ -8,6 +8,13 @@ use std::sync::RwLock;
 
 static ACTIVE_ACCOUNT: RwLock<Option<oxidezap_core::AccountId>> = RwLock::new(None);
 
+#[cfg(test)]
+pub(super) static PERSISTENT_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(super) static DECODE_COMPLETED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub fn set_active_account(account: Option<oxidezap_core::AccountId>) {
     if let Ok(mut lock) = ACTIVE_ACCOUNT.write() {
         *lock = account;
@@ -31,7 +38,78 @@ pub fn resolve_account(key: &str) -> Option<oxidezap_core::AccountId> {
 
 pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {
     let path = oxidezap_ipc::media_path(key)?;
+    #[cfg(test)]
+    PERSISTENT_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     smol::unblock(move || std::fs::read(path).ok()).await
+}
+
+// A restore can read dozens of pictures together. Decoding them on smol's
+// single default executor thread prevents other futures from making progress;
+// unbounded blocking jobs would instead compete with rendering for every CPU
+// and retain one full-size decoded allocation per picture.
+type DecodeJob = Box<dyn FnOnce() + Send>;
+struct DecodeQueues {
+    high: smol::channel::Sender<DecodeJob>,
+    low: smol::channel::Sender<DecodeJob>,
+}
+static DECODE_JOBS: std::sync::LazyLock<DecodeQueues> = std::sync::LazyLock::new(|| {
+    let (high, high_receive) = smol::channel::bounded::<DecodeJob>(super::MAX_PERSISTENT_READS);
+    let (low, low_receive) = smol::channel::bounded::<DecodeJob>(super::MAX_PERSISTENT_READS);
+    for index in 0..2 {
+        let high = high_receive.clone();
+        let low = low_receive.clone();
+        std::thread::Builder::new()
+            .name(format!("avatar-decode-{index}"))
+            .spawn(move || {
+                while let Ok(job) = high
+                    .try_recv()
+                    .or_else(|_| smol::block_on(smol::future::or(high.recv(), low.recv())))
+                {
+                    job();
+                }
+            })
+            .expect("start avatar decoder");
+    }
+    DecodeQueues { high, low }
+});
+
+pub(super) async fn decode_avatar(
+    bytes: Vec<u8>,
+    priority: super::DemandPriority,
+) -> Option<(std::sync::Arc<gpui::RenderImage>, u64)> {
+    decode_work(priority, move || {
+        crate::session::media::decode_avatar(&bytes)
+    })
+    .await
+}
+
+pub(super) async fn decode_work<T: Send + 'static>(
+    priority: super::DemandPriority,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (send, receive) = smol::channel::bounded(1);
+    let queue = match priority {
+        super::DemandPriority::High => &DECODE_JOBS.high,
+        super::DemandPriority::Low => &DECODE_JOBS.low,
+    };
+    queue
+        .send(Box::new(move || {
+            let _ = send.try_send(work());
+        }))
+        .await
+        .expect("avatar decoder queue stays open");
+    let result = receive
+        .recv()
+        .await
+        .expect("avatar decoder returns a result");
+    #[cfg(test)]
+    DECODE_COMPLETED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    result
+}
+
+#[cfg(test)]
+pub(super) fn queued_decodes() -> usize {
+    DECODE_JOBS.high.len() + DECODE_JOBS.low.len()
 }
 
 pub async fn delete_persistent(key: &str) -> Result<(), String> {
@@ -75,4 +153,108 @@ pub async fn purge_legacy_caches() {
 
 pub fn spawn_task(fut: impl std::future::Future<Output = ()> + Send + 'static) {
     smol::spawn(fut).detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn decoding_yields_the_executor_and_bounds_cpu_jobs() {
+        let release = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (started, receiving) = std::sync::mpsc::channel();
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let release = release.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            let started = started.clone();
+            tasks.push(smol::spawn(decode_work(
+                super::super::DemandPriority::High,
+                move || {
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                    started.send(()).unwrap();
+                    while !release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                },
+            )));
+        }
+        let both_started = receiving.recv_timeout(Duration::from_secs(5)).is_ok()
+            && receiving.recv_timeout(Duration::from_secs(5)).is_ok();
+        let pulse = smol::block_on(smol::future::or(
+            async { smol::spawn(async { true }).await },
+            async {
+                smol::Timer::after(Duration::from_secs(1)).await;
+                false
+            },
+        ));
+        let third_started_early = receiving.try_recv().is_ok();
+        release.store(true, Ordering::SeqCst);
+        smol::block_on(async {
+            for task in tasks {
+                task.await;
+            }
+        });
+        assert!(both_started, "blocking workers must run concurrently");
+        assert!(pulse, "decoding must leave the async executor runnable");
+        assert!(!third_started_early, "the third job must wait for a slot");
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+
+        // Keep one worker occupied while the other drains a low-priority
+        // request queued before a visible one. Visible work must overtake it.
+        let (started, receiving) = std::sync::mpsc::channel();
+        let mut blockers = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let release = Arc::new(AtomicBool::new(false));
+            releases.push(release.clone());
+            let started = started.clone();
+            blockers.push(smol::spawn(decode_work(
+                super::super::DemandPriority::High,
+                move || {
+                    started.send(()).unwrap();
+                    while !release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                },
+            )));
+        }
+        for _ in 0..2 {
+            receiving.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let (order, received) = std::sync::mpsc::channel();
+        let low_order = order.clone();
+        let low = smol::spawn(decode_work(super::super::DemandPriority::Low, move || {
+            low_order.send("overscan").unwrap()
+        }));
+        let high = smol::spawn(decode_work(super::super::DemandPriority::High, move || {
+            order.send("visible").unwrap()
+        }));
+        let deadline = wacore::time::Instant::now() + Duration::from_secs(5);
+        while queued_decodes() < 2 {
+            assert!(wacore::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        releases[0].store(true, Ordering::SeqCst);
+        let first = received.recv_timeout(Duration::from_secs(5));
+        let second = received.recv_timeout(Duration::from_secs(5));
+        releases[1].store(true, Ordering::SeqCst);
+        smol::block_on(async {
+            low.await;
+            high.await;
+            for blocker in blockers {
+                blocker.await;
+            }
+        });
+        assert_eq!(first.unwrap(), "visible");
+        assert_eq!(second.unwrap(), "overscan");
+    }
 }

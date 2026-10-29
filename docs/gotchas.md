@@ -1870,6 +1870,19 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
      rotates the account scope (128-bit hex); clearing media cache evicts blobs
      without destroying durable descriptors.
 
+  Tray Hide ends the desktop front-end process, so Open recovers decoded
+  avatars from the persistent tier, just like a first opening. Native local
+  recovery decodes on two dedicated workers, with bounded queues preferring
+  visible rows and the header over overscan. The workers sleep when idle;
+  using fixed workers also avoids spreading decoder allocations across the
+  general blocking pool's allocator arenas. A completed decode rechecks its
+  read reservation, account and generation before publishing into RAM.
+  `session::avatar::probe::native_restore_probe` is an opt-in synthetic probe
+  for this path: three fresh processes, 15 visible pictures and 10 overscan,
+  disk-read and byte-demand counts, executor heartbeat, CPU ticks and RSS on
+  Linux. Its timings end at RAM readiness, before GPU upload or painting;
+  they do not measure complete tray-to-window latency.
+
   The browser's persistent avatar index is bounded by bytes and entry count.
   Web Locks serialize mutations across tabs; a persisted generation rejects
   writes captured before a clear. Failure to persist that generation leaves
