@@ -6,12 +6,15 @@
 
 use gpui::prelude::*;
 use gpui::{
-    App, Entity, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div,
+    App, Entity, IntoElement, ParentElement, Pixels, SharedString, Size,
+    StatefulInteractiveElement, Styled, div, size,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
+use gpui_component::{VirtualListScrollHandle, v_virtual_list};
+use std::{cell::RefCell, rc::Rc};
 
 use crate::app::WhatsAppApp;
 use crate::components::parts;
@@ -73,6 +76,7 @@ pub fn render_status_list(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
+    let scroll = props.scroll.clone();
 
     let base = if layout.is_mobile() {
         div().w_full()
@@ -97,25 +101,7 @@ pub fn render_status_list(
                 .flex_1()
                 .min_h_0()
                 .relative()
-                .child(
-                    div()
-                        .id("status-list")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&props.scroll)
-                        // The gutter is the rows', not the region's: on the
-                        // scrolling element it moves the region, and the bar
-                        // with it, a gutter's width inside the pane.
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .px(metrics.space_md())
-                                .pb(metrics.space_lg())
-                                .child(render_mine(&props, entity.clone(), layout, cx))
-                                .children(render_recent(&props, entity, layout, cx)),
-                        ),
-                )
+                .child(render_rows(props, entity, layout, cx))
                 // Like both other lists: the bar belongs to whatever scrolls,
                 // and it paints over the bounds its handle reports rather than
                 // over the element it was hung from — so the overlay only has
@@ -125,9 +111,108 @@ pub fn render_status_list(
                     div()
                         .absolute()
                         .inset_0()
-                        .child(Scrollbar::vertical(&props.scroll)),
+                        .child(Scrollbar::vertical(&scroll)),
                 ),
         )
+}
+
+/// The header rows scroll with the contacts, but only visible contacts build
+/// buttons, formatted subtitles and avatar rings.
+fn render_rows(
+    props: StatusListProps,
+    entity: Entity<WhatsAppApp>,
+    layout: ResponsiveLayout,
+    cx: &App,
+) -> gpui::AnyElement {
+    let metrics = *layout.metrics();
+    // Virtualization has a fixed cost. Keep the existing layout when all
+    // contacts fit in roughly one viewport.
+    let authors = props.feed.authors().len();
+    let content_height = layout.chat_item_height() * (authors as f32 + 1.)
+        + metrics.space_sm()
+        + metrics.space_lg() * 2.
+        + section_height(metrics);
+    if authors == 0 || content_height <= layout.viewport().height - metrics.sidebar_header_height()
+    {
+        return div()
+            .id("status-list")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&props.scroll)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px(metrics.space_md())
+                    .pb(metrics.space_lg())
+                    .child(render_mine(&props, entity.clone(), layout, cx))
+                    .children(render_recent(&props, entity, layout, cx)),
+            )
+            .into_any_element();
+    }
+    let sizes = status_row_sizes(props.feed.authors().len(), layout);
+    let scroll = VirtualListScrollHandle::from(props.scroll.clone());
+    let rows_entity = entity.clone();
+    v_virtual_list(entity, "status-list", sizes, move |_, range, _, cx| {
+        range
+            .map(|ix| {
+                let row = match ix {
+                    0 => render_mine(&props, rows_entity.clone(), layout, cx).into_any_element(),
+                    1 => section_label("Recent", metrics, cx).into_any_element(),
+                    _ => {
+                        let author = &props.feed.authors()[ix - 2];
+                        render_author_row(
+                            author,
+                            props.selected.is(&author.jid),
+                            None,
+                            rows_entity.clone(),
+                            layout,
+                            cx,
+                        )
+                        .into_any_element()
+                    }
+                };
+                div()
+                    .px(metrics.space_md())
+                    .when(ix == props.feed.authors().len() + 1, |el| {
+                        el.pb(metrics.space_lg())
+                    })
+                    .child(row)
+            })
+            .collect()
+    })
+    .track_scroll(&scroll)
+    .size_full()
+    .into_any_element()
+}
+
+fn section_height(metrics: Metrics) -> Pixels {
+    metrics.text_meta() * 1.5 + metrics.space_sm()
+}
+
+/// Cache geometry across repaints, including font and density changes.
+fn status_row_sizes(authors: usize, layout: ResponsiveLayout) -> Rc<Vec<Size<Pixels>>> {
+    type Cached = (usize, Pixels, Metrics, Rc<Vec<Size<Pixels>>>);
+    thread_local! { static SIZES: RefCell<Option<Cached>> = const { RefCell::new(None) }; }
+    let width = layout.sidebar_width();
+    let metrics = *layout.metrics();
+    SIZES.with(|held| {
+        let mut held = held.borrow_mut();
+        if let Some((count, old_width, old_metrics, sizes)) = held.as_ref()
+            && *count == authors
+            && *old_width == width
+            && *old_metrics == metrics
+        {
+            return Rc::clone(sizes);
+        }
+        let mut sizes = vec![size(width, layout.chat_item_height()); authors + 2];
+        sizes[0].height += metrics.space_sm() + metrics.space_lg();
+        sizes[1].height = section_height(metrics);
+        sizes[authors + 1].height += metrics.space_lg();
+        let sizes = Rc::new(sizes);
+        *held = Some((authors, width, metrics, Rc::clone(&sizes)));
+        sizes
+    })
 }
 
 fn render_title_bar(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
@@ -223,6 +308,8 @@ fn render_recent(
 
 fn section_label(label: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     div()
+        .h(section_height(metrics))
+        .line_height(metrics.text_meta() * 1.5)
         .px(metrics.space_md())
         .pb(metrics.space_sm())
         .text_size(metrics.text_meta())
@@ -240,6 +327,15 @@ fn render_author_row(
     layout: ResponsiveLayout,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    #[cfg(test)]
+    {
+        tests::ROWS.with(|rows| rows.set(rows.get() + 1));
+        tests::CAPTURE.with(|capture| {
+            if let Some(ids) = capture.borrow_mut().as_mut() {
+                ids.push(author.jid.clone());
+            }
+        });
+    }
     let metrics = *layout.metrics();
     let jid = author.jid.clone();
     let name: SharedString = author.name.clone().into();
@@ -363,7 +459,38 @@ fn update_count(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::StatusSelection;
+    use super::*;
+    thread_local! {
+        pub(super) static ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    #[test]
+    fn status_geometry_tracks_count_and_metrics() {
+        let layout = ResponsiveLayout::new(
+            size(gpui::px(320.), gpui::px(600.)),
+            crate::responsive::MobilePanel::ChatList,
+            Metrics::default(),
+        );
+        let first = status_row_sizes(1000, layout);
+        assert!(Rc::ptr_eq(&first, &status_row_sizes(1000, layout)));
+        assert_eq!(first.len(), 1002);
+        assert_eq!(
+            first[0].height,
+            layout.chat_item_height() + layout.metrics().space_sm() + layout.metrics().space_lg()
+        );
+        assert_eq!(
+            first[1001].height,
+            layout.chat_item_height() + layout.metrics().space_lg()
+        );
+        assert!(!Rc::ptr_eq(&first, &status_row_sizes(999, layout)));
+        let zoomed = ResponsiveLayout::new(
+            layout.viewport(),
+            crate::responsive::MobilePanel::ChatList,
+            Metrics::new(24., layout.metrics().density()),
+        );
+        assert_ne!(first[2].height, status_row_sizes(1000, zoomed)[2].height);
+    }
 
     /// The account's own updates are keyed by the empty string in the feed,
     /// and as a bare `Option<String>` selection any path producing an empty
@@ -383,5 +510,156 @@ mod tests {
             "and our own is not a contact"
         );
         assert!(StatusSelection::Author("a@s.whatsapp.net".to_string()).is("a@s.whatsapp.net"));
+    }
+}
+
+#[cfg(test)]
+mod visible_cost {
+    use super::*;
+    use crate::responsive::MobilePanel;
+    use gpui::{Context, Render, TestAppContext, Window, px, size};
+
+    struct Pane {
+        feed: StatusFeed,
+        app: Entity<WhatsAppApp>,
+        scroll: gpui::ScrollHandle,
+    }
+    impl Render for Pane {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let layout = ResponsiveLayout::new(
+                size(px(320.), px(600.)),
+                MobilePanel::ChatList,
+                Metrics::default(),
+            );
+            render_status_list(
+                StatusListProps {
+                    feed: self.feed.clone(),
+                    selected: StatusSelection::None,
+                    scroll: self.scroll.clone(),
+                },
+                self.app.clone(),
+                layout,
+                cx,
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn status_constructs_visible_contacts_and_can_scroll_to_last(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut chat = oxidezap_core::Chat::new("status@broadcast".into());
+        for n in 0..1000 {
+            chat.messages.push(oxidezap_core::ChatMessage::new_incoming(
+                format!("S-{n}"),
+                format!("contact-{n}@s.whatsapp.net"),
+                "Synthetic update".into(),
+            ));
+        }
+        let feed = StatusFeed::from_chat(&chat);
+        let first = feed.authors().first().unwrap().jid.clone();
+        let last = feed.authors().last().unwrap().jid.clone();
+        let scroll = gpui::ScrollHandle::new();
+        let window = cx.open_window(size(px(320.), px(600.)), |_, cx| Pane {
+            feed,
+            app: cx.new(WhatsAppApp::new),
+            scroll: scroll.clone(),
+        });
+        cx.run_until_parked();
+        super::tests::CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let visible = super::tests::CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+        assert!(visible.contains(&first));
+        assert!(!visible.contains(&last));
+        assert!(
+            visible.len() < 20,
+            "built {} contacts for one viewport",
+            visible.len()
+        );
+        let max = scroll.max_offset();
+        assert!(max.y > px(0.));
+        scroll.set_offset(gpui::point(px(0.), -max.y));
+        super::tests::CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let visible = super::tests::CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+        assert!(visible.contains(&last), "last contact cannot be reached");
+        assert!(visible.len() < 20);
+        assert!(scroll.offset().y < px(0.));
+
+        // Expiry can replace a scrolled virtual list with the empty state.
+        window
+            .update(cx, |pane, _, cx| {
+                pane.feed = StatusFeed::default();
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!(scroll.offset().y, px(0.));
+    }
+
+    #[gpui::test]
+    #[ignore = "manual release performance measurement"]
+    fn status_visible_cost(cx: &mut TestAppContext) {
+        let count: usize = std::env::var("STATUS_AUTHORS")
+            .unwrap_or("1000".into())
+            .parse()
+            .unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut chat = oxidezap_core::Chat::new("status@broadcast".into());
+        for n in 0..count {
+            chat.messages.push(oxidezap_core::ChatMessage::new_incoming(
+                format!("S-{n}"),
+                format!("contact-{n}@s.whatsapp.net"),
+                "Synthetic update".into(),
+            ));
+        }
+        let feed = StatusFeed::from_chat(&chat);
+        assert_eq!(feed.authors().len(), count);
+        let window = cx.open_window(size(px(320.), px(600.)), |_, cx| Pane {
+            feed,
+            app: cx.new(WhatsAppApp::new),
+            scroll: gpui::ScrollHandle::new(),
+        });
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        for sample in 0..7 {
+            super::tests::ROWS.with(|rows| rows.set(0));
+            let start = wacore::time::Instant::now();
+            for _ in 0..20 {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+            }
+            let elapsed = start.elapsed();
+            let rows = super::tests::ROWS.with(std::cell::Cell::get);
+            eprintln!(
+                "STATUS_COST authors={count} sample={sample} ns_per_frame={} rows_per_frame={}",
+                elapsed.as_nanos() / 20,
+                rows / 20
+            );
+        }
     }
 }
