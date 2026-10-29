@@ -73,62 +73,29 @@ pub fn render_status_list(
     props: StatusListProps,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
-    cx: &App,
+    _cx: &App,
 ) -> impl IntoElement + use<> {
-    let metrics = *layout.metrics();
-    let scroll = props.scroll.clone();
-
-    let base = if layout.is_mobile() {
-        div().w_full()
-    } else {
-        div().w(layout.sidebar_width())
-    };
-
-    base
-        // The same shell the conversation list draws, for the same reason: the
-        // boundary belongs to the sidebar, and the pane beside it draws none.
-        .when(!layout.is_mobile(), |el| {
-            el.border_r_1().border_color(cx.theme().border)
-        })
-        .flex()
-        .flex_col()
-        .h_full()
-        .min_h_0()
-        .bg(cx.theme().sidebar)
-        .child(render_title_bar(metrics, cx))
-        .child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .relative()
-                .child(StatusRows {
-                    props,
-                    entity,
-                    layout,
-                })
-                // Like both other lists: the bar belongs to whatever scrolls,
-                // and it paints over the bounds its handle reports rather than
-                // over the element it was hung from — so the overlay only has
-                // to be here. With twenty contacts posting, nothing else said
-                // the list continued.
-                .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .child(Scrollbar::vertical(&scroll)),
-                ),
-        )
+    StatusList {
+        props,
+        entity,
+        layout,
+    }
 }
 
 #[derive(IntoElement)]
-struct StatusRows {
+struct StatusList {
     props: StatusListProps,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
 }
 
-impl gpui::RenderOnce for StatusRows {
+impl gpui::RenderOnce for StatusList {
     fn render(self, window: &mut gpui::Window, cx: &mut App) -> impl IntoElement {
+        let Self {
+            props,
+            entity,
+            layout,
+        } = self;
         let focus = window
             .use_keyed_state("status-list-focus", cx, |_, cx| {
                 cx.focus_handle().tab_stop(false)
@@ -140,16 +107,51 @@ impl gpui::RenderOnce for StatusRows {
         let eager = window.last_input_was_keyboard()
             || window.is_a11y_active()
             || focus.contains_focused(window, cx);
-        div()
-            .id("status-list-focus")
-            .size_full()
+        let metrics = *layout.metrics();
+        let scroll = props.scroll.clone();
+
+        let base = if layout.is_mobile() {
+            div().w_full()
+        } else {
+            div().w(layout.sidebar_width())
+        };
+
+        base.id("status-list-focus")
             .track_focus(&focus)
-            .child(render_rows(self.props, self.entity, self.layout, eager, cx))
+            // The same shell the conversation list draws, for the same reason: the
+            // boundary belongs to the sidebar, and the pane beside it draws none.
+            .when(!layout.is_mobile(), |el| {
+                el.border_r_1().border_color(cx.theme().border)
+            })
+            .flex()
+            .flex_col()
+            .h_full()
+            .min_h_0()
+            .bg(cx.theme().sidebar)
+            .child(render_title_bar(metrics, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(render_rows(props, entity, layout, eager, cx))
+                    // Like both other lists: the bar belongs to whatever scrolls,
+                    // and it paints over the bounds its handle reports rather than
+                    // over the element it was hung from — so the overlay only has
+                    // to be here. With twenty contacts posting, nothing else said
+                    // the list continued.
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .child(Scrollbar::vertical(&scroll)),
+                    ),
+            )
     }
 }
 
-/// The header rows scroll with the contacts, but only visible contacts build
-/// buttons, formatted subtitles and avatar rings.
+/// Headers scroll with contacts. Unfocused pointer navigation builds only
+/// visible buttons, formatted subtitles and avatar rings.
 fn render_rows(
     props: StatusListProps,
     entity: Entity<WhatsAppApp>,
