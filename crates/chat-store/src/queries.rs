@@ -190,6 +190,8 @@ struct ChatRow {
     #[allow(dead_code)]
     address_book_fallback: Option<String>,
     group_hierarchy: Option<String>,
+    #[allow(dead_code)]
+    unread_initialized: bool,
 }
 
 impl From<ChatRow> for ChatEntry {

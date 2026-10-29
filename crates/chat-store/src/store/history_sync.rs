@@ -79,9 +79,13 @@ fn apply_history_conversation(
     // The conflict update below keeps a live-owned count, so read the row
     // first: the seed must agree with the count the sync leaves behind.
     let stored_unread: Option<i32> = chat_row(device_id, chat)
-        .select(schema::chats::unread_count)
-        .first(conn)
-        .optional()?;
+        .select((
+            schema::chats::unread_count,
+            schema::chats::unread_initialized,
+        ))
+        .first::<(i32, bool)>(conn)
+        .optional()?
+        .and_then(|(count, initialized)| initialized.then_some(count));
 
     {
         use schema::chats::dsl;
@@ -134,6 +138,11 @@ fn apply_history_conversation(
             // A nameless chunk preserves an existing name rather than
             // clobbering it with NULL; a named one still updates.
             .set((
+                // A preference-only row has no live-owned unread state yet.
+                dsl::unread_count.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
+                    "CASE WHEN unread_initialized THEN unread_count ELSE excluded.unread_count END",
+                )),
+                dsl::unread_initialized.eq(true),
                 dsl::name.eq(diesel::dsl::sql::<
                     diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 >("COALESCE(excluded.name, name)")),

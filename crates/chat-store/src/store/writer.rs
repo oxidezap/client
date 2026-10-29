@@ -612,7 +612,7 @@ fn apply_writer_msg(
                 })?;
                 // A preference exists independently of message history. Persist
                 // it now so the first inbound message observes the same policy.
-                crate::store::chat_rows::ensure_chat(conn, device_id, jid)?;
+                crate::store::chat_rows::ensure_preference_chat(conn, device_id, jid)?;
                 let until = muted.then_some(i64::MAX);
                 diesel::update(
                     dsl::chats.filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid))),

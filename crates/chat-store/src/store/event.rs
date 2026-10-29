@@ -174,7 +174,7 @@ pub(super) fn apply_event(
                 .unwrap_or(false)
                 .then(|| update.timestamp.timestamp_millis());
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
-            ensure_chat(conn, device_id, &chat)?;
+            crate::store::chat_rows::ensure_preference_chat(conn, device_id, &chat)?;
             // Only when it is news, the same rule the subject change already
             // holds: the server redistributes app-state mutations on every
             // resync, and a pin the row already carries would buy a full
@@ -210,7 +210,7 @@ pub(super) fn apply_event(
                 (true, Some(until)) => Some(until),
             };
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
-            ensure_chat(conn, device_id, &chat)?;
+            crate::store::chat_rows::ensure_preference_chat(conn, device_id, &chat)?;
             let (stored, seen, revision): (Option<i64>, bool, i64) = chat_row(device_id, &chat)
                 .select((
                     schema::chats::muted_until,
@@ -241,7 +241,7 @@ pub(super) fn apply_event(
                 return Ok(());
             };
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
-            ensure_chat(conn, device_id, &chat)?;
+            crate::store::chat_rows::ensure_preference_chat(conn, device_id, &chat)?;
             let (stored, seen): (bool, bool) = chat_row(device_id, &chat)
                 .select((
                     schema::chats::archived,
@@ -345,7 +345,10 @@ pub(super) fn apply_event(
                     recompute_chat_preview(conn, device_id, &chat)?;
                     let unread = count_uncovered_incoming(conn, device_id, &chat, bound)?;
                     diesel::update(chat_row(device_id, &chat))
-                        .set(schema::chats::unread_count.eq(unread))
+                        .set((
+                            schema::chats::unread_count.eq(unread),
+                            schema::chats::unread_initialized.eq(true),
+                        ))
                         .execute(conn)?;
                 }
                 _ => {
@@ -377,7 +380,10 @@ pub(super) fn apply_event(
                 None => 0,
             };
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::unread_count.eq(unread))
+                .set((
+                    schema::chats::unread_count.eq(unread),
+                    schema::chats::unread_initialized.eq(true),
+                ))
                 .execute(conn)?;
             cs.chats = true;
             cs.message_chats.insert(chat);

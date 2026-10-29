@@ -339,3 +339,109 @@ fn mute_revision_migration_keeps_existing_unread_and_mute_values() {
         (4, Some(i64::MAX))
     );
 }
+
+#[tokio::test]
+async fn preference_only_rows_accept_initial_history_unread_and_manual_markers() {
+    const CHANNEL: &str = "120363000000000002@newsletter";
+    for channel in [false, true] {
+        for (count, marked, expected) in [(4, false, 4), (0, true, -1)] {
+            let (_db, store) = test_store().await;
+            let chat = if channel { CHANNEL } else { GROUP };
+            if channel {
+                store
+                    .apply_channel_mutes(vec![(chat.into(), true)])
+                    .unwrap();
+                store.flush().await.unwrap();
+            } else {
+                feed(
+                    &store,
+                    [Event::MuteUpdate(
+                        wacore::types::events::MuteUpdate::builder()
+                            .jid(jid(chat))
+                            .timestamp(ts(1_700_000_000))
+                            .action(Box::new({
+                                let mut action = wa::sync_action_value::MuteAction::default();
+                                action.muted = Some(true);
+                                action.mute_end_timestamp = Some(-1);
+                                action
+                            }))
+                            .from_full_sync(false)
+                            .build(),
+                    )],
+                )
+                .await;
+            }
+            feed(
+                &store,
+                [history_sync_event({
+                    let mut history = wa::HistorySync::default();
+                    let mut conv = wa::Conversation::default();
+                    conv.id = chat.into();
+                    conv.unread_count = Some(count);
+                    conv.marked_as_unread = Some(marked);
+                    conv.mute_end_time = Some(0);
+                    history.conversations = vec![conv];
+                    history
+                })],
+            )
+            .await;
+            assert_eq!(
+                store.chat(&jid(chat)).await.unwrap().unwrap().unread_count,
+                expected
+            );
+            assert!(
+                store
+                    .notification_metadata(&jid(chat))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .muted
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn preference_rows_do_not_let_history_overwrite_live_or_explicit_read_state() {
+    const CHANNEL: &str = "120363000000000002@newsletter";
+    for explicitly_read in [false, true] {
+        let (_db, store) = test_store().await;
+        store
+            .apply_channel_mutes(vec![(CHANNEL.into(), true)])
+            .unwrap();
+        store.flush().await.unwrap();
+        if explicitly_read {
+            feed(&store, [mark_read_event(CHANNEL, true, 1_700_000_100)]).await;
+        } else {
+            feed(
+                &store,
+                [message_event(
+                    wa::Message::text("live"),
+                    incoming_info(CHANNEL, CHANNEL, "LIVE-BEFORE-HISTORY", 1_700_000_100),
+                )],
+            )
+            .await;
+        }
+        feed(
+            &store,
+            [history_sync_event({
+                let mut history = wa::HistorySync::default();
+                let mut conv = wa::Conversation::default();
+                conv.id = CHANNEL.into();
+                conv.unread_count = Some(8);
+                history.conversations = vec![conv];
+                history
+            })],
+        )
+        .await;
+        assert_eq!(
+            store
+                .chat(&jid(CHANNEL))
+                .await
+                .unwrap()
+                .unwrap()
+                .unread_count,
+            if explicitly_read { 0 } else { 1 }
+        );
+    }
+}
