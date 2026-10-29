@@ -26,6 +26,7 @@ mod membership;
 mod mutations;
 /// Polls, profiles, contacts, channels, media fetch and history coverage.
 mod ops;
+mod profile;
 /// Sends a scriptable front end asks for, read from daemon-local paths.
 mod sends;
 
@@ -73,10 +74,11 @@ pub use groups::{
 };
 pub use ops::{
     BackfillFile, BackfillReport, ChannelView, ContactCheckView, ContactView, HistoryCoverage,
-    PollView, ProfileView,
+    PollView,
 };
 pub use outgoing::OutgoingFile;
 pub use paging::ReadBoundary;
+pub use profile::ProfileView;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -767,12 +769,10 @@ fn live_content_fallback(message: &wa::Message, has_media: bool) -> String {
         return String::new();
     }
 
-    match oxidezap_chat_store::MessageKind::of(message) {
-        oxidezap_chat_store::MessageKind::Poll => "[poll]".to_string(),
-        oxidezap_chat_store::MessageKind::Album => "[album]".to_string(),
-        oxidezap_chat_store::MessageKind::Product => "[product]".to_string(),
-        _ => "[Media]".to_string(),
-    }
+    oxidezap_chat_store::sticker_pack_text(message).unwrap_or_else(|| {
+        oxidezap_chat_store::message_fallback(&oxidezap_chat_store::MessageKind::of(message))
+            .to_owned()
+    })
 }
 
 impl WhatsAppClient {
@@ -2347,6 +2347,7 @@ impl WhatsAppClient {
         let content = business
             .as_ref()
             .map(|b| b.body.clone())
+            .or_else(|| oxidezap_chat_store::sticker_pack_text(base_msg))
             .or_else(|| base_msg.text_content().map(str::to_owned))
             .or_else(|| base_msg.get_caption().map(|s| s.to_string()))
             .or_else(|| oxidezap_chat_store::shared_contacts_text(base_msg))
@@ -2477,66 +2478,77 @@ impl WhatsAppClient {
         // message. GUI hydration is paged and can lag this event (or omit an
         // archived chat entirely); its in-memory Chat cannot decide mute or
         // archive policy. Offline drains are history, not new attention.
-        // Only the protocol's explicit mention list counts. WhatsApp lets a
-        // personal @mention through a group's mute/archive settings, but an
-        // ordinary `@` in prose must not bypass them.
+        // Explicit mentions only affect the title. Muted conversations never
+        // alert, including when a message mentions this account.
         let mentions_me = info.source.chat.is_group()
             && !info.source.is_from_me
             && crate::mentions::mentions_own_account(Some(msg), &history::own_jids(client));
-        let (notification_allowed, notification_title, notification_archived, chat_name) =
-            if let Some(store) = names.chat_store() {
-                match store.notification_metadata(&info.source.chat).await {
-                    Ok(Some(metadata)) => {
-                        // The wire flag is the notification invariant, not a
-                        // copy of the chat policy: self echoes are displayed
-                        // as outgoing bubbles and must never ask a front end
-                        // to alert, even when their chat is otherwise eligible.
-                        // Offline drains are not new attention, but they still
-                        // need the durable archive bit: an archived chat is
-                        // absent from the active page, so a front end receiving
-                        // its message before hydration must not recreate it in
-                        // the inbox.
-                        let allowed = eager
-                            && allows_desktop_notification(
-                                info.source.is_from_me,
-                                metadata.allowed,
-                                mentions_me,
-                            );
-                        let identity = names.identity(client, &info.source.chat).await;
-                        let (resolved_name, priority) = names
-                            .resolve(
-                                store,
-                                &info.source.chat,
-                                metadata.name.as_deref(),
-                                &identity,
-                            )
-                            .await;
-                        let chat_name = (priority > 0).then_some(resolved_name.clone());
-                        let title = if allowed {
-                            if mentions_me {
-                                let group = if priority > 0 {
-                                    resolved_name.as_str()
-                                } else {
-                                    "group"
-                                };
-                                Some(format!("Mentioned in {group}"))
+        let (
+            mut notification_allowed,
+            mut notification_title,
+            mut notification_archived,
+            chat_name,
+            mut chat_muted_until_ms,
+        ) = if let Some(store) = names.chat_store() {
+            match store.notification_metadata(&info.source.chat).await {
+                Ok(Some(metadata)) => {
+                    // The wire flag is the notification invariant, not a
+                    // copy of the chat policy: self echoes are displayed
+                    // as outgoing bubbles and must never ask a front end
+                    // to alert, even when their chat is otherwise eligible.
+                    // Offline drains are not new attention, but they still
+                    // need the durable archive bit: an archived chat is
+                    // absent from the active page, so a front end receiving
+                    // its message before hydration must not recreate it in
+                    // the inbox.
+                    let allowed = eager
+                        && allows_desktop_notification(
+                            info.source.is_from_me,
+                            metadata.muted,
+                            metadata.archived,
+                            mentions_me,
+                        );
+                    let identity = names.identity(client, &info.source.chat).await;
+                    let (resolved_name, priority) = names
+                        .resolve(
+                            store,
+                            &info.source.chat,
+                            metadata.name.as_deref(),
+                            &identity,
+                        )
+                        .await;
+                    let chat_name = (priority > 0).then_some(resolved_name.clone());
+                    let title = if allowed {
+                        if mentions_me {
+                            let group = if priority > 0 {
+                                resolved_name.as_str()
                             } else {
-                                (priority > 0).then_some(resolved_name)
-                            }
+                                "group"
+                            };
+                            Some(format!("Mentioned in {group}"))
                         } else {
-                            None
-                        };
-                        (allowed, title, Some(metadata.archived), chat_name)
-                    }
-                    Ok(None) => (false, None, None, None),
-                    Err(error) => {
-                        warn!("could not read chat notification policy: {error}");
-                        (false, None, None, None)
-                    }
+                            (priority > 0).then_some(resolved_name)
+                        }
+                    } else {
+                        None
+                    };
+                    (
+                        allowed,
+                        title,
+                        Some(metadata.archived),
+                        chat_name,
+                        metadata.muted_until_ms,
+                    )
                 }
-            } else {
-                (false, None, None, None)
-            };
+                Ok(None) => (false, None, None, None, None),
+                Err(error) => {
+                    warn!("could not read chat notification policy: {error}");
+                    (false, None, None, None, None)
+                }
+            }
+        } else {
+            (false, None, None, None, None)
+        };
 
         // Delivery ACKs describe transport, not whether this user read the
         // message on another device. A live replay may already be covered by
@@ -2565,6 +2577,39 @@ impl WhatsAppClient {
         };
         chat_message.is_read = already_read == Some(true);
 
+        // Name/identity lookups above may await network I/O. A linked-device
+        // mute committed while those ran must win before we publish attention.
+        if let Some(store) = names.chat_store() {
+            match store.notification_metadata(&info.source.chat).await {
+                Ok(Some(metadata)) => {
+                    notification_archived = Some(metadata.archived);
+                    chat_muted_until_ms = metadata.muted_until_ms;
+                    notification_allowed = eager
+                        && allows_desktop_notification(
+                            info.source.is_from_me,
+                            metadata.muted,
+                            metadata.archived,
+                            mentions_me,
+                        );
+                    notification_title = if notification_allowed {
+                        if mentions_me {
+                            Some(format!(
+                                "Mentioned in {}",
+                                chat_name.as_deref().unwrap_or("group")
+                            ))
+                        } else {
+                            chat_name.clone()
+                        }
+                    } else {
+                        None
+                    };
+                }
+                Ok(None) | Err(_) => {
+                    notification_allowed = false;
+                    notification_title = None;
+                }
+            }
+        }
         let notification_allowed = notification_allowed && already_read == Some(false);
 
         let _ = ui_tx.send(UiEvent::MessageReceived {
@@ -2575,6 +2620,7 @@ impl WhatsAppClient {
             notification_allowed,
             notification_title,
             notification_archived,
+            chat_muted_until_ms,
         });
     }
 
@@ -2708,7 +2754,15 @@ impl WhatsAppClient {
                 match client
                     .download(
                         &downloadable,
-                        whatsapp_rust::download::DownloadLimits::default(),
+                        if downloadable.is_channel_preview_candidate() {
+                            crate::net::channel_image_limits(if downloadable.is_thumbnail {
+                                DownloadableMedia::CHANNEL_THUMBNAIL_BYTES
+                            } else {
+                                DownloadableMedia::CHANNEL_PREVIEW_BYTES
+                            })
+                        } else {
+                            whatsapp_rust::download::DownloadLimits::default()
+                        },
                     )
                     .await
                 {
@@ -3263,9 +3317,14 @@ impl WhatsAppClient {
 }
 
 /// Keep the notification bit's wire invariant in one place: outgoing echoes
-/// never alert, while an explicit mention may bypass the durable chat policy.
-fn allows_desktop_notification(is_from_me: bool, policy_allowed: bool, mentions_me: bool) -> bool {
-    !is_from_me && (policy_allowed || mentions_me)
+/// never alert, and a mute applies to mentions as well as ordinary messages.
+fn allows_desktop_notification(
+    is_from_me: bool,
+    muted: bool,
+    archived: bool,
+    mentions_me: bool,
+) -> bool {
+    !is_from_me && !muted && (!archived || mentions_me)
 }
 
 /// Tell the UI which real id a just-sent optimistic bubble got.
@@ -3384,11 +3443,13 @@ mod notification_policy_tests {
 
     #[test]
     fn self_echoes_never_cross_the_notification_wire() {
-        assert!(!allows_desktop_notification(true, true, false));
-        assert!(!allows_desktop_notification(true, false, true));
-        assert!(allows_desktop_notification(false, true, false));
-        assert!(allows_desktop_notification(false, false, true));
-        assert!(!allows_desktop_notification(false, false, false));
+        assert!(!allows_desktop_notification(true, false, false, false));
+        assert!(!allows_desktop_notification(true, false, true, true));
+        assert!(allows_desktop_notification(false, false, false, false));
+        assert!(!allows_desktop_notification(false, true, false, true));
+        assert!(!allows_desktop_notification(false, true, true, true));
+        assert!(allows_desktop_notification(false, false, true, true));
+        assert!(!allows_desktop_notification(false, false, true, false));
     }
 }
 

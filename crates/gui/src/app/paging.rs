@@ -369,6 +369,19 @@ impl WhatsAppApp {
         }
     }
 
+    /// Whether the active destination is waiting for another sidebar page.
+    pub fn chat_list_loading(&self, cx: &App) -> bool {
+        let pages = self.pages.read(cx);
+        let state = if self.destination == super::Destination::Chats
+            && self.chat_filter == super::ChatFilter::Archived
+        {
+            &pages.archived_chats
+        } else {
+            &pages.chats
+        };
+        matches!(state, Paging::Loading { .. })
+    }
+
     /// Ask for more of the chat list.
     ///
     /// Normally from where the last history load stopped, which it says in the
@@ -380,7 +393,8 @@ impl WhatsAppApp {
         let Some(client) = &self.client else {
             return;
         };
-        let archived = self.chat_filter == super::ChatFilter::Archived;
+        let archived = self.destination == super::Destination::Chats
+            && self.chat_filter == super::ChatFilter::Archived;
         if let Some(ask) = self.pages.update(cx, |pages, _| pages.more_chats(archived)) {
             if archived && ask.is_none() {
                 self.archived_scan.clear();

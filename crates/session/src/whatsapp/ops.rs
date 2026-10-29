@@ -9,7 +9,6 @@
 use whatsapp_rust::wacore::proto_helpers::MessageExt as _;
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _};
 use whatsapp_rust::waproto::whatsapp as wa;
-use whatsapp_rust::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
 use super::WhatsAppClient;
 use super::convert::{poll_creation_of, stored_to_chat_message};
@@ -34,16 +33,6 @@ pub struct PollView {
     pub question: String,
     pub options: Vec<String>,
     pub selectable_count: u32,
-}
-
-/// A profile as the network describes it.
-#[derive(Debug, Clone, Default)]
-pub struct ProfileView {
-    pub jid: String,
-    pub name: Option<String>,
-    pub about: Option<String>,
-    pub picture_url: Option<String>,
-    pub is_business: bool,
 }
 
 /// Whether a phone number is on WhatsApp.
@@ -86,6 +75,7 @@ fn contact_view_of(entry: oxidezap_chat_store::ContactEntry) -> ContactView {
 #[derive(Debug, Clone)]
 pub struct ChannelView {
     pub jid: String,
+    pub muted: Option<bool>,
     pub name: String,
     pub description: Option<String>,
     pub subscriber_count: u64,
@@ -105,7 +95,7 @@ pub struct HistoryCoverage {
 pub struct BackfillFile {
     pub message_id: String,
     pub chat_jid: String,
-    pub file_enc_sha256: Vec<u8>,
+    pub content_hash: Vec<u8>,
     pub bytes: Vec<u8>,
 }
 
@@ -425,95 +415,6 @@ impl WhatsAppClient {
         })
     }
 
-    /// A profile as the network describes it: about, picture and business
-    /// name. `None` asks about this account itself.
-    pub fn get_profile(&self, jid: Option<String>) -> Task<Result<ProfileView, String>> {
-        let session = self.session.clone();
-        self.exec.spawn(async move {
-            let Some(live) = session.lock().await.clone() else {
-                return Err("no session yet".to_string());
-            };
-            let target: Jid = match jid {
-                Some(j) => j.parse().map_err(|_| "not a user address".to_string())?,
-                None => live
-                    .client
-                    .pn()
-                    .ok_or_else(|| "not logged in".to_string())?,
-            };
-            let client = &live.client;
-            let info = client
-                .contacts()
-                .get_user_info(std::slice::from_ref(&target))
-                .await
-                .map_err(|e| e.to_string())?;
-            let about = info.values().next().and_then(|u| u.status.clone());
-            let is_business = info.values().next().is_some_and(|u| u.is_business);
-            let picture_url = client
-                .pictures()
-                .lookup(ProfilePictureRequest::new(
-                    ProfilePictureTarget::Contact(&target),
-                    ProfilePictureType::Full,
-                ))
-                .await
-                .ok()
-                .and_then(|outcome| outcome.into_found())
-                .map(|p| p.url);
-            let name = live
-                .chat_store
-                .contact(&target)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|c| c.full_name.or(c.push_name).or(c.business_name));
-            Ok(ProfileView {
-                jid: target.to_string(),
-                name,
-                about,
-                picture_url,
-                is_business,
-            })
-        })
-    }
-
-    /// A business profile: verified name, about and picture.
-    pub fn get_business_profile(&self, jid: String) -> Task<Result<ProfileView, String>> {
-        let session = self.session.clone();
-        self.exec.spawn(async move {
-            let target: Jid = jid.parse().map_err(|_| "not a user address".to_string())?;
-            let Some(live) = session.lock().await.clone() else {
-                return Err("no session yet".to_string());
-            };
-            let client = &live.client;
-            let info = client
-                .contacts()
-                .get_user_info(std::slice::from_ref(&target))
-                .await
-                .map_err(|e| e.to_string())?;
-            let user = info
-                .values()
-                .next()
-                .ok_or_else(|| "no profile returned".to_string())?;
-            let name = user.verified_name.as_ref().and_then(|v| v.name.clone());
-            let picture_url = client
-                .pictures()
-                .lookup(ProfilePictureRequest::new(
-                    ProfilePictureTarget::Contact(&target),
-                    ProfilePictureType::Full,
-                ))
-                .await
-                .ok()
-                .and_then(|outcome| outcome.into_found())
-                .map(|p| p.url);
-            Ok(ProfileView {
-                jid: target.to_string(),
-                name,
-                about: user.status.clone(),
-                picture_url,
-                is_business: user.is_business,
-            })
-        })
-    }
-
     /// Set the "recado" (about) text.
     pub fn set_profile_about(&self, about: String) -> Task<Result<(), String>> {
         let session = self.session.clone();
@@ -816,12 +717,27 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let mute_snapshot = live
+                .chat_store
+                .channel_mute_snapshot()
+                .await
+                .map_err(|e| e.to_string())?;
             let subscribed = live
                 .client
                 .newsletter()
                 .list_subscribed()
                 .await
                 .map_err(|e| e.to_string())?;
+            live.chat_store
+                .apply_channel_mute_metadata(
+                    subscribed
+                        .iter()
+                        .filter_map(|meta| meta.muted.map(|muted| (meta.jid.to_string(), muted)))
+                        .collect(),
+                    mute_snapshot,
+                )
+                .map_err(|e| e.to_string())?;
+            live.chat_store.flush().await.map_err(|e| e.to_string())?;
             Ok(subscribed.into_iter().map(channel_view_of).collect())
         })
     }
@@ -836,12 +752,23 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let mute_snapshot = live
+                .chat_store
+                .channel_mute_snapshot()
+                .await
+                .map_err(|e| e.to_string())?;
             let meta = live
                 .client
                 .newsletter()
                 .get_metadata(&channel)
                 .await
                 .map_err(|e| e.to_string())?;
+            if let Some(muted) = meta.muted {
+                live.chat_store
+                    .apply_channel_mute_metadata(vec![(meta.jid.to_string(), muted)], mute_snapshot)
+                    .map_err(|e| e.to_string())?;
+                live.chat_store.flush().await.map_err(|e| e.to_string())?;
+            }
             Ok(channel_view_of(meta))
         })
     }
@@ -856,12 +783,23 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let mute_snapshot = live
+                .chat_store
+                .channel_mute_snapshot()
+                .await
+                .map_err(|e| e.to_string())?;
             let meta = live
                 .client
                 .newsletter()
                 .join(&channel)
                 .await
                 .map_err(|e| e.to_string())?;
+            if let Some(muted) = meta.muted {
+                live.chat_store
+                    .apply_channel_mute_metadata(vec![(meta.jid.to_string(), muted)], mute_snapshot)
+                    .map_err(|e| e.to_string())?;
+                live.chat_store.flush().await.map_err(|e| e.to_string())?;
+            }
             Ok(channel_view_of(meta))
         })
     }
@@ -1236,7 +1174,7 @@ impl WhatsAppClient {
                     Ok(bytes) => report.files.push(BackfillFile {
                         message_id,
                         chat_jid,
-                        file_enc_sha256: downloadable.file_enc_sha256.clone(),
+                        content_hash: downloadable.content_hash().to_vec(),
                         bytes,
                     }),
                     Err(e) => {
@@ -1301,6 +1239,7 @@ fn poll_view_of(stored: oxidezap_chat_store::StoredMessage) -> Option<PollView> 
 /// A subscribed channel as a plain view.
 fn channel_view_of(meta: whatsapp_rust::features::NewsletterMetadata) -> ChannelView {
     ChannelView {
+        muted: meta.muted,
         jid: meta.jid.to_string(),
         name: meta.name,
         description: meta.description,

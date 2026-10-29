@@ -292,6 +292,24 @@ impl StateStore {
         matches!(self.lock().connection, ConnectionState::LoggedOut { .. })
     }
 
+    /// Recompute time-dependent attention under the state/publication locks.
+    pub(super) fn refresh_tray(&self, publish: impl FnOnce(TrayState)) {
+        let inner = self.lock();
+        publish(inner.tray_state());
+    }
+
+    pub(super) fn next_mute_expiry(&self, now_ms: i64) -> Option<i64> {
+        self.lock()
+            .chats
+            .values()
+            .filter_map(|e| e.summary.muted_until_ms)
+            .filter(|until| {
+                *until > now_ms
+                    && *until < chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis()
+            })
+            .min()
+    }
+
     /// The summary held for `jid`, if any.
     pub(super) fn chat(&self, jid: &str) -> Option<ChatSummary> {
         self.lock().chats.get(jid).map(|e| e.summary.clone())
@@ -459,17 +477,18 @@ impl StateStore {
 
 impl Inner {
     fn tray_state(&self) -> TrayState {
+        let now_ms = wacore::time::now_utc().timestamp_millis();
         TrayState {
             connected: self.connection.is_connected(),
             // A manually-unread chat carries a badge with no number, so it
             // counts as one for a tray that can only show a total. The status
             // broadcast is left out of it entirely: see
-            // `ChatSummary::counts_toward_unread`.
+            // `ChatSummary::counts_toward_attention`.
             unread: self
                 .chats
                 .values()
                 .map(|e| &e.summary)
-                .filter(|c| c.counts_toward_unread())
+                .filter(|c| c.counts_toward_attention(now_ms))
                 .fold(0u32, |acc, c| {
                     acc.saturating_add(if c.unread == 0 && c.manually_unread {
                         1
@@ -500,6 +519,7 @@ mod tests {
             manually_unread: false,
             last_message: None,
             pinned_at_ms: None,
+            muted_until_ms: None,
             group_hierarchy: None,
         }))
     }
@@ -511,6 +531,7 @@ mod tests {
             unread: 0,
             manually_unread: false,
             pinned_at_ms: Some(pinned_at_ms),
+            muted_until_ms: None,
             group_hierarchy: None,
             last_message: Some(oxidezap_ipc::MessagePreview {
                 id: None,
@@ -528,6 +549,7 @@ mod tests {
             unread: 0,
             manually_unread: false,
             pinned_at_ms: None,
+            muted_until_ms: None,
             group_hierarchy: None,
             last_message: Some(oxidezap_ipc::MessagePreview {
                 id: None,
@@ -554,6 +576,7 @@ mod tests {
                 manually_unread: false,
                 last_message: None,
                 pinned_at_ms: None,
+                muted_until_ms: None,
                 group_hierarchy: Some(hierarchy.clone()),
             })),
             None,
@@ -576,6 +599,7 @@ mod tests {
                 manually_unread: false,
                 last_message: None,
                 pinned_at_ms: None,
+                muted_until_ms: None,
                 group_hierarchy: Some(explicit.clone()),
             })),
             None,

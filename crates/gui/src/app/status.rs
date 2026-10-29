@@ -20,15 +20,46 @@ pub enum Destination {
     #[default]
     Chats,
     Status,
+    Channels,
+    Communities,
 }
 
 impl Destination {
-    pub const ALL: [Self; 2] = [Self::Chats, Self::Status];
+    pub const ALL: [Self; 4] = [Self::Chats, Self::Status, Self::Channels, Self::Communities];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Chats => "Chats",
             Self::Status => "Status",
+            Self::Channels => "Channels",
+            Self::Communities => "Communities",
+        }
+    }
+
+    pub fn has_conversations(self) -> bool {
+        self != Self::Status
+    }
+
+    pub fn matches(self, chat: &oxidezap_core::Chat) -> bool {
+        use oxidezap_core::GroupHierarchy;
+        if chat.is_status {
+            return self == Self::Status;
+        }
+        let channel = chat.jid.ends_with("@newsletter");
+        match self {
+            Self::Channels => channel,
+            Self::Communities => {
+                !channel
+                    && matches!(
+                        chat.group_hierarchy,
+                        Some(GroupHierarchy::Community | GroupHierarchy::Subgroup { .. })
+                    )
+            }
+            // Community child groups are conversations too, as in WhatsApp Web.
+            Self::Chats => {
+                !channel && !matches!(chat.group_hierarchy, Some(GroupHierarchy::Community))
+            }
+            Self::Status => false,
         }
     }
 
@@ -37,6 +68,8 @@ impl Destination {
         match self {
             Self::Chats => "nav-chats",
             Self::Status => "nav-status",
+            Self::Channels => "nav-channels",
+            Self::Communities => "nav-communities",
         }
     }
 }
@@ -150,7 +183,12 @@ impl WhatsAppApp {
 
     /// Switch destinations. The selection inside each is left as it was, so
     /// coming back to Chats lands on the conversation that was open.
-    pub fn set_destination(&mut self, destination: Destination, cx: &mut Context<Self>) {
+    pub fn set_destination(
+        &mut self,
+        destination: Destination,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.destination == destination {
             return;
         }
@@ -165,7 +203,31 @@ impl WhatsAppApp {
         if self.destination == Destination::Status {
             self.leave_shown_status();
         }
+        if self.destination.has_conversations() {
+            self.destination_selections
+                .insert(self.destination.id(), self.selected_destination_jid());
+        }
+        self.destination_selections
+            .entry(destination.id())
+            .or_insert(None);
         self.destination = destination;
+        self.search
+            .update(cx, |search, cx| search.clear_list_query(window, cx));
+        self.chat_list_scroll
+            .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        self.invalidate_chat_cache();
+        if let Some(jid) = self
+            .destination_selections
+            .get(destination.id())
+            .cloned()
+            .flatten()
+            && self
+                .chat_named(&jid)
+                .is_some_and(|chat| destination.matches(chat))
+        {
+            self.select_chat(jid, super::ChatOpen::Restore, window, cx);
+        }
+        self.mobile_panel = crate::responsive::MobilePanel::ChatList;
         cx.notify();
     }
 
@@ -589,7 +651,9 @@ impl WhatsAppApp {
         // that has arrived is drawn and there is nothing else to do.
         let needs_bytes = media.data.is_empty() || media.data_is_preview;
         match media.media_type {
-            MediaType::Image if needs_bytes => self.download_image(message_id, downloadable, cx),
+            MediaType::Image if needs_bytes => {
+                self.download_image(STATUS_BROADCAST_JID.into(), message_id, downloadable, cx)
+            }
             MediaType::Image => {}
             // A video needs a *player*, and that is a different thing from
             // needing bytes: `toggle_video` downloads when it must and starts
@@ -623,6 +687,43 @@ impl WhatsAppApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destinations_separate_channels_and_community_containers_but_keep_child_conversations() {
+        use oxidezap_core::{Chat, GroupHierarchy, SubgroupKind};
+        let direct = Chat::new("peer@example.invalid".into());
+        let channel = Chat::new("channel@newsletter".into());
+        let mut parent = Chat::new("community@g.us".into());
+        parent.is_group = true;
+        parent.group_hierarchy = Some(GroupHierarchy::Community);
+        let mut child = Chat::new("child@g.us".into());
+        child.is_group = true;
+        child.group_hierarchy = Some(GroupHierarchy::Subgroup {
+            parent_jid: parent.jid.clone(),
+            kind: SubgroupKind::Announcement,
+        });
+        let status = Chat::new(STATUS_BROADCAST_JID.into());
+        for (chat, expected) in [
+            (&direct, [true, false, false, false]),
+            (&channel, [false, false, true, false]),
+            (&parent, [false, false, false, true]),
+            (&child, [true, false, false, true]),
+            (&status, [false, true, false, false]),
+        ] {
+            assert_eq!(
+                Destination::ALL.map(|destination| destination.matches(chat)),
+                expected,
+                "{}",
+                chat.jid
+            );
+        }
+        parent.group_hierarchy = None;
+        assert!(
+            Destination::Chats.matches(&parent),
+            "unknown relationships stay reachable"
+        );
+        assert!(!Destination::Communities.matches(&parent));
+    }
 
     fn update(id: &str, read: bool) -> oxidezap_core::ChatMessage {
         let mut message =

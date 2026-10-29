@@ -14,10 +14,12 @@ diesel::table! {
         read_boundary_ms -> BigInt,
         read_boundary_ids -> Nullable<Text>,
         mute_appstate_seen -> Bool,
+        mute_revision -> BigInt,
         archive_appstate_seen -> Bool,
         name_from_address_book -> Bool,
         address_book_fallback -> Nullable<Text>,
         group_hierarchy -> Nullable<Text>,
+        unread_initialized -> Bool,
     }
 }
 

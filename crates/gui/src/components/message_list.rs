@@ -203,6 +203,26 @@ fn render_row(
                 return div().into_any_element();
             };
             let message_id = &msg.id;
+            if crate::platform::channel_preview::AUTOMATIC
+                && chat_jid.ends_with("@newsletter")
+                && msg.media.as_ref().is_some_and(|media| {
+                    media.media_type == MediaType::Image
+                        && (media.data_is_preview || media.data.is_empty())
+                        && media
+                            .preview_downloadable
+                            .as_ref()
+                            .or(media.downloadable.as_ref())
+                            .is_some_and(|d| d.is_channel_preview_candidate())
+                })
+            {
+                let entity = entity.clone();
+                let chat = chat_jid.to_string();
+                let id = message_id.clone();
+                // Defer until the list releases its read of the app entity.
+                cx.defer(move |cx| {
+                    entity.update(cx, |app, cx| app.improve_channel_preview(chat, id, cx))
+                });
+            }
 
             let app = entity.read(cx);
             // Decoded once and reused: stickers additionally need the stable

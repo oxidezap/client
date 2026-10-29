@@ -672,6 +672,8 @@ actions!(mobile_nav, [NavigateBack]);
 pub enum ChatOpen {
     ToCompose,
     ToPreview,
+    /// Restore a remembered selection without showing or reading its timeline.
+    Restore,
 }
 
 #[derive(Clone, Copy)]
@@ -952,6 +954,9 @@ pub struct WhatsAppApp {
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
+    /// Automatic attempts: false while pending/failed, true after success.
+    channel_preview_attempts: std::collections::HashMap<(String, String), bool>,
+    image_downloads_in_flight: std::collections::HashSet<String>,
     /// Native document destinations, scoped to the account, chat and message
     /// that initiated the save. Browser handoffs never enter this map.
     saved_documents: HashMap<(String, String, String), std::path::PathBuf>,
@@ -1012,7 +1017,7 @@ pub struct WhatsAppApp {
     mobile_panel: MobilePanel,
     /// Which conversations the sidebar is showing.
     chat_filter: ChatFilter,
-    /// JIDs of community rows the Groups list has collapsed.
+    /// JIDs of collapsed rows in Communities.
     collapsed_communities: std::collections::HashSet<String>,
     /// The message being replied to, mirrored here so the send path can
     /// attach it and the composer can show it.
@@ -1047,6 +1052,7 @@ pub struct WhatsAppApp {
     settings: Entity<settings::Settings>,
     /// Which of the sidebar's destinations is on screen.
     destination: Destination,
+    destination_selections: HashMap<&'static str, Option<String>>,
     /// Whose status updates are open, and which one of them.
     status_pane: StatusPane,
     /// The broadcast grouped by author, against the message count it was
@@ -1070,6 +1076,7 @@ pub struct WhatsAppApp {
 /// The GUI's paged chat row may not yet know any of them.
 struct IncomingMessageMetadata {
     allowed: bool,
+    muted_until_ms: Option<i64>,
     title: Option<String>,
     archived: Option<bool>,
     chat_name: Option<String>,
@@ -1103,6 +1110,11 @@ fn remove_pending_notification(queue: &mut VecDeque<String>, tag: &str) -> bool 
 }
 
 impl IncomingMessageMetadata {
+    fn with_mute(mut self, until: Option<i64>) -> Self {
+        self.muted_until_ms = until;
+        self
+    }
+
     fn new(
         allowed: bool,
         title: Option<String>,
@@ -1111,6 +1123,7 @@ impl IncomingMessageMetadata {
     ) -> Self {
         Self {
             allowed,
+            muted_until_ms: None,
             title,
             archived,
             chat_name,
@@ -1485,6 +1498,8 @@ impl WhatsAppApp {
             recovery: cx.new(|_| recovery::Recovering::new()),
             notices: cx.new(|_| notices::Notices::new()),
             downloads_in_flight: std::collections::HashSet::new(),
+            channel_preview_attempts: std::collections::HashMap::new(),
+            image_downloads_in_flight: std::collections::HashSet::new(),
             saved_documents: HashMap::new(),
             document_downloads_in_flight: std::collections::HashSet::new(),
             document_state_generation: 0,
@@ -1507,6 +1522,7 @@ impl WhatsAppApp {
             chat_list_cache: RefCell::new(None),
             chat_cache_version: std::cell::Cell::new(0),
             destination: Destination::default(),
+            destination_selections: HashMap::new(),
             status_pane: StatusPane::default(),
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
@@ -1620,7 +1636,9 @@ impl WhatsAppApp {
     /// destination the window is on.
     fn has_something_to_show(&self) -> bool {
         match self.destination {
-            Destination::Chats => self.selected_chat.is_some(),
+            Destination::Chats | Destination::Channels | Destination::Communities => {
+                self.selected_destination_jid().is_some()
+            }
             Destination::Status => self.status_pane.is_open(),
         }
     }
@@ -1679,7 +1697,14 @@ impl WhatsAppApp {
         let query = self.search.read(cx).list_query();
         let filtered: Vec<&Chat> = self
             .conversations()
-            .filter(|chat| self.chat_filter.matches(chat))
+            .filter(|chat| {
+                self.destination.matches(chat)
+                    && (if self.destination == Destination::Chats {
+                        self.chat_filter.matches(chat)
+                    } else {
+                        !chat.archived
+                    })
+            })
             .collect();
 
         let mut rows: Vec<ChatRow> = filtered
@@ -1697,7 +1722,7 @@ impl WhatsAppApp {
                 )
             })
             .collect();
-        let mut rows = if self.chat_filter == ChatFilter::Groups {
+        let mut rows = if self.destination == Destination::Communities {
             chats::hierarchical_group_rows(&rows, query, &self.collapsed_communities)
         } else {
             rows.retain(|row| {
@@ -1723,8 +1748,12 @@ impl WhatsAppApp {
     /// Counted over every chat rather than the filtered view: the number has
     /// to say what pressing `Unread` would reveal.
     pub fn unread_chat_count(&self) -> usize {
+        self.unread_destination_count(Destination::Chats)
+    }
+
+    pub fn unread_destination_count(&self, destination: Destination) -> usize {
         self.conversations()
-            .filter(|chat| ChatFilter::Unread.matches(chat))
+            .filter(|chat| destination.matches(chat) && ChatFilter::Unread.matches(chat))
             .count()
     }
 
@@ -1738,6 +1767,20 @@ impl WhatsAppApp {
             .iter()
             .map(Arc::as_ref)
             .filter(|chat| !chat.is_status)
+    }
+
+    pub fn selected_destination_jid(&self) -> Option<String> {
+        self.selected_chat
+            .as_ref()
+            .filter(|jid| {
+                self.chat_named(jid)
+                    .is_some_and(|chat| self.destination.matches(chat))
+                    && self
+                        .destination_selections
+                        .get(self.destination.id())
+                        .is_none_or(|selected| selected.as_ref() == Some(jid))
+            })
+            .cloned()
     }
 
     pub fn chat_filter(&self) -> ChatFilter {
@@ -2162,6 +2205,7 @@ impl WhatsAppApp {
             self.retained_chat.clone_from(&jid);
         }
         self.visible_chat = jid;
+        self.resume_visible_read(cx);
         if moved {
             self.sweep_retained_media(cx);
         }
@@ -2300,6 +2344,7 @@ impl WhatsAppApp {
         // the whole screen with no way back out of it.
         self.status_pane.close();
         self.destination = Destination::default();
+        self.destination_selections.clear();
         self.message_list_cache.borrow_mut().clear();
         self.chat_list_cache.borrow_mut().take();
         self.status_feed_cache.borrow_mut().take();
@@ -2336,6 +2381,8 @@ impl WhatsAppApp {
         // Playback itself is already stopped, above.
         self.video_players.clear();
         self.downloads_in_flight.clear();
+        self.channel_preview_attempts.clear();
+        self.image_downloads_in_flight.clear();
         self.saved_documents.clear();
         self.document_downloads_in_flight.clear();
         self.document_state_generation = self.document_state_generation.wrapping_add(1);
@@ -2847,6 +2894,18 @@ impl WhatsAppApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(chat) = self.chat_named(&jid)
+            && !self.destination.matches(chat)
+        {
+            let destination = if Destination::Channels.matches(chat) {
+                Destination::Channels
+            } else if Destination::Communities.matches(chat) {
+                Destination::Communities
+            } else {
+                Destination::Chats
+            };
+            self.set_destination(destination, window, cx);
+        }
         // Opening a chat by hand is the explicit user action a notification
         // permission prompt needs: on the web the startup ask runs without
         // transient activation and most browsers ignore it, so without this
@@ -2854,12 +2913,18 @@ impl WhatsAppApp {
         // Asked only while undecided — a grant or a block ends it — and only
         // on this target, where the prompt is the browser's rather than the
         // operating system's.
-        crate::platform::request_gesture_authorization();
+        if open != ChatOpen::Restore {
+            crate::platform::request_gesture_authorization();
+        }
         if self.selected_chat.as_deref() != Some(jid.as_str()) {
             self.cancel_message_delete(cx);
             // Message-text selection belongs to the conversation being left,
             // not to the next list reusing the window selection layer.
             clear_window_message_selection(window, cx);
+        }
+        if self.destination.has_conversations() {
+            self.destination_selections
+                .insert(self.destination.id(), Some(jid.clone()));
         }
         self.stop_user_media();
         // Leaving a chat mid-composition: release its typing indicator now,
@@ -2920,9 +2985,15 @@ impl WhatsAppApp {
         if let Some(chat) = self.find_chat(&jid).cloned() {
             self.demand_avatar_for_chat(&chat);
         }
-        self.navigate_to_chat();
+        if open != ChatOpen::Restore {
+            self.navigate_to_chat();
+        }
 
-        self.keyboard_intent = open;
+        self.keyboard_intent = if open == ChatOpen::Restore {
+            ChatOpen::ToPreview
+        } else {
+            open
+        };
         if open == ChatOpen::ToCompose {
             // After `navigate_to_chat`, so on mobile the composer exists on the
             // panel being switched to rather than the one being left.
@@ -2936,13 +3007,15 @@ impl WhatsAppApp {
         // here is the message this side is looking at.
         let mut mark_locally = false;
         let owed = self.owed_reads.contains(&jid);
-        if chat_read_can_be_committed(
-            self.window_focused,
-            crate::platform::application_is_active(),
-            self.client.is_some(),
-        ) && let Some(chat) = self
-            .find_chat(&jid)
-            .filter(|c| chat_read_needs_resume(c, owed))
+        if open != ChatOpen::Restore
+            && chat_read_can_be_committed(
+                self.window_focused,
+                crate::platform::application_is_active(),
+                self.client.is_some(),
+            )
+            && let Some(chat) = self
+                .find_chat(&jid)
+                .filter(|c| chat_read_needs_resume(c, owed))
         {
             match read_bound(chat) {
                 ReadBound::Now(newest) => {
@@ -3512,6 +3585,13 @@ impl WhatsAppApp {
             // Update the existing chat
             let chat = Arc::make_mut(&mut self.chats[index]);
             if let Some(archived) = metadata.archived {
+                chat.muted_until = metadata.muted_until_ms.and_then(|ms| {
+                    if ms == i64::MAX {
+                        Some(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                    } else {
+                        chrono::DateTime::from_timestamp_millis(ms)
+                    }
+                });
                 chat.archived = archived;
             }
 
@@ -3571,6 +3651,13 @@ impl WhatsAppApp {
             // an unknown answer out of the active inbox until store hydration
             // supplies an explicit state; `Some(false)` still unarchives it.
             new_chat.archived = metadata.archived.unwrap_or(true);
+            new_chat.muted_until = metadata.muted_until_ms.and_then(|ms| {
+                if ms == i64::MAX {
+                    Some(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                } else {
+                    chrono::DateTime::from_timestamp_millis(ms)
+                }
+            });
 
             // For groups: track participant
             if is_group && let Some(ref name) = sender_name {
@@ -4427,9 +4514,9 @@ impl Render for WhatsAppApp {
         // asks nothing of the conversation underneath it; the stack draws
         // nothing at all while it is empty.
         let conversation_strip = !self.showing_settings(cx)
-            && self.destination == Destination::Chats
+            && self.destination.has_conversations()
             && self.responsive_layout(window, cx).show_chat_area()
-            && self.selected_chat_jid().is_some();
+            && self.selected_destination_jid().is_some();
         let offline_banner =
             self.offline_recovery()
                 .filter(|_| !conversation_strip)

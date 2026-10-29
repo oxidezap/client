@@ -50,6 +50,7 @@ pub fn render_chat_item(
 
     div()
         .id(SharedString::from(format!("chat-{jid}")))
+        .debug_selector(|| "chat-row".into())
         .w_full()
         .h(layout.chat_item_height())
         .flex()
@@ -126,7 +127,6 @@ pub fn render_chat_item(
         .child(
             parts::detail_stack()
                 .gap(metrics.space_xs())
-                .overflow_hidden()
                 .child(render_name_row(&row, name, has_unread, metrics, cx))
                 .child(render_preview_row(&row, has_unread, metrics, cx)),
         )
@@ -173,6 +173,17 @@ fn render_name_row(
                         .text_color(cx.theme().secondary_foreground)
                         .child(label)
                 })),
+        )
+        .children(
+            row.muted_until
+                .filter(|until| *until > wacore::time::now_utc())
+                .map(|_| {
+                    div()
+                        .flex_shrink_0()
+                        .text_size(metrics.text_meta())
+                        .text_color(parts::subtle(cx))
+                        .child("Muted")
+                }),
         )
         .children(row.pinned.then(|| {
             div()
@@ -221,7 +232,13 @@ fn render_preview_row(
                 .child(label)
         }))
         .child(render_preview(&row.preview, row.is_group, metrics, cx))
-        .children(render_unread(&row.unread, has_unread, metrics, cx))
+        .children(render_unread(
+            &row.jid,
+            &row.unread,
+            has_unread,
+            metrics,
+            cx,
+        ))
 }
 
 fn render_preview(
@@ -299,6 +316,7 @@ fn render_preview(
 }
 
 fn render_unread(
+    jid: &str,
     unread: &Unread,
     has_unread: bool,
     metrics: crate::theme::Metrics,
@@ -307,7 +325,11 @@ fn render_unread(
     if !has_unread {
         return None;
     }
+    let badge_id = format!("unread-{jid}");
     let badge = div()
+        .id(SharedString::from(badge_id.clone()))
+        .debug_selector(move || badge_id.clone())
+        .whitespace_nowrap()
         .flex_shrink_0()
         .rounded_full()
         .bg(cx.theme().primary)
@@ -318,12 +340,19 @@ fn render_unread(
     Some(match unread {
         Unread::Count(count) => badge
             .min_w(metrics.space_xxl())
-            .h(metrics.space_xxl())
+            .min_h(metrics.space_xxl())
+            .py(metrics.space_xxs())
+            .line_height(gpui::relative(1.0))
             .px(metrics.space_sm())
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(metrics.text_meta())
             .text_color(cx.theme().primary_foreground)
-            .child(format_count(*count))
+            .child(
+                div()
+                    .id("unread-label")
+                    .debug_selector(|| "unread-label".into())
+                    .child(format_count(*count)),
+            )
             .into_any_element(),
         // Marked unread by hand has no number. A pill containing a bullet
         // pretends to be a count of something; a dot does not.

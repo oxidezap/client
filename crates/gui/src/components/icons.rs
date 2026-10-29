@@ -45,11 +45,12 @@ pub enum ProductIcon {
     MinimizeCard,
     /// The status ring: a circle drawn as segments, one per update.
     CircleDashed,
+    Channels,
 }
 
 impl ProductIcon {
     /// Every icon, so a test can prove each one actually loads.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::Phone,
         Self::PhoneOff,
         Self::Video,
@@ -80,6 +81,7 @@ impl ProductIcon {
         Self::WifiOff,
         Self::MinimizeCard,
         Self::CircleDashed,
+        Self::Channels,
     ];
 
     /// Path inside the embedded asset bundle.
@@ -115,6 +117,7 @@ impl ProductIcon {
             Self::WifiOff => "icons/wifi-off.svg",
             Self::MinimizeCard => "icons/minimize-card.svg",
             Self::CircleDashed => "icons/circle-dashed.svg",
+            Self::Channels => "icons/channels.svg",
         }
     }
 }

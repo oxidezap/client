@@ -44,6 +44,24 @@ started), `3` handshake rejected. Code `1` is the general failure: a daemon
 refusal, an unsupported output mode, a local read-only violation, and
 anything else the command could not carry out.
 
+## Profiles
+
+`profile get` queries the selected local account itself. Its explicit PN or LID
+selects the same profile, with device suffixes removed before network queries.
+Other contacts retain the requested user namespace. These network reads require
+a connected account and remain available in read-only mode.
+
+Text and JSON include the queried JID, PN/LID when known, username and verified
+business name when returned. `pn_source` and `lid_source` distinguish `protocol`
+from `session`, `local_mapping`, and `request`. A local mapping is prior knowledge,
+not proof that the current query disclosed the counterpart. Missing identities
+remain absent. `profile business` returns the same details with the verified name.
+
+`picture_status` distinguishes `found`, `not_found`, `not_authorized`, `unchanged`,
+and `unknown`. Only `not_found` prints `Photo: none`. Lookup failures fail the
+command; they do not become an absent photo. A full lookup requests a fresh URL
+without a conditional picture ID, independently of the GUI's avatar-byte cache.
+
 ## Safety
 
 `--read-only` (or `OXIDEZAP_READONLY=1`) refuses every mutating action

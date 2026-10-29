@@ -308,6 +308,10 @@ impl Claim<'_> {
             }
         }
 
+        self.publish_tray(tray);
+    }
+
+    pub(super) fn publish_tray(self, tray: TrayState) {
         // `send_if_modified` so an update that leaves the tray identical wakes
         // nothing: receipts and typing churn state constantly without changing
         // what the icon shows.

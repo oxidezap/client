@@ -16,6 +16,8 @@ path = "src/main.rs"
 test-support = ["oxidezap-session/test-support"]
 
 [dependencies]
+chrono = { workspace = true, features = ["std"] }
+oxidezap-platform = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
