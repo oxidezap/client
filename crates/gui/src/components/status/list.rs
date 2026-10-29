@@ -838,7 +838,7 @@ mod visible_cost {
     }
 
     #[gpui::test]
-    fn status_modality_keeps_contact_positions_without_own_updates(cx: &mut TestAppContext) {
+    fn status_pointer_activation_and_modality_keep_virtual_rows(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
@@ -897,6 +897,40 @@ mod visible_cost {
                 .unwrap(),
             original
         );
+        // The pinned Button already prevents pointer focus on mouse down.
+        // Exercise activation itself, not just a hover/modality transition.
+        visual.simulate_mouse_down(
+            original.center(),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(
+            original.center(),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        super::tests::CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(
+                window.focused(cx).is_none(),
+                "pointer activation must not retain list focus"
+            );
+        });
+        let mounted = super::tests::CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+        assert!(
+            mounted.len() < 20,
+            "pointer activation must preserve virtualization"
+        );
+        window
+            .update(&mut visual, |pane, _, cx| {
+                assert_eq!(
+                    pane.app.read(cx).status_pane().author(),
+                    Some("contact-49@s.whatsapp.net")
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]
