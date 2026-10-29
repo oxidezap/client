@@ -371,6 +371,18 @@ async fn preference_only_rows_accept_initial_history_unread_and_manual_markers()
                 )
                 .await;
             }
+            // Metadata-only chunks do not establish an unread value.
+            feed(
+                &store,
+                [history_sync_event({
+                    let mut history = wa::HistorySync::default();
+                    let mut conv = wa::Conversation::default();
+                    conv.id = chat.into();
+                    history.conversations = vec![conv];
+                    history
+                })],
+            )
+            .await;
             feed(
                 &store,
                 [history_sync_event({
@@ -444,4 +456,114 @@ async fn preference_rows_do_not_let_history_overwrite_live_or_explicit_read_stat
             if explicitly_read { 0 } else { 1 }
         );
     }
+}
+
+#[tokio::test]
+async fn self_receipts_establish_unread_ownership_before_initial_history() {
+    for kind in [ReceiptType::ReadSelf, ReceiptType::PlayedSelf] {
+        for marked in [false, true] {
+            let (_db, store) = test_store().await;
+            feed(
+                &store,
+                [Event::MuteUpdate(
+                    wacore::types::events::MuteUpdate::builder()
+                        .jid(jid(PEER))
+                        .timestamp(ts(1_700_000_000))
+                        .action(Box::new({
+                            let mut action = wa::sync_action_value::MuteAction::default();
+                            action.muted = Some(true);
+                            action.mute_end_timestamp = Some(-1);
+                            action
+                        }))
+                        .from_full_sync(false)
+                        .build(),
+                )],
+            )
+            .await;
+            feed(
+                &store,
+                [receipt(
+                    jid(PEER),
+                    jid(PEER),
+                    &["COVERED-BEFORE-HISTORY"],
+                    kind.clone(),
+                    ts(1_700_000_100),
+                )],
+            )
+            .await;
+            feed(
+                &store,
+                [history_sync_event({
+                    let mut history = wa::HistorySync::default();
+                    let mut conv = wa::Conversation::default();
+                    conv.id = PEER.into();
+                    conv.unread_count = Some(4);
+                    conv.marked_as_unread = Some(marked);
+                    history.conversations = vec![conv];
+                    history
+                })],
+            )
+            .await;
+            assert_eq!(
+                store.chat(&jid(PEER)).await.unwrap().unwrap().unread_count,
+                0
+            );
+            assert!(
+                store
+                    .notification_metadata(&jid(PEER))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .muted
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn late_metadata_does_not_resurrect_a_deleted_revision_zero_channel() {
+    const CHANNEL: &str = "120363000000000002@newsletter";
+    let (_db, store) = test_store().await;
+    feed(
+        &store,
+        [history_sync_event({
+            let mut history = wa::HistorySync::default();
+            let mut conv = wa::Conversation::default();
+            conv.id = CHANNEL.into();
+            conv.unread_count = Some(0);
+            history.conversations = vec![conv];
+            history
+        })],
+    )
+    .await;
+    let before = store.channel_mute_snapshot().await.unwrap();
+    assert_eq!(before.get(CHANNEL), Some(&0));
+    feed(
+        &store,
+        [Event::DeleteChatUpdate(
+            wacore::types::events::DeleteChatUpdate::builder()
+                .jid(jid(CHANNEL))
+                .delete_media(false)
+                .timestamp(ts(1_700_000_100))
+                .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert!(store.chat(&jid(CHANNEL)).await.unwrap().is_none());
+    let mut changes = store.subscribe();
+    store
+        .apply_channel_mute_metadata(vec![(CHANNEL.into(), true)], before)
+        .unwrap();
+    store.flush().await.unwrap();
+    assert!(store.chat(&jid(CHANNEL)).await.unwrap().is_none());
+    assert!(
+        !store
+            .channel_mute_snapshot()
+            .await
+            .unwrap()
+            .contains_key(CHANNEL)
+    );
+    assert!(changes.try_recv().is_err());
 }

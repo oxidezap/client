@@ -241,7 +241,10 @@ pub(super) fn clear_unread_marker(
     let cleared = diesel::update(
         chat_row(device_id, chat).filter(schema::chats::unread_count.eq(UNREAD_MARKER)),
     )
-    .set(schema::chats::unread_count.eq(unread))
+    .set((
+        schema::chats::unread_count.eq(unread),
+        schema::chats::unread_initialized.eq(true),
+    ))
     .execute(conn)?;
     if cleared > 0 {
         cs.chats = true;

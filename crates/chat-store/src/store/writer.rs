@@ -602,8 +602,13 @@ fn apply_writer_msg(
                     .optional()?;
                 let (stored, seen, revision) = current.unwrap_or((None, false, 0));
                 if let Some(expected) = expected {
-                    let before = expected.get(jid).copied().unwrap_or(0);
-                    if revision != before {
+                    let before = expected.get(jid).copied();
+                    // A row known at lookup time and deleted since then is
+                    // different from a genuinely unseen subscribed channel.
+                    if before.is_some() && current.is_none() {
+                        continue;
+                    }
+                    if revision != before.unwrap_or(0) {
                         continue;
                     }
                 }

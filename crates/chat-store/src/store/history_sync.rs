@@ -76,6 +76,7 @@ fn apply_history_conversation(
         Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
         _ => 0,
     };
+    let history_unread_known = conv.unread_count.is_some() || conv.marked_as_unread == Some(true);
     // The conflict update below keeps a live-owned count, so read the row
     // first: the seed must agree with the count the sync leaves behind.
     let stored_unread: Option<i32> = chat_row(device_id, chat)
@@ -115,6 +116,7 @@ fn apply_history_conversation(
                 dsl::address_book_fallback.eq(address_book_fallback),
                 dsl::last_message_ts.eq(last_ts_ms),
                 dsl::unread_count.eq(unread_count),
+                dsl::unread_initialized.eq(history_unread_known),
                 // Wire values are unix SECONDS; the columns (and the live
                 // app-state paths) are milliseconds.
                 dsl::pinned_at.eq(conv
@@ -140,9 +142,11 @@ fn apply_history_conversation(
             .set((
                 // A preference-only row has no live-owned unread state yet.
                 dsl::unread_count.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
-                    "CASE WHEN unread_initialized THEN unread_count ELSE excluded.unread_count END",
+                    "CASE WHEN unread_initialized OR NOT excluded.unread_initialized THEN unread_count ELSE excluded.unread_count END",
                 )),
-                dsl::unread_initialized.eq(true),
+                dsl::unread_initialized.eq(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "unread_initialized OR excluded.unread_initialized",
+                )),
                 dsl::name.eq(diesel::dsl::sql::<
                     diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 >("COALESCE(excluded.name, name)")),
