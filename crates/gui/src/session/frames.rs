@@ -805,9 +805,13 @@ fn placeholder_chat(summary: &ChatSummary) -> Chat {
     chat.pinned_at = summary
         .pinned_at_ms
         .and_then(DateTime::from_timestamp_millis);
-    chat.muted_until = summary
-        .muted_until_ms
-        .and_then(DateTime::from_timestamp_millis);
+    chat.muted_until = summary.muted_until_ms.and_then(|until| {
+        if until == i64::MAX {
+            Some(DateTime::<chrono::Utc>::MAX_UTC)
+        } else {
+            DateTime::from_timestamp_millis(until)
+        }
+    });
     chat.group_hierarchy = summary.group_hierarchy.clone();
     if let Some(preview) = &summary.last_message {
         chat.last_message = Some(preview.text.clone());
@@ -1862,5 +1866,13 @@ mod tests {
             events.try_recv(),
             Ok(FromDaemon::AvatarFailed { jid, retryable: false }) if jid == "missing@s.whatsapp.net"
         ));
+    }
+    #[test]
+    fn snapshot_placeholder_keeps_an_indefinite_mute_and_unread_count() {
+        let mut entry = summary("120363000000000002@newsletter", "Example", 4);
+        entry.muted_until_ms = Some(i64::MAX);
+        let chat = placeholder_chat(&entry);
+        assert_eq!(chat.muted_until, Some(DateTime::<chrono::Utc>::MAX_UTC));
+        assert_eq!(chat.unread_count, 4);
     }
 }
