@@ -171,6 +171,7 @@ async fn forever_mute_is_not_reported_as_unmuted() {
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                         constructed.muted = Some(true);
+                        constructed.mute_end_timestamp = Some(-1);
                         constructed
                     }))
                     .from_full_sync(false)
@@ -1175,6 +1176,7 @@ async fn notification_policy_checks_both_unmerged_peer_aliases() {
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                         constructed.muted = Some(true);
+                        constructed.mute_end_timestamp = Some(-1);
                         constructed
                     }))
                     .from_full_sync(false)

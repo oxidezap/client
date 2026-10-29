@@ -73,10 +73,9 @@ pub(crate) fn connection_status_of(state: &ConnectionState, hub: &StateHub) -> C
     }
 }
 
-/// A chat summary as the protocol's chat. Summaries do not carry mute,
-/// archive or group-role state — those ride the full chat — so the wire
-/// reads them as unset rather than guessed.
+/// A chat summary as the protocol's chat. Archive state still requires a full chat.
 pub(crate) fn chat_summary_to_dto(summary: ChatSummary) -> ChatDto {
+    let is_muted = summary.is_muted(wacore::time::now_utc().timestamp_millis());
     let is_group = summary.jid.parse::<Jid>().is_ok_and(|jid| jid.is_group());
     ChatDto {
         jid: summary.jid,
@@ -85,7 +84,7 @@ pub(crate) fn chat_summary_to_dto(summary: ChatSummary) -> ChatDto {
         manually_unread: summary.manually_unread,
         is_group,
         is_pinned: summary.pinned_at_ms.is_some(),
-        is_muted: false,
+        is_muted,
         is_archived: false,
         last_message_ts: summary.last_message.as_ref().map(|p| p.timestamp_ms),
         last_message_preview: summary.last_message.map(|p| p.text),
@@ -329,6 +328,7 @@ mod tests {
                 notification_allowed: false,
                 notification_title: None,
                 notification_archived: None,
+                chat_muted_until_ms: None,
             }),
         })
         .unwrap();
@@ -352,6 +352,7 @@ mod tests {
                 manually_unread: false,
                 last_message: None,
                 pinned_at_ms: None,
+                muted_until_ms: None,
                 group_hierarchy: None,
             })),
         })

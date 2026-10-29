@@ -153,6 +153,18 @@ impl StateHub {
         self.out.publish_session(frame);
     }
 
+    /// Recompute mute expiry without changing messages or their read state.
+    pub fn refresh_tray(&self) {
+        self.state
+            .refresh_tray(|tray| self.out.claim().publish_tray(tray));
+    }
+
+    /// The next finite active mute deadline for this account.
+    pub fn next_mute_expiry(&self, now_ms: i64) -> Option<i64> {
+        self.state.next_mute_expiry(now_ms)
+    }
+
+    /// Subscribe to the latest tray state.
     pub fn watch_tray(&self) -> watch::Receiver<TrayState> {
         self.out.watch_tray()
     }
@@ -364,6 +376,7 @@ mod tests {
             unread,
             manually_unread: false,
             pinned_at_ms: None,
+            muted_until_ms: None,
             group_hierarchy: None,
             last_message: Some(MessagePreview {
                 id: Some(format!("{jid}-newest")),
@@ -961,5 +974,36 @@ mod tests {
             ),
             "overrun surfaces as Lagged so the server can send Resync"
         );
+    }
+    #[tokio::test]
+    async fn mute_unmute_and_expiry_recompute_tray_without_marking_read() {
+        let hub = StateHub::new();
+        hub.apply(Change::live(DaemonEvent::ConnectionChanged(
+            ConnectionState::Connected,
+        )));
+        let mut summary = chat("channel@newsletter", 7, 0);
+        summary.muted_until_ms = Some(i64::MAX);
+        hub.apply(Change::from_store(DaemonEvent::ChatUpdated(
+            summary.clone(),
+        )));
+        let mut tray = hub.watch_tray();
+        assert_eq!(tray.borrow_and_update().unread, 0);
+        assert_eq!(hub.chat(&summary.jid).unwrap().unread, 7);
+        summary.muted_until_ms = None;
+        hub.apply(Change::from_store(DaemonEvent::ChatUpdated(
+            summary.clone(),
+        )));
+        assert_eq!(tray.borrow_and_update().unread, 7);
+        let until = wacore::time::now_utc().timestamp_millis() + 30;
+        summary.muted_until_ms = Some(until);
+        hub.apply(Change::from_store(DaemonEvent::ChatUpdated(
+            summary.clone(),
+        )));
+        assert_eq!(tray.borrow_and_update().unread, 0);
+        assert_eq!(hub.next_mute_expiry(until - 1), Some(until));
+        oxidezap_platform::sleep(std::time::Duration::from_millis(40)).await;
+        hub.refresh_tray();
+        assert_eq!(tray.borrow_and_update().unread, 7);
+        assert_eq!(hub.chat(&summary.jid).unwrap().unread, 7);
     }
 }

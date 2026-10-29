@@ -2477,66 +2477,72 @@ impl WhatsAppClient {
         // message. GUI hydration is paged and can lag this event (or omit an
         // archived chat entirely); its in-memory Chat cannot decide mute or
         // archive policy. Offline drains are history, not new attention.
-        // Only the protocol's explicit mention list counts. WhatsApp lets a
-        // personal @mention through a group's mute/archive settings, but an
-        // ordinary `@` in prose must not bypass them.
+        // Explicit mentions only affect the title. Muted conversations never
+        // alert, including when a message mentions this account.
         let mentions_me = info.source.chat.is_group()
             && !info.source.is_from_me
             && crate::mentions::mentions_own_account(Some(msg), &history::own_jids(client));
-        let (notification_allowed, notification_title, notification_archived, chat_name) =
-            if let Some(store) = names.chat_store() {
-                match store.notification_metadata(&info.source.chat).await {
-                    Ok(Some(metadata)) => {
-                        // The wire flag is the notification invariant, not a
-                        // copy of the chat policy: self echoes are displayed
-                        // as outgoing bubbles and must never ask a front end
-                        // to alert, even when their chat is otherwise eligible.
-                        // Offline drains are not new attention, but they still
-                        // need the durable archive bit: an archived chat is
-                        // absent from the active page, so a front end receiving
-                        // its message before hydration must not recreate it in
-                        // the inbox.
-                        let allowed = eager
-                            && allows_desktop_notification(
-                                info.source.is_from_me,
-                                metadata.allowed,
-                                mentions_me,
-                            );
-                        let identity = names.identity(client, &info.source.chat).await;
-                        let (resolved_name, priority) = names
-                            .resolve(
-                                store,
-                                &info.source.chat,
-                                metadata.name.as_deref(),
-                                &identity,
-                            )
-                            .await;
-                        let chat_name = (priority > 0).then_some(resolved_name.clone());
-                        let title = if allowed {
-                            if mentions_me {
-                                let group = if priority > 0 {
-                                    resolved_name.as_str()
-                                } else {
-                                    "group"
-                                };
-                                Some(format!("Mentioned in {group}"))
+        let (
+            mut notification_allowed,
+            mut notification_title,
+            mut notification_archived,
+            chat_name,
+            mut chat_muted_until_ms,
+        ) = if let Some(store) = names.chat_store() {
+            match store.notification_metadata(&info.source.chat).await {
+                Ok(Some(metadata)) => {
+                    // The wire flag is the notification invariant, not a
+                    // copy of the chat policy: self echoes are displayed
+                    // as outgoing bubbles and must never ask a front end
+                    // to alert, even when their chat is otherwise eligible.
+                    // Offline drains are not new attention, but they still
+                    // need the durable archive bit: an archived chat is
+                    // absent from the active page, so a front end receiving
+                    // its message before hydration must not recreate it in
+                    // the inbox.
+                    let allowed = eager
+                        && allows_desktop_notification(info.source.is_from_me, metadata.allowed);
+                    let identity = names.identity(client, &info.source.chat).await;
+                    let (resolved_name, priority) = names
+                        .resolve(
+                            store,
+                            &info.source.chat,
+                            metadata.name.as_deref(),
+                            &identity,
+                        )
+                        .await;
+                    let chat_name = (priority > 0).then_some(resolved_name.clone());
+                    let title = if allowed {
+                        if mentions_me {
+                            let group = if priority > 0 {
+                                resolved_name.as_str()
                             } else {
-                                (priority > 0).then_some(resolved_name)
-                            }
+                                "group"
+                            };
+                            Some(format!("Mentioned in {group}"))
                         } else {
-                            None
-                        };
-                        (allowed, title, Some(metadata.archived), chat_name)
-                    }
-                    Ok(None) => (false, None, None, None),
-                    Err(error) => {
-                        warn!("could not read chat notification policy: {error}");
-                        (false, None, None, None)
-                    }
+                            (priority > 0).then_some(resolved_name)
+                        }
+                    } else {
+                        None
+                    };
+                    (
+                        allowed,
+                        title,
+                        Some(metadata.archived),
+                        chat_name,
+                        metadata.muted_until_ms,
+                    )
                 }
-            } else {
-                (false, None, None, None)
-            };
+                Ok(None) => (false, None, None, None, None),
+                Err(error) => {
+                    warn!("could not read chat notification policy: {error}");
+                    (false, None, None, None, None)
+                }
+            }
+        } else {
+            (false, None, None, None, None)
+        };
 
         // Delivery ACKs describe transport, not whether this user read the
         // message on another device. A live replay may already be covered by
@@ -2565,6 +2571,34 @@ impl WhatsAppClient {
         };
         chat_message.is_read = already_read == Some(true);
 
+        // Name/identity lookups above may await network I/O. A linked-device
+        // mute committed while those ran must win before we publish attention.
+        if let Some(store) = names.chat_store() {
+            match store.notification_metadata(&info.source.chat).await {
+                Ok(Some(metadata)) => {
+                    notification_archived = Some(metadata.archived);
+                    chat_muted_until_ms = metadata.muted_until_ms;
+                    notification_allowed = eager
+                        && allows_desktop_notification(info.source.is_from_me, metadata.allowed);
+                    notification_title = if notification_allowed {
+                        if mentions_me {
+                            Some(format!(
+                                "Mentioned in {}",
+                                chat_name.as_deref().unwrap_or("group")
+                            ))
+                        } else {
+                            chat_name.clone()
+                        }
+                    } else {
+                        None
+                    };
+                }
+                Ok(None) | Err(_) => {
+                    notification_allowed = false;
+                    notification_title = None;
+                }
+            }
+        }
         let notification_allowed = notification_allowed && already_read == Some(false);
 
         let _ = ui_tx.send(UiEvent::MessageReceived {
@@ -2575,6 +2609,7 @@ impl WhatsAppClient {
             notification_allowed,
             notification_title,
             notification_archived,
+            chat_muted_until_ms,
         });
     }
 
@@ -3263,9 +3298,9 @@ impl WhatsAppClient {
 }
 
 /// Keep the notification bit's wire invariant in one place: outgoing echoes
-/// never alert, while an explicit mention may bypass the durable chat policy.
-fn allows_desktop_notification(is_from_me: bool, policy_allowed: bool, mentions_me: bool) -> bool {
-    !is_from_me && (policy_allowed || mentions_me)
+/// never alert, and a mute applies to mentions as well as ordinary messages.
+fn allows_desktop_notification(is_from_me: bool, policy_allowed: bool) -> bool {
+    !is_from_me && policy_allowed
 }
 
 /// Tell the UI which real id a just-sent optimistic bubble got.
@@ -3384,11 +3419,10 @@ mod notification_policy_tests {
 
     #[test]
     fn self_echoes_never_cross_the_notification_wire() {
-        assert!(!allows_desktop_notification(true, true, false));
-        assert!(!allows_desktop_notification(true, false, true));
-        assert!(allows_desktop_notification(false, true, false));
-        assert!(allows_desktop_notification(false, false, true));
-        assert!(!allows_desktop_notification(false, false, false));
+        assert!(!allows_desktop_notification(true, true));
+        assert!(!allows_desktop_notification(true, false));
+        assert!(allows_desktop_notification(false, true));
+        assert!(!allows_desktop_notification(false, false));
     }
 }
 

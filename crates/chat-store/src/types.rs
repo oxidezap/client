@@ -291,6 +291,7 @@ impl ChatArchiveFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatNotificationMetadata {
     pub muted: bool,
+    pub muted_until_ms: Option<i64>,
     pub archived: bool,
     pub allowed: bool,
     pub name: Option<String>,

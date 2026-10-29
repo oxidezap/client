@@ -272,6 +272,7 @@ impl WhatsAppApp {
                 notification_allowed,
                 notification_title,
                 notification_archived,
+                chat_muted_until_ms,
             } => {
                 self.handle_message_received(
                     chat_jid,
@@ -282,7 +283,8 @@ impl WhatsAppApp {
                         notification_title,
                         notification_archived,
                         chat_name,
-                    ),
+                    )
+                    .with_mute(chat_muted_until_ms),
                     cx,
                 );
                 // A live status update brings its own 24-hour deadline with

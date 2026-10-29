@@ -798,9 +798,8 @@ impl ChatStore {
         if rows.is_empty() {
             return Ok(None);
         }
-        let muted = rows
-            .iter()
-            .any(|(mute, _, _)| mute.is_some_and(|until| until > now_ms));
+        let muted_until_ms = rows.iter().filter_map(|(mute, _, _)| *mute).max();
+        let muted = muted_until_ms.is_some_and(|until| until > now_ms);
         let archived = rows.iter().any(|(_, archived, _)| *archived);
         let name = rows
             .into_iter()
@@ -812,6 +811,7 @@ impl ChatStore {
             });
         Ok(Some(ChatNotificationMetadata {
             muted,
+            muted_until_ms,
             archived,
             allowed: !muted && !archived,
             name,

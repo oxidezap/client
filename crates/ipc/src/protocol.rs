@@ -160,9 +160,18 @@ pub struct ChatSummary {
     /// Server-reported community relationship, omitted until known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_hierarchy: Option<GroupHierarchy>,
+    /// Unix milliseconds. None is unmuted; an indefinite mute uses the
+    /// maximum representable domain timestamp. Actual unread state is separate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted_until_ms: Option<i64>,
 }
 
 impl ChatSummary {
+    #[must_use]
+    pub fn is_muted(&self, now_ms: i64) -> bool {
+        self.muted_until_ms.is_some_and(|until| until > now_ms)
+    }
+
     /// Whether this chat should carry an unread badge at all.
     #[must_use]
     pub fn has_unread(&self) -> bool {
@@ -197,6 +206,12 @@ impl ChatSummary {
     #[must_use]
     pub fn counts_toward_unread(&self) -> bool {
         !self.is_status()
+    }
+
+    /// Whether this conversation contributes to the tray/taskbar attention count.
+    #[must_use]
+    pub fn counts_toward_attention(&self, now_ms: i64) -> bool {
+        self.counts_toward_unread() && !self.is_muted(now_ms)
     }
 }
 
@@ -1560,6 +1575,7 @@ mod tests {
             manually_unread: false,
             last_message: None,
             pinned_at_ms: None,
+            muted_until_ms: None,
             group_hierarchy: None,
         };
         let snapshot = StateSnapshot {
@@ -1621,6 +1637,7 @@ mod tests {
                 manually_unread: false,
                 last_message: None,
                 pinned_at_ms: None,
+                muted_until_ms: None,
                 group_hierarchy: None,
             }),
             DaemonEvent::ChatRemoved {
@@ -1744,6 +1761,7 @@ mod tests {
             manually_unread: false,
             last_message: None,
             pinned_at_ms: None,
+            muted_until_ms: None,
             group_hierarchy: None,
         };
         let snapshot = StateSnapshot {
@@ -1769,6 +1787,7 @@ mod tests {
             manually_unread: true,
             last_message: None,
             pinned_at_ms: None,
+            muted_until_ms: None,
             group_hierarchy: None,
         };
         assert!(chat.has_unread(), "it carries a badge");
@@ -1893,6 +1912,7 @@ mod tests {
             manually_unread: false,
             last_message: None,
             pinned_at_ms: None,
+            muted_until_ms: None,
             group_hierarchy: Some(hierarchy.clone()),
         };
         let json = serde_json::to_value(&summary).expect("serialize summary");
@@ -1920,6 +1940,7 @@ mod tests {
                 unread: 2,
                 manually_unread: false,
                 pinned_at_ms: None,
+                muted_until_ms: None,
                 group_hierarchy: None,
                 last_message: Some(MessagePreview {
                     id: Some("3EB0".into()),
@@ -2405,5 +2426,28 @@ mod audio_played_tests {
         );
         assert!(json.contains("mark_audio_played"));
         assert!(!json.contains("participant"));
+    }
+    #[test]
+    fn mute_filters_attention_without_changing_unread_state() {
+        for jid in ["user@example.invalid", "group@g.us", "channel@newsletter"] {
+            let mut chat = ChatSummary {
+                jid: jid.into(),
+                name: "Example".into(),
+                unread: 5,
+                manually_unread: true,
+                last_message: None,
+                pinned_at_ms: None,
+                group_hierarchy: None,
+                muted_until_ms: Some(2000),
+            };
+            assert!(!chat.counts_toward_attention(1999));
+            assert!(chat.has_unread());
+            assert_eq!(chat.unread, 5);
+            assert!(chat.counts_toward_attention(2000));
+            chat.muted_until_ms = Some(i64::MAX);
+            assert!(!chat.counts_toward_attention(9000));
+            chat.muted_until_ms = None;
+            assert!(chat.counts_toward_attention(9000));
+        }
     }
 }

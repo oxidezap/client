@@ -897,6 +897,7 @@ async fn live_message_carries_store_notification_decision() {
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                     constructed.muted = Some(true);
+                    constructed.mute_end_timestamp = Some(-1);
                     constructed
                 }))
                 .from_full_sync(false)
@@ -969,11 +970,10 @@ async fn live_message_carries_store_notification_decision() {
     ));
 }
 
-/// WhatsApp's explicit personal @mention is the exception to a group's mute
-/// and archive state. A bare @ in text is not, and an offline drain is never
-/// a fresh desktop alert even when it contains a mention.
+/// A personal @mention respects mute/archive policy. Offline drains never
+/// produce a new alert, including when they contain a mention.
 #[tokio::test]
-async fn direct_group_mention_alerts_through_mute_and_archive() {
+async fn direct_group_mention_respects_mute_and_archive() {
     use whatsapp_rust::waproto::buffa;
     use whatsapp_rust::waproto::whatsapp::message;
 
@@ -1006,6 +1006,7 @@ async fn direct_group_mention_alerts_through_mute_and_archive() {
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                     constructed.muted = Some(true);
+                    constructed.mute_end_timestamp = Some(-1);
                     constructed
                 }))
                 .from_full_sync(false)
@@ -1067,11 +1068,11 @@ async fn direct_group_mention_alerts_through_mute_and_archive() {
     assert!(matches!(
         ui_rx.try_recv(),
         Ok(oxidezap_core::UiEvent::MessageReceived {
-            notification_allowed: true,
-            notification_title: Some(title),
+            notification_allowed: false,
+            notification_title: None,
             notification_archived: Some(true),
             ..
-        }) if title == "Mentioned in Example group"
+        })
     ));
 
     for (message, eager) in [

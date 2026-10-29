@@ -584,6 +584,30 @@ fn apply_writer_msg(
         WriterMsg::AvatarCleared { jid, seq } => {
             crate::store::avatar::delete(conn, device_id, jid, *seq)
         }
+        WriterMsg::ChannelMutes(writes) => {
+            use diesel::prelude::*;
+            use schema::chats::dsl;
+            for (jid, muted) in writes {
+                if !jid.ends_with("@newsletter") {
+                    continue;
+                }
+                let until = muted.then_some(i64::MAX);
+                let changed = diesel::update(
+                    dsl::chats.filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid))),
+                )
+                .filter(
+                    dsl::muted_until
+                        .is_not(until)
+                        .or(dsl::mute_appstate_seen.eq(false)),
+                )
+                .set((dsl::muted_until.eq(until), dsl::mute_appstate_seen.eq(true)))
+                .execute(conn)?;
+                if changed > 0 {
+                    cs.message_chats.insert(jid.clone());
+                }
+            }
+            Ok(())
+        }
         WriterMsg::ChatNames(names) => {
             crate::store::chat_names::apply_chat_names(conn, device_id, names, cs)
         }

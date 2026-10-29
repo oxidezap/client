@@ -805,6 +805,9 @@ fn placeholder_chat(summary: &ChatSummary) -> Chat {
     chat.pinned_at = summary
         .pinned_at_ms
         .and_then(DateTime::from_timestamp_millis);
+    chat.muted_until = summary
+        .muted_until_ms
+        .and_then(DateTime::from_timestamp_millis);
     chat.group_hierarchy = summary.group_hierarchy.clone();
     if let Some(preview) = &summary.last_message {
         chat.last_message = Some(preview.text.clone());
@@ -1641,6 +1644,7 @@ mod tests {
             unread,
             manually_unread: false,
             pinned_at_ms: None,
+            muted_until_ms: None,
             group_hierarchy: None,
             last_message: Some(oxidezap_ipc::MessagePreview {
                 id: Some("3EB0".into()),

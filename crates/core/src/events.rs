@@ -75,10 +75,14 @@ pub enum UiEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_title: Option<String>,
         /// The store's archive answer. `None` means not known (including an
-        /// older daemon frame), distinct from an explicit unarchive. A live
-        /// @mention may still alert without resurrecting an archived chat.
+        /// older daemon frame), distinct from an explicit unarchive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_archived: Option<bool>,
+        /// Durable mute deadline in unix milliseconds, including for live
+        /// arrivals before the chat-list reload. Meaningful when archive
+        /// metadata is known; None then explicitly means unmuted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_muted_until_ms: Option<i64>,
     },
     ReceiptReceived {
         chat_jid: String,
@@ -412,6 +416,7 @@ mod notification_wire_tests {
             notification_allowed: true,
             notification_title: Some("Example group".into()),
             notification_archived: Some(true),
+            chat_muted_until_ms: None,
         };
         let mut wire = serde_json::to_value(event).unwrap();
         let fields = wire
@@ -430,6 +435,7 @@ mod notification_wire_tests {
                 chat_name: None,
                 notification_title: None,
                 notification_archived: None,
+                chat_muted_until_ms: None,
                 ..
             }
         ));

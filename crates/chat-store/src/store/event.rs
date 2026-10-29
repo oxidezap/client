@@ -200,18 +200,14 @@ pub(super) fn apply_event(
                 // Missing is not an explicit unmute or app-state authority.
                 return Ok(());
             };
-            let muted_until = if muted {
-                // Absent or non-positive (WA Web sends -1 for indefinite,
-                // this crate's own mute_chat() included) = muted forever.
-                Some(
-                    update
-                        .action
-                        .mute_end_timestamp
-                        .filter(|&ts| ts > 0)
-                        .unwrap_or(i64::MAX),
-                )
-            } else {
-                None
+            let muted_until = match (muted, update.action.mute_end_timestamp) {
+                (false, _) => None,
+                // WA Web rejects a mute without its timestamp. Zero means
+                // unmuted, -1 is indefinite, positive values are unix ms.
+                (true, None) => return Ok(()),
+                (true, Some(0)) => None,
+                (true, Some(until)) if until < 0 => Some(i64::MAX),
+                (true, Some(until)) => Some(until),
             };
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
@@ -230,7 +226,9 @@ pub(super) fn apply_event(
                     schema::chats::mute_appstate_seen.eq(true),
                 ))
                 .execute(conn)?;
-            cs.chats = true;
+            // A muted row may be past the first page. Reload this identity
+            // directly so the tray and existing windows receive the change.
+            cs.message_chats.insert(chat);
             Ok(())
         }
         Event::ArchiveUpdate(update) => {

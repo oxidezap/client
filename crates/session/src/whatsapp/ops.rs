@@ -822,6 +822,15 @@ impl WhatsAppClient {
                 .list_subscribed()
                 .await
                 .map_err(|e| e.to_string())?;
+            live.chat_store
+                .apply_channel_mutes(
+                    subscribed
+                        .iter()
+                        .filter_map(|meta| meta.muted.map(|muted| (meta.jid.to_string(), muted)))
+                        .collect(),
+                )
+                .map_err(|e| e.to_string())?;
+            live.chat_store.flush().await.map_err(|e| e.to_string())?;
             Ok(subscribed.into_iter().map(channel_view_of).collect())
         })
     }
@@ -842,6 +851,12 @@ impl WhatsAppClient {
                 .get_metadata(&channel)
                 .await
                 .map_err(|e| e.to_string())?;
+            if let Some(muted) = meta.muted {
+                live.chat_store
+                    .apply_channel_mutes(vec![(meta.jid.to_string(), muted)])
+                    .map_err(|e| e.to_string())?;
+                live.chat_store.flush().await.map_err(|e| e.to_string())?;
+            }
             Ok(channel_view_of(meta))
         })
     }
@@ -862,6 +877,12 @@ impl WhatsAppClient {
                 .join(&channel)
                 .await
                 .map_err(|e| e.to_string())?;
+            if let Some(muted) = meta.muted {
+                live.chat_store
+                    .apply_channel_mutes(vec![(meta.jid.to_string(), muted)])
+                    .map_err(|e| e.to_string())?;
+                live.chat_store.flush().await.map_err(|e| e.to_string())?;
+            }
             Ok(channel_view_of(meta))
         })
     }
