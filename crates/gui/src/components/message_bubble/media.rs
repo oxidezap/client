@@ -38,6 +38,7 @@ pub(super) struct MediaProps {
     pub is_preparing: bool,
     pub saved_document_path: Option<std::path::PathBuf>,
     pub max_media_size: f32,
+    pub sticker_size: f32,
 }
 
 pub(super) fn render_media_content(
@@ -60,6 +61,7 @@ pub(super) fn render_media_content(
         is_preparing,
         saved_document_path,
         max_media_size,
+        sticker_size,
     } = props;
     match media_content.media_type {
         MediaType::Image => {
@@ -144,11 +146,9 @@ pub(super) fn render_media_content(
             }
         }
         MediaType::Sticker => {
-            let (display_w, display_h) = scale_media_dimensions(
-                media_content.width.unwrap_or(300),
-                media_content.height.unwrap_or(300),
-                max_media_size,
-            );
+            // The whole canvas gets the same box in every loading state.
+            // Contain preserves non-square content and transparent padding.
+            let (display_w, display_h) = (sticker_size, sticker_size);
 
             if media_content.data_is_preview
                 && let Some(format) = still_image_format(&media_content)
@@ -996,6 +996,144 @@ mod tests {
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect();
         MediaContent::sticker(Arc::new(bytes), "image/webp".into(), false, true)
+    }
+
+    // Exercise the actual renderer rather than a second copy of its sizing
+    // formula. Intrinsic dimensions and loading state must not move the box.
+    #[cfg(not(target_family = "wasm"))]
+    #[gpui::test]
+    fn sticker_layout_is_stable_across_dimensions_and_loading_states(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{AppContext as _, InteractiveElement as _, ParentElement as _, Styled as _};
+        use std::io::Cursor;
+        let entity = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            cx.new(super::WhatsAppApp::new)
+        });
+        struct StickerView {
+            app: gpui::Entity<super::WhatsAppApp>,
+            media: MediaContent,
+            cached: Option<Arc<gpui::Image>>,
+            canvas: f32,
+            downloading: bool,
+        }
+        impl gpui::Render for StickerView {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                super::div()
+                    .flex()
+                    .items_start()
+                    .child(super::render_media_content(
+                        super::div().debug_selector(|| "sticker-layout".into()),
+                        self.media.clone(),
+                        "fixture".into(),
+                        false,
+                        self.app.clone(),
+                        super::MediaProps {
+                            video_player_state: None,
+                            video_frame: None,
+                            decoded_image: self.cached.clone(),
+                            audio: None,
+                            playback_speed: 1.0,
+                            listened: None,
+                            is_downloading: self.downloading,
+                            is_preparing: false,
+                            saved_document_path: None,
+                            max_media_size: 300.0,
+                            sticker_size: self.canvas,
+                        },
+                        cx,
+                    ))
+            }
+        }
+        let handle = cx.open_window(gpui::size(super::px(800.), super::px(800.)), |_, _| {
+            StickerView {
+                app: entity,
+                media: webp_sticker(false),
+                cached: None,
+                canvas: 300.0,
+                downloading: false,
+            }
+        });
+        let view = cx.read(|cx| handle.entity(cx).unwrap());
+        let mut window = gpui::VisualTestContext::from_window(handle.into(), cx);
+        let downloadable = oxidezap_core::DownloadableMedia {
+            direct_path: "/synthetic-sticker".into(),
+            media_key: vec![],
+            file_enc_sha256: vec![],
+            file_length: 0,
+            mime_type: "image/webp".into(),
+            duration_secs: None,
+            download_type: wacore::download::MediaType::Image,
+        };
+        for canvas in [96.0, 187.5, 300.0, 450.0] {
+            for (width, height) in [(1, 1), (32, 64), (512, 512), (512, 128), (0, 0)] {
+                let mut rgba = image::RgbaImage::new(width.max(1), height.max(1));
+                // Transparent padding is part of the canvas, not a crop hint.
+                rgba.put_pixel(0, 0, image::Rgba([255, 64, 32, 128]));
+                let mut png = Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgba8(rgba)
+                    .write_to(&mut png, image::ImageFormat::Png)
+                    .unwrap();
+                let preview = MediaContent::sticker(
+                    Arc::new(png.into_inner()),
+                    "image/png".into(),
+                    true,
+                    false,
+                );
+                for state in 0..6 {
+                    let mut media = match state {
+                        0 | 1 => preview.clone(),
+                        2 => webp_sticker(false),
+                        3 => animated_webp_sticker(),
+                        _ => MediaContent::sticker(
+                            Arc::new(vec![]),
+                            "image/webp".into(),
+                            false,
+                            false,
+                        ),
+                    };
+                    media.width = Some(width);
+                    media.height = Some(height);
+                    media.downloadable = Some(downloadable.clone());
+                    let cached = (state == 1 || state == 2 || state == 3).then(|| {
+                        Arc::new(gpui::Image::from_bytes(
+                            if state == 1 {
+                                gpui::ImageFormat::Png
+                            } else {
+                                gpui::ImageFormat::Webp
+                            },
+                            media.data.to_vec(),
+                        ))
+                    });
+                    view.update(&mut window, |view, cx| {
+                        view.media = media;
+                        view.cached = cached;
+                        view.canvas = canvas;
+                        view.downloading = state == 5;
+                        cx.notify();
+                    });
+                    for _ in 0..2 {
+                        window.run_until_parked();
+                        window.update(|window, cx| {
+                            window.refresh();
+                            window.draw(cx).clear(cx);
+                        });
+                        let bounds = window.debug_bounds("sticker-layout").unwrap();
+                        assert_eq!(
+                            bounds.size,
+                            gpui::size(super::px(canvas), super::px(canvas)),
+                            "state {state}, metadata {width}x{height}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
