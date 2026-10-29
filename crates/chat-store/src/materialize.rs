@@ -62,6 +62,8 @@ pub fn message_kind(message: &wa::Message) -> &'static str {
         }
     } else if base.sticker_message.is_set() || base.lottie_sticker_message.is_set() {
         "sticker"
+    } else if base.sticker_pack_message.is_set() {
+        "sticker_pack"
     } else if base.document_message.is_set() {
         "document"
     } else if base.contact_message.is_set() || base.contacts_array_message.is_set() {
@@ -305,10 +307,12 @@ pub(crate) fn extract_text(base: &wa::Message) -> Option<String> {
         };
         return (!body.is_empty()).then_some(body);
     }
-    base.text_content()
-        .or_else(|| base.get_caption())
-        .map(str::to_owned)
-        .or_else(|| crate::shared_contacts_text(base))
+    crate::sticker_pack_text(base).or_else(|| {
+        base.text_content()
+            .or_else(|| base.get_caption())
+            .map(str::to_owned)
+            .or_else(|| crate::shared_contacts_text(base))
+    })
 }
 
 /// Whether the unwrapped message carries anything a chat log should show.
