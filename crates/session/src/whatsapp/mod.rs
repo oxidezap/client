@@ -2709,10 +2709,7 @@ impl WhatsAppClient {
                     .download(
                         &downloadable,
                         if downloadable.is_channel_preview_candidate() {
-                            whatsapp_rust::download::DownloadLimits::new(
-                                DownloadableMedia::CHANNEL_PREVIEW_BYTES,
-                                DownloadableMedia::CHANNEL_PREVIEW_BYTES,
-                            )
+                            crate::net::channel_image_limits()
                         } else {
                             whatsapp_rust::download::DownloadLimits::default()
                         },

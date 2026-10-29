@@ -59,7 +59,7 @@ async fn download_media<T: Downloadable>(
     let limits = if !media.is_encrypted()
         && media.app_info() == whatsapp_rust::wacore::download::MediaType::Image
     {
-        whatsapp_rust::download::DownloadLimits::new(EAGER_MEDIA_BYTES, EAGER_MEDIA_BYTES)
+        crate::net::channel_image_limits()
     } else {
         whatsapp_rust::download::DownloadLimits::default()
     };

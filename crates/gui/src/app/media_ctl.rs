@@ -903,7 +903,9 @@ impl WhatsAppApp {
         message_id: String,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_connected()
+        if !crate::platform::channel_preview::AUTOMATIC
+            || self.visible_chat.as_deref() != Some(chat_jid.as_str())
+            || !self.is_connected()
             || self.downloads_in_flight.len() >= 2
             || self.is_downloading(&message_id)
             || self.channel_preview_attempts.len() >= 256

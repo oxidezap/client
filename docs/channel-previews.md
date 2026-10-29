@@ -13,7 +13,13 @@ in that account session. The attempt set stops growing at 256 entries. Unknown
 or larger images remain manual downloads. This is application policy, not a
 claim that the official client uses those limits.
 
-Native and web use the same metadata, scheduling and daemon download path.
+Native and web preserve the same download metadata and cache identity. Automatic
+fetch is currently native only: the browser HTTP adapter implements buffered
+`fetch`, not the SDK's synchronous streaming reader. Bounded SDK downloads refuse
+that adapter before HTTP, so browser manual downloads retain their existing
+buffered path and automatic attempts are disabled there. A browser attached to a
+native daemon can still manually fetch/cache the full channel image. Adding an
+asynchronous bounded browser media API is a separate dependency-level change.
 Full channel images use the account-scoped content cache. Old `f-<message>`
 entries cannot be trusted: earlier clients treated a channel thumbnail with
 discarded download metadata as a full image and could cache it there. No

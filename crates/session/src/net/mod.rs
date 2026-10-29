@@ -131,3 +131,23 @@ mod tests {
         );
     }
 }
+
+/// The browser adapter has no synchronous streaming reader. Keep its existing
+/// manual buffered path usable; only native can enforce SDK streaming budgets.
+pub(crate) fn channel_image_limits() -> whatsapp_rust::download::DownloadLimits {
+    imp::limits()
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod imp {
+    pub(super) fn limits() -> whatsapp_rust::download::DownloadLimits {
+        let max = oxidezap_core::DownloadableMedia::CHANNEL_PREVIEW_BYTES;
+        whatsapp_rust::download::DownloadLimits::new(max, max)
+    }
+}
+#[cfg(target_family = "wasm")]
+mod imp {
+    pub(super) fn limits() -> whatsapp_rust::download::DownloadLimits {
+        whatsapp_rust::download::DownloadLimits::default()
+    }
+}

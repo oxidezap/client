@@ -203,7 +203,8 @@ fn render_row(
                 return div().into_any_element();
             };
             let message_id = &msg.id;
-            if chat_jid.ends_with("@newsletter")
+            if crate::platform::channel_preview::AUTOMATIC
+                && chat_jid.ends_with("@newsletter")
                 && msg.media.as_ref().is_some_and(|media| {
                     media.media_type == MediaType::Image
                         && (media.data_is_preview || media.data.is_empty())

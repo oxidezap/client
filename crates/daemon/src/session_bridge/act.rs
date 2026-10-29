@@ -2434,6 +2434,8 @@ mod tests {
             direct_path: "/synthetic-never-fetch".into(),
             media_key: vec![0; 32],
             file_enc_sha256: hash,
+            file_sha256: Vec::new(),
+            static_url: None,
             file_length: 3,
             mime_type: "image/png".into(),
             duration_secs: None,
