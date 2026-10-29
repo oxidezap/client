@@ -28,6 +28,7 @@ use oxidezap_core::{DownloadableMedia, MediaType};
 /// that entity again inside it panics; everything the app knows arrives here
 /// instead.
 pub(super) struct MediaProps {
+    pub chat_jid: SharedString,
     pub video_player_state: Option<VideoPlayerState>,
     pub video_frame: Option<Arc<RenderImage>>,
     pub decoded_image: Option<Arc<Image>>,
@@ -38,6 +39,7 @@ pub(super) struct MediaProps {
     pub is_preparing: bool,
     pub saved_document_path: Option<std::path::PathBuf>,
     pub max_media_size: f32,
+    pub sticker_size: f32,
 }
 
 pub(super) fn render_media_content(
@@ -50,6 +52,7 @@ pub(super) fn render_media_content(
     cx: &App,
 ) -> gpui::Div {
     let MediaProps {
+        chat_jid,
         video_player_state,
         video_frame,
         decoded_image,
@@ -60,6 +63,7 @@ pub(super) fn render_media_content(
         is_preparing,
         saved_document_path,
         max_media_size,
+        sticker_size,
     } = props;
     match media_content.media_type {
         MediaType::Image => {
@@ -101,7 +105,7 @@ pub(super) fn render_media_content(
                                 let msg_id = message_id.clone();
                                 let dl = dl.clone();
                                 entity.update(cx, |app, cx| {
-                                    app.download_image(msg_id, dl, cx);
+                                    app.download_image(chat_jid.to_string(), msg_id, dl, cx);
                                 });
                             })
                             .child(image),
@@ -129,6 +133,7 @@ pub(super) fn render_media_content(
                 el.child(render_download_placeholder(
                     "img-dl",
                     "[Image] Tap to download",
+                    chat_jid,
                     message_id,
                     dl,
                     entity,
@@ -144,11 +149,11 @@ pub(super) fn render_media_content(
             }
         }
         MediaType::Sticker => {
-            let (display_w, display_h) = scale_media_dimensions(
-                media_content.width.unwrap_or(300),
-                media_content.height.unwrap_or(300),
-                max_media_size,
-            );
+            // The whole canvas gets the same box in every loading state.
+            // Contain preserves non-square content and transparent padding.
+            // Explicit square aspect ratios below prevent GPUI from replacing
+            // the box's ratio with intrinsic dimensions after decoding.
+            let (display_w, display_h) = (sticker_size, sticker_size);
 
             if media_content.data_is_preview
                 && let Some(format) = still_image_format(&media_content)
@@ -164,6 +169,10 @@ pub(super) fn render_media_content(
                     Some(cached) => img(ImageSource::Image(cached))
                         .w(px(display_w))
                         .h(px(display_h))
+                        .aspect_square()
+                        .when(cfg!(test), |image| {
+                            image.debug_selector(|| "sticker-image".into())
+                        })
                         .object_fit(gpui::ObjectFit::Contain),
                     None => render_image_from_bytes(
                         media_content.data,
@@ -172,7 +181,11 @@ pub(super) fn render_media_content(
                         display_h,
                         cx.product().metrics.radius_lg(),
                         false,
-                    ),
+                    )
+                    .aspect_square()
+                    .when(cfg!(test), |image| {
+                        image.debug_selector(|| "sticker-image".into())
+                    }),
                 };
                 let preview_id: SharedString = format!("sticker-preview-{}", message_id).into();
                 el.child(
@@ -183,7 +196,7 @@ pub(super) fn render_media_content(
                             let msg_id = message_id.clone();
                             let dl = dl.clone();
                             entity.update(cx, |app, cx| {
-                                app.download_image(msg_id, dl, cx);
+                                app.download_image(chat_jid.to_string(), msg_id, dl, cx);
                             });
                         })
                         .child(image),
@@ -192,10 +205,14 @@ pub(super) fn render_media_content(
                 match (sticker_render_kind(&media_content), decoded_image) {
                     (Some(_kind), Some(cached_image)) => {
                         let sticker_id: SharedString = format!("sticker-{}", message_id).into();
-                        let image = img(ImageSource::Image(cached_image))
+                        let image = img(sticker_image_source(cached_image))
                             .id(sticker_id)
                             .w(px(display_w))
                             .h(px(display_h))
+                            .aspect_square()
+                            .when(cfg!(test), |image| {
+                                image.debug_selector(|| "sticker-image".into())
+                            })
                             .object_fit(gpui::ObjectFit::Contain);
                         el.child(image)
                     }
@@ -211,6 +228,10 @@ pub(super) fn render_media_content(
                                 Some(cached) => img(ImageSource::Image(cached))
                                     .w(px(display_w))
                                     .h(px(display_h))
+                                    .aspect_square()
+                                    .when(cfg!(test), |image| {
+                                        image.debug_selector(|| "sticker-image".into())
+                                    })
                                     .object_fit(gpui::ObjectFit::Contain)
                                     .into_any_element(),
                                 None => render_image_from_bytes(
@@ -221,12 +242,17 @@ pub(super) fn render_media_content(
                                     cx.product().metrics.radius_lg(),
                                     false,
                                 )
+                                .aspect_square()
+                                .when(cfg!(test), |image| {
+                                    image.debug_selector(|| "sticker-image".into())
+                                })
                                 .into_any_element(),
                             })
                         } else if let Some(dl) = media_content.downloadable.clone() {
                             el.child(render_download_placeholder(
                                 "sticker-dl",
                                 "[Sticker] Tap to download",
+                                chat_jid,
                                 message_id,
                                 dl,
                                 entity,
@@ -290,6 +316,7 @@ pub(super) fn render_media_content(
 fn render_download_placeholder(
     id_prefix: &str,
     label: &'static str,
+    chat_jid: SharedString,
     message_id: String,
     dl: DownloadableMedia,
     entity: Entity<WhatsAppApp>,
@@ -373,7 +400,7 @@ fn render_download_placeholder(
                 let msg_id = message_id.clone();
                 let dl = dl.clone();
                 entity.update(cx, |app, cx| {
-                    app.download_image(msg_id, dl, cx);
+                    app.download_image(chat_jid.to_string(), msg_id, dl, cx);
                 });
             })
         })
@@ -428,6 +455,53 @@ fn still_image_format(media: &oxidezap_core::MediaContent) -> Option<gpui::Image
         .has_still_image()
         .then(|| mime_to_image_format(&media.mime_type))
         .flatten()
+}
+
+// GPUI's Arc<Image> decoder treats WebP as a still image. Keep the existing
+// encoded-image cache, but load sticker frames through a dedicated asset so
+// repeated renders reuse the decoded frames on desktop and web alike.
+fn sticker_image_source(image: Arc<Image>) -> ImageSource {
+    ImageSource::Custom(Arc::new(move |window, cx| {
+        window.use_asset::<StickerDecoder>(&image, cx)
+    }))
+}
+
+struct StickerDecoder;
+
+impl gpui::Asset for StickerDecoder {
+    type Source = Arc<Image>;
+    type Output = Result<Arc<RenderImage>, gpui::ImageCacheError>;
+
+    fn load(
+        source: Self::Source,
+        cx: &mut App,
+    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+        cx.background_executor()
+            .spawn(async move { decode_sticker(&source.bytes).map_err(Into::into) })
+    }
+}
+
+fn decode_sticker(bytes: &[u8]) -> image::ImageResult<Arc<RenderImage>> {
+    let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))?;
+    let frames: smallvec::SmallVec<[_; 1]> = if decoder.has_animation() {
+        // WhatsApp stickers have a transparent canvas, regardless of ANIM's
+        // background colour. The decoder composites frame offsets/disposal.
+        let _ = decoder.set_background_color(image::Rgba([0, 0, 0, 0]));
+        decoder.into_frames().collect::<image::ImageResult<_>>()?
+    } else {
+        let image = image::DynamicImage::from_decoder(decoder)?.into_rgba8();
+        smallvec::smallvec![image::Frame::new(image)]
+    };
+    let frames: smallvec::SmallVec<[_; 1]> = frames
+        .into_iter()
+        .map(|mut frame| {
+            for pixel in frame.buffer_mut().as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2); // GPUI textures use BGRA.
+            }
+            frame
+        })
+        .collect();
+    Ok(Arc::new(RenderImage::new(frames)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -947,6 +1021,7 @@ fn render_video_player(
 mod tests {
     use std::sync::Arc;
 
+    use gpui::{InteractiveElement as _, Styled as _};
     use oxidezap_core::MediaContent;
 
     use super::{StickerRenderKind, extension_of, format_bytes, sticker_render_kind};
@@ -998,6 +1073,151 @@ mod tests {
         MediaContent::sticker(Arc::new(bytes), "image/webp".into(), false, true)
     }
 
+    // Exercise the actual renderer rather than a second copy of its sizing
+    // formula. Intrinsic dimensions and loading state must not move the box.
+    #[cfg(not(target_family = "wasm"))]
+    #[gpui::test]
+    fn sticker_layout_is_stable_across_dimensions_and_loading_states(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{AppContext as _, InteractiveElement as _, ParentElement as _, Styled as _};
+        use std::io::Cursor;
+        let entity = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            cx.new(super::WhatsAppApp::new)
+        });
+        struct StickerView {
+            app: gpui::Entity<super::WhatsAppApp>,
+            media: MediaContent,
+            cached: Option<Arc<gpui::Image>>,
+            canvas: f32,
+            downloading: bool,
+        }
+        impl gpui::Render for StickerView {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                super::div()
+                    .flex()
+                    .items_start()
+                    .child(super::render_media_content(
+                        super::div().debug_selector(|| "sticker-layout".into()),
+                        self.media.clone(),
+                        "fixture".into(),
+                        false,
+                        self.app.clone(),
+                        super::MediaProps {
+                            video_player_state: None,
+                            video_frame: None,
+                            decoded_image: self.cached.clone(),
+                            audio: None,
+                            playback_speed: 1.0,
+                            listened: None,
+                            is_downloading: self.downloading,
+                            is_preparing: false,
+                            saved_document_path: None,
+                            max_media_size: 300.0,
+                            sticker_size: self.canvas,
+                        },
+                        cx,
+                    ))
+            }
+        }
+        let handle = cx.open_window(gpui::size(super::px(800.), super::px(800.)), |_, _| {
+            StickerView {
+                app: entity,
+                media: webp_sticker(false),
+                cached: None,
+                canvas: 300.0,
+                downloading: false,
+            }
+        });
+        let view = cx.read(|cx| handle.entity(cx).unwrap());
+        let mut window = gpui::VisualTestContext::from_window(handle.into(), cx);
+        let downloadable = oxidezap_core::DownloadableMedia {
+            direct_path: "/synthetic-sticker".into(),
+            media_key: vec![],
+            file_enc_sha256: vec![],
+            file_length: 0,
+            mime_type: "image/webp".into(),
+            duration_secs: None,
+            download_type: wacore::download::MediaType::Image,
+        };
+        for canvas in [96.0, 187.5, 300.0, 450.0] {
+            for (width, height) in [(1, 1), (32, 64), (512, 512), (512, 128), (0, 0)] {
+                let mut rgba = image::RgbaImage::new(width.max(1), height.max(1));
+                // Transparent padding is part of the canvas, not a crop hint.
+                rgba.put_pixel(0, 0, image::Rgba([255, 64, 32, 128]));
+                let mut png = Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgba8(rgba)
+                    .write_to(&mut png, image::ImageFormat::Png)
+                    .unwrap();
+                let preview = MediaContent::sticker(
+                    Arc::new(png.into_inner()),
+                    "image/png".into(),
+                    true,
+                    false,
+                );
+                for state in 0..6 {
+                    let mut media = match state {
+                        0 | 1 => preview.clone(),
+                        2 => webp_sticker(false),
+                        3 => animated_webp_sticker(),
+                        _ => MediaContent::sticker(
+                            Arc::new(vec![]),
+                            "image/webp".into(),
+                            false,
+                            false,
+                        ),
+                    };
+                    media.width = Some(width);
+                    media.height = Some(height);
+                    media.downloadable = Some(downloadable.clone());
+                    let cached = (state == 1 || state == 2 || state == 3).then(|| {
+                        Arc::new(gpui::Image::from_bytes(
+                            if state == 1 {
+                                gpui::ImageFormat::Png
+                            } else {
+                                gpui::ImageFormat::Webp
+                            },
+                            media.data.to_vec(),
+                        ))
+                    });
+                    view.update(&mut window, |view, cx| {
+                        view.media = media;
+                        view.cached = cached;
+                        view.canvas = canvas;
+                        view.downloading = state == 5;
+                        cx.notify();
+                    });
+                    for _ in 0..2 {
+                        window.run_until_parked();
+                        window.update(|window, cx| {
+                            window.refresh();
+                            window.draw(cx).clear(cx);
+                        });
+                        let bounds = window.debug_bounds("sticker-layout").unwrap();
+                        assert_eq!(
+                            bounds.size,
+                            gpui::size(super::px(canvas), super::px(canvas)),
+                            "state {state}, metadata {width}x{height}"
+                        );
+                        if state < 4 {
+                            assert_eq!(
+                                window.debug_bounds("sticker-image").unwrap().size,
+                                gpui::size(super::px(canvas), super::px(canvas)),
+                                "decoded image must stay inside the canvas"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn static_webp_uses_the_dedicated_sticker_path() {
         assert_eq!(
@@ -1017,6 +1237,115 @@ mod tests {
     #[test]
     fn animated_webp_payload_reaches_the_animation_decoder() {
         assert!(super::sticker_payload_is_valid(&animated_webp_sticker()));
+    }
+
+    #[test]
+    fn sticker_decoder_keeps_distinct_frames_and_delays() {
+        let media = animated_webp_sticker();
+        let decoded = super::decode_sticker(&media.data).unwrap();
+        assert_eq!(decoded.frame_count(), 2);
+        assert_ne!(decoded.as_bytes(0), decoded.as_bytes(1));
+        assert_eq!(decoded.delay(0).numer_denom_ms(), (1000, 1));
+        assert_eq!(decoded.delay(1).numer_denom_ms(), (1000, 1));
+    }
+
+    struct StickerTestView(gpui::ImageSource);
+
+    impl gpui::Render for StickerTestView {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::img(self.0.clone()).id("sticker-test").size_full()
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[gpui::test]
+    fn sticker_frames_loop_and_stay_cached_across_renders(cx: &mut gpui::TestAppContext) {
+        let mut media = animated_webp_sticker();
+        // GPUI reads wall-clock Instant for playback, not the test executor's
+        // clock. Shorten only this fixture's frame delays to keep the real
+        // playback regression fast without mocking GPUI's implementation.
+        let bytes = Arc::make_mut(&mut media.data);
+        let mut at = 12;
+        while at + 8 <= bytes.len() {
+            let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            if &bytes[at..at + 4] == b"ANMF" {
+                bytes[at + 20..at + 23].copy_from_slice(&[1, 0, 0]);
+            }
+            at += 8 + size + size % 2;
+        }
+        let image = Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Webp,
+            media.data.to_vec(),
+        ));
+        let source = super::sticker_image_source(image.clone());
+        let handle = cx.open_window(gpui::size(gpui::px(10.), gpui::px(10.)), |_, _| {
+            StickerTestView(source)
+        });
+        let mut window = gpui::VisualTestContext::from_window(handle.into(), cx);
+        window.run_until_parked();
+        window.update(|window, _| window.activate_window());
+        window.run_until_parked();
+        window.update(|window, cx| {
+            assert!(window.is_window_active());
+            assert!(!cx.reduce_motion());
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let first = window.update(|window, cx| {
+            window
+                .use_asset::<super::StickerDecoder>(&image, cx)
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(first.frame_count(), 2);
+        // Probe frame zero under the decoded image's texture id. Removing
+        // textures before every draw prevents stale uploads hiding a restart.
+        let mut probe = gpui::RenderImage::new(smallvec::smallvec![image::Frame::new(
+            image::RgbaImage::new(2, 2)
+        )]);
+        probe.id = first.id;
+        for frame in 1..=6 {
+            window.update(|window, _| window.drop_image(first.clone()).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            window.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            assert_eq!(
+                window.update(|window, _| window.has_image_atlas_entry(&probe)),
+                frame % 2 == 0
+            );
+            let next = window.update(|window, cx| {
+                window
+                    .use_asset::<super::StickerDecoder>(&image, cx)
+                    .unwrap()
+                    .unwrap()
+            });
+            assert!(Arc::ptr_eq(&first, &next));
+        }
+    }
+
+    #[test]
+    fn sticker_decoder_converts_rgba_to_gpui_bgra() {
+        let mut bytes = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
+            .encode(&[255, 64, 32, 128], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let decoded = super::decode_sticker(&bytes).unwrap();
+        assert_eq!(decoded.as_bytes(0).unwrap(), &[32, 64, 255, 128]);
+    }
+
+    #[test]
+    fn sticker_decoder_preserves_static_transparency() {
+        let media = webp_sticker(false);
+        let decoded = super::decode_sticker(&media.data).unwrap();
+        assert_eq!(decoded.frame_count(), 1);
+        assert_eq!(decoded.as_bytes(0).unwrap(), &[0, 0, 0, 0]);
     }
 
     #[test]

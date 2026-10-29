@@ -237,6 +237,26 @@ impl ResponsiveLayout {
         })
     }
 
+    /// A fixed sticker canvas, capped to the space beside the hover actions.
+    /// Reserve the largest action strip so captions do not resize stickers.
+    pub fn sticker_size(&self) -> f32 {
+        let metrics = &self.metrics;
+        let actions = metrics.icon_button() * 3.0 + metrics.space_xxs() * 2.0;
+        // The chat-area estimate includes the navigation rail on two-pane
+        // layouts; it is outside the rendered conversation's available width.
+        let rail = if self.is_mobile() {
+            0.0
+        } else {
+            f32::from(metrics.icon_button() + metrics.space_lg())
+        };
+        let available = self.chat_area_width()
+            - rail
+            - f32::from(self.conversation_padding() * 2.0 + actions + metrics.space_md());
+        let content = available.min(f32::from(self.max_bubble_width()))
+            - f32::from(metrics.bubble_padding_x() * 2.0);
+        f32::from(metrics.sticker_size()).min(content.max(0.0))
+    }
+
     pub fn chat_area_width(&self) -> f32 {
         f32::from(match self.breakpoint {
             Breakpoint::Desktop | Breakpoint::Tablet => self.viewport.width - self.sidebar_width(),
@@ -314,6 +334,54 @@ impl ResponsiveLayout {
             self.metrics.space_md()
         } else {
             self.metrics.space_lg()
+        }
+    }
+}
+
+#[cfg(test)]
+mod sticker_tests {
+    use super::*;
+    use crate::theme::metrics::Density;
+    use gpui::{px, size};
+
+    #[test]
+    fn sticker_canvas_follows_zoom_and_fits_narrow_conversations() {
+        for rem in [10.0, 16.0, 24.0, 32.0] {
+            for density in Density::ALL {
+                let metrics = Metrics::new(rem, density);
+                let wide =
+                    ResponsiveLayout::new(size(px(2400.0), px(1600.0)), MobilePanel::Chat, metrics);
+                assert_eq!(wide.sticker_size(), 300.0 * rem / 16.0);
+                for width in [280.0, 400.0, 600.0, 700.0, 900.0, 1200.0] {
+                    let layout = ResponsiveLayout::new(
+                        size(px(width), px(800.0)),
+                        MobilePanel::Chat,
+                        metrics,
+                    );
+                    let canvas = layout.sticker_size();
+                    assert!(canvas.is_finite() && canvas >= 0.0);
+                    assert!(canvas <= f32::from(metrics.sticker_size()));
+                    assert!(canvas <= f32::from(layout.max_bubble_width()));
+                    if canvas > 0.0 {
+                        let rail = if layout.is_mobile() {
+                            0.0
+                        } else {
+                            f32::from(metrics.icon_button() + metrics.space_lg())
+                        };
+                        assert!(
+                            canvas
+                                + f32::from(
+                                    metrics.bubble_padding_x() * 2.0
+                                        + layout.conversation_padding() * 2.0
+                                        + metrics.icon_button() * 3.0
+                                        + metrics.space_xxs() * 2.0
+                                        + metrics.space_md(),
+                                )
+                                <= layout.chat_area_width() - rail + 0.001
+                        );
+                    }
+                }
+            }
         }
     }
 }

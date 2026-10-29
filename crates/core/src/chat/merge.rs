@@ -189,11 +189,18 @@ impl Chat {
                 && let Some(old_media) = existing.media.as_ref()
                 && !old_media.data.is_empty()
                 && (new_media.data.is_empty()
-                    || (new_media.data_is_preview && !old_media.data_is_preview))
+                    || (new_media.data_is_preview && !old_media.data_is_preview)
+                    || (new_media.data_is_preview
+                        && !new_media.data_is_server_preview
+                        && old_media.data_is_server_preview))
             {
                 new_media.data = Arc::clone(&old_media.data);
                 new_media.mime_type = old_media.mime_type.clone();
                 new_media.data_is_preview = old_media.data_is_preview;
+                new_media.data_is_server_preview = old_media.data_is_server_preview;
+                if new_media.data_is_server_preview && new_media.preview_downloadable.is_none() {
+                    new_media.preview_downloadable = old_media.preview_downloadable.clone();
+                }
             }
             // Live-only state the store doesn't carry must also survive the
             // replace: a delivery state the hydrated row has not caught up
@@ -940,6 +947,39 @@ mod tests {
         let media = chat.messages[0].media.as_ref().unwrap();
         assert_eq!(*media.data, vec![1, 2, 3]);
         assert!(!media.data_is_preview);
+    }
+
+    #[test]
+    fn hydration_keeps_server_preview_bytes_metadata_and_quality_over_inline() {
+        let full: crate::DownloadableMedia = serde_json::from_value(serde_json::json!({
+            "direct_path":"/v/original", "media_key":[], "file_enc_sha256":[],
+            "file_sha256":vec![7;32], "file_length":1024, "mime_type":"image/webp",
+            "duration_secs":null, "download_type":"image"
+        }))
+        .unwrap();
+        let mut hq = full.clone();
+        hq.file_sha256 = vec![8; 32];
+        hq.is_thumbnail = true;
+        let mut media = make_media(vec![1, 2], true).with_download(Some(full.clone()));
+        media.preview_downloadable = Some(hq.clone());
+        media.adopt_server_preview(Arc::new(vec![3, 4, 5]));
+        let mut chat = Chat::new("channel@newsletter".into());
+        let mut live = make_message("42", 1000);
+        live.media = Some(media);
+        chat.add_message(live);
+        for inline in [vec![1], vec![]] {
+            let mut hydrated = make_message("42", 1000);
+            hydrated.media = Some(make_media(inline, true).with_download(Some(full.clone())));
+            chat.insert_history_message(hydrated);
+            let media = chat.messages[0].media.as_ref().unwrap();
+            assert_eq!(media.data.as_slice(), [3, 4, 5]);
+            assert!(media.data_is_preview && media.data_is_server_preview);
+            assert_eq!(media.preview_downloadable, Some(hq.clone()));
+            assert!(
+                media.is_releasable(),
+                "grafted HQ bytes still share retention budget"
+            );
+        }
     }
 
     #[test]

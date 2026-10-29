@@ -93,7 +93,10 @@ pub(super) fn apply_receipt(
             };
             let unread = count_unread(conn, device_id, &chat, &state)?;
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::unread_count.eq(unread))
+                .set((
+                    schema::chats::unread_count.eq(unread),
+                    schema::chats::unread_initialized.eq(true),
+                ))
                 .execute(conn)?;
             cs.chats = true;
             return Ok(());

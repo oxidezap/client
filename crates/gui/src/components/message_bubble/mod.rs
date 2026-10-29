@@ -297,6 +297,7 @@ pub fn render_message_bubble(
                                         is_playing,
                                         entity.clone(),
                                         MediaProps {
+                                            chat_jid: props.chat_jid.clone(),
                                             video_player_state: props.video_player_state,
                                             video_frame: props.video_frame.clone(),
                                             decoded_image: props.decoded_image.clone(),
@@ -310,6 +311,7 @@ pub fn render_message_bubble(
                                             is_preparing: props.is_preparing,
                                             saved_document_path: props.saved_document_path.clone(),
                                             max_media_size: layout.max_media_size(),
+                                            sticker_size: layout.sticker_size(),
                                         },
                                         cx,
                                     )

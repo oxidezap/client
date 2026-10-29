@@ -79,6 +79,7 @@ pub(crate) enum NameLookup {
     Found {
         name: String,
         hierarchy: Option<oxidezap_core::GroupHierarchy>,
+        muted: Option<bool>,
     },
     /// The request failed. A global failure is a server-directed throttle;
     /// other failures cool only this chat.
@@ -89,6 +90,12 @@ pub(crate) enum NameLookup {
 }
 
 /// The group fields the resolver needs from an authoritative engine overview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedChannel {
+    name: String,
+    muted: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedGroupOverview {
     subject: Option<String>,
@@ -128,7 +135,7 @@ pub(crate) trait MetadataSource {
     ) -> impl Future<Output = Result<HashMap<String, ResolvedGroupOverview>, NameRetry>> + MaybeSend;
     fn subscribed_channels(
         &self,
-    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend;
+    ) -> impl Future<Output = Result<HashMap<String, ResolvedChannel>, NameRetry>> + MaybeSend;
     fn channel_name(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend;
 }
 
@@ -149,6 +156,7 @@ impl MetadataSource for Client {
                         NameLookup::Found {
                             name: meta.subject.unwrap_or_default(),
                             hierarchy: group_hierarchy(&meta.hierarchy, &meta.id),
+                            muted: None,
                         }
                     }
                     Some(_) | None => NameLookup::Failed {
@@ -194,12 +202,20 @@ impl MetadataSource for Client {
     #[allow(clippy::manual_async_fn)]
     fn subscribed_channels(
         &self,
-    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
+    ) -> impl Future<Output = Result<HashMap<String, ResolvedChannel>, NameRetry>> + MaybeSend {
         async move {
             match self.newsletter().list_subscribed().await {
                 Ok(subscribed) => Ok(subscribed
                     .into_iter()
-                    .map(|meta| (meta.jid.to_string(), meta.name))
+                    .map(|meta| {
+                        (
+                            meta.jid.to_string(),
+                            ResolvedChannel {
+                                name: meta.name,
+                                muted: meta.muted,
+                            },
+                        )
+                    })
                     .collect()),
                 Err(e) => Err(name_retry_after(&e)),
             }
@@ -213,6 +229,7 @@ impl MetadataSource for Client {
                 Ok(meta) => NameLookup::Found {
                     name: meta.name,
                     hierarchy: None,
+                    muted: meta.muted,
                 },
                 Err(e) => {
                     let retry = name_retry_after(&e);
@@ -319,7 +336,7 @@ impl<T: MetadataSource + ?Sized> MetadataSource for Arc<T> {
 
     fn subscribed_channels(
         &self,
-    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
+    ) -> impl Future<Output = Result<HashMap<String, ResolvedChannel>, NameRetry>> + MaybeSend {
         (**self).subscribed_channels()
     }
 
@@ -882,6 +899,8 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     // retries after the delay rather than on the next message.
     let mut settled: Vec<(String, Option<String>)> = Vec::new();
     let mut resolved: Vec<oxidezap_chat_store::ChatNameWrite> = Vec::new();
+    let mut resolved_mutes = Vec::new();
+    let mut pre_channel_mutes = Default::default();
     let mut resolved_hierarchies: Vec<oxidezap_chat_store::GroupHierarchyWrite> = Vec::new();
     let mut failed: Vec<(String, std::time::Duration)> = Vec::new();
     let mut global_backoff: Option<std::time::Duration> = None;
@@ -983,7 +1002,9 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         }
         for (jid, name) in answered {
             match name {
-                NameLookup::Found { name, hierarchy } => {
+                NameLookup::Found {
+                    name, hierarchy, ..
+                } => {
                     let name = name.trim().to_owned();
                     let key = jid.to_string();
                     settled.push((key.clone(), usable_name(&name).then(|| name.clone())));
@@ -1050,6 +1071,14 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         // failure of the cheapest call into per-channel requests for all
         // of them, exactly while the service is down. On failure the whole
         // channel half stays pending (cooled per chat) for a later pass.
+        pre_channel_mutes = match chat_store.channel_mute_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                warn!("channel mute snapshot failed: {e}");
+                retry_after_store_failure(resolver, signal, &request, stop).await;
+                return;
+            }
+        };
         let listed = source.subscribed_channels();
         tokio::pin!(listed);
         let listed = tokio::select! {
@@ -1061,8 +1090,11 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 let mut fallback: Vec<Jid> = Vec::new();
                 for jid in channels {
                     match subscribed.get(&jid.to_string()) {
-                        Some(name) => {
-                            let name = name.trim().to_owned();
+                        Some(meta) => {
+                            if let Some(muted) = meta.muted {
+                                resolved_mutes.push((jid.to_string(), muted));
+                            }
+                            let name = meta.name.trim().to_owned();
                             let key = jid.to_string();
                             settled.push((key.clone(), usable_name(&name).then(|| name.clone())));
                             if usable_name(&name) {
@@ -1104,7 +1136,10 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                     }
                     for (jid, name) in answered {
                         match name {
-                            NameLookup::Found { name, .. } => {
+                            NameLookup::Found { name, muted, .. } => {
+                                if let Some(muted) = muted {
+                                    resolved_mutes.push((jid.to_string(), muted));
+                                }
                                 let name = name.trim().to_owned();
                                 let key = jid.to_string();
                                 settled
@@ -1186,6 +1221,12 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             queue_error = Some(e);
         }
         if queue_error.is_none()
+            && let Err(e) =
+                chat_store.apply_channel_mute_metadata(resolved_mutes.clone(), pre_channel_mutes)
+        {
+            queue_error = Some(e);
+        }
+        if queue_error.is_none()
             && !resolved_hierarchies.is_empty()
             && let Err(e) = chat_store.apply_group_hierarchies(resolved_hierarchies.clone())
         {
@@ -1205,7 +1246,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         warn!("chat-name resolver could not queue resolved names: {e}");
         return;
     }
-    if !resolved.is_empty() || !resolved_hierarchies.is_empty() {
+    if !resolved.is_empty() || !resolved_hierarchies.is_empty() || !resolved_mutes.is_empty() {
         let flushed = chat_store.flush();
         tokio::pin!(flushed);
         let flushed = tokio::select! {
@@ -1411,6 +1452,7 @@ mod tests {
         groups: StdMutex<HashMap<String, String>>,
         group_hierarchies: StdMutex<HashMap<String, oxidezap_core::GroupHierarchy>>,
         channels: StdMutex<HashMap<String, String>>,
+        channel_mutes: StdMutex<HashMap<String, bool>>,
         listed: StdMutex<Option<HashMap<String, String>>>,
         participating_groups: StdMutex<Option<HashMap<String, ResolvedGroupOverview>>>,
         group_list_calls: AtomicUsize,
@@ -1426,6 +1468,7 @@ mod tests {
                 groups: StdMutex::new(HashMap::new()),
                 group_hierarchies: StdMutex::new(HashMap::new()),
                 channels: StdMutex::new(HashMap::new()),
+                channel_mutes: StdMutex::new(HashMap::new()),
                 listed: StdMutex::new(Some(HashMap::new())),
                 participating_groups: StdMutex::new(Some(HashMap::new())),
                 group_list_calls: AtomicUsize::new(0),
@@ -1513,6 +1556,7 @@ mod tests {
                 {
                     Some(name) => NameLookup::Found {
                         name,
+                        muted: None,
                         hierarchy: self
                             .group_hierarchies
                             .lock()
@@ -1553,7 +1597,8 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn subscribed_channels(
             &self,
-        ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
+        ) -> impl Future<Output = Result<HashMap<String, ResolvedChannel>, NameRetry>> + MaybeSend
+        {
             let listed = if self.fail_list.load(Ordering::Relaxed) {
                 Err(NameRetry {
                     retry_after: NAME_RETRY_COOLDOWN,
@@ -1569,7 +1614,17 @@ mod tests {
                         scope: RetryScope::Chat,
                     })
             };
-            async move { listed }
+            let mutes = self.channel_mutes.lock().unwrap().clone();
+            async move {
+                listed.map(|rows| {
+                    rows.into_iter()
+                        .map(|(jid, name)| {
+                            let muted = mutes.get(&jid).copied();
+                            (jid, ResolvedChannel { name, muted })
+                        })
+                        .collect()
+                })
+            }
         }
 
         #[allow(clippy::manual_async_fn)]
@@ -1590,6 +1645,12 @@ mod tests {
                     Some(name) => NameLookup::Found {
                         name,
                         hierarchy: None,
+                        muted: self
+                            .channel_mutes
+                            .lock()
+                            .unwrap()
+                            .get(&jid.to_string())
+                            .copied(),
                     },
                     None => NameLookup::Failed {
                         retry_after: NAME_RETRY_COOLDOWN,
@@ -2381,7 +2442,7 @@ mod tests {
             #[allow(clippy::manual_async_fn)]
             fn subscribed_channels(
                 &self,
-            ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend
+            ) -> impl Future<Output = Result<HashMap<String, ResolvedChannel>, NameRetry>> + MaybeSend
             {
                 async move { Ok(HashMap::new()) }
             }
@@ -2609,5 +2670,35 @@ mod tests {
             !resolver.needs(GROUP, signal.generation()),
             "a blank answer still settles the generation"
         );
+    }
+    #[tokio::test]
+    async fn channel_metadata_updates_mute_even_when_name_was_already_known() {
+        let store = test_store("channel-mute-metadata").await;
+        feed(&store, group_message(CHANNEL, "MSG-CHANNEL-MUTE")).await;
+        let source = FakeMeta::with_channel(CHANNEL, "Announcements", true);
+        let signal = ChatNameResolveSignal::new();
+        let mut resolver = NameResolver::new();
+        for muted in [true, false] {
+            source
+                .channel_mutes
+                .lock()
+                .unwrap()
+                .insert(CHANNEL.into(), muted);
+            signal.new_connection();
+            drive(
+                &source,
+                &store,
+                &signal,
+                &mut resolver,
+                named_request(&[CHANNEL]),
+            )
+            .await;
+            let policy = store
+                .notification_metadata(&CHANNEL.parse().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(policy.muted, muted);
+        }
     }
 }

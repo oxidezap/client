@@ -18,6 +18,8 @@ pub enum MessageKind {
     /// Push-to-talk voice note ("ptt").
     VoiceNote,
     Sticker,
+    /// A downloadable pack archive, distinct from an individual sticker.
+    StickerPack,
     Document,
     Contact,
     Location,
@@ -79,6 +81,7 @@ impl MessageKind {
             Self::Audio => "audio",
             Self::VoiceNote => "ptt",
             Self::Sticker => "sticker",
+            Self::StickerPack => "sticker_pack",
             Self::Document => "document",
             Self::Contact => "contact",
             Self::Location => "location",
@@ -126,6 +129,7 @@ impl MessageKind {
             "audio" => Self::Audio,
             "ptt" => Self::VoiceNote,
             "sticker" => Self::Sticker,
+            "sticker_pack" => Self::StickerPack,
             "document" => Self::Document,
             "contact" => Self::Contact,
             "location" => Self::Location,
@@ -291,6 +295,7 @@ impl ChatArchiveFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatNotificationMetadata {
     pub muted: bool,
+    pub muted_until_ms: Option<i64>,
     pub archived: bool,
     pub allowed: bool,
     pub name: Option<String>,
@@ -644,3 +649,7 @@ pub enum StoreChange {
     /// Contact naming changed.
     Contacts,
 }
+
+/// Per-channel monotonic mute revision captured before a metadata request.
+/// Missing rows have revision zero, until their first observed mute decision.
+pub type ChannelMuteSnapshot = std::collections::BTreeMap<String, i64>;

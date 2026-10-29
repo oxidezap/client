@@ -534,6 +534,10 @@ tokens! {
     media_max_size = scaled(300.0);
     media_max_size_compact = scaled(280.0);
 
+    /// A sticker's square canvas, independent of encoded or declared size.
+    /// Retains the existing 300px nominal media size at the reference rem.
+    sticker_size = scaled(300.0);
+
     // ---- other --------------------------------------------------------
 
     /// The pairing code, which is content rather than chrome.

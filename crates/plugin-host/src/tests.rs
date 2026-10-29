@@ -165,6 +165,7 @@ fn message(chat: &str, text: &str) -> UiEvent {
         notification_allowed: false,
         notification_title: None,
         notification_archived: None,
+        chat_muted_until_ms: None,
     }
 }
 

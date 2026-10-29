@@ -174,7 +174,7 @@ pub(super) fn apply_event(
                 .unwrap_or(false)
                 .then(|| update.timestamp.timestamp_millis());
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
-            ensure_chat(conn, device_id, &chat)?;
+            crate::store::chat_rows::ensure_preference_chat(conn, device_id, &chat)?;
             // Only when it is news, the same rule the subject change already
             // holds: the server redistributes app-state mutations on every
             // resync, and a pin the row already carries would buy a full
@@ -200,37 +200,39 @@ pub(super) fn apply_event(
                 // Missing is not an explicit unmute or app-state authority.
                 return Ok(());
             };
-            let muted_until = if muted {
-                // Absent or non-positive (WA Web sends -1 for indefinite,
-                // this crate's own mute_chat() included) = muted forever.
-                Some(
-                    update
-                        .action
-                        .mute_end_timestamp
-                        .filter(|&ts| ts > 0)
-                        .unwrap_or(i64::MAX),
-                )
-            } else {
-                None
+            let muted_until = match (muted, update.action.mute_end_timestamp) {
+                (false, _) => None,
+                // WA Web rejects a mute without its timestamp. Zero means
+                // unmuted, -1 is indefinite, positive values are unix ms.
+                (true, None) => return Ok(()),
+                (true, Some(0)) => None,
+                (true, Some(until)) if until < 0 => Some(i64::MAX),
+                (true, Some(until)) => Some(until),
             };
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
-            ensure_chat(conn, device_id, &chat)?;
-            let (stored, seen): (Option<i64>, bool) = chat_row(device_id, &chat)
+            crate::store::chat_rows::ensure_preference_chat(conn, device_id, &chat)?;
+            let (stored, seen, revision): (Option<i64>, bool, i64) = chat_row(device_id, &chat)
                 .select((
                     schema::chats::muted_until,
                     schema::chats::mute_appstate_seen,
+                    schema::chats::mute_revision,
                 ))
                 .first(conn)?;
-            if stored == muted_until && seen {
-                return Ok(());
-            }
+            let next_revision = revision.checked_add(1).ok_or_else(|| {
+                diesel::result::Error::SerializationError("mute revision exhausted".into())
+            })?;
             diesel::update(chat_row(device_id, &chat))
                 .set((
                     schema::chats::muted_until.eq(muted_until),
                     schema::chats::mute_appstate_seen.eq(true),
+                    schema::chats::mute_revision.eq(next_revision),
                 ))
                 .execute(conn)?;
-            cs.chats = true;
+            // A muted row may be past the first page. Reload this identity
+            // directly so the tray and existing windows receive the change.
+            if stored != muted_until || !seen {
+                cs.message_chats.insert(chat);
+            }
             Ok(())
         }
         Event::ArchiveUpdate(update) => {
@@ -239,7 +241,7 @@ pub(super) fn apply_event(
                 return Ok(());
             };
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
-            ensure_chat(conn, device_id, &chat)?;
+            crate::store::chat_rows::ensure_preference_chat(conn, device_id, &chat)?;
             let (stored, seen): (bool, bool) = chat_row(device_id, &chat)
                 .select((
                     schema::chats::archived,
@@ -343,7 +345,10 @@ pub(super) fn apply_event(
                     recompute_chat_preview(conn, device_id, &chat)?;
                     let unread = count_uncovered_incoming(conn, device_id, &chat, bound)?;
                     diesel::update(chat_row(device_id, &chat))
-                        .set(schema::chats::unread_count.eq(unread))
+                        .set((
+                            schema::chats::unread_count.eq(unread),
+                            schema::chats::unread_initialized.eq(true),
+                        ))
                         .execute(conn)?;
                 }
                 _ => {
@@ -375,7 +380,10 @@ pub(super) fn apply_event(
                 None => 0,
             };
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::unread_count.eq(unread))
+                .set((
+                    schema::chats::unread_count.eq(unread),
+                    schema::chats::unread_initialized.eq(true),
+                ))
                 .execute(conn)?;
             cs.chats = true;
             cs.message_chats.insert(chat);

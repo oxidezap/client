@@ -49,7 +49,7 @@ pub fn render_connected_view(
         &plugin_ctx,
         cx,
     );
-    let selected_jid = app.selected_chat_jid();
+    let selected_jid = app.selected_destination_jid();
     // Cloned rather than borrowed: building the timeline's rows below needs
     // the app mutably, and these are handles — a clone is a refcount.
     let chat_list_scroll = app.chat_list_scroll().clone();
@@ -72,7 +72,7 @@ pub fn render_connected_view(
     // fullscreen viewer covers whatever is underneath it — a picture at the
     // size of the window is a mode, so the timeline behind it is no more
     // visible than a chat on another screen.
-    let visible = (app.destination() == Destination::Chats
+    let visible = (app.destination().has_conversations()
         && layout.show_chat_area()
         && !app.paste_preview_showing()
         && app.media_viewer(cx).is_none())
@@ -91,6 +91,8 @@ pub fn render_connected_view(
     let list_selected_jid = app.chat_list_selection_jid(&chat_list_cache);
     let list_props = ChatListProps {
         cache: chat_list_cache,
+        destination: app.destination(),
+        loading: app.chat_list_loading(cx),
         selected_jid: list_selected_jid,
         filter: app.chat_filter(),
         unread_count: app.unread_chat_count(),
@@ -105,7 +107,8 @@ pub fn render_connected_view(
     // unread chat — can be on a page nobody has fetched. An empty list is at
     // its end by definition, so it asks like any other list that is; the
     // paging state is what stops it asking twice, and `Done` is what ends it.
-    if app.chat_list_is_empty(cx) || app.is_searching(cx) {
+    if app.destination().has_conversations() && (app.chat_list_is_empty(cx) || app.is_searching(cx))
+    {
         app.want_more_chats(cx);
     }
 
@@ -243,8 +246,8 @@ pub fn render_connected_view(
     // that made it, the offline strip takes its place, and on a phone the
     // list and the conversation are one slot. See `sync_overlay_focus`.
     app.note_keyboard_surfaces(crate::app::KeyboardSurfaces {
-        chat_list: destination == Destination::Chats && layout.show_sidebar(),
-        composer: destination == Destination::Chats
+        chat_list: destination.has_conversations() && layout.show_sidebar(),
+        composer: destination.has_conversations()
             && layout.show_chat_area()
             && open_chat.is_some()
             && !is_offline,
@@ -259,8 +262,12 @@ pub fn render_connected_view(
 
     let rail = render_nav_rail(
         destination,
-        unread_chats,
-        unseen_status,
+        [
+            unread_chats,
+            unseen_status,
+            app.unread_destination_count(Destination::Channels),
+            app.unread_destination_count(Destination::Communities),
+        ],
         entity.clone(),
         layout,
         cx,

@@ -257,6 +257,9 @@ fn bump_chat_target(
 ) -> QueryResult<()> {
     use schema::chats::dsl;
     ensure_chat(conn, device_id, chat)?;
+    diesel::update(chat_row(device_id, chat).filter(dsl::unread_initialized.eq(false)))
+        .set(dsl::unread_initialized.eq(true))
+        .execute(conn)?;
     // Ordering timestamp is monotonic on its own...
     diesel::update(chat_row(device_id, chat).filter(dsl::last_message_ts.le(bump.ts_ms)))
         .set(dsl::last_message_ts.eq(bump.ts_ms))
@@ -292,6 +295,25 @@ pub(super) fn ensure_chat(
     Ok(())
 }
 
+/// Preferences can arrive before the initial unread/history snapshot.
+/// Existing rows retain their established unread ownership.
+pub(super) fn ensure_preference_chat(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+) -> QueryResult<()> {
+    use schema::chats::dsl;
+    diesel::insert_into(dsl::chats)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::jid.eq(chat),
+            dsl::unread_initialized.eq(false),
+        ))
+        .on_conflict_do_nothing()
+        .execute(conn)?;
+    Ok(())
+}
+
 /// Union a split pair's chat rows into `dest` and drop `src` (the message
 /// rows have already moved). Activity and preview re-derive from the merged
 /// messages; the self-read state is the union of both sides so neither
@@ -319,6 +341,8 @@ pub(crate) fn merge_chat_metadata(
         bool,
         bool,
         Option<String>,
+        i64,
+        bool,
     );
     let prefs = |conn: &mut SqliteConnection, key: &str| -> QueryResult<Option<PrefRow>> {
         chat_row(device_id, key)
@@ -334,6 +358,8 @@ pub(crate) fn merge_chat_metadata(
                 dsl::archive_appstate_seen,
                 dsl::name_from_address_book,
                 dsl::address_book_fallback,
+                dsl::mute_revision,
+                dsl::unread_initialized,
             ))
             .first(conn)
             .optional()
@@ -342,9 +368,10 @@ pub(crate) fn merge_chat_metadata(
         return Ok(());
     };
     let src_state = read_state(conn, device_id, src)?;
+    let dest_before = prefs(conn, dest)?;
     ensure_chat(conn, device_id, dest)?;
-    let dest_row = prefs(conn, dest)?.unwrap_or((
-        0, 0, None, None, false, None, None, false, false, false, None,
+    let dest_row = dest_before.unwrap_or((
+        0, 0, None, None, false, None, None, false, false, false, None, 0, false,
     ));
     let dest_state = read_state(conn, device_id, dest)?;
 
@@ -393,6 +420,7 @@ pub(crate) fn merge_chat_metadata(
         .set((
             dsl::last_message_ts.eq(src_row.0.max(dest_row.0)),
             dsl::unread_count.eq(unread),
+            dsl::unread_initialized.eq(src_row.12 || dest_row.12),
             dsl::pinned_at.eq(dest_row.2.or(src_row.2)),
             dsl::muted_until.eq(muted_until),
             dsl::archived.eq(archived),
@@ -401,6 +429,7 @@ pub(crate) fn merge_chat_metadata(
             dsl::name_from_address_book.eq(name_from_address_book),
             dsl::address_book_fallback.eq(address_book_fallback),
             dsl::mute_appstate_seen.eq(dest_row.7 || src_row.7),
+            dsl::mute_revision.eq(src_row.11.max(dest_row.11).saturating_add(1)),
             dsl::archive_appstate_seen.eq(dest_row.8 || src_row.8),
             dsl::read_boundary_ms.eq(merged.watermark_ms),
             dsl::read_boundary_ids.eq(ids_json),

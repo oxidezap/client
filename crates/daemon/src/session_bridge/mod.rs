@@ -338,13 +338,19 @@ pub async fn run(
     let mut stopping = false;
 
     tokio::pin!(shutdown);
+    let mute_timer = wait_for_mute_expiry(bridge.hub.clone());
+    tokio::pin!(mute_timer);
     loop {
         tokio::select! {
+            () = &mut mute_timer => {
+                mute_timer.set(wait_for_mute_expiry(bridge.hub.clone()));
+            },
             event = events.recv() => match event {
                 Some(event) => {
                     if let Answer::Decline(call_id) = bridge.observe(event) {
                         client.decline_call(&call_id);
                     }
+                    mute_timer.set(wait_for_mute_expiry(bridge.hub.clone()));
                 }
                 // The session dropped its sender: the run loop is gone and no
                 // further event can arrive.
@@ -372,6 +378,7 @@ pub async fn run(
             command = commands.recv(), if !commands_closed => match command {
                 Some(command) => {
                     bridge.execute(&client, command).await;
+                    mute_timer.set(wait_for_mute_expiry(bridge.hub.clone()));
                     // Asked to stop and be reset or removed: stop here so the
                     // teardown below runs before anything touches the row
                     // it is closing.
@@ -741,5 +748,21 @@ impl Bridge {
         self.reads
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Refresh time-dependent attention and wait for its next possible change.
+/// Video frames do not reset this timer or scan the conversation list.
+async fn wait_for_mute_expiry(hub: Arc<StateHub>) {
+    let now_ms = wacore::time::now_utc().timestamp_millis();
+    hub.refresh_tray();
+    match hub.next_mute_expiry(now_ms) {
+        Some(until) => {
+            oxidezap_platform::sleep(std::time::Duration::from_millis(
+                (until - now_ms).clamp(1, 60_000) as u64,
+            ))
+            .await
+        }
+        None => std::future::pending::<()>().await,
     }
 }
