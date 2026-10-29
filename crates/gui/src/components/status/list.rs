@@ -129,16 +129,22 @@ struct StatusRows {
 
 impl gpui::RenderOnce for StatusRows {
     fn render(self, window: &mut gpui::Window, cx: &mut App) -> impl IntoElement {
-        // GPUI's Tab order comes from mounted buttons. Keep every contact
-        // mounted during keyboard navigation so offscreen contacts remain
-        // reachable, as in the original eager list.
-        render_rows(
-            self.props,
-            self.entity,
-            self.layout,
-            window.last_input_was_keyboard(),
-            cx,
-        )
+        let focus = window
+            .use_keyed_state("status-list-focus", cx, |_, cx| {
+                cx.focus_handle().tab_stop(false)
+            })
+            .read(cx)
+            .clone();
+        // Keep the complete focus/accessibility tree while it is being used.
+        // A mouse move must not unmount a keyboard-focused contact.
+        let eager = window.last_input_was_keyboard()
+            || window.is_a11y_active()
+            || focus.contains_focused(window, cx);
+        div()
+            .id("status-list-focus")
+            .size_full()
+            .track_focus(&focus)
+            .child(render_rows(self.props, self.entity, self.layout, eager, cx))
     }
 }
 
@@ -148,7 +154,7 @@ fn render_rows(
     props: StatusListProps,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
-    keyboard: bool,
+    eager: bool,
     cx: &App,
 ) -> gpui::AnyElement {
     let metrics = *layout.metrics();
@@ -159,10 +165,9 @@ fn render_rows(
         + metrics.space_sm()
         + metrics.space_lg() * 2.
         + section_height(metrics);
-    if keyboard
-        || authors == 0
-        || content_height <= layout.viewport().height - metrics.sidebar_header_height()
-    {
+    let long_list =
+        authors > 0 && content_height > layout.viewport().height - metrics.sidebar_header_height();
+    if eager || !long_list {
         return div()
             .id("status-list")
             .size_full()
@@ -174,7 +179,7 @@ fn render_rows(
                     .flex_col()
                     .px(metrics.space_md())
                     .pb(metrics.space_lg())
-                    .child(render_mine(&props, entity.clone(), layout, false, cx))
+                    .child(render_mine(&props, entity.clone(), layout, long_list, cx))
                     .children(render_recent(&props, entity, layout, cx)),
             )
             .into_any_element();
@@ -397,6 +402,7 @@ fn render_author_row(
     // the only thing this screen does, and a chat row at least has ↑↓ and the
     // list's own selection behind it. This has nothing else.
     Button::new(SharedString::from(format!("status-{jid}")))
+        .debug_selector(|| format!("status-{jid}"))
         .ghost()
         .selected(is_selected)
         .w_full()
@@ -569,18 +575,17 @@ mod visible_cost {
         feed: StatusFeed,
         app: Entity<WhatsAppApp>,
         scroll: gpui::ScrollHandle,
+        metrics: Metrics,
+        selected: StatusSelection,
     }
     impl Render for Pane {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let layout = ResponsiveLayout::new(
-                size(px(320.), px(600.)),
-                MobilePanel::ChatList,
-                Metrics::default(),
-            );
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let layout =
+                ResponsiveLayout::new(window.viewport_size(), MobilePanel::ChatList, self.metrics);
             render_status_list(
                 StatusListProps {
                     feed: self.feed.clone(),
-                    selected: StatusSelection::None,
+                    selected: self.selected.clone(),
                     scroll: self.scroll.clone(),
                 },
                 self.app.clone(),
@@ -647,6 +652,8 @@ mod visible_cost {
         let window = cx.open_window(size(px(320.), px(600.)), |_, cx| Pane {
             feed,
             app: cx.new(WhatsAppApp::new),
+            metrics: Metrics::default(),
+            selected: StatusSelection::None,
             scroll: scroll.clone(),
         });
         cx.run_until_parked();
@@ -694,6 +701,203 @@ mod visible_cost {
     }
 
     #[gpui::test]
+    fn status_modality_and_resize_preserve_focus_selection_and_scroll(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut chat = oxidezap_core::Chat::new("status@broadcast".into());
+        for n in 0..100 {
+            chat.messages.push(oxidezap_core::ChatMessage::new_incoming(
+                format!("S-{n}"),
+                format!("contact-{n}@s.whatsapp.net"),
+                "Synthetic update".into(),
+            ));
+        }
+        // Multiple updates group into one row; our own updates add a separate
+        // focusable header without changing the contact geometry.
+        for n in 0..100 {
+            chat.messages.push(oxidezap_core::ChatMessage::new_incoming(
+                format!("second-{n}"),
+                format!("contact-{n}@s.whatsapp.net"),
+                "Second synthetic update".into(),
+            ));
+        }
+        chat.messages.push(oxidezap_core::ChatMessage::new_outgoing(
+            "mine".into(),
+            "My synthetic update".into(),
+        ));
+        let feed = StatusFeed::from_chat(&chat);
+        assert_eq!(feed.authors().len(), 100);
+        assert!(feed.authors().iter().all(|author| author.count() == 2));
+        assert_eq!(feed.mine().unwrap().count(), 1);
+        let selected = StatusSelection::Author(feed.authors()[1].jid.clone());
+        let scroll = gpui::ScrollHandle::new();
+        let window = cx.open_window(size(px(320.), px(600.)), |_, cx| Pane {
+            feed,
+            app: cx.new(WhatsAppApp::new),
+            scroll: scroll.clone(),
+            metrics: Metrics::default(),
+            selected: selected.clone(),
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(window.into(), "tab");
+        let focused = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                window.focus_next(cx);
+                window.focused(cx).unwrap()
+            })
+            .unwrap();
+        let expected_next = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                window.focus_next(cx);
+                let next = window.focused(cx).unwrap();
+                window.focus_prev(cx);
+                assert_eq!(window.focused(cx).as_ref(), Some(&focused));
+                next
+            })
+            .unwrap();
+        super::tests::CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+        scroll.set_offset(gpui::point(px(0.), -px(1000.)));
+        let before = scroll.offset();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    position: gpui::point(px(10.), px(10.)),
+                    modifiers: gpui::Modifiers::default(),
+                    pressed_button: None,
+                }),
+                cx,
+            );
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(!window.last_input_was_keyboard());
+            assert_eq!(window.focused(cx).as_ref(), Some(&focused));
+        })
+        .unwrap();
+        let mounted = super::tests::CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+        assert_eq!(
+            mounted.len(),
+            101,
+            "focused rows must remain mounted after a mouse move"
+        );
+        assert_eq!(scroll.offset(), before);
+        window
+            .update(cx, |pane, _, cx| {
+                assert_eq!(pane.selected, selected);
+                pane.metrics = Metrics::new(24., crate::theme::metrics::Density::Compact);
+                cx.notify();
+            })
+            .unwrap();
+        cx.simulate_window_resize(window.into(), size(px(240.), px(450.)));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert_eq!(window.focused(cx).as_ref(), Some(&focused));
+        })
+        .unwrap();
+        window
+            .update(cx, |pane, _, _| assert_eq!(pane.selected, selected))
+            .unwrap();
+        assert!(scroll.offset().y <= px(0.) && -scroll.offset().y <= scroll.max_offset().y);
+        cx.simulate_keystrokes(window.into(), "tab");
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            window.focus_next(cx);
+            assert_eq!(window.focused(cx).as_ref(), Some(&expected_next));
+        })
+        .unwrap();
+        super::tests::CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.blur(cx);
+            window.dispatch_event(
+                gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    position: gpui::point(px(10.), px(10.)),
+                    modifiers: gpui::Modifiers::default(),
+                    pressed_button: None,
+                }),
+                cx,
+            );
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(window.focused(cx).is_none());
+        })
+        .unwrap();
+        let mounted = super::tests::CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+        assert!(
+            mounted.len() < 20,
+            "unfocused pointer navigation should virtualize again"
+        );
+    }
+
+    #[gpui::test]
+    fn status_modality_keeps_contact_positions_without_own_updates(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut chat = oxidezap_core::Chat::new("status@broadcast".into());
+        let now = wacore::time::now_utc();
+        for n in 0..50 {
+            let mut message = oxidezap_core::ChatMessage::new_incoming(
+                format!("S-{n}"),
+                format!("contact-{n}@s.whatsapp.net"),
+                "Synthetic update".into(),
+            );
+            message.timestamp = now + chrono::Duration::seconds(n);
+            chat.messages.push(message);
+        }
+        let feed = StatusFeed::from_chat(&chat);
+        let window = cx.open_window(size(px(320.), px(600.)), |_, cx| Pane {
+            feed,
+            app: cx.new(WhatsAppApp::new),
+            metrics: Metrics::default(),
+            selected: StatusSelection::None,
+            scroll: gpui::ScrollHandle::new(),
+        });
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let original = visual
+            .debug_bounds("status-contact-49@s.whatsapp.net")
+            .unwrap();
+        visual.simulate_keystrokes("tab");
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            visual
+                .debug_bounds("status-contact-49@s.whatsapp.net")
+                .unwrap(),
+            original
+        );
+        visual.simulate_mouse_move(
+            gpui::point(px(10.), px(10.)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            visual
+                .debug_bounds("status-contact-49@s.whatsapp.net")
+                .unwrap(),
+            original
+        );
+    }
+
+    #[gpui::test]
     #[ignore = "manual release performance measurement"]
     fn status_visible_cost(cx: &mut TestAppContext) {
         let count: usize = std::env::var("STATUS_AUTHORS")
@@ -717,6 +921,8 @@ mod visible_cost {
         let window = cx.open_window(size(px(320.), px(600.)), |_, cx| Pane {
             feed,
             app: cx.new(WhatsAppApp::new),
+            metrics: Metrics::default(),
+            selected: StatusSelection::None,
             scroll: gpui::ScrollHandle::new(),
         });
         cx.run_until_parked();
@@ -762,6 +968,8 @@ mod visible_cost {
         let window = cx.open_window(size(px(320.), px(600.)), |_, cx| Pane {
             feed,
             app: cx.new(WhatsAppApp::new),
+            metrics: Metrics::default(),
+            selected: StatusSelection::None,
             scroll: gpui::ScrollHandle::new(),
         });
         cx.run_until_parked();
