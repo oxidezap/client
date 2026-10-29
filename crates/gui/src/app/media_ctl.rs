@@ -133,6 +133,24 @@ impl WhatsAppApp {
                 0
             };
 
+            // A successful preview may already have been released by the
+            // active chat's budget. Rearm it only after leaving that chat;
+            // failed/pending attempts must not become network retries.
+            if allowance == 0 {
+                for message in &chat.messages {
+                    if message
+                        .media
+                        .as_ref()
+                        .is_some_and(|media| media.data.is_empty())
+                    {
+                        let key = (chat.jid.clone(), message.id.clone());
+                        if self.channel_preview_attempts.get(&key) == Some(&true) {
+                            self.channel_preview_attempts.remove(&key);
+                        }
+                    }
+                }
+            }
+
             // Whether there is anything to do, read before anything is
             // written: writing means `Arc::make_mut`, and a chat shared with
             // a frame in flight is a whole conversation copied. The
@@ -169,8 +187,10 @@ impl WhatsAppApp {
             // otherwise a visible old row could fetch/evict on every repaint.
             if allowance == 0 {
                 for id in &released.rows {
-                    self.channel_preview_attempts
-                        .remove(&(chat.jid.clone(), id.clone()));
+                    let key = (chat.jid.clone(), id.clone());
+                    if self.channel_preview_attempts.get(&key) == Some(&true) {
+                        self.channel_preview_attempts.remove(&key);
+                    }
                 }
             }
             touched.push(chat.jid.clone());
@@ -896,6 +916,14 @@ impl WhatsAppApp {
                 }
                 app.image_downloads_in_flight.remove(&message_id);
                 app.finish_download(&message_id);
+                if !user_initiated
+                    && let Some(chat) = &chat_jid
+                    && let Some(success) = app
+                        .channel_preview_attempts
+                        .get_mut(&(chat.clone(), message_id.clone()))
+                {
+                    *success = result.is_ok();
+                }
                 match result {
                     Ok(data) => {
                         info!("Image downloaded: {} bytes", data.len());
@@ -968,11 +996,14 @@ impl WhatsAppApp {
         else {
             return;
         };
-        if !self
+        match self
             .channel_preview_attempts
-            .insert((chat_jid.clone(), message_id.clone()))
+            .entry((chat_jid.clone(), message_id.clone()))
         {
-            return;
+            std::collections::hash_map::Entry::Occupied(_) => return,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(false);
+            }
         }
         self.fetch_image(message_id, downloadable, false, Some(chat_jid), cx);
     }
@@ -1904,7 +1935,8 @@ mod tests {
                 }
                 message.media = Some(media);
                 chat.messages.push(message);
-                app.channel_preview_attempts.insert((jid.into(), id.into()));
+                app.channel_preview_attempts
+                    .insert((jid.into(), id.into()), success);
             }
             app.chats = vec![Arc::new(chat)];
             app.retained_chat = Some("other@newsletter".into());
@@ -1928,11 +1960,11 @@ mod tests {
             );
             assert!(
                 !app.channel_preview_attempts
-                    .contains(&(jid.into(), "success".into()))
+                    .contains_key(&(jid.into(), "success".into()))
             );
             assert!(
                 app.channel_preview_attempts
-                    .contains(&(jid.into(), "failed".into()))
+                    .contains_key(&(jid.into(), "failed".into()))
             );
             // Budget eviction inside the visible conversation must not start
             // a cache-read/eviction loop on each subsequent repaint.
@@ -1951,7 +1983,7 @@ mod tests {
                 media.adopt_server_preview(Arc::clone(&payload));
                 message.media = Some(media);
                 chat.messages.push(message);
-                app.channel_preview_attempts.insert((jid.into(), id));
+                app.channel_preview_attempts.insert((jid.into(), id), true);
             }
             app.chats = vec![Arc::new(chat)];
             app.retained_chat = Some(jid.into());
@@ -1966,7 +1998,24 @@ mod tests {
             );
             assert!(
                 app.channel_preview_attempts
-                    .contains(&(jid.into(), "budget-0".into()))
+                    .contains_key(&(jid.into(), "budget-0".into()))
+            );
+            app.retained_chat = Some("other@newsletter".into());
+            app.sweep_retained_media(cx);
+            assert!(
+                !app.channel_preview_attempts
+                    .contains_key(&(jid.into(), "budget-0".into())),
+                "a successful budget-evicted preview becomes restorable after leaving"
+            );
+            // A failed subsequent restoration remains suppressed even though
+            // the row still records that its earlier bytes were server HQ.
+            app.channel_preview_attempts
+                .insert((jid.into(), "budget-0".into()), false);
+            app.sweep_retained_media(cx);
+            assert_eq!(
+                app.channel_preview_attempts
+                    .get(&(jid.into(), "budget-0".into())),
+                Some(&false)
             );
         });
     }
@@ -1985,7 +2034,7 @@ mod tests {
                 .extend(["image".into(), "audio".into()]);
             app.image_downloads_in_flight.insert("image".into());
             app.channel_preview_attempts
-                .insert(("channel@newsletter".into(), "image".into()));
+                .insert(("channel@newsletter".into(), "image".into()), false);
             let generation = app.document_state_generation;
             let account = app.account_scope();
             app.invalidate_document_downloads();

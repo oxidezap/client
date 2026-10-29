@@ -942,8 +942,8 @@ pub struct WhatsAppApp {
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
-    /// At most one automatic attempt per rendered channel image in this session.
-    channel_preview_attempts: std::collections::HashSet<(String, String)>,
+    /// Automatic attempts: false while pending/failed, true after success.
+    channel_preview_attempts: std::collections::HashMap<(String, String), bool>,
     image_downloads_in_flight: std::collections::HashSet<String>,
     /// Native document destinations, scoped to the account, chat and message
     /// that initiated the save. Browser handoffs never enter this map.
@@ -1478,7 +1478,7 @@ impl WhatsAppApp {
             recovery: cx.new(|_| recovery::Recovering::new()),
             notices: cx.new(|_| notices::Notices::new()),
             downloads_in_flight: std::collections::HashSet::new(),
-            channel_preview_attempts: std::collections::HashSet::new(),
+            channel_preview_attempts: std::collections::HashMap::new(),
             image_downloads_in_flight: std::collections::HashSet::new(),
             saved_documents: HashMap::new(),
             document_downloads_in_flight: std::collections::HashSet::new(),

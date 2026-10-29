@@ -13,9 +13,10 @@ still downloads its original. Full and HQ files have separate content identities
 
 Two requests run at once, with deduplicated attempts and at most 256 remembered
 attempt markers per account session. Failure keeps the inline fallback and manual retry.
-Successful payloads released when leaving a chat can be restored through the
-cache-first path on return. Failed attempts stay suppressed; budget eviction in
-an active chat does not rearm automatic fetches and cause a repaint loop.
+Successful automatic payloads released from memory can be restored through the
+cache-first path when returning to a chat, including payloads evicted earlier by
+its memory budget. Failed attempts stay suppressed; eviction within the active
+chat does not immediately rearm fetches and cause a repaint loop.
 Materialized HQ previews share the existing retained-media budget. Inline bytes
 remain protected even when the message also carries a server-preview descriptor. The client has no photo auto-download preference or metered-network
 policy; these limits do not emulate such controls.
