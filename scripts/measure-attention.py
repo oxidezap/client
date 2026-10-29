@@ -17,16 +17,15 @@ import tempfile
 import time
 
 
-def sample(binary, count, mute_every):
+def sample(launcher, binary, count, mute_every):
     env = dict(os.environ, ATTENTION_CHATS=str(count), ATTENTION_MUTE_EVERY=str(mute_every))
     with tempfile.TemporaryFile(mode="w+") as output:
         started = time.perf_counter_ns()
         process = subprocess.Popen(
-            [binary, "--ignored", "--exact", "state::store::tests::attention_workload", "--nocapture"],
+            [launcher, binary, "--ignored", "--exact", "state::store::tests::attention_workload", "--nocapture"],
             env=env, stdout=output, stderr=subprocess.STDOUT,
         )
-        _, status, usage = os.wait4(process.pid, 0)
-        process.returncode = os.waitstatus_to_exitcode(status)
+        process.wait()
         wall_ns = time.perf_counter_ns() - started
         output.seek(0)
         text = output.read()
@@ -38,9 +37,12 @@ def sample(binary, count, mute_every):
     memory = {key: int(value) for key, value in re.findall(
         r"attention memory (Rss|Pss|Private_Dirty):\s*(\d+)", text,
     )}
+    child = re.search(r"attention child cpu_s=([0-9.]+) peak_rss_kib=(\d+)", text)
+    if not child:
+        raise RuntimeError(f"Missing child resource usage: {text}")
     return dict(
         elapsed_ns=int(match[1]), process_wall_ns=wall_ns,
-        cpu_s=usage.ru_utime + usage.ru_stime, peak_rss_kib=usage.ru_maxrss,
+        cpu_s=float(child[1]), peak_rss_kib=int(child[2]),
         **memory,
     )
 
@@ -52,7 +54,13 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("attention-results.json"))
     parser.add_argument("--samples", type=int, default=9)
     args = parser.parse_args()
+    if args.samples < 1:
+        parser.error("--samples must be positive")
     binaries = [("base", str(args.base.resolve())), ("head", str(args.head.resolve()))]
+    launcher_dir = tempfile.TemporaryDirectory(prefix="attention-launcher-")
+    launcher = str(Path(launcher_dir.name) / "child")
+    subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror",
+                    str(Path(__file__).with_suffix(".c")), "-o", launcher], check=True)
     results = []
     for count in [100, 1000, 10000]:
         for mute_every in [0, 2, 1]:
@@ -60,7 +68,7 @@ def main():
                 order = binaries if iteration % 2 == 0 else binaries[::-1]
                 for label, binary in order:
                     row = dict(label=label, count=count, mute_every=mute_every,
-                               iteration=iteration, **sample(binary, count, mute_every))
+                               iteration=iteration, **sample(launcher, binary, count, mute_every))
                     if iteration:  # One warmup pair per scenario.
                         results.append(row)
             subset = [row for row in results if row["count"] == count
