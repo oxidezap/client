@@ -62,7 +62,7 @@ async fn terminal_recovery_is_account_scoped_and_does_not_require_a_bot() {
 async fn membership_notice_reloads_with_phone_alias_in_browser() {
     use std::sync::Arc;
     use whatsapp_rust::wacore::stanza::groups::{GroupNotificationAction, GroupParticipantInfo};
-    use whatsapp_rust::wacore::types::events::{Event, EventHandler, GroupUpdate};
+    use whatsapp_rust::wacore::types::events::{Event, GroupUpdate};
     let backend = SqliteStore::open("file:oxidezap-browser-membership?mode=memory&cache=shared")
         .await
         .unwrap();
@@ -80,19 +80,16 @@ async fn membership_notice_reloads_with_phone_alias_in_browser() {
         .notification_id("BROWSER-MEMBERS".to_owned())
         .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_000).unwrap())
         .is_lid_addressing_mode(true)
-        .action(Box::new(GroupNotificationAction::Add {
-            participants: vec![GroupParticipantInfo {
-                jid: lid.parse().unwrap(),
-                phone_number: Some("12025550123@s.whatsapp.net".parse().unwrap()),
-                display_name: None,
-                r#type: None,
-                lid: None,
-                username: None,
-                join_time: None,
-                group_history_sent_state: None,
-            }],
-            reason: None,
-        }))
+        .action(Box::new(
+            GroupNotificationAction::add()
+                .participants(vec![
+                    GroupParticipantInfo::builder()
+                        .jid(lid.parse().unwrap())
+                        .phone_number("12025550123@s.whatsapp.net".parse().unwrap())
+                        .build(),
+                ])
+                .build(),
+        ))
         .build();
     store
         .handler()
