@@ -1139,7 +1139,11 @@ impl WhatsAppApp {
         if let Some(cache) = &self.materialization_cache {
             return Some(Arc::clone(cache));
         }
-        self.client.as_ref().map(Session::media_cache)
+        self.client.as_ref().map(Session::media_cache).or_else(|| {
+            (!self.chats.is_empty())
+                .then(Session::retained_media_cache)
+                .flatten()
+        })
     }
 
     /// Demand avatar images for visible rows and overscan (+/- 10 rows).

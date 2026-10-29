@@ -155,11 +155,13 @@ impl WhatsAppApp {
     /// Let cache-only hydration finish before automatic network improvements.
     pub fn awaiting_cached_media(&self, jid: &str, message: &ChatMessage) -> bool {
         self.has_deferred_media_reference(message)
-            && !self
-                .media_materialization
-                .failed
-                .iter()
-                .any(|target| target.jid == jid && target.matches(message))
+            && !self.media_materialization.failed.iter().any(|target| {
+                target.generation == self.document_state_generation
+                    && target.account.0 == self.account_jid
+                    && target.account.1 == self.account_lid
+                    && target.jid == jid
+                    && target.matches(message)
+            })
     }
 
     fn materialization_owner(&self, cx: &App) -> Option<Owner> {
@@ -183,14 +185,20 @@ impl WhatsAppApp {
     }
 
     pub(super) fn reconcile_media_owner(&mut self, cx: &App) {
-        self.media_materialization
-            .surface(self.materialization_owner(cx));
+        let owner = self
+            .media_cache()
+            .filter(|cache| cache.defers_message_media())
+            .and_then(|_| self.materialization_owner(cx));
+        self.media_materialization.surface(owner);
     }
 
     /// Called after the connected view has reconciled its visible surfaces.
     pub fn note_media_surface(&mut self, cx: &mut Context<Self>) {
-        let owner = self.materialization_owner(cx);
-        self.media_materialization.surface(owner.clone());
+        self.reconcile_media_owner(cx);
+        let owner = self.media_materialization.owner.clone();
+        if owner.is_none() {
+            return;
+        }
         let row = match &owner {
             Some(Owner::Status(id)) => Some((STATUS_BROADCAST_JID.to_string(), id.clone())),
             Some(Owner::Viewer(jid, id)) => Some((jid.clone(), id.clone())),
@@ -256,8 +264,7 @@ impl WhatsAppApp {
     }
 
     fn pump_materialization(&mut self, cx: &mut Context<Self>) {
-        self.media_materialization
-            .surface(self.materialization_owner(cx));
+        self.reconcile_media_owner(cx);
         let Some(cache) = self
             .media_cache()
             .filter(|cache| cache.defers_message_media())
@@ -287,8 +294,7 @@ impl WhatsAppApp {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let result = read.await;
             let _ = entity.update(cx, |app, cx| {
-                app.media_materialization
-                    .surface(app.materialization_owner(cx));
+                app.reconcile_media_owner(cx);
                 if let Some(target) = app.media_materialization.finish(ticket)
                     && app.target_is_current(&target, cx)
                 {
@@ -768,6 +774,171 @@ mod tests {
                 &app.chats[0].messages[0].media.as_ref().unwrap().data,
                 &app.chats[0].messages[1].media.as_ref().unwrap().data,
             ))
+        });
+    }
+    fn open_deferred_viewer(app: &mut WhatsAppApp, cx: &mut Context<WhatsAppApp>) {
+        let chat = Arc::make_mut(&mut app.chats[0]);
+        for (n, message) in chat.messages.iter_mut().enumerate() {
+            let media = message.media.as_mut().unwrap();
+            media.data_is_preview = false;
+            media.preview_cache_key = None;
+            media.cache_key = Some(format!("full-{n}"));
+        }
+        let viewer = MediaViewer::open(chat.jid.clone(), "m0", &chat.messages).unwrap();
+        app.viewer.update(cx, |state, cx| state.open(viewer, cx));
+        app.note_media_surface(cx);
+    }
+
+    #[gpui::test]
+    fn viewer_missing_and_removed_files_end_loading_and_retry_only_after_navigation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cache) = setup(cx);
+        cache.fail.store(true, Ordering::Relaxed);
+        app.update(cx, |app, cx| {
+            open_deferred_viewer(app, cx);
+            let message = app.media_viewer_message(cx).unwrap();
+            assert!(app.awaiting_cached_media("peer@example.invalid", message));
+        });
+        cx.executor().run_until_parked();
+        app.update(cx, |app, cx| {
+            let message = app.media_viewer_message(cx).unwrap();
+            assert!(!app.awaiting_cached_media("peer@example.invalid", message));
+            assert!(message.media.as_ref().unwrap().data.is_empty());
+            assert_eq!(app.viewer.read(cx).showing().unwrap().items.len(), 12);
+            for _ in 0..5 {
+                app.note_media_surface(cx);
+            }
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(
+            cache.reads.load(Ordering::Relaxed),
+            1,
+            "a missing file cannot cause repaint retries"
+        );
+        cache.fail.store(false, Ordering::Relaxed);
+        app.update(cx, |app, cx| {
+            app.step_media_viewer(true, cx);
+            app.note_media_surface(cx);
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(cache.reads.load(Ordering::Relaxed), 2);
+        // Simulate a different cache file being removed while its reference
+        // remains in the album. The same path handles native ENOENT.
+        cache.fail.store(true, Ordering::Relaxed);
+        app.update(cx, |app, cx| {
+            app.step_media_viewer(true, cx);
+            app.note_media_surface(cx);
+        });
+        cx.executor().run_until_parked();
+        app.read_with(cx, |app, cx| {
+            let message = app.media_viewer_message(cx).unwrap();
+            assert_eq!(message.id, "m2");
+            assert!(!app.awaiting_cached_media("peer@example.invalid", message));
+            assert!(message.media.as_ref().unwrap().data.is_empty());
+        });
+        cache.fail.store(false, Ordering::Relaxed);
+        app.update(cx, |app, cx| {
+            app.step_media_viewer(false, cx); // ready m1
+            app.note_media_surface(cx);
+            app.step_media_viewer(false, cx); // retry m0
+            app.note_media_surface(cx);
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(cache.reads.load(Ordering::Relaxed), 4);
+        app.read_with(cx, |app, cx| {
+            assert!(
+                !app.media_viewer_message(cx)
+                    .unwrap()
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .is_empty()
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn rapid_viewer_navigation_cancels_old_reads_and_hydrates_only_the_last_image(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cache) = setup(cx);
+        app.update(cx, |app, cx| {
+            open_deferred_viewer(app, cx);
+            for _ in 0..2 {
+                app.step_media_viewer(true, cx);
+                app.note_media_surface(cx);
+            }
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(cache.reads.load(Ordering::Relaxed), 1);
+        app.read_with(cx, |app, cx| {
+            assert_eq!(app.viewer.read(cx).current_id(), Some("m2"));
+            for (n, message) in app.chats[0].messages.iter().enumerate() {
+                assert_eq!(!message.media.as_ref().unwrap().data.is_empty(), n == 2);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn a_viewer_read_cannot_adopt_into_a_revoked_edited_or_new_account_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, _) = setup(cx);
+        for change in 0..4 {
+            app.update(cx, |app, cx| {
+                Arc::make_mut(&mut app.chats[0]).messages = (0..12).map(message).collect();
+                app.media_materialization.surface(None);
+                open_deferred_viewer(app, cx);
+                match change {
+                    0 => Arc::make_mut(&mut app.chats[0]).messages[0].revoked = true,
+                    1 => {
+                        Arc::make_mut(&mut app.chats[0]).messages[0].content = "new caption".into()
+                    }
+                    2 => app.document_state_generation += 1,
+                    3 => app.account_lid = Some("other-account@example.invalid".into()),
+                    _ => unreachable!(),
+                }
+            });
+            cx.executor().run_until_parked();
+            app.read_with(cx, |app, _| {
+                assert!(
+                    app.chats[0].messages[0]
+                        .media
+                        .as_ref()
+                        .unwrap()
+                        .data
+                        .is_empty()
+                )
+            });
+        }
+        // A reference removed by an edit no longer belongs to the album.
+        app.update(cx, |app, cx| {
+            Arc::make_mut(&mut app.chats[0]).messages[0].media = None;
+            app.invalidate_message_cache("peer@example.invalid", cx);
+            assert_ne!(app.viewer.read(cx).current_id(), Some("m0"));
+        });
+    }
+    #[cfg(not(target_family = "wasm"))]
+    #[gpui::test]
+    fn native_retained_history_keeps_a_validated_cache_after_ipc_ends(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, _) = setup(cx);
+        app.update(cx, |app, _| {
+            app.materialization_cache = None;
+            assert!(app.client.is_none());
+            let cache = app
+                .media_cache()
+                .expect("retained native history has its local cache");
+            assert!(cache.defers_message_media());
+            assert!(cache.read_deferred("not/a/key", MAX_READ_BYTES).is_err());
+            app.chats.clear();
+            assert!(
+                app.media_cache().is_none(),
+                "no disconnected cache is offered without retained history"
+            );
         });
     }
 }

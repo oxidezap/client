@@ -13,6 +13,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::spinner::Spinner;
 use gpui_component::{Disableable as _, FocusTrapElement as _, Icon, IconName, Sizable as _};
 
 use crate::app::{MediaViewer, VIEWER_CONTEXT, ViewerNext, ViewerPrev, WhatsAppApp};
@@ -37,6 +38,7 @@ pub struct ViewerProps {
     /// current frame instead.
     pub image: Option<Arc<Image>>,
     pub frame: Option<Arc<RenderImage>>,
+    pub is_loading: bool,
     pub author: SharedString,
 }
 
@@ -178,6 +180,7 @@ pub fn render_media_viewer(
                                     props.image,
                                     props.frame,
                                     is_video,
+                                    props.is_loading,
                                     metrics,
                                     cx,
                                 )),
@@ -308,6 +311,7 @@ fn render_frame(
     image: Option<Arc<Image>>,
     frame: Option<Arc<RenderImage>>,
     is_video: bool,
+    is_loading: bool,
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -333,9 +337,33 @@ fn render_frame(
             .into_any_element();
     }
 
+    if is_loading {
+        return div()
+            .id("viewer-loading")
+            .debug_selector(|| "viewer-loading".into())
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(metrics.space_lg())
+            .child(
+                Spinner::new()
+                    .small()
+                    .color(parts::on_scrim(cx).opacity(0.6)),
+            )
+            .child(
+                div()
+                    .text_size(metrics.text_secondary())
+                    .text_color(parts::on_scrim(cx).opacity(0.6))
+                    .child("Loading image..."),
+            )
+            .into_any_element();
+    }
+
     // Bytes the viewer cannot decode. Saying so beats an empty black screen
     // that reads as a hung window.
     div()
+        .id("viewer-unavailable")
+        .debug_selector(|| "viewer-unavailable".into())
         .flex()
         .flex_col()
         .items_center()
@@ -373,4 +401,40 @@ fn step_button<F: Fn(&mut App) + 'static>(
         .disabled(!enabled)
         .when(enabled, |button| button.cursor_pointer())
         .on_click(move |_, _window, cx| on_click(cx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::ActiveProductTheme as _;
+    use gpui::{Context, Render, Window};
+
+    struct Fixture {
+        loading: bool,
+    }
+    impl Render for Fixture {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            render_frame(None, None, false, self.loading, cx.product().metrics, cx)
+        }
+    }
+
+    #[gpui::test]
+    fn loading_is_replaced_by_a_terminal_error_when_the_read_fails(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let (fixture, cx) = cx.add_window_view(|_, _| Fixture { loading: true });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("viewer-loading").is_some());
+        assert!(cx.debug_bounds("viewer-unavailable").is_none());
+        fixture.update(cx, |fixture, cx| {
+            fixture.loading = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("viewer-loading").is_none());
+        assert!(cx.debug_bounds("viewer-unavailable").is_some());
+    }
 }

@@ -120,6 +120,34 @@ pub trait MediaCache: Send + Sync {
     fn discard(&self, key: &str);
 }
 
+impl super::Session {
+    /// The native directory outlives the IPC connection. A retained-history
+    /// view can still hydrate its account-qualified keys after that link ends.
+    pub(crate) fn retained_media_cache() -> Option<Arc<dyn MediaCache>> {
+        imp::retained_cache()
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod imp {
+    use super::{Arc, Directory, MediaCache};
+    use std::sync::OnceLock;
+
+    pub(super) fn retained_cache() -> Option<Arc<dyn MediaCache>> {
+        static CACHE: OnceLock<Arc<dyn MediaCache>> = OnceLock::new();
+        Some(Arc::clone(CACHE.get_or_init(|| Arc::new(Directory))))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+mod imp {
+    use super::{Arc, MediaCache};
+
+    pub(super) fn retained_cache() -> Option<Arc<dyn MediaCache>> {
+        None
+    }
+}
+
 fn cached_image_source(
     key: &str,
     read: impl FnOnce() -> Result<Arc<Vec<u8>>, String>,

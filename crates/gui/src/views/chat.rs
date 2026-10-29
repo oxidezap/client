@@ -158,6 +158,7 @@ pub fn render_connected_view(
         } else {
             SharedString::from(app.author_label(open_chat.as_deref(), &message))
         };
+        let is_loading = app.awaiting_cached_media(&viewer.jid, &message);
         Some(
             render_media_viewer(
                 viewer,
@@ -165,6 +166,7 @@ pub fn render_connected_view(
                     message,
                     image,
                     frame,
+                    is_loading,
                     author,
                 },
                 entity.clone(),

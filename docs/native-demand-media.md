@@ -12,7 +12,10 @@ real-account measurement. No real profile, database or account data was used.
 
 Only the native directory cache opts in. Web, embedded and follower-tab caches
 retain eager frame hydration. Avatar readiness and explicit download responses
-also retain their existing paths. There is no wire, daemon, store or dependency
+also retain their existing paths. Retained native history can obtain the same
+stateless directory cache after IPC closes, without creating a session. No cache
+is offered through that fallback when there is no retained history. Web has no
+disconnected-directory fallback. There is no wire, daemon, store or dependency
 change.
 
 The virtual timeline reports actual child bounds after prepaint. Intersecting
@@ -46,7 +49,11 @@ Before adoption the controller checks those identities, current owner, message
 content/edit/revoke state and the entire media descriptor, including its key.
 A newer explicit download therefore wins. Each recipient of a repeated visible
 key adopts its own full/preview metadata while sharing one `Arc<Vec<u8>>`.
-Inline previews without a `downloadable` remain usable offline. Failed reads
+Inline previews without a `downloadable` remain usable offline. Full references
+remain members of the viewer album before materialization. Only the displayed
+image is read; its loading indicator becomes a terminal error when the cache
+reports a failure. A missing file remains navigable and retryable after leaving
+and returning, rather than keeping an indefinite pending state. Failed reads
 are suppressed while the row remains in that viewport, and leaving/returning
 allows another attempt. This is not a persistent negative cache.
 
@@ -132,7 +139,16 @@ A separate filesystem test checks exact bytes, byte ceilings, empty files,
 missing files and unusable keys. Native production-frame tests preserve keys
 without attempting any cache read.
 
-The viewer's album membership currently requires materialized bytes; including
-full deferred references in that predicate needs a coordinated follow-up hunk
-before this branch is ready for a PR. No viewer code has been changed yet.
-Remote platform/web CI and review remain required. #280 is preserved separately.
+Viewer tests cover album membership of deferred full references, absent/removed
+cache files, rapid image changes, stale revoke/edit/account results and replacing
+loading with the unavailable state. The native disconnected-cache test removes
+the test cache override and verifies the real cache is available without IPC,
+retaining key validation. Previews alone, videos and revoked messages stay out
+of the image album.
+
+Native GUI validation passed: 605 tests passed, 7 measurement tests ignored;
+all-target/all-feature GUI Clippy with `-D warnings`, workspace formatting and
+diff checks passed. Raw primitive measurements were captured at 8f8c43f; the
+measured fill helpers and bounded-read primitive are unchanged by the subsequent
+viewer/offline qualification changes. Remote platform/web CI and review remain
+required. The PR is stacked on #280, which remains separate.
