@@ -830,7 +830,7 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        self.fetch_image(message_id, downloadable, true, cx);
+        self.fetch_image(message_id, downloadable, true, None, cx);
     }
 
     fn fetch_image(
@@ -838,6 +838,7 @@ impl WhatsAppApp {
         message_id: String,
         downloadable: DownloadableMedia,
         user_initiated: bool,
+        chat_jid: Option<String>,
         cx: &mut Context<Self>,
     ) {
         // A second tap while the first is still in flight would download the
@@ -858,7 +859,6 @@ impl WhatsAppApp {
             client.download_downloadable_media(downloadable)
         };
 
-        let chat_jid = self.selected_chat.clone();
         let generation = self.document_state_generation;
         let account = self.account_scope();
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -941,11 +941,11 @@ impl WhatsAppApp {
         };
         if !self
             .channel_preview_attempts
-            .insert((chat_jid, message_id.clone()))
+            .insert((chat_jid.clone(), message_id.clone()))
         {
             return;
         }
-        self.fetch_image(message_id, downloadable, false, cx);
+        self.fetch_image(message_id, downloadable, false, Some(chat_jid), cx);
     }
 
     /// Whether a download for this message is in flight.
