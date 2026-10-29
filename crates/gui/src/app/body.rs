@@ -679,6 +679,53 @@ pub(super) mod tests {
         }
     }
 
+    #[gpui::test]
+    fn navigation_badges_fit_compact_buttons_with_three_digit_labels(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                for index in 0..110 {
+                    let mut channel = Chat::new(format!("channel{index}@newsletter"));
+                    channel.unread_count = 1;
+                    app.chats.push(Arc::new(channel));
+                }
+                app.set_destination(Destination::Channels, window, cx);
+            });
+        });
+        for width in [1000., 320., 360., 1600.] {
+            cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(800.)));
+            cx.update(|_, cx| app.update(cx, |_, cx| cx.notify()));
+            cx.run_until_parked();
+            let button = cx.debug_bounds("nav-channels").expect("Channels button");
+            let badge = cx
+                .debug_bounds("nav-badge-nav-channels")
+                .expect("99+ badge");
+            let label = cx.debug_bounds("nav-badge-label").expect("99+ label");
+            assert!(button.contains(&badge.origin) && button.contains(&badge.bottom_right()));
+            assert!(badge.contains(&label.origin) && badge.contains(&label.bottom_right()));
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.set_destination(Destination::Communities, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        let badge = cx
+            .debug_bounds("nav-badge-nav-channels")
+            .expect("Channels unread badge");
+        cx.simulate_click(badge.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx).destination(),
+                Destination::Channels,
+                "badge must not block the tab button"
+            )
+        });
+    }
+
     fn paste_preview_fixture(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {

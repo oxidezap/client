@@ -110,7 +110,7 @@ fn render_destination(
     // pointer-only rail would put a whole destination out of reach of the
     // keyboard — and the focus ring the theme defines is drawn by the
     // library's controls, not by anything hand-rolled.
-    Button::new(destination.id())
+    let button = Button::new(destination.id())
         .ghost()
         .selected(is_current)
         .toggled(is_current)
@@ -133,13 +133,27 @@ fn render_destination(
             cx.theme().foreground
         } else {
             parts::subtle(cx)
-        }))
+        }));
+
+    // Button clips its internal content to the icon box. Keep the badge beside
+    // it so all digits survive on compact desktop buttons too.
+    div()
+        .relative()
+        .size(target)
+        .flex_shrink_0()
+        .child(button)
         // A count, not a dot: how many conversations are waiting is the thing
         // worth knowing before deciding to look.
         .when(badge > 0, |el| {
             el.child(
                 div()
+                    .id(gpui::SharedString::from(format!(
+                        "nav-badge-{}",
+                        destination.id()
+                    )))
+                    .debug_selector(move || format!("nav-badge-{}", destination.id()))
                     .absolute()
+                    .whitespace_nowrap()
                     .top(metrics.space_xs())
                     .right(metrics.space_xs())
                     .min_w(metrics.space_lg())
@@ -155,11 +169,16 @@ fn render_destination(
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(metrics.text_micro())
                     .text_color(cx.theme().primary_foreground)
-                    .child(if badge > 99 {
-                        "99+".to_string()
-                    } else {
-                        badge.to_string()
-                    }),
+                    .child(
+                        div()
+                            .id("nav-badge-label")
+                            .debug_selector(|| "nav-badge-label".into())
+                            .child(if badge > 99 {
+                                "99+".to_string()
+                            } else {
+                                badge.to_string()
+                            }),
+                    ),
             )
         })
 }

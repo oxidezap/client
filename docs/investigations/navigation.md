@@ -12,6 +12,10 @@ but does not filter other destinations. A selection hidden by a destination cann
 become a visible/read conversation. Restoring a selection does not commit a read;
 the rendered conversation resumes it when visible. Status keeps its existing media lifecycle.
 
+The rail badge is a sibling of its button. The button component clips its internal
+content to the icon box, which truncates `99+` on desktop even when the badge
+height and text bounds are correct. Count badges use content height plus padding.
+
 ## Official Web evidence
 
 Inspected 2026-10-29, whatspec `eb16f595d455d8b0b3f7966a59444f4f9894c127`,
