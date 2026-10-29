@@ -151,8 +151,10 @@ web-sys = { version = "0.3.106", features = [
 # can give: there is no path, there is a VFS. `sqlite-wasm-rs` is what diesel
 # already links against on this target — naming it here adds no second copy —
 # and `sqlite-wasm-vfs` is where the durable one lives. See `src/store/`.
-sqlite-wasm-rs = { version = "0.6.2", default-features = false }
-sqlite-wasm-vfs = "0.3.0"
+# VFS 0.3 removes relaxed_idb, which holds existing browser databases.
+# Keep its matching callback ABI until IndexedDB data has a migration path.
+sqlite-wasm-rs = { version = "0.5.5", default-features = false }
+sqlite-wasm-vfs = "0.2.0"
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen-test = "0.3.79"
