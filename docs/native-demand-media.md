@@ -146,9 +146,19 @@ the test cache override and verifies the real cache is available without IPC,
 retaining key validation. Previews alone, videos and revoked messages stay out
 of the image album.
 
-Native GUI validation passed: 605 tests passed, 7 measurement tests ignored;
+Native GUI validation passed: 606 tests passed, 7 measurement tests ignored;
 all-target/all-feature GUI Clippy with `-D warnings`, workspace formatting and
-diff checks passed. Raw primitive measurements were captured at 8f8c43f; the
+diff checks passed. The GUI web target also type-checked with
+`cargo +nightly-2026-09-03 check -p oxidezap-gui --all-features --target wasm32-unknown-unknown -Z build-std=std,panic_abort`,
+with atomics and dead-code/unused-import warnings in unmodified paths. A first
+stable attempt stopped in `wasm_thread`, which requires nightly; it did not
+establish a source regression. This is a type check, not a browser runtime test.
+Per-row prepaint listeners are attached only for deferred references; plain-text
+and already-materialized rows do not allocate that listener. An inline preview
+is preserved if a separate full-reference read fails, while the viewer shows
+loading/error until the full bytes arrive.
+
+Raw primitive measurements were captured at 8f8c43f; the
 measured fill helpers and bounded-read primitive are unchanged by the subsequent
 viewer/offline qualification changes. Remote platform/web CI and review remain
 required. The PR is stacked on #280, which remains separate.

@@ -143,13 +143,14 @@ impl Materialization {
 
 impl WhatsAppApp {
     pub fn has_deferred_media_reference(&self, message: &ChatMessage) -> bool {
-        self.media_cache()
-            .is_some_and(|cache| cache.defers_message_media())
-            && !message.revoked
+        !message.revoked
             && message.media.as_ref().is_some_and(|media| {
                 (media.data.is_empty() || media.data_is_preview)
                     && (media.cache_key.is_some() || media.preview_cache_key.is_some())
             })
+            && self
+                .media_cache()
+                .is_some_and(|cache| cache.defers_message_media())
     }
 
     /// Let cache-only hydration finish before automatic network improvements.
@@ -940,5 +941,30 @@ mod tests {
                 "no disconnected cache is offered without retained history"
             );
         });
+    }
+    #[gpui::test]
+    fn a_failed_full_reference_preserves_inline_bytes_without_claiming_the_full_image_loaded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cache) = setup(cx);
+        cache.fail.store(true, Ordering::Relaxed);
+        app.update(cx, |app, cx| {
+            let chat = Arc::make_mut(&mut app.chats[0]);
+            let media = chat.messages[0].media.as_mut().unwrap();
+            media.cache_key = Some("missing-full".into());
+            media.data = Arc::new(cache.payload.clone());
+            let viewer = MediaViewer::open(chat.jid.clone(), "m0", &chat.messages).unwrap();
+            app.viewer.update(cx, |state, cx| state.open(viewer, cx));
+            app.note_media_surface(cx);
+        });
+        cx.executor().run_until_parked();
+        app.read_with(cx, |app, cx| {
+            let message = app.media_viewer_message(cx).unwrap();
+            let media = message.media.as_ref().unwrap();
+            assert_eq!(media.data.as_slice(), cache.payload.as_slice());
+            assert!(media.data_is_preview);
+            assert!(!app.awaiting_cached_media("peer@example.invalid", message));
+        });
+        assert_eq!(cache.reads.load(Ordering::Relaxed), 1);
     }
 }

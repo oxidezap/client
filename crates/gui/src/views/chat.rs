@@ -149,7 +149,7 @@ pub fn render_connected_view(
     let viewer = app.media_viewer(cx).and_then(|viewer| {
         let message = app.media_viewer_message(cx)?.clone();
         let media = message.media.as_ref()?;
-        let image = (!media.data.is_empty())
+        let image = (!media.data.is_empty() && !media.data_is_preview)
             .then(|| app.get_decoded_image(&message.id, media, cx))
             .flatten();
         let frame = app.video_current_frame(&message.id);

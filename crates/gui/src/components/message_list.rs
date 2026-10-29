@@ -157,14 +157,16 @@ pub fn render_message_list(
                         .map(|message| message.id.clone()),
                     _ => None,
                 };
-                let hits = std::rc::Rc::clone(&media_hits);
                 div()
                     .w_full()
                     .px(gutter)
-                    .on_children_prepainted(move |bounds, _, _| {
-                        if let (Some(id), Some(bounds)) = (&media_id, bounds.first()) {
-                            hits.borrow_mut().push((id.clone(), *bounds));
-                        }
+                    .when_some(media_id, |element, id| {
+                        let hits = std::rc::Rc::clone(&media_hits);
+                        element.on_children_prepainted(move |bounds, _, _| {
+                            if let Some(bounds) = bounds.first() {
+                                hits.borrow_mut().push((id.clone(), *bounds));
+                            }
+                        })
                     })
                     .child(render_row(
                         &items,
