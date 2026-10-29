@@ -140,27 +140,30 @@ const MAX_BOUNDARY: usize = 512;
 /// deliberately holds no messages, so it keeps exactly this much and no more.
 #[derive(Default)]
 struct ChatReads {
+    // IDs and sender addresses never grow while retained. Box<str> omits
+    // String's unused capacity word in every queue and set slot. Receipt
+    // queries transfer their buffers back into Strings without copying.
     /// Newest message timestamp seen, in whole seconds.
     newest_secs: i64,
     /// Every message at `newest_secs`, oldest arrival first, shaped as
     /// `mark_chat_read` wants them. Bounded; see [`MAX_BOUNDARY`].
-    boundary: VecDeque<(String, bool, Option<String>)>,
+    boundary: VecDeque<(Box<str>, bool, Option<Box<str>>)>,
     /// The ids in `boundary`, so recognising a redelivery is a lookup.
     ///
     /// A burst is the shape that fills a boundary, and asking the list itself
     /// cost a pass per arrival: folding a same-second burst of n messages was
     /// n² comparisons, inside the lock a read action holds.
-    boundary_ids: HashSet<String>,
+    boundary_ids: HashSet<Box<str>>,
     /// Incoming messages still unread, shaped as `send_read_receipts` wants
     /// them.
-    unread: VecDeque<(String, String)>,
+    unread: VecDeque<(Box<str>, Box<str>)>,
     /// Every incoming message this chat has been handed, receipt owed or not.
     ///
     /// Separate from `unread` because that one is drained when the receipts
     /// go out: after a read, it remembers nothing, and a redelivery of a
     /// message already read would come back as a first sighting and put the
     /// badge up over it. Ids only, and bounded the same way.
-    seen: VecDeque<String>,
+    seen: VecDeque<Box<str>>,
 }
 
 impl ChatReads {
@@ -172,8 +175,8 @@ impl ChatReads {
     /// would never be queued for its receipt again.
     fn forget<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
         let ids: std::collections::HashSet<&str> = ids.into_iter().collect();
-        self.unread.retain(|(id, _)| !ids.contains(id.as_str()));
-        self.seen.retain(|id| !ids.contains(id.as_str()));
+        self.unread.retain(|(id, _)| !ids.contains(id.as_ref()));
+        self.seen.retain(|id| !ids.contains(id.as_ref()));
     }
 
     /// Fold one message in, answering whether it is an incoming message this
@@ -197,11 +200,11 @@ impl ChatReads {
             self.boundary.clear();
             self.boundary_ids.clear();
         }
-        if secs == self.newest_secs && self.boundary_ids.insert(message.id.clone()) {
+        if secs == self.newest_secs && self.boundary_ids.insert(message.id.as_str().into()) {
             self.boundary.push_back((
-                message.id.clone(),
+                message.id.as_str().into(),
                 message.is_from_me,
-                (!message.is_from_me).then(|| message.sender.clone()),
+                (!message.is_from_me).then(|| message.sender.as_str().into()),
             ));
             if self.boundary.len() > MAX_BOUNDARY
                 && let Some((dropped, ..)) = self.boundary.pop_front()
@@ -210,10 +213,15 @@ impl ChatReads {
             }
         }
 
-        if message.is_from_me || self.seen.iter().any(|id| *id == message.id) {
+        if message.is_from_me
+            || self
+                .seen
+                .iter()
+                .any(|id| id.as_ref() == message.id.as_str())
+        {
             return false;
         }
-        self.seen.push_back(message.id.clone());
+        self.seen.push_back(message.id.as_str().into());
         if self.seen.len() > MAX_TRACKED_UNREAD {
             self.seen.pop_front();
         }
@@ -223,7 +231,7 @@ impl ChatReads {
             return false;
         }
         self.unread
-            .push_back((message.id.clone(), message.sender.clone()));
+            .push_back((message.id.as_str().into(), message.sender.as_str().into()));
         if self.unread.len() > MAX_TRACKED_UNREAD {
             self.unread.pop_front();
         }
@@ -231,8 +239,20 @@ impl ChatReads {
     }
 
     fn boundary(&self) -> Option<ReadBoundary> {
-        (!self.boundary.is_empty())
-            .then(|| (self.newest_secs, self.boundary.iter().cloned().collect()))
+        (!self.boundary.is_empty()).then(|| {
+            let ids = self
+                .boundary
+                .iter()
+                .map(|(id, from_me, sender)| {
+                    (
+                        id.to_string(),
+                        *from_me,
+                        sender.as_deref().map(str::to_owned),
+                    )
+                })
+                .collect();
+            (self.newest_secs, ids)
+        })
     }
 }
 
@@ -348,7 +368,13 @@ impl ReadTracker {
     pub(super) fn take_receipts(&mut self, jid: &str) -> Vec<(String, String)> {
         self.chats
             .get_mut(jid)
-            .map(|reads| reads.unread.drain(..).collect())
+            .map(|reads| {
+                reads
+                    .unread
+                    .drain(..)
+                    .map(|(id, sender)| (id.into_string(), sender.into_string()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
