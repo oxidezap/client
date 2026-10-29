@@ -43,7 +43,10 @@
          without starting a WASM download it would have to abandon. On an
          isolated page the preloads are activated during parsing, before the
          module starts. This also works when the host sends the headers
-         itself and no service worker is needed. -->
+         itself and no service worker is needed. If setup fails or service
+         workers are unavailable, the loader continues with the existing
+         main-thread fallback. A stalled installation is bounded to ten
+         seconds before trying that fallback. -->
     <link data-trunk rel="copy-file" href="coi-serviceworker.js" />
     <script src="coi-serviceworker.js"></script>
 
