@@ -162,6 +162,17 @@ impl WhatsAppApp {
                 released.rows.len(),
                 chat.jid
             );
+            // A successful payload evicted when leaving a conversation may
+            // be restored through the daemon's cache-first download path on
+            // return. Failed attempts release no bytes and stay suppressed.
+            // Keep the marker for budget eviction within the active chat:
+            // otherwise a visible old row could fetch/evict on every repaint.
+            if allowance == 0 {
+                for id in &released.rows {
+                    self.channel_preview_attempts
+                        .remove(&(chat.jid.clone(), id.clone()));
+                }
+            }
             touched.push(chat.jid.clone());
             released_rows.extend(released.rows);
         }
@@ -1858,6 +1869,106 @@ mod tests {
         assert!(!pending.matches("voice-1", 7));
         assert!(!pending.matches("voice-2", 8));
         assert!(pending.matches("voice-1", 8));
+    }
+
+    #[gpui::test]
+    fn leaving_a_chat_rearms_successful_previews_but_preserves_failed_attempts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        app.update(cx, |app, cx| {
+            let jid = "120363000000000001@newsletter";
+            let full: DownloadableMedia = serde_json::from_value(serde_json::json!({
+                "direct_path":"/v/original", "media_key":[], "file_enc_sha256":[],
+                "file_sha256":vec![7;32], "file_length":1024, "mime_type":"image/webp",
+                "duration_secs":null, "download_type":"image"
+            }))
+            .unwrap();
+            let mut hq = full.clone();
+            hq.is_thumbnail = true;
+            hq.file_sha256 = vec![8; 32];
+            let mut chat = Chat::new(jid.into());
+            for (id, success) in [("success", true), ("failed", false)] {
+                let mut message =
+                    ChatMessage::new_incoming(id.into(), "channel".into(), String::new());
+                let mut media =
+                    MediaContent::image(Arc::new(vec![1, 2]), "image/jpeg".into(), true)
+                        .with_download(Some(full.clone()));
+                media.preview_downloadable = Some(hq.clone());
+                if success {
+                    media.adopt_server_preview(Arc::new(vec![3, 4, 5]));
+                }
+                message.media = Some(media);
+                chat.messages.push(message);
+                app.channel_preview_attempts.insert((jid.into(), id.into()));
+            }
+            app.chats = vec![Arc::new(chat)];
+            app.retained_chat = Some("other@newsletter".into());
+            app.sweep_retained_media(cx);
+            assert!(
+                app.chats[0].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .is_empty()
+            );
+            assert_eq!(
+                app.chats[0].messages[1]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+                [1, 2]
+            );
+            assert!(
+                !app.channel_preview_attempts
+                    .contains(&(jid.into(), "success".into()))
+            );
+            assert!(
+                app.channel_preview_attempts
+                    .contains(&(jid.into(), "failed".into()))
+            );
+            // Budget eviction inside the visible conversation must not start
+            // a cache-read/eviction loop on each subsequent repaint.
+            let payload = Arc::new(vec![0; 512 * 1024]);
+            let count = oxidezap_core::RETAINED_MEDIA_BUDGET_BYTES as usize / payload.len() + 1;
+            let mut chat = Chat::new(jid.into());
+            app.channel_preview_attempts.clear();
+            for i in 0..count {
+                let id = format!("budget-{i}");
+                let mut message =
+                    ChatMessage::new_incoming(id.clone(), "channel".into(), String::new());
+                let mut media =
+                    MediaContent::image(Arc::new(Vec::new()), "image/jpeg".into(), true)
+                        .with_download(Some(full.clone()));
+                media.preview_downloadable = Some(hq.clone());
+                media.adopt_server_preview(Arc::clone(&payload));
+                message.media = Some(media);
+                chat.messages.push(message);
+                app.channel_preview_attempts.insert((jid.into(), id));
+            }
+            app.chats = vec![Arc::new(chat)];
+            app.retained_chat = Some(jid.into());
+            app.sweep_retained_media(cx);
+            assert!(
+                app.chats[0].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .is_empty()
+            );
+            assert!(
+                app.channel_preview_attempts
+                    .contains(&(jid.into(), "budget-0".into()))
+            );
+        });
     }
 
     #[gpui::test]
