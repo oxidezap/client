@@ -22,9 +22,10 @@ tests compare the wrapper against Diesel's integer limit across negative,
 zero, positive, `i32` boundary and `i64` boundary values, in both directions.
 Application entry points continue to normalize negative budgets to zero.
 
-## Reproduction
+## Original reproduction
 
-The base is `a5c7c3e9d968c455bbba572c0cea2ccda3adfafd` from #278 plus the
+The initial study predates the merge of #278. Its base is
+`a5c7c3e9d968c455bbba572c0cea2ccda3adfafd` from #278 plus the
 same profiling harness from `92ecea4` in both binaries. The implementation
 change is `1569e95`; `92ecea4` also selects portable profiling counters.
 Build both sequentially on the same runner using the ordinary Cargo cache:
@@ -138,3 +139,54 @@ The first run's backward and forward paired CPU medians were 0.920 and
 Raw data: [initial run](measurements/sqlite-page-limit.csv),
 [confirmation](measurements/sqlite-page-limit-confirmation.csv), and
 [provenance](measurements/sqlite-page-limit-provenance.json).
+
+## Revalidation after the pagination dependency landed
+
+After #278 was squash-merged, `main` at
+`cbacb4ee0b0aa72e778045e1f25c06e38e2adc7d` was incorporated by merge commit
+`7ca608a5b3242b9ca97753b78846cabee61e9cf4`. Main's `queries.rs` is byte-identical
+to the previously measured #278 head. The resolved `queries.rs` is byte-identical
+to the reviewed CAST implementation at `10ecd51`. This preserves both cursor
+predicates and LIMIT wrappers, with no rewriting of other merged commits.
+
+The integrated all-feature chat-store suite passed 457 tests; six profiling
+and documentation tests were ignored in ordinary runs. All-target/all-feature
+chat-store Clippy passed. Both release binaries were rebuilt with the same
+harness and flags against the integrated sources, using main's query file for
+the base and the CAST query file for the head. Setup, dataset and result checks
+are the same as above. No compiler ran during measurement.
+
+The new timing run again used seven alternating pairs, 256 batches per process,
+allocation accounting disabled, and CPU affinity 0. It retained 42 observations.
+Times below are milliseconds for 256 batches; ratios and ranges are paired.
+
+| Case | Base wall ms | Head wall ms | Paired wall ratio | Paired CPU ratio | CPU ratio range |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| attach | 2302.1 | 1960.6 | 0.864 | 0.863 | 0.817–0.893 |
+| history | 5282.9 | 4762.4 | 0.917 | 0.917 | 0.868–0.977 |
+| reactions | 366.3 | 354.8 | 0.989 | 0.990 | 0.940–1.026 |
+
+These observed CPU medians correspond to about 13.7% less CPU for attach and
+8.3% for history with reactions. The unchanged reaction control moved about 1%.
+They describe these synthetic pooled reads on the pinned runner, with the
+ranges shown, rather than whole-application startup or connected behavior.
+
+A separate 32-iteration allocation run retained 42 observations. Attach Rust
+allocation requests per batch were 25,585.03 in the base and 25,537.03 in the head.
+Requested bytes increased by 816.00 bytes per batch, about 0.035%.
+Reaction-only Rust requests and bytes matched. As in the initial study, the
+SQLite C allocator is outside this counter; no total heap or RSS gain is claimed.
+
+Timing reproduction with the rebuilt binaries:
+
+```sh
+python3 scripts/measure-sqlite-page-limit.py /tmp/page-limit-post-main-base \
+  /tmp/page-limit-post-main-head --iterations 256 --samples 7 \
+  --cases attach history reactions --modes 0 --cpu 0 \
+  --output docs/measurements/sqlite-page-limit-post-main.csv
+```
+
+Data: [post-main timing](measurements/sqlite-page-limit-post-main.csv),
+[post-main Rust allocation traffic](measurements/sqlite-page-limit-post-main-alloc.csv),
+and [post-main provenance](measurements/sqlite-page-limit-post-main-provenance.json).
+Historical CSV line endings were normalized to LF without changing any values.

@@ -64,7 +64,7 @@ def main():
                     raise RuntimeError(f"base/head result mismatch: {case}, {observed}")
             print(json.dumps(dict(case=case, allocations=allocations, completed=True)), flush=True)
     with args.output.open("w", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(output, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     for case in args.cases:
