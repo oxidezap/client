@@ -1,62 +1,40 @@
 # Channel image previews
 
-Channel media can be plaintext. Hydration must preserve `fileSha256` and
-`staticUrl` without requiring `mediaKey` or `fileEncSha256`. Returning an empty
-key as `Some([])` incorrectly selects encrypted download in the library.
+Channel media can be plaintext. Preserve `fileSha256` and `staticUrl` without
+requiring E2EE keys. An absent key must remain absent in `Downloadable`;
+`Some([])` incorrectly selects encrypted download.
 
-The virtual message list schedules a full-image fetch for channel rows near the
-viewport when the declared image size is known and at most 4 MiB. Downloads use
-the library's streaming byte budget (4 MiB total wire and plaintext, including
-retries), with at most two image requests in flight. A failed automatic request
-keeps the inline thumbnail, stays manually retryable and is attempted only once
-in that account session. The attempt set stops growing at 256 entries. Unknown
-or larger images remain manual downloads. This is application policy, not a
-claim that the official client uses those limits.
+Native virtual-list rows may fetch a known image up to 4 MiB. The streaming
+budget bounds actual wire/plaintext bytes across retries; two requests run at
+once, with one automatic attempt per image and 256 remembered attempts per
+account session. Failure retains the inline fallback and manual retry.
+Unknown/larger images remain manual. The client has no photo auto-download
+preference or metered-network policy; these bounds do not emulate such controls.
 
-Native and web preserve the same download metadata and cache identity. Automatic
-fetch is currently native only: the browser HTTP adapter implements buffered
-`fetch`, not the SDK's synchronous streaming reader. Bounded SDK downloads refuse
-that adapter before HTTP, so browser manual downloads retain their existing
-buffered path and automatic attempts are disabled there. A browser attached to a
-native daemon can still manually fetch/cache the full channel image. Adding an
-asynchronous bounded browser media API is a separate dependency-level change.
-Full channel images use the account-scoped content cache. Old `f-<message>`
-entries cannot be trusted: earlier clients treated a channel thumbnail with
-discarded download metadata as a full image and could cache it there. No
-resizing, recompression or upscaling is added. Session changes discard late
-image completions; existing retained-media and decoded-image budgets still apply.
+Web preserves metadata and manual downloads. Automatic fetching is disabled:
+its buffered HTTP adapter cannot enforce the SDK's synchronous streaming budget.
+Full channel images use the account-scoped content hash, bypassing old
+`f-<message>` entries that may contain inline thumbnails. No recompression or
+upscaling is added. Session/logout guards reject late completions.
 
-## Protocol evidence
+## Preserved Web evidence
 
-Static analysis on 2026-10-29 of whatspec commit
-`eb16f595d455d8b0b3f7966a59444f4f9894c127`, schema `4.4.0`, WhatsApp Web
-`2.3000.1047483476`. The preserved snapshot contains 579 bundles, set hash
+Whatspec commit `eb16f595d455d8b0b3f7966a59444f4f9894c127`, schema `4.4.0`,
+WhatsApp Web `2.3000.1047483476`; analyzed 2026-10-29. The 579-bundle set hash is
 `05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b`.
-The [exact release asset](https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1047483476-05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b.tar.xz)
+The [release asset](https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1047483476-05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b.tar.xz)
 has SHA-256 `22243b9c2ff18a66cea8fd66551821fe0f9f09786d107e2be8284637db86c349`.
-Archive digest, complete bundle hash/size multiset and set fingerprint were
-verified before AST extraction. Offsets below are bytes in original bundles.
+Archive digest, complete hash/size multiset and set fingerprint were verified
+before AST extraction; duplicate module bodies were identical. Offsets are bytes.
 
-- `WAWebParseImageMessageProto`, bundle `09d91f…b871b8`, 344242–347609:
-  preserves inline JPEG, dimensions, original and encrypted hashes, direct path,
-  allowlisted static URL and separate server-thumbnail metadata.
-- `WAWebMediaMessageGetValidatedProperties`, same bundle, 337063–340702:
-  key validation is conditional on the message not being a newsletter;
-  plaintext SHA-256 remains validated.
-- `WAWebMediaUrlAllowlist`, same bundle, 326506–327138: HTTPS and
-  `whatsapp.net` or its subdomains. The client applies that boundary to retained
-  static URLs.
-- `WAWebMediaCryptoEligibilityUtils`, bundle `430cb8…9eee`, 979236–980120:
-  media crypto is not expected for newsletter messages.
-- `useWAWebMsgDownloadMedia`, bundle `36dc12…717`, 563446–565504:
-  render triggers download subject to cached-file state, photo-download
-  preference and chat suspension. The client uses the bounded policy above.
-- `WAWebMediaDownloadMmsThumbnail`, bundle `f588ee…c4690`, 1902352–1908535:
-  server thumbnails can replace the inline fallback separately from full media.
-  This change fetches the original small channel image; separate HQ link-card
-  thumbnails are not implemented here.
+| Module | Bundle / offsets | Observed behavior |
+| --- | --- | --- |
+| `WAWebParseImageMessageProto` | `09d91f…b871b8`, 344242–347609 | Preserves original media and separate server-thumbnail metadata. |
+| `WAWebMediaMessageGetValidatedProperties` | Same, 337063–340702 | Newsletter media does not require E2EE keys; SHA-256 remains validated. |
+| `WAWebMediaUrlAllowlist` | Same, 326506–327138 | HTTPS, `whatsapp.net` or its subdomains. |
+| `useWAWebMsgDownloadMedia` | `36dc12…717`, 563446–565504 | Full-media fetch on render checks cache, photo preferences and suspension; passes `downloadEvenIfExpensive:false`. |
+| `WAWebMediaDownloadMmsThumbnail` | `f588ee…c4690`, 1902352–1908535 | Separate server thumbnail can replace the inline fallback. |
 
-This is not an authenticated G1 replay or a visual parity result. Library
-materialization of both supplied screenshots failed in the executor, and the
-returned workspace paths were not readable there. Screenshot-specific pixel
-quality and live native/browser rendering still need verification.
+Fetching a small original is an application choice, not a necessary official
+preview step or proof of visual parity. Separate HQ/link-card thumbnails are not
+implemented here.
