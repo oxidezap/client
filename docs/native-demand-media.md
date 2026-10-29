@@ -31,7 +31,8 @@ OS-level window occlusion is not tracked.
 The controller holds at most 64 demanded descriptors and one read slot. A
 cancelled read retains that slot until its background task completes, so rapid
 navigation or account changes cannot accumulate reads in parallel. A cancellation
-flag is checked before file I/O. An already-running filesystem read may finish;
+flag is checked before file I/O, and destroying the controller also marks its
+queued work cancelled. An already-running filesystem read may finish;
 its result is discarded after the owner leaves. A later identical owner cannot
 revive a cancelled request.
 
@@ -146,9 +147,11 @@ the test cache override and verifies the real cache is available without IPC,
 retaining key validation. Previews alone, videos and revoked messages stay out
 of the image album.
 
-Native GUI validation passed: 606 tests passed, 7 measurement tests ignored;
-all-target/all-feature GUI Clippy with `-D warnings`, workspace formatting and
-diff checks passed. The GUI web target also type-checked with
+Native validation passed: the full workspace passed 2,370 unit/integration/
+doctests with 23 ignored, including 607 GUI tests with 7 ignored measurements.
+Workspace all-target/all-feature Clippy with `-D warnings`, formatting and diff
+checks passed. A lifecycle regression releases the app entity before the queued
+worker runs and asserts that the cache receives no read. The GUI web target also type-checked with
 `cargo +nightly-2026-09-03 check -p oxidezap-gui --all-features --target wasm32-unknown-unknown -Z build-std=std,panic_abort`,
 with atomics and dead-code/unused-import warnings in unmodified paths. A first
 stable attempt stopped in `wasm_thread`, which requires nightly; it did not

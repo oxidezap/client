@@ -85,6 +85,14 @@ pub(super) struct Materialization {
     ticket: u64,
 }
 
+impl Drop for Materialization {
+    fn drop(&mut self) {
+        if let Some(running) = &self.running {
+            running.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl Materialization {
     fn surface(&mut self, owner: Option<Owner>) {
         if self.owner == owner {
@@ -966,5 +974,26 @@ mod tests {
             assert!(!app.awaiting_cached_media("peer@example.invalid", message));
         });
         assert_eq!(cache.reads.load(Ordering::Relaxed), 1);
+    }
+    #[gpui::test]
+    fn dropping_the_owner_cancels_a_read_queued_on_the_background_executor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cache) = setup(cx);
+        let weak = app.downgrade();
+        app.update(cx, |app, cx| {
+            app.visible_chat = Some("peer@example.invalid".into());
+            app.note_visible_media("peer@example.invalid".into(), vec!["m0".into()], cx);
+        });
+        assert_eq!(cache.reads.load(Ordering::Relaxed), 0);
+        drop(app);
+        cx.update(|_| ()); // flush the entity release before the worker runs
+        assert!(weak.upgrade().is_none());
+        cx.executor().run_until_parked();
+        assert_eq!(
+            cache.reads.load(Ordering::Relaxed),
+            0,
+            "no I/O may start for a destroyed owner"
+        );
     }
 }
