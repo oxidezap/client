@@ -1387,9 +1387,7 @@ fn execute_command(
                 let resp = client.request(ClientRequest::GetProfile { jid: g.jid })?;
                 if let DaemonResponse::Profile(p) = resp {
                     print_result(output_mode, &p, |prof| {
-                        println!("Name:  {}", prof.name.as_deref().unwrap_or("none"));
-                        println!("About: {}", prof.about.as_deref().unwrap_or("none"));
-                        println!("Photo: {}", prof.picture_url.as_deref().unwrap_or("none"));
+                        print!("{}", output::profile_text(prof));
                     });
                 }
                 Ok(())
@@ -1439,9 +1437,7 @@ fn execute_command(
                 let resp = client.request(ClientRequest::GetBusinessProfile { jid })?;
                 if let DaemonResponse::Profile(p) = resp {
                     print_result(output_mode, &p, |prof| {
-                        println!("Name:  {}", prof.name.as_deref().unwrap_or("none"));
-                        println!("About: {}", prof.about.as_deref().unwrap_or("none"));
-                        println!("Photo: {}", prof.picture_url.as_deref().unwrap_or("none"));
+                        print!("{}", output::profile_text(prof));
                     });
                 }
                 Ok(())

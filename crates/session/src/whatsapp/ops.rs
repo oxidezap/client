@@ -9,7 +9,6 @@
 use whatsapp_rust::wacore::proto_helpers::MessageExt as _;
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _};
 use whatsapp_rust::waproto::whatsapp as wa;
-use whatsapp_rust::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
 use super::WhatsAppClient;
 use super::convert::{poll_creation_of, stored_to_chat_message};
@@ -34,16 +33,6 @@ pub struct PollView {
     pub question: String,
     pub options: Vec<String>,
     pub selectable_count: u32,
-}
-
-/// A profile as the network describes it.
-#[derive(Debug, Clone, Default)]
-pub struct ProfileView {
-    pub jid: String,
-    pub name: Option<String>,
-    pub about: Option<String>,
-    pub picture_url: Option<String>,
-    pub is_business: bool,
 }
 
 /// Whether a phone number is on WhatsApp.
@@ -422,95 +411,6 @@ impl WhatsAppClient {
                 result.message_id.to_string(),
                 whatsapp_rust::wacore::time::now_millis(),
             ))
-        })
-    }
-
-    /// A profile as the network describes it: about, picture and business
-    /// name. `None` asks about this account itself.
-    pub fn get_profile(&self, jid: Option<String>) -> Task<Result<ProfileView, String>> {
-        let session = self.session.clone();
-        self.exec.spawn(async move {
-            let Some(live) = session.lock().await.clone() else {
-                return Err("no session yet".to_string());
-            };
-            let target: Jid = match jid {
-                Some(j) => j.parse().map_err(|_| "not a user address".to_string())?,
-                None => live
-                    .client
-                    .pn()
-                    .ok_or_else(|| "not logged in".to_string())?,
-            };
-            let client = &live.client;
-            let info = client
-                .contacts()
-                .get_user_info(std::slice::from_ref(&target))
-                .await
-                .map_err(|e| e.to_string())?;
-            let about = info.values().next().and_then(|u| u.status.clone());
-            let is_business = info.values().next().is_some_and(|u| u.is_business);
-            let picture_url = client
-                .pictures()
-                .lookup(ProfilePictureRequest::new(
-                    ProfilePictureTarget::Contact(&target),
-                    ProfilePictureType::Full,
-                ))
-                .await
-                .ok()
-                .and_then(|outcome| outcome.into_found())
-                .map(|p| p.url);
-            let name = live
-                .chat_store
-                .contact(&target)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|c| c.full_name.or(c.push_name).or(c.business_name));
-            Ok(ProfileView {
-                jid: target.to_string(),
-                name,
-                about,
-                picture_url,
-                is_business,
-            })
-        })
-    }
-
-    /// A business profile: verified name, about and picture.
-    pub fn get_business_profile(&self, jid: String) -> Task<Result<ProfileView, String>> {
-        let session = self.session.clone();
-        self.exec.spawn(async move {
-            let target: Jid = jid.parse().map_err(|_| "not a user address".to_string())?;
-            let Some(live) = session.lock().await.clone() else {
-                return Err("no session yet".to_string());
-            };
-            let client = &live.client;
-            let info = client
-                .contacts()
-                .get_user_info(std::slice::from_ref(&target))
-                .await
-                .map_err(|e| e.to_string())?;
-            let user = info
-                .values()
-                .next()
-                .ok_or_else(|| "no profile returned".to_string())?;
-            let name = user.verified_name.as_ref().and_then(|v| v.name.clone());
-            let picture_url = client
-                .pictures()
-                .lookup(ProfilePictureRequest::new(
-                    ProfilePictureTarget::Contact(&target),
-                    ProfilePictureType::Full,
-                ))
-                .await
-                .ok()
-                .and_then(|outcome| outcome.into_found())
-                .map(|p| p.url);
-            Ok(ProfileView {
-                jid: target.to_string(),
-                name,
-                about: user.status.clone(),
-                picture_url,
-                is_business: user.is_business,
-            })
         })
     }
 
