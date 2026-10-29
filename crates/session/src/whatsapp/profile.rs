@@ -201,6 +201,13 @@ fn profile_details(
             lid = Some((own.to_non_ad(), "session"));
         }
     }
+    // The returned primary JID is protocol evidence too, including a reply
+    // addressed through the other namespace with an explicit association.
+    if user.jid.server.is_pn_family() {
+        pn = Some((user.jid.to_non_ad(), "protocol"));
+    } else if user.jid.server.is_lid_family() {
+        lid = Some((user.jid.to_non_ad(), "protocol"));
+    }
     if let Some(disclosed) = user.pn_jid.as_ref().filter(|jid| jid.server.is_pn_family()) {
         pn = Some((disclosed.to_non_ad(), "protocol"));
     }
@@ -311,7 +318,7 @@ mod tests {
         let profile = profile_details(&target, user, None, None, Some(&mapping));
         assert_eq!(profile.lid.as_deref(), Some("100000001@lid"));
         assert_eq!(profile.lid_source, Some("protocol"));
-        assert_eq!(profile.pn_source, Some("request"));
+        assert_eq!(profile.pn_source, Some("protocol"));
 
         let info = user_info(&target, vec![]);
         let user = matching_user(&info, &target).unwrap();
@@ -399,6 +406,14 @@ mod tests {
             ],
         );
         assert_eq!(matching_user(&info, &pn).unwrap().jid, lid);
+        let profile = profile_details(&pn, matching_user(&info, &pn).unwrap(), None, None, None);
+        assert_eq!(
+            profile.pn_jid.as_deref(),
+            Some("15550001111@s.whatsapp.net")
+        );
+        assert_eq!(profile.lid.as_deref(), Some("100000001@lid"));
+        assert_eq!(profile.pn_source, Some("protocol"));
+        assert_eq!(profile.lid_source, Some("protocol"));
         assert!(matching_user(&info, &Jid::pn("15550002222")).is_err());
     }
 
