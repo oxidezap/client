@@ -2386,6 +2386,14 @@ fn profile_view_to_dto(profile: oxidezap_session::ProfileView) -> oxidezap_wire:
         name: profile.name,
         about: profile.about,
         picture_url: profile.picture_url,
+        picture_status: Some(profile.picture_status.to_owned()),
+        pn_jid: profile.pn_jid,
+        lid: profile.lid,
+        pn_source: profile.pn_source.map(str::to_owned),
+        lid_source: profile.lid_source.map(str::to_owned),
+        username: profile.username,
+        verified_name: profile.verified_name,
+        is_business: profile.is_business,
     }
 }
 
@@ -2422,6 +2430,27 @@ mod tests {
 
     use super::super::tests::{bridge, loaded, message, received, saturate, stored_chat};
     use super::*;
+
+    #[test]
+    fn profile_mapping_preserves_identity_provenance_and_picture_outcome() {
+        let dto = profile_view_to_dto(oxidezap_session::ProfileView {
+            jid: "100000001@lid".into(),
+            pn_jid: Some("15550001111@s.whatsapp.net".into()),
+            lid: Some("100000001@lid".into()),
+            pn_source: Some("protocol"),
+            lid_source: Some("request"),
+            picture_status: "not_authorized",
+            username: Some("synthetic_user".into()),
+            is_business: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(dto.pn_source.as_deref(), Some("protocol"));
+        assert_eq!(dto.lid_source.as_deref(), Some("request"));
+        assert_eq!(dto.pn_jid.as_deref(), Some("15550001111@s.whatsapp.net"));
+        assert_eq!(dto.picture_status.as_deref(), Some("not_authorized"));
+        assert_eq!(dto.username.as_deref(), Some("synthetic_user"));
+        assert_eq!(dto.is_business, Some(true));
+    }
 
     #[tokio::test]
     async fn offline_media_reads_hit_only_the_account_cache_and_refuse_misses() {

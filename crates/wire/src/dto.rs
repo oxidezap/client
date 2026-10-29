@@ -165,6 +165,24 @@ pub struct ProfileDto {
     pub name: Option<String>,
     pub about: Option<String>,
     pub picture_url: Option<String>,
+    /// Lookup outcome; absent for daemons predating this field.
+    #[serde(default)]
+    pub picture_status: Option<String>,
+    #[serde(default)]
+    pub pn_jid: Option<String>,
+    #[serde(default)]
+    pub lid: Option<String>,
+    /// Where each identity was learned: request, session, protocol, or local_mapping.
+    #[serde(default)]
+    pub pn_source: Option<String>,
+    #[serde(default)]
+    pub lid_source: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub verified_name: Option<String>,
+    #[serde(default)]
+    pub is_business: Option<bool>,
 }
 
 /// Call event metadata in chat history.

@@ -26,6 +26,7 @@ mod membership;
 mod mutations;
 /// Polls, profiles, contacts, channels, media fetch and history coverage.
 mod ops;
+mod profile;
 /// Sends a scriptable front end asks for, read from daemon-local paths.
 mod sends;
 
@@ -73,10 +74,11 @@ pub use groups::{
 };
 pub use ops::{
     BackfillFile, BackfillReport, ChannelView, ContactCheckView, ContactView, HistoryCoverage,
-    PollView, ProfileView,
+    PollView,
 };
 pub use outgoing::OutgoingFile;
 pub use paging::ReadBoundary;
+pub use profile::ProfileView;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

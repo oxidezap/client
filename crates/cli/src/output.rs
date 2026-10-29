@@ -87,3 +87,116 @@ mod tests {
         assert_eq!(envelope["data"]["id"], serde_json::json!("x"));
     }
 }
+
+/// Shared by ordinary and business profile commands.
+pub(crate) fn profile_text(profile: &oxidezap_wire::dto::ProfileDto) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let _ = writeln!(text, "JID:   {}", profile.jid);
+    for (label, jid, source) in [
+        ("PN", &profile.pn_jid, &profile.pn_source),
+        ("LID", &profile.lid, &profile.lid_source),
+    ] {
+        if let Some(jid) = jid {
+            let _ = write!(text, "{label}: {jid}");
+            if let Some(source) = source {
+                let _ = write!(text, " [{source}]");
+            }
+            text.push('\n');
+        }
+    }
+    let _ = writeln!(text, "Name:  {}", profile.name.as_deref().unwrap_or("none"));
+    let _ = writeln!(
+        text,
+        "About: {}",
+        profile.about.as_deref().unwrap_or("none")
+    );
+    if let Some(username) = &profile.username {
+        let _ = writeln!(text, "Username: @{username}");
+    }
+    if let Some(is_business) = profile.is_business {
+        let _ = writeln!(text, "Business: {is_business}");
+    }
+    if let Some(name) = &profile.verified_name {
+        let _ = writeln!(text, "Verified name: {name}");
+    }
+    let photo = profile
+        .picture_url
+        .as_deref()
+        .unwrap_or(match profile.picture_status.as_deref() {
+            Some("not_found") => "none",
+            Some("not_authorized") => "not authorized",
+            Some("unchanged") => "unchanged, URL unavailable",
+            _ => "unknown",
+        });
+    let _ = writeln!(text, "Photo: {photo}");
+    text
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::profile_text;
+    use oxidezap_wire::dto::ProfileDto;
+
+    #[test]
+    fn profile_text_distinguishes_absence_privacy_and_legacy_unknown() {
+        let mut profile = ProfileDto {
+            jid: "15550001111@s.whatsapp.net".into(),
+            ..Default::default()
+        };
+        assert!(profile_text(&profile).contains("Photo: unknown\n"));
+        for (status, expected) in [
+            ("not_found", "none"),
+            ("not_authorized", "not authorized"),
+            ("unchanged", "unchanged, URL unavailable"),
+        ] {
+            profile.picture_status = Some(status.into());
+            assert!(profile_text(&profile).contains(&format!("Photo: {expected}\n")));
+        }
+        profile.picture_url = Some("https://example.invalid/photo.jpg".into());
+        profile.picture_status = Some("found".into());
+        assert!(profile_text(&profile).contains("Photo: https://example.invalid/photo.jpg\n"));
+    }
+
+    #[test]
+    fn profile_text_and_json_preserve_identity_sources_and_optional_details() {
+        let profile = ProfileDto {
+            jid: "100000001@lid".into(),
+            pn_jid: Some("15550001111@s.whatsapp.net".into()),
+            lid: Some("100000001@lid".into()),
+            pn_source: Some("local_mapping".into()),
+            lid_source: Some("request".into()),
+            username: Some("synthetic_user".into()),
+            verified_name: Some("Synthetic shop".into()),
+            is_business: Some(true),
+            picture_status: Some("not_authorized".into()),
+            ..Default::default()
+        };
+        let text = profile_text(&profile);
+        assert!(text.contains("PN: 15550001111@s.whatsapp.net [local_mapping]\n"));
+        assert!(text.contains("LID: 100000001@lid [request]\n"));
+        assert!(text.contains("Username: @synthetic_user\n"));
+        assert!(text.contains("Verified name: Synthetic shop\n"));
+        let json = serde_json::to_value(&profile).unwrap();
+        assert_eq!(json["pn_source"], "local_mapping");
+        assert_eq!(json["picture_status"], "not_authorized");
+        assert_eq!(json["username"], "synthetic_user");
+        let decoded: ProfileDto = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn old_daemon_profiles_remain_readable_without_claiming_a_photo_is_absent() {
+        let profile: ProfileDto = serde_json::from_str(
+            r#"{"jid":"100000001@lid","name":null,"about":null,"picture_url":null}"#,
+        )
+        .unwrap();
+        assert_eq!(profile.lid, None);
+        assert_eq!(profile.pn_jid, None);
+        assert_eq!(profile.picture_status, None);
+        let text = profile_text(&profile);
+        assert!(text.contains("Photo: unknown\n"));
+        assert!(!text.contains("PN:"));
+        assert!(!text.contains("LID:"));
+    }
+}
