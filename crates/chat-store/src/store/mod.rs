@@ -178,7 +178,10 @@ pub(crate) enum WriterMsg {
     /// name is news — like the group-subject arm — so a pass that learned
     /// nothing broadcasts nothing and the debounced reload stays quiet.
     ChatNames(Vec<ChatNameWrite>),
-    ChannelMutes(Vec<(String, bool)>),
+    ChannelMutes {
+        writes: Vec<(String, bool)>,
+        expected: Option<crate::types::ChannelMuteSnapshot>,
+    },
     /// Authoritative, typed community relationships read from group overviews.
     GroupHierarchies(Vec<GroupHierarchyWrite>),
     SendFailed {
@@ -1114,7 +1117,27 @@ impl ChatStore {
             return Ok(());
         }
         self.tx
-            .send(WriterMsg::ChannelMutes(writes))
+            .send(WriterMsg::ChannelMutes {
+                writes,
+                expected: None,
+            })
+            .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
+    }
+
+    /// Apply a metadata response only where the pre-request mute still matches.
+    pub fn apply_channel_mute_metadata(
+        &self,
+        writes: Vec<(String, bool)>,
+        expected: crate::types::ChannelMuteSnapshot,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::ChannelMutes {
+                writes,
+                expected: Some(expected),
+            })
             .map_err(|error| ChatStoreError::Store(StoreError::Validation(error.to_string())))
     }
 

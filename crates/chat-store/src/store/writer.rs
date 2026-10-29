@@ -584,12 +584,25 @@ fn apply_writer_msg(
         WriterMsg::AvatarCleared { jid, seq } => {
             crate::store::avatar::delete(conn, device_id, jid, *seq)
         }
-        WriterMsg::ChannelMutes(writes) => {
+        WriterMsg::ChannelMutes { writes, expected } => {
             use diesel::prelude::*;
             use schema::chats::dsl;
             for (jid, muted) in writes {
                 if !jid.ends_with("@newsletter") {
                     continue;
+                }
+                if let Some(expected) = expected {
+                    let Some(before) = expected.get(jid) else {
+                        continue;
+                    };
+                    let current: Option<(Option<i64>, bool)> = dsl::chats
+                        .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(jid)))
+                        .select((dsl::muted_until, dsl::mute_appstate_seen))
+                        .first(conn)
+                        .optional()?;
+                    if current.as_ref() != Some(before) {
+                        continue;
+                    }
                 }
                 let until = muted.then_some(i64::MAX);
                 let changed = diesel::update(

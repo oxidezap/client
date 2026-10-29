@@ -116,3 +116,40 @@ async fn zero_unmutes_and_malformed_mute_does_not_replace_durable_state() {
         );
     }
 }
+
+#[tokio::test]
+async fn late_channel_metadata_does_not_revert_a_newer_mute_or_unmute() {
+    let (_db, store) = test_store().await;
+    const CHANNEL: &str = "120363000000000002@newsletter";
+    feed(
+        &store,
+        [history_sync_event({
+            let mut history = wa::HistorySync::default();
+            let mut conv = wa::Conversation::default();
+            conv.id = CHANNEL.into();
+            history.conversations = vec![conv];
+            history
+        })],
+    )
+    .await;
+    for (newer, stale) in [(true, false), (false, true)] {
+        let before = store.channel_mute_snapshot().await.unwrap();
+        store
+            .apply_channel_mutes(vec![(CHANNEL.into(), newer)])
+            .unwrap();
+        store.flush().await.unwrap();
+        store
+            .apply_channel_mute_metadata(vec![(CHANNEL.into(), stale)], before)
+            .unwrap();
+        store.flush().await.unwrap();
+        assert_eq!(
+            store
+                .notification_metadata(&jid(CHANNEL))
+                .await
+                .unwrap()
+                .unwrap()
+                .muted,
+            newer
+        );
+    }
+}

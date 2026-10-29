@@ -184,6 +184,9 @@ pub struct CallEventDto {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelDto {
     pub jid: String,
+    /// Viewer update mute setting; absent means unknown, not unmuted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_muted: Option<bool>,
     pub name: String,
     pub description: Option<String>,
     pub subscriber_count: u64,

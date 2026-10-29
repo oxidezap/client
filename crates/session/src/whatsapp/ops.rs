@@ -86,6 +86,7 @@ fn contact_view_of(entry: oxidezap_chat_store::ContactEntry) -> ContactView {
 #[derive(Debug, Clone)]
 pub struct ChannelView {
     pub jid: String,
+    pub muted: Option<bool>,
     pub name: String,
     pub description: Option<String>,
     pub subscriber_count: u64,
@@ -816,6 +817,11 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let mute_snapshot = live
+                .chat_store
+                .channel_mute_snapshot()
+                .await
+                .map_err(|e| e.to_string())?;
             let subscribed = live
                 .client
                 .newsletter()
@@ -823,11 +829,12 @@ impl WhatsAppClient {
                 .await
                 .map_err(|e| e.to_string())?;
             live.chat_store
-                .apply_channel_mutes(
+                .apply_channel_mute_metadata(
                     subscribed
                         .iter()
                         .filter_map(|meta| meta.muted.map(|muted| (meta.jid.to_string(), muted)))
                         .collect(),
+                    mute_snapshot,
                 )
                 .map_err(|e| e.to_string())?;
             live.chat_store.flush().await.map_err(|e| e.to_string())?;
@@ -845,6 +852,11 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let mute_snapshot = live
+                .chat_store
+                .channel_mute_snapshot()
+                .await
+                .map_err(|e| e.to_string())?;
             let meta = live
                 .client
                 .newsletter()
@@ -853,7 +865,7 @@ impl WhatsAppClient {
                 .map_err(|e| e.to_string())?;
             if let Some(muted) = meta.muted {
                 live.chat_store
-                    .apply_channel_mutes(vec![(meta.jid.to_string(), muted)])
+                    .apply_channel_mute_metadata(vec![(meta.jid.to_string(), muted)], mute_snapshot)
                     .map_err(|e| e.to_string())?;
                 live.chat_store.flush().await.map_err(|e| e.to_string())?;
             }
@@ -871,6 +883,11 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let mute_snapshot = live
+                .chat_store
+                .channel_mute_snapshot()
+                .await
+                .map_err(|e| e.to_string())?;
             let meta = live
                 .client
                 .newsletter()
@@ -879,7 +896,7 @@ impl WhatsAppClient {
                 .map_err(|e| e.to_string())?;
             if let Some(muted) = meta.muted {
                 live.chat_store
-                    .apply_channel_mutes(vec![(meta.jid.to_string(), muted)])
+                    .apply_channel_mute_metadata(vec![(meta.jid.to_string(), muted)], mute_snapshot)
                     .map_err(|e| e.to_string())?;
                 live.chat_store.flush().await.map_err(|e| e.to_string())?;
             }
@@ -1322,6 +1339,7 @@ fn poll_view_of(stored: oxidezap_chat_store::StoredMessage) -> Option<PollView> 
 /// A subscribed channel as a plain view.
 fn channel_view_of(meta: whatsapp_rust::features::NewsletterMetadata) -> ChannelView {
     ChannelView {
+        muted: meta.muted,
         jid: meta.jid.to_string(),
         name: meta.name,
         description: meta.description,

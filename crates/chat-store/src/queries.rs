@@ -818,6 +818,30 @@ impl ChatStore {
         }))
     }
 
+    /// Snapshot channel mute state before awaiting server metadata.
+    pub async fn channel_mute_snapshot(&self) -> Result<crate::types::ChannelMuteSnapshot> {
+        use schema::chats::dsl;
+        let device_id = self.device_id();
+        Ok(self
+            .db()
+            .read(move |conn| {
+                let rows: Vec<(String, Option<i64>, bool)> = dsl::chats
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::jid.like("%@newsletter")),
+                    )
+                    .select((dsl::jid, dsl::muted_until, dsl::mute_appstate_seen))
+                    .load(conn)
+                    .map_err(db_err)?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(jid, until, seen)| (jid, (until, seen)))
+                    .collect())
+            })
+            .await?)
+    }
+
     /// Every special chat's identity columns, in one read.
     ///
     /// The chat-name resolver's full pass works from this, not from the

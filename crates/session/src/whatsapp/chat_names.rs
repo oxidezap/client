@@ -900,6 +900,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     let mut settled: Vec<(String, Option<String>)> = Vec::new();
     let mut resolved: Vec<oxidezap_chat_store::ChatNameWrite> = Vec::new();
     let mut resolved_mutes = Vec::new();
+    let mut pre_channel_mutes = Default::default();
     let mut resolved_hierarchies: Vec<oxidezap_chat_store::GroupHierarchyWrite> = Vec::new();
     let mut failed: Vec<(String, std::time::Duration)> = Vec::new();
     let mut global_backoff: Option<std::time::Duration> = None;
@@ -1070,6 +1071,14 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
         // failure of the cheapest call into per-channel requests for all
         // of them, exactly while the service is down. On failure the whole
         // channel half stays pending (cooled per chat) for a later pass.
+        pre_channel_mutes = match chat_store.channel_mute_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                warn!("channel mute snapshot failed: {e}");
+                retry_after_store_failure(resolver, signal, &request, stop).await;
+                return;
+            }
+        };
         let listed = source.subscribed_channels();
         tokio::pin!(listed);
         let listed = tokio::select! {
@@ -1212,7 +1221,8 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             queue_error = Some(e);
         }
         if queue_error.is_none()
-            && let Err(e) = chat_store.apply_channel_mutes(resolved_mutes.clone())
+            && let Err(e) =
+                chat_store.apply_channel_mute_metadata(resolved_mutes.clone(), pre_channel_mutes)
         {
             queue_error = Some(e);
         }
