@@ -96,6 +96,8 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path crates/gui/tests/webcodecs/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml --all -- --check
+      - name: Test memory measurement driver
+        run: python3 -m unittest discover -s scripts -p test_measure_daemon_memory.py
       - name: Check unused dependencies
         run: cargo machete
       - name: Test benchmark cleanup

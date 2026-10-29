@@ -7,13 +7,41 @@ import json
 import os
 from pathlib import Path
 import platform
+import math
+import signal
 import statistics
 import subprocess
 import tempfile
 import time
 
 
-def run(binary, scenario, mode):
+def wait_for_workload(process, timeout):
+    def expired(_signal, _frame):
+        raise TimeoutError(f"Workload exceeded {timeout:g} seconds")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        _, status, usage = os.wait4(process.pid, 0)
+        process.returncode = os.waitstatus_to_exitcode(status)
+        return usage
+    except BaseException:
+        # Prevent a stalled workload or an interrupted driver from leaving a child.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            _, status, _ = os.wait4(process.pid, 0)
+            process.returncode = os.waitstatus_to_exitcode(status)
+        raise
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def run(binary, scenario, mode, timeout):
     env = os.environ.copy()
     env.pop("OXIDEZAP_MEMORY_REPORT", None)
     if mode == "memory":
@@ -24,9 +52,8 @@ def run(binary, scenario, mode):
     with tempfile.TemporaryFile(mode="w+") as log:
         started = time.monotonic()
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
-        _, status, usage = os.wait4(process.pid, 0)
+        usage = wait_for_workload(process, timeout)
         elapsed = time.monotonic() - started
-        process.returncode = os.waitstatus_to_exitcode(status)
         log.seek(0)
         output = log.read()
     if process.returncode != 0:
@@ -57,7 +84,7 @@ def summarize(records):
     result = {}
     for scenario in sorted({r["scenario"] for r in records}):
         result[scenario] = {}
-        for variant in sorted({r["variant"] for r in records}):
+        for variant in sorted({r["variant"] for r in records if r["scenario"] == scenario}):
             selected = [r for r in records if r["scenario"] == scenario and r["variant"] == variant]
             data = {key: distribution([r[key] for r in selected])
                     for key in ["wall_s", "cpu_s", "maxrss_kib"]}
@@ -84,28 +111,40 @@ def main():
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--timeout", type=float, default=120, help="Seconds per workload process")
     args = parser.parse_args()
     if platform.system() != "Linux" or args.repeats < 1 or args.warmups < 0:
         parser.error("Requires Linux, positive repeats and nonnegative warmups")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be finite and positive")
     binaries = {"base": args.base.resolve(strict=True)}
     if args.head:
         binaries["head"] = args.head.resolve(strict=True)
+    output = args.output.resolve()
+    if any(output == binary or (output.exists() and output.samefile(binary))
+           for binary in binaries.values()):
+        parser.error("--output must not refer to an input binary")
     scenarios = ["headless", "attached", "read", "groups"]
     records = []
-    for scenario in scenarios:
-        for _ in range(args.warmups):
-            for binary in binaries.values():
-                run(binary, scenario, args.mode)
-        for repeat in range(args.repeats):
-            order = list(binaries)
-            if repeat % 2:
-                order.reverse()
-            for variant in order:
-                sample = run(binaries[variant], scenario, args.mode)
-                records.append({"scenario": scenario, "variant": variant, "repeat": repeat, **sample})
+    failure = None
+    try:
+        for scenario in scenarios:
+            for _ in range(args.warmups):
+                for binary in binaries.values():
+                    run(binary, scenario, args.mode, args.timeout)
+            for repeat in range(args.repeats):
+                order = list(binaries)
+                if repeat % 2:
+                    order.reverse()
+                for variant in order:
+                    sample = run(binaries[variant], scenario, args.mode, args.timeout)
+                    records.append({"scenario": scenario, "variant": variant, "repeat": repeat, **sample})
+    except (Exception, KeyboardInterrupt) as error:
+        failure = f"{type(error).__name__}: {error}"
     model = next((line.split(":", 1)[1].strip() for line in
                   Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), "unknown")
     result = {"mode": args.mode, "repeats": args.repeats, "warmups": args.warmups,
+              "timeout_s": args.timeout, "complete": failure is None, "error": failure,
               "runner": {"machine": platform.machine(), "kernel": platform.release(),
                          "cpu_model": model, "affinity": sorted(os.sched_getaffinity(0))},
               "binaries": {name: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -114,6 +153,8 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(f"Wrote {len(records)} isolated runs to {args.output}")
+    if failure is not None:
+        parser.exit(1, failure + "\n")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,9 @@ The driver alternates base/head order, excludes one warmup per scenario and
 reports seven isolated samples with median/min/max and raw observations. Each
 binary has a recorded SHA-256; build metadata records the compiler and revision.
 The OS file cache is warm, not forcibly cleared. Do not compare different hosts.
+Each workload has a configurable `--timeout` (120 seconds by default); failed
+runs exit nonzero and preserve completed samples in an explicitly incomplete
+report. Output paths that alias an input binary are rejected before execution.
 
 The bridge workloads replay 75,703 fixed-size synthetic text messages over 1,032
 chats, after a 100-chat attach with eight read rows per chat. Cases cover unread

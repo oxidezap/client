@@ -89,6 +89,7 @@ async fn account_sized_history_pages_without_skips_or_duplicates() {
 
     let mut cursor = None;
     let mut chats = std::collections::HashSet::new();
+    let mut previous_activity = i64::MAX;
     loop {
         let page = history
             .chats_page(ChatArchiveFilter::Unarchived, cursor, 100)
@@ -97,6 +98,12 @@ async fn account_sized_history_pages_without_skips_or_duplicates() {
         assert!(page.len() <= 100);
         for chat in &page {
             assert!(chats.insert(chat.jid.to_string()), "repeated chat");
+            let activity = chat.last_message_at.unwrap().timestamp_millis();
+            assert!(
+                activity < previous_activity,
+                "chat activity order across pages"
+            );
+            previous_activity = activity;
         }
         cursor = page.last().map(ChatCursor::from);
         if page.len() < 100 {
@@ -116,7 +123,14 @@ async fn account_sized_history_pages_without_skips_or_duplicates() {
             assert!(ids.insert(message.id.clone()), "repeated message");
             assert!(message.timestamp.timestamp_millis() < previous_timestamp);
             previous_timestamp = message.timestamp.timestamp_millis();
-            assert!(message.message.is_some(), "stored payload still decodes");
+            assert_eq!(
+                message
+                    .message
+                    .as_deref()
+                    .and_then(|m| m.conversation.as_deref()),
+                Some("synthetic fixture message"),
+                "stored payload decodes to the seeded text"
+            );
         }
         cursor = page.last().map(MessageCursor::from);
         if page.len() < 50 {
