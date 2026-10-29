@@ -944,6 +944,9 @@ pub struct WhatsAppApp {
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
+    /// Automatic attempts: false while pending/failed, true after success.
+    channel_preview_attempts: std::collections::HashMap<(String, String), bool>,
+    image_downloads_in_flight: std::collections::HashSet<String>,
     /// Native document destinations, scoped to the account, chat and message
     /// that initiated the save. Browser handoffs never enter this map.
     saved_documents: HashMap<(String, String, String), std::path::PathBuf>,
@@ -1478,6 +1481,8 @@ impl WhatsAppApp {
             recovery: cx.new(|_| recovery::Recovering::new()),
             notices: cx.new(|_| notices::Notices::new()),
             downloads_in_flight: std::collections::HashSet::new(),
+            channel_preview_attempts: std::collections::HashMap::new(),
+            image_downloads_in_flight: std::collections::HashSet::new(),
             saved_documents: HashMap::new(),
             document_downloads_in_flight: std::collections::HashSet::new(),
             document_state_generation: 0,
@@ -2359,6 +2364,8 @@ impl WhatsAppApp {
         // Playback itself is already stopped, above.
         self.video_players.clear();
         self.downloads_in_flight.clear();
+        self.channel_preview_attempts.clear();
+        self.image_downloads_in_flight.clear();
         self.saved_documents.clear();
         self.document_downloads_in_flight.clear();
         self.document_state_generation = self.document_state_generation.wrapping_add(1);

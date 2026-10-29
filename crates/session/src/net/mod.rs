@@ -131,3 +131,45 @@ mod tests {
         );
     }
 }
+
+/// The browser adapter has no synchronous streaming reader. Keep its existing
+/// manual buffered path usable; only native can enforce SDK streaming budgets.
+pub(crate) fn channel_image_limits(max: u64) -> whatsapp_rust::download::DownloadLimits {
+    imp::limits(max)
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod imp {
+    pub(super) const AUTOMATIC: bool = true;
+    pub(super) fn limits(max: u64) -> whatsapp_rust::download::DownloadLimits {
+        whatsapp_rust::download::DownloadLimits::new(max, max)
+    }
+}
+#[cfg(target_family = "wasm")]
+mod imp {
+    pub(super) const AUTOMATIC: bool = false;
+    pub(super) fn limits(_max: u64) -> whatsapp_rust::download::DownloadLimits {
+        whatsapp_rust::download::DownloadLimits::default()
+    }
+}
+
+pub(crate) fn automatic_channel_previews() -> bool {
+    imp::AUTOMATIC
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod image_budget_tests {
+    #[test]
+    fn native_hq_and_original_limits_remain_distinct() {
+        use oxidezap_core::DownloadableMedia as D;
+        use whatsapp_rust::download::DownloadLimits;
+        assert_eq!(
+            super::channel_image_limits(D::CHANNEL_THUMBNAIL_BYTES),
+            DownloadLimits::new(512 * 1024, 512 * 1024)
+        );
+        assert_eq!(
+            super::channel_image_limits(D::CHANNEL_PREVIEW_BYTES),
+            DownloadLimits::new(4 * 1024 * 1024, 4 * 1024 * 1024)
+        );
+    }
+}

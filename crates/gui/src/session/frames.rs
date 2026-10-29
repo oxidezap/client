@@ -573,7 +573,12 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
         {
             return;
         }
-        let Some(key) = media.cache_key.clone() else {
+        let Some(key) = media
+            .cache_key
+            .as_ref()
+            .or(media.preview_cache_key.as_ref())
+            .cloned()
+        else {
             return;
         };
         into.push(key);
@@ -892,14 +897,18 @@ fn materialize_avatar(key: &str, cache: &dyn MediaCache) -> Result<(), Materiali
 
 fn fill(media: &mut Option<MediaContent>, cache: &dyn MediaCache) {
     let Some(media) = media else { return };
-    let Some(key) = media.cache_key.take() else {
+    let reference = media
+        .cache_key
+        .take()
+        .map(|key| (key, false))
+        .or_else(|| media.preview_cache_key.take().map(|key| (key, true)));
+    let Some((key, preview)) = reference else {
         return;
     };
     match cache.read(&key) {
-        // The daemon only caches the real thing, so whatever came out of the
-        // cache is it — including when the row arrived carrying a fallback
-        // thumbnail, which is the shape a reload takes. The metadata beside
-        // the bytes described that thumbnail, and has to move with them.
+        // Inline fallback bytes have a separate reference. Only a full-media
+        // key may change the preview flag or restore the original MIME type.
+        Ok(bytes) if preview => media.data = bytes,
         Ok(bytes) => media.adopt_full_bytes(bytes),
         // The renderer falls back to offering the download, which is the same
         // thing it does for media that was never cached.
@@ -912,6 +921,60 @@ mod tests {
     use super::*;
     use oxidezap_core::CallState;
     use oxidezap_ipc::StateVersion;
+
+    #[test]
+    fn wire_preview_bytes_keep_their_mime_and_retry_flag_until_full_media_arrives() {
+        struct Cache;
+        impl MediaCache for Cache {
+            fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
+                match key {
+                    "preview" => Ok(Arc::new(vec![1, 2])),
+                    "full" => Ok(Arc::new(vec![3, 4, 5])),
+                    _ => Err("missing".into()),
+                }
+            }
+            fn stage(&self, _: &str, _: &[u8]) -> Result<(), String> {
+                unreachable!()
+            }
+            fn discard(&self, _: &str) {
+                unreachable!()
+            }
+        }
+        let dl: oxidezap_core::DownloadableMedia = serde_json::from_value(serde_json::json!({
+            "direct_path":"/v/channel", "media_key":[], "file_enc_sha256":[],
+            "file_sha256":vec![7;32], "file_length":1024, "mime_type":"image/webp",
+            "duration_secs":null, "download_type":"image"
+        }))
+        .unwrap();
+        let mut media = MediaContent::image(Arc::new(vec![1, 2]), "image/jpeg".into(), true)
+            .with_download(Some(dl));
+        media.preview_cache_key = Some("preview".into());
+        let mut wire: Option<MediaContent> =
+            serde_json::from_str(&serde_json::to_string(&Some(media)).unwrap()).unwrap();
+        assert!(wire.as_ref().unwrap().data.is_empty());
+        fill(&mut wire, &Cache);
+        let loaded = wire.as_mut().unwrap();
+        assert_eq!(loaded.data.as_slice(), [1, 2]);
+        assert!(loaded.data_is_preview);
+        assert!(!loaded.data_is_server_preview, "inline is not HQ");
+        assert_eq!(loaded.mime_type, "image/jpeg");
+        assert!(loaded.can_download());
+        loaded.adopt_server_preview(Arc::new(Vec::new()));
+        loaded.preview_cache_key = Some("preview".into());
+        wire = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+        fill(&mut wire, &Cache);
+        let loaded = wire.as_mut().unwrap();
+        assert!(loaded.data_is_preview && loaded.data_is_server_preview);
+        assert_eq!(loaded.mime_type, "image/jpeg");
+        assert!(loaded.can_download());
+        loaded.cache_key = Some("full".into());
+        fill(&mut wire, &Cache);
+        let loaded = wire.unwrap();
+        assert_eq!(loaded.data.as_slice(), [3, 4, 5]);
+        assert!(!loaded.data_is_preview);
+        assert!(!loaded.data_is_server_preview);
+        assert_eq!(loaded.mime_type, "image/webp");
+    }
 
     struct NoMedia;
 

@@ -28,6 +28,7 @@ use oxidezap_core::{DownloadableMedia, MediaType};
 /// that entity again inside it panics; everything the app knows arrives here
 /// instead.
 pub(super) struct MediaProps {
+    pub chat_jid: SharedString,
     pub video_player_state: Option<VideoPlayerState>,
     pub video_frame: Option<Arc<RenderImage>>,
     pub decoded_image: Option<Arc<Image>>,
@@ -50,6 +51,7 @@ pub(super) fn render_media_content(
     cx: &App,
 ) -> gpui::Div {
     let MediaProps {
+        chat_jid,
         video_player_state,
         video_frame,
         decoded_image,
@@ -101,7 +103,7 @@ pub(super) fn render_media_content(
                                 let msg_id = message_id.clone();
                                 let dl = dl.clone();
                                 entity.update(cx, |app, cx| {
-                                    app.download_image(msg_id, dl, cx);
+                                    app.download_image(chat_jid.to_string(), msg_id, dl, cx);
                                 });
                             })
                             .child(image),
@@ -129,6 +131,7 @@ pub(super) fn render_media_content(
                 el.child(render_download_placeholder(
                     "img-dl",
                     "[Image] Tap to download",
+                    chat_jid,
                     message_id,
                     dl,
                     entity,
@@ -183,7 +186,7 @@ pub(super) fn render_media_content(
                             let msg_id = message_id.clone();
                             let dl = dl.clone();
                             entity.update(cx, |app, cx| {
-                                app.download_image(msg_id, dl, cx);
+                                app.download_image(chat_jid.to_string(), msg_id, dl, cx);
                             });
                         })
                         .child(image),
@@ -227,6 +230,7 @@ pub(super) fn render_media_content(
                             el.child(render_download_placeholder(
                                 "sticker-dl",
                                 "[Sticker] Tap to download",
+                                chat_jid,
                                 message_id,
                                 dl,
                                 entity,
@@ -290,6 +294,7 @@ pub(super) fn render_media_content(
 fn render_download_placeholder(
     id_prefix: &str,
     label: &'static str,
+    chat_jid: SharedString,
     message_id: String,
     dl: DownloadableMedia,
     entity: Entity<WhatsAppApp>,
@@ -373,7 +378,7 @@ fn render_download_placeholder(
                 let msg_id = message_id.clone();
                 let dl = dl.clone();
                 entity.update(cx, |app, cx| {
-                    app.download_image(msg_id, dl, cx);
+                    app.download_image(chat_jid.to_string(), msg_id, dl, cx);
                 });
             })
         })

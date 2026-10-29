@@ -29,6 +29,7 @@
 pub(crate) mod account;
 mod activity;
 mod capabilities;
+pub(crate) mod channel_preview;
 pub mod clipboard;
 pub mod clock;
 pub mod download;

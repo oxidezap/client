@@ -184,6 +184,13 @@ fn an_omitted_field_comes_back_as_what_it_was() {
         media_type: MediaType::Image,
         data: Default::default(),
         cache_key: Some("f-3EB0".into()),
+        preview_cache_key: Some("d-preview-fixture".into()),
+        preview_downloadable: Some(serde_json::from_value(serde_json::json!({
+            "direct_path":"/v/hq-fixture", "media_key":[], "file_enc_sha256":[],
+            "file_sha256":vec![7;32], "static_url":null, "is_thumbnail":true,
+            "file_length":0, "mime_type":"image/jpeg", "duration_secs":null, "download_type":"image"
+        })).unwrap()),
+        data_is_server_preview: true,
         mime_type: "image/jpeg".into(),
         width: Some(1200),
         height: Some(800),
