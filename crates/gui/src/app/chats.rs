@@ -277,7 +277,7 @@ impl WhatsAppApp {
     }
 }
 
-/// Flatten the authoritative community relationships for the Groups filter.
+/// Flatten authoritative relationships for the Communities destination.
 /// A child is nested only when its parent JID is present and explicitly marked
 /// as a community; absent/unknown parents leave the subgroup visible at the
 /// root instead of guessing from a matching name. A pinned subgroup whose
@@ -405,10 +405,8 @@ impl WhatsAppApp {
     /// The row the chat list can visibly highlight for the current
     /// conversation, including a collapsed subgroup's community parent.
     pub(crate) fn chat_list_selection_jid(&self, cache: &ChatListCache) -> Option<String> {
-        let selected = self
-            .selected_chat
-            .as_deref()
-            .and_then(|jid| self.find_chat(jid))?;
+        let jid = self.selected_destination_jid()?;
+        let selected = self.find_chat(&jid)?;
         visible_chat_list_selection(&cache.rows, selected)
     }
 }

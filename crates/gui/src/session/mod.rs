@@ -793,6 +793,14 @@ pub struct Session {
 }
 
 impl Session {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn recording_test_session(endpoint: oxidezap_ipc::Endpoint) -> Self {
+        let (_, writer) = endpoint.split().expect("split test endpoint");
+        attach::begin(Link::over_stream(writer), Arc::new(media::Directory), false)
+            .expect("attach recording peer")
+            .session
+    }
+
     pub fn media_cache(&self) -> Arc<dyn MediaCache> {
         Arc::clone(&self.handle.conn.media)
     }

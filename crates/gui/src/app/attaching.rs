@@ -128,7 +128,7 @@ impl WhatsAppApp {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<(String, Option<ReplyDraft>, u64)> {
-        if self.destination != Destination::Chats || self.showing_settings(cx) {
+        if !self.destination.has_conversations() || self.showing_settings(cx) {
             return None;
         }
         let jid = self.selected_chat.clone()?;
@@ -154,7 +154,7 @@ impl WhatsAppApp {
     /// or drop may take long enough for the user to move to another chat or
     /// surface; opening a modal over it would name the previous destination.
     pub(crate) fn incoming_chat_still_visible(&self, jid: &str, cx: &App) -> bool {
-        self.destination == Destination::Chats
+        self.destination.has_conversations()
             && !self.showing_settings(cx)
             && self.visible_chat.as_deref() == Some(jid)
     }
@@ -367,7 +367,7 @@ impl WhatsAppApp {
         for file in files {
             drawn |= self.send_attachment(&jid, file.file, quoted.take(), caption.take(), cx);
         }
-        let destination_still_open = self.destination == Destination::Chats
+        let destination_still_open = self.destination.has_conversations()
             && self.selected_chat.as_deref() == Some(jid.as_str());
         if drawn && chat_was_visible && destination_still_open {
             self.scroll_to_last_message();

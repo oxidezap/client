@@ -47,7 +47,9 @@ impl WhatsAppApp {
         // slot. Focusing it there handed the keyboard to an input nothing was
         // drawing — the shortcut looked like it had done nothing, and every
         // keystroke after it edited a query no one could see.
-        self.set_destination(Destination::Chats, cx);
+        if !self.destination.has_conversations() {
+            self.set_destination(Destination::Chats, window, cx);
+        }
         // Mobile shows one pane at a time, and the field lives on the list.
         if self.mobile_panel.is_chat() {
             self.mobile_panel = MobilePanel::ChatList;
