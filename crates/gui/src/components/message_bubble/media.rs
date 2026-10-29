@@ -1110,6 +1110,7 @@ mod tests {
                         false,
                         self.app.clone(),
                         super::MediaProps {
+                            chat_jid: oxidezap_core::fixtures::PEER.into(),
                             video_player_state: None,
                             video_frame: None,
                             decoded_image: self.cached.clone(),
@@ -1141,6 +1142,9 @@ mod tests {
             direct_path: "/synthetic-sticker".into(),
             media_key: vec![],
             file_enc_sha256: vec![],
+            file_sha256: vec![],
+            static_url: None,
+            is_thumbnail: false,
             file_length: 0,
             mime_type: "image/webp".into(),
             duration_secs: None,
