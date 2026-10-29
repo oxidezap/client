@@ -6,18 +6,24 @@ matching browser/WebDriver binaries. Set CHROMEDRIVER and, if needed,
 WASM_BINDGEN_TEST_WEBDRIVER_JSON as for the project's browser tests, then run:
   RUSTFLAGS='--cfg web_sys_unstable_apis' python3 crates/daemon/tests/media_cache_browser_bench.py BASE_REF
 
+For shared memory, install the CI-pinned nightly with rust-src, configure the
+browser's SharedArrayBuffer flag as in CI, unset RUSTFLAGS and
+CARGO_ENCODED_RUSTFLAGS, then append --shared. The probe asserts the actual
+memory type before measuring. It inherits the repository's production wasm
+flags and rebuilds std; it still does not run the whole page.
+
 This uses the actual cache sources with the same pure dependency shims as the
 native probe. It measures synthetic fill/clear cycles in one browser with
 alternating execution order after warmup. It does not measure the whole page,
-shared-memory production builds, networking, image decode, CPU time or heap.
+networking, image decode, CPU time or heap.
 The temporary crate reuses the normal Cargo target/cache; no workspace manifest
 or production dependency changes are made.
 """
 
+import argparse
 import os
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import tomllib
 
@@ -29,6 +35,7 @@ PROBE = r'''
 #[cfg(test)] mod probe {
  use super::*;
  use wasm_bindgen::prelude::*;
+ use wasm_bindgen::JsCast as _;
  use wasm_bindgen_test::*;
  wasm_bindgen_test_configure!(run_in_browser);
  #[wasm_bindgen(inline_js="export function cache_probe_now() { return performance.now(); } export function cache_probe_yield() { return new Promise(resolve => setTimeout(resolve, 0)); }")]
@@ -53,6 +60,10 @@ PROBE = r'''
  }
  #[wasm_bindgen_test]
  async fn paired_release_measurements() {
+  let memory = wasm_bindgen::memory().unchecked_into::<js_sys::WebAssembly::Memory>();
+  let shared = memory.buffer().is_instance_of::<js_sys::SharedArrayBuffer>();
+  assert_eq!(shared, EXPECT_SHARED);
+  console_log!("SHARED_MEMORY={}",shared);
   for (count, rounds) in [(256,200),(1024,30),(4096,5),(4200,5)] {
    let keys:Vec<String>=(0..count).map(|i|format!("a1-d-{i:032x}")).collect();
    // Warm both implementations before collecting paired samples.
@@ -71,7 +82,11 @@ PROBE = r'''
 
 
 if __name__ == "__main__":
-    base = sys.argv[1]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("base")
+    parser.add_argument("--shared", action="store_true")
+    args = parser.parse_args()
+    base = args.base
     definitions = native.definitions(base)
     if definitions != native.definitions(None):
         raise RuntimeError("Probe requires identical key predicates, wipe rules and budget constants")
@@ -87,11 +102,18 @@ if __name__ == "__main__":
         for name in ["wasm-bindgen", "wasm-bindgen-futures", "wasm-bindgen-test", "js-sys"]:
             manifest += f'{name} = "={versions[name]}"\n'
         (directory / "Cargo.toml").write_text(manifest)
-        (directory / "lib.rs").write_text(definitions + "\n" + PROBE)
+        (directory / "lib.rs").write_text(definitions + f"\nconst EXPECT_SHARED: bool = {str(args.shared).lower()};\n" + PROBE)
         env = os.environ.copy()
         env.setdefault("CARGO_TARGET_DIR", str(native.ROOT / "target"))
         env.setdefault("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER", "wasm-bindgen-test-runner")
         env.setdefault("WASM_BINDGEN_TEST_TIMEOUT", "300")
-        subprocess.run(["cargo", "test", "--manifest-path", str(directory / "Cargo.toml"),
-                        "--target", "wasm32-unknown-unknown", "--release", "--", "--nocapture"],
-                       env=env, check=True)
+        command = ["cargo"]
+        if args.shared:
+            if env.get("RUSTFLAGS") or env.get("CARGO_ENCODED_RUSTFLAGS"):
+                raise RuntimeError("Unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS to inherit production flags")
+            command.append("+nightly-2026-09-03")
+        command += ["test", "--manifest-path", str(directory / "Cargo.toml"),
+                    "--target", "wasm32-unknown-unknown", "--release"]
+        if args.shared:
+            command += ["-Z", "build-std=std,panic_abort"]
+        subprocess.run(command + ["--", "--nocapture"], cwd=native.ROOT, env=env, check=True)
