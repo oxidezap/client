@@ -167,7 +167,9 @@ pub(super) fn render_media_content(
                         .w(px(display_w))
                         .h(px(display_h))
                         .aspect_square()
-                        .debug_selector(|| "sticker-image".into())
+                        .when(cfg!(test), |image| {
+                            image.debug_selector(|| "sticker-image".into())
+                        })
                         .object_fit(gpui::ObjectFit::Contain),
                     None => render_image_from_bytes(
                         media_content.data,
@@ -178,7 +180,9 @@ pub(super) fn render_media_content(
                         false,
                     )
                     .aspect_square()
-                    .debug_selector(|| "sticker-image".into()),
+                    .when(cfg!(test), |image| {
+                        image.debug_selector(|| "sticker-image".into())
+                    }),
                 };
                 let preview_id: SharedString = format!("sticker-preview-{}", message_id).into();
                 el.child(
@@ -203,7 +207,9 @@ pub(super) fn render_media_content(
                             .w(px(display_w))
                             .h(px(display_h))
                             .aspect_square()
-                            .debug_selector(|| "sticker-image".into())
+                            .when(cfg!(test), |image| {
+                                image.debug_selector(|| "sticker-image".into())
+                            })
                             .object_fit(gpui::ObjectFit::Contain);
                         el.child(image)
                     }
@@ -220,7 +226,9 @@ pub(super) fn render_media_content(
                                     .w(px(display_w))
                                     .h(px(display_h))
                                     .aspect_square()
-                                    .debug_selector(|| "sticker-image".into())
+                                    .when(cfg!(test), |image| {
+                                        image.debug_selector(|| "sticker-image".into())
+                                    })
                                     .object_fit(gpui::ObjectFit::Contain)
                                     .into_any_element(),
                                 None => render_image_from_bytes(
@@ -232,7 +240,9 @@ pub(super) fn render_media_content(
                                     false,
                                 )
                                 .aspect_square()
-                                .debug_selector(|| "sticker-image".into())
+                                .when(cfg!(test), |image| {
+                                    image.debug_selector(|| "sticker-image".into())
+                                })
                                 .into_any_element(),
                             })
                         } else if let Some(dl) = media_content.downloadable.clone() {
