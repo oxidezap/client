@@ -89,7 +89,7 @@ def main():
             src=path/(name+'.rs');src.write_text(source(ref));binary=path/name
             subprocess.run(['rustc','--edition=2024','-O',str(src),'-o',str(binary)],check=True)
             bins[name]=binary
-        w=csv.writer(sys.stdout);w.writerow(['sample','mode','unique','size','variant','elapsed_ns','reads','read_bytes','retained_payload_bytes','additional_peak_requested_heap','allocation_calls','process_user_s','process_system_s','peak_rss_kib'])
+        w=csv.writer(sys.stdout, lineterminator='\n');w.writerow(['sample','mode','unique','size','variant','elapsed_ns','reads','read_bytes','retained_payload_bytes','additional_peak_requested_heap','allocation_calls','process_user_s','process_system_s','peak_rss_kib'])
         for unique,size in [(12,1024*1024),(1,1024*1024),(3,1024*1024),(12,128)]:
             for i in range(12): (path/str(i)).write_bytes(bytes([i])*size)
             for mode in ['time','heap']:
