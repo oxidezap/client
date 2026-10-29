@@ -18,7 +18,7 @@ test-support = ["oxidezap-session/test-support"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 log = { workspace = true }
 
 oxidezap-audio = { workspace = true }
@@ -51,20 +51,20 @@ wacore-binary = { workspace = true }
 # macOS and Windows failed on `tokio::fs` not existing.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 # The microphone test consumes the audio capture receiver directly.
-async-channel = "2"
+async-channel = "2.5.0"
 tokio = { workspace = true, features = ["fs", "net", "rt-multi-thread", "signal"] }
-ureq = "3"
+ureq = "3.5.0"
 # The WebSocket handshake's accept key, which is a SHA-1 of the client's key
 # and a fixed string, base64-encoded (RFC 6455 §4.2.2). Not a security
 # construction — it exists so a cache cannot complete a handshake it did not
 # understand — which is why SHA-1 is the right and only answer here.
-base64 = "0.23"
+base64 = "0.23.1"
 # `SinkExt`/`StreamExt` over the WebSocket, which is a sink of messages
 # rather than a byte stream.
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 # The web bridge's token, which is the whole of its admission check.
 getrandom = { workspace = true }
-sha1 = "0.11"
+sha1 = "0.11.0"
 # No TLS: the bridge is a loopback endpoint, and a certificate a browser would
 # accept is not something a daemon can produce. See `listener/web/` on what
 # stands in for the peer check a Unix socket gets for free.
@@ -72,7 +72,7 @@ sha1 = "0.11"
 # Here rather than shared, and it is not only about size: it drags `rand`,
 # whose `getrandom` refuses this target outright. A page has no WebSocket
 # *server* to run — it is the thing that connects — so nothing is lost.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 # The page half. `getrandom_02` is named for the same reason the session and
 # the chat store name it: an older `getrandom` comes in through the graph and
@@ -84,11 +84,11 @@ getrandom_02 = { workspace = true }
 # browser's own answer to "one of these at a time", and the same question the
 # binary answers with a file lock. Bound from Rust like every other browser
 # API in this tree.
-futures-channel = "0.3"
-js-sys = "0.3"
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
+futures-channel = "0.3.34"
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
     # The transport between two tabs of one origin: this tab holds the
     # account, and the others are front ends onto it. See `listener/tab.rs`.
     "BroadcastChannel",
@@ -121,7 +121,7 @@ web-sys = { version = "0.3", features = [
 # which is how a total breakage of the plugin folder reached production with
 # the review rounds all green. See `plugins/web/tests.rs`.
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
-wasm-bindgen-test = "0.3"
+wasm-bindgen-test = "0.3.79"
 oxidezap-platform = { workspace = true }
 serde = { workspace = true }
 
@@ -140,7 +140,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # whose UI talks to wayland and wgpu directly. ksni reuses the zbus already in
 # the tree. Other platforms get their own impl behind `tray::Tray`.
 [target.'cfg(target_os = "linux")'.dependencies]
-ksni = "0.3"
+ksni = "0.3.7"
 
 # The Unix syscalls the daemon makes directly: flock for the startup lock and
 # getuid for the state directory's ownership check. Safe wrappers, so neither
@@ -149,21 +149,21 @@ ksni = "0.3"
 # user-only endpoint other than building one, and its default grants read
 # access to Everyone.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 # The tray icon where ksni's StatusNotifierItem has nothing to talk to:
 # Shell_NotifyIcon on Windows, NSStatusItem on macOS. `default-features =
 # false` keeps the Linux-only GTK/libxdo halves out, and the menu types come
 # along through its muda re-export rather than a second direct dependency.
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-tray-icon = { version = "0.24", default-features = false }
+tray-icon = { version = "0.26.1", default-features = false }
 # The main thread's runloop, which the macOS tray is pumped through. AppKit
 # dispatches a status item's clicks and menus there and nowhere else, and
 # `tray-icon` owns the window but runs no loop of its own. Already in the
 # graph transitively; declared because this crate imports it directly.
 [target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = "0.9"
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSRunningApplication"] }
+core-foundation = "0.10.1"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSRunningApplication"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }

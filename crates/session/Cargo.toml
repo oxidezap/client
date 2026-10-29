@@ -12,14 +12,14 @@ repository.workspace = true
 test-support = ["whatsapp-rust/test-support"]
 
 [dependencies]
-async-channel = "2"
+async-channel = "2.5.0"
 async-trait = { workspace = true }
 # What an outgoing picture says about itself: its dimensions, and the small
 # JPEG that rides on the message so the other side draws something before it
 # has downloaded anything. The formats a file picker actually hands over — the
 # defaults add a dozen decoders nothing here can be pointed at, and every one
 # of them is bytes in the page's bundle.
-image = { version = "0.25", default-features = false, features = [
+image = { version = "0.25.10", default-features = false, features = [
     "gif",
     "jpeg",
     "png",
@@ -30,7 +30,7 @@ serde_json = { workspace = true, features = ["std"] }
 # The same, for a video: an ISO-MP4 knows its own dimensions and duration, and
 # a message that states them is one the recipient can lay out before the file
 # arrives. Demuxing only — nothing here decodes a frame.
-mp4 = "0.14"
+mp4 = "0.14.0"
 
 # The clock, for the cold-start stopwatch in `whatsapp::run_client`. Already
 # in this graph through `whatsapp-rust`; named here because `clippy.toml`
@@ -86,7 +86,7 @@ whatsapp-rust = { workspace = true, features = [
 # A MOV is converted in a private temporary directory before being uploaded
 # as an MP4 video. Only the macOS implementation uses the system converter.
 [target.'cfg(target_os = "macos")'.dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 # `voip-mlow` and not `voip`: the library's VoIP runtime is portable, and what
@@ -108,16 +108,16 @@ whatsapp-rust-sqlite-storage = { workspace = true, default-features = false }
 # stand in for the transport, the HTTP client and the runtime the defaults
 # would have supplied.
 anyhow = { workspace = true }
-bytes = "1"
-futures-channel = "0.3"
+bytes = "1.12.1"
+futures-channel = "0.3.34"
 # `or`, for racing a future against its own cancellation.
-futures-lite = "2"
+futures-lite = "2.6.1"
 getrandom = { workspace = true }
 getrandom_02 = { workspace = true }
-js-sys = "0.3"
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
     "BinaryType",
     "CloseEvent",
     "Event",
@@ -151,11 +151,11 @@ web-sys = { version = "0.3", features = [
 # can give: there is no path, there is a VFS. `sqlite-wasm-rs` is what diesel
 # already links against on this target — naming it here adds no second copy —
 # and `sqlite-wasm-vfs` is where the durable one lives. See `src/store/`.
-sqlite-wasm-rs = { version = "0.5", default-features = false }
-sqlite-wasm-vfs = "0.2"
+sqlite-wasm-rs = { version = "0.6.2", default-features = false }
+sqlite-wasm-vfs = "0.3.0"
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
-wasm-bindgen-test = "0.3"
+wasm-bindgen-test = "0.3.79"
 
 # The cancellation semantics `net::abort_requested` decides are the same on
 # both targets — a `oneshot` and nothing else — so the test that pins them
@@ -164,8 +164,8 @@ wasm-bindgen-test = "0.3"
 [dev-dependencies]
 anyhow = { workspace = true }
 diesel = { workspace = true }
-futures-channel = "0.3"
-futures-lite = "2"
+futures-channel = "0.3.34"
+futures-lite = "2.6.1"
 
 [lints]
 workspace = true

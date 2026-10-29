@@ -15,7 +15,7 @@ anyhow = { workspace = true }
 # plugin's command reaches the daemon through `blocking_send`, which panics
 # inside a Tokio context, and the worker's future awaits nothing but this
 # crate's own platform calls.
-futures-lite = "2"
+futures-lite = "2.6.1"
 # A 64-bit capability mask, through portable-atomic rather than std
 # (see /clippy.toml).
 portable-atomic = { workspace = true }
@@ -37,7 +37,8 @@ serde_json = { workspace = true, features = ["std"] }
 # TimeProvider rather than std (see /clippy.toml): a plugin observing time
 # must move when a deterministic test moves it.
 wacore = { workspace = true }
-wasmi = { version = "1.0", default-features = false, features = ["std"] }
+# Wasmi 2 gates safe Module::new and bytecode validation separately from std.
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate"] }
 
 # One call, `getuid`, for the check that refuses a plugin another local
 # account could have replaced — through the same crate the daemon and the IPC
@@ -54,7 +55,7 @@ tokio = { workspace = true, features = ["sync"] }
 # A plugin's settings, which is the one browser object this crate still names
 # for itself. The timer that used to need `js-sys`, `wasm-bindgen` and a
 # `WorkerGlobalScope` feature beside it now comes from `oxidezap-platform`.
-web-sys = { version = "0.3", features = ["Storage", "Window"] }
+web-sys = { version = "0.3.106", features = ["Storage", "Window"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
@@ -66,7 +67,7 @@ rustix = { workspace = true }
 chrono = { workspace = true, features = ["std", "clock"] }
 # The same synthetic chats and messages every crate above core tests against.
 oxidezap-core = { workspace = true, features = ["fixtures"] }
-wat = "1.0"
+wat = "1.262.0"
 
 [lints]
 workspace = true

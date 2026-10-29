@@ -3320,19 +3320,17 @@ async fn membership_labels_refresh_from_contacts_after_persistence_and_history_r
         .participant("559900000002@s.whatsapp.net".parse().unwrap())
         .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_000).unwrap())
         .is_lid_addressing_mode(true)
-        .action(Box::new(GroupNotificationAction::Add {
-            participants: vec![GroupParticipantInfo {
-                jid: lid.parse().unwrap(),
-                phone_number: Some(pn.parse().unwrap()),
-                display_name: Some("Event name".to_owned()),
-                r#type: None,
-                lid: None,
-                username: None,
-                join_time: None,
-                group_history_sent_state: None,
-            }],
-            reason: None,
-        }))
+        .action(Box::new(
+            GroupNotificationAction::add()
+                .participants(vec![
+                    GroupParticipantInfo::builder()
+                        .jid(lid.parse().unwrap())
+                        .maybe_phone_number(Some(pn.parse().unwrap()))
+                        .maybe_display_name(Some("Event name".to_owned()))
+                        .build(),
+                ])
+                .build(),
+        ))
         .build();
     feed(&store, Event::GroupUpdate(update.clone())).await;
     let names = book(); // History receives its store explicitly, even without a live book.

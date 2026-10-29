@@ -84,7 +84,7 @@ pub fn render_paste_preview(props: PastePreviewProps<'_>, cx: &App) -> impl Into
         .gap(metrics.space_xl())
         .p(metrics.space_xxl())
         .bg(parts::scrim(cx).opacity(0.92))
-        .on_scroll_wheel(|_, _window, cx| cx.stop_propagation())
+        .on_scroll(|_, _window, cx| cx.stop_propagation())
         .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
             cx.stop_propagation();
         })

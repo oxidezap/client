@@ -10,7 +10,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-async-channel = "2"
+async-channel = "2.5.0"
 log = { workspace = true }
 portable-atomic = { workspace = true }
 # `wacore::time::Instant` rather than std's, which /clippy.toml disallows: the
@@ -30,7 +30,7 @@ nokhwa = { version = "0.10.11", default-features = false, features = [
 ] }
 # The same encoder the GUI already decodes with: one copy of OpenH264 in the
 # tree, and a video call adds no codec the binary did not already carry.
-openh264 = "0.9"
+openh264 = "0.9.9"
 # Only to get the blocking open and the blocking close off a runtime thread.
 tokio = { workspace = true, features = ["rt"] }
 
@@ -48,12 +48,12 @@ oxidezap-platform = { workspace = true }
 # Not called from here; see the same note in `oxidezap-audio`.
 getrandom = { workspace = true }
 # Racing the camera permission prompt against a ceiling; see `after`.
-futures-lite = "2"
+futures-lite = "2.6.1"
 getrandom_02 = { workspace = true }
-js-sys = "0.3"
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
     "CodecState",
     "Document",
     "Element",

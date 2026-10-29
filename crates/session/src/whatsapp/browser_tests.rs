@@ -20,7 +20,7 @@ async fn bot_builds_with_chat_store_durability_hook() {
         .await;
 
     if let Ok(bot) = &result {
-        bot.client().shutdown().await;
+        super::completion::report_shutdown(&bot.client().shutdown().await);
     }
     chat_store.close().await.expect("chat store closes");
     result.expect("bot builds with the SQLite durability probe in a browser");
@@ -114,6 +114,6 @@ async fn membership_notice_reloads_with_phone_alias_in_browser() {
         panic!("membership")
     };
     assert_eq!(event.participants[0].jid, lid);
-    bot.client().shutdown().await;
+    super::completion::report_shutdown(&bot.client().shutdown().await);
     store.close().await.unwrap();
 }
