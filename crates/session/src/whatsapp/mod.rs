@@ -2501,7 +2501,12 @@ impl WhatsAppClient {
                     // its message before hydration must not recreate it in
                     // the inbox.
                     let allowed = eager
-                        && allows_desktop_notification(info.source.is_from_me, metadata.allowed);
+                        && allows_desktop_notification(
+                            info.source.is_from_me,
+                            metadata.muted,
+                            metadata.archived,
+                            mentions_me,
+                        );
                     let identity = names.identity(client, &info.source.chat).await;
                     let (resolved_name, priority) = names
                         .resolve(
@@ -2579,7 +2584,12 @@ impl WhatsAppClient {
                     notification_archived = Some(metadata.archived);
                     chat_muted_until_ms = metadata.muted_until_ms;
                     notification_allowed = eager
-                        && allows_desktop_notification(info.source.is_from_me, metadata.allowed);
+                        && allows_desktop_notification(
+                            info.source.is_from_me,
+                            metadata.muted,
+                            metadata.archived,
+                            mentions_me,
+                        );
                     notification_title = if notification_allowed {
                         if mentions_me {
                             Some(format!(
@@ -3299,8 +3309,13 @@ impl WhatsAppClient {
 
 /// Keep the notification bit's wire invariant in one place: outgoing echoes
 /// never alert, and a mute applies to mentions as well as ordinary messages.
-fn allows_desktop_notification(is_from_me: bool, policy_allowed: bool) -> bool {
-    !is_from_me && policy_allowed
+fn allows_desktop_notification(
+    is_from_me: bool,
+    muted: bool,
+    archived: bool,
+    mentions_me: bool,
+) -> bool {
+    !is_from_me && !muted && (!archived || mentions_me)
 }
 
 /// Tell the UI which real id a just-sent optimistic bubble got.
@@ -3419,10 +3434,13 @@ mod notification_policy_tests {
 
     #[test]
     fn self_echoes_never_cross_the_notification_wire() {
-        assert!(!allows_desktop_notification(true, true));
-        assert!(!allows_desktop_notification(true, false));
-        assert!(allows_desktop_notification(false, true));
-        assert!(!allows_desktop_notification(false, false));
+        assert!(!allows_desktop_notification(true, false, false, false));
+        assert!(!allows_desktop_notification(true, false, true, true));
+        assert!(allows_desktop_notification(false, false, false, false));
+        assert!(!allows_desktop_notification(false, true, false, true));
+        assert!(!allows_desktop_notification(false, true, true, true));
+        assert!(allows_desktop_notification(false, false, true, true));
+        assert!(!allows_desktop_notification(false, false, true, false));
     }
 }
 
