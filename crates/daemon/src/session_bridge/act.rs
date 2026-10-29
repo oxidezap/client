@@ -2436,6 +2436,7 @@ mod tests {
             file_enc_sha256: hash,
             file_sha256: Vec::new(),
             static_url: None,
+            is_thumbnail: false,
             file_length: 3,
             mime_type: "image/png".into(),
             duration_secs: None,

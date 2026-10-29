@@ -187,7 +187,7 @@ impl WhatsAppApp {
 
     /// Update a message's media data (used to cache downloaded media)
     fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>, cx: &mut App) {
-        self.update_chat_media_data(None, message_id, data, cx);
+        self.update_chat_media_data(None, message_id, data, false, cx);
     }
 
     fn update_chat_media_data(
@@ -195,6 +195,7 @@ impl WhatsAppApp {
         chat_jid: Option<&str>,
         message_id: &str,
         data: Arc<Vec<u8>>,
+        preview: bool,
         cx: &mut App,
     ) {
         // Locate the owning chat through shared references first. Calling
@@ -216,7 +217,13 @@ impl WhatsAppApp {
                 // Bytes and the metadata that describes them, together:
                 // decoding a WebP sticker as the `image/jpeg` its poster
                 // frame claimed fails every time.
-                media.adopt_full_bytes(data);
+                if preview {
+                    media.data = data;
+                    media.mime_type = "image/jpeg".into();
+                    media.data_is_preview = true;
+                } else {
+                    media.adopt_full_bytes(data);
+                }
                 info!("Cached media data for message {}", message_id);
                 touched = Some(chat.jid.clone());
             }
@@ -851,6 +858,7 @@ impl WhatsAppApp {
         if !self.begin_download(&message_id, cx) {
             return;
         }
+        let preview = downloadable.is_thumbnail;
         let download_rx = {
             let Some(client) = &self.client else {
                 warn!("Cannot download image: client is unavailable");
@@ -882,7 +890,13 @@ impl WhatsAppApp {
                 match result {
                     Ok(data) => {
                         info!("Image downloaded: {} bytes", data.len());
-                        app.update_chat_media_data(chat_jid.as_deref(), &message_id, data, cx);
+                        app.update_chat_media_data(
+                            chat_jid.as_deref(),
+                            &message_id,
+                            data,
+                            preview,
+                            cx,
+                        );
                     }
                     Err(e) => {
                         error!("Failed to download image: {}", e);
@@ -933,8 +947,9 @@ impl WhatsAppApp {
             return;
         };
         let Some(downloadable) = media
-            .downloadable
+            .preview_downloadable
             .as_ref()
+            .or(media.downloadable.as_ref())
             .filter(|d| {
                 media.media_type == oxidezap_core::MediaType::Image
                     && (media.data_is_preview || media.data.is_empty())
@@ -1906,6 +1921,7 @@ mod tests {
                 Some("120363000000000002@newsletter"),
                 "42",
                 Arc::new(vec![2, 3]),
+                false,
                 cx,
             );
             assert_eq!(
@@ -1925,6 +1941,29 @@ mod tests {
                     .data
                     .as_slice(),
                 [2, 3]
+            );
+            app.update_chat_media_data(
+                Some("120363000000000002@newsletter"),
+                "42",
+                Arc::new(vec![4, 5]),
+                true,
+                cx,
+            );
+            let preview = app.chats[1].messages[0].media.as_ref().unwrap();
+            assert!(
+                preview.data_is_preview,
+                "HQ bytes must not masquerade as the original"
+            );
+            assert_eq!(preview.mime_type, "image/jpeg");
+            assert_eq!(preview.data.as_slice(), [4, 5]);
+            assert_eq!(
+                app.chats[0].messages[0]
+                    .media
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+                [1]
             );
         });
     }

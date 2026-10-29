@@ -77,12 +77,14 @@ impl MediaContent {
     ///
     /// Three conditions, and each of them is a row this must not silently
     /// empty: there have to *be* bytes, they have to be the media rather than
-    /// a preview standing in for it — a thumbnail is a few kilobytes and the
-    /// only picture the row can draw before a fetch — and there has to be
-    /// somewhere to fetch them from.
+    /// an irreplaceable inline preview, and there has to be somewhere to
+    /// fetch them from. A server-preview descriptor makes preview bytes
+    /// re-fetchable too, so HQ JPEGs share the retained-media budget.
     #[must_use]
     pub fn is_releasable(&self) -> bool {
-        !self.data.is_empty() && !self.data_is_preview && self.can_download()
+        !self.data.is_empty()
+            && self.can_download()
+            && (!self.data_is_preview || self.preview_downloadable.is_some())
     }
 
     /// Let go of bytes that can be fetched again, and answer how many.
@@ -172,6 +174,7 @@ mod tests {
                 file_enc_sha256: vec![2],
                 file_sha256: Vec::new(),
                 static_url: None,
+                is_thumbnail: false,
                 file_length: bytes as u64,
                 mime_type: "image/jpeg".to_string(),
                 duration_secs: None,
@@ -202,6 +205,26 @@ mod tests {
     /// The defect: a conversation's media had no ceiling at all, so what the
     /// interface retained grew with the history rather than with the budget.
     /// A hundred photos is an ordinary album and half a gigabyte of tab.
+    #[test]
+    fn a_fetchable_server_preview_shares_the_retention_budget() {
+        let mut media = fetchable_photo(100);
+        media.data_is_preview = true;
+        assert!(!media.is_releasable(), "inline-only fallback stays");
+        let mut preview = media.downloadable.clone().unwrap();
+        preview.is_thumbnail = true;
+        preview.media_key.clear();
+        preview.file_sha256 = vec![7; 32];
+        media.preview_downloadable = Some(preview.clone());
+        assert_eq!(media.release(), 100);
+        assert!(media.data.is_empty());
+        assert!(media.data_is_preview);
+        assert_eq!(media.preview_downloadable, Some(preview));
+        assert!(
+            media.downloadable.is_some(),
+            "original remains manually available"
+        );
+    }
+
     #[test]
     fn a_conversation_holds_no_more_media_than_its_budget() {
         let mut chat = chat_of_photos(100, 1024 * 1024);
@@ -326,6 +349,7 @@ mod tests {
                     file_enc_sha256: vec![2],
                     file_sha256: Vec::new(),
                     static_url: None,
+                    is_thumbnail: false,
                     file_length: 4096,
                     mime_type: "image/jpeg".to_string(),
                     duration_secs: None,
@@ -363,6 +387,7 @@ mod tests {
                 file_enc_sha256: vec![2],
                 file_sha256: Vec::new(),
                 static_url: None,
+                is_thumbnail: false,
                 file_length: 4096,
                 mime_type: "video/mp4".to_string(),
                 duration_secs: Some(15),

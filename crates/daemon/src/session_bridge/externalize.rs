@@ -94,6 +94,13 @@ fn cache_media(
             media.cache_key = Some(by_content);
             return;
         }
+        if let Some(thumbnail) = media.preview_downloadable.as_ref()
+            && let Some(key) = account_media.download_key(thumbnail.content_hash())
+            && account_media.has(&key)
+        {
+            media.preview_cache_key = Some(key);
+            return;
+        }
         // Inline bytes also cross the process boundary, under an identity
         // that can never satisfy a full-media lookup. Oversized inline data
         // stays a download placeholder rather than consuming a frame budget.
@@ -147,9 +154,13 @@ mod tests {
             "duration_secs":null, "download_type":"image"
         }))
         .unwrap();
-        let original =
+        let mut original =
             MediaContent::image(std::sync::Arc::new(vec![1, 2]), "image/jpeg".into(), true)
                 .with_download(Some(dl));
+        let mut thumbnail = original.downloadable.clone().unwrap();
+        thumbnail.file_sha256 = vec![0x91; 32];
+        thumbnail.is_thumbnail = true;
+        original.preview_downloadable = Some(thumbnail.clone());
         let full_local = local_media_key("42", &original);
         let full_key = cache.key(&full_local);
         let mut fallback = Some(original.clone());
@@ -164,6 +175,14 @@ mod tests {
         assert!(decoded.data.is_empty());
         assert!(decoded.data_is_preview);
         assert_eq!(decoded.preview_cache_key.as_ref(), Some(preview_key));
+        let hq_local = crate::media::download_key(thumbnail.content_hash()).unwrap();
+        let hq_key = cache.put_owned(&hq_local, vec![6, 5, 4]).unwrap();
+        let mut hq_hydrated = Some(original.clone());
+        cache_media(&cache, cache.epoch(), "42", &mut hq_hydrated);
+        assert_eq!(
+            hq_hydrated.unwrap().preview_cache_key.as_ref(),
+            Some(&hq_key)
+        );
         cache.put_owned(&full_local, vec![9, 8, 7]).unwrap();
         let mut hydrated = Some(original);
         cache_media(&cache, cache.epoch(), "42", &mut hydrated);

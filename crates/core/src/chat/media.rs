@@ -98,6 +98,9 @@ pub struct DownloadableMedia {
     /// Some channel media is addressed directly instead of through a media host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_url: Option<String>,
+    /// A separately addressed JPEG preview, not the original file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_thumbnail: bool,
     /// Expected file size in bytes
     pub file_length: u64,
     /// MIME type of the actual media (e.g., "video/mp4")
@@ -146,12 +149,13 @@ const CHANNEL_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
 
 impl DownloadableMedia {
     pub const CHANNEL_PREVIEW_BYTES: u64 = CHANNEL_PREVIEW_BYTES;
+    pub const CHANNEL_THUMBNAIL_BYTES: u64 = 512 * 1024;
     /// A known small plaintext image may replace its inline thumbnail on render.
     pub fn is_channel_preview_candidate(&self) -> bool {
         self.media_key.is_empty()
             && self.file_sha256.len() == 32
             && self.mime_type.starts_with("image/")
-            && (1..=CHANNEL_PREVIEW_BYTES).contains(&self.file_length)
+            && (self.is_thumbnail || (1..=CHANNEL_PREVIEW_BYTES).contains(&self.file_length))
     }
 
     /// Identity of the bytes the downloader verifies, shared by cache lookup
@@ -197,6 +201,9 @@ pub struct MediaContent {
     /// Separate so old readers cannot mistake a thumbnail for full media.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_cache_key: Option<String>,
+    /// Optional server HQ JPEG, fetched separately from the original image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_downloadable: Option<DownloadableMedia>,
     /// MIME type of the display data (may differ from downloadable media)
     pub mime_type: String,
     /// Width in pixels (if known)
@@ -253,6 +260,7 @@ impl MediaContent {
             data,
             cache_key: None,
             preview_cache_key: None,
+            preview_downloadable: None,
             mime_type,
             width: None,
             height: None,
@@ -529,6 +537,7 @@ mod tests {
             file_enc_sha256: vec![],
             file_sha256: vec![7; 32],
             static_url: None,
+            is_thumbnail: false,
             file_length: 1024,
             mime_type: "image/jpeg".into(),
             duration_secs: None,
@@ -569,6 +578,7 @@ mod tests {
                 file_enc_sha256: Vec::new(),
                 file_sha256: Vec::new(),
                 static_url: None,
+                is_thumbnail: false,
                 file_length: 3,
                 mime_type: "video/mp4".to_string(),
                 duration_secs: Some(15),
@@ -644,6 +654,7 @@ mod tests {
                 file_enc_sha256: vec![2],
                 file_sha256: Vec::new(),
                 static_url: None,
+                is_thumbnail: false,
                 file_length: 3,
                 mime_type: "image/jpeg".to_string(),
                 duration_secs: None,

@@ -4,12 +4,18 @@ Channel media can be plaintext. Preserve `fileSha256` and `staticUrl` without
 requiring E2EE keys. An absent key must remain absent in `Downloadable`;
 `Some([])` incorrectly selects encrypted download.
 
-Native virtual-list rows may fetch a known image up to 4 MiB. The streaming
-budget bounds actual wire/plaintext bytes across retries; two requests run at
-once, with one automatic attempt per image and 256 remembered attempts per
-account session. Failure retains the inline fallback and manual retry.
-Unknown/larger images remain manual. The client has no photo auto-download
-preference or metered-network policy; these bounds do not emulate such controls.
+Native virtual-list rows prefer the separately addressed server HQ JPEG when
+`thumbnailDirectPath` and a 32-byte `thumbnailSha256` are present on a plaintext
+image. Its actual wire/plaintext budget is 512 KiB across retries; no thumbnail
+length is declared by the protobuf. Without that reference, known originals up
+to 4 MiB remain the fallback. HQ bytes retain the preview flag: opening the photo
+still downloads its original. Full and HQ files have separate content identities.
+
+Two requests run at once, with one automatic attempt per image and 256 remembered
+attempts per account session. Failure keeps the inline fallback and manual retry.
+HQ previews share the existing retained-media budget; inline-only bytes remain
+protected. The client has no photo auto-download preference or metered-network
+policy; these limits do not emulate such controls.
 
 Web preserves metadata and manual downloads. Automatic fetching is disabled:
 its buffered HTTP adapter cannot enforce the SDK's synchronous streaming budget.
@@ -36,8 +42,11 @@ before AST extraction; duplicate module bodies were identical. Offsets are bytes
 | `WAWebMediaUrlAllowlist` | Same, 326506–327138 | HTTPS, `whatsapp.net` or its subdomains. |
 | `useWAWebMsgDownloadMedia` | `36dc12…717`, 563446–565504 | Full-media fetch on render checks cache, photo preferences and suspension. |
 | `WAWebMediaMmsV4Download` | `f588ee…c4690`, 1919619–1937869 | `downloadEvenIfExpensive` enables phone RMR when no download entry exists; it is not evidence of a metered-network check. |
+| `WAWebGetThumbnailTypeForMediaImageMsg` | `f588ee…c4690`, 1890966–1891311 | Newsletter image HQ uses NEWSLETTER_IMAGE; encrypted image HQ uses THUMBNAIL_IMAGE. |
 | `WAWebMediaDownloadMmsThumbnail` | `f588ee…c4690`, 1902352–1908535 | Separate server thumbnail can replace the inline fallback. |
 
-Fetching a small original is an application choice, not a necessary official
-preview step or proof of visual parity. Separate HQ/link-card thumbnails are not
-implemented here.
+The official image-thumbnail registry uses NEWSLETTER_IMAGE for newsletter HQ
+JPEGs, which the current SDK can download as plaintext Image media. Encrypted
+image thumbnails use THUMBNAIL_IMAGE, absent from this SDK, so this path is kept
+to plaintext channels. Link-card HQ thumbnails remain outside this change.
+Neither this static trace nor local tests prove authenticated visual parity.

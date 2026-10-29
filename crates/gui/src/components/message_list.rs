@@ -209,8 +209,9 @@ fn render_row(
                     media.media_type == MediaType::Image
                         && (media.data_is_preview || media.data.is_empty())
                         && media
-                            .downloadable
+                            .preview_downloadable
                             .as_ref()
+                            .or(media.downloadable.as_ref())
                             .is_some_and(|d| d.is_channel_preview_candidate())
                 })
             {
