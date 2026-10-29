@@ -1230,17 +1230,18 @@ fn page_query<'a>(
         )
         .into_boxed();
     if let Some(cursor) = before {
-        // Match both sort keys so a cursor inside a same-second run stays
-        // exact. A row-value bound also seeks to the cursor in the existing
-        // (device_id, chat_jid, timestamp_ms, rowid) index; the equivalent OR
-        // predicate only constrains its device/chat prefix and rescans newer
-        // messages on every older page.
+        // Give SQLite a time range it can seek in idx_messages_chat_time.
+        // Within that range, time < bound OR id < seq is the exact same
+        // non-null lexicographic boundary as time < bound OR
+        // (time = bound AND id < seq), without rescanning newer timestamps.
+        // A row-value comparison still scans a same-time run in bundled
+        // SQLite 3.53.2 and does more VM work there than this scalar form.
         query = query.filter(
-            diesel::dsl::sql::<diesel::sql_types::Bool>("(messages.timestamp_ms, messages.id) < (")
-                .bind::<diesel::sql_types::BigInt, _>(cursor.timestamp_ms)
-                .sql(", ")
-                .bind::<diesel::sql_types::BigInt, _>(cursor.seq)
-                .sql(")"),
+            dsl::timestamp_ms.le(cursor.timestamp_ms).and(
+                dsl::timestamp_ms
+                    .lt(cursor.timestamp_ms)
+                    .or(dsl::id.lt(cursor.seq)),
+            ),
         );
     }
     query
@@ -1258,14 +1259,11 @@ fn page_query_after<'a>(
             dsl::device_id
                 .eq(device_id)
                 .and(dsl::chat_jid.eq_any(keys.to_vec()))
+                .and(dsl::timestamp_ms.ge(after.timestamp_ms))
                 .and(
-                    diesel::dsl::sql::<diesel::sql_types::Bool>(
-                        "(messages.timestamp_ms, messages.id) > (",
-                    )
-                    .bind::<diesel::sql_types::BigInt, _>(after.timestamp_ms)
-                    .sql(", ")
-                    .bind::<diesel::sql_types::BigInt, _>(after.seq)
-                    .sql(")"),
+                    dsl::timestamp_ms
+                        .gt(after.timestamp_ms)
+                        .or(dsl::id.gt(after.seq)),
                 ),
         )
         .into_boxed()
@@ -2838,7 +2836,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_tuple_bounds_match_lexicographic_order_and_account_scope() {
+    fn cursor_bounds_match_lexicographic_order_and_account_scope() {
         use crate::schema::messages::dsl;
         use diesel::sql_types::{BigInt, Integer, Text};
         let mut conn = SqliteConnection::establish(":memory:").unwrap();
