@@ -91,6 +91,7 @@ fn with_contexts<T>(
     probe_body!(found, msg, audio_message, as_option, |ctx| f(ctx));
     probe_body!(found, msg, document_message, as_option, |ctx| f(ctx));
     probe_body!(found, msg, sticker_message, as_option, |ctx| f(ctx));
+    probe_body!(found, msg, sticker_pack_message, as_option, |ctx| f(ctx));
     found
 }
 
@@ -109,6 +110,9 @@ fn with_contexts_mut<T>(
     probe_body!(found, msg, audio_message, as_option_mut, |ctx| f(ctx));
     probe_body!(found, msg, document_message, as_option_mut, |ctx| f(ctx));
     probe_body!(found, msg, sticker_message, as_option_mut, |ctx| f(ctx));
+    probe_body!(found, msg, sticker_pack_message, as_option_mut, |ctx| f(
+        ctx
+    ));
     found
 }
 
