@@ -1253,15 +1253,25 @@ mod tests {
         assert_eq!(decoded.delay(1).numer_denom_ms(), (1000, 1));
     }
 
-    struct StickerTestView(gpui::ImageSource);
+    struct StickerTestView {
+        source: gpui::ImageSource,
+        image: Arc<gpui::Image>,
+        decoded: Option<Arc<gpui::RenderImage>>,
+    }
 
     impl gpui::Render for StickerTestView {
         fn render(
             &mut self,
-            _: &mut gpui::Window,
-            _: &mut gpui::Context<Self>,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
         ) -> impl gpui::IntoElement {
-            gpui::img(self.0.clone()).id("sticker-test").size_full()
+            // GPUI 0.3.10 associates assets with the view currently drawing.
+            self.decoded = window
+                .use_asset::<super::StickerDecoder>(&self.image, cx)
+                .and_then(Result::ok);
+            gpui::img(self.source.clone())
+                .id("sticker-test")
+                .size_full()
         }
     }
 
@@ -1287,7 +1297,11 @@ mod tests {
         ));
         let source = super::sticker_image_source(image.clone());
         let handle = cx.open_window(gpui::size(gpui::px(10.), gpui::px(10.)), |_, _| {
-            StickerTestView(source)
+            StickerTestView {
+                source,
+                image: image.clone(),
+                decoded: None,
+            }
         });
         let mut window = gpui::VisualTestContext::from_window(handle.into(), cx);
         window.run_until_parked();
@@ -1299,12 +1313,7 @@ mod tests {
             window.refresh();
             window.draw(cx).clear(cx);
         });
-        let first = window.update(|window, cx| {
-            window
-                .use_asset::<super::StickerDecoder>(&image, cx)
-                .unwrap()
-                .unwrap()
-        });
+        let first = window.read(|cx| handle.read(cx).unwrap().decoded.clone().unwrap());
         assert_eq!(first.frame_count(), 2);
         // Probe frame zero under the decoded image's texture id. Removing
         // textures before every draw prevents stale uploads hiding a restart.
@@ -1324,12 +1333,7 @@ mod tests {
                 window.update(|window, _| window.has_image_atlas_entry(&probe)),
                 frame % 2 == 0
             );
-            let next = window.update(|window, cx| {
-                window
-                    .use_asset::<super::StickerDecoder>(&image, cx)
-                    .unwrap()
-                    .unwrap()
-            });
+            let next = window.read(|cx| handle.read(cx).unwrap().decoded.clone().unwrap());
             assert!(Arc::ptr_eq(&first, &next));
         }
     }
