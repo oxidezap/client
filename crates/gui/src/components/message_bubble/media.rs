@@ -148,6 +148,8 @@ pub(super) fn render_media_content(
         MediaType::Sticker => {
             // The whole canvas gets the same box in every loading state.
             // Contain preserves non-square content and transparent padding.
+            // Explicit square aspect ratios below prevent GPUI from replacing
+            // the box's ratio with intrinsic dimensions after decoding.
             let (display_w, display_h) = (sticker_size, sticker_size);
 
             if media_content.data_is_preview
@@ -164,6 +166,8 @@ pub(super) fn render_media_content(
                     Some(cached) => img(ImageSource::Image(cached))
                         .w(px(display_w))
                         .h(px(display_h))
+                        .aspect_square()
+                        .debug_selector(|| "sticker-image".into())
                         .object_fit(gpui::ObjectFit::Contain),
                     None => render_image_from_bytes(
                         media_content.data,
@@ -172,7 +176,9 @@ pub(super) fn render_media_content(
                         display_h,
                         cx.product().metrics.radius_lg(),
                         false,
-                    ),
+                    )
+                    .aspect_square()
+                    .debug_selector(|| "sticker-image".into()),
                 };
                 let preview_id: SharedString = format!("sticker-preview-{}", message_id).into();
                 el.child(
@@ -196,6 +202,8 @@ pub(super) fn render_media_content(
                             .id(sticker_id)
                             .w(px(display_w))
                             .h(px(display_h))
+                            .aspect_square()
+                            .debug_selector(|| "sticker-image".into())
                             .object_fit(gpui::ObjectFit::Contain);
                         el.child(image)
                     }
@@ -211,6 +219,8 @@ pub(super) fn render_media_content(
                                 Some(cached) => img(ImageSource::Image(cached))
                                     .w(px(display_w))
                                     .h(px(display_h))
+                                    .aspect_square()
+                                    .debug_selector(|| "sticker-image".into())
                                     .object_fit(gpui::ObjectFit::Contain)
                                     .into_any_element(),
                                 None => render_image_from_bytes(
@@ -221,6 +231,8 @@ pub(super) fn render_media_content(
                                     cx.product().metrics.radius_lg(),
                                     false,
                                 )
+                                .aspect_square()
+                                .debug_selector(|| "sticker-image".into())
                                 .into_any_element(),
                             })
                         } else if let Some(dl) = media_content.downloadable.clone() {
@@ -1130,6 +1142,13 @@ mod tests {
                             gpui::size(super::px(canvas), super::px(canvas)),
                             "state {state}, metadata {width}x{height}"
                         );
+                        if state < 4 {
+                            assert_eq!(
+                                window.debug_bounds("sticker-image").unwrap().size,
+                                gpui::size(super::px(canvas), super::px(canvas)),
+                                "decoded image must stay inside the canvas"
+                            );
+                        }
                     }
                 }
             }
