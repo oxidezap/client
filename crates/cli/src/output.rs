@@ -67,12 +67,29 @@ pub fn print_error(mode: OutputMode, code: &str, message: &str) {
 }
 
 fn print_json_ok<T: Serialize>(data: &T) {
-    let value = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
-    let envelope = serde_json::json!({ "ok": true, "data": value });
-    match serde_json::to_string_pretty(&envelope) {
+    match json_ok(data) {
         Ok(json) => println!("{json}"),
         Err(err) => eprintln!("error: failed to serialize json output: {err}"),
     }
+}
+
+// Borrow the payload instead of cloning every field into a JSON value first.
+// Field order is not part of the JSON contract; the envelope keeps its existing
+// data/ok order for readers that also inspect the pretty-printed text.
+#[derive(Serialize)]
+struct Success<'a, T: ?Sized> {
+    data: &'a T,
+    ok: bool,
+}
+
+pub(crate) fn json_ok<T: Serialize>(data: &T) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(&Success { data, ok: true }).or_else(|_| {
+        // Preserve the previous fallback when a payload cannot be serialized.
+        serde_json::to_string_pretty(&Success {
+            data: &serde_json::Value::Null,
+            ok: true,
+        })
+    })
 }
 
 #[cfg(test)]
