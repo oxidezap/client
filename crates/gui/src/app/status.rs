@@ -225,7 +225,7 @@ impl WhatsAppApp {
                 .chat_named(&jid)
                 .is_some_and(|chat| destination.matches(chat))
         {
-            self.select_chat(jid, super::ChatOpen::ToPreview, window, cx);
+            self.select_chat(jid, super::ChatOpen::Restore, window, cx);
         }
         self.mobile_panel = crate::responsive::MobilePanel::ChatList;
         cx.notify();

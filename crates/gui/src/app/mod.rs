@@ -662,6 +662,8 @@ actions!(mobile_nav, [NavigateBack]);
 pub enum ChatOpen {
     ToCompose,
     ToPreview,
+    /// Restore a remembered selection without showing or reading its timeline.
+    Restore,
 }
 
 #[derive(Clone, Copy)]
@@ -2181,6 +2183,7 @@ impl WhatsAppApp {
             self.retained_chat.clone_from(&jid);
         }
         self.visible_chat = jid;
+        self.resume_visible_read(cx);
         if moved {
             self.sweep_retained_media(cx);
         }
@@ -2886,7 +2889,9 @@ impl WhatsAppApp {
         // Asked only while undecided — a grant or a block ends it — and only
         // on this target, where the prompt is the browser's rather than the
         // operating system's.
-        crate::platform::request_gesture_authorization();
+        if open != ChatOpen::Restore {
+            crate::platform::request_gesture_authorization();
+        }
         if self.selected_chat.as_deref() != Some(jid.as_str()) {
             self.cancel_message_delete(cx);
             // Message-text selection belongs to the conversation being left,
@@ -2956,9 +2961,15 @@ impl WhatsAppApp {
         if let Some(chat) = self.find_chat(&jid).cloned() {
             self.demand_avatar_for_chat(&chat);
         }
-        self.navigate_to_chat();
+        if open != ChatOpen::Restore {
+            self.navigate_to_chat();
+        }
 
-        self.keyboard_intent = open;
+        self.keyboard_intent = if open == ChatOpen::Restore {
+            ChatOpen::ToPreview
+        } else {
+            open
+        };
         if open == ChatOpen::ToCompose {
             // After `navigate_to_chat`, so on mobile the composer exists on the
             // panel being switched to rather than the one being left.
@@ -2972,13 +2983,15 @@ impl WhatsAppApp {
         // here is the message this side is looking at.
         let mut mark_locally = false;
         let owed = self.owed_reads.contains(&jid);
-        if chat_read_can_be_committed(
-            self.window_focused,
-            crate::platform::application_is_active(),
-            self.client.is_some(),
-        ) && let Some(chat) = self
-            .find_chat(&jid)
-            .filter(|c| chat_read_needs_resume(c, owed))
+        if open != ChatOpen::Restore
+            && chat_read_can_be_committed(
+                self.window_focused,
+                crate::platform::application_is_active(),
+                self.client.is_some(),
+            )
+            && let Some(chat) = self
+                .find_chat(&jid)
+                .filter(|c| chat_read_needs_resume(c, owed))
         {
             match read_bound(chat) {
                 ReadBound::Now(newest) => {

@@ -9,7 +9,8 @@ Each conversation destination remembers its last selection for this window. Swit
 resets the sidebar search and scroll position, keeps drafts through the existing chat
 selection path, and returns a narrow window to the list. The Chats filter is retained
 but does not filter other destinations. A selection hidden by a destination cannot
-become a visible/read conversation. Status keeps its existing media lifecycle.
+become a visible/read conversation. Restoring a selection does not commit a read;
+the rendered conversation resumes it when visible. Status keeps its existing media lifecycle.
 
 ## Official Web evidence
 

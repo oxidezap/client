@@ -500,6 +500,113 @@ pub(super) mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn restoring_a_tab_keeps_unseen_messages_unread_until_its_conversation_is_shown(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::io::Read as _;
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(800.)));
+        let path = std::env::temp_dir().join(format!(
+            "oxidezap-hidden-tab-read-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let endpoint = oxidezap_ipc::Endpoint::connect_at(&path).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.client = Some(Session::recording_test_session(endpoint));
+                app.window_focused = true;
+                app.set_destination(Destination::Channels, window, cx);
+                let chat = app.find_chat_mut("peer@example.invalid").unwrap();
+                chat.add_message(ChatMessage::new_incoming(
+                    "UNSEEN".into(),
+                    "peer@example.invalid".into(),
+                    "unseen text".into(),
+                ));
+                chat.unread_count = 1;
+                app.set_destination(Destination::Chats, window, cx);
+                assert!(app.visible_panel().is_chat_list());
+                assert_eq!(
+                    app.chat_named("peer@example.invalid").unwrap().unread_count,
+                    1,
+                    "restoration must not mark a hidden timeline read"
+                );
+                assert!(!app.owed_reads.contains("peer@example.invalid"));
+            });
+        });
+        cx.run_until_parked();
+        let mut frames = String::new();
+        let _ = peer.read_to_string(&mut frames);
+        assert!(
+            !frames.contains("\"request\":\"mark_read\""),
+            "no receipt while only the list is shown"
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.select_chat(
+                    "peer@example.invalid".into(),
+                    ChatOpen::ToCompose,
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    app.chat_named("peer@example.invalid").unwrap().unread_count,
+                    0
+                );
+            });
+        });
+        cx.run_until_parked();
+        let mut frames = String::new();
+        let _ = peer.read_to_string(&mut frames);
+        assert!(
+            frames.contains("\"request\":\"mark_read\""),
+            "opening the conversation commits the receipt"
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.set_destination(Destination::Channels, window, cx);
+                let chat = app.find_chat_mut("peer@example.invalid").unwrap();
+                chat.add_message(ChatMessage::new_incoming(
+                    "DESKTOP-UNSEEN".into(),
+                    "peer@example.invalid".into(),
+                    "another unseen message".into(),
+                ));
+                chat.unread_count = 1;
+            });
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(800.)));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.set_destination(Destination::Chats, window, cx);
+                assert_eq!(
+                    app.chat_named("peer@example.invalid").unwrap().unread_count,
+                    1,
+                    "restoration itself still does not read on desktop"
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx)
+                    .chat_named("peer@example.invalid")
+                    .unwrap()
+                    .unread_count,
+                0,
+                "the drawn desktop conversation resumes its read"
+            )
+        });
+        let mut frames = String::new();
+        let _ = peer.read_to_string(&mut frames);
+        assert!(frames.contains("\"request\":\"mark_read\""));
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[gpui::test]
     fn navigation_rail_buttons_are_keyboard_reachable(cx: &mut gpui::TestAppContext) {
         let (mut cx, app) = connected_app_fixture(cx);
