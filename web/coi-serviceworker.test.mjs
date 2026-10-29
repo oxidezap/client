@@ -140,3 +140,68 @@ for (const isolated of [false, true]) {
         }
     });
 }
+
+function pageWith({ isolated = false, secure = true, worker, reloaded = false, stored = new Map() } = {}) {
+    const errors = [];
+    let reloads = 0;
+    if (reloaded) stored.set("coi-serviceworker:reloaded", "1");
+    const context = {
+        window: {
+            crossOriginIsolated: isolated,
+            isSecureContext: secure,
+            document: { currentScript: { src: "https://example.test/client/coi-serviceworker.js" } },
+            location: { reload: () => { reloads++; } },
+            sessionStorage: {
+                getItem: (key) => stored.get(key) ?? null,
+                setItem: (key, value) => stored.set(key, value),
+                removeItem: (key) => stored.delete(key),
+            },
+        },
+        navigator: { serviceWorker: worker },
+        console: { error: (...args) => errors.push(args.join(" ")), warn: () => {} },
+    };
+    vm.runInNewContext(script, context);
+    return { errors, stored, reloads: () => reloads };
+}
+
+test("a host already providing isolation needs no service worker", () => {
+    const page = pageWith({ isolated: true, reloaded: true });
+    assert.deepEqual(page.errors, []);
+    assert.equal(page.reloads(), 0);
+    assert.equal(page.stored.has("coi-serviceworker:reloaded"), false);
+});
+
+test("a browser without service workers reports the failure without reloading", () => {
+    const page = pageWith();
+    assert.match(page.errors.join(" "), /no service workers/);
+    assert.equal(page.reloads(), 0);
+});
+
+test("service worker registration failure reports the failure without reloading", async () => {
+    const page = pageWith({ worker: {
+        addEventListener: () => {},
+        register: async () => { throw new Error("registration unavailable"); },
+    } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(page.errors.join(" "), /registration failed/);
+    assert.equal(page.reloads(), 0);
+});
+
+test("the first visit reloads once and an unsuccessful reload stops", async () => {
+    const listeners = new Map();
+    const page = pageWith({ worker: {
+        addEventListener: (name, listener) => listeners.set(name, listener),
+        controller: null,
+        register: async () => ({ active: true }),
+    } });
+    await new Promise((resolve) => setImmediate(resolve));
+    listeners.get("controllerchange")();
+    listeners.get("controllerchange")();
+    assert.equal(page.reloads(), 1);
+    assert.equal(page.stored.get("coi-serviceworker:reloaded"), "1");
+    const retry = pageWith({ stored: page.stored, worker: {
+        register: () => { throw new Error("must not register twice"); },
+    } });
+    assert.equal(retry.reloads(), 0);
+    assert.match(retry.errors.join(" "), /still not isolated/);
+});
