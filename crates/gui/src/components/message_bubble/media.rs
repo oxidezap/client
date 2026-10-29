@@ -192,7 +192,7 @@ pub(super) fn render_media_content(
                 match (sticker_render_kind(&media_content), decoded_image) {
                     (Some(_kind), Some(cached_image)) => {
                         let sticker_id: SharedString = format!("sticker-{}", message_id).into();
-                        let image = img(ImageSource::Image(cached_image))
+                        let image = img(sticker_image_source(cached_image))
                             .id(sticker_id)
                             .w(px(display_w))
                             .h(px(display_h))
@@ -428,6 +428,52 @@ fn still_image_format(media: &oxidezap_core::MediaContent) -> Option<gpui::Image
         .has_still_image()
         .then(|| mime_to_image_format(&media.mime_type))
         .flatten()
+}
+
+// GPUI's Arc<Image> decoder treats WebP as a still image. Keep the existing
+// encoded-image cache, but load sticker frames through a dedicated asset so
+// repeated renders reuse the decoded frames on desktop and web alike.
+fn sticker_image_source(image: Arc<Image>) -> ImageSource {
+    ImageSource::Custom(Arc::new(move |window, cx| {
+        window.use_asset::<StickerDecoder>(&image, cx)
+    }))
+}
+
+struct StickerDecoder;
+
+impl gpui::Asset for StickerDecoder {
+    type Source = Arc<Image>;
+    type Output = Result<Arc<RenderImage>, gpui::ImageCacheError>;
+
+    fn load(
+        source: Self::Source,
+        _cx: &mut App,
+    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+        async move { decode_sticker(&source.bytes).map_err(Into::into) }
+    }
+}
+
+fn decode_sticker(bytes: &[u8]) -> image::ImageResult<Arc<RenderImage>> {
+    let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))?;
+    let frames: smallvec::SmallVec<[_; 1]> = if decoder.has_animation() {
+        // WhatsApp stickers have a transparent canvas, regardless of ANIM's
+        // background colour. The decoder composites frame offsets/disposal.
+        let _ = decoder.set_background_color(image::Rgba([0, 0, 0, 0]));
+        decoder.into_frames().collect::<image::ImageResult<_>>()?
+    } else {
+        let image = image::DynamicImage::from_decoder(decoder)?.into_rgba8();
+        smallvec::smallvec![image::Frame::new(image)]
+    };
+    let frames: smallvec::SmallVec<[_; 1]> = frames
+        .into_iter()
+        .map(|mut frame| {
+            for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+                pixel.swap(0, 2); // GPUI textures use BGRA.
+            }
+            frame
+        })
+        .collect();
+    Ok(Arc::new(RenderImage::new(frames)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -947,6 +993,7 @@ fn render_video_player(
 mod tests {
     use std::sync::Arc;
 
+    use gpui::{InteractiveElement as _, Styled as _};
     use oxidezap_core::MediaContent;
 
     use super::{StickerRenderKind, extension_of, format_bytes, sticker_render_kind};
@@ -1017,6 +1064,81 @@ mod tests {
     #[test]
     fn animated_webp_payload_reaches_the_animation_decoder() {
         assert!(super::sticker_payload_is_valid(&animated_webp_sticker()));
+    }
+
+    #[test]
+    fn sticker_decoder_keeps_distinct_frames_and_delays() {
+        let media = animated_webp_sticker();
+        let decoded = super::decode_sticker(&media.data).unwrap();
+        assert_eq!(decoded.frame_count(), 2);
+        assert_ne!(decoded.as_bytes(0), decoded.as_bytes(1));
+        assert_eq!(decoded.delay(0).numer_denom_ms(), (1000, 1));
+        assert_eq!(decoded.delay(1).numer_denom_ms(), (1000, 1));
+    }
+
+    #[gpui::test]
+    fn sticker_frames_loop_and_stay_cached_across_renders(cx: &mut gpui::TestAppContext) {
+        let media = animated_webp_sticker();
+        let image = Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Webp,
+            media.data.to_vec(),
+        ));
+        let mut window = cx.add_empty_window();
+        let source = super::sticker_image_source(image.clone());
+        let draw = |window: &mut gpui::VisualTestContext| {
+            window.draw(
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                gpui::size(gpui::px(10.), gpui::px(10.)),
+                |_, _| gpui::img(source.clone()).id("sticker-test").size_full(),
+            );
+        };
+        window.update(|_, cx| {
+            cx.fetch_asset::<super::StickerDecoder>(&image);
+        });
+        window.run_until_parked();
+        draw(&mut window);
+        let first = window.update(|window, cx| {
+            window
+                .use_asset::<super::StickerDecoder>(&image, cx)
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(first.frame_count(), 2);
+        // A one-frame probe with the same texture id observes whether GPUI
+        // painted frame zero. Remove atlas entries before each draw so a
+        // stale texture cannot make the assertion pass.
+        let mut probe = gpui::RenderImage::new(smallvec::smallvec![image::Frame::new(
+            image::RgbaImage::new(2, 2)
+        )]);
+        probe.id = first.id;
+        draw(&mut window);
+        for frame in 1..=6 {
+            window.update(|window, _| window.drop_image(first.clone()).unwrap());
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_millis(1000));
+            draw(&mut window);
+            assert_eq!(
+                window.update(|window, _| window.has_image_atlas_entry(&probe)),
+                frame % 2 == 0
+            );
+
+            let next = window.update(|window, cx| {
+                window
+                    .use_asset::<super::StickerDecoder>(&image, cx)
+                    .unwrap()
+                    .unwrap()
+            });
+            assert!(Arc::ptr_eq(&first, &next));
+        }
+    }
+
+    #[test]
+    fn sticker_decoder_preserves_static_transparency() {
+        let media = webp_sticker(false);
+        let decoded = super::decode_sticker(&media.data).unwrap();
+        assert_eq!(decoded.frame_count(), 1);
+        assert_eq!(decoded.as_bytes(0).unwrap(), &[0, 0, 0, 0]);
     }
 
     #[test]
