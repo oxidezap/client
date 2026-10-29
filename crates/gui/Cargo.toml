@@ -108,7 +108,7 @@ block2 = "0.6.2"
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL", "std"] }
-objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["block2", "UNNotificationAttachment", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationTrigger", "UNUserNotificationCenter"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["block2", "UNNotificationAttachment", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 
 # The same window as a page. `gpui_platform` picks the web backend by target,
 # so the dependency differs only in the features a browser has no use for —
