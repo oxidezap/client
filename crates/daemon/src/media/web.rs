@@ -510,4 +510,43 @@ mod owned_tests {
         delete_for(prefix, Wipe::Everything).unwrap();
         assert_budget_matches_entries();
     }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn account_clear_and_removal_keep_budget_and_other_accounts_intact() {
+        use super::super::AccountMedia;
+        use oxidezap_core::AccountId;
+
+        let a = AccountMedia::new(AccountId::new(990007).unwrap());
+        let b = AccountMedia::new(AccountId::new(990008).unwrap());
+        a.wipe(Wipe::Everything).unwrap();
+        b.wipe(Wipe::Everything).unwrap();
+        let a_epoch = a.epoch();
+        let b_epoch = b.epoch();
+        let a_download = a.put_owned_since(a_epoch, "d-clear", vec![1; 32]).unwrap();
+        let b_download = b.put_owned_since(b_epoch, "d-keep", vec![2; 64]).unwrap();
+        let staged = a.staged_key("budget-account-fixture");
+        super::super::put_owned(&staged, vec![3; 16]).unwrap();
+        assert_budget_matches_entries();
+
+        a.wipe(Wipe::Cache).unwrap();
+        assert!(!has(&a_download));
+        assert!(has(&b_download));
+        assert!(has(&staged));
+        assert_eq!(b.epoch(), b_epoch);
+        // A stale writer fails before mutation. B's pending writer remains
+        // valid because clearing A never changes B's epoch.
+        assert!(a.put_owned_since(a_epoch, "d-stale", vec![4; 128]).is_err());
+        assert!(!has(&a.key("d-stale")));
+        b.put_owned_since(b_epoch, "d-later", vec![5; 8]).unwrap();
+        assert_budget_matches_entries();
+
+        let claimed = a.put_owned("d-requested", vec![6; 12]).unwrap();
+        a.wipe(Wipe::Everything).unwrap();
+        assert!(!has(&claimed));
+        assert!(!has(&staged));
+        assert!(has(&b_download));
+        assert_budget_matches_entries();
+        b.wipe(Wipe::Everything).unwrap();
+        assert_budget_matches_entries();
+    }
 }

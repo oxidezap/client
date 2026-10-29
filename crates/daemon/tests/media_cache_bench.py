@@ -42,7 +42,7 @@ def item(source, marker):
     return source[start:end]
 
 
-def build(ref, directory, name):
+def definitions(ref):
     transport = read(ref, "crates/ipc/src/transport.rs")
     media = read(ref, MEDIA + "mod.rs")
     helpers = "\n".join(item(transport, marker) for marker in [
@@ -57,10 +57,7 @@ def build(ref, directory, name):
     helpers = helpers.replace("pub(super)", "pub")
     budget = next(line for line in read(ref, "crates/core/src/media_budget.rs").splitlines()
                   if line.startswith("pub const WEB_MEDIA_BUDGET_BYTES:"))
-    module = directory / (name + "_module.rs")
-    module.write_text(read(ref, MEDIA + "web.rs"))
-    source = directory / (name + ".rs")
-    source.write_text(r'''#![allow(dead_code)]
+    return r'''#![allow(dead_code)]
 extern crate self as anyhow;
 extern crate self as oxidezap_core;
 extern crate self as oxidezap_ipc;
@@ -74,7 +71,14 @@ pub type Result<T> = std::result::Result<T, String>;
 }
 const STAGED_PREFIX: &str = "u-";
 const IN_PROGRESS_PREFIX: &str = "w-";
-''' + budget + "\n" + helpers + f'\n#[path="{module}"] mod cache;\n' + r'''
+''' + budget + "\n" + helpers
+
+
+def build(ref, directory, name):
+    module = directory / (name + "_module.rs")
+    module.write_text(read(ref, MEDIA + "web.rs"))
+    source = directory / (name + ".rs")
+    source.write_text(definitions(ref) + f'\n#[path="{module}"] mod cache;\n' + r'''
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let count: usize = args[1].parse().unwrap();
