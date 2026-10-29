@@ -37,6 +37,9 @@ mod wire_events;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod memory_scenario;
+
 pub use action::{
     AccountDisposition, AccountExit, Action, CommandOutcome, Commands, Outbox, SessionCommand,
 };
