@@ -504,6 +504,45 @@ impl Inner {
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "release performance workload"]
+    fn attention_workload() {
+        let count: usize = std::env::var("ATTENTION_CHATS")
+            .unwrap_or_else(|_| "10000".into()).parse().unwrap();
+        let mute_every: usize = std::env::var("ATTENTION_MUTE_EVERY")
+            .unwrap_or_else(|_| "0".into()).parse().unwrap();
+        let until = wacore::time::now_utc().timestamp_millis() + 3_600_000;
+        let make_chat = |i: usize, unread| {
+            let mut change = chat(&format!("synthetic-{i}@s.whatsapp.net"), unread);
+            if mute_every > 0 && i.is_multiple_of(mute_every)
+                && let DaemonEvent::ChatUpdated(summary) = &mut change.event
+            { summary.muted_until_ms = Some(until + i as i64); }
+            change
+        };
+        let store = store();
+        let mut expected = 0;
+        let start = wacore::time::Instant::now();
+        for unread in [1, 2] {
+            for i in 0..count {
+                let muted = mute_every > 0 && i.is_multiple_of(mute_every);
+                expected += u32::from(!muted);
+                let published = store.apply_unless_stale(make_chat(i, unread), None, || ()).unwrap();
+                assert_eq!(published.tray.unread, expected);
+                store.refresh_tray(|tray| assert_eq!(tray.unread, expected));
+                let deadline = store.next_mute_expiry(wacore::time::now_utc().timestamp_millis());
+                assert_eq!(deadline, (mute_every > 0).then_some(until));
+                let _ = std::hint::black_box(published);
+            }
+        }
+        println!("attention workload chats={count} mute_every={mute_every} elapsed_ns={}", start.elapsed().as_nanos());
+        if let Ok(stats) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+            for line in stats.lines().filter(|line| line.starts_with("Rss:") || line.starts_with("Pss:") || line.starts_with("Private_Dirty:")) {
+                println!("attention memory {line}");
+            }
+        }
+        std::hint::black_box(&store);
+    }
+
     /// Nothing here has anywhere to send, and that is the point of the split:
     /// what the daemon *knows* can be driven, and asserted on, without four
     /// broadcast channels and a watch existing at all.
