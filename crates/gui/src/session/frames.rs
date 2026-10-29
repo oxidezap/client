@@ -842,11 +842,9 @@ fn remaining_secs(expires_at_ms: i64) -> u64 {
     u64::try_from(left / 1_000).unwrap_or(0)
 }
 
-/// Fill in the media bytes the daemon left in its cache.
-///
-/// The inverse of what the daemon does on the way out. Media is the one thing
-/// the wire does not carry, so this is the one place the front end has to know
-/// that — every renderer above it still just reads `data`.
+/// Resolve frame-time media for caches that need it before publication.
+/// Native message payloads retain their keys for visibility-owned hydration;
+/// avatar readiness still materializes here, independently of message payloads.
 fn load_media(event: &mut UiEvent, cache: &dyn MediaCache) {
     match event {
         UiEvent::MessageReceived { message, .. } => fill(&mut message.media, cache),
@@ -908,6 +906,9 @@ fn materialize_avatar(key: &str, cache: &dyn MediaCache) -> Result<(), Materiali
 }
 
 fn fill(media: &mut Option<MediaContent>, cache: &dyn MediaCache) {
+    if cache.defers_message_media() {
+        return;
+    }
     fill_with(media, |key| cache.read(key));
 }
 
@@ -918,6 +919,9 @@ fn fill_many<'a>(
     media: impl IntoIterator<Item = &'a mut Option<MediaContent>>,
     cache: &dyn MediaCache,
 ) {
+    if cache.defers_message_media() {
+        return;
+    }
     let mut held = std::collections::HashMap::<String, Arc<Vec<u8>>>::new();
     for media in media {
         fill_with(media, |key| {
@@ -1090,6 +1094,66 @@ mod tests {
         assert!(rows[0].as_ref().unwrap().data.is_empty());
         assert_eq!(rows[1].as_ref().unwrap().data.as_slice(), [42]);
         assert!(!rows[1].as_ref().unwrap().data_is_preview);
+    }
+
+    #[test]
+    fn deferred_frames_preserve_distinct_full_and_preview_keys_without_reading() {
+        struct Deferred;
+        impl MediaCache for Deferred {
+            fn read(&self, _: &str) -> Result<Arc<Vec<u8>>, String> {
+                panic!("eager media read")
+            }
+            fn defers_message_media(&self) -> bool {
+                true
+            }
+            fn stage(&self, _: &str, _: &[u8]) -> Result<(), String> {
+                unreachable!()
+            }
+            fn discard(&self, _: &str) {
+                unreachable!()
+            }
+        }
+        let mut rows: Vec<_> = (0..12)
+            .map(|n| {
+                let mut media =
+                    MediaContent::image(Arc::new(Vec::new()), "image/jpeg".into(), n % 2 == 0);
+                if n % 2 == 0 {
+                    media.preview_cache_key = Some(format!("preview-{n}"));
+                } else {
+                    media.cache_key = Some(format!("full-{n}"));
+                }
+                Some(media)
+            })
+            .collect();
+        let before = rows.clone();
+        fill_many(&mut rows, &Deferred);
+        assert_eq!(rows, before);
+        for row in &mut rows {
+            fill(row, &Deferred);
+        }
+        assert_eq!(rows, before);
+        let mut chat = Chat::new("peer@example.invalid".into());
+        chat.messages = rows
+            .into_iter()
+            .enumerate()
+            .map(|(n, media)| {
+                let mut message = oxidezap_core::ChatMessage::new_incoming(
+                    format!("m{n}"),
+                    "peer@example.invalid".into(),
+                    "photo".into(),
+                );
+                message.media = media;
+                message
+            })
+            .collect();
+        let mut event = UiEvent::HistoryLoaded {
+            chats: vec![chat],
+            complete: false,
+            next: None,
+        };
+        let before = event.clone();
+        load_media(&mut event, &Deferred);
+        assert_eq!(event, before);
     }
 
     struct NoMedia;

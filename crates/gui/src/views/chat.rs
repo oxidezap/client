@@ -223,6 +223,7 @@ pub fn render_connected_view(
             is_loading: is_loading_update,
         })
     });
+    app.note_media_surface(cx);
     let status_list = status_feed.map(|feed| StatusListProps {
         feed,
         selected: StatusSelection::of(app.status_pane().author()),

@@ -21,6 +21,7 @@ pub use editing::EditMessage;
 mod frame_cost;
 mod media;
 mod media_ctl;
+mod media_materialization;
 mod message_actions;
 mod messages;
 pub mod notices;
@@ -944,6 +945,9 @@ pub struct WhatsAppApp {
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
+    media_materialization: media_materialization::Materialization,
+    #[cfg(test)]
+    materialization_cache: Option<Arc<dyn crate::session::MediaCache>>,
     /// Automatic attempts: false while pending/failed, true after success.
     channel_preview_attempts: std::collections::HashMap<(String, String), bool>,
     image_downloads_in_flight: std::collections::HashSet<String>,
@@ -1131,6 +1135,10 @@ pub(super) fn clear_window_message_selection(window: &mut Window, cx: &mut App) 
 
 impl WhatsAppApp {
     pub fn media_cache(&self) -> Option<std::sync::Arc<dyn crate::session::MediaCache>> {
+        #[cfg(test)]
+        if let Some(cache) = &self.materialization_cache {
+            return Some(Arc::clone(cache));
+        }
         self.client.as_ref().map(Session::media_cache)
     }
 
@@ -1488,6 +1496,9 @@ impl WhatsAppApp {
             recovery: cx.new(|_| recovery::Recovering::new()),
             notices: cx.new(|_| notices::Notices::new()),
             downloads_in_flight: std::collections::HashSet::new(),
+            media_materialization: media_materialization::Materialization::default(),
+            #[cfg(test)]
+            materialization_cache: None,
             channel_preview_attempts: std::collections::HashMap::new(),
             image_downloads_in_flight: std::collections::HashSet::new(),
             saved_documents: HashMap::new(),
@@ -4365,6 +4376,7 @@ impl Focusable for WhatsAppApp {
 
 impl Render for WhatsAppApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reconcile_media_owner(cx);
         self.observe_window_activation(window, cx);
         // First, because every dimension below resolves from the scale this
         // settles: the window's size is folded into the base font here and
