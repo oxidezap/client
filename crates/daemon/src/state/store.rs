@@ -16,6 +16,7 @@
 //! [`Published`] for why that hand-over-hand is load-bearing.
 
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Mutex;
 
 use oxidezap_ipc::{ChatSummary, ConnectionState, DaemonEvent, StateSnapshot, StateVersion};
@@ -303,12 +304,11 @@ impl StateStore {
     }
 
     pub(super) fn next_mute_expiry(&self, now_ms: i64) -> Option<i64> {
-        let mut inner = self.lock();
-        inner.advance_attention(now_ms);
-        inner
+        self.lock()
             .attention
             .deadlines
-            .first_key_value()
+            .range((Excluded(now_ms), Unbounded))
+            .next()
             .map(|(&until, _)| until)
             .filter(|&until| until < chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis())
     }
@@ -518,16 +518,12 @@ impl Attention {
         u128::from(summary.unread.max(u32::from(summary.manually_unread)))
     }
 
-    fn deadline(&self, summary: &ChatSummary) -> Option<i64> {
-        summary.muted_until_ms.filter(|&until| until > self.now_ms)
-    }
-
     fn add(&mut self, summary: &ChatSummary) {
         let weight = Self::weight(summary);
         if summary.counts_toward_attention(self.now_ms) {
             self.total += weight;
         }
-        if let Some(until) = self.deadline(summary) {
+        if let Some(until) = summary.muted_until_ms {
             let bucket = self.deadlines.entry(until).or_default();
             bucket.chats += 1;
             bucket.unread += weight;
@@ -539,7 +535,7 @@ impl Attention {
         if summary.counts_toward_attention(self.now_ms) {
             self.total -= weight;
         }
-        if let Some(until) = self.deadline(summary) {
+        if let Some(until) = summary.muted_until_ms {
             let bucket = self
                 .deadlines
                 .get_mut(&until)
@@ -555,29 +551,30 @@ impl Attention {
 
 impl Inner {
     fn advance_attention(&mut self, now_ms: i64) {
-        // Wall time can move backwards. Rebuild in that case so a mute whose
-        // bucket was already expired becomes active again, as a scan would.
-        if now_ms < self.attention.now_ms {
-            self.attention = Attention::new(now_ms);
-            for entry in self.chats.values() {
-                self.attention.add(&entry.summary);
-            }
+        let before = self.attention.now_ms;
+        if before == now_ms {
             return;
         }
-        self.attention.now_ms = now_ms;
-        while self
+        let (lower, upper) = if before <= now_ms {
+            (before, now_ms)
+        } else {
+            (now_ms, before)
+        };
+        // Keep past deadlines until their chats change or leave. A stale timer
+        // query and a clock reversal can then use the same index without
+        // rebuilding it or consulting every chat.
+        let crossed: u128 = self
             .attention
             .deadlines
-            .first_key_value()
-            .is_some_and(|(&until, _)| until <= now_ms)
-        {
-            let (_, bucket) = self
-                .attention
-                .deadlines
-                .pop_first()
-                .expect("deadline exists");
-            self.attention.total += bucket.unread;
+            .range((Excluded(lower), Included(upper)))
+            .map(|(_, bucket)| bucket.unread)
+            .sum();
+        if before <= now_ms {
+            self.attention.total += crossed;
+        } else {
+            self.attention.total -= crossed;
         }
+        self.attention.now_ms = now_ms;
     }
 
     fn tray_state(&mut self) -> TrayState {
@@ -670,7 +667,6 @@ mod tests {
             .chats
             .values()
             .filter_map(|entry| entry.summary.muted_until_ms)
-            .filter(|&until| until > now_ms)
             .min();
         assert_eq!(
             inner
@@ -754,6 +750,7 @@ mod tests {
         assert_eq!(published.tray.unread, 10);
         assert_eq!(store.next_mute_expiry(until - 1), Some(until));
         assert_eq!(store.next_mute_expiry(until), None);
+        assert_eq!(store.next_mute_expiry(until - 1), Some(until));
         assert_attention_matches_scan(&store, until);
         assert_attention_matches_scan(&store, until - 1);
     }
