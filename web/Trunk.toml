@@ -11,6 +11,38 @@
 target = "index.html"
 dist = "dist"
 
+# The first visit must reload after the isolation worker takes control.
+# Keep both preloads inert until that reload; otherwise it abandons a WASM
+# download already in flight. An isolated page activates them during parsing,
+# before the module script runs, preserving parallel download and compilation.
+# Templates also keep the hashed URLs visible to `xtask bundle check`.
+pattern_preload = '''
+<template id="wasm-preloads">
+  <link rel="modulepreload" href="{base}{js}" crossorigin="{crossorigin}">
+  <link rel="preload" href="{base}{wasm}" as="fetch" type="application/wasm" crossorigin="{crossorigin}">
+</template>
+<script>
+if (window.crossOriginIsolated) {
+  document.head.append(document.getElementById("wasm-preloads").content);
+}
+</script>
+'''
+
+# Dynamic import matters here: a static import starts fetching even when the
+# branch containing the call to `init` is skipped. The service worker reports
+# unsupported contexts and bounds the reload; the module cannot run there.
+# Match Trunk's default initializer and application-started event. The object
+# argument is the wasm-bindgen API used by this workspace's pinned version.
+pattern_script = '''
+<script type="module">
+if (window.crossOriginIsolated) {
+  const { default: init } = await import('{base}{js}');
+  const wasm = await init({ module_or_path: '{base}{wasm}' });
+  dispatchEvent(new CustomEvent("TrunkApplicationStarted", { detail: { wasm } }));
+}
+</script>
+'''
+
 [serve]
 addresses = ["127.0.0.1"]
 port = 8080

@@ -79,3 +79,64 @@ test("unrelated notification clicks are ignored", () => {
     click({ notification: { data: { oxidezapTag: "other" }, close: () => { closed = true; } } });
     assert.equal(closed, false);
 });
+
+// These are the actual templates Trunk expands, not a second loader. A
+// browser test can then exercise the same templates with synthetic assets.
+const trunk = readFileSync(new URL("./Trunk.toml", import.meta.url), "utf8");
+const startup = Object.fromEntries([...trunk.matchAll(
+    /pattern_(preload|script)\s*=\s*'''([\s\S]*?)'''/g,
+)].map((match) => [match[1], match[2]]));
+const inlineScript = (html) => html.match(/<script(?: type="module")?>([\s\S]*?)<\/script>/)[1];
+
+test("an uncontrolled page leaves the WASM and glue preloads inert", () => {
+    const activated = [];
+    vm.runInNewContext(inlineScript(startup.preload), {
+        window: { crossOriginIsolated: false },
+        document: { head: { append: (value) => activated.push(value) } },
+    });
+    assert.deepEqual(activated, []);
+    assert.match(startup.preload, /<template[^>]*>[\s\S]*href="\{base\}\{js\}"[\s\S]*href="\{base\}\{wasm\}"[\s\S]*<\/template>/);
+});
+
+test("an isolated page activates both preloads before starting the module", () => {
+    const content = {};
+    const activated = [];
+    vm.runInNewContext(inlineScript(startup.preload), {
+        window: { crossOriginIsolated: true },
+        document: {
+            getElementById: (id) => { assert.equal(id, "wasm-preloads"); return { content }; },
+            head: { append: (value) => activated.push(value) },
+        },
+    });
+    assert.deepEqual(activated, [content]);
+});
+
+for (const isolated of [false, true]) {
+    test(`the loader ${isolated ? "starts and announces" : "does not import"} the application when isolation is ${isolated}`, async () => {
+        const imports = [];
+        const events = [];
+        const wasm = {};
+        // vm's ordinary script runner has no module loader. Substitute only
+        // the dynamic import expression; the branch and init call stay exact.
+        const script = inlineScript(startup.script).replace("await import(", "await importModule(");
+        await vm.runInNewContext(`(async () => { ${script} })()`, {
+            window: { crossOriginIsolated: isolated },
+            importModule: async (url) => {
+                imports.push(url);
+                return { default: async (options) => {
+                    assert.equal(options.module_or_path, "{base}{wasm}");
+                    return wasm;
+                } };
+            },
+            CustomEvent: class { constructor(name, options) { this.name = name; this.detail = options.detail; } },
+            dispatchEvent: (event) => events.push(event),
+        });
+        assert.equal(imports.length, isolated ? 1 : 0);
+        assert.equal(events.length, isolated ? 1 : 0);
+        if (isolated) {
+            assert.equal(imports[0], "{base}{js}");
+            assert.equal(events[0].name, "TrunkApplicationStarted");
+            assert.equal(events[0].detail.wasm, wasm);
+        }
+    });
+}
