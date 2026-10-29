@@ -13,8 +13,8 @@ still downloads its original. Full and HQ files have separate content identities
 
 Two requests run at once, with one automatic attempt per image and 256 remembered
 attempts per account session. Failure keeps the inline fallback and manual retry.
-HQ previews share the existing retained-media budget; inline-only bytes remain
-protected. The client has no photo auto-download preference or metered-network
+Materialized HQ previews share the existing retained-media budget. Inline bytes
+remain protected even when the message also carries a server-preview descriptor. The client has no photo auto-download preference or metered-network
 policy; these limits do not emulate such controls.
 
 Web preserves metadata and manual downloads. Automatic fetching is disabled:

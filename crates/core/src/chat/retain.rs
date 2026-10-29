@@ -84,7 +84,8 @@ impl MediaContent {
     pub fn is_releasable(&self) -> bool {
         !self.data.is_empty()
             && self.can_download()
-            && (!self.data_is_preview || self.preview_downloadable.is_some())
+            && (!self.data_is_preview
+                || (self.data_is_server_preview && self.preview_downloadable.is_some()))
     }
 
     /// Let go of bytes that can be fetched again, and answer how many.
@@ -215,6 +216,13 @@ mod tests {
         preview.media_key.clear();
         preview.file_sha256 = vec![7; 32];
         media.preview_downloadable = Some(preview.clone());
+        assert!(
+            !media.is_releasable(),
+            "a server descriptor cannot evict inline bytes"
+        );
+        assert_eq!(media.release(), 0);
+        assert_eq!(media.data.len(), 100);
+        media.adopt_server_preview(Arc::new(vec![1; 100]));
         assert_eq!(media.release(), 100);
         assert!(media.data.is_empty());
         assert!(media.data_is_preview);

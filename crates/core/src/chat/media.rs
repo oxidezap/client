@@ -204,6 +204,9 @@ pub struct MediaContent {
     /// Optional server HQ JPEG, fetched separately from the original image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_downloadable: Option<DownloadableMedia>,
+    /// The held bytes are a materialized server JPEG, rather than inline fallback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub data_is_server_preview: bool,
     /// MIME type of the display data (may differ from downloadable media)
     pub mime_type: String,
     /// Width in pixels (if known)
@@ -261,6 +264,7 @@ impl MediaContent {
             cache_key: None,
             preview_cache_key: None,
             preview_downloadable: None,
+            data_is_server_preview: false,
             mime_type,
             width: None,
             height: None,
@@ -403,6 +407,15 @@ impl MediaContent {
         self.has_data() || self.can_download()
     }
 
+    /// Install a server JPEG without changing the original download reference.
+    pub fn adopt_server_preview(&mut self, bytes: Arc<Vec<u8>>) {
+        self.data = bytes;
+        self.mime_type = "image/jpeg".into();
+        self.data_is_preview = true;
+        self.data_is_server_preview = true;
+        self.cache_key = None;
+    }
+
     /// The full media has arrived: take the bytes, and the metadata that
     /// describes *them*.
     ///
@@ -415,6 +428,7 @@ impl MediaContent {
     pub fn adopt_full_bytes(&mut self, bytes: Arc<Vec<u8>>) {
         self.data = bytes;
         self.data_is_preview = false;
+        self.data_is_server_preview = false;
         self.preview_cache_key = None;
         if let Some(downloadable) = &self.downloadable {
             self.mime_type = downloadable.mime_type.clone();

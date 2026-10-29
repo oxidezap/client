@@ -218,9 +218,7 @@ impl WhatsAppApp {
                 // decoding a WebP sticker as the `image/jpeg` its poster
                 // frame claimed fails every time.
                 if preview {
-                    media.data = data;
-                    media.mime_type = "image/jpeg".into();
-                    media.data_is_preview = true;
+                    media.adopt_server_preview(data);
                 } else {
                     media.adopt_full_bytes(data);
                 }

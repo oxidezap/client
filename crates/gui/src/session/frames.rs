@@ -956,6 +956,15 @@ mod tests {
         let loaded = wire.as_mut().unwrap();
         assert_eq!(loaded.data.as_slice(), [1, 2]);
         assert!(loaded.data_is_preview);
+        assert!(!loaded.data_is_server_preview, "inline is not HQ");
+        assert_eq!(loaded.mime_type, "image/jpeg");
+        assert!(loaded.can_download());
+        loaded.adopt_server_preview(Arc::new(Vec::new()));
+        loaded.preview_cache_key = Some("preview".into());
+        wire = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+        fill(&mut wire, &Cache);
+        let loaded = wire.as_mut().unwrap();
+        assert!(loaded.data_is_preview && loaded.data_is_server_preview);
         assert_eq!(loaded.mime_type, "image/jpeg");
         assert!(loaded.can_download());
         loaded.cache_key = Some("full".into());
@@ -963,6 +972,7 @@ mod tests {
         let loaded = wire.unwrap();
         assert_eq!(loaded.data.as_slice(), [3, 4, 5]);
         assert!(!loaded.data_is_preview);
+        assert!(!loaded.data_is_server_preview);
         assert_eq!(loaded.mime_type, "image/webp");
     }
 

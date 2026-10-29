@@ -98,6 +98,9 @@ fn cache_media(
             && let Some(key) = account_media.download_key(thumbnail.content_hash())
             && account_media.has(&key)
         {
+            // No inline JPEG is required for a cached server preview. Clear
+            // old inline bytes before labeling the cache payload as HQ.
+            media.adopt_server_preview(std::sync::Arc::new(Vec::new()));
             media.preview_cache_key = Some(key);
             return;
         }
@@ -183,6 +186,21 @@ mod tests {
             hq_hydrated.unwrap().preview_cache_key.as_ref(),
             Some(&hq_key)
         );
+        let mut without_inline = original.clone();
+        without_inline.data = std::sync::Arc::new(Vec::new());
+        without_inline.data_is_preview = false;
+        without_inline.mime_type = "image/webp".into();
+        let mut without_inline = Some(without_inline);
+        cache_media(&cache, cache.epoch(), "42", &mut without_inline);
+        let hq = without_inline.unwrap();
+        assert!(hq.data_is_preview && hq.data_is_server_preview);
+        assert_eq!(hq.mime_type, "image/jpeg");
+        assert_eq!(hq.preview_cache_key.as_ref(), Some(&hq_key));
+        assert_eq!(
+            hq.downloadable, original.downloadable,
+            "original stays available"
+        );
+
         cache.put_owned(&full_local, vec![9, 8, 7]).unwrap();
         let mut hydrated = Some(original);
         cache_media(&cache, cache.epoch(), "42", &mut hydrated);
