@@ -21,7 +21,8 @@ def sample(binary, case, allocations, iterations):
         [str(binary), "--ignored", "--exact", "pooled_page_limit_workload", "--nocapture"],
         env=env, text=True, capture_output=True, check=True,
     )
-    match = re.search(r"^PAGE_LIMIT (.+)$", result.stdout, re.MULTILINE)
+    # libtest can prefix this line with its progress text on a pinned CPU.
+    match = re.search(r"\bPAGE_LIMIT (.+)$", result.stdout, re.MULTILINE)
     if not match:
         raise RuntimeError(result.stdout + result.stderr)
     return {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", match[1])}
@@ -33,14 +34,22 @@ def main():
     parser.add_argument("head", type=Path)
     parser.add_argument("--iterations", type=int, default=64)
     parser.add_argument("--samples", type=int, default=7)
+    parser.add_argument("--cases", nargs="+", choices=["attach", "backward", "forward", "history", "reactions"],
+                        default=["attach", "backward", "forward", "history", "reactions"])
+    parser.add_argument("--modes", nargs="+", type=int, choices=[0, 1], default=[0, 1])
+    parser.add_argument("--cpu", type=int, help="pin this runner and its children to an allowed Linux CPU")
     parser.add_argument("--output", type=Path, default=Path("sqlite-page-limit.csv"))
     args = parser.parse_args()
     if min(args.iterations, args.samples) < 1:
         parser.error("iterations and samples must be positive")
+    if args.cpu is not None:
+        if args.cpu not in os.sched_getaffinity(0):
+            parser.error("cpu is outside this process's allowed affinity")
+        os.sched_setaffinity(0, {args.cpu})
     binaries = [("base", args.base.resolve()), ("head", args.head.resolve())]
     rows = []
-    for case in ["attach", "backward", "forward", "history", "reactions"]:
-        for allocations in [0, 1]:
+    for case in args.cases:
+        for allocations in args.modes:
             for pair in range(args.samples + 1):
                 order = binaries if pair % 2 == 0 else binaries[::-1]
                 observed = []
@@ -58,8 +67,10 @@ def main():
         writer = csv.DictWriter(output, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    for case in ["attach", "backward", "forward", "history", "reactions"]:
+    for case in args.cases:
         timed = [row for row in rows if row["case"] == case and row["allocations"] == 0]
+        if not timed:
+            continue
         base = {row["pair"]: row for row in timed if row["label"] == "base"}
         head = {row["pair"]: row for row in timed if row["label"] == "head"}
         print(json.dumps(dict(case=case, **{

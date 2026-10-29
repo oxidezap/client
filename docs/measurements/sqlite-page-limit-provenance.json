@@ -1,0 +1,44 @@
+{
+  "base_application": "a5c7c3e9d968c455bbba572c0cea2ccda3adfafd",
+  "head_application_change": "1569e95",
+  "same_harness_snapshot": "92ecea4",
+  "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+  "sqlite": "3.53.2",
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.41",
+  "cpu": "AMD EPYC 9V74 80-Core Processor",
+  "cpu_quota": "4 CPUs; affinity allows 5 logical CPUs",
+  "build": "cargo test -p oxidezap-chat-store --release --all-features --test page_limit_profile --no-run",
+  "profile": "workspace release, opt-level=3, fat LTO, codegen-units=1; identical flags and ordinary Cargo target/cache for both",
+  "iterations": 32,
+  "pairs_per_case_and_mode": 7,
+  "measurement_modes": [
+    "timing with allocation accounting disabled",
+    "Rust allocation traffic accounting enabled"
+  ],
+  "setup": "synthetic shared in-memory store; no session or laptop data",
+  "binary_sha256": {
+    "base": "b3c45b8f676560547d3e2335f19579231cf2b98db32b19f6b980b34f3247a2dd",
+    "head": "d2677a915a9703ec6324e52ce30d0bcb975d9883940a1ae97245bf78eb1ad9d1"
+  },
+  "source_sha256": {
+    "crates/chat-store/tests/page_limit_profile.rs": "bf3f89ec1ee7b3c705ecf0fd44ecc0e3d119cf6f4448bd0ec4548aae5898a5b8",
+    "scripts/measure-sqlite-page-limit.py": "d52163f2b07151c28a94b82e01147de3aaf6524fd42e9d03d28d2e8cdf4e3a27",
+    "crates/chat-store/src/queries.rs": "67812e03d6cca74e1fd83481fac71881b5afa287c405990c0a083c1df030bf23"
+  },
+  "confirmation": {
+    "iterations": 256,
+    "pairs_per_case": 7,
+    "cases": [
+      "attach",
+      "history",
+      "reactions"
+    ],
+    "allocations": 0,
+    "cpu_affinity": [
+      0
+    ],
+    "retained_observations": 42,
+    "runner_sha256": "4a009cb66f7467450e50d5031881417582cf9cb7d85c9329fb2532369aacbf23",
+    "same_binary_sha256_as_initial_run": true
+  }
+}
