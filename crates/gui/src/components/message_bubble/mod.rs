@@ -311,6 +311,7 @@ pub fn render_message_bubble(
                                             is_preparing: props.is_preparing,
                                             saved_document_path: props.saved_document_path.clone(),
                                             max_media_size: layout.max_media_size(),
+                                            sticker_size: layout.sticker_size(),
                                         },
                                         cx,
                                     )
