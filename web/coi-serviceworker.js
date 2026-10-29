@@ -165,6 +165,13 @@ if (typeof window === "undefined") {
     window.oxidezapIsolationReady = new Promise((resolve) => {
         startApplication = resolve;
     });
+    // The initial document can enter the back/forward cache during the
+    // isolation reload. If restored later, its unresolved loader must be
+    // allowed to use the existing main-thread fallback rather than waiting
+    // for a takeover that already happened in a different document.
+    window.addEventListener("pageshow", (event) => {
+        if (event.persisted) startApplication();
+    });
 
     // `sessionStorage` is per tab and survives a reload, which is exactly the
     // scope the bound wants. A browser may refuse it (a privacy mode, a
@@ -226,6 +233,7 @@ if (typeof window === "undefined") {
             console.warn("coi-serviceworker: setup timed out; trying the main-thread fallback");
             startApplication();
         }, 10000);
+        window.oxidezapIsolationReady.then(() => window.clearTimeout(startupDeadline));
 
         // One reload, whichever of the two paths below asks for it first. A
         // `location.reload()` does not stop this script — the document is
@@ -279,13 +287,11 @@ if (typeof window === "undefined") {
                 } else if (registration.active && !reloading) {
                     // Already controlled but still not isolated. No takeover
                     // is pending, so preserve the previous fallback immediately.
-                    window.clearTimeout(startupDeadline);
                     startApplication();
                 }
             })
             .catch((error) => {
                 console.error("coi-serviceworker: registration failed:", error);
-                window.clearTimeout(startupDeadline);
                 startApplication();
             });
     }

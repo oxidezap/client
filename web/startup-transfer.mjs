@@ -1,5 +1,6 @@
 // Run with `node web/startup-transfer.mjs`; needs Chromium on PATH.
 // ISOLATED=1 checks a host that supplies COOP/COEP without a reload.
+// CHECK_FLOWS=1 additionally checks reload/bfcache and the loaded page offline.
 // Alternating base/head order, fresh scopes, one Chromium process, no packages.
 import http from "node:http";
 import fs from "node:fs";
@@ -13,7 +14,8 @@ const config = fs.readFileSync(root + "/web/Trunk.toml", "utf8");
 const patterns = [
   ...config.matchAll(/pattern_(preload|script)\s*=\s*'''([\s\S]*?)'''/g),
 ];
-if (patterns.length !== 2) throw new Error("Trunk startup patterns are missing");
+if (patterns.length !== 2)
+  throw new Error("Trunk startup patterns are missing");
 // Synthetic module with a 22 MiB custom section. Measures requests and transfer,
 // not application execution, CPU, heap, RSS, or production startup latency.
 const moduleSize = 22 * 1024 * 1024;
@@ -31,6 +33,7 @@ const payload = Buffer.concat([
   Buffer.alloc(moduleSize - 1),
 ]);
 const stats = new Map();
+const checkFlows = process.env.CHECK_FLOWS === "1";
 const basePreload =
   '<link rel="modulepreload" href="{base}{js}"><link rel="preload" href="{base}{wasm}" as="fetch" type="application/wasm" crossorigin="anonymous">';
 const baseScript =
@@ -142,7 +145,7 @@ async function connect(url) {
 }
 const rows = [];
 try {
-  for (let pair = 0; pair < 8; pair++)
+  for (let pair = 0; pair < (checkFlows ? 2 : 8); pair++)
     for (const variant of pair % 2 ? ["head", "base"] : ["base", "head"]) {
       const key = variant + "-" + pair;
       const s = { requests: 0, bytes: 0, cancelled: 0 };
@@ -155,22 +158,67 @@ try {
       await c.send("Page.enable");
       await c.send("Page.addScriptToEvaluateOnNewDocument", {
         source:
-          'window.started=false;addEventListener("TrunkApplicationStarted",()=>window.started=true)',
+          'window.docId=Math.random();window.started=false;addEventListener("TrunkApplicationStarted",()=>window.started=true)',
       });
       const start = performance.now();
       await c.send("Page.navigate", {
         url: `http://127.0.0.1:${port}/${key}/`,
       });
-      let done = false;
-      for (let n = 0; n < 200; n++) {
-        await new Promise((r) => setTimeout(r, 30));
-        const r = await c.send("Runtime.evaluate", {
-          expression: "window.started === true",
-        });
-        if (r.result?.result?.value) {
-          done = true;
-          break;
+      async function started() {
+        for (let n = 0; n < 200; n++) {
+          await new Promise((r) => setTimeout(r, 30));
+          const result = await c.send("Runtime.evaluate", {
+            expression: "window.started === true",
+          });
+          if (result.result?.result?.value) return true;
         }
+        return false;
+      }
+      const done = await started();
+      let flows;
+      if (checkFlows) {
+        const oldId = (
+          await c.send("Runtime.evaluate", {
+            expression: "window.docId",
+          })
+        ).result?.result?.value;
+        await c.send("Page.reload");
+        let documentChanged = false;
+        for (let n = 0; n < 200; n++) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          const id = (
+            await c.send("Runtime.evaluate", {
+              expression: "window.docId",
+            })
+          ).result?.result?.value;
+          if (id !== undefined && id !== oldId) {
+            documentChanged = true;
+            break;
+          }
+        }
+        const reloadDone = await started();
+        await c.send("Network.enable");
+        await c.send("Network.emulateNetworkConditions", {
+          offline: true,
+          latency: 0,
+          downloadThroughput: 0,
+          uploadThroughput: 0,
+        });
+        // This checks a loaded page. It does not claim offline installation
+        // or exercise the full client's offline store/session behavior.
+        const offlineDone =
+          (
+            await c.send("Runtime.evaluate", {
+              expression: "window.started === true",
+            })
+          ).result?.result?.value === true;
+        await c.send("Network.emulateNetworkConditions", {
+          offline: false,
+          latency: 0,
+          downloadThroughput: -1,
+          uploadThroughput: -1,
+        });
+        flows = { documentChanged, reloadDone, offlineDone };
       }
       rows.push({
         pair,
@@ -178,6 +226,7 @@ try {
         ...s,
         ms: Math.round(performance.now() - start),
         done,
+        flows,
       });
       c.ws.close();
       await fetch(debugOrigin + "/json/close/" + target.id);
@@ -188,13 +237,21 @@ try {
         payloadBytes: payload.length,
         patterns: patterns.length,
         isolatedHost: process.env.ISOLATED === "1",
+        checkFlows,
         rows,
       },
       null,
       2,
     ),
   );
-  if (rows.some((row) => !row.done)) process.exitCode = 1;
+  if (
+    rows.some(
+      (row) =>
+        !row.done ||
+        (row.flows && (!row.flows.documentChanged || !row.flows.reloadDone || !row.flows.offlineDone)),
+    )
+  )
+    process.exitCode = 1;
 } finally {
   chrome.kill();
   await new Promise((resolve) => chrome.once("exit", resolve));

@@ -154,10 +154,12 @@ function pageWith({ isolated = false, secure = true, worker, reloaded = false, s
     const errors = [];
     let reloads = 0;
     let deadline;
+    const pageEvents = new Map();
     if (reloaded) stored.set("coi-serviceworker:reloaded", "1");
     const context = {
         window: {
             crossOriginIsolated: isolated,
+            addEventListener: (name, listener) => pageEvents.set(name, listener),
             isSecureContext: secure,
             document: { currentScript: { src: "https://example.test/client/coi-serviceworker.js" } },
             location: { reload: () => { reloads++; } },
@@ -173,7 +175,7 @@ function pageWith({ isolated = false, secure = true, worker, reloaded = false, s
         console: { error: (...args) => errors.push(args.join(" ")), warn: () => {} },
     };
     vm.runInNewContext(script, context);
-    return { errors, stored, reloads: () => reloads, ready: context.window.oxidezapIsolationReady, deadline: () => deadline?.() };
+    return { errors, stored, reloads: () => reloads, ready: context.window.oxidezapIsolationReady, deadline: () => deadline?.(), restore: () => pageEvents.get("pageshow")({ persisted: true }) };
 }
 
 test("a host already providing isolation needs no service worker", async () => {
@@ -266,4 +268,15 @@ test("an insecure context immediately retains fallback", async () => {
     await page.ready;
     assert.equal(page.reloads(), 0);
     assert.match(page.errors.join(" "), /not a secure context/);
+});
+
+
+test("restoring the initial document from bfcache releases its pending loader", async () => {
+    const page = pageWith({ worker: {
+        addEventListener: () => {},
+        register: () => new Promise(() => {}),
+    } });
+    page.restore();
+    await page.ready;
+    assert.equal(page.reloads(), 0);
 });
