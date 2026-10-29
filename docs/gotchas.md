@@ -1872,8 +1872,9 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
 
   Tray Hide ends the desktop front-end process, so Open recovers decoded
   avatars from the persistent tier, just like a first opening. Native local
-  recovery decodes on two dedicated workers, with bounded queues preferring
-  visible rows and the header over overscan. The workers sleep when idle;
+  recovery decodes on two dedicated workers, with a bounded queue preferring
+  visible rows and the header over overscan. Queued priorities follow viewport
+  demand without rereading files. The workers sleep when idle;
   using fixed workers also avoids spreading decoder allocations across the
   general blocking pool's allocator arenas. A completed decode rechecks its
   read reservation, account and generation before publishing into RAM.

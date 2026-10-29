@@ -50,35 +50,54 @@ pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {
 // single default executor thread prevents other futures from making progress;
 // unbounded blocking jobs would instead compete with rendering for every CPU
 // and retain one full-size decoded allocation per picture.
-type DecodeJob = Box<dyn FnOnce() + Send>;
-struct DecodeQueues {
-    high: smol::channel::Sender<DecodeJob>,
-    low: smol::channel::Sender<DecodeJob>,
+struct DecodeJob {
+    priority: super::DecodePriority,
+    run: Box<dyn FnOnce() + Send>,
 }
-static DECODE_JOBS: std::sync::LazyLock<DecodeQueues> = std::sync::LazyLock::new(|| {
-    let (high, high_receive) = smol::channel::bounded::<DecodeJob>(super::MAX_PERSISTENT_READS);
-    let (low, low_receive) = smol::channel::bounded::<DecodeJob>(super::MAX_PERSISTENT_READS);
-    for index in 0..2 {
-        let high = high_receive.clone();
-        let low = low_receive.clone();
-        std::thread::Builder::new()
-            .name(format!("avatar-decode-{index}"))
-            .spawn(move || {
-                while let Ok(job) = high
-                    .try_recv()
-                    .or_else(|_| smol::block_on(smol::future::or(high.recv(), low.recv())))
-                {
-                    job();
-                }
-            })
-            .expect("start avatar decoder");
-    }
-    DecodeQueues { high, low }
-});
+struct DecodeQueue {
+    jobs: std::sync::Mutex<std::collections::VecDeque<DecodeJob>>,
+    ready: std::sync::Condvar,
+    slots: tokio::sync::Semaphore,
+}
+static DECODE_JOBS: std::sync::LazyLock<std::sync::Arc<DecodeQueue>> =
+    std::sync::LazyLock::new(|| {
+        let queue = std::sync::Arc::new(DecodeQueue {
+            jobs: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            ready: std::sync::Condvar::new(),
+            slots: tokio::sync::Semaphore::const_new(super::MAX_PERSISTENT_READS),
+        });
+        for index in 0..2 {
+            let queue = queue.clone();
+            std::thread::Builder::new()
+                .name(format!("avatar-decode-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let mut jobs = queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                            while jobs.is_empty() {
+                                jobs = queue.ready.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            }
+                            // Read priority when selecting work: scrolling can promote
+                            // an existing reservation without rereading its file.
+                            let index = jobs
+                                .iter()
+                                .position(|job| {
+                                    job.priority.load(portable_atomic::Ordering::Relaxed)
+                                })
+                                .unwrap_or(0);
+                            jobs.remove(index).expect("nonempty decode queue")
+                        };
+                        (job.run)();
+                    }
+                })
+                .expect("start avatar decoder");
+        }
+        queue
+    });
 
 pub(super) async fn decode_avatar(
     bytes: Vec<u8>,
-    priority: super::DemandPriority,
+    priority: super::DecodePriority,
     current: impl FnOnce() -> bool + Send + 'static,
 ) -> Option<(std::sync::Arc<gpui::RenderImage>, u64)> {
     decode_work(priority, move || {
@@ -93,20 +112,29 @@ pub(super) async fn decode_avatar(
 }
 
 pub(super) async fn decode_work<T: Send + 'static>(
-    priority: super::DemandPriority,
+    priority: super::DecodePriority,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> T {
-    let (send, receive) = smol::channel::bounded(1);
-    let queue = match priority {
-        super::DemandPriority::High => &DECODE_JOBS.high,
-        super::DemandPriority::Low => &DECODE_JOBS.low,
-    };
-    queue
-        .send(Box::new(move || {
-            let _ = send.try_send(work());
-        }))
+    // Count running and queued jobs together. Producers await admission
+    // without blocking the async executor.
+    let permit = DECODE_JOBS
+        .slots
+        .acquire()
         .await
-        .expect("avatar decoder queue stays open");
+        .expect("decode slots never close");
+    let (send, receive) = smol::channel::bounded(1);
+    DECODE_JOBS
+        .jobs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(DecodeJob {
+            priority,
+            run: Box::new(move || {
+                let _permit = permit;
+                let _ = send.try_send(work());
+            }),
+        });
+    DECODE_JOBS.ready.notify_one();
     let result = receive
         .recv()
         .await
@@ -118,7 +146,11 @@ pub(super) async fn decode_work<T: Send + 'static>(
 
 #[cfg(test)]
 pub(super) fn queued_decodes() -> usize {
-    DECODE_JOBS.high.len() + DECODE_JOBS.low.len()
+    DECODE_JOBS
+        .jobs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
 }
 
 pub async fn delete_persistent(key: &str) -> Result<(), String> {
@@ -184,7 +216,7 @@ mod tests {
             let peak = peak.clone();
             let started = started.clone();
             tasks.push(smol::spawn(decode_work(
-                super::super::DemandPriority::High,
+                super::super::decode_priority(super::super::DemandPriority::High),
                 move || {
                     let count = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(count, Ordering::SeqCst);
@@ -227,7 +259,7 @@ mod tests {
             releases.push(release.clone());
             let started = started.clone();
             blockers.push(smol::spawn(decode_work(
-                super::super::DemandPriority::High,
+                super::super::decode_priority(super::super::DemandPriority::High),
                 move || {
                     started.send(()).unwrap();
                     while !release.load(Ordering::SeqCst) {
@@ -241,10 +273,12 @@ mod tests {
         }
         let (order, received) = std::sync::mpsc::channel();
         let low_order = order.clone();
-        let low = smol::spawn(decode_work(super::super::DemandPriority::Low, move || {
-            low_order.send("overscan").unwrap()
-        }));
-        let high = smol::spawn(decode_work(super::super::DemandPriority::High, move || {
+        let low = smol::spawn(decode_work(
+            super::super::decode_priority(super::super::DemandPriority::Low),
+            move || low_order.send("overscan").unwrap(),
+        ));
+        let promoted = super::super::decode_priority(super::super::DemandPriority::Low);
+        let high = smol::spawn(decode_work(promoted.clone(), move || {
             order.send("visible").unwrap()
         }));
         let deadline = wacore::time::Instant::now() + Duration::from_secs(5);
@@ -252,6 +286,7 @@ mod tests {
             assert!(wacore::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
+        promoted.store(true, portable_atomic::Ordering::Relaxed);
         releases[0].store(true, Ordering::SeqCst);
         let first = received.recv_timeout(Duration::from_secs(5));
         let second = received.recv_timeout(Duration::from_secs(5));

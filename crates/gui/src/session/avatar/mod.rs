@@ -76,6 +76,28 @@ pub enum DemandPriority {
     Low,
 }
 
+type DecodePriority = Arc<portable_atomic::AtomicBool>;
+
+fn decode_priority(priority: DemandPriority) -> DecodePriority {
+    Arc::new(portable_atomic::AtomicBool::new(
+        priority == DemandPriority::High,
+    ))
+}
+
+struct PendingRead {
+    token: u64,
+    priority: DecodePriority,
+}
+
+impl PendingRead {
+    fn new(token: u64, priority: DemandPriority) -> Self {
+        Self {
+            token,
+            priority: decode_priority(priority),
+        }
+    }
+}
+
 const MAX_TRACKED_AVATARS: usize = 2048;
 const MAX_PENDING_DEMANDS: usize = 256;
 const MAX_PERSISTENT_READS: usize = 64;
@@ -86,7 +108,7 @@ static NEXT_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// and in-memory decoded image caching.
 #[derive(Clone, Default)]
 pub struct AvatarManager {
-    persistent_in_flight: Arc<Mutex<HashMap<(String, String), u64>>>,
+    persistent_in_flight: Arc<Mutex<HashMap<(String, String), PendingRead>>>,
     network_in_flight: Arc<Mutex<HashSet<String>>>,
     revalidated: Arc<Mutex<indexmap::IndexSet<String>>>,
     failed_cooldowns: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
@@ -289,13 +311,21 @@ impl AvatarManager {
                 .persistent_in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            if let Some(read) = p_flight.get(&(jid.clone(), key.clone())) {
+                if priority == DemandPriority::High {
+                    read.priority.store(true, Ordering::Relaxed);
+                }
+                return;
+            }
             if p_flight.len() >= MAX_PERSISTENT_READS {
                 return;
             }
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 p_flight.entry((jid.clone(), key.clone()))
             {
-                entry.insert(op_token);
+                let reservation = PendingRead::new(op_token, priority);
+                let decode_priority = reservation.priority.clone();
+                entry.insert(reservation);
                 let key_clone = key.clone();
                 let jid_clone = jid.clone();
                 let pic_id = chat.picture_id.clone();
@@ -319,7 +349,8 @@ impl AvatarManager {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .get(&read_key)
-                        != Some(&op_token)
+                        .map(|read| read.token)
+                        != Some(op_token)
                     {
                         return;
                     }
@@ -331,7 +362,7 @@ impl AvatarManager {
                         let mut p = persistent_in_flight
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        if p.get(&read_key) == Some(&op_token) {
+                        if p.get(&read_key).map(|read| read.token) == Some(op_token) {
                             p.remove(&read_key);
                         }
                         return;
@@ -345,13 +376,13 @@ impl AvatarManager {
                             let key = read_key.clone();
                             move || {
                                 let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
-                                pending.get(&key) == Some(&op_token)
+                                pending.get(&key).map(|read| read.token) == Some(op_token)
                                     && generation.load(Ordering::Relaxed) == born_gen
                                     && *account.lock().unwrap_or_else(|e| e.into_inner())
                                         == born_account
                             }
                         };
-                        let decoded = imp::decode_avatar(bytes, priority, current).await;
+                        let decoded = imp::decode_avatar(bytes, decode_priority, current).await;
                         {
                             let mut p = persistent_in_flight
                                 .lock()
@@ -360,12 +391,12 @@ impl AvatarManager {
                             // account change. Check again after the worker's
                             // await, holding the read reservation through RAM
                             // publication so retirement cannot overtake it.
-                            if p.get(&read_key) != Some(&op_token)
+                            if p.get(&read_key).map(|read| read.token) != Some(op_token)
                                 || generation.load(Ordering::Relaxed) != born_gen
                                 || *account_id.lock().unwrap_or_else(|e| e.into_inner())
                                     != born_account
                             {
-                                if p.get(&read_key) == Some(&op_token) {
+                                if p.get(&read_key).map(|read| read.token) == Some(op_token) {
                                     p.remove(&read_key);
                                 }
                                 return;
@@ -378,7 +409,7 @@ impl AvatarManager {
                             let mut p = persistent_in_flight
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            if p.get(&read_key) != Some(&op_token) {
+                            if p.get(&read_key).map(|read| read.token) != Some(op_token) {
                                 return;
                             }
                             p.remove(&read_key);
@@ -434,7 +465,7 @@ impl AvatarManager {
                             let mut p = persistent_in_flight
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            if p.get(&read_key) == Some(&op_token) {
+                            if p.get(&read_key).map(|read| read.token) == Some(op_token) {
                                 p.remove(&read_key);
                             }
                             return;
@@ -446,16 +477,28 @@ impl AvatarManager {
                         let mut p = persistent_in_flight
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        if p.get(&read_key) != Some(&op_token) {
+                        if p.get(&read_key).map(|read| read.token) != Some(op_token) {
                             return;
                         }
                         p.remove(&read_key);
                     }
-                    let mut n_flight = network_in_flight.lock().unwrap_or_else(|e| e.into_inner());
-                    if n_flight.len() >= MAX_PENDING_DEMANDS {
-                        return;
+                    let reserved = {
+                        let mut n_flight =
+                            network_in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                        n_flight.len() < MAX_PENDING_DEMANDS && n_flight.insert(jid_clone.clone())
+                    };
+                    // A miss also releases visible local admission. Wake the
+                    // viewport even offline, so deferred overscan can recover
+                    // without waiting for a successful network response.
+                    demand_epoch.fetch_add(1, Ordering::Relaxed);
+                    if let Some(session) = session_handle
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        session.notify_avatar_loaded();
                     }
-                    if n_flight.insert(jid_clone.clone()) {
+                    if reserved {
                         let demand = AvatarDemand {
                             jid: jid_clone,
                             known_picture_id: None,
@@ -733,6 +776,44 @@ mod tests {
             assert!(!demand.need_bytes, "disk hit needs only freshness metadata");
             assert_eq!(demand.known_picture_id, chat.picture_id);
 
+            // Offline failures in visible local recovery must release and
+            // advance admission so valid overscan hits can still load.
+            for corrupt in [false, true] {
+                clear_image_sources();
+                let missing = ChatDemand {
+                    jid: "offline-miss@example.invalid".into(),
+                    picture_id: Some("missing-picture".into()),
+                    cache_key: Some("avatar-offline-miss".into()),
+                };
+                let missing_path =
+                    oxidezap_ipc::media_path(missing.cache_key.as_ref().unwrap()).unwrap();
+                if corrupt {
+                    std::fs::write(&missing_path, b"corrupt fixture").unwrap();
+                }
+                let recovery = AvatarManager::new();
+                let epoch = recovery.demand_epoch();
+                recovery.demand_chats_windowed(
+                    std::slice::from_ref(&missing),
+                    std::slice::from_ref(&chat),
+                );
+                assert!(next(&recovery).await.need_bytes);
+                assert_ne!(
+                    recovery.demand_epoch(),
+                    epoch,
+                    "failed reads must invalidate the demand fingerprint"
+                );
+                recovery.demand_chats_windowed(
+                    std::slice::from_ref(&missing),
+                    std::slice::from_ref(&chat),
+                );
+                assert!(
+                    !next(&recovery).await.need_bytes,
+                    "offline overscan must recover from disk"
+                );
+                assert!(get_avatar_image(key).is_some());
+                assert!(!missing_path.exists());
+            }
+
             let freshness = AvatarManager::new();
             freshness.demand_chats_windowed(&[], std::slice::from_ref(&chat));
             assert!(freshness.is_revalidated(&chat.jid));
@@ -829,7 +910,7 @@ mod tests {
                     let release = release.clone();
                     let started = started.clone();
                     blockers.push(smol::spawn(native::decode_work(
-                        DemandPriority::High,
+                        decode_priority(DemandPriority::High),
                         move || {
                             started.send(()).unwrap();
                             while !release.load(std::sync::atomic::Ordering::Relaxed) {
@@ -844,12 +925,32 @@ mod tests {
                         .unwrap();
                 }
                 let retired = AvatarManager::new();
-                retired.demand_chats_windowed(&chats[..1], &chats[1..2]);
+                let reads = native::PERSISTENT_READS.load(std::sync::atomic::Ordering::Relaxed);
+                if retirement == "replacement" {
+                    retired.demand_one(&chats[0], DemandPriority::Low);
+                } else {
+                    retired.demand_chats_windowed(&chats[..1], &chats[1..2]);
+                }
                 let deadline = Instant::now() + std::time::Duration::from_secs(5);
                 while native::queued_decodes() == 0 {
                     assert!(Instant::now() < deadline);
                     crate::platform::sleep(std::time::Duration::from_millis(1)).await;
                 }
+                retired.demand_chat(&chats[0]);
+                assert_eq!(
+                    native::PERSISTENT_READS.load(std::sync::atomic::Ordering::Relaxed),
+                    reads + 1,
+                    "promotion must not reread disk"
+                );
+                assert!(
+                    retired
+                        .persistent_in_flight
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .all(|read| read.priority.load(Ordering::Relaxed)),
+                    "visible demand must promote queued recovery"
+                );
                 assert!(
                     !retired.is_in_flight(&chats[1].jid),
                     "overscan must wait for visible local recovery"
@@ -1032,8 +1133,14 @@ mod tests {
         for key in ["new-picture", ""] {
             let manager = AvatarManager::new();
             let mut pending = manager.persistent_in_flight.lock().unwrap();
-            pending.insert(("peer@example.invalid".into(), "old-picture".into()), 1);
-            pending.insert(("other@example.invalid".into(), "other-picture".into()), 2);
+            pending.insert(
+                ("peer@example.invalid".into(), "old-picture".into()),
+                PendingRead::new(1, DemandPriority::Low),
+            );
+            pending.insert(
+                ("other@example.invalid".into(), "other-picture".into()),
+                PendingRead::new(2, DemandPriority::Low),
+            );
             drop(pending);
             manager.on_avatar_ready("peer@example.invalid", key);
             let pending = manager.persistent_in_flight.lock().unwrap();
