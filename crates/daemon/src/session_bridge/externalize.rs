@@ -64,6 +64,8 @@ fn cache_media(
     media: &mut Option<MediaContent>,
 ) {
     let Some(media) = media else { return };
+    media.cache_key = None;
+    media.preview_cache_key = None;
     let local_key = local_media_key(message_id, media);
     let key = account_media.key(&local_key);
 
@@ -90,6 +92,17 @@ fn cache_media(
             && account_media.has(&by_content)
         {
             media.cache_key = Some(by_content);
+            return;
+        }
+        // Inline bytes also cross the process boundary, under an identity
+        // that can never satisfy a full-media lookup. Oversized inline data
+        // stays a download placeholder rather than consuming a frame budget.
+        if media.data_is_preview && !media.data.is_empty() && media.data.len() <= 256 * 1024 {
+            let preview_key = format!("d-preview-{local_key}");
+            match account_media.put_since(cache_epoch, &preview_key, &media.data) {
+                Ok(key) => media.preview_cache_key = Some(key),
+                Err(e) => log::warn!("could not transfer inline media preview: {e}"),
+            }
         }
         return;
     }
@@ -122,6 +135,45 @@ fn local_media_key(message_id: &str, media: &MediaContent) -> String {
 mod tests {
     use super::*;
     use oxidezap_core::DownloadableMedia;
+
+    #[test]
+    fn an_inline_channel_fallback_crosses_the_wire_without_poisoning_the_original() {
+        let cache = AccountMedia::new(oxidezap_core::AccountId::new(731).unwrap());
+        let mut hash = vec![0x7b; 32];
+        hash[..4].copy_from_slice(&std::process::id().to_be_bytes());
+        let dl: DownloadableMedia = serde_json::from_value(serde_json::json!({
+            "direct_path":"/v/channel-preview", "media_key":[], "file_enc_sha256":[],
+            "file_sha256":hash, "file_length":1024, "mime_type":"image/webp",
+            "duration_secs":null, "download_type":"image"
+        }))
+        .unwrap();
+        let original =
+            MediaContent::image(std::sync::Arc::new(vec![1, 2]), "image/jpeg".into(), true)
+                .with_download(Some(dl));
+        let full_local = local_media_key("42", &original);
+        let full_key = cache.key(&full_local);
+        let mut fallback = Some(original.clone());
+        cache_media(&cache, cache.epoch(), "42", &mut fallback);
+        let sent = fallback.as_ref().unwrap();
+        let preview_key = sent.preview_cache_key.as_ref().expect("preview transfer");
+        assert!(cache.has(preview_key));
+        assert!(!cache.has(&full_key), "thumbnail is never the original");
+        assert!(sent.cache_key.is_none());
+        let decoded: MediaContent =
+            serde_json::from_str(&serde_json::to_string(sent).unwrap()).unwrap();
+        assert!(decoded.data.is_empty());
+        assert!(decoded.data_is_preview);
+        assert_eq!(decoded.preview_cache_key.as_ref(), Some(preview_key));
+        cache.put_owned(&full_local, vec![9, 8, 7]).unwrap();
+        let mut hydrated = Some(original);
+        cache_media(&cache, cache.epoch(), "42", &mut hydrated);
+        let full = hydrated.unwrap();
+        assert_eq!(full.cache_key.as_ref(), Some(&full_key));
+        assert!(
+            full.preview_cache_key.is_none(),
+            "cached original takes precedence"
+        );
+    }
 
     #[test]
     fn channel_previews_bypass_old_message_thumbnail_cache_entries() {

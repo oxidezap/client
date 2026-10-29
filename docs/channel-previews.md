@@ -13,7 +13,9 @@ preference or metered-network policy; these bounds do not emulate such controls.
 
 Web preserves metadata and manual downloads. Automatic fetching is disabled:
 its buffered HTTP adapter cannot enforce the SDK's synchronous streaming budget.
-Full channel images use the account-scoped content hash, bypassing old
+Inline bytes cross the wire under a separate preview cache reference; loading
+them preserves their preview flag and MIME type. Full channel images use the
+account-scoped content hash, bypassing old
 `f-<message>` entries that may contain inline thumbnails. No recompression or
 upscaling is added. Session/logout guards reject late completions.
 
@@ -32,7 +34,8 @@ before AST extraction; duplicate module bodies were identical. Offsets are bytes
 | `WAWebParseImageMessageProto` | `09d91f…b871b8`, 344242–347609 | Preserves original media and separate server-thumbnail metadata. |
 | `WAWebMediaMessageGetValidatedProperties` | Same, 337063–340702 | Newsletter media does not require E2EE keys; SHA-256 remains validated. |
 | `WAWebMediaUrlAllowlist` | Same, 326506–327138 | HTTPS, `whatsapp.net` or its subdomains. |
-| `useWAWebMsgDownloadMedia` | `36dc12…717`, 563446–565504 | Full-media fetch on render checks cache, photo preferences and suspension; passes `downloadEvenIfExpensive:false`. |
+| `useWAWebMsgDownloadMedia` | `36dc12…717`, 563446–565504 | Full-media fetch on render checks cache, photo preferences and suspension. |
+| `WAWebMediaMmsV4Download` | `f588ee…c4690`, 1919619–1937869 | `downloadEvenIfExpensive` enables phone RMR when no download entry exists; it is not evidence of a metered-network check. |
 | `WAWebMediaDownloadMmsThumbnail` | `f588ee…c4690`, 1902352–1908535 | Separate server thumbnail can replace the inline fallback. |
 
 Fetching a small original is an application choice, not a necessary official

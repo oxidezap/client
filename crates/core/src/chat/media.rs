@@ -175,7 +175,8 @@ pub struct MediaContent {
     /// Never serialized. For an image this is the whole photo, and a megabyte
     /// of it has no business inside a newline-delimited JSON frame; a front
     /// end in another process reads it out of the daemon's media cache under
-    /// [`cache_key`](Self::cache_key) instead. Skipping it here rather than
+    /// [`cache_key`](Self::cache_key) or [`preview_cache_key`](Self::preview_cache_key)
+    /// instead. Skipping it here rather than
     /// remembering not to send it is what makes that mechanical.
     ///
     /// It is also the one exception to the rule the rest of these fields keep
@@ -192,6 +193,10 @@ pub struct MediaContent {
     /// `None` in the process that already has the bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_key: Option<String>,
+    /// Cache reference to inline fallback bytes, never to the original file.
+    /// Separate so old readers cannot mistake a thumbnail for full media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_cache_key: Option<String>,
     /// MIME type of the display data (may differ from downloadable media)
     pub mime_type: String,
     /// Width in pixels (if known)
@@ -247,6 +252,7 @@ impl MediaContent {
             media_type,
             data,
             cache_key: None,
+            preview_cache_key: None,
             mime_type,
             width: None,
             height: None,
@@ -401,6 +407,7 @@ impl MediaContent {
     pub fn adopt_full_bytes(&mut self, bytes: Arc<Vec<u8>>) {
         self.data = bytes;
         self.data_is_preview = false;
+        self.preview_cache_key = None;
         if let Some(downloadable) = &self.downloadable {
             self.mime_type = downloadable.mime_type.clone();
         }

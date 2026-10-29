@@ -297,6 +297,7 @@ pub fn render_message_bubble(
                                         is_playing,
                                         entity.clone(),
                                         MediaProps {
+                                            chat_jid: props.chat_jid.clone(),
                                             video_player_state: props.video_player_state,
                                             video_frame: props.video_frame.clone(),
                                             decoded_image: props.decoded_image.clone(),

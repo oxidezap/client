@@ -589,7 +589,9 @@ impl WhatsAppApp {
         // that has arrived is drawn and there is nothing else to do.
         let needs_bytes = media.data.is_empty() || media.data_is_preview;
         match media.media_type {
-            MediaType::Image if needs_bytes => self.download_image(message_id, downloadable, cx),
+            MediaType::Image if needs_bytes => {
+                self.download_image(STATUS_BROADCAST_JID.into(), message_id, downloadable, cx)
+            }
             MediaType::Image => {}
             // A video needs a *player*, and that is a different thing from
             // needing bytes: `toggle_video` downloads when it must and starts

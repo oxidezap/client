@@ -826,11 +826,12 @@ impl WhatsAppApp {
     /// cached bytes just render).
     pub fn download_image(
         &mut self,
+        chat_jid: String,
         message_id: String,
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        self.fetch_image(message_id, downloadable, true, None, cx);
+        self.fetch_image(message_id, downloadable, true, Some(chat_jid), cx);
     }
 
     fn fetch_image(
