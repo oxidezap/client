@@ -1110,7 +1110,7 @@ mod tests {
                         false,
                         self.app.clone(),
                         super::MediaProps {
-                            chat_jid: oxidezap_core::fixtures::PEER.into(),
+                            chat_jid: "synthetic-sticker-chat@chat.invalid".into(),
                             video_player_state: None,
                             video_frame: None,
                             decoded_image: self.cached.clone(),
