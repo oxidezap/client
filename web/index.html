@@ -37,16 +37,12 @@
          own generated glue, and it is here because the alternative is a
          header we have no way to send.
 
-         It is declared before the module. Trunk.toml keeps the generated
-         preloads in an inert template and imports the glue only when this
-         document is isolated, so the first visit registers and reloads
-         without starting a WASM download it would have to abandon. On an
-         isolated page the preloads are activated during parsing, before the
-         module starts. This also works when the host sends the headers
-         itself and no service worker is needed. If setup fails or service
-         workers are unavailable, the loader continues with the existing
-         main-thread fallback. A stalled installation is bounded to ten
-         seconds before trying that fallback. -->
+         It is declared *before* the module, and that ordering is about
+         the first visit: registering and reloading is how the headers arrive,
+         and a reload that lands after the preload has begun throws away
+         however much of a twenty-megabyte module the browser had got. The
+         registration is asynchronous, so this narrows the window rather
+         than closing it — but the other order guarantees the waste. -->
     <link data-trunk rel="copy-file" href="coi-serviceworker.js" />
     <script src="coi-serviceworker.js"></script>
 

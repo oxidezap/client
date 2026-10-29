@@ -157,22 +157,6 @@ if (typeof window === "undefined") {
     // is past the bound is a console error rather than another navigation.
     const RELOADED = "coi-serviceworker:reloaded";
 
-    // The loader waits while this document is about to be replaced. If
-    // isolation is unavailable, retain the original main-thread fallback.
-    // A missing script also remains compatible: awaiting an undefined
-    // property in Trunk's loader continues immediately.
-    let startApplication;
-    window.oxidezapIsolationReady = new Promise((resolve) => {
-        startApplication = resolve;
-    });
-    // The initial document can enter the back/forward cache during the
-    // isolation reload. If restored later, its unresolved loader must be
-    // allowed to use the existing main-thread fallback rather than waiting
-    // for a takeover that already happened in a different document.
-    window.addEventListener("pageshow", (event) => {
-        if (event.persisted) startApplication();
-    });
-
     // `sessionStorage` is per tab and survives a reload, which is exactly the
     // scope the bound wants. A browser may refuse it (a privacy mode, a
     // blocked storage context), and a refusal must not be read as "not yet
@@ -187,7 +171,6 @@ if (typeof window === "undefined") {
     };
 
     if (window.crossOriginIsolated) {
-        startApplication();
         // Isolated: either this worker is serving us or the host set the
         // headers itself. Spend the mark, so that a later load which is
         // somehow not isolated — the registration removed by hand, a browser
@@ -205,36 +188,24 @@ if (typeof window === "undefined") {
                 "cannot be cross-origin isolated. Serve it over HTTPS or " +
                 "from localhost.",
         );
-        startApplication();
     } else if (!navigator.serviceWorker) {
         console.error(
             "coi-serviceworker: this browser has no service workers, so " +
-                "the window will use its main-thread fallback.",
+                "the window cannot start its background executor.",
         );
-        startApplication();
     } else if (alreadyReloaded()) {
         // We have been here already in this tab, and came back without the
         // headers. Reloading again would only ask the same question, so the
-        // loop stops here and the main-thread fallback can try starting.
+        // loop stops here and says what it knows: everything below needs a
+        // `SharedArrayBuffer`, and there will not be one.
         console.error(
             "coi-serviceworker: this page reloaded to pick up cross-origin " +
-                "isolation and is still not isolated. Trying the main-thread " +
-                "fallback. Check that the service worker is controlling this " +
+                "isolation and is still not isolated. The window will not " +
+                "start. Check that the service worker is controlling this " +
                 "page (Application → Service Workers) and that nothing " +
                 "is stripping COOP/COEP from its responses.",
         );
-        startApplication();
     } else {
-        // Do not let an installation that never settles prevent the existing
-        // main-thread fallback from starting. A completed reload destroys this
-        // document and its timer. A late takeover can still reload after
-        // fallback starts, as it could before the loader waited for setup.
-        const startupDeadline = window.setTimeout(() => {
-            console.warn("coi-serviceworker: setup timed out; trying the main-thread fallback");
-            startApplication();
-        }, 10000);
-        window.oxidezapIsolationReady.then(() => window.clearTimeout(startupDeadline));
-
         // One reload, whichever of the two paths below asks for it first. A
         // `location.reload()` does not stop this script — the document is
         // torn down at the browser's convenience — so an unguarded call is a
@@ -284,15 +255,10 @@ if (typeof window === "undefined") {
                 // and no `controllerchange` is coming for us.
                 if (registration.active && !navigator.serviceWorker.controller) {
                     reloadOnce();
-                } else if (registration.active && !reloading) {
-                    // Already controlled but still not isolated. No takeover
-                    // is pending, so preserve the previous fallback immediately.
-                    startApplication();
                 }
             })
-            .catch((error) => {
-                console.error("coi-serviceworker: registration failed:", error);
-                startApplication();
-            });
+            .catch((error) =>
+                console.error("coi-serviceworker: registration failed:", error),
+            );
     }
 }
