@@ -101,7 +101,11 @@ pub fn render_status_list(
                 .flex_1()
                 .min_h_0()
                 .relative()
-                .child(render_rows(props, entity, layout, cx))
+                .child(StatusRows {
+                    props,
+                    entity,
+                    layout,
+                })
                 // Like both other lists: the bar belongs to whatever scrolls,
                 // and it paints over the bounds its handle reports rather than
                 // over the element it was hung from — so the overlay only has
@@ -116,12 +120,35 @@ pub fn render_status_list(
         )
 }
 
+#[derive(IntoElement)]
+struct StatusRows {
+    props: StatusListProps,
+    entity: Entity<WhatsAppApp>,
+    layout: ResponsiveLayout,
+}
+
+impl gpui::RenderOnce for StatusRows {
+    fn render(self, window: &mut gpui::Window, cx: &mut App) -> impl IntoElement {
+        // GPUI's Tab order comes from mounted buttons. Keep every contact
+        // mounted during keyboard navigation so offscreen contacts remain
+        // reachable, as in the original eager list.
+        render_rows(
+            self.props,
+            self.entity,
+            self.layout,
+            window.last_input_was_keyboard(),
+            cx,
+        )
+    }
+}
+
 /// The header rows scroll with the contacts, but only visible contacts build
 /// buttons, formatted subtitles and avatar rings.
 fn render_rows(
     props: StatusListProps,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
+    keyboard: bool,
     cx: &App,
 ) -> gpui::AnyElement {
     let metrics = *layout.metrics();
@@ -132,7 +159,9 @@ fn render_rows(
         + metrics.space_sm()
         + metrics.space_lg() * 2.
         + section_height(metrics);
-    if authors == 0 || content_height <= layout.viewport().height - metrics.sidebar_header_height()
+    if keyboard
+        || authors == 0
+        || content_height <= layout.viewport().height - metrics.sidebar_header_height()
     {
         return div()
             .id("status-list")
@@ -145,7 +174,7 @@ fn render_rows(
                     .flex_col()
                     .px(metrics.space_md())
                     .pb(metrics.space_lg())
-                    .child(render_mine(&props, entity.clone(), layout, cx))
+                    .child(render_mine(&props, entity.clone(), layout, false, cx))
                     .children(render_recent(&props, entity, layout, cx)),
             )
             .into_any_element();
@@ -157,7 +186,8 @@ fn render_rows(
         range
             .map(|ix| {
                 let row = match ix {
-                    0 => render_mine(&props, rows_entity.clone(), layout, cx).into_any_element(),
+                    0 => render_mine(&props, rows_entity.clone(), layout, true, cx)
+                        .into_any_element(),
                     1 => section_label("Recent", metrics, cx).into_any_element(),
                     _ => {
                         let author = &props.feed.authors()[ix - 2];
@@ -241,6 +271,7 @@ fn render_mine(
     props: &StatusListProps,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
+    bounded: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
@@ -269,7 +300,13 @@ fn render_mine(
                 cx,
             )
             .into_any_element(),
-            None => render_placeholder_row(subtitle, metrics, cx).into_any_element(),
+            None => render_placeholder_row(
+                subtitle,
+                metrics,
+                bounded.then(|| layout.chat_item_height()),
+                cx,
+            )
+            .into_any_element(),
         })
 }
 
@@ -411,9 +448,12 @@ fn render_author_row(
 fn render_placeholder_row(
     subtitle: SharedString,
     metrics: Metrics,
+    row_height: Option<Pixels>,
     cx: &App,
 ) -> impl IntoElement + use<> {
     div()
+        .debug_selector(|| "status-placeholder".into())
+        .when_some(row_height, |el, height| el.h(height).overflow_hidden())
         .w_full()
         .flex()
         .items_center()
@@ -433,6 +473,9 @@ fn render_placeholder_row(
                 .gap(metrics.space_xs())
                 .child(
                     div()
+                        .when(row_height.is_some(), |el| {
+                            el.whitespace_nowrap().overflow_hidden().text_ellipsis()
+                        })
                         .text_size(metrics.text_body())
                         .text_color(cx.theme().foreground)
                         .font_weight(gpui::FontWeight::MEDIUM)
@@ -440,6 +483,9 @@ fn render_placeholder_row(
                 )
                 .child(
                     div()
+                        .when(row_height.is_some(), |el| {
+                            el.whitespace_nowrap().overflow_hidden().text_ellipsis()
+                        })
                         .text_size(metrics.text_small())
                         .text_color(parts::subtle(cx))
                         .child(subtitle),
@@ -541,6 +587,42 @@ mod visible_cost {
                 layout,
                 cx,
             )
+        }
+    }
+
+    struct PlaceholderPane(Metrics);
+    impl Render for PlaceholderPane {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            render_placeholder_row(
+                "Posting is not available yet".into(),
+                self.0,
+                Some(self.0.chat_row_height()),
+                cx,
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn narrow_placeholder_stays_inside_the_virtual_row(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        for density in crate::theme::metrics::Density::ALL {
+            let metrics = Metrics::new(24., density);
+            let (_, visual) = cx.add_window_view(|_, _| PlaceholderPane(metrics));
+            visual.simulate_resize(size(px(120.), px(400.)));
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+            let actual = visual
+                .debug_bounds("status-placeholder")
+                .unwrap()
+                .size
+                .height;
+            let expected = metrics.chat_row_height();
+            // GPUI snaps fractional layout dimensions to device pixels.
+            assert!(actual >= expected - px(0.5) && actual <= expected + px(0.5));
         }
     }
 
@@ -661,5 +743,41 @@ mod visible_cost {
                 rows / 20
             );
         }
+    }
+    #[gpui::test]
+    fn status_keyboard_navigation_reaches_all_contacts(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut chat = oxidezap_core::Chat::new("status@broadcast".into());
+        for n in 0..100 {
+            chat.messages.push(oxidezap_core::ChatMessage::new_incoming(
+                format!("S-{n}"),
+                format!("contact-{n}@s.whatsapp.net"),
+                "Synthetic update".into(),
+            ));
+        }
+        let feed = StatusFeed::from_chat(&chat);
+        let window = cx.open_window(size(px(320.), px(600.)), |_, cx| Pane {
+            feed,
+            app: cx.new(WhatsAppApp::new),
+            scroll: gpui::ScrollHandle::new(),
+        });
+        cx.run_until_parked();
+        let mut seen = std::collections::HashSet::new();
+        cx.simulate_keystrokes(window.into(), "tab");
+        for _ in 0..105 {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                window.focus_next(cx);
+                if let Some(handle) = window.focused(cx) {
+                    seen.insert(format!("{handle:?}"));
+                }
+            })
+            .unwrap();
+        }
+        assert_eq!(seen.len(), 100, "Tab must reach offscreen contacts");
     }
 }
