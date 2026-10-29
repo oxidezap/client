@@ -30,8 +30,11 @@ static ACTIVE_ACCOUNT: RwLock<Option<oxidezap_core::AccountId>> = RwLock::new(No
 pub(super) async fn decode_avatar(
     bytes: Vec<u8>,
     _priority: super::DemandPriority,
+    current: impl FnOnce() -> bool + Send + 'static,
 ) -> Option<(std::sync::Arc<gpui::RenderImage>, u64)> {
-    crate::session::media::decode_avatar(&bytes)
+    current()
+        .then(|| crate::session::media::decode_avatar(&bytes))
+        .flatten()
 }
 
 pub fn set_active_account(account: Option<oxidezap_core::AccountId>) {

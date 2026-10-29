@@ -14,6 +14,9 @@ pub(super) static PERSISTENT_READS: std::sync::atomic::AtomicU64 =
 #[cfg(test)]
 pub(super) static DECODE_COMPLETED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(super) static DECODE_PERFORMED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 pub fn set_active_account(account: Option<oxidezap_core::AccountId>) {
     if let Ok(mut lock) = ACTIVE_ACCOUNT.write() {
@@ -76,8 +79,14 @@ static DECODE_JOBS: std::sync::LazyLock<DecodeQueues> = std::sync::LazyLock::new
 pub(super) async fn decode_avatar(
     bytes: Vec<u8>,
     priority: super::DemandPriority,
+    current: impl FnOnce() -> bool + Send + 'static,
 ) -> Option<(std::sync::Arc<gpui::RenderImage>, u64)> {
     decode_work(priority, move || {
+        if !current() {
+            return None;
+        }
+        #[cfg(test)]
+        DECODE_PERFORMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::session::media::decode_avatar(&bytes)
     })
     .await

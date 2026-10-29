@@ -338,7 +338,20 @@ impl AvatarManager {
                     }
 
                     if let Some(bytes) = persistent_bytes {
-                        let decoded = imp::decode_avatar(bytes, priority).await;
+                        let current = {
+                            let pending = persistent_in_flight.clone();
+                            let generation = generation.clone();
+                            let account = account_id.clone();
+                            let key = read_key.clone();
+                            move || {
+                                let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                                pending.get(&key) == Some(&op_token)
+                                    && generation.load(Ordering::Relaxed) == born_gen
+                                    && *account.lock().unwrap_or_else(|e| e.into_inner())
+                                        == born_account
+                            }
+                        };
+                        let decoded = imp::decode_avatar(bytes, priority, current).await;
                         {
                             let mut p = persistent_in_flight
                                 .lock()
@@ -811,6 +824,7 @@ mod tests {
                 let (started, receiving) = std::sync::mpsc::channel();
                 let mut blockers = Vec::new();
                 let completed = native::DECODE_COMPLETED.load(std::sync::atomic::Ordering::Relaxed);
+                let performed = native::DECODE_PERFORMED.load(std::sync::atomic::Ordering::Relaxed);
                 for _ in 0..2 {
                     let release = release.clone();
                     let started = started.clone();
@@ -861,6 +875,11 @@ mod tests {
                     "late decode survived {retirement}"
                 );
                 assert!(retired.take_demands().is_empty());
+                assert_eq!(
+                    native::DECODE_PERFORMED.load(std::sync::atomic::Ordering::Relaxed),
+                    performed,
+                    "retired queued work must skip decoding after {retirement}"
+                );
             }
         });
     }
