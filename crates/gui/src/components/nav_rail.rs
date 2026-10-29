@@ -1,12 +1,10 @@
 //! The window's destinations.
 //!
-//! Two of them today, Chats and Status, and the rail exists because Status is
-//! not a conversation: it has no other party and nothing is sent to it, so
-//! putting it in the list of people to talk to made it read as one.
+//! Chats, Status, Channels and Communities share the same navigation on both targets.
 //!
 //! One list of destinations, drawn along whichever axis there is room for: a
 //! strip down the side of a window, a bar across the foot of a phone. The
-//! alternative — two functions — is two places to add the third destination.
+//! axis follows the responsive layout.
 
 use gpui::prelude::*;
 use gpui::{App, Entity, IntoElement, ParentElement, Styled, div};
@@ -21,8 +19,7 @@ use crate::theme::Metrics;
 
 pub fn render_nav_rail(
     current: Destination,
-    unread_chats: usize,
-    unseen_status: usize,
+    unread: [usize; 4],
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
@@ -41,6 +38,7 @@ pub fn render_nav_rail(
     let thickness = target + metrics.space_lg();
 
     let base = div()
+        .tab_group()
         .flex_shrink_0()
         .flex()
         .items_center()
@@ -67,21 +65,22 @@ pub fn render_nav_rail(
             .border_r_1()
     };
 
-    base.children(Destination::ALL.into_iter().map(|destination| {
-        let badge = match destination {
-            Destination::Chats => unread_chats,
-            Destination::Status => unseen_status,
-        };
-        render_destination(
-            destination,
-            destination == current,
-            badge,
-            target,
-            entity.clone(),
-            metrics,
-            cx,
-        )
-    }))
+    base.children(
+        Destination::ALL
+            .into_iter()
+            .zip(unread)
+            .map(|(destination, badge)| {
+                render_destination(
+                    destination,
+                    destination == current,
+                    badge,
+                    target,
+                    entity.clone(),
+                    metrics,
+                    cx,
+                )
+            }),
+    )
 }
 
 /// One destination. It selects where the window is, the way a chat row selects
@@ -102,15 +101,22 @@ fn render_destination(
     let icon: Icon = match destination {
         Destination::Chats => crate::components::ProductIcon::MessageSquare.into(),
         Destination::Status => crate::components::ProductIcon::CircleDashed.into(),
+        Destination::Channels => crate::components::ProductIcon::Channels.into(),
+        Destination::Communities => crate::components::ProductIcon::Users.into(),
     };
 
-    // A `Button`, not a styled `div`: this is the only route to Status, so a
+    // A `Button`: destinations need keyboard activation and a focus ring.
+    // This is the only route to each list, so a
     // pointer-only rail would put a whole destination out of reach of the
     // keyboard — and the focus ring the theme defines is drawn by the
     // library's controls, not by anything hand-rolled.
     Button::new(destination.id())
         .ghost()
         .selected(is_current)
+        .toggled(is_current)
+        .accessibility_id(destination.id())
+        .accessibility_label(destination.label())
+        .debug_selector(move || destination.id().into())
         .relative()
         .size(target)
         .flex()
@@ -120,8 +126,8 @@ fn render_destination(
         .tooltip(destination.label())
         .when(is_current, |el| el.bg(cx.theme().list_active))
         .cursor_pointer()
-        .on_click(move |_, _window, cx| {
-            entity.update(cx, |app, cx| app.set_destination(destination, cx));
+        .on_click(move |_, window, cx| {
+            entity.update(cx, |app, cx| app.set_destination(destination, window, cx));
         })
         .child(icon.size(metrics.icon()).text_color(if is_current {
             cx.theme().foreground
@@ -137,7 +143,9 @@ fn render_destination(
                     .top(metrics.space_xs())
                     .right(metrics.space_xs())
                     .min_w(metrics.space_lg())
-                    .h(metrics.space_lg())
+                    .min_h(metrics.space_lg())
+                    .py(metrics.space_xxs())
+                    .line_height(gpui::relative(1.0))
                     .px(metrics.space_xxs())
                     .flex()
                     .items_center()

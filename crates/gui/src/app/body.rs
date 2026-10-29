@@ -417,6 +417,161 @@ pub(super) mod tests {
         (cx, app)
     }
 
+    #[gpui::test]
+    fn destination_switches_preserve_selection_and_never_expose_another_tabs_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let mut channel = Chat::new("channel@newsletter".into());
+                channel.unread_count = 7;
+                app.chats.push(Arc::new(channel));
+                let mut parent = Chat::new("community@g.us".into());
+                parent.is_group = true;
+                parent.group_hierarchy = Some(oxidezap_core::GroupHierarchy::Community);
+                app.chats.push(Arc::new(parent));
+                let mut child = Chat::new("child@g.us".into());
+                child.is_group = true;
+                child.group_hierarchy = Some(oxidezap_core::GroupHierarchy::Subgroup {
+                    parent_jid: "community@g.us".into(),
+                    kind: oxidezap_core::SubgroupKind::Regular,
+                });
+                app.chats.push(Arc::new(child));
+                app.invalidate_chat_cache();
+                assert_eq!(app.get_chat_list_cache(cx).rows.len(), 2);
+                app.set_chat_filter(ChatFilter::Groups, cx);
+                app.set_destination(Destination::Channels, window, cx);
+                assert_eq!(app.selected_destination_jid(), None);
+                assert_eq!(
+                    app.get_chat_list_cache(cx).rows[0].jid,
+                    "channel@newsletter"
+                );
+                assert_eq!(
+                    app.get_chat_list_cache(cx).rows.len(),
+                    1,
+                    "chat chips do not narrow Channels"
+                );
+                app.select_chat("channel@newsletter".into(), ChatOpen::ToPreview, window, cx);
+                for _ in 0..3 {
+                    app.set_destination(Destination::Communities, window, cx);
+                    assert_eq!(app.selected_destination_jid(), None);
+                    assert_eq!(app.get_chat_list_cache(cx).rows.len(), 2);
+                    assert_eq!(
+                        app.chat_list_selection_jid(&app.get_chat_list_cache(cx)),
+                        None
+                    );
+                    app.toggle_community("community@g.us", cx);
+                    assert_eq!(app.get_chat_list_cache(cx).rows.len(), 1);
+                    app.toggle_community("community@g.us", cx);
+                    app.set_destination(Destination::Chats, window, cx);
+                    assert_eq!(
+                        app.selected_destination_jid().as_deref(),
+                        Some("peer@example.invalid")
+                    );
+                    assert_eq!(app.chat_filter(), ChatFilter::Groups);
+                    app.set_destination(Destination::Channels, window, cx);
+                    assert_eq!(
+                        app.selected_destination_jid().as_deref(),
+                        Some("channel@newsletter")
+                    );
+                    assert!(app.visible_panel().is_chat_list());
+                }
+                app.select_next_chat(window, cx);
+                assert_eq!(
+                    app.selected_chat_jid().as_deref(),
+                    Some("channel@newsletter")
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(720.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.navigate_back(cx);
+                assert!(app.responsive_layout(window, cx).show_sidebar());
+                app.set_destination(Destination::Communities, window, cx);
+                app.select_chat("child@g.us".into(), ChatOpen::ToCompose, window, cx);
+                assert!(app.responsive_layout(window, cx).show_chat_area());
+                app.navigate_back(cx);
+                assert!(app.responsive_layout(window, cx).show_sidebar());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn navigation_rail_buttons_are_keyboard_reachable(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let channels = cx.debug_bounds("nav-channels").expect("Channels tab");
+        cx.simulate_click(channels.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| assert_eq!(app.read(cx).destination(), Destination::Channels));
+        cx.update(|window, cx| {
+            window.blur(cx);
+            for _ in 0..6 {
+                window.focus_next(cx);
+            }
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let keystroke = gpui::Keystroke::parse("enter").unwrap();
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        cx.run_until_parked();
+        cx.read(|cx| assert_eq!(app.read(cx).destination(), Destination::Communities));
+    }
+
+    #[gpui::test]
+    fn unread_badges_fit_the_row_and_label_at_narrow_widths(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = connected_app_fixture(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let mut channel = Chat::new("channel@newsletter".into());
+                channel.name = "A channel with a title that must truncate before the badge".into();
+                channel.unread_count = u32::MAX;
+                app.chats.push(Arc::new(channel));
+                app.set_destination(Destination::Channels, window, cx);
+            });
+        });
+        for width in [1000., 320., 360., 1600.] {
+            cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(800.)));
+            cx.update(|_window, cx| app.update(cx, |_, cx| cx.notify()));
+            cx.run_until_parked();
+            let row = cx.debug_bounds("chat-row").expect("channel row");
+            let badge = cx
+                .debug_bounds("unread-channel@newsletter")
+                .expect("unread count badge");
+            let label = cx.debug_bounds("unread-label").expect("count label");
+            assert!(
+                row.contains(&badge.origin) && row.contains(&badge.bottom_right()),
+                "badge must fit inside the row at {width}"
+            );
+            assert!(
+                badge.contains(&label.origin) && badge.contains(&label.bottom_right()),
+                "label must fit inside its badge at {width}"
+            );
+            assert!(
+                badge.size.width > label.size.width,
+                "count needs horizontal padding"
+            );
+            assert!(
+                badge.size.height > label.size.height,
+                "font needs vertical padding"
+            );
+        }
+    }
+
     fn paste_preview_fixture(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {

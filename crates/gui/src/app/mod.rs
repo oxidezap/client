@@ -1002,7 +1002,7 @@ pub struct WhatsAppApp {
     mobile_panel: MobilePanel,
     /// Which conversations the sidebar is showing.
     chat_filter: ChatFilter,
-    /// JIDs of community rows the Groups list has collapsed.
+    /// JIDs of collapsed rows in Communities.
     collapsed_communities: std::collections::HashSet<String>,
     /// The message being replied to, mirrored here so the send path can
     /// attach it and the composer can show it.
@@ -1037,6 +1037,7 @@ pub struct WhatsAppApp {
     settings: Entity<settings::Settings>,
     /// Which of the sidebar's destinations is on screen.
     destination: Destination,
+    destination_selections: HashMap<&'static str, Option<String>>,
     /// Whose status updates are open, and which one of them.
     status_pane: StatusPane,
     /// The broadcast grouped by author, against the message count it was
@@ -1497,6 +1498,7 @@ impl WhatsAppApp {
             chat_list_cache: RefCell::new(None),
             chat_cache_version: std::cell::Cell::new(0),
             destination: Destination::default(),
+            destination_selections: HashMap::new(),
             status_pane: StatusPane::default(),
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
@@ -1610,7 +1612,9 @@ impl WhatsAppApp {
     /// destination the window is on.
     fn has_something_to_show(&self) -> bool {
         match self.destination {
-            Destination::Chats => self.selected_chat.is_some(),
+            Destination::Chats | Destination::Channels | Destination::Communities => {
+                self.selected_destination_jid().is_some()
+            }
             Destination::Status => self.status_pane.is_open(),
         }
     }
@@ -1669,7 +1673,14 @@ impl WhatsAppApp {
         let query = self.search.read(cx).list_query();
         let filtered: Vec<&Chat> = self
             .conversations()
-            .filter(|chat| self.chat_filter.matches(chat))
+            .filter(|chat| {
+                self.destination.matches(chat)
+                    && (if self.destination == Destination::Chats {
+                        self.chat_filter.matches(chat)
+                    } else {
+                        !chat.archived
+                    })
+            })
             .collect();
 
         let mut rows: Vec<ChatRow> = filtered
@@ -1687,7 +1698,7 @@ impl WhatsAppApp {
                 )
             })
             .collect();
-        let mut rows = if self.chat_filter == ChatFilter::Groups {
+        let mut rows = if self.destination == Destination::Communities {
             chats::hierarchical_group_rows(&rows, query, &self.collapsed_communities)
         } else {
             rows.retain(|row| {
@@ -1713,8 +1724,12 @@ impl WhatsAppApp {
     /// Counted over every chat rather than the filtered view: the number has
     /// to say what pressing `Unread` would reveal.
     pub fn unread_chat_count(&self) -> usize {
+        self.unread_destination_count(Destination::Chats)
+    }
+
+    pub fn unread_destination_count(&self, destination: Destination) -> usize {
         self.conversations()
-            .filter(|chat| ChatFilter::Unread.matches(chat))
+            .filter(|chat| destination.matches(chat) && ChatFilter::Unread.matches(chat))
             .count()
     }
 
@@ -1728,6 +1743,20 @@ impl WhatsAppApp {
             .iter()
             .map(Arc::as_ref)
             .filter(|chat| !chat.is_status)
+    }
+
+    pub fn selected_destination_jid(&self) -> Option<String> {
+        self.selected_chat
+            .as_ref()
+            .filter(|jid| {
+                self.chat_named(jid)
+                    .is_some_and(|chat| self.destination.matches(chat))
+                    && self
+                        .destination_selections
+                        .get(self.destination.id())
+                        .is_none_or(|selected| selected.as_ref() == Some(jid))
+            })
+            .cloned()
     }
 
     pub fn chat_filter(&self) -> ChatFilter {
@@ -2290,6 +2319,7 @@ impl WhatsAppApp {
         // the whole screen with no way back out of it.
         self.status_pane.close();
         self.destination = Destination::default();
+        self.destination_selections.clear();
         self.message_list_cache.borrow_mut().clear();
         self.chat_list_cache.borrow_mut().take();
         self.status_feed_cache.borrow_mut().take();
@@ -2837,6 +2867,18 @@ impl WhatsAppApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(chat) = self.chat_named(&jid)
+            && !self.destination.matches(chat)
+        {
+            let destination = if Destination::Channels.matches(chat) {
+                Destination::Channels
+            } else if Destination::Communities.matches(chat) {
+                Destination::Communities
+            } else {
+                Destination::Chats
+            };
+            self.set_destination(destination, window, cx);
+        }
         // Opening a chat by hand is the explicit user action a notification
         // permission prompt needs: on the web the startup ask runs without
         // transient activation and most browsers ignore it, so without this
@@ -2850,6 +2892,10 @@ impl WhatsAppApp {
             // Message-text selection belongs to the conversation being left,
             // not to the next list reusing the window selection layer.
             clear_window_message_selection(window, cx);
+        }
+        if self.destination.has_conversations() {
+            self.destination_selections
+                .insert(self.destination.id(), Some(jid.clone()));
         }
         self.stop_user_media();
         // Leaving a chat mid-composition: release its typing indicator now,
@@ -4417,9 +4463,9 @@ impl Render for WhatsAppApp {
         // asks nothing of the conversation underneath it; the stack draws
         // nothing at all while it is empty.
         let conversation_strip = !self.showing_settings(cx)
-            && self.destination == Destination::Chats
+            && self.destination.has_conversations()
             && self.responsive_layout(window, cx).show_chat_area()
-            && self.selected_chat_jid().is_some();
+            && self.selected_destination_jid().is_some();
         let offline_banner =
             self.offline_recovery()
                 .filter(|_| !conversation_strip)

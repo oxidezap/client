@@ -17,7 +17,8 @@ use gpui_component::{Disableable as _, Icon, IconName, Sizable as _, VirtualList
 use gpui_component::{scroll::Scrollbar, v_virtual_list};
 
 use crate::app::{
-    ChatFilter, ChatListCache, SelectDown, SelectUp, ToggleSelectedCommunity, WhatsAppApp,
+    ChatFilter, ChatListCache, Destination, SelectDown, SelectUp, ToggleSelectedCommunity,
+    WhatsAppApp,
 };
 use crate::components::parts;
 use crate::components::{EmptyState, render_chat_item};
@@ -32,6 +33,8 @@ const CHAT_LIST_CONTEXT: &str = "ChatList";
 /// function of one frame's state.
 pub struct ChatListProps<'a> {
     pub cache: ChatListCache,
+    pub destination: Destination,
+    pub loading: bool,
     pub selected_jid: Option<String>,
     pub filter: ChatFilter,
     pub unread_count: usize,
@@ -117,20 +120,27 @@ pub fn render_chat_list(
         .when(!layout.is_mobile(), |el| {
             el.border_r_1().border_color(cx.theme().border)
         })
-        .child(render_title_bar(entity.clone(), metrics, cx))
+        .child(render_title_bar(
+            props.destination,
+            entity.clone(),
+            metrics,
+            cx,
+        ))
         .children(
             props
                 .search_input
                 .cloned()
                 .map(|input| render_search(input, metrics, cx)),
         )
-        .child(render_filters(
-            props.filter,
-            props.unread_count,
-            entity.clone(),
-            metrics,
-            cx,
-        ))
+        .when(props.destination == Destination::Chats, |el| {
+            el.child(render_filters(
+                props.filter,
+                props.unread_count,
+                entity.clone(),
+                metrics,
+                cx,
+            ))
+        })
         .child(render_rows(
             &props,
             scroll_handle,
@@ -147,6 +157,7 @@ pub fn render_chat_list(
 }
 
 fn render_title_bar(
+    destination: Destination,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
@@ -166,7 +177,7 @@ fn render_title_bar(
                 .text_size(metrics.text_title())
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(cx.theme().foreground)
-                .child("Chats"),
+                .child(destination.label()),
         )
         .child(
             div()
@@ -320,14 +331,18 @@ fn render_empty(
     let clear_entity = entity.clone();
     let reset_entity = entity;
 
-    let empty = if props.is_searching {
+    let empty = if props.loading {
+        EmptyState::new("Loading...")
+            .icon(IconName::Inbox)
+            .description("Fetching more conversations.")
+    } else if props.is_searching {
         EmptyState::new("No matches")
             .icon(IconName::Search)
             .description("No conversation or message matches your search.")
             .action("Clear search", move |window, cx| {
                 clear_entity.update(cx, |app, cx| app.clear_search(window, cx));
             })
-    } else if props.filter != ChatFilter::All {
+    } else if props.destination == Destination::Chats && props.filter != ChatFilter::All {
         EmptyState::new(match props.filter {
             ChatFilter::Unread => "Nothing unread",
             ChatFilter::Groups => "No groups",
@@ -340,9 +355,13 @@ fn render_empty(
             reset_entity.update(cx, |app, cx| app.set_chat_filter(ChatFilter::All, cx));
         })
     } else {
-        EmptyState::new("No chats yet")
-            .icon(IconName::Inbox)
-            .description("Conversations appear here once your phone finishes syncing.")
+        EmptyState::new(match props.destination {
+            Destination::Channels => "No channels yet",
+            Destination::Communities => "No communities yet",
+            _ => "No chats yet",
+        })
+        .icon(IconName::Inbox)
+        .description("Conversations appear here once your phone finishes syncing.")
     };
 
     div()
