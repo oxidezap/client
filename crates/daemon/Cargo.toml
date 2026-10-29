@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [features]
 test-support = ["oxidezap-session/test-support"]
+# Instrument only native test binaries; production allocators are unchanged.
+memory-profiling = []
 
 [dependencies]
 chrono = { workspace = true, features = ["std"] }
