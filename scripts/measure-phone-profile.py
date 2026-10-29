@@ -36,7 +36,7 @@ for mode in ["heap", "timing"]:
                 if pair >= 0:
                     rows.append(dict(mode=mode, case=case, pair=pair, rev=rev, **values))
 with args.output.open("w", newline="") as output:
-    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys(), lineterminator="\n")
     writer.writeheader()
     writer.writerows(rows)
 for mode in ["heap", "timing"]:
