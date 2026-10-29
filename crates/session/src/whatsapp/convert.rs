@@ -59,12 +59,14 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
     let poll = base_message.and_then(poll_of);
     let business = base_message.and_then(oxidezap_chat_store::business_content);
     let contacts = base_message.and_then(oxidezap_chat_store::shared_contacts_text);
+    let pack = base_message.and_then(oxidezap_chat_store::sticker_pack_text);
     let content = match (&stored.text, stored.revoked) {
         (_, true) => "[Message deleted]".to_string(),
         (_, _) if business.is_some() => business
             .as_ref()
             .map(|b| b.body.clone())
             .unwrap_or_default(),
+        (_, _) if pack.is_some() => pack.unwrap_or_default(),
         (Some(text), _) => text.clone(),
         (None, _) if contacts.is_some() => contacts.unwrap_or_default(),
         (None, _) if poll.is_some() => poll
@@ -72,7 +74,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
             .map(|p| p.question.clone())
             .unwrap_or_default(),
         (None, _) if media.is_some() => String::new(),
-        (None, _) => format!("[{}]", stored.kind.as_str()),
+        (None, _) => oxidezap_chat_store::message_fallback(&stored.kind).to_owned(),
     };
     // Outgoing ticks come from the stored delivery status; incoming default
     // to read and load_history un-reads the chat's unread tail (per-incoming
@@ -271,6 +273,45 @@ pub(super) fn account_event(client: &Arc<Client>) -> UiEvent {
 mod tests {
     use super::*;
     use whatsapp_rust::buffa::MessageField;
+
+    #[test]
+    fn channel_pack_live_projection_and_legacy_reload_agree_and_revocation_erases_it() {
+        let mut pack = wa::message::StickerPackMessage::default();
+        pack.name = Some("Example animals".into());
+        pack.caption = Some("Example caption".into());
+        let mut context = wa::ContextInfo::default();
+        context.stanza_id = Some("ORIGINAL".into());
+        pack.context_info = MessageField::some(context);
+        let mut proto = wa::Message::default();
+        proto.sticker_pack_message = MessageField::some(pack);
+        let expected = super::super::live_content_fallback(&proto, false);
+        let mut row = stored_poll_creation();
+        row.chat_jid = "120363000000000001@newsletter".parse().unwrap();
+        row.kind = oxidezap_chat_store::MessageKind::Unknown;
+        row.text = None;
+        row.message = Some(Box::new(proto));
+        let rendered = stored_to_chat_message(row.clone());
+        assert_eq!(rendered.content, expected);
+        assert!(rendered.content.contains("Example caption"));
+        assert_eq!(rendered.quoted.unwrap().message_id, "ORIGINAL");
+        row.revoked = true;
+        let revoked = stored_to_chat_message(row);
+        assert_eq!(revoked.content, "[Message deleted]");
+        assert!(revoked.quoted.is_none());
+    }
+
+    #[test]
+    fn future_channel_payload_has_same_safe_fallback_live_and_after_reload() {
+        let mut row = stored_poll_creation();
+        row.chat_jid = "120363000000000001@newsletter".parse().unwrap();
+        row.kind = oxidezap_chat_store::MessageKind::Other("future-internal-label".into());
+        row.text = None;
+        row.message = None;
+        assert_eq!(
+            stored_to_chat_message(row).content,
+            oxidezap_chat_store::message_fallback(&oxidezap_chat_store::MessageKind::Unknown)
+        );
+    }
 
     pub(super) fn stored_poll_creation() -> oxidezap_chat_store::StoredMessage {
         let proto = {

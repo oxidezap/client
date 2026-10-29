@@ -767,12 +767,10 @@ fn live_content_fallback(message: &wa::Message, has_media: bool) -> String {
         return String::new();
     }
 
-    match oxidezap_chat_store::MessageKind::of(message) {
-        oxidezap_chat_store::MessageKind::Poll => "[poll]".to_string(),
-        oxidezap_chat_store::MessageKind::Album => "[album]".to_string(),
-        oxidezap_chat_store::MessageKind::Product => "[product]".to_string(),
-        _ => "[Media]".to_string(),
-    }
+    oxidezap_chat_store::sticker_pack_text(message).unwrap_or_else(|| {
+        oxidezap_chat_store::message_fallback(&oxidezap_chat_store::MessageKind::of(message))
+            .to_owned()
+    })
 }
 
 impl WhatsAppClient {
@@ -2347,6 +2345,7 @@ impl WhatsAppClient {
         let content = business
             .as_ref()
             .map(|b| b.body.clone())
+            .or_else(|| oxidezap_chat_store::sticker_pack_text(base_msg))
             .or_else(|| base_msg.text_content().map(str::to_owned))
             .or_else(|| base_msg.get_caption().map(|s| s.to_string()))
             .or_else(|| oxidezap_chat_store::shared_contacts_text(base_msg))

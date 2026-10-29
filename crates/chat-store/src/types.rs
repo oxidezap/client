@@ -18,6 +18,8 @@ pub enum MessageKind {
     /// Push-to-talk voice note ("ptt").
     VoiceNote,
     Sticker,
+    /// A downloadable pack archive, distinct from an individual sticker.
+    StickerPack,
     Document,
     Contact,
     Location,
@@ -79,6 +81,7 @@ impl MessageKind {
             Self::Audio => "audio",
             Self::VoiceNote => "ptt",
             Self::Sticker => "sticker",
+            Self::StickerPack => "sticker_pack",
             Self::Document => "document",
             Self::Contact => "contact",
             Self::Location => "location",
@@ -126,6 +129,7 @@ impl MessageKind {
             "audio" => Self::Audio,
             "ptt" => Self::VoiceNote,
             "sticker" => Self::Sticker,
+            "sticker_pack" => Self::StickerPack,
             "document" => Self::Document,
             "contact" => Self::Contact,
             "location" => Self::Location,

@@ -10,6 +10,30 @@ mod common;
 use common::*;
 
 #[tokio::test]
+async fn channel_sticker_pack_keeps_metadata_and_proto_after_storage() {
+    let (_store, chat_store) = test_store().await;
+    let channel = "120363000000000001@newsletter";
+    let mut pack = wa::message::StickerPackMessage::default();
+    pack.name = Some("Example animals".into());
+    pack.caption = Some("Example caption".into());
+    let mut proto = wa::Message::default();
+    proto.sticker_pack_message = MessageField::some(pack);
+    let expected = oxidezap_chat_store::sticker_pack_text(&proto).unwrap();
+    feed(
+        &chat_store,
+        [message_event(
+            proto.clone(),
+            incoming_info(channel, channel, "PACK", 1_700_000_000),
+        )],
+    )
+    .await;
+    let rows = chat_store.messages(&jid(channel), None, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text.as_deref(), Some(expected.as_str()));
+    assert_eq!(rows[0].message.as_deref(), Some(&proto));
+}
+
+#[tokio::test]
 async fn live_text_message_materializes_chat_and_message() {
     let (_store, chat_store) = test_store().await;
 

@@ -123,12 +123,21 @@ fn live_nonrenderable_fallback_uses_the_shared_message_kind() {
         constructed
     };
 
-    assert_eq!(super::live_content_fallback(&poll, false), "[poll]");
-    assert_eq!(super::live_content_fallback(&album, false), "[album]");
-    assert_eq!(super::live_content_fallback(&product, false), "[product]");
+    assert_eq!(
+        super::live_content_fallback(&poll, false),
+        "This poll is not supported yet. Open it in WhatsApp on your phone."
+    );
+    assert_eq!(
+        super::live_content_fallback(&album, false),
+        "Media album. Open it in WhatsApp on your phone."
+    );
+    assert_eq!(
+        super::live_content_fallback(&product, false),
+        "Product. Open it in WhatsApp on your phone."
+    );
     assert_eq!(
         super::live_content_fallback(&wa::Message::default(), false),
-        "[Media]"
+        "This message is not supported yet. Open it in WhatsApp on your phone."
     );
     assert_eq!(super::live_content_fallback(&product, true), "");
 }

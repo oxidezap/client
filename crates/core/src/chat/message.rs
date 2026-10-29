@@ -226,7 +226,11 @@ impl ChatMessage {
         // message would send the caption without the file. Failed media has
         // no resendable form here — the echo of a video holds no bytes — so
         // it offers no retry rather than a wrong one.
-        if self.business.is_none() && self.media.is_none() && !self.content.is_empty() {
+        if self.is_text
+            && self.business.is_none()
+            && self.media.is_none()
+            && !self.content.is_empty()
+        {
             return Some(Resend::Text(&self.content));
         }
         // A voice note has no text and is not therefore beyond recovery: the
@@ -304,6 +308,15 @@ pub(super) fn make_message(id: &str, timestamp_secs: i64) -> ChatMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_display_projection_is_not_sent_again_as_plain_text() {
+        let mut message =
+            ChatMessage::new_outgoing("pack".into(), "Sticker pack\nExample pack".into());
+        message.status = MessageStatus::Failed;
+        message.is_text = false;
+        assert!(message.resend().is_none());
+    }
 
     /// A message to your own number has been read by the only person who could
     /// read it, and no receipt will ever say so — the peer that would send one

@@ -41,6 +41,7 @@ pub fn quoted_from(message: &wa::Message) -> Option<QuotedMessage> {
             .and_then(|base| {
                 oxidezap_chat_store::business_content(base)
                     .map(|b| b.summary())
+                    .or_else(|| oxidezap_chat_store::sticker_pack_text(base))
                     .or_else(|| {
                         base.text_content()
                             .or_else(|| base.get_caption())
@@ -83,6 +84,7 @@ fn context_info(message: &wa::Message) -> Option<&wa::ContextInfo> {
         audio_message,
         document_message,
         sticker_message,
+        sticker_pack_message,
     )
     .or_else(|| {
         oxidezap_chat_store::business_contexts(message)

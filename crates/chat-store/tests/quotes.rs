@@ -40,6 +40,104 @@ fn live_chat(chat: &str, sender: &str, id: &str, msg: wa::Message, at_secs: i64)
     message_event(msg, incoming_info(chat, sender, id, at_secs))
 }
 
+#[tokio::test]
+async fn sticker_pack_reply_uses_current_parent_and_does_not_keep_revoked_snapshot() {
+    let (store, chat_store) = test_store().await;
+    let mut text = text_reply(
+        "unused",
+        "PACK-PARENT",
+        PEER,
+        wa::Message::text("old snapshot"),
+    );
+    let context = text
+        .extended_text_message
+        .as_option_mut()
+        .unwrap()
+        .context_info
+        .take()
+        .unwrap();
+    let mut pack = wa::message::StickerPackMessage::default();
+    pack.name = Some("Example pack".into());
+    pack.context_info = MessageField::some(context);
+    let mut reply = wa::Message::default();
+    reply.sticker_pack_message = MessageField::some(pack);
+    feed(
+        &chat_store,
+        [
+            live_chat(
+                PEER,
+                PEER,
+                "PACK-PARENT",
+                wa::Message::text("current parent"),
+                1_700_000_000,
+            ),
+            live_chat(PEER, PEER, "PACK-REPLY", reply, 1_700_000_060),
+        ],
+    )
+    .await;
+    let (bytes, codec) = stored_proto(&store, "PACK-REPLY").await;
+    assert_eq!(codec, 0);
+    let stored = waproto::codec::message_decode(&bytes.unwrap()).unwrap();
+    assert!(
+        !stored
+            .sticker_pack_message
+            .as_option()
+            .unwrap()
+            .context_info
+            .as_option()
+            .unwrap()
+            .quoted_message
+            .is_set()
+    );
+    let loaded = chat_store
+        .message(&jid(PEER), "PACK-REPLY")
+        .await
+        .unwrap()
+        .unwrap();
+    let quoted = loaded
+        .message
+        .as_deref()
+        .unwrap()
+        .sticker_pack_message
+        .as_option()
+        .unwrap()
+        .context_info
+        .as_option()
+        .unwrap()
+        .quoted_message
+        .as_option()
+        .unwrap();
+    assert_eq!(quoted.conversation.as_deref(), Some("current parent"));
+    feed(
+        &chat_store,
+        [live_chat(
+            PEER,
+            PEER,
+            "PACK-REVOKE",
+            revoke("PACK-PARENT"),
+            1_700_000_120,
+        )],
+    )
+    .await;
+    let loaded = chat_store
+        .message(&jid(PEER), "PACK-REPLY")
+        .await
+        .unwrap()
+        .unwrap();
+    let context = loaded
+        .message
+        .as_deref()
+        .unwrap()
+        .sticker_pack_message
+        .as_option()
+        .unwrap()
+        .context_info
+        .as_option()
+        .unwrap();
+    assert_eq!(context.stanza_id.as_deref(), Some("PACK-PARENT"));
+    assert!(!context.quoted_message.is_set());
+}
+
 #[derive(QueryableByName)]
 struct StoredProto {
     #[diesel(sql_type = Nullable<diesel::sql_types::Binary>)]
