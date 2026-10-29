@@ -1154,19 +1154,7 @@ fn fill_unique_after(
     let mut after = after;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
-        let rows: Vec<MessageRow> = dsl::messages
-            .filter(
-                dsl::device_id
-                    .eq(device_id)
-                    .and(dsl::chat_jid.eq_any(keys.to_vec()))
-                    .and(
-                        dsl::timestamp_ms
-                            .gt(after.timestamp_ms)
-                            .or(dsl::timestamp_ms
-                                .eq(after.timestamp_ms)
-                                .and(dsl::id.gt(after.seq))),
-                    ),
-            )
+        let rows: Vec<MessageRow> = page_query_after(device_id, keys, &after)
             .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
             .limit(wanted)
             .load(conn)
@@ -1253,6 +1241,28 @@ fn page_query<'a>(
         );
     }
     query
+}
+
+fn page_query_after<'a>(
+    device_id: i32,
+    keys: &[String],
+    after: &MessageCursor,
+) -> schema::messages::BoxedQuery<'a, diesel::sqlite::Sqlite> {
+    use schema::messages::dsl;
+    dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq_any(keys.to_vec()))
+                .and(
+                    dsl::timestamp_ms
+                        .gt(after.timestamp_ms)
+                        .or(dsl::timestamp_ms
+                            .eq(after.timestamp_ms)
+                            .and(dsl::id.gt(after.seq))),
+                ),
+        )
+        .into_boxed()
 }
 
 /// Rows into messages, with the quotes the writer stripped filled back in.
@@ -2585,6 +2595,129 @@ mod tests {
     struct PlanRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
         detail: String,
+    }
+
+    /// Production SQL and row decoding, without async pool/alias lookup or proto
+    /// hydration. Setup is outside the timed interval. All data are synthetic.
+    #[test]
+    #[ignore = "release cursor-seek measurement"]
+    fn cursor_seek_workload() {
+        use crate::schema::messages::dsl;
+        use diesel::sql_types::Text;
+        let size: i64 = std::env::var("PAGING_ROWS")
+            .unwrap_or_else(|_| "200000".into())
+            .parse()
+            .unwrap();
+        let case = std::env::var("PAGING_CASE").unwrap_or_else(|_| "deep".into());
+        let direction = std::env::var("PAGING_DIRECTION").unwrap_or_else(|_| "backward".into());
+        let iterations: usize = std::env::var("PAGING_ITERATIONS")
+            .unwrap_or_else(|_| "128".into())
+            .parse()
+            .unwrap();
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        diesel::sql_query("CREATE TABLE device (id INTEGER PRIMARY KEY)")
+            .execute(&mut conn)
+            .unwrap();
+        diesel::sql_query("CREATE TABLE lid_pn_mapping (device_id INTEGER NOT NULL)")
+            .execute(&mut conn)
+            .unwrap();
+        conn.run_pending_migrations(MIGRATIONS).unwrap();
+        diesel::sql_query("INSERT INTO device VALUES (1), (2)")
+            .execute(&mut conn)
+            .unwrap();
+        let time_expr = if case == "ties" {
+            "1700000000000"
+        } else {
+            "1700000000000 + (i / 20) * 1000"
+        };
+        let chat_expr = if case == "aliases" {
+            "CASE WHEN i % 2 = 0 THEN 'primary' ELSE 'alias' END"
+        } else {
+            "'primary'"
+        };
+        diesel::sql_query(format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < {size}) \
+             INSERT INTO messages(device_id, chat_jid, msg_id, sender_jid, timestamp_ms, kind, text_content, proto) \
+             SELECT 1, {chat_expr}, printf('SYN-%d', i), 'synthetic', {time_expr}, 'text', \
+             printf('Synthetic message %d', i), zeroblob(128) FROM n"
+        )).execute(&mut conn).unwrap();
+        diesel::sql_query("INSERT INTO messages(device_id, chat_jid, msg_id, sender_jid, timestamp_ms, kind, text_content, proto) \
+             SELECT 2, chat_jid, msg_id, sender_jid, timestamp_ms, kind, text_content, proto FROM messages WHERE device_id=1")
+            .execute(&mut conn).unwrap();
+        let position = match case.as_str() {
+            "head" => size - 100,
+            "middle" => size / 2,
+            _ => 100,
+        };
+        let cursor = super::MessageCursor {
+            timestamp_ms: if case == "ties" {
+                1_700_000_000_000
+            } else {
+                1_700_000_000_000 + (position / 20) * 1000
+            },
+            seq: position,
+        };
+        let keys = if case == "aliases" {
+            vec!["primary".into(), "alias".into()]
+        } else {
+            vec!["primary".into()]
+        };
+        let read = |conn: &mut SqliteConnection| -> Vec<super::MessageRow> {
+            if direction == "forward" {
+                super::page_query_after(1, &keys, &cursor)
+                    .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
+                    .limit(50)
+                    .load(conn)
+                    .unwrap()
+            } else {
+                super::page_query(1, &keys, Some(&cursor))
+                    .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
+                    .limit(50)
+                    .load(conn)
+                    .unwrap()
+            }
+        };
+        let first = read(&mut conn);
+        let expected: Vec<i64> = if direction == "forward" {
+            (position + 1..=position + 50).collect()
+        } else {
+            (position - 50..position).rev().collect()
+        };
+        assert_eq!(first.iter().map(|row| row.id).collect::<Vec<_>>(), expected);
+        let ticks = || {
+            std::fs::read_to_string("/proc/self/stat")
+                .ok()
+                .and_then(|s| {
+                    let fields: Vec<_> = s.rsplit_once(')')?.1.split_whitespace().collect();
+                    Some(
+                        fields.get(11)?.parse::<u64>().ok()?
+                            + fields.get(12)?.parse::<u64>().ok()?,
+                    )
+                })
+        };
+        let cpu_before = ticks();
+        let start = wacore::time::Instant::now();
+        for _ in 0..iterations {
+            let rows = read(&mut conn);
+            assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), expected);
+            std::hint::black_box(rows);
+        }
+        let elapsed_ns = start.elapsed().as_nanos();
+        let cpu_ticks = ticks()
+            .zip(cpu_before)
+            .map(|(after, before)| after - before);
+        println!(
+            "cursor workload rows={size} case={case} direction={direction} iterations={iterations} elapsed_ns={elapsed_ns} cpu_ticks={cpu_ticks:?}"
+        );
+        #[derive(QueryableByName)]
+        struct Version {
+            #[diesel(sql_type = Text)]
+            version: String,
+        }
+        let version: Version = diesel::sql_query("SELECT sqlite_version() AS version")
+            .get_result(&mut conn)
+            .unwrap();
+        println!("sqlite_version={}", version.version);
     }
 
     /// `EXPLAIN QUERY PLAN` for the query as diesel actually renders it. Binds
