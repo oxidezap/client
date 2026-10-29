@@ -1339,6 +1339,11 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   state per `Arc<Image>` and rebuilding one re-decodes the bytes. Whoever
   replaces a preview with real bytes must evict the entry — and so must
   whoever *takes* the bytes away, which is the sweep below.
+  Stickers use a dedicated GPUI asset decoder because GPUI's `Arc<Image>`
+  path decodes WebP as a still image. The shared desktop/web decoder retains
+  composited frames and their delays, with transparent backgrounds and BGRA
+  pixels. The identified `img` element owns playback and looping; keep its
+  message id stable across renders.
 - **A conversation lets go of media it can fetch again, and only that.** A
   message holds its own bytes for as long as the row is loaded, so the two
   media budgets that exist bound what is *cached* rather than what the window
