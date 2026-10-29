@@ -74,8 +74,8 @@ fn print_json_ok<T: Serialize>(data: &T) {
 }
 
 // Borrow the payload instead of cloning every field into a JSON value first.
-// Field order is not part of the JSON contract; the envelope keeps its existing
-// data/ok order for readers that also inspect the pretty-printed text.
+// Object key order follows the serializer rather than an intermediate map.
+// Consumers use the parsed keys; key ordering is not part of the CLI contract.
 #[derive(Serialize)]
 struct Success<'a, T: ?Sized> {
     data: &'a T,

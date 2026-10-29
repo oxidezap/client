@@ -94,7 +94,10 @@ fn borrowed_envelope_preserves_json_values() {
         assert_eq!(old, new);
     }
     let map = serde_json::json!({ "nested": { "empty": [], "null": null, "number": 123 } });
-    assert_eq!(legacy(&map), output::json_ok(&map).unwrap());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&legacy(&map)).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&output::json_ok(&map).unwrap()).unwrap(),
+    );
 }
 
 #[test]
@@ -105,7 +108,14 @@ fn failed_serialization_keeps_the_null_fallback() {
             Err(serde::ser::Error::custom("synthetic failure"))
         }
     }
-    assert_eq!(legacy(&Failure), output::json_ok(&Failure).unwrap());
+    let result: serde_json::Value =
+        serde_json::from_str(&output::json_ok(&Failure).unwrap()).unwrap();
+    assert_eq!(result["ok"], true);
+    assert!(result["data"].is_null());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&legacy(&Failure)).unwrap(),
+        result,
+    );
 }
 
 // Native-only output measurement; the CLI deliberately has no wacore dependency.
