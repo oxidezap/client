@@ -447,9 +447,10 @@ impl gpui::Asset for StickerDecoder {
 
     fn load(
         source: Self::Source,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
-        async move { decode_sticker(&source.bytes).map_err(Into::into) }
+        cx.background_executor()
+            .spawn(async move { decode_sticker(&source.bytes).map_err(Into::into) })
     }
 }
 
@@ -467,7 +468,7 @@ fn decode_sticker(bytes: &[u8]) -> image::ImageResult<Arc<RenderImage>> {
     let frames: smallvec::SmallVec<[_; 1]> = frames
         .into_iter()
         .map(|mut frame| {
-            for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+            for pixel in frame.buffer_mut().as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2); // GPUI textures use BGRA.
             }
             frame
@@ -1076,27 +1077,52 @@ mod tests {
         assert_eq!(decoded.delay(1).numer_denom_ms(), (1000, 1));
     }
 
+    struct StickerTestView(gpui::ImageSource);
+
+    impl gpui::Render for StickerTestView {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::img(self.0.clone()).id("sticker-test").size_full()
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     #[gpui::test]
     fn sticker_frames_loop_and_stay_cached_across_renders(cx: &mut gpui::TestAppContext) {
-        let media = animated_webp_sticker();
+        let mut media = animated_webp_sticker();
+        // GPUI reads wall-clock Instant for playback, not the test executor's
+        // clock. Shorten only this fixture's frame delays to keep the real
+        // playback regression fast without mocking GPUI's implementation.
+        let bytes = Arc::make_mut(&mut media.data);
+        let mut at = 12;
+        while at + 8 <= bytes.len() {
+            let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            if &bytes[at..at + 4] == b"ANMF" {
+                bytes[at + 20..at + 23].copy_from_slice(&[1, 0, 0]);
+            }
+            at += 8 + size + size % 2;
+        }
         let image = Arc::new(gpui::Image::from_bytes(
             gpui::ImageFormat::Webp,
             media.data.to_vec(),
         ));
-        let mut window = cx.add_empty_window();
         let source = super::sticker_image_source(image.clone());
-        let draw = |window: &mut gpui::VisualTestContext| {
-            window.draw(
-                gpui::point(gpui::px(0.), gpui::px(0.)),
-                gpui::size(gpui::px(10.), gpui::px(10.)),
-                |_, _| gpui::img(source.clone()).id("sticker-test").size_full(),
-            );
-        };
-        window.update(|_, cx| {
-            cx.fetch_asset::<super::StickerDecoder>(&image);
+        let handle = cx.open_window(gpui::size(gpui::px(10.), gpui::px(10.)), |_, _| {
+            StickerTestView(source)
         });
+        let mut window = gpui::VisualTestContext::from_window(handle.into(), cx);
         window.run_until_parked();
-        draw(&mut window);
+        window.update(|window, _| window.activate_window());
+        window.run_until_parked();
+        window.update(|window, cx| {
+            assert!(window.is_window_active());
+            assert!(!cx.reduce_motion());
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
         let first = window.update(|window, cx| {
             window
                 .use_asset::<super::StickerDecoder>(&image, cx)
@@ -1104,25 +1130,24 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(first.frame_count(), 2);
-        // A one-frame probe with the same texture id observes whether GPUI
-        // painted frame zero. Remove atlas entries before each draw so a
-        // stale texture cannot make the assertion pass.
+        // Probe frame zero under the decoded image's texture id. Removing
+        // textures before every draw prevents stale uploads hiding a restart.
         let mut probe = gpui::RenderImage::new(smallvec::smallvec![image::Frame::new(
             image::RgbaImage::new(2, 2)
         )]);
         probe.id = first.id;
-        draw(&mut window);
         for frame in 1..=6 {
             window.update(|window, _| window.drop_image(first.clone()).unwrap());
-            window
-                .executor()
-                .advance_clock(std::time::Duration::from_millis(1000));
-            draw(&mut window);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            window.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
             assert_eq!(
                 window.update(|window, _| window.has_image_atlas_entry(&probe)),
                 frame % 2 == 0
             );
-
             let next = window.update(|window, cx| {
                 window
                     .use_asset::<super::StickerDecoder>(&image, cx)
@@ -1131,6 +1156,16 @@ mod tests {
             });
             assert!(Arc::ptr_eq(&first, &next));
         }
+    }
+
+    #[test]
+    fn sticker_decoder_converts_rgba_to_gpui_bgra() {
+        let mut bytes = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
+            .encode(&[255, 64, 32, 128], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let decoded = super::decode_sticker(&bytes).unwrap();
+        assert_eq!(decoded.as_bytes(0).unwrap(), &[32, 64, 255, 128]);
     }
 
     #[test]
