@@ -60,7 +60,7 @@ def main():
             binary = path / variant
             subprocess.run(['rustc', '--edition=2024', '-O', str(src), '-o', str(binary)], check=True)
             bins[variant] = binary
-        w = csv.writer(sys.stdout)
+        w = csv.writer(sys.stdout, lineterminator='\n')
         w.writerow(['sample','mode','visible','size','variant','elapsed_ns','reads','read_bytes','retained_payload_bytes','additional_peak_requested_heap','allocation_calls','process_user_s','process_system_s','peak_rss_kib'])
         for size in [1024 * 1024, 128]:
             for i in range(12):
