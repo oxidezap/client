@@ -50,6 +50,7 @@ pub struct VideoPlayer {
     audio: Option<Arc<VideoAudio>>,
     needs_audio_start: bool,
     completion_tx: Option<oneshot::Sender<()>>,
+    preparation: Arc<()>,
 }
 
 impl Default for VideoPlayer {
@@ -71,6 +72,7 @@ impl VideoPlayer {
             audio: None,
             needs_audio_start: false,
             completion_tx: None,
+            preparation: Arc::new(()),
         }
     }
 
@@ -85,9 +87,15 @@ impl VideoPlayer {
         self.state
     }
 
-    pub fn set_downloading(&mut self) {
+    pub fn set_downloading(&mut self) -> Arc<()> {
+        self.preparation = Arc::new(());
         self.state = VideoPlayerState::Downloading;
         self.error = None;
+        Arc::clone(&self.preparation)
+    }
+
+    pub fn owns_preparation(&self, preparation: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.preparation, preparation)
     }
 
     pub fn set_decoding(&mut self) {
@@ -162,6 +170,19 @@ impl VideoPlayer {
         self.update_current_frame();
         self.needs_audio_start = true;
         self.completion_tx = None;
+    }
+
+    /// Stop a hidden viewer and release temporary decode resources.
+    /// Invalidate work from this opening, even if the same message reopens.
+    pub fn stop_hidden(&mut self) {
+        self.preparation = Arc::new(());
+        if self.decoder.is_some() {
+            self.stop();
+            self.release_decoder();
+        } else {
+            self.state = VideoPlayerState::Idle;
+            self.completion_tx = None;
+        }
     }
 
     /// Give up the codec session while this player is not the one playing.
@@ -248,5 +269,58 @@ impl VideoPlayer {
 
     pub fn current_frame(&self) -> Option<Arc<RenderImage>> {
         self.current_frame.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_preparation_cannot_replace_a_reopened_player() {
+        let mut player = VideoPlayer::new();
+        let old = player.set_downloading();
+        player.set_decoding();
+        player.stop_hidden();
+        assert_eq!(player.state(), VideoPlayerState::Idle);
+        assert!(!player.owns_preparation(&old));
+        let reopened = player.set_downloading();
+        assert!(player.owns_preparation(&reopened));
+        assert!(!player.owns_preparation(&old));
+        let mut replacement = VideoPlayer::new();
+        replacement.set_downloading();
+        assert!(!replacement.owns_preparation(&reopened));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn hidden_player_keeps_poster_and_replays_with_shared_audio() {
+        let data = super::super::platform::tests::synthetic_video();
+        let decoder = StreamingVideoDecoder::new(&data).unwrap();
+        let mut player = VideoPlayer::new();
+        player.load(decoder);
+        let samples: Arc<[f32]> = vec![0.25; 48000].into();
+        player.set_audio(VideoAudio {
+            samples: samples.clone(),
+            sample_rate: 48000,
+        });
+        let shared_frame = player.current_frame().unwrap();
+        let frame = Arc::downgrade(&shared_frame);
+        let completion = player.on_complete();
+        player.play();
+        player.stop_hidden();
+        assert!(
+            frame.upgrade().is_some(),
+            "another visible owner keeps its frame"
+        );
+        drop(shared_frame);
+        assert!(player.current_frame().is_some());
+        assert!(completion.blocking_recv().is_err());
+        assert!(player.current_frame().is_some());
+        assert_eq!(player.current_time(), Duration::ZERO);
+        assert!(Arc::ptr_eq(&player.get_audio().unwrap().samples, &samples));
+        assert!(player.play());
+        player.update();
+        assert!(player.current_frame().is_some());
     }
 }

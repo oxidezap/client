@@ -289,6 +289,14 @@ impl WhatsAppApp {
 
     /// Discard playback during teardown or failed preparation, without notifying the UI.
     pub(super) fn stop_current_media(&mut self) {
+        self.stop_media_with_poster(true);
+    }
+
+    pub(super) fn stop_hidden_media(&mut self) {
+        self.stop_media_with_poster(false);
+    }
+
+    fn stop_media_with_poster(&mut self, poster: bool) {
         self.audio_player.stop();
         // A stopped tick may still be between its sleep and `entity.update`.
         // Drop the handle before a new preparation starts; otherwise the new
@@ -308,7 +316,11 @@ impl WhatsAppApp {
 
         if let ActiveMedia::Video { message_id } = &self.active_media {
             if let Some(player) = self.video_players.get_mut(message_id) {
-                player.stop();
+                if poster {
+                    player.stop();
+                } else {
+                    player.stop_hidden();
+                }
             }
             self.video_update_task = None;
         }
@@ -1622,7 +1634,7 @@ impl WhatsAppApp {
 
         // Create or get player and set to downloading
         let player = self.video_players.entry(message_id.clone()).or_default();
-        player.set_downloading();
+        let preparation = player.set_downloading();
 
         let msg_id = message_id.clone();
 
@@ -1633,17 +1645,35 @@ impl WhatsAppApp {
                     info!("Video downloaded: {} bytes", data.len());
 
                     // Set to decoding state (quick UI update)
-                    let _ = entity.update(cx, |app, cx| {
-                        if let Some(player) = app.video_players.get_mut(&msg_id) {
+                    let current = entity
+                        .update(cx, |app, cx| {
+                            let Some(player) = app
+                                .video_players
+                                .get_mut(&msg_id)
+                                .filter(|player| player.owns_preparation(&preparation))
+                            else {
+                                return false;
+                            };
                             player.set_decoding();
-                        }
-                        cx.notify();
-                    });
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !current {
+                        return;
+                    }
 
                     let decode_result = crate::video::build_decoder(cx, data).await;
 
-                    // Update UI with decode results
+                    // Update only the opening that requested this preparation.
                     let _ = entity.update(cx, |app, cx| {
+                        if !app
+                            .video_players
+                            .get(&msg_id)
+                            .is_some_and(|player| player.owns_preparation(&preparation))
+                        {
+                            return;
+                        }
                         match decode_result {
                             Ok(mut decoder) => {
                                 info!(
@@ -1686,6 +1716,7 @@ impl WhatsAppApp {
                                             == Some(msg_id_for_play.as_str())
                                             && let Some(player) =
                                                 app.video_players.get_mut(&msg_id_for_play)
+                                            && player.owns_preparation(&preparation)
                                             && player.state() == VideoPlayerState::Paused
                                         {
                                             let needs_audio = player.play();
@@ -1730,7 +1761,11 @@ impl WhatsAppApp {
                 Err(e) => {
                     error!("Failed to download video: {}", e);
                     let _ = entity.update(cx, |app, cx| {
-                        if let Some(player) = app.video_players.get_mut(&msg_id) {
+                        if let Some(player) = app
+                            .video_players
+                            .get_mut(&msg_id)
+                            .filter(|player| player.owns_preparation(&preparation))
+                        {
                             player.set_error(what_went_wrong("Could not download that video", &e));
                         }
                         cx.notify();

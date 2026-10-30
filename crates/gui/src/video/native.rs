@@ -392,13 +392,12 @@ impl StreamingVideoDecoder {
         self.current_frame.as_ref()
     }
 
-    /// Give up whatever the platform is holding while nothing plays.
-    ///
-    /// Nothing, here: openh264 is a decoder in this process's own memory,
-    /// with no session to run out of. The web twin gives back a hardware
-    /// codec session, which a browser allows only a handful of. Present on
-    /// both so the caller does not learn which build it is in.
-    pub fn release(&mut self) {}
+    /// Drop conversion scratch while cached, retaining the codec reference
+    /// chain and poster so replay does not have to decode the first frame again.
+    pub fn release(&mut self) {
+        self.rgba_buffer = Vec::new();
+        self.frame_size = (0, 0);
+    }
 
     /// Reset to first frame
     pub fn reset(&mut self) {
@@ -414,9 +413,200 @@ impl StreamingVideoDecoder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::geometry::Rotation;
     use super::*;
+
+    /// Synthetic encoded samples, with no user media or external tools.
+    pub(crate) fn synthetic_video() -> Vec<u8> {
+        use mp4::{AvcConfig, Bytes, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
+        use openh264::encoder::Encoder;
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+        use std::io::Cursor;
+        let mut encoder = Encoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            openh264::encoder::EncoderConfig::new()
+                .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(4)),
+        )
+        .unwrap();
+        let pixels = vec![80; 128 * 96 * 3];
+        let mut samples = Vec::new();
+        let mut sps = Vec::new();
+        let mut pps = Vec::new();
+        for _ in 0..8 {
+            let encoded = encoder
+                .encode(&YUVBuffer::from_rgb8_source(RgbSliceU8::new(
+                    &pixels,
+                    (128, 96),
+                )))
+                .unwrap()
+                .to_vec();
+            let mut sample = Vec::new();
+            let mut sync = false;
+            for nal in openh264::nal_units(&encoded) {
+                let nal = if nal.starts_with(&[0, 0, 0, 1]) {
+                    &nal[4..]
+                } else {
+                    &nal[3..]
+                };
+                match nal[0] & 31 {
+                    7 => sps = nal.to_vec(),
+                    8 => pps = nal.to_vec(),
+                    _ => {
+                        sync |= nal[0] & 31 == 5;
+                        sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                        sample.extend_from_slice(nal);
+                    }
+                }
+            }
+            samples.push((sample, sync));
+        }
+        let mut writer = Mp4Writer::write_start(
+            Cursor::new(Vec::new()),
+            &Mp4Config {
+                major_brand: (*b"isom").into(),
+                minor_version: 512,
+                compatible_brands: vec![(*b"isom").into()],
+                timescale: 1000,
+            },
+        )
+        .unwrap();
+        writer
+            .add_track(&TrackConfig::from(MediaConfig::AvcConfig(AvcConfig {
+                width: 128,
+                height: 96,
+                seq_param_set: sps,
+                pic_param_set: pps,
+            })))
+            .unwrap();
+        for (index, (bytes, sync)) in samples.into_iter().enumerate() {
+            writer
+                .write_sample(
+                    1,
+                    &Mp4Sample {
+                        start_time: index as u64 * 40,
+                        duration: 40,
+                        rendering_offset: 0,
+                        is_sync: sync,
+                        bytes: Bytes::from(bytes),
+                    },
+                )
+                .unwrap();
+        }
+        writer.write_end().unwrap();
+        writer.into_writer().into_inner()
+    }
+
+    #[test]
+    fn release_drops_scratch_without_redecoding_cached_frames() {
+        let data = synthetic_video();
+        let mut decoder = StreamingVideoDecoder::new(&data).unwrap();
+        let mut reference = StreamingVideoDecoder::new(&data).unwrap();
+        for _ in 0..20 {
+            for rank in [0, 3, 7, 2] {
+                decoder.release();
+                decoder.seek_to_frame(rank);
+                reference.seek_to_frame(rank);
+                let frame = decoder.current_frame().expect("decoded picture");
+                let expected = reference.current_frame().unwrap();
+                assert_eq!(frame.index, expected.index);
+                assert_eq!(frame.timestamp, expected.timestamp);
+                assert_eq!(frame.image.as_bytes(0), expected.image.as_bytes(0));
+            }
+            assert!(decoder.rgba_buffer.capacity() >= 128 * 96 * 4);
+            let samples = decoder.track.samples.as_ptr();
+            decoder.release();
+            decoder.release();
+            let frame = decoder.current_frame().unwrap();
+            let image = frame.image.clone();
+            let index = frame.index;
+            let cursor = decoder.last_decoded_index;
+            decoder.seek_to_frame(index);
+            assert_eq!(decoder.last_decoded_index, cursor);
+            assert!(Arc::ptr_eq(&image, &decoder.current_frame().unwrap().image));
+            assert_eq!(decoder.rgba_buffer.capacity(), 0);
+            assert_eq!(decoder.track.samples.as_ptr(), samples);
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic profiling, set OXIDE_VIDEO_PROFILE_MP4"]
+    fn profile_idle_video_resources() {
+        let data = std::fs::read(std::env::var("OXIDE_VIDEO_PROFILE_MP4").unwrap()).unwrap();
+        let rss = || {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .unwrap()
+                .to_owned()
+        };
+        let cpu = || {
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect();
+            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+        };
+        let legacy = std::env::var_os("OXIDE_VIDEO_PROFILE_LEGACY").is_some();
+        let mut decoders = Vec::new();
+        for _ in 0..10 {
+            let mut decoder = StreamingVideoDecoder::new(&data).unwrap();
+            decoder.seek(decoder.duration() / 2);
+            assert!(decoder.current_frame().is_some());
+            decoders.push(decoder);
+        }
+        let scratch: usize = decoders.iter().map(|d| d.rgba_buffer.capacity()).sum();
+        let frames: usize = decoders
+            .iter()
+            .map(|d| d.current_frame().unwrap().image.as_bytes(0).unwrap().len())
+            .sum();
+        let compressed: usize = decoders
+            .iter()
+            .flat_map(|d| &d.track.samples)
+            .map(|s| s.data.capacity())
+            .sum();
+        println!(
+            "loaded codec_count=10 scratch={scratch} decoded_frames={frames} compressed={compressed} {}",
+            rss()
+        );
+        let start_cpu = cpu();
+        let start = wacore::time::Instant::now();
+        for decoder in &mut decoders {
+            decoder.reset();
+            if !legacy {
+                decoder.release();
+            }
+        }
+        println!(
+            "legacy={legacy} close_wall={:?} close_cpu_ticks={} {}",
+            start.elapsed(),
+            cpu() - start_cpu,
+            rss()
+        );
+        if !legacy {
+            assert!(
+                decoders
+                    .iter()
+                    .all(|d| d.rgba_buffer.capacity() == 0 && d.current_frame.is_some())
+            );
+        }
+        let start_cpu = cpu();
+        let start = wacore::time::Instant::now();
+        for decoder in &mut decoders {
+            decoder.seek(Duration::ZERO);
+            assert!(decoder.current_frame().is_some());
+        }
+        println!(
+            "reopen_10_wall={:?} reopen_cpu_ticks={} {}",
+            start.elapsed(),
+            cpu() - start_cpu,
+            rss()
+        );
+    }
 
     /// The crash a `.mp4` used to cause, and the sizing that stops it.
     ///
