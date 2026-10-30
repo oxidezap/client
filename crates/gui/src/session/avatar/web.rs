@@ -27,6 +27,16 @@ static STORAGE_GENERATION: portable_atomic::AtomicU64 = portable_atomic::AtomicU
 
 static ACTIVE_ACCOUNT: RwLock<Option<oxidezap_core::AccountId>> = RwLock::new(None);
 
+pub(super) async fn decode_avatar(
+    bytes: Vec<u8>,
+    _priority: super::DecodePriority,
+    current: impl FnOnce() -> bool + Send + 'static,
+) -> Option<(std::sync::Arc<gpui::RenderImage>, u64)> {
+    current()
+        .then(|| crate::session::media::decode_avatar(&bytes))
+        .flatten()
+}
+
 pub fn set_active_account(account: Option<oxidezap_core::AccountId>) {
     if let Ok(mut lock) = ACTIVE_ACCOUNT.write() {
         if *lock != account {

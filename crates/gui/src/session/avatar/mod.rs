@@ -15,6 +15,9 @@ mod web;
 #[cfg(target_family = "wasm")]
 mod web_lock;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod probe;
+
 #[cfg(not(target_family = "wasm"))]
 use native as imp;
 #[cfg(target_family = "wasm")]
@@ -27,9 +30,7 @@ use std::sync::{Arc, Mutex};
 use oxidezap_core::{AccountId, AvatarDemand};
 use wacore::time::Instant;
 
-use crate::session::media::{
-    clear_image_sources, decode_avatar, get_avatar_image, put_avatar_image,
-};
+use crate::session::media::{clear_image_sources, get_avatar_image, put_avatar_image};
 
 #[allow(unused_imports)]
 pub use imp::{
@@ -75,6 +76,28 @@ pub enum DemandPriority {
     Low,
 }
 
+type DecodePriority = Arc<portable_atomic::AtomicBool>;
+
+fn decode_priority(priority: DemandPriority) -> DecodePriority {
+    Arc::new(portable_atomic::AtomicBool::new(
+        priority == DemandPriority::High,
+    ))
+}
+
+struct PendingRead {
+    token: u64,
+    priority: DecodePriority,
+}
+
+impl PendingRead {
+    fn new(token: u64, priority: DemandPriority) -> Self {
+        Self {
+            token,
+            priority: decode_priority(priority),
+        }
+    }
+}
+
 const MAX_TRACKED_AVATARS: usize = 2048;
 const MAX_PENDING_DEMANDS: usize = 256;
 const MAX_PERSISTENT_READS: usize = 64;
@@ -85,11 +108,12 @@ static NEXT_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// and in-memory decoded image caching.
 #[derive(Clone, Default)]
 pub struct AvatarManager {
-    persistent_in_flight: Arc<Mutex<HashMap<(String, String), u64>>>,
+    persistent_in_flight: Arc<Mutex<HashMap<(String, String), PendingRead>>>,
     network_in_flight: Arc<Mutex<HashSet<String>>>,
     revalidated: Arc<Mutex<indexmap::IndexSet<String>>>,
     failed_cooldowns: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
     pending_demands: Arc<Mutex<HashMap<String, (AvatarDemand, DemandPriority)>>>,
+    deferred_misses: Arc<Mutex<indexmap::IndexMap<String, String>>>,
     generation: Arc<AtomicU64>,
     demand_epoch: Arc<AtomicU64>,
     account_id: Arc<Mutex<Option<AccountId>>>,
@@ -130,15 +154,21 @@ impl AvatarManager {
 
     /// Reset in-memory cache and tracking (e.g. on cache clear or account change).
     pub fn clear(&self) {
-        clear_image_sources();
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.bump_demand_epoch();
         self.reset_connection();
+        // Retire reads before clearing images. A worker publishing while
+        // reset_connection waits for its read lock is then cleared as well.
+        clear_image_sources();
     }
 
     /// Clear in-flight, revalidated, and cooldown tracking on connection restart while
     /// preserving decoded images in memory.
     pub fn reset_connection(&self) {
+        self.deferred_misses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.persistent_in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -181,8 +211,23 @@ impl AvatarManager {
         for chat in visible {
             self.demand_one(chat, DemandPriority::High);
         }
-        for chat in overscan {
-            self.demand_one(chat, DemandPriority::Low);
+        // A batch of local reads is scheduled asynchronously, so spawning
+        // overscan last does not ensure it runs last. Let visible disk hits
+        // reach RAM before admitting speculative local work. Completion
+        // advances demand_epoch and wakes the viewport to admit overscan.
+        let visible_loading = {
+            let reads = self
+                .persistent_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            visible
+                .iter()
+                .any(|chat| reads.keys().any(|(jid, _)| jid == &chat.jid))
+        };
+        if !visible_loading {
+            for chat in overscan {
+                self.demand_one(chat, DemandPriority::Low);
+            }
         }
 
         // Prune low-priority pending demands that are no longer in the active window
@@ -265,19 +310,69 @@ impl AvatarManager {
                 return;
             }
 
+            // A previous read already established that this exact blob is
+            // absent. Retry network admission without reading it again on
+            // every repaint while the network queue remains full.
+            let deferred = self
+                .deferred_misses
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(jid)
+                == Some(key);
+            if deferred {
+                let reserved = {
+                    let mut network = self
+                        .network_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    network.len() < MAX_PENDING_DEMANDS && network.insert(jid.clone())
+                };
+                if reserved {
+                    if self.enqueue_demand(
+                        AvatarDemand {
+                            jid: jid.clone(),
+                            known_picture_id: None,
+                            cache_key: None,
+                            need_bytes: true,
+                            cache_miss: true,
+                        },
+                        priority,
+                    ) {
+                        self.deferred_misses
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .shift_remove(jid);
+                    } else {
+                        self.network_in_flight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(jid);
+                    }
+                }
+                return;
+            }
+
             // Miss in RAM: check persistent store if not already in flight
             let op_token = NEXT_OP_TOKEN.fetch_add(1, Ordering::Relaxed);
             let mut p_flight = self
                 .persistent_in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            if let Some(read) = p_flight.get(&(jid.clone(), key.clone())) {
+                if priority == DemandPriority::High {
+                    read.priority.store(true, Ordering::Relaxed);
+                }
+                return;
+            }
             if p_flight.len() >= MAX_PERSISTENT_READS {
                 return;
             }
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 p_flight.entry((jid.clone(), key.clone()))
             {
-                entry.insert(op_token);
+                let reservation = PendingRead::new(op_token, priority);
+                let decode_priority = reservation.priority.clone();
+                entry.insert(reservation);
                 let key_clone = key.clone();
                 let jid_clone = jid.clone();
                 let pic_id = chat.picture_id.clone();
@@ -290,6 +385,7 @@ impl AvatarManager {
                 let generation = Arc::clone(&self.generation);
                 let demand_epoch = Arc::clone(&self.demand_epoch);
                 let account_id = Arc::clone(&self.account_id);
+                let deferred_misses = Arc::clone(&self.deferred_misses);
                 let born_gen = generation.load(Ordering::Relaxed);
                 let born_account = *account_id.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -301,7 +397,8 @@ impl AvatarManager {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .get(&read_key)
-                        != Some(&op_token)
+                        .map(|read| read.token)
+                        != Some(op_token)
                     {
                         return;
                     }
@@ -313,23 +410,63 @@ impl AvatarManager {
                         let mut p = persistent_in_flight
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        if p.get(&read_key) == Some(&op_token) {
+                        if p.get(&read_key).map(|read| read.token) == Some(op_token) {
                             p.remove(&read_key);
                         }
                         return;
                     }
 
                     if let Some(bytes) = persistent_bytes {
-                        if let Some((source, decoded_size)) = decode_avatar(&bytes) {
-                            put_avatar_image(key_clone.clone(), source, decoded_size);
+                        let current = {
+                            let pending = persistent_in_flight.clone();
+                            let generation = generation.clone();
+                            let account = account_id.clone();
+                            let key = read_key.clone();
+                            move || {
+                                let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                                pending.get(&key).map(|read| read.token) == Some(op_token)
+                                    && generation.load(Ordering::Relaxed) == born_gen
+                                    && *account.lock().unwrap_or_else(|e| e.into_inner())
+                                        == born_account
+                            }
+                        };
+                        let decoded = imp::decode_avatar(bytes, decode_priority, current).await;
+                        {
                             let mut p = persistent_in_flight
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            if p.get(&read_key) != Some(&op_token) {
+                            // A decode can outlive replacement, cache clear or
+                            // account change. Check again after the worker's
+                            // await, holding the read reservation through RAM
+                            // publication so retirement cannot overtake it.
+                            if p.get(&read_key).map(|read| read.token) != Some(op_token)
+                                || generation.load(Ordering::Relaxed) != born_gen
+                                || *account_id.lock().unwrap_or_else(|e| e.into_inner())
+                                    != born_account
+                            {
+                                if p.get(&read_key).map(|read| read.token) == Some(op_token) {
+                                    p.remove(&read_key);
+                                }
+                                return;
+                            }
+                            if let Some((source, decoded_size)) = &decoded {
+                                put_avatar_image(key_clone.clone(), source.clone(), *decoded_size);
+                            }
+                        }
+                        if decoded.is_some() {
+                            let mut p = persistent_in_flight
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if p.get(&read_key).map(|read| read.token) != Some(op_token) {
                                 return;
                             }
                             p.remove(&read_key);
                             drop(p);
+                            // Disk reads can all finish while decodes are
+                            // queued. Releasing a decode also releases local
+                            // admission, so a viewport refused at the read
+                            // limit must get another fingerprint and retry.
+                            demand_epoch.fetch_add(1, Ordering::Relaxed);
 
                             // Notify UI that the avatar image is ready in RAM
                             if let Some(session) = session_handle
@@ -376,7 +513,7 @@ impl AvatarManager {
                             let mut p = persistent_in_flight
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            if p.get(&read_key) == Some(&op_token) {
+                            if p.get(&read_key).map(|read| read.token) == Some(op_token) {
                                 p.remove(&read_key);
                             }
                             return;
@@ -388,16 +525,38 @@ impl AvatarManager {
                         let mut p = persistent_in_flight
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        if p.get(&read_key) != Some(&op_token) {
+                        if p.get(&read_key).map(|read| read.token) != Some(op_token) {
                             return;
                         }
                         p.remove(&read_key);
                     }
-                    let mut n_flight = network_in_flight.lock().unwrap_or_else(|e| e.into_inner());
-                    if n_flight.len() >= MAX_PENDING_DEMANDS {
-                        return;
+                    let reserved = {
+                        let mut n_flight =
+                            network_in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                        n_flight.len() < MAX_PENDING_DEMANDS && n_flight.insert(jid_clone.clone())
+                    };
+                    if !reserved {
+                        let mut deferred =
+                            deferred_misses.lock().unwrap_or_else(|e| e.into_inner());
+                        if deferred.len() >= MAX_TRACKED_AVATARS
+                            && !deferred.contains_key(&jid_clone)
+                        {
+                            deferred.shift_remove_index(0);
+                        }
+                        deferred.insert(jid_clone.clone(), key_clone.clone());
                     }
-                    if n_flight.insert(jid_clone.clone()) {
+                    // A miss also releases visible local admission. Wake the
+                    // viewport even offline, so deferred overscan can recover
+                    // without waiting for a successful network response.
+                    demand_epoch.fetch_add(1, Ordering::Relaxed);
+                    if let Some(session) = session_handle
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        session.notify_avatar_loaded();
+                    }
+                    if reserved {
                         let demand = AvatarDemand {
                             jid: jid_clone,
                             known_picture_id: None,
@@ -517,6 +676,10 @@ impl AvatarManager {
 
     /// Called when the daemon signals an avatar is ready (or cleared).
     pub fn on_avatar_ready(&self, jid: &str, key: &str) {
+        self.deferred_misses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shift_remove(jid);
         self.network_in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -534,6 +697,28 @@ impl AvatarManager {
             note_revalidation(&mut revalidated, jid);
         } else {
             revalidated.shift_remove(jid);
+        }
+        drop(revalidated);
+        self.wake_deferred_misses();
+    }
+
+    fn wake_deferred_misses(&self) {
+        if self
+            .deferred_misses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return;
+        }
+        self.bump_demand_epoch();
+        if let Some(session) = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            session.notify_avatar_loaded();
         }
     }
 
@@ -570,6 +755,8 @@ impl AvatarManager {
             }
         }
         cooldowns.insert(jid.to_string(), (retryable, until));
+        drop(cooldowns);
+        self.wake_deferred_misses();
         until
     }
 
@@ -609,6 +796,7 @@ fn note_revalidation(revalidated: &mut indexmap::IndexSet<String>, jid: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::media::decode_avatar;
 
     // Run the real native storage and manager together in a separate process:
     // changing a process-wide runtime path in a parallel test would risk the
@@ -673,6 +861,95 @@ mod tests {
             let demand = next(&first).await;
             assert!(!demand.need_bytes, "disk hit needs only freshness metadata");
             assert_eq!(demand.known_picture_id, chat.picture_id);
+
+            // Offline failures in visible local recovery must release and
+            // advance admission so valid overscan hits can still load.
+            for corrupt in [false, true] {
+                clear_image_sources();
+                let missing = ChatDemand {
+                    jid: "offline-miss@example.invalid".into(),
+                    picture_id: Some("missing-picture".into()),
+                    cache_key: Some("avatar-offline-miss".into()),
+                };
+                let missing_path =
+                    oxidezap_ipc::media_path(missing.cache_key.as_ref().unwrap()).unwrap();
+                if corrupt {
+                    std::fs::write(&missing_path, b"corrupt fixture").unwrap();
+                }
+                let recovery = AvatarManager::new();
+                let epoch = recovery.demand_epoch();
+                recovery.demand_chats_windowed(
+                    std::slice::from_ref(&missing),
+                    std::slice::from_ref(&chat),
+                );
+                assert!(next(&recovery).await.need_bytes);
+                assert_ne!(
+                    recovery.demand_epoch(),
+                    epoch,
+                    "failed reads must invalidate the demand fingerprint"
+                );
+                recovery.demand_chats_windowed(
+                    std::slice::from_ref(&missing),
+                    std::slice::from_ref(&chat),
+                );
+                assert!(
+                    !next(&recovery).await.need_bytes,
+                    "offline overscan must recover from disk"
+                );
+                assert!(get_avatar_image(key).is_some());
+                assert!(!missing_path.exists());
+            }
+
+            // Saturated network admission must not turn its own completion
+            // wake into repeated filesystem reads. Capacity release retries
+            // the known miss directly, without another disk lookup.
+            let saturated = AvatarManager::new();
+            saturated
+                .network_in_flight
+                .lock()
+                .unwrap()
+                .extend((0..MAX_PENDING_DEMANDS).map(|i| format!("saturated-{i}@example.invalid")));
+            let missing = ChatDemand {
+                jid: "deferred-miss@example.invalid".into(),
+                picture_id: Some("missing-picture".into()),
+                cache_key: Some("avatar-deferred-miss".into()),
+            };
+            let reads = native::PERSISTENT_READS.load(std::sync::atomic::Ordering::Relaxed);
+            saturated.demand_chat(&missing);
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while !saturated
+                .deferred_misses
+                .lock()
+                .unwrap()
+                .contains_key(&missing.jid)
+            {
+                assert!(Instant::now() < deadline);
+                crate::platform::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            for _ in 0..10 {
+                saturated.demand_chat(&missing);
+            }
+            assert!(saturated.take_demands().is_empty());
+            assert_eq!(
+                native::PERSISTENT_READS.load(std::sync::atomic::Ordering::Relaxed),
+                reads + 1
+            );
+            let epoch = saturated.demand_epoch();
+            saturated.on_avatar_failed("saturated-0@example.invalid", true);
+            assert_ne!(
+                saturated.demand_epoch(),
+                epoch,
+                "capacity release must wake deferred demand"
+            );
+            saturated.demand_chat(&missing);
+            let retry = saturated.take_demands();
+            assert_eq!(retry.len(), 1);
+            assert!(retry[0].need_bytes && retry[0].cache_miss);
+            assert_eq!(
+                native::PERSISTENT_READS.load(std::sync::atomic::Ordering::Relaxed),
+                reads + 1,
+                "capacity retry must not read disk again"
+            );
 
             let freshness = AvatarManager::new();
             freshness.demand_chats_windowed(&[], std::slice::from_ref(&chat));
@@ -754,6 +1031,93 @@ mod tests {
                 window.demand_chats_windowed(&chats[..2], &chats[2..]);
                 assert!(window.take_demands().is_empty());
                 assert_eq!(window.demand_epoch(), epoch, "recovery must settle");
+            }
+
+            // Force a local decode to wait behind occupied workers, then
+            // retire it. Its late result must not resurrect cleared images,
+            // select an old picture, or send freshness for a departed account.
+            for retirement in ["clear", "replacement", "account"] {
+                clear_image_sources();
+                let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (started, receiving) = std::sync::mpsc::channel();
+                let mut blockers = Vec::new();
+                let completed = native::DECODE_COMPLETED.load(std::sync::atomic::Ordering::Relaxed);
+                let performed = native::DECODE_PERFORMED.load(std::sync::atomic::Ordering::Relaxed);
+                for _ in 0..2 {
+                    let release = release.clone();
+                    let started = started.clone();
+                    blockers.push(smol::spawn(native::decode_work(
+                        decode_priority(DemandPriority::High),
+                        move || {
+                            started.send(()).unwrap();
+                            while !release.load(std::sync::atomic::Ordering::Relaxed) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        },
+                    )));
+                }
+                for _ in 0..2 {
+                    receiving
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+                let retired = AvatarManager::new();
+                let reads = native::PERSISTENT_READS.load(std::sync::atomic::Ordering::Relaxed);
+                if retirement == "replacement" {
+                    retired.demand_one(&chats[0], DemandPriority::Low);
+                } else {
+                    retired.demand_chats_windowed(&chats[..1], &chats[1..2]);
+                }
+                let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                while native::queued_decodes() == 0 {
+                    assert!(Instant::now() < deadline);
+                    crate::platform::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                retired.demand_chat(&chats[0]);
+                assert_eq!(
+                    native::PERSISTENT_READS.load(std::sync::atomic::Ordering::Relaxed),
+                    reads + 1,
+                    "promotion must not reread disk"
+                );
+                assert!(
+                    retired
+                        .persistent_in_flight
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .all(|read| read.priority.load(Ordering::Relaxed)),
+                    "visible demand must promote queued recovery"
+                );
+                assert!(
+                    !retired.is_in_flight(&chats[1].jid),
+                    "overscan must wait for visible local recovery"
+                );
+                match retirement {
+                    "clear" => retired.clear(),
+                    "replacement" => retired.on_avatar_ready(&chats[0].jid, "new-picture"),
+                    "account" => retired.set_session(None),
+                    _ => unreachable!(),
+                }
+                release.store(true, std::sync::atomic::Ordering::Relaxed);
+                for blocker in blockers {
+                    blocker.await;
+                }
+                while native::DECODE_COMPLETED.load(std::sync::atomic::Ordering::Relaxed)
+                    < completed + 3
+                {
+                    assert!(Instant::now() < deadline);
+                    crate::platform::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                assert!(
+                    get_avatar_image(chats[0].cache_key.as_ref().unwrap()).is_none(),
+                    "late decode survived {retirement}"
+                );
+                assert!(retired.take_demands().is_empty());
+                assert_eq!(
+                    native::DECODE_PERFORMED.load(std::sync::atomic::Ordering::Relaxed),
+                    performed,
+                    "retired queued work must skip decoding after {retirement}"
+                );
             }
         });
     }
@@ -906,8 +1270,14 @@ mod tests {
         for key in ["new-picture", ""] {
             let manager = AvatarManager::new();
             let mut pending = manager.persistent_in_flight.lock().unwrap();
-            pending.insert(("peer@example.invalid".into(), "old-picture".into()), 1);
-            pending.insert(("other@example.invalid".into(), "other-picture".into()), 2);
+            pending.insert(
+                ("peer@example.invalid".into(), "old-picture".into()),
+                PendingRead::new(1, DemandPriority::Low),
+            );
+            pending.insert(
+                ("other@example.invalid".into(), "other-picture".into()),
+                PendingRead::new(2, DemandPriority::Low),
+            );
             drop(pending);
             manager.on_avatar_ready("peer@example.invalid", key);
             let pending = manager.persistent_in_flight.lock().unwrap();
