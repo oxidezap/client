@@ -1,5 +1,6 @@
 //! Media attachments inside a message bubble: images, video, documents.
 
+use crate::retained_image::RetainedImage;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ pub(super) struct MediaProps {
     pub chat_jid: SharedString,
     pub video_player_state: Option<VideoPlayerState>,
     pub video_frame: Option<Arc<RenderImage>>,
-    pub decoded_image: Option<Arc<Image>>,
+    pub decoded_image: Option<RetainedImage>,
     pub audio: Option<super::AudioProgress>,
     pub playback_speed: f32,
     pub listened: Option<&'static str>,
@@ -77,7 +78,7 @@ pub(super) fn render_media_content(
                 // Prefer the app-level cache: rebuilding from bytes clones the
                 // buffer and makes GPUI decode it again on every render.
                 let image = match decoded_image.clone() {
-                    Some(cached) => img(ImageSource::Image(cached))
+                    Some(cached) => img(cached.source(false))
                         .w(px(display_w))
                         .h(px(display_h))
                         .object_fit(gpui::ObjectFit::Contain)
@@ -166,7 +167,7 @@ pub(super) fn render_media_content(
                 // one below, so rebuilding it here was the whole saving of
                 // that cache given back on every repaint.
                 let image = match decoded_image {
-                    Some(cached) => img(ImageSource::Image(cached))
+                    Some(cached) => img(cached.source(false))
                         .w(px(display_w))
                         .h(px(display_h))
                         .aspect_square()
@@ -225,7 +226,7 @@ pub(super) fn render_media_content(
                             && format != gpui::ImageFormat::Webp
                         {
                             el.child(match cached_image {
-                                Some(cached) => img(ImageSource::Image(cached))
+                                Some(cached) => img(cached.source(false))
                                     .w(px(display_w))
                                     .h(px(display_h))
                                     .aspect_square()
@@ -460,28 +461,11 @@ fn still_image_format(media: &oxidezap_core::MediaContent) -> Option<gpui::Image
 // GPUI's Arc<Image> decoder treats WebP as a still image. Keep the existing
 // encoded-image cache, but load sticker frames through a dedicated asset so
 // repeated renders reuse the decoded frames on desktop and web alike.
-fn sticker_image_source(image: Arc<Image>) -> ImageSource {
-    ImageSource::Custom(Arc::new(move |window, cx| {
-        window.use_asset::<StickerDecoder>(&image, cx)
-    }))
+fn sticker_image_source(image: RetainedImage) -> ImageSource {
+    image.source(true)
 }
 
-struct StickerDecoder;
-
-impl gpui::Asset for StickerDecoder {
-    type Source = Arc<Image>;
-    type Output = Result<Arc<RenderImage>, gpui::ImageCacheError>;
-
-    fn load(
-        source: Self::Source,
-        cx: &mut App,
-    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
-        cx.background_executor()
-            .spawn(async move { decode_sticker(&source.bytes).map_err(Into::into) })
-    }
-}
-
-fn decode_sticker(bytes: &[u8]) -> image::ImageResult<Arc<RenderImage>> {
+pub(crate) fn decode_sticker(bytes: &[u8]) -> image::ImageResult<Arc<RenderImage>> {
     let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))?;
     let frames: smallvec::SmallVec<[_; 1]> = if decoder.has_animation() {
         // WhatsApp stickers have a transparent canvas, regardless of ANIM's
@@ -590,7 +574,7 @@ fn render_image_from_bytes(
     let image_data = Arc::unwrap_or_clone(data);
     let image = Image::from_bytes(format, image_data);
 
-    let img_el = img(ImageSource::Image(Arc::new(image)))
+    let img_el = img(RetainedImage::new(image).source(false))
         .w(px(width))
         .h(px(height))
         .object_fit(gpui::ObjectFit::Contain);
@@ -797,7 +781,7 @@ struct VideoProps {
     state: Option<VideoPlayerState>,
     frame: Option<Arc<RenderImage>>,
     /// Decoded once by the app. See `MediaProps`.
-    poster: Option<Arc<Image>>,
+    poster: Option<RetainedImage>,
 }
 
 fn render_video_player(
@@ -856,7 +840,7 @@ fn render_video_player(
                     .w_full()
                     .h_full()
                     .child(
-                        img(ImageSource::Image(cached))
+                        img(cached.source(false))
                             .w(px(display_w))
                             .h(px(display_h))
                             .object_fit(gpui::ObjectFit::Contain)
@@ -1019,6 +1003,7 @@ fn render_video_player(
 
 #[cfg(test)]
 mod tests {
+    use crate::retained_image::RetainedImage;
     use std::sync::Arc;
 
     use gpui::{InteractiveElement as _, Styled as _};
@@ -1090,7 +1075,7 @@ mod tests {
         struct StickerView {
             app: gpui::Entity<super::WhatsAppApp>,
             media: MediaContent,
-            cached: Option<Arc<gpui::Image>>,
+            cached: Option<RetainedImage>,
             canvas: f32,
             downloading: bool,
         }
@@ -1181,7 +1166,7 @@ mod tests {
                     media.height = Some(height);
                     media.downloadable = Some(downloadable.clone());
                     let cached = (state == 1 || state == 2 || state == 3).then(|| {
-                        Arc::new(gpui::Image::from_bytes(
+                        RetainedImage::new(gpui::Image::from_bytes(
                             if state == 1 {
                                 gpui::ImageFormat::Png
                             } else {
@@ -1255,20 +1240,16 @@ mod tests {
 
     struct StickerTestView {
         source: gpui::ImageSource,
-        image: Arc<gpui::Image>,
-        decoded: Option<Arc<gpui::RenderImage>>,
+        image: RetainedImage,
     }
 
     impl gpui::Render for StickerTestView {
         fn render(
             &mut self,
-            window: &mut gpui::Window,
-            cx: &mut gpui::Context<Self>,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
         ) -> impl gpui::IntoElement {
             // GPUI 0.3.10 associates assets with the view currently drawing.
-            self.decoded = window
-                .use_asset::<super::StickerDecoder>(&self.image, cx)
-                .and_then(Result::ok);
             gpui::img(self.source.clone())
                 .id("sticker-test")
                 .size_full()
@@ -1291,7 +1272,7 @@ mod tests {
             }
             at += 8 + size + size % 2;
         }
-        let image = Arc::new(gpui::Image::from_bytes(
+        let image = RetainedImage::new(gpui::Image::from_bytes(
             gpui::ImageFormat::Webp,
             media.data.to_vec(),
         ));
@@ -1300,7 +1281,6 @@ mod tests {
             StickerTestView {
                 source,
                 image: image.clone(),
-                decoded: None,
             }
         });
         let mut window = gpui::VisualTestContext::from_window(handle.into(), cx);
@@ -1313,7 +1293,7 @@ mod tests {
             window.refresh();
             window.draw(cx).clear(cx);
         });
-        let first = window.read(|cx| handle.read(cx).unwrap().decoded.clone().unwrap());
+        let first = window.read(|cx| handle.read(cx).unwrap().image.decoded(true, cx).unwrap());
         assert_eq!(first.frame_count(), 2);
         // Probe frame zero under the decoded image's texture id. Removing
         // textures before every draw prevents stale uploads hiding a restart.
@@ -1333,7 +1313,7 @@ mod tests {
                 window.update(|window, _| window.has_image_atlas_entry(&probe)),
                 frame % 2 == 0
             );
-            let next = window.read(|cx| handle.read(cx).unwrap().decoded.clone().unwrap());
+            let next = window.read(|cx| handle.read(cx).unwrap().image.decoded(true, cx).unwrap());
             assert!(Arc::ptr_eq(&first, &next));
         }
     }

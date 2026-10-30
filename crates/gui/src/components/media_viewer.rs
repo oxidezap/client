@@ -4,12 +4,13 @@
 //! not a panel, and a scrim that leaves the conversation half-readable
 //! underneath invites clicking through to it by accident.
 
+use crate::retained_image::RetainedImage;
 use std::sync::Arc;
 
 use gpui::StyledImage as _;
 use gpui::{
-    App, Entity, Image, ImageSource, InteractiveElement, IntoElement, ParentElement, RenderImage,
-    SharedString, StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _,
+    App, Entity, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString,
+    StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -36,7 +37,7 @@ pub struct ViewerProps {
     pub message: ChatMessage,
     /// The decoded image, when the app's cache has one. Video shows its
     /// current frame instead.
-    pub image: Option<Arc<Image>>,
+    pub image: Option<RetainedImage>,
     pub frame: Option<Arc<RenderImage>>,
     pub is_loading: bool,
     pub author: SharedString,
@@ -308,7 +309,7 @@ fn render_bar(
 
 /// The picture itself, contained so nothing is cropped.
 fn render_frame(
-    image: Option<Arc<Image>>,
+    image: Option<RetainedImage>,
     frame: Option<Arc<RenderImage>>,
     is_video: bool,
     is_loading: bool,
@@ -329,7 +330,7 @@ fn render_frame(
             .into_any_element();
     }
     if let Some(image) = image {
-        return img(ImageSource::Image(image))
+        return img(image.source(false))
             .max_w_full()
             .max_h_full()
             .object_fit(gpui::ObjectFit::Contain)

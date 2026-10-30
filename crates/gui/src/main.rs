@@ -21,6 +21,7 @@ mod assets;
 mod components;
 mod platform;
 mod responsive;
+mod retained_image;
 mod session;
 mod theme;
 mod utils;

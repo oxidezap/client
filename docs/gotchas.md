@@ -1344,6 +1344,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   composited frames and their delays, with transparent backgrounds and BGRA
   pixels. The identified `img` element owns playback and looping; keep its
   message id stable across renders.
+  Cache eviction also has to retire the GPUI asset: dropping an encoded
+  `Arc<Image>` alone leaves its decoded pixels in GPUI's global cache.
+  [Image asset ownership and its synthetic reproduction](status-image-retention.md)
+  explain why `RetainedImage` waits for both cache owners and painted elements.
 - **A conversation lets go of media it can fetch again, and only that.** A
   message holds its own bytes for as long as the row is loaded, so the two
   media budgets that exist bound what is *cached* rather than what the window

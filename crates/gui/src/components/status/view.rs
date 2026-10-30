@@ -5,12 +5,13 @@
 //! read is a bug wearing a feature's clothes, so this steps when the reader
 //! says so.
 
+use crate::retained_image::RetainedImage;
 use std::sync::Arc;
 
 use gpui::StyledImage as _;
 use gpui::{
-    App, Entity, Image, ImageSource, InteractiveElement as _, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, div, img, prelude::FluentBuilder as _,
+    App, Entity, InteractiveElement as _, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement as _, Styled, div, img, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -33,7 +34,7 @@ pub struct StatusViewProps {
     pub author_jid: String,
     pub author_name: SharedString,
     pub message: ChatMessage,
-    pub image: Option<Arc<Image>>,
+    pub image: Option<RetainedImage>,
     /// A video update's current decoded frame, when one has been produced.
     pub frame: Option<Arc<gpui::RenderImage>>,
     /// Which of the run is on screen, and how many there are.
@@ -231,7 +232,7 @@ fn render_update(props: &StatusViewProps, metrics: Metrics, cx: &App) -> impl In
                 .object_fit(gpui::ObjectFit::Contain)
                 .rounded(metrics.radius_lg())
                 .into_any_element(),
-            (None, Some(image)) => img(ImageSource::Image(image))
+            (None, Some(image)) => img(image.source(false))
                 .max_w_full()
                 .max_h_full()
                 .object_fit(gpui::ObjectFit::Contain)
