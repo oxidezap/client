@@ -267,6 +267,7 @@ fn generic_byte_keys_and_numeric_status_keep_the_legacy_behavior() {
             MapDeserializer::new(entries.into_iter()),
         ))
         .unwrap();
+        assert_eq!(legacy.id, Some(u64::MAX));
         assert_eq!(current.id, legacy.id);
         assert_eq!(current.result, legacy.result);
     }
@@ -319,6 +320,17 @@ impl<'de> serde::Deserializer<'de> for GenericValue {
             Self::Bytes(value) => visitor.visit_borrowed_bytes(value),
         }
     }
+    fn deserialize_u64<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self {
+            Self::Json(Value::String(value)) => {
+                visitor.visit_u64(value.parse::<u64>().map_err(serde::de::Error::custom)?)
+            }
+            other => serde::Deserializer::deserialize_any(other, visitor),
+        }
+    }
     fn deserialize_option<V: serde::de::Visitor<'de>>(
         self,
         visitor: V,
@@ -329,7 +341,7 @@ impl<'de> serde::Deserializer<'de> for GenericValue {
         }
     }
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u128 f32 f64 char str string bytes byte_buf
         unit unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier ignored_any
     }
 }
@@ -378,6 +390,65 @@ fn generic_byte_tag_values_match_the_reference_acceptance() {
                 (Ok(base), Ok(head)) => assert_eq!(base, head),
                 (Err(_), Err(_)) => {}
                 (base, head) => panic!("byte tag acceptance changed: base={base:?}, head={head:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_key_identifier_restrictions_are_not_bypassed() {
+    use serde::Deserialize;
+    use serde::de::value::{MapAccessDeserializer, MapDeserializer};
+    // Value's identifier method rejects a numeric key even though its any
+    // method accepts it. Keep the old entry point, not just the resulting type.
+    let entries = vec![
+        (json!(7), json!(null)),
+        (json!("status"), json!("ok")),
+        (json!("type"), json!("ack")),
+    ];
+    let base = cases::LegacyEnvelope::deserialize(MapAccessDeserializer::new(
+        MapDeserializer::new(entries.clone().into_iter()),
+    ));
+    let head = ResponseEnvelope::deserialize(MapAccessDeserializer::new(MapDeserializer::new(
+        entries.into_iter(),
+    )));
+    assert!(base.is_err());
+    assert!(head.is_err());
+}
+#[test]
+fn generic_id_option_and_integer_hints_match_the_reference() {
+    use serde::Deserialize;
+    use serde::de::value::{MapAccessDeserializer, MapDeserializer};
+    for key in [json!("id"), json!(0)] {
+        for id in [
+            json!("17"),
+            json!("18446744073709551615"),
+            json!(null),
+            json!("invalid"),
+            json!("18446744073709551616"),
+        ] {
+            let entries = vec![
+                (GenericKey(key.clone()), GenericValue::Json(id.clone())),
+                (GenericKey(json!("status")), GenericValue::Json(json!("ok"))),
+                (GenericKey(json!("type")), GenericValue::Json(json!("ack"))),
+            ];
+            let base = cases::LegacyEnvelope::deserialize(MapAccessDeserializer::new(
+                MapDeserializer::new(entries.clone().into_iter()),
+            ))
+            .map(|v| ResponseEnvelope {
+                id: v.id,
+                result: v.result,
+            });
+            let head = ResponseEnvelope::deserialize(MapAccessDeserializer::new(
+                MapDeserializer::new(entries.into_iter()),
+            ));
+            if key == json!("id") && id == json!("17") {
+                assert_eq!(base.as_ref().unwrap().id, Some(17));
+            }
+            match (base, head) {
+                (Ok(base), Ok(head)) => assert_eq!(base, head),
+                (Err(base), Err(head)) => assert_eq!(base.to_string(), head.to_string()),
+                (base, head) => panic!("id hint changed for {id}: base={base:?}, head={head:?}"),
             }
         }
     }
