@@ -7,6 +7,8 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
+use diesel::query_builder::{AstPass, Query, QueryFragment, QueryId};
+use diesel::sqlite::Sqlite;
 use log::warn;
 use wacore_binary::jid::{Jid, JidExt};
 
@@ -38,6 +40,39 @@ impl MessageReadState {
 /// SQLite's compiled-in parameter ceiling is 999 on older builds; a page well
 /// under it costs one extra statement per fifty chats at most.
 pub(crate) const BIND_CHUNK: usize = 400;
+
+/// A runtime integer limit for the timestamp-indexed message pages.
+///
+/// Bundled SQLite 3.53 specializes a bare `LIMIT ?` during `sqlite3_step`,
+/// recompiling even a reused statement. CAST keeps the i64 bound at runtime.
+/// It also prevents limit-sensitive planning, so this is scoped to the page
+/// readers whose plans and pooled workloads are measured in
+/// `docs/sqlite-page-limit-performance.md`, rather than every limited query.
+struct PageLimit<Q> {
+    query: Q,
+    limit: i64,
+}
+
+impl<Q: Query> Query for PageLimit<Q> {
+    type SqlType = Q::SqlType;
+}
+
+impl<Q> QueryId for PageLimit<Q> {
+    type QueryId = ();
+    const HAS_STATIC_QUERY_ID: bool = false;
+}
+
+impl<Q: QueryFragment<Sqlite>> QueryFragment<Sqlite> for PageLimit<Q> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        self.query.walk_ast(out.reborrow())?;
+        out.push_sql(" LIMIT CAST(");
+        out.push_bind_param::<diesel::sql_types::BigInt, _>(&self.limit)?;
+        out.push_sql(" AS INTEGER)");
+        Ok(())
+    }
+}
+
+impl<Q> RunQueryDsl<SqliteConnection> for PageLimit<Q> {}
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(crate::types::clamp_ms(ms))
@@ -1078,11 +1113,13 @@ fn fill_unique(
     let mut before = before;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
-        let rows: Vec<MessageRow> = page_query(device_id, keys, before.as_ref())
-            .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
-            .limit(wanted)
-            .load(conn)
-            .map_err(db_err)?;
+        let rows: Vec<MessageRow> = PageLimit {
+            query: page_query(device_id, keys, before.as_ref())
+                .order((dsl::timestamp_ms.desc(), dsl::id.desc())),
+            limit: wanted,
+        }
+        .load(conn)
+        .map_err(db_err)?;
         let exhausted = (rows.len() as i64) < wanted;
         before = rows.last().map(|row| MessageCursor {
             timestamp_ms: row.timestamp_ms,
@@ -1154,11 +1191,13 @@ fn fill_unique_after(
     let mut after = after;
     while (kept.len() as i64) < limit {
         let wanted = limit - kept.len() as i64;
-        let rows: Vec<MessageRow> = page_query_after(device_id, keys, &after)
-            .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
-            .limit(wanted)
-            .load(conn)
-            .map_err(db_err)?;
+        let rows: Vec<MessageRow> = PageLimit {
+            query: page_query_after(device_id, keys, &after)
+                .order((dsl::timestamp_ms.asc(), dsl::id.asc())),
+            limit: wanted,
+        }
+        .load(conn)
+        .map_err(db_err)?;
         let exhausted = (rows.len() as i64) < wanted;
         if let Some(last) = rows.last() {
             after = MessageCursor {
@@ -2594,6 +2633,69 @@ mod tests {
     use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
     const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+    #[test]
+    fn page_limit_preserves_integer_domain_and_one_sql_shape() {
+        use crate::schema::messages::dsl;
+        use diesel::connection::SimpleConnection;
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute(
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, device_id INTEGER NOT NULL, \
+             chat_jid TEXT NOT NULL, timestamp_ms BIGINT NOT NULL); \
+             CREATE INDEX idx_messages_chat_time ON messages(device_id,chat_jid,timestamp_ms); \
+             INSERT INTO messages VALUES \
+             (-9223372036854775808,1,'primary',-9223372036854775808), \
+             (1,1,'primary',10),(2,1,'alias',10),(3,2,'primary',10), \
+             (9223372036854775807,1,'primary',9223372036854775807)",
+        )
+        .unwrap();
+        let cursor = super::MessageCursor {
+            timestamp_ms: 10,
+            seq: 2,
+        };
+        let keys = vec![
+            "primary".to_string(),
+            "alias".to_string(),
+            "x'); DROP TABLE messages; --".to_string(),
+        ];
+        for forward in [false, true] {
+            let query = || {
+                if forward {
+                    super::page_query_after(1, &keys, &cursor)
+                        .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
+                        .select(dsl::id)
+                } else {
+                    super::page_query(1, &keys, Some(&cursor))
+                        .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
+                        .select(dsl::id)
+                }
+            };
+            let mut sql_shape = None;
+            for limit in [
+                i64::MIN,
+                -1,
+                0,
+                1,
+                8,
+                50,
+                400,
+                i32::MAX as i64,
+                i32::MAX as i64 + 1,
+                i64::MAX,
+            ] {
+                let expected: Vec<i64> = query().limit(limit).load(&mut conn).unwrap();
+                let limited = super::PageLimit {
+                    query: query(),
+                    limit,
+                };
+                let sql = rendered(&limited);
+                assert!(sql.ends_with(" LIMIT CAST(? AS INTEGER)"), "{sql}");
+                assert_eq!(sql_shape.get_or_insert_with(|| sql.clone()), &sql);
+                let actual: Vec<i64> = limited.load(&mut conn).unwrap();
+                assert_eq!(actual, expected, "forward={forward}, limit={limit}");
+            }
+        }
+    }
 
     #[derive(diesel::QueryableByName)]
     struct PlanRow {

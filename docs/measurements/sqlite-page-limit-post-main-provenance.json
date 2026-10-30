@@ -1,0 +1,38 @@
+{
+  "base_application": "cbacb4ee0b0aa72e778045e1f25c06e38e2adc7d",
+  "head_application": "7ca608a5b3242b9ca97753b78846cabee61e9cf4",
+  "query_resolution": "byte-identical to reviewed implementation at 10ecd514cee9ca29c840e9dc81f97fa6d9cc11f3",
+  "same_harness_snapshot": "92ecea4",
+  "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+  "sqlite": "3.53.2",
+  "profile": "workspace release, all features, same flags, ordinary target/cache",
+  "timing_iterations": 256,
+  "allocation_iterations": 32,
+  "pairs_per_case_and_mode": 7,
+  "cases": [
+    "attach",
+    "history",
+    "reactions"
+  ],
+  "cpu_affinity": [
+    0
+  ],
+  "timing_observations": 42,
+  "binary_sha256": {
+    "base": "0e34c5fa90a16de4a8b1bfe5a2004e373dc497fc02ba8d7a076b9b02042c26bb",
+    "head": "bb5c085c8ee530232b3c9b386d12c1f15ece9f9b05eee797ea9506102cca59f9"
+  },
+  "source_sha256": {
+    "crates/chat-store/tests/page_limit_profile.rs": "bf3f89ec1ee7b3c705ecf0fd44ecc0e3d119cf6f4448bd0ec4548aae5898a5b8",
+    "crates/chat-store/src/queries.rs": "67812e03d6cca74e1fd83481fac71881b5afa287c405990c0a083c1df030bf23",
+    "scripts/measure-sqlite-page-limit.py": "f6963490c2f5a1e009410d7cbd2c6c219f542e20a32de1fe0531035acd52cbc3"
+  },
+  "memory_scope": "Rust allocation/reallocation requests and full requested sizes; excludes SQLite C allocations; no live-heap or RSS improvement claimed",
+  "allocation_observations": 42,
+  "attach_rust_allocation_requests_per_batch": {
+    "base": 25585.03125,
+    "head": 25537.03125
+  },
+  "attach_rust_requested_bytes_delta_per_batch": 816.0,
+  "attach_rust_requested_bytes_delta_percent": 0.03476181235991171
+}
