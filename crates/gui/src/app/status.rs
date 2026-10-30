@@ -484,7 +484,9 @@ impl WhatsAppApp {
             return;
         };
         if self.active_media.message_id() == Some(id.as_str()) {
-            self.stop_current_media();
+            self.stop_hidden_media();
+        } else if let Some(player) = self.video_players.get_mut(&id) {
+            player.stop_hidden();
         }
         if self.pending_media_request.as_deref() == Some(id.as_str()) {
             self.pending_media_request = None;
