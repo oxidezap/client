@@ -45,7 +45,7 @@ impl<'de, D: serde::Deserializer<'de>> serde::Deserializer<'de> for ResponseDese
         self.0.is_human_readable()
     }
     fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
-        self.0.deserialize_any(ResponseVisitor(visitor))
+        self.0.deserialize_map(ResponseVisitor(visitor))
     }
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf

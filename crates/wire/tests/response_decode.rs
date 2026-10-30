@@ -203,6 +203,12 @@ fn generic_map_keys_match_the_previous_flattened_decoder() {
     use serde::Deserialize;
     use serde::de::value::{MapAccessDeserializer, MapDeserializer};
     let keys = [
+        json!(0),
+        json!(1),
+        json!(2),
+        json!(u64::MAX),
+        json!(-1),
+        json!(1.5),
         json!(7),
         json!(true),
         json!(null),
@@ -263,5 +269,116 @@ fn generic_byte_keys_and_numeric_status_keep_the_legacy_behavior() {
         .unwrap();
         assert_eq!(current.id, legacy.id);
         assert_eq!(current.result, legacy.result);
+    }
+}
+
+struct MapOnly<D>(D);
+impl<'de, D: serde::Deserializer<'de>> serde::Deserializer<'de> for MapOnly<D> {
+    type Error = D::Error;
+    fn deserialize_any<V: serde::de::Visitor<'de>>(
+        self,
+        _visitor: V,
+    ) -> Result<V::Value, D::Error> {
+        Err(serde::de::Error::custom(
+            "root deserialize_any is unavailable",
+        ))
+    }
+    fn deserialize_map<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
+        self.0.deserialize_map(visitor)
+    }
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+        option unit unit_struct newtype_struct seq tuple tuple_struct struct enum identifier ignored_any
+    }
+}
+#[test]
+fn root_deserializers_that_support_maps_keep_working_without_deserialize_any() {
+    use serde::Deserialize;
+    let frame = r#"{"id":1,"status":"ok","type":"ack"}"#;
+    let mut base = serde_json::Deserializer::from_str(frame);
+    let base = cases::LegacyEnvelope::deserialize(MapOnly(&mut base)).unwrap();
+    let mut head = serde_json::Deserializer::from_str(frame);
+    let head = ResponseEnvelope::deserialize(MapOnly(&mut head)).unwrap();
+    assert_eq!(base.id, head.id);
+    assert_eq!(base.result, head.result);
+}
+
+#[derive(Clone)]
+enum GenericValue {
+    Json(Value),
+    Bytes(&'static [u8]),
+}
+impl<'de> serde::Deserializer<'de> for GenericValue {
+    type Error = serde_json::Error;
+    fn deserialize_any<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self {
+            Self::Json(value) => serde::Deserializer::deserialize_any(value, visitor),
+            Self::Bytes(value) => visitor.visit_borrowed_bytes(value),
+        }
+    }
+    fn deserialize_option<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self {
+            Self::Json(Value::Null) => visitor.visit_none(),
+            other => visitor.visit_some(other),
+        }
+    }
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+        unit unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier ignored_any
+    }
+}
+impl<'de> serde::de::IntoDeserializer<'de, serde_json::Error> for GenericValue {
+    type Deserializer = Self;
+    fn into_deserializer(self) -> Self {
+        self
+    }
+}
+#[test]
+fn generic_byte_tag_values_match_the_reference_acceptance() {
+    use serde::Deserialize;
+    use serde::de::value::{BorrowedBytesDeserializer, MapAccessDeserializer, MapDeserializer};
+    for status in [
+        GenericValue::Json(json!("ok")),
+        GenericValue::Bytes(b"ok"),
+        GenericValue::Json(json!(0)),
+    ] {
+        for kind in [
+            GenericValue::Json(json!("ack")),
+            GenericValue::Bytes(b"ack"),
+            GenericValue::Json(json!(0)),
+        ] {
+            let entries = vec![
+                (
+                    BorrowedBytesDeserializer::<serde_json::Error>::new(b"status"),
+                    status.clone(),
+                ),
+                (BorrowedBytesDeserializer::new(b"type"), kind),
+                (
+                    BorrowedBytesDeserializer::new(b"unknown"),
+                    GenericValue::Bytes(b"\xff"),
+                ),
+            ];
+            let base = cases::LegacyEnvelope::deserialize(MapAccessDeserializer::new(
+                MapDeserializer::new(entries.clone().into_iter()),
+            ))
+            .map(|v| ResponseEnvelope {
+                id: v.id,
+                result: v.result,
+            });
+            let head = ResponseEnvelope::deserialize(MapAccessDeserializer::new(
+                MapDeserializer::new(entries.into_iter()),
+            ));
+            match (base, head) {
+                (Ok(base), Ok(head)) => assert_eq!(base, head),
+                (Err(_), Err(_)) => {}
+                (base, head) => panic!("byte tag acceptance changed: base={base:?}, head={head:?}"),
+            }
+        }
     }
 }
