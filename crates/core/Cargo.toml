@@ -42,3 +42,12 @@ workspace = true
 [dev-dependencies]
 # The call snapshot crosses the daemon socket; the round trip is a test.
 serde_json = { workspace = true, features = ["std"] }
+
+# Exercise the actual build-time visitor against all runtime regex categories.
+# The backend already uses this dependency; this edge is test-only.
+[dev-dependencies.regex]
+version = "1.7"
+
+[[test]]
+name = "phone_metadata_build"
+path = "../../vendor/phonenumber/build.rs"
