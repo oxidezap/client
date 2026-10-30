@@ -84,7 +84,9 @@ static DECODE_JOBS: std::sync::LazyLock<std::sync::Arc<DecodeQueue>> =
                                 .unwrap_or(0);
                             jobs.remove(index).expect("nonempty decode queue")
                         };
-                        (job.run)();
+                        // A bad image must not permanently remove a fixed worker.
+                        // Unwinding drops the sender and releases its admission permit.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.run));
                     }
                 })
                 .expect("start avatar decoder");
@@ -106,12 +108,13 @@ pub(super) async fn decode_avatar(
         crate::session::media::decode_avatar(&bytes)
     })
     .await
+    .flatten()
 }
 
 pub(super) async fn decode_work<T: Send + 'static>(
     priority: super::DecodePriority,
     work: impl FnOnce() -> T + Send + 'static,
-) -> T {
+) -> Option<T> {
     // Count running and queued jobs together. Producers await admission
     // without blocking the async executor.
     let permit = DECODE_JOBS
@@ -132,13 +135,10 @@ pub(super) async fn decode_work<T: Send + 'static>(
             }),
         });
     DECODE_JOBS.ready.notify_one();
-    let result = receive
-        .recv()
-        .await
-        .expect("avatar decoder returns a result");
+    let result = receive.recv().await.ok()?;
     #[cfg(test)]
     DECODE_COMPLETED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    result
+    Some(result)
 }
 
 #[cfg(test)]
@@ -202,6 +202,23 @@ mod tests {
 
     #[test]
     fn decoding_yields_the_executor_and_bounds_cpu_jobs() {
+        // More panics than workers must neither exhaust the pool nor leak slots.
+        for _ in 0..super::super::MAX_PERSISTENT_READS + 2 {
+            let result = smol::block_on(smol::future::or(
+                decode_work(
+                    super::super::decode_priority(super::super::DemandPriority::High),
+                    || panic!("synthetic decoder panic"),
+                ),
+                async {
+                    smol::Timer::after(Duration::from_secs(5)).await;
+                    Some(())
+                },
+            ));
+            assert_eq!(
+                result, None,
+                "panic must return failure and release admission"
+            );
+        }
         let release = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
