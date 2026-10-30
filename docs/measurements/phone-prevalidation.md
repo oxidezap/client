@@ -3,6 +3,8 @@
 Measured on 2026-10-30, Linux x86_64, rustc 1.99.1, release profile.
 Base is client `33108ce` with core `af2e018c`. Head changes only the phone
 metadata validation path, its local source patch, and regression/probe coverage.
+The performance CSV records runtime patch `30e3e05`; the follow-up adds tests and
+documentation without changing runtime phone parsing or formatting.
 No account, session database, captured number or live connection was used.
 
 ## Result
@@ -13,6 +15,12 @@ than again when the default database initializes. Regex compilation remains lazy
 through the original 100-entry LRU. The library already compiled regexes lazily;
 the expensive cold work removed here was syntax validation, not compilation of
 all countries' regexes.
+
+The new build check uses `regex::RegexBuilder::ignore_whitespace(true).build()`.
+The previous `CachedRegexBuilder::build()` check uses the `regex-syntax` 0.6
+`Parser::new().parse()` syntax parser, without applying the builder whitespace
+option. These are not literally the same validator. The retained bundled XML
+passes both, and the runtime engine used for actual matching is unchanged.
 
 15 fresh processes per revision and mode, alternating order, after discarding
 one pair. Timing runs disable allocation counters. Heap runs enable them.
@@ -56,14 +64,29 @@ all-zero/all-nine national strings. It includes invalid calling codes and
 unusual lengths, not just ordinary valid numbers. Every case also asserts that
 a device suffix produces the same label. Base and head outputs are byte-identical,
 SHA-256 `feeb2545c22b6bf45f7d223a459045c38af3317013c9049dc74a30d7874966d5`.
-The identical probe source was used with both library versions.
+The identical probe source was used with both library versions. Zero/nine
+strings do not exercise every formatting rule or establish exhaustive
+international equivalence. The separate `--representative` corpus adds synthetic
+fixed/mobile, toll-free, variable-length, Italian leading-zero, shared calling
+code and non-geographic cases, alongside PN/LID, device, invalid-code, short and
+malformed inputs. These 24 cases also produced byte-identical base/head output,
+SHA-256 `b33de771cfc26c144e79bec9894cc95d768aed609adf90a3435319563b0a9476`.
+The formatted cases have pinned baseline outputs in core regression tests.
+This corpus also remains representative, not exhaustive.
 
 Core regressions cover NANPA and Ofcom fictional-use numbers, multiple calling
 codes, invalid-code fallback, resolved/offered labels, LID rejection and PN
 aliases. Caller-provided malformed metadata still fails runtime validation.
-All core tests and doctests pass. A fault-injection check replaced one bundled
-national-number regex with `[` and ran the actual compiled build script: it
-failed with `invalid bundled phone metadata regex`, exit 101, before emitting
+The repeatable `phone_metadata_build` integration target compiles the actual
+vendored `build.rs` as its test source. Its 25 fault-injection positions cover
+all 16 descriptors, all three optional regexes, national/international format
+patterns and each of two leading-digit entries in both format lists. Every
+injected `[` must fail both the original checked runtime path and the build
+visitor. A deliberate mutation removing `mobile` from the visitor makes the
+test fail with `mobile: build visitor omitted invalid regex`. The whole bundled
+XML must pass both paths. This runs in normal workspace tests/CI and can be
+repeated with `cargo test -p oxidezap-core --test phone_metadata_build`.
+The earlier executable build-script fault injection also failed before emitting
 `database.bin`.
 
 The bundled XML is byte-identical to the published 0.3.10+9.0.33 crate. Among
@@ -77,7 +100,7 @@ provenance, maintenance requirements and removal condition are documented in
 
 Build head and base with the repository's release profile in the same environment.
 Copy each binary before a subsequent build can overwrite it. The base checkout
-needs the same updated probe source solely for the equivalence mode.
+needs the same updated probe source for both functional-comparison modes.
 
 ```sh
 git worktree add --detach /tmp/phone-base 33108ce
@@ -92,8 +115,15 @@ python3 scripts/measure-phone-profile.py /tmp/phone-usage /tmp/phone-base-probe 
 /tmp/phone-base-probe --equivalence > /tmp/phone-base-labels
 /tmp/phone-head --equivalence > /tmp/phone-head-labels
 cmp /tmp/phone-base-labels /tmp/phone-head-labels
+/tmp/phone-base-probe --representative > /tmp/phone-base-representative
+/tmp/phone-head --representative > /tmp/phone-head-representative
+cmp /tmp/phone-base-representative /tmp/phone-head-representative
+cargo test -p oxidezap-core --test phone_metadata_build
 cargo test -p oxidezap-core --all-features
 cargo clippy -p oxidezap-core --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+cargo machete
+cargo check --locked -p oxidezap-audio --target wasm32-unknown-unknown
 ```
 
 This investigation used the explicitly authorized local alternative to CodSpeed.

@@ -234,12 +234,25 @@ mod tests {
     }
     #[test]
     fn phone_metadata_patch_preserves_labels_and_error_fallback() {
-        // NANPA and Ofcom reserved fictional numbers. Device suffixes never
-        // participate in international formatting.
+        // NANPA/Ofcom fictional-use fixtures plus synthetic formatting cases.
+        // Device suffixes never participate in international formatting.
         for (jid, expected) in [
             ("12025550123:7@s.whatsapp.net", "+1 202-555-0123"),
             ("442079460000@s.whatsapp.net", "+44 20 7946 0000"),
             ("447700900123@s.whatsapp.net", "+44 7700 900123"),
+            ("18005550123@s.whatsapp.net", "+1 800-555-0123"),
+            ("61491570156@s.whatsapp.net", "+61 491 570 156"),
+            ("390600000000@s.whatsapp.net", "+39 06 0000 0000"),
+            ("552120000000@s.whatsapp.net", "+55 21 2000-0000"),
+            ("5521900000000@s.whatsapp.net", "+55 21 90000-0000"),
+            ("49300000000@s.whatsapp.net", "+49 30 0000000"),
+            ("4930000000000@s.whatsapp.net", "+49 30 000000000"),
+            ("33100000000@s.whatsapp.net", "+33 1 00 00 00 00"),
+            ("911100000000@s.whatsapp.net", "+91 11 0000 0000"),
+            ("81300000000@s.whatsapp.net", "+81 3-0000-0000"),
+            ("74950000000@s.whatsapp.net", "+7 495 000-00-00"),
+            ("77000000000@s.whatsapp.net", "+7 700 000 0000"),
+            ("80010000000@s.whatsapp.net", "+800 1000 0000"),
             ("9990000000@s.whatsapp.net", "+9990000000"),
         ] {
             assert_eq!(format_phone_jid(jid).as_deref(), Some(expected));

@@ -37,6 +37,10 @@ keywords = [
 license = "Apache-2.0"
 repository = "https://github.com/whisperfish/rust-phonenumber"
 
+# serde_derive expands references to serde in the retained loader module.
+[package.metadata.cargo-machete]
+ignored = ["serde"]
+
 [lib]
 name = "phonenumber"
 path = "src/lib.rs"
@@ -81,14 +85,8 @@ version = "2.0"
 [dev-dependencies.anyhow]
 version = "1"
 
-[dev-dependencies.criterion]
-version = ">=0.4, <=0.5"
-
 [dev-dependencies.doc-comment]
 version = "0.3"
-
-[dev-dependencies.proptest]
-version = "1.0.0"
 
 [dev-dependencies.rstest]
 version = "0.26"
