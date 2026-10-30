@@ -285,7 +285,12 @@ const PONG_WITHOUT_PERMISSION: &str = r#"(module
 )"#;
 
 fn spins() -> String {
-    versioned(SPINS)
+    // Wasmi charges const operators before folding constant/drop pairs away.
+    // Burn the real per-call fuel budget with fewer interpreter dispatches:
+    // a bare branch needs 50 million debug dispatches and races the 10 s
+    // publication deadline on a busy CI runner. The loop, fuel budget,
+    // deadline and fuel-trap assertion remain unchanged.
+    versioned(&SPINS.replace("$FUEL_WORK", &"i32.const 0 drop\n".repeat(64)))
 }
 
 const SPINS: &str = r#"(module
@@ -293,7 +298,7 @@ const SPINS: &str = r#"(module
   (memory (export "memory") 1)
   (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (func (export "oxi_init") (result i32) (call $subscribe (i64.const 2)) (i32.const 0))
-  (func (export "oxi_on_event") (param i32 i32) (result i32) (loop (br 0)) (i32.const 0))
+  (func (export "oxi_on_event") (param i32 i32) (result i32) (loop $FUEL_WORK (br 0)) (i32.const 0))
 )"#;
 
 /// Asks for one page and then for far more than the limit allows.
@@ -606,6 +611,37 @@ fn a_command_outside_the_declared_capabilities_never_reaches_the_daemon() {
     assert!(surface.roots.is_empty(), "and it may not draw");
     assert!(surface.capabilities.is_empty());
     assert!(surface.is_running(), "but it is not stopped for trying");
+}
+
+/// Keep the original empty-loop case covered independently of the cheaper
+/// host fixture: adding billed work must not hide a free-branch regression.
+#[test]
+fn a_bare_branch_loop_consumes_fuel() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let mut config = wasmi::Config::default();
+        config.consume_fuel(true);
+        let engine = wasmi::Engine::new(&config);
+        let bytes = wat::parse_str("(module (func (export \"spin\") (loop (br 0))))")
+            .expect("valid bare-loop fixture");
+        let module = wasmi::Module::new(&engine, &bytes[..]).expect("the module validates");
+        let mut store = wasmi::Store::new(&engine, ());
+        store.set_fuel(32).expect("fuel metering is enabled");
+        let instance = wasmi::Linker::new(&engine)
+            .instantiate_and_start(&mut store, &module)
+            .expect("the module has no start function");
+        let spin = instance.get_typed_func::<(), ()>(&store, "spin").unwrap();
+        let error = spin
+            .call(&mut store, ())
+            .expect_err("the loop exhausts fuel");
+        tx.send(error.as_trap_code()).unwrap();
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("bare branches must consume fuel"),
+        Some(wasmi::TrapCode::OutOfFuel)
+    );
+    worker.join().expect("the fuel probe completed");
 }
 
 /// The number that makes running a stranger's code in this process
