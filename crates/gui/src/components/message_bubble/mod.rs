@@ -14,11 +14,12 @@ mod quote;
 mod reactions;
 mod system;
 
+use crate::retained_image::RetainedImage;
 use std::sync::Arc;
 
 use gpui::{
-    App, Entity, Image, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString,
-    Styled, div, prelude::FluentBuilder as _,
+    App, Entity, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString, Styled,
+    div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -28,8 +29,8 @@ use gpui_component::{Sizable as _, h_flex, v_flex};
 pub use audio::SPEEDS;
 pub use system::render_encryption_notice;
 
-pub(crate) use media::sticker_payload_is_valid;
 use media::{MediaProps, render_media_content};
+pub(crate) use media::{decode_sticker, sticker_payload_is_valid};
 use poll::render_poll;
 use quote::render_quote;
 use reactions::{render_hover_actions, render_reaction_picker, render_reactions};
@@ -75,7 +76,7 @@ pub struct BubbleProps {
     pub starts_run: bool,
     pub video_player_state: Option<VideoPlayerState>,
     pub video_frame: Option<Arc<RenderImage>>,
-    pub decoded_image: Option<Arc<Image>>,
+    pub decoded_image: Option<RetainedImage>,
     /// Where this clip's playback is, when this clip is the one playing.
     ///
     /// Read out by the list rather than looked up here: the virtual list has

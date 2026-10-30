@@ -1305,7 +1305,7 @@ impl WhatsAppApp {
         message_id: &str,
         media: &MediaContent,
         cx: &App,
-    ) -> Option<Arc<Image>> {
+    ) -> Option<RetainedImage> {
         let (data, format) = (&media.data, mime_to_image_format(&media.mime_type)?);
 
         // Keyed by the id *and* what the bytes are, because a message's bytes
@@ -1353,9 +1353,7 @@ impl WhatsAppApp {
                     }
                     let last = cache.len() - 1;
                     cache.move_index(at, last);
-                    return cache
-                        .get_index(last)
-                        .map(|(_, (_, image))| Arc::clone(image));
+                    return cache.get_index(last).map(|(_, (_, image))| image.clone());
                 }
             }
         }
@@ -1368,7 +1366,7 @@ impl WhatsAppApp {
             return None;
         }
 
-        let image = Arc::new(Image::from_bytes(format, data.to_vec()));
+        let image = RetainedImage::new(Image::from_bytes(format, data.to_vec()));
 
         // What is on screen right now, which may not be evicted whatever the
         // order says: dropping it is a rebuild inside the same frame.
@@ -1403,7 +1401,7 @@ impl WhatsAppApp {
         // entries older than itself — a rebuild, which is the thing this
         // whole path exists to avoid.
         cache.shift_remove(message_id);
-        cache.insert(message_id.to_string(), (cached, Arc::clone(&image)));
+        cache.insert(message_id.to_string(), (cached, image.clone()));
         Some(image)
     }
 

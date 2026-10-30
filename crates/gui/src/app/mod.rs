@@ -410,6 +410,7 @@ use crate::components::{
     AccountSummary, InputAreaEvent, InputAreaView, PastePreviewProps, ReplyDraft,
     new_timeline_state, render_paste_preview,
 };
+use crate::retained_image::RetainedImage;
 use log::{debug, error, info, warn};
 use wacore_binary::jid::{Jid, JidExt, observe_str};
 
@@ -490,8 +491,8 @@ const _: () = assert!(MIN_DECODED_IMAGES < MAX_DECODED_IMAGES);
 ///
 /// The second half of [`DECODED_IMAGE_BUDGET`], and not redundant with it:
 /// what this cache measures is the *encoded* payload, and what it keeps alive
-/// is the decoded one. `gpui` holds the `RenderImage` against the `Arc<Image>`
-/// this map is what retains, and nothing here can see how large that is
+/// is the decoded one. `RetainedImage` owns GPUI's asset and its atlas lifetime,
+/// and nothing here can see how large the decoded image is
 /// without decoding the picture to find out. A sticker, a screenshot or a
 /// flat-colour PNG is a few kilobytes encoded and megabytes of RGBA, so a byte
 /// budget alone admits hundreds of them — which is the bound the count was
@@ -1007,7 +1008,7 @@ pub struct WhatsAppApp {
     /// stable across a *different* picture under the same id.
     /// Uses RefCell for interior mutability since we need to cache during immutable render.
     /// Uses IndexMap to maintain insertion order for deterministic FIFO eviction.
-    decoded_images: RefCell<IndexMap<String, (Cached, Arc<Image>)>>,
+    decoded_images: RefCell<IndexMap<String, (Cached, RetainedImage)>>,
     sticker_validation: RefCell<IndexMap<String, StickerValidation>>,
     /// Cache of message list data per chat to avoid expensive recomputation on every render.
     /// Key is the chat JID, value is the cached data.
