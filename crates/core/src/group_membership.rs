@@ -117,8 +117,8 @@ impl GroupMembership {
         let (action, participants) = match &*update.action {
             A::Add { participants, .. } => (MembershipAction::Add, participants),
             A::Remove { participants, .. } => (MembershipAction::Remove, participants),
-            A::Promote { participants } => (MembershipAction::Promote, participants),
-            A::Demote { participants } => (MembershipAction::Demote, participants),
+            A::Promote { participants, .. } => (MembershipAction::Promote, participants),
+            A::Demote { participants, .. } => (MembershipAction::Demote, participants),
             _ => return None,
         };
         Some(Self {

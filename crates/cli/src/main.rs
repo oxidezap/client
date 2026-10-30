@@ -65,9 +65,9 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
             let shell = match comp.shell.as_str() {
-                "bash" => usage::complete::Shell::Bash,
-                "zsh" => usage::complete::Shell::Zsh,
-                _ => usage::complete::Shell::Fish,
+                "bash" => usage_rs::complete::Shell::Bash,
+                "zsh" => usage_rs::complete::Shell::Zsh,
+                _ => usage_rs::complete::Shell::Fish,
             };
             print!("{}", OxidezapCli::completion_script(shell));
             return ExitCode::SUCCESS;

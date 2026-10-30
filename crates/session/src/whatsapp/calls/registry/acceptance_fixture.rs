@@ -276,7 +276,7 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
             case,
             OutgoingAcceptCase::EarlyVideo | OutgoingAcceptCase::Ended | OutgoingAcceptCase::Flood
         );
-    let injection = early.then(|| {
+    let mut injection = early.then(|| {
         tokio::spawn({
             let fixture = fixture.clone();
             let accept = accept.clone();
@@ -285,7 +285,19 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
             }
         })
     });
-    if early {
+    if early && wrong_user {
+        // The library now authenticates the answer before selecting a device.
+        // A spoofed early answer completes without mutating the pending call.
+        injection.take().unwrap().await.unwrap();
+        assert!(
+            fixture
+                .call_snapshot(&id)
+                .unwrap()
+                .answering_device
+                .is_none()
+        );
+        assert!(!starting.is_finished());
+    } else if early {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while fixture
                 .call_snapshot(&id)
@@ -297,7 +309,9 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!("{case:?}: early answering device was not observed: {error}")
+        });
         assert!(!starting.is_finished());
     }
     offer.complete().unwrap();
@@ -352,7 +366,8 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
         );
     }
     let mut cursor = 0;
-    let mut early_dispatch = early.then(|| Box::pin(dispatch(&fixture, &mut cursor, &calls, &ui)));
+    let mut early_dispatch =
+        (early && !wrong_user).then(|| Box::pin(dispatch(&fixture, &mut cursor, &calls, &ui)));
     if let Some(dispatching) = &mut early_dispatch {
         assert!(
             whatsapp_rust::futures::poll!(dispatching.as_mut()).is_pending(),
@@ -460,15 +475,13 @@ pub async fn outgoing_accept_events(case: OutgoingAcceptCase) -> Vec<UiEvent> {
         "the watcher must drain queued events"
     );
     if wrong_user {
-        assert_eq!(
+        assert!(
             fixture
                 .call_snapshot(&id)
                 .unwrap()
                 .answering_device
-                .unwrap()
-                .user
-                .as_str(),
-            "999999999999999"
+                .is_none(),
+            "{case:?}: an unauthenticated answer must not select a device"
         );
     } else if !matches!(case, OutgoingAcceptCase::Ended) {
         assert_eq!(handle.peer_jid(), fixture.peer().clone().with_device(2));

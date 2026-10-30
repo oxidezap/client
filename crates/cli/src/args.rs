@@ -1,6 +1,6 @@
 //! CLI arguments and command definitions powered by `usage-rs`.
 
-use usage::{Args, Cli, Subcommands};
+use usage_rs::{Args, Cli, Subcommands};
 
 /// Lightweight, scriptable WhatsApp CLI for OxideZap
 #[derive(Cli)]

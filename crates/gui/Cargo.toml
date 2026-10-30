@@ -27,20 +27,20 @@ path = "src/main.rs"
 # Voice notes are Opus and live in `oxidezap-audio`, so only the AAC codec and
 # the ISO-MP4 reader are ever reachable; every other format symphonia can
 # register is dead weight in the probe tables.
-mp4 = "0.14"
-symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
+mp4 = "0.14.0"
+symphonia = { version = "0.6.1", default-features = false, features = ["aac", "isomp4"] }
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["std", "clock"] }
 
 # Match GPUI Kit's published GPUI family so entities share one implementation.
-gpui = { package = "gpui-pre", version = "0.3.4" }
+gpui = { package = "gpui-pre", version = "0.3.10" }
 gpui-base = { git = "https://github.com/longbridge/gpui-kit.git" }
 gpui-component = { git = "https://github.com/longbridge/gpui-kit.git" }
 gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit.git" }
 
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 # Ordered maps for deterministic cache eviction
-indexmap = "2"
+indexmap = "2.14.2"
 log = { workspace = true }
 
 oxidezap-audio = { workspace = true }
@@ -58,20 +58,20 @@ portable-atomic = { workspace = true }
 # file has never asked for — an SVG one and a `pic`/troff one — and the whole
 # use of it is `render::<image::Luma<u8>>()` in `views/pairing.rs`, which is
 # the `image` feature.
-qrcode = { version = "0.14", default-features = false, features = ["image"] }
+qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 # `include-exclude` is not a default feature, and the icon set is selected
 # with `#[include]`. It resolves on the host through another crate in the
 # graph turning it on, and nothing does that for the web — where the same
 # attributes then fail to compile rather than being quietly ignored.
-rust-embed = { version = "8", features = ["include-exclude", "interpolate-folder-path"] }
+rust-embed = { version = "8.13.0", features = ["include-exclude", "interpolate-folder-path"] }
 # theme.json: the palette is data, so it needs a schema and a parser.
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
-smallvec = "1"
+smallvec = "1.16.4"
 # Racing two futures, and nothing else. The executor-free half of `smol`,
 # which is all the window ever used it for besides timers — and the only half
 # that builds for a page, since `smol`'s timer is an epoll loop.
-futures-lite = { version = "2", default-features = false, features = ["std"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 # Channels only. The session runs in another process now, so nothing here
 # needs a runtime to drive it.
 tokio = { workspace = true, features = ["sync"] }
@@ -90,25 +90,25 @@ wacore-binary = { workspace = true }
 # a windowing system to draw on, a sound card to open, a C decoder to link.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 # Timers, on a platform that has a reactor to run them on.
-smol = "2"
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.4", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-openh264 = "0.9" # H.264 software decoder
+smol = "2.0.2"
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.10", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+openh264 = "0.9.9" # H.264 software decoder
 
 # The one Win32 constant the daemon spawn names (`CREATE_NO_WINDOW`), and
 # nothing else: process creation flags are std, and the value itself belongs
 # to the OS rather than to a literal in the call.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
 # Native notification authorization and the process-level active state. GPUI
 # already uses this objc2 family internally; declared because this crate calls
 # the platform APIs directly.
 [target.'cfg(target_os = "macos")'.dependencies]
-block2 = "0.6"
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL", "std"] }
-objc2-user-notifications = { version = "0.3", default-features = false, features = ["block2", "UNNotificationAttachment", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationTrigger", "UNUserNotificationCenter"] }
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL", "std"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["block2", "UNNotificationAttachment", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 
 # The same window as a page. `gpui_platform` picks the web backend by target,
 # so the dependency differs only in the features a browser has no use for —
@@ -129,12 +129,12 @@ getrandom = { workspace = true }
 # window has nowhere to put.
 oxidezap-platform = { workspace = true }
 # The oneshot behind "wait for the file dialog to end"; see `platform/plugins.rs`.
-futures-channel = "0.3"
-js-sys = "0.3"
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.4" }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
+futures-channel = "0.3.34"
+js-sys = "0.3.106"
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.10" }
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
     "console",
     "Navigator",
     "Notification",
@@ -195,8 +195,8 @@ web-sys = { version = "0.3", features = [
 # hold a browser-only failure under `cargo test` by building the same thing —
 # the crate is already in the graph on every platform, and this only names it.
 [dev-dependencies]
-gpui = { package = "gpui-pre", version = "0.3.4", features = ["test-support"] }
-gpui_wgpu = { package = "gpui-pre-wgpu", version = "0.3.4" }
+gpui = { package = "gpui-pre", version = "0.3.10", features = ["test-support"] }
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "0.3.10" }
 # The same synthetic chats and messages every crate above core tests against.
 oxidezap-core = { workspace = true, features = ["fixtures"] }
 

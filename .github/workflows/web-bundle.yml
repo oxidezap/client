@@ -53,7 +53,7 @@ jobs:
       # gives: `-Z build-std` is nightly-only, the standard library has to be
       # rebuilt with the atomics target feature on for `gpui_web`'s executor,
       # and `rust-src` is what build-std compiles from.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly
           targets: wasm32-unknown-unknown
@@ -62,11 +62,11 @@ jobs:
       # Host builds even though the artifact is wasm: the build script that
       # embeds gpui-component's icons runs on the host, and `waproto`
       # generates code with protoc.
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
-          tool: protoc,trunk
+          tool: protoc,trunk@0.22.1
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           # Its own, and not shareable with the Pages build however alike the
           # two are: `key` is *added to* rust-cache's automatic job-based key
@@ -103,7 +103,7 @@ jobs:
       # would fetch from the origin root wherever it was unpacked, which is
       # the single way a relative build can silently come out non-relative.
       # Asserted rather than assumed, because it is a property of trunk's
-      # handling of `--public-url` and trunk is not pinned here.
+      # handling of `--public-url` across Trunk updates.
       - name: Check the bundle is complete and relocatable
         run: cargo xtask bundle check web/dist --relocatable
 

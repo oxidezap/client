@@ -225,7 +225,7 @@ pub(super) fn render_message_delete(
         .justify_center()
         .p(metrics.space_xxl())
         .bg(crate::components::parts::scrim(cx).opacity(0.92))
-        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
             div()

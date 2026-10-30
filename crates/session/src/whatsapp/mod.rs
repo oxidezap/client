@@ -1574,7 +1574,7 @@ impl WhatsAppClient {
                     }
                     let _ = ui_tx.send(event);
                 }
-                client.shutdown().await;
+                completion::report_shutdown(&client.shutdown().await);
                 if let Ok(Some(message)) = chat_store.logout_message().await {
                     retain_local = true;
                     let _ = ui_tx.send(UiEvent::LoggedOut(message));
@@ -1592,7 +1592,7 @@ impl WhatsAppClient {
                 // dropped run future is not awaited out instead, because a
                 // shutdown() landing before run()'s first poll would be
                 // clobbered by run's own is_running swap.
-                client.shutdown().await;
+                completion::report_shutdown(&client.shutdown().await);
             }
         }
     }

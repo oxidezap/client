@@ -671,7 +671,7 @@ mod local_roster_tests {
             .unwrap()
             .unwrap_err();
         assert!(missing.contains("not cached locally"));
-        bot.client().shutdown().await;
+        crate::whatsapp::completion::report_shutdown(&bot.client().shutdown().await);
         client.close(std::time::Duration::from_secs(1)).await;
     }
 }

@@ -11,19 +11,19 @@ repository.workspace = true
 [dependencies]
 oxidezap-core = { workspace = true }
 anyhow = { workspace = true }
-async-channel = "2"
+async-channel = "2.5.0"
 # Portable, because `call_ending` is: the rule it states is about which half of
 # a call's audio the engine let go of, which is the same question on both
 # platforms even though only one of them has a device behind it.
-futures-lite = "2"
+futures-lite = "2.6.1"
 log = { workspace = true }
 # The container, which is not the codec: `ogg` is plain Rust and builds for
 # every target here, so `ogg_opus` packages packets from libopus on a desktop
 # and from the browser's own encoder in a page, into the identical stream.
-ogg = "0.9"
+ogg = "0.9.2"
 # The one channel shape that is the same on both targets: `Recording::Pending`
 # is a oneshot, and tokio's own would pull a runtime a page does not have.
-futures-channel = "0.3"
+futures-channel = "0.3.34"
 
 portable-atomic = { workspace = true }
 # Channels and timers only on the web, where there is no thread pool to build
@@ -36,11 +36,11 @@ wacore = { workspace = true }
 # anyway, because libopus is C and a voice note that cannot be encoded is not
 # one worth capturing. See `src/web/mod.rs`.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-cpal = "0.18"
+cpal = "0.18.2"
 # Kept on the same major as the library's voip-libopus dependency: two
 # semver-incompatible wrappers would each link their own copy of libopus.
-opus = "0.4"
-ringbuf = "0.5"
+opus = "0.4.0"
+ringbuf = "0.5.3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 # Playback, through the decoder and mixer a browser already has.
@@ -51,16 +51,16 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 # only reaches as far as the package being built.
 getrandom = { workspace = true }
 getrandom_02 = { workspace = true }
-js-sys = "0.3"
+js-sys = "0.3.106"
 # The page's loop, which is the only executor there is here. Web only: the
 # desktop half of this crate spawns nothing — a capture runs on the device
 # thread cpal gives it. See `src/web/mod.rs`.
 oxidezap-platform = { workspace = true }
-wasm-bindgen = "0.2"
+wasm-bindgen = "0.2.129"
 # `JsFuture`, for the promises the encoder and the decoder hand back. The
 # spawn beside it comes from `oxidezap-platform`.
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
     "AudioBuffer",
     "AudioBufferSourceNode",
     "AudioContext",
@@ -102,4 +102,4 @@ web-sys = { version = "0.3", features = [
 workspace = true
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
-wasm-bindgen-test = "=0.3.77"
+wasm-bindgen-test = "0.3.79"
