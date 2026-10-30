@@ -1,0 +1,97 @@
+SQLite 3.53.2 source 2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24
+plan q=0 bound=1 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=1 sample=0 prepare_ns=7461 wall_ns=133806079 cpu_ns=133627206 reprepare=20000 heap_before=96000 heap_after=96000 heap_peak=102336 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=0 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=0 sample=0 prepare_ns=6390 wall_ns=7887829 cpu_ns=7889601 reprepare=0 heap_before=96000 heap_after=96000 heap_peak=96000 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=0 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=0 sample=1 prepare_ns=7952 wall_ns=8208662 cpu_ns=8209935 reprepare=0 heap_before=96000 heap_after=96000 heap_peak=96000 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=1 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=1 sample=1 prepare_ns=7802 wall_ns=125314937 cpu_ns=125315666 reprepare=20000 heap_before=96000 heap_after=96000 heap_peak=102336 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=1 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=1 sample=2 prepare_ns=5839 wall_ns=128463970 cpu_ns=128463860 reprepare=20000 heap_before=96000 heap_after=96000 heap_peak=102336 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=0 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=0 sample=2 prepare_ns=5919 wall_ns=8730788 cpu_ns=8732077 reprepare=0 heap_before=96000 heap_after=96000 heap_peak=96000 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=0 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=0 sample=3 prepare_ns=7572 wall_ns=8311477 cpu_ns=8312998 reprepare=0 heap_before=96000 heap_after=96000 heap_peak=96000 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=1 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=1 sample=3 prepare_ns=7141 wall_ns=124694623 cpu_ns=124695639 reprepare=20000 heap_before=96000 heap_after=96000 heap_peak=102336 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=1 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=1 sample=4 prepare_ns=6059 wall_ns=128462858 cpu_ns=128463449 reprepare=20000 heap_before=96000 heap_after=96000 heap_peak=102336 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=0 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=0 sample=4 prepare_ns=5758 wall_ns=8484667 cpu_ns=8487124 reprepare=0 heap_before=96000 heap_after=96000 heap_peak=96000 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=0 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=0 sample=5 prepare_ns=8192 wall_ns=7993398 cpu_ns=7994927 reprepare=0 heap_before=96000 heap_after=96000 heap_peak=96000 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=1 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=1 sample=5 prepare_ns=7621 wall_ns=126428304 cpu_ns=126429592 reprepare=20000 heap_before=96000 heap_after=96000 heap_peak=102336 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=1 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=1 sample=6 prepare_ns=6260 wall_ns=125285362 cpu_ns=125286073 reprepare=20000 heap_before=96000 heap_after=96000 heap_peak=102336 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=0 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=0 sample=6 prepare_ns=6260 wall_ns=7959386 cpu_ns=7960426 reprepare=0 heap_before=96000 heap_after=96000 heap_peak=96000 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=0 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=0 sample=7 prepare_ns=8282 wall_ns=8301662 cpu_ns=8303042 reprepare=0 heap_before=96000 heap_after=96000 heap_peak=96000 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=0 bound=1 | SEARCH contacts USING INDEX sqlite_autoindex_contacts_1 (device_id=? AND jid=?)
+q=0 bound=1 sample=7 prepare_ns=7011 wall_ns=128586694 cpu_ns=128562125 reprepare=20000 heap_before=96000 heap_after=96000 heap_peak=102336 stmt_bytes=4192 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=1 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=1 sample=0 prepare_ns=4347 wall_ns=79669788 cpu_ns=79672102 reprepare=20000 heap_before=93656 heap_after=93656 heap_peak=97736 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=0 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=0 sample=0 prepare_ns=4116 wall_ns=7757553 cpu_ns=7759068 reprepare=0 heap_before=93656 heap_after=93656 heap_peak=93656 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=0 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=0 sample=1 prepare_ns=4497 wall_ns=7421646 cpu_ns=7422260 reprepare=0 heap_before=93656 heap_after=93656 heap_peak=93656 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=1 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=1 sample=1 prepare_ns=5468 wall_ns=78994792 cpu_ns=78996984 reprepare=20000 heap_before=93656 heap_after=93656 heap_peak=97736 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=1 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=1 sample=2 prepare_ns=4066 wall_ns=78208768 cpu_ns=78210972 reprepare=20000 heap_before=93656 heap_after=93656 heap_peak=97736 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=0 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=0 sample=2 prepare_ns=5117 wall_ns=8109343 cpu_ns=8110588 reprepare=0 heap_before=93656 heap_after=93656 heap_peak=93656 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=0 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=0 sample=3 prepare_ns=5909 wall_ns=7767538 cpu_ns=7769934 reprepare=0 heap_before=93656 heap_after=93656 heap_peak=93656 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=1 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=1 sample=3 prepare_ns=5639 wall_ns=81084619 cpu_ns=81086432 reprepare=20000 heap_before=93656 heap_after=93656 heap_peak=97736 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=1 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=1 sample=4 prepare_ns=3665 wall_ns=82181831 cpu_ns=82184826 reprepare=20000 heap_before=93656 heap_after=93656 heap_peak=97736 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=0 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=0 sample=4 prepare_ns=3696 wall_ns=7262677 cpu_ns=7264107 reprepare=0 heap_before=93656 heap_after=93656 heap_peak=93656 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=0 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=0 sample=5 prepare_ns=4256 wall_ns=7259373 cpu_ns=7259920 reprepare=0 heap_before=93656 heap_after=93656 heap_peak=93656 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=1 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=1 sample=5 prepare_ns=3575 wall_ns=83253865 cpu_ns=83197282 reprepare=20000 heap_before=93656 heap_after=93656 heap_peak=97736 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=1 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=1 sample=6 prepare_ns=3805 wall_ns=80368140 cpu_ns=80368961 reprepare=20000 heap_before=93656 heap_after=93656 heap_peak=97736 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=0 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=0 sample=6 prepare_ns=3806 wall_ns=7381716 cpu_ns=7382412 reprepare=0 heap_before=93656 heap_after=93656 heap_peak=93656 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=0 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=0 sample=7 prepare_ns=5588 wall_ns=7712445 cpu_ns=7713211 reprepare=0 heap_before=93656 heap_after=93656 heap_peak=93656 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=1 bound=1 | SEARCH lid_pn_mapping USING INDEX sqlite_autoindex_lid_pn_mapping_1 (lid=? AND device_id=?)
+q=1 bound=1 sample=7 prepare_ns=4587 wall_ns=81359273 cpu_ns=81361588 reprepare=20000 heap_before=93656 heap_after=93656 heap_peak=97736 stmt_bytes=1840 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=1 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=1 sample=0 prepare_ns=7271 wall_ns=155218690 cpu_ns=155209312 reprepare=20000 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=0 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=0 sample=0 prepare_ns=5819 wall_ns=40777970 cpu_ns=40781168 reprepare=0 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=0 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=0 sample=1 prepare_ns=9664 wall_ns=42645292 cpu_ns=42648438 reprepare=0 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=1 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=1 sample=1 prepare_ns=8884 wall_ns=167807447 cpu_ns=167708465 reprepare=20000 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=1 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=1 sample=2 prepare_ns=5368 wall_ns=166421922 cpu_ns=166379982 reprepare=20000 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=0 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=0 sample=2 prepare_ns=5618 wall_ns=40225927 cpu_ns=40227980 reprepare=0 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=0 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=0 sample=3 prepare_ns=10156 wall_ns=39484457 cpu_ns=39487125 reprepare=0 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=1 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=1 sample=3 prepare_ns=69354 wall_ns=159469863 cpu_ns=159470490 reprepare=20000 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=1 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=1 sample=4 prepare_ns=5619 wall_ns=158452832 cpu_ns=158452965 reprepare=20000 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=0 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=0 sample=4 prepare_ns=5488 wall_ns=38673477 cpu_ns=38676867 reprepare=0 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=0 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=0 sample=5 prepare_ns=10356 wall_ns=39889987 cpu_ns=39892804 reprepare=0 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=1 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=1 sample=5 prepare_ns=8152 wall_ns=158051410 cpu_ns=158051733 reprepare=20000 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=1 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=1 sample=6 prepare_ns=5679 wall_ns=169410457 cpu_ns=169387428 reprepare=20000 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=0 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=0 sample=6 prepare_ns=5538 wall_ns=45475670 cpu_ns=45478581 reprepare=0 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=0 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=0 sample=7 prepare_ns=10185 wall_ns=45897995 cpu_ns=45900444 reprepare=0 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0
+plan q=2 bound=1 | SEARCH lid_pn_mapping USING INDEX idx_lid_pn_mapping_phone (phone_number=? AND device_id=?) | USE TEMP B-TREE FOR ORDER BY
+q=2 bound=1 sample=7 prepare_ns=8282 wall_ns=170596231 cpu_ns=170596275 reprepare=20000 heap_before=94384 heap_after=94384 heap_peak=114464 stmt_bytes=2488 alloc_calls=0 alloc_bytes=0

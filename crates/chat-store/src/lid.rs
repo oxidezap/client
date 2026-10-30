@@ -80,22 +80,26 @@ fn counterpart_of(
     use schema::lid_pn_mapping::dsl;
     let user = jid.user.as_str();
     if jid.is_lid() {
-        return Ok(dsl::lid_pn_mapping
-            .filter(dsl::device_id.eq(device_id).and(dsl::lid.eq(user)))
-            .select(dsl::phone_number)
-            .first::<String>(conn)
-            .optional()?
-            .map(|pn| Jid::new(pn, Server::Pn).to_string()));
-    }
-    Ok(dsl::lid_pn_mapping
-        .filter(dsl::device_id.eq(device_id).and(dsl::phone_number.eq(user)))
-        // The lid tiebreak keeps routing stable when updated_at ties —
-        // flapping between counterpart keys would re-split the thread.
-        .order((dsl::updated_at.desc(), dsl::lid.desc()))
-        .select(dsl::lid)
-        .first::<String>(conn)
+        return Ok(crate::point_lookup::First(
+            dsl::lid_pn_mapping
+                .filter(dsl::device_id.eq(device_id).and(dsl::lid.eq(user)))
+                .select(dsl::phone_number),
+        )
+        .get_result::<String>(conn)
         .optional()?
-        .map(|lid| Jid::new(lid, Server::Lid).to_string()))
+        .map(|pn| Jid::new(pn, Server::Pn).to_string()));
+    }
+    Ok(crate::point_lookup::First(
+        dsl::lid_pn_mapping
+            .filter(dsl::device_id.eq(device_id).and(dsl::phone_number.eq(user)))
+            // The lid tiebreak keeps routing stable when updated_at ties —
+            // flapping between counterpart keys would re-split the thread.
+            .order((dsl::updated_at.desc(), dsl::lid.desc()))
+            .select(dsl::lid),
+    )
+    .get_result::<String>(conn)
+    .optional()?
+    .map(|lid| Jid::new(lid, Server::Lid).to_string()))
 }
 
 /// Every key the peer's rows may live under: the given key, its PN, and all
@@ -709,4 +713,47 @@ pub(crate) fn merge_split_chat(
     cs.message_chats.insert(src.to_string());
     cs.message_chats.insert(dest.to_string());
     Ok(dest.to_string())
+}
+
+#[cfg(test)]
+mod point_lookup_tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+
+    #[test]
+    fn counterpart_preserves_accounts_absence_and_latest_lid_ties() {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute(
+            "CREATE TABLE lid_pn_mapping(device_id INTEGER NOT NULL,lid TEXT NOT NULL,phone_number TEXT NOT NULL,updated_at BIGINT NOT NULL,PRIMARY KEY(lid,device_id));\
+             INSERT INTO lid_pn_mapping VALUES(1,'100','500',1),(1,'200','500',2),(1,'300','500',2),(2,'100','900',9),(2,'400','500',9)",
+        ).unwrap();
+        // Repeated reads also exercise cached statements with different binds.
+        for _ in 0..3 {
+            for (account, input, expected) in [
+                (1, "100@lid", Some("500@s.whatsapp.net")),
+                (2, "100@lid", Some("900@s.whatsapp.net")),
+                (1, "500@s.whatsapp.net", Some("300@lid")),
+                (2, "500@s.whatsapp.net", Some("400@lid")),
+                (1, "400@lid", None),
+                (1, "999@s.whatsapp.net", None),
+                (3, "100@lid", None),
+            ] {
+                let jid = input.parse::<Jid>().unwrap();
+                assert_eq!(
+                    counterpart_of(&mut conn, account, &jid).unwrap().as_deref(),
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            counterpart_chat_key(&mut conn, 1, "100:5@lid")
+                .unwrap()
+                .as_deref(),
+            Some("500@s.whatsapp.net")
+        );
+        assert_eq!(
+            counterpart_chat_key(&mut conn, 1, "123@g.us").unwrap(),
+            None
+        );
+    }
 }
