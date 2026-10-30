@@ -19,8 +19,9 @@ use regex_cache::CachedRegex;
 pub struct Descriptor {
     pub(crate) national_number: CachedRegex,
 
-    pub(crate) possible_length: Vec<u16>,
-    pub(crate) possible_local_length: Vec<u16>,
+    // Runtime metadata is immutable; retain no growth capacity.
+    pub(crate) possible_length: Box<[u16]>,
+    pub(crate) possible_local_length: Box<[u16]>,
 
     pub(crate) example: Option<String>,
 }

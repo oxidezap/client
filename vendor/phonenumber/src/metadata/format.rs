@@ -20,7 +20,7 @@ pub struct Format {
     pub(crate) pattern: CachedRegex,
     pub(crate) format: String,
 
-    pub(crate) leading_digits: Vec<CachedRegex>,
+    pub(crate) leading_digits: Box<[CachedRegex]>,
     pub(crate) national_prefix: Option<String>,
     pub(crate) national_prefix_optional: bool,
     pub(crate) domestic_carrier: Option<String>,

@@ -846,17 +846,21 @@ mod tests {
             cache_key: Some(key.to_string()),
         };
         smol::block_on(async {
-            async fn next(manager: &AvatarManager) -> AvatarDemand {
+            async fn next_batch(manager: &AvatarManager, count: usize) -> Vec<AvatarDemand> {
                 let deadline = Instant::now() + std::time::Duration::from_secs(5);
                 loop {
-                    let mut demands = manager.take_demands();
-                    if !demands.is_empty() {
-                        assert_eq!(demands.len(), 1);
-                        return demands.remove(0);
+                    let ready = manager.pending_demands.lock().unwrap().len() >= count;
+                    if ready {
+                        return manager.take_demands();
                     }
                     assert!(Instant::now() < deadline, "avatar demand did not complete");
                     crate::platform::sleep(std::time::Duration::from_millis(1)).await;
                 }
+            }
+            async fn next(manager: &AvatarManager) -> AvatarDemand {
+                let mut demands = next_batch(manager, 1).await;
+                assert_eq!(demands.len(), 1);
+                demands.remove(0)
             }
             let first = AvatarManager::new();
             first.demand_chat(&chat);
@@ -884,7 +888,20 @@ mod tests {
                     std::slice::from_ref(&missing),
                     std::slice::from_ref(&chat),
                 );
-                assert!(next(&recovery).await.need_bytes);
+                // Keep the visible miss queued while the viewport repeats.
+                // Overscan can finish in the same batch if the visible read
+                // completes before demand_chats_windowed checks admission.
+                // Require both JIDs instead of assuming one completion per poll.
+                let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                while !recovery
+                    .pending_demands
+                    .lock()
+                    .unwrap()
+                    .contains_key(&missing.jid)
+                {
+                    assert!(Instant::now() < deadline, "visible miss did not complete");
+                    crate::platform::sleep(std::time::Duration::from_millis(1)).await;
+                }
                 assert_ne!(
                     recovery.demand_epoch(),
                     epoch,
@@ -894,10 +911,16 @@ mod tests {
                     std::slice::from_ref(&missing),
                     std::slice::from_ref(&chat),
                 );
+                let demands = next_batch(&recovery, 2).await;
+                assert_eq!(demands.len(), 2);
+                assert_eq!(demands[0].jid, missing.jid, "visible demand has priority");
+                assert!(demands[0].need_bytes && demands[0].cache_miss);
+                assert_eq!(demands[1].jid, chat.jid);
                 assert!(
-                    !next(&recovery).await.need_bytes,
+                    !demands[1].need_bytes,
                     "offline overscan must recover from disk"
                 );
+                assert_eq!(demands[1].known_picture_id, chat.picture_id);
                 assert!(get_avatar_image(key).is_some());
                 assert!(!missing_path.exists());
             }

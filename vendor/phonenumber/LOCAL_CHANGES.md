@@ -3,7 +3,8 @@
 Source: `phonenumber` 0.3.10+9.0.33 from crates.io, SHA-256
 `66d85d3cc5477bfe2f357939e7f02a5a566632508633af1a2c37577d0bef87d9`.
 Apache-2.0 license retained. All `src/` files and the bundled
-`assets/PhoneNumberMetadata.xml` are unchanged except `src/metadata/database.rs`.
+`assets/PhoneNumberMetadata.xml` are unchanged except the four runtime metadata files `database.rs`,
+`descriptor.rs`, `format.rs` and `metadata.rs`.
 The published manifest is retained without the unavailable upstream integration
 test, example and benchmark targets and their unused criterion/proptest
 dev-dependencies. Unused assets and external test files are omitted. The original README is retained.
@@ -39,6 +40,14 @@ prevalidation. A general update to 0.4 is not part of this change.
 
 See `docs/measurements/phone-prevalidation.md` for the measurement and reproduction.
 
+Immutable descriptor lengths, format lists and leading-digit lists use boxed
+slices. Their public getters remain slices, the loader still accepts vectors,
+and the regex implementation and 100-entry LRU are unchanged. This removes
+unused vector capacity and capacity words from retained metadata. Conversion
+reserves the input length once before validating and pushing each element,
+avoiding collect-then-shrink reallocations. See
+`docs/measurements/phone-compaction.md` for paired measurements and limits.
+
 ## Update procedure
 
 1. Download the exact new crates.io `.crate`, verify its registry SHA-256 before
@@ -47,7 +56,7 @@ See `docs/measurements/phone-prevalidation.md` for the measurement and reproduct
 2. Diff the previous pristine `build.rs` and `src/metadata/database.rs` against
    this vendor to recover the local patch, including the tests in `build.rs`.
    Replace retained source, XML, LICENSE, README and the published manifest with
-   the new archive. Reapply and review only those two Rust-file patches.
+   the new archive. Reapply and review the build visitor and four runtime metadata patches.
 3. Remove only manifest targets whose external test/example/bench files are not
    retained, plus dev-dependencies used exclusively by those omitted targets.
    Keep all `src/` modules, internal-test dependencies, README used by `doctest!`,
@@ -63,8 +72,8 @@ See `docs/measurements/phone-prevalidation.md` for the measurement and reproduct
 6. Compare base/head outputs for both probe corpora with identical probe source.
    Re-measure cold and warm paths if runtime metadata handling changed. Finally
    compare the new pristine `src/` and XML against the vendor: the XML must be
-   byte-identical, and `src/metadata/database.rs` must be the only modified
-   `src/` file. Inspect the separate `build.rs` and manifest differences. Remove
+   byte-identical, and only the four runtime metadata files listed above may differ
+   under `src/`. Inspect the separate `build.rs` and manifest differences. Remove
    the vendor instead if upstream now provides equivalent prevalidation.
 
 The fault-injection test places an invalid regex in every descriptor, every

@@ -72,6 +72,19 @@ impl Database {
             }
         }
 
+        // Result's collection cannot preserve the source iterator's exact length.
+        // Reserve once so immutable lists need neither growth nor a final shrink.
+        fn map_boxed<T, U, E>(
+            values: Vec<T>,
+            mut convert: impl FnMut(T) -> Result<U, E>,
+        ) -> Result<Box<[U]>, E> {
+            let mut result = Vec::with_capacity(values.len());
+            for value in values {
+                result.push(convert(value)?);
+            }
+            Ok(result.into_boxed_slice())
+        }
+
         let cache = Arc::new(Mutex::new(RegexCache::new(100)));
         let regex = |value: String| -> Result<CachedRegex, error::LoadMetadata> {
             let mut builder = CachedRegexBuilder::new(cache.clone(), &value);
@@ -99,8 +112,8 @@ impl Database {
                         })
                         .and_then(regex)?,
 
-                    possible_length: desc.possible_length,
-                    possible_local_length: desc.possible_local_length,
+                    possible_length: desc.possible_length.into_boxed_slice(),
+                    possible_local_length: desc.possible_local_length.into_boxed_slice(),
                     example: desc.example,
                 })
             };
@@ -124,11 +137,7 @@ impl Database {
                     })
                 })?,
 
-                leading_digits: format
-                    .leading_digits
-                    .into_iter()
-                    .map(&regex)
-                    .collect::<Result<_, _>>()?,
+                leading_digits: map_boxed(format.leading_digits, &regex)?,
 
                 national_prefix: format.national_prefix_formatting_rule,
                 national_prefix_optional: format.national_prefix_optional_when_formatting,
@@ -185,16 +194,8 @@ impl Database {
                 national_prefix_for_parsing: tranpose(meta.national_prefix_for_parsing.map(regex))?,
                 national_prefix_transform_rule: meta.national_prefix_transform_rule,
 
-                formats: meta
-                    .formats
-                    .into_iter()
-                    .map(&format)
-                    .collect::<Result<_, _>>()?,
-                international_formats: meta
-                    .international_formats
-                    .into_iter()
-                    .map(&format)
-                    .collect::<Result<_, _>>()?,
+                formats: map_boxed(meta.formats, &format)?,
+                international_formats: map_boxed(meta.international_formats, &format)?,
 
                 main_country_for_code: meta.main_country_for_code,
                 leading_digits: tranpose(meta.leading_digits.map(regex))?,
