@@ -319,3 +319,30 @@ fn history_load_wire_cost() {
     println!("one conversation, opened:");
     cost("50 messages of one chat (a page)", &load(1, 50));
 }
+
+#[test]
+fn borrowed_frame_decoding_preserves_message_fields() {
+    use oxidezap_ipc::{FrameResult, read_frame_with};
+    let expected = DaemonMessage::Messages {
+        id: 7,
+        jid: "synthetic@s.whatsapp.net".into(),
+        messages: vec![oxidezap_core::ChatMessage::new_incoming(
+            "synthetic-id".into(),
+            "synthetic@s.whatsapp.net".into(),
+            "Olá 🦀".repeat(4096),
+        )],
+        next: Some(oxidezap_ipc::PageCursor::new("synthetic-cursor")),
+    };
+    let mut wire = serde_json::to_vec(&expected).unwrap();
+    wire.push(b'\n');
+    let mut buf = Vec::new();
+    for capacity in [1, 31, 8192] {
+        let mut reader = std::io::BufReader::with_capacity(capacity, wire.as_slice());
+        let frame = read_frame_with(&mut reader, &mut buf, wire.len(), |line| {
+            serde_json::from_str::<DaemonMessage>(line.trim_end())
+        })
+        .unwrap();
+        assert!(matches!(frame, Some(FrameResult::Line(Ok(actual))) if actual == expected));
+        assert!(buf.is_empty());
+    }
+}

@@ -55,6 +55,17 @@ pub enum FrameRead {
     TooLong,
 }
 
+/// The outcome of [`read_frame_with`], containing the callback's owned result.
+///
+/// Framing errors have the same meaning as in [`FrameRead`]. Keeping this
+/// separate leaves the original enum's variants usable without type annotations.
+#[derive(Debug)]
+pub enum FrameResult<T> {
+    Line(T),
+    NotUtf8,
+    TooLong,
+}
+
 /// Read one newline-delimited frame, bounded independently of every other.
 ///
 /// Returns `None` at end of stream. Reads bytes rather than lines because a
@@ -69,10 +80,33 @@ pub fn read_frame<R: BufRead>(
     buf: &mut Vec<u8>,
     limit: usize,
 ) -> Result<Option<FrameRead>> {
+    Ok(
+        read_frame_with(reader, buf, limit, str::to_owned)?.map(|frame| match frame {
+            FrameResult::Line(line) => FrameRead::Line(line),
+            FrameResult::NotUtf8 => FrameRead::NotUtf8,
+            FrameResult::TooLong => FrameRead::TooLong,
+        }),
+    )
+}
+
+/// Read a frame and parse its text directly from the connection buffer.
+///
+/// The callback runs only for a complete UTF-8 frame, without the newline.
+/// Its result must own anything it keeps: the buffer is cleared after the
+/// callback and reused by the next read. This avoids a full-frame copy while
+/// keeping the allocation available for repeated large frames.
+///
+/// Partial prefixes, limits, EOF and I/O errors behave as in [`read_frame`].
+pub fn read_frame_with<R: BufRead, T>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+    parse: impl FnOnce(&str) -> T,
+) -> Result<Option<FrameResult<T>>> {
     let carried = buf.len();
     if carried >= limit {
         buf.clear();
-        return Ok(Some(FrameRead::TooLong));
+        return Ok(Some(FrameResult::TooLong));
     }
 
     let read = {
@@ -95,13 +129,13 @@ pub fn read_frame<R: BufRead>(
         // away mid-frame.
         let hit_the_cap = buf.len() == limit;
         buf.clear();
-        return Ok(hit_the_cap.then_some(FrameRead::TooLong));
+        return Ok(hit_the_cap.then_some(FrameResult::TooLong));
     }
 
     buf.pop();
     let frame = match std::str::from_utf8(buf) {
-        Ok(line) => FrameRead::Line(line.to_string()),
-        Err(_) => FrameRead::NotUtf8,
+        Ok(line) => FrameResult::Line(parse(line)),
+        Err(_) => FrameResult::NotUtf8,
     };
     buf.clear();
     Ok(Some(frame))
@@ -146,5 +180,101 @@ mod tests {
     fn bytes_that_are_not_text_are_answerable() {
         let read = frames(&[0xff, 0xfe, b'\n'], 64);
         assert!(matches!(read[0], Some(FrameRead::NotUtf8)));
+    }
+
+    #[test]
+    fn borrowed_parsing_matches_owned_frames_and_reuses_capacity() {
+        for bytes in [
+            b"one\ntwo\n".as_slice(),
+            b"\n\r\n",
+            b"unterminated",
+            b"1234567\nnext\n",
+            b"12345678\n",
+            b"\xff\nvalid\n",
+            b"\xc3\xa9\n",
+        ] {
+            for capacity in [1, 3, 8192] {
+                let mut owned = std::io::BufReader::with_capacity(capacity, bytes);
+                let mut borrowed = std::io::BufReader::with_capacity(capacity, bytes);
+                let mut owned_buf = Vec::new();
+                let mut borrowed_buf = Vec::with_capacity(32);
+                for _ in 0..bytes.len() + 1 {
+                    let expected = read_frame(&mut owned, &mut owned_buf, 8).unwrap();
+                    let actual = read_frame_with(&mut borrowed, &mut borrowed_buf, 8, |line| {
+                        line.as_bytes().to_vec()
+                    })
+                    .unwrap();
+                    assert!(borrowed_buf.is_empty());
+                    assert_eq!(borrowed_buf.capacity(), 32);
+                    match (expected, actual) {
+                        (Some(FrameRead::Line(a)), Some(FrameResult::Line(b))) => {
+                            assert_eq!(a.as_bytes(), b);
+                        }
+                        (Some(FrameRead::NotUtf8), Some(FrameResult::NotUtf8))
+                        | (Some(FrameRead::TooLong), Some(FrameResult::TooLong)) => {}
+                        (None, None) => break,
+                        pair => panic!("different outcomes: {pair:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn carried_prefix_counts_toward_limit_and_is_parsed_once() {
+        for (prefix, suffix, expected) in [
+            (b"pre".as_slice(), b"fix\n".as_slice(), Some("prefix")),
+            (b"1234567", b"\n", Some("1234567")),
+            (b"12345678", b"\n", None),
+            (b"1234567", b"x\n", None),
+            (b"pre", b"", None),
+        ] {
+            let mut buf = prefix.to_vec();
+            let mut reader = std::io::BufReader::with_capacity(1, suffix);
+            let mut calls = 0;
+            let actual = read_frame_with(&mut reader, &mut buf, 8, |line| {
+                calls += 1;
+                line.to_owned()
+            })
+            .unwrap();
+            assert!(buf.is_empty());
+            assert_eq!(calls, usize::from(expected.is_some()));
+            if let Some(expected) = expected {
+                assert!(matches!(actual, Some(FrameResult::Line(line)) if line == expected));
+            } else {
+                assert!(matches!(actual, None | Some(FrameResult::TooLong)));
+            }
+        }
+    }
+
+    #[test]
+    fn io_error_keeps_prefix_for_retry() {
+        struct Interrupted(bool);
+        impl std::io::Read for Interrupted {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    Err(std::io::ErrorKind::WouldBlock.into())
+                } else {
+                    self.0 = true;
+                    out[0] = b'a';
+                    Ok(1)
+                }
+            }
+        }
+        let mut reader = std::io::BufReader::with_capacity(1, Interrupted(false));
+        let mut buf = Vec::new();
+        assert!(read_frame_with(&mut reader, &mut buf, 8, |_| panic!("incomplete")).is_err());
+        assert_eq!(buf, b"a");
+        let result = read_frame_with(&mut b"b\n".as_slice(), &mut buf, 8, str::to_owned).unwrap();
+        assert!(matches!(result, Some(FrameResult::Line(line)) if line == "ab"));
+    }
+
+    #[test]
+    fn owned_variants_keep_their_original_type_inference_and_imports() {
+        use FrameRead::{NotUtf8, TooLong};
+        let invalid = NotUtf8;
+        let oversized = TooLong;
+        assert!(matches!(invalid, FrameRead::NotUtf8));
+        assert!(matches!(oversized, FrameRead::TooLong));
     }
 }
