@@ -99,8 +99,8 @@ impl Database {
                         })
                         .and_then(regex)?,
 
-                    possible_length: desc.possible_length,
-                    possible_local_length: desc.possible_local_length,
+                    possible_length: desc.possible_length.into_boxed_slice(),
+                    possible_local_length: desc.possible_local_length.into_boxed_slice(),
                     example: desc.example,
                 })
             };

@@ -32,8 +32,8 @@ pub struct Metadata {
     pub(crate) national_prefix_for_parsing: Option<CachedRegex>,
     pub(crate) national_prefix_transform_rule: Option<String>,
 
-    pub(crate) formats: Vec<Format>,
-    pub(crate) international_formats: Vec<Format>,
+    pub(crate) formats: Box<[Format]>,
+    pub(crate) international_formats: Box<[Format]>,
     pub(crate) main_country_for_code: bool,
     pub(crate) leading_digits: Option<CachedRegex>,
     pub(crate) mobile_number_portable: bool,
