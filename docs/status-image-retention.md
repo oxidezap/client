@@ -12,7 +12,11 @@ in the global asset system. The sticker decoder used the same asset system.
 
 `RetainedImage` now shares ownership between the existing application cache
 and the image sources handed to surfaces. Drawing leases its decode entity
-through GPUI element state as well. This last lease matters because cached
+through GPUI element state as well. Independently constructed images with
+identical bytes share that entity through an application-scoped weak registry,
+because GPUI's image IDs and asset keys are content-derived. Releasing one
+message cannot retire a decode still owned by another. Element-state leasing
+matters because cached
 paint can retain atlas coordinates without retaining the image source. Once
 all owners and paint leases are gone, deferred retirement removes that one
 asset and its atlas entries. Removing a pending asset drops GPUI's cached-load
@@ -53,16 +57,16 @@ One paired run on 2026-10-30, debug test profile, GPUI TestRenderer:
 
 | Observation | Legacy lifetime | Owned lifetime |
 | --- | ---: | ---: |
-| Initial RSS, KiB | 30,956 | 31,184 |
-| Initial PSS, KiB | 30,483 | 30,711 |
+| Initial RSS, KiB | 31,164 | 30,444 |
+| Initial PSS, KiB | 30,691 | 29,971 |
 | Live decoded pixels after 80, MiB | 320 | 200 |
-| RSS after 80, KiB | 378,444 | 317,276 |
-| PSS after 80, KiB | 377,971 | 316,803 |
+| RSS after 80, KiB | 379,684 | 321,248 |
+| PSS after 80, KiB | 379,211 | 320,775 |
 | Live decoded pixels after cache clear and close, MiB | 320 | 0 |
-| RSS after close, KiB | 378,508 | 165,916 |
-| PSS after close, KiB | 378,035 | 165,443 |
-| Process CPU through close, seconds | 8.61 | 8.57 |
-| Process CPU for 10,000 forced draws, seconds | 0.07 | 0.09 |
+| RSS after close, KiB | 379,736 | 165,788 |
+| PSS after close, KiB | 379,263 | 165,315 |
+| Process CPU through close, seconds | 8.50 | 8.44 |
+| Process CPU for 10,000 forced draws, seconds | 0.06 | 0.08 |
 
 The 120 MiB reduction while the cache is alive follows its existing
 50-entry policy. The stronger result is release of all 320 MiB of abandoned
@@ -89,6 +93,8 @@ The ordinary tests exercise:
 - closing a pending decode without late cache repopulation;
 - cached paint retaining both pixels and atlas until its pane repaints;
 - a shared image surviving another window closing;
+- independently constructed identical PNG images and WebP stickers sharing
+  retirement ownership, with the first window closing while the other remains;
 - existing sticker animation, transparency and layout checks.
 
 The Linux diagnostic is ignored by default because it intentionally retains

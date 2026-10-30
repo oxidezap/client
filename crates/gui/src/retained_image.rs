@@ -10,8 +10,8 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 use gpui::{
-    App, AppContext as _, Asset, ElementId, Entity, Image, ImageCacheError, ImageSource,
-    RenderImage,
+    App, AppContext as _, Asset, ElementId, Entity, Global, Image, ImageCacheError, ImageSource,
+    RenderImage, WeakEntity,
 };
 
 #[derive(Clone)]
@@ -26,6 +26,13 @@ struct Decoded {
     source: Source,
     output: Option<Arc<RenderImage>>,
 }
+
+// GPUI Image IDs are content-derived. Independent messages with identical
+// bytes must share retirement ownership as well as the global asset key.
+#[derive(Default)]
+struct Assets(HashMap<(u64, bool), WeakEntity<Decoded>>);
+
+impl Global for Assets {}
 
 #[derive(Clone, Hash)]
 struct Source {
@@ -88,11 +95,28 @@ impl RetainedImage {
                 .borrow_mut()
                 .entry(sticker)
                 .or_insert_with(|| {
-                    cx.new(|cx| {
+                    let key = (owner.id, sticker);
+                    if let Some(asset) = cx
+                        .default_global::<Assets>()
+                        .0
+                        .get(&key)
+                        .and_then(WeakEntity::upgrade)
+                    {
+                        return asset;
+                    }
+                    let asset = cx.new(|cx| {
                         cx.on_release(|asset: &mut Decoded, cx| {
                             let source = asset.source.clone();
                             let output = asset.output.clone();
                             cx.defer(move |cx| {
+                                let key = (source.image.id, source.sticker);
+                                let assets = cx.default_global::<Assets>();
+                                // A new owner may acquire this content between
+                                // release and this deferred retirement.
+                                if assets.0.get(&key).and_then(WeakEntity::upgrade).is_some() {
+                                    return;
+                                }
+                                assets.0.remove(&key);
                                 cx.remove_asset::<Decoder>(&source);
                                 if let Some(output) = output {
                                     cx.drop_image(output, None);
@@ -107,20 +131,25 @@ impl RetainedImage {
                             },
                             output: None,
                         }
-                    })
+                    });
+                    cx.default_global::<Assets>()
+                        .0
+                        .insert(key, asset.downgrade());
+                    asset
                 })
                 .clone();
 
             // A cached paint can retain atlas coordinates without retaining its
             // ImageSource. Keep the asset with that element state as well.
             window.with_global_id(
-                ElementId::named_usize(
+                ElementId::NamedInteger(
                     if sticker {
                         "sticker-asset"
                     } else {
                         "image-asset"
-                    },
-                    owner.id as usize,
+                    }
+                    .into(),
+                    owner.id,
                 ),
                 |id, window| {
                     window.with_element_state(id, |_: Option<Entity<Decoded>>, _| {
@@ -157,13 +186,28 @@ mod tests {
     }
 
     fn image(index: u8) -> RetainedImage {
+        image_with_format(index, false)
+    }
+
+    fn image_with_format(index: u8, sticker: bool) -> RetainedImage {
         let pixels = image::RgbaImage::from_pixel(1024, 1024, image::Rgba([index, 7, 11, 255]));
         let mut bytes = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(pixels)
-            .write_to(&mut bytes, image::ImageFormat::Png)
+            .write_to(
+                &mut bytes,
+                if sticker {
+                    image::ImageFormat::WebP
+                } else {
+                    image::ImageFormat::Png
+                },
+            )
             .unwrap();
         RetainedImage::new(Image::from_bytes(
-            gpui::ImageFormat::Png,
+            if sticker {
+                gpui::ImageFormat::Webp
+            } else {
+                gpui::ImageFormat::Png
+            },
             bytes.into_inner(),
         ))
     }
@@ -391,6 +435,61 @@ mod tests {
                 assert!(!window.has_image_atlas_entry(&probe));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn independently_constructed_identical_images_share_retirement(cx: &mut TestAppContext) {
+        for sticker in [false, true] {
+            let first = image_with_format(5, sticker);
+            let second = RetainedImage::new(Image::from_bytes(first.format, first.bytes.clone()));
+            assert!(!Rc::ptr_eq(&first.0, &second.0));
+            assert_eq!(first.id, second.id);
+            let windows: Vec<_> = [&first, &second]
+                .into_iter()
+                .map(|owner| {
+                    cx.open_window(gpui::size(gpui::px(40.), gpui::px(40.)), |_, _| {
+                        View(Some(owner.source(sticker)))
+                    })
+                })
+                .collect();
+            cx.run_until_parked();
+            let decoded = cx.read(|cx| first.decoded(sticker, cx).unwrap());
+            assert!(cx.read(|cx| Arc::ptr_eq(&decoded, &second.decoded(sticker, cx).unwrap())));
+            let weak = Arc::downgrade(&decoded);
+            let source = Source {
+                image: first.0.image.clone(),
+                sticker,
+            };
+            let mut probe = RenderImage::new(smallvec::smallvec![image::Frame::new(
+                image::RgbaImage::new(1, 1)
+            )]);
+            probe.id = decoded.id;
+            drop(decoded);
+            drop(first);
+            windows[0]
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+            windows[1]
+                .update(cx, |_, window, cx| {
+                    assert!(
+                        cx.has_asset::<Decoder>(&source),
+                        "another message still owns this decode"
+                    );
+                    assert!(window.has_image_atlas_entry(&probe));
+                })
+                .unwrap();
+            drop(second);
+            windows[1]
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| {
+                assert!(!cx.has_asset::<Decoder>(&source));
+                assert!(weak.upgrade().is_none());
+                assert!(cx.default_global::<Assets>().0.is_empty());
+            });
+        }
     }
 
     /// Reproducible native diagnostic, kept out of the ordinary test run.
