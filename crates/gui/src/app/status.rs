@@ -637,6 +637,21 @@ impl WhatsAppApp {
     /// a video status sat on "cannot be shown" having never asked for the
     /// bytes that would show it.
     fn fetch_shown_status(&mut self, cx: &mut Context<Self>) {
+        if self
+            .media_cache()
+            .is_some_and(|cache| cache.defers_message_media())
+            && self.shown_status_media().is_some_and(|(_, media)| {
+                (media.data.is_empty() || media.data_is_preview)
+                    && (media.cache_key.is_some() || media.preview_cache_key.is_some())
+            })
+        {
+            // The render pass will request the one update it actually draws.
+            return;
+        }
+        self.fetch_shown_status_after_cache(cx);
+    }
+
+    pub(super) fn fetch_shown_status_after_cache(&mut self, cx: &mut Context<Self>) {
         let Some((message_id, media)) = self.shown_status_media() else {
             return;
         };

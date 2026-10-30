@@ -43,6 +43,18 @@ pub trait MediaCache: Send + Sync {
     /// gigabyte against a budget that had counted it once.
     fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String>;
 
+    /// Native message payloads can be read later, when a view owns them.
+    /// Remote caches keep frame-time hydration until they have that capability.
+    fn defers_message_media(&self) -> bool {
+        false
+    }
+
+    /// Read a deferred payload on a background executor, within a byte ceiling.
+    /// Only called for a cache that opts in through `defers_message_media`.
+    fn read_deferred(&self, _key: &str, _most: usize) -> Result<Arc<Vec<u8>>, String> {
+        Err("this cache does not support deferred reads".into())
+    }
+
     #[allow(dead_code)]
     fn image_source(&self, key: &str) -> Option<ImageSource> {
         cached_image_source(key, || self.read(key))
@@ -106,6 +118,34 @@ pub trait MediaCache: Send + Sync {
     ///
     /// Best effort and silent: the daemon may have taken it already.
     fn discard(&self, key: &str);
+}
+
+impl super::Session {
+    /// The native directory outlives the IPC connection. A retained-history
+    /// view can still hydrate its account-qualified keys after that link ends.
+    pub(crate) fn retained_media_cache() -> Option<Arc<dyn MediaCache>> {
+        imp::retained_cache()
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod imp {
+    use super::{Arc, Directory, MediaCache};
+    use std::sync::OnceLock;
+
+    pub(super) fn retained_cache() -> Option<Arc<dyn MediaCache>> {
+        static CACHE: OnceLock<Arc<dyn MediaCache>> = OnceLock::new();
+        Some(Arc::clone(CACHE.get_or_init(|| Arc::new(Directory))))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+mod imp {
+    use super::{Arc, MediaCache};
+
+    pub(super) fn retained_cache() -> Option<Arc<dyn MediaCache>> {
+        None
+    }
 }
 
 fn cached_image_source(
@@ -269,6 +309,16 @@ impl SourceCache {
 
 #[cfg(not(target_family = "wasm"))]
 impl MediaCache for Directory {
+    fn defers_message_media(&self) -> bool {
+        true
+    }
+
+    fn read_deferred(&self, key: &str, most: usize) -> Result<Arc<Vec<u8>>, String> {
+        let path = oxidezap_ipc::media_path(key)
+            .ok_or_else(|| format!("the daemon named an unusable cache key: {key}"))?;
+        read_bounded(&path, most).map(Arc::new)
+    }
+
     fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
         oxidezap_ipc::media_path(key)
             .ok_or_else(|| format!("the daemon named an unusable cache key: {key}"))
@@ -356,6 +406,26 @@ impl MediaCache for Directory {
             }
         }));
     }
+}
+
+/// Check before allocating and cap the read as well: a file can grow after
+/// metadata was read. A fixed-size buffer prevents `read_to_end` from growing
+/// its allocation beyond the admitted payload size.
+#[cfg(not(target_family = "wasm"))]
+fn read_bounded(path: &std::path::Path, most: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let size = usize::try_from(file.metadata().map_err(|e| e.to_string())?.len())
+        .ok()
+        .filter(|size| *size <= most)
+        .ok_or_else(|| "cached payload exceeds the materialization limit".to_string())?;
+    let mut bytes = vec![0; size];
+    file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+    let mut extra = [0];
+    if file.read(&mut extra).map_err(|e| e.to_string())? != 0 {
+        return Err("cached payload changed during materialization".into());
+    }
+    Ok(bytes)
 }
 
 /// Somewhere blocking is allowed, for the one process that has one.
@@ -845,6 +915,24 @@ mod tests {
             "the cache was left reachable by other accounts on this machine"
         );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn deferred_file_reads_enforce_the_byte_limit_and_preserve_exact_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "oxidezap-bounded-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, [1, 2, 3, 4]).unwrap();
+        assert!(read_bounded(&path, 3).is_err());
+        assert_eq!(read_bounded(&path, 4).unwrap(), [1, 2, 3, 4]);
+        assert_eq!(read_bounded(&path, 100).unwrap(), [1, 2, 3, 4]);
+        std::fs::write(&path, []).unwrap();
+        assert!(read_bounded(&path, 0).unwrap().is_empty());
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_bounded(&path, 4).is_err());
+        assert!(Directory.read_deferred("not/a/key", 4).is_err());
     }
 
     #[test]

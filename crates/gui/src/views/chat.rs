@@ -149,7 +149,7 @@ pub fn render_connected_view(
     let viewer = app.media_viewer(cx).and_then(|viewer| {
         let message = app.media_viewer_message(cx)?.clone();
         let media = message.media.as_ref()?;
-        let image = (!media.data.is_empty())
+        let image = (!media.data.is_empty() && !media.data_is_preview)
             .then(|| app.get_decoded_image(&message.id, media, cx))
             .flatten();
         let frame = app.video_current_frame(&message.id);
@@ -158,6 +158,7 @@ pub fn render_connected_view(
         } else {
             SharedString::from(app.author_label(open_chat.as_deref(), &message))
         };
+        let is_loading = app.awaiting_cached_media(&viewer.jid, &message);
         Some(
             render_media_viewer(
                 viewer,
@@ -165,6 +166,7 @@ pub fn render_connected_view(
                     message,
                     image,
                     frame,
+                    is_loading,
                     author,
                 },
                 entity.clone(),
@@ -223,6 +225,7 @@ pub fn render_connected_view(
             is_loading: is_loading_update,
         })
     });
+    app.note_media_surface(cx);
     let status_list = status_feed.map(|feed| StatusListProps {
         feed,
         selected: StatusSelection::of(app.status_pane().author()),

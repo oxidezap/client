@@ -241,9 +241,10 @@ impl MediaViewer {
 
 /// Whether a message is something the viewer can show.
 ///
-/// Downloaded bytes are the bar, not the media kind: an image whose bytes are
-/// still a blurred placeholder would open to a blurred placeholder at full
-/// size, which reads as a broken viewer rather than a pending download.
+/// Inline thumbnails alone cannot fill the viewer. A full cache reference
+/// can: native hydration will load it
+/// when the viewer reaches that picture, keeping the rest of the album lazy.
+/// Missing references report an error in place and remain navigable/retryable.
 ///
 /// Pictures only. A video's bytes are an encoded stream, and the viewer has
 /// no decoder of its own — opening one would show the "cannot be shown"
@@ -251,7 +252,9 @@ impl MediaViewer {
 /// bubble until the viewer grows a player.
 fn is_viewable(message: &ChatMessage) -> bool {
     message.media.as_ref().is_some_and(|media| {
-        media.media_type == MediaType::Image && !media.data.is_empty() && !media.data_is_preview
+        !message.revoked
+            && media.media_type == MediaType::Image
+            && (media.cache_key.is_some() || (!media.data.is_empty() && !media.data_is_preview))
     })
 }
 
@@ -383,5 +386,34 @@ mod tests {
     fn losing_every_picture_closes_the_viewer() {
         let mut viewer = MediaViewer::open("chat".into(), "photo-1", &history()).unwrap();
         assert!(!viewer.refresh(&[message("text", None)]));
+    }
+    #[test]
+    fn deferred_full_references_stay_in_the_album_but_previews_and_revokes_do_not() {
+        let mut deferred = image(false, false);
+        deferred.cache_key = Some("full-reference".into());
+        let mut preview = image(true, false);
+        preview.preview_cache_key = Some("preview-reference".into());
+        let mut revoked = message("revoked", Some(deferred.clone()));
+        revoked.revoked = true;
+        let mut messages = vec![
+            message("ready", Some(image(false, true))),
+            message("deferred", Some(deferred)),
+            message("preview", Some(preview)),
+            revoked,
+        ];
+        let mut viewer = MediaViewer::open("chat".into(), "ready", &messages).unwrap();
+        assert_eq!(viewer.items, ["ready", "deferred"]);
+        viewer.step(true);
+        assert_eq!(viewer.current_id(), Some("deferred"));
+        assert!(
+            viewer.refresh(&messages),
+            "hydration is allowed to remain pending or fail"
+        );
+        assert_eq!(viewer.current_id(), Some("deferred"));
+        messages[1].revoked = true;
+        assert!(viewer.refresh(&messages));
+        assert_eq!(viewer.current_id(), Some("ready"));
+        messages[0].revoked = true;
+        assert!(!viewer.refresh(&messages));
     }
 }

@@ -95,12 +95,44 @@ pub fn render_message_list(
     let items = Arc::clone(&cache.items);
 
     let gutter = layout.conversation_padding();
+    let media_state = state.clone();
+    let media_hits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let painted_media = std::rc::Rc::clone(&media_hits);
+    let media_entity = entity.clone();
+    let media_chat = chat_jid.clone();
 
     div()
         .flex_1()
         .min_h_0()
         .relative()
         .overflow_hidden()
+        .on_children_prepainted(move |_, _, cx| {
+            if !media_entity
+                .read(cx)
+                .media_cache()
+                .is_some_and(|cache| cache.defers_message_media())
+            {
+                return;
+            }
+            let viewport = media_state.viewport_bounds();
+            let mut visible: Vec<String> = std::mem::take(&mut *painted_media.borrow_mut())
+                .into_iter()
+                .filter(|(_, bounds): &(String, gpui::Bounds<gpui::Pixels>)| {
+                    bounds.bottom() > viewport.top()
+                        && bounds.top() < viewport.bottom()
+                        && bounds.right() > viewport.left()
+                        && bounds.left() < viewport.right()
+                })
+                .map(|(id, _)| id)
+                .collect();
+            visible.sort();
+            visible.dedup();
+            let entity = media_entity.clone();
+            let jid = media_chat.to_string();
+            cx.defer(move |cx| {
+                entity.update(cx, |app, cx| app.note_visible_media(jid, visible, cx))
+            });
+        })
         .child(
             div()
                 .absolute()
@@ -118,9 +150,24 @@ pub fn render_message_list(
             // a gutter there hung the scrollbar a gutter's width inside the
             // pane, floating over the conversation rather than at its edge.
             list(state.clone(), move |ix, _window, cx| {
+                let media_id = match items.get(ix) {
+                    Some(TimelineItem::Message { ix, .. }) => messages
+                        .get(*ix)
+                        .filter(|message| entity.read(cx).has_deferred_media_reference(message))
+                        .map(|message| message.id.clone()),
+                    _ => None,
+                };
                 div()
                     .w_full()
                     .px(gutter)
+                    .when_some(media_id, |element, id| {
+                        let hits = std::rc::Rc::clone(&media_hits);
+                        element.on_children_prepainted(move |bounds, _, _| {
+                            if let Some(bounds) = bounds.first() {
+                                hits.borrow_mut().push((id.clone(), *bounds));
+                            }
+                        })
+                    })
                     .child(render_row(
                         &items,
                         &messages,
@@ -204,6 +251,7 @@ fn render_row(
             };
             let message_id = &msg.id;
             if crate::platform::channel_preview::AUTOMATIC
+                && !entity.read(cx).awaiting_cached_media(chat_jid, msg)
                 && chat_jid.ends_with("@newsletter")
                 && msg.media.as_ref().is_some_and(|media| {
                     media.media_type == MediaType::Image
