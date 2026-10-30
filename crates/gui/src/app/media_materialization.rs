@@ -34,19 +34,24 @@ struct Target {
 }
 
 impl Target {
-    fn new(app: &WhatsAppApp, owner: Owner, jid: &str, message: &ChatMessage) -> Option<Self> {
+    fn reference(message: &ChatMessage) -> Option<(&String, bool)> {
         let media = message.media.as_ref()?;
         if message.revoked || (!media.data.is_empty() && !media.data_is_preview) {
             return None;
         }
-        let (key, preview) = media
+        media
             .cache_key
             .as_ref()
             .map(|key| (key, false))
             .or_else(|| {
                 media.data.is_empty().then_some(())?;
                 media.preview_cache_key.as_ref().map(|key| (key, true))
-            })?;
+            })
+    }
+
+    fn new(app: &WhatsAppApp, owner: Owner, jid: &str, message: &ChatMessage) -> Option<Self> {
+        let (key, preview) = Self::reference(message)?;
+        let media = message.media.as_ref()?;
         Some(Self {
             owner,
             generation: app.document_state_generation,
@@ -151,11 +156,7 @@ impl Materialization {
 
 impl WhatsAppApp {
     pub fn has_deferred_media_reference(&self, message: &ChatMessage) -> bool {
-        !message.revoked
-            && message.media.as_ref().is_some_and(|media| {
-                (media.data.is_empty() || media.data_is_preview)
-                    && (media.cache_key.is_some() || media.preview_cache_key.is_some())
-            })
+        Target::reference(message).is_some()
             && self
                 .media_cache()
                 .is_some_and(|cache| cache.defers_message_media())
@@ -363,6 +364,7 @@ impl WhatsAppApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxidezap_core::MediaType;
     use std::sync::atomic::AtomicUsize;
 
     struct Cache {
@@ -425,6 +427,83 @@ mod tests {
         media.preview_cache_key = Some(format!("preview-{n}"));
         message.media = Some(media);
         message
+    }
+
+    #[gpui::test]
+    fn history_preserved_preview_does_not_wait_for_an_ineligible_cache_read(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cache) = setup(cx);
+        app.update(cx, |app, cx| {
+            let chat = Arc::make_mut(&mut app.chats[0]);
+            let old = chat.messages[0].media.as_mut().unwrap();
+            old.data = Arc::new(vec![1, 2, 3]);
+            old.data_is_preview = true;
+            old.preview_cache_key = None;
+            chat.insert_history_message(message(0));
+            let row = chat.messages.iter().find(|m| m.id == "m0").unwrap().clone();
+            let media = row.media.as_ref().unwrap();
+            assert!(!media.data.is_empty() && media.preview_cache_key.is_some());
+            assert!(!app.has_deferred_media_reference(&row));
+            assert!(!app.awaiting_cached_media("peer@example.invalid", &row));
+            app.visible_chat = Some("peer@example.invalid".into());
+            app.note_visible_media("peer@example.invalid".into(), vec!["m0".into()], cx);
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(cache.reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[gpui::test]
+    fn reopened_status_skips_materialized_preview_but_waits_for_full_cache_attempt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cache) = setup(cx);
+        for media_type in [MediaType::Image, MediaType::Video] {
+            app.update(cx, |app, cx| {
+                app.media_materialization.surface(None);
+                let chat = Arc::make_mut(&mut app.chats[0]);
+                chat.jid = STATUS_BROADCAST_JID.into();
+                chat.is_status = true;
+                chat.messages = vec![message(0)];
+                let media = chat.messages[0].media.as_mut().unwrap();
+                media.data = Arc::new(vec![1, 2, 3]);
+                media.data_is_preview = true;
+                let mut incoming = message(0);
+                incoming.media.as_mut().unwrap().media_type = media_type;
+                chat.insert_history_message(incoming);
+                app.destination = Destination::Status;
+                app.status_pane.open("peer@example.invalid".into());
+                app.status_pane.follow(Some("m0".into()));
+                assert!(!app.shown_status_awaits_cache());
+                app.note_media_surface(cx);
+            });
+            cx.executor().run_until_parked();
+            let reads = cache.reads.load(Ordering::Relaxed);
+            app.update(cx, |app, cx| {
+                let media = Arc::make_mut(&mut app.chats[0]).messages[0]
+                    .media
+                    .as_mut()
+                    .unwrap();
+                media.cache_key = Some("missing-full".into());
+                assert!(app.shown_status_awaits_cache());
+                cache.fail.store(true, Ordering::Relaxed);
+                app.note_media_surface(cx);
+            });
+            cx.executor().run_until_parked();
+            assert_eq!(cache.reads.load(Ordering::Relaxed), reads + 1);
+            app.read_with(cx, |app, _| {
+                assert!(!app.shown_status_awaits_cache());
+                assert_eq!(
+                    app.chats[0].messages[0]
+                        .media
+                        .as_ref()
+                        .unwrap()
+                        .data
+                        .as_slice(),
+                    &[1, 2, 3]
+                );
+            });
+        }
     }
 
     fn setup(cx: &mut gpui::TestAppContext) -> (Entity<WhatsAppApp>, Arc<Cache>) {

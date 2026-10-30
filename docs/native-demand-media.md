@@ -60,7 +60,12 @@ allows another attempt. This is not a persistent negative cache.
 
 Status waits for the cache-only attempt before resuming its existing full-media
 fetch/playback behavior. Automatic channel-preview improvements also wait for
-the local attempt. Staging, downloads explicitly initiated by a user and their
+the local attempt. A history refresh can preserve preview bytes together with
+an incoming preview cache reference. That reference needs no second read: both
+the scheduling and waiting predicates use the same eligibility rule. A full
+cache reference still takes precedence and receives its local attempt; a failed
+attempt releases Status and channel improvements from waiting.
+Staging, downloads explicitly initiated by a user and their
 cancellation rules are separate from this ownership controller.
 
 ## Reproduction and measurement limits
