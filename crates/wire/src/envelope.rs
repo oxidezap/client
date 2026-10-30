@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+mod response_decode;
+
 use crate::error::ApiError;
 use crate::request::ClientRequest;
 use crate::response::DaemonResponse;
@@ -47,7 +49,7 @@ pub struct RequestEnvelope {
 }
 
 /// One daemon response correlating to a request ID.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResponseEnvelope {
     pub id: Option<RequestId>,
     #[serde(flatten)]
