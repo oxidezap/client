@@ -285,7 +285,12 @@ const PONG_WITHOUT_PERMISSION: &str = r#"(module
 )"#;
 
 fn spins() -> String {
-    versioned(SPINS)
+    // Wasmi charges const operators before folding constant/drop pairs away.
+    // Burn the real per-call fuel budget with fewer interpreter dispatches:
+    // a bare branch needs 50 million debug dispatches and races the 10 s
+    // publication deadline on a busy CI runner. The loop, fuel budget,
+    // deadline and fuel-trap assertion remain unchanged.
+    versioned(&SPINS.replace("$FUEL_WORK", &"i32.const 0 drop\n".repeat(64)))
 }
 
 const SPINS: &str = r#"(module
@@ -293,7 +298,7 @@ const SPINS: &str = r#"(module
   (memory (export "memory") 1)
   (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (func (export "oxi_init") (result i32) (call $subscribe (i64.const 2)) (i32.const 0))
-  (func (export "oxi_on_event") (param i32 i32) (result i32) (loop (br 0)) (i32.const 0))
+  (func (export "oxi_on_event") (param i32 i32) (result i32) (loop $FUEL_WORK (br 0)) (i32.const 0))
 )"#;
 
 /// Asks for one page and then for far more than the limit allows.
