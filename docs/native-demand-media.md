@@ -147,12 +147,13 @@ the test cache override and verifies the real cache is available without IPC,
 retaining key validation. Previews alone, videos and revoked messages stay out
 of the image album.
 
-Native validation passed: the full workspace passed 2,370 unit/integration/
-doctests with 23 ignored, including 607 GUI tests with 7 ignored measurements.
-Workspace all-target/all-feature Clippy with `-D warnings`, formatting and diff
-checks passed. A lifecycle regression releases the app entity before the queued
+After integrating main 01987cc, native validation passed: 2,387 top-level
+unit/integration/doctests with 31 ignored, plus one isolated avatar subprocess.
+The GUI group passed 613 tests with 8 ignored measurements. Workspace
+all-target/all-feature Clippy with `-D warnings`, formatting and diff checks
+passed. A lifecycle regression releases the app entity before the queued
 worker runs and asserts that the cache receives no read. The GUI web target also type-checked with
-`cargo +nightly-2026-09-03 check -p oxidezap-gui --all-features --target wasm32-unknown-unknown -Z build-std=std,panic_abort`,
+`cargo +nightly-2026-10-29 check -p oxidezap-gui --all-features --target wasm32-unknown-unknown -Z build-std=std,panic_abort`,
 with atomics and dead-code/unused-import warnings in unmodified paths. A first
 stable attempt stopped in `wasm_thread`, which requires nightly; it did not
 establish a source regression. This is a type check, not a browser runtime test.
@@ -164,4 +165,6 @@ loading/error until the full bytes arrive.
 Raw primitive measurements were captured at 8f8c43f; the
 measured fill helpers and bounded-read primitive are unchanged by the subsequent
 viewer/offline qualification changes. Remote platform/web CI and review remain
-required. The PR is stacked on #280, which remains separate.
+required. The PR originally depended on #280; that change is now in main. The
+branch integrates main 01987cc, including the dependency refresh, so its current
+diff contains only native hydration, its tests and its measurements.
