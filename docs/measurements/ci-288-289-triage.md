@@ -105,3 +105,21 @@ Cache Storage recovery/account-isolation tests. Existing unrelated WASM
 warnings remain. The production GUI also needs its normal Pages build;
 Windows, macOS and the remaining CI jobs remain the PR's checks. No merge
 is performed as part of this investigation.
+
+## Avatar comparison workflow instrumentation
+
+Changing an avatar file activates the existing `Avatar restore` comparison
+workflow. Its base step exposed another baseline harness problem on #290:
+E0428, duplicate `probe` module and duplicate `PERSISTENT_READS` static.
+The workflow unconditionally injected instrumentation that #282 had already
+committed into main. It also would have double-counted reads by adding a
+second increment. This failed while measuring the unchanged base, before
+running the candidate.
+
+The injection now adds each declaration/increment only when absent. Both
+legacy uninstrumented inputs and current main were exercised through the
+actual Python block extracted from the workflow. Each produced one probe,
+one counter and one increment; applying the block twice was byte-identical.
+For current main the entire output was byte-identical to the input. Both
+base/candidate measurements and PNG/JPEG probe runs remain enabled. This is
+an idempotency fix, with no deletion of the performance or lifecycle checks.
