@@ -173,3 +173,95 @@ fn structured_error_details_keep_the_reference_map_order() {
         compare(frame);
     }
 }
+
+// A self-describing generic key deserializer. serde_json::Value's own
+// deserialize_identifier deliberately requires text, which would hide the
+// non-string-key behavior this regression test needs to exercise.
+#[derive(Clone)]
+struct GenericKey(Value);
+impl<'de> serde::Deserializer<'de> for GenericKey {
+    type Error = serde_json::Error;
+    fn deserialize_any<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        serde::Deserializer::deserialize_any(self.0, visitor)
+    }
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+        option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier ignored_any
+    }
+}
+impl<'de> serde::de::IntoDeserializer<'de, serde_json::Error> for GenericKey {
+    type Deserializer = Self;
+    fn into_deserializer(self) -> Self {
+        self
+    }
+}
+#[test]
+fn generic_map_keys_match_the_previous_flattened_decoder() {
+    use serde::Deserialize;
+    use serde::de::value::{MapAccessDeserializer, MapDeserializer};
+    let keys = [
+        json!(7),
+        json!(true),
+        json!(null),
+        json!([7]),
+        json!({"synthetic":7}),
+    ];
+    for key in keys {
+        let entries = vec![
+            (GenericKey(key.clone()), json!(null)),
+            (GenericKey(json!("status")), json!("ok")),
+            (GenericKey(json!("type")), json!("ack")),
+        ];
+        let legacy = cases::LegacyEnvelope::deserialize(MapAccessDeserializer::new(
+            MapDeserializer::new(entries.clone().into_iter()),
+        ))
+        .map(|v| ResponseEnvelope {
+            id: v.id,
+            result: v.result,
+        });
+        let current = ResponseEnvelope::deserialize(MapAccessDeserializer::new(
+            MapDeserializer::new(entries.into_iter()),
+        ));
+        if key == json!(7) {
+            assert!(
+                legacy.is_ok(),
+                "the reference accepts an unknown numeric key"
+            );
+        }
+        match (legacy, current) {
+            (Ok(base), Ok(head)) => assert_eq!(base, head),
+            (Err(_), Err(_)) => {}
+            (base, head) => panic!("generic key {key}: base={base:?}, head={head:?}"),
+        }
+    }
+}
+
+#[test]
+fn generic_byte_keys_and_numeric_status_keep_the_legacy_behavior() {
+    use serde::Deserialize;
+    use serde::de::value::{BorrowedBytesDeserializer, MapAccessDeserializer, MapDeserializer};
+    for unknown in [b"unknown".as_slice(), b"\xff"] {
+        let entries = vec![
+            (
+                BorrowedBytesDeserializer::<serde_json::Error>::new(unknown),
+                json!(null),
+            ),
+            (BorrowedBytesDeserializer::new(b"status"), json!(0)),
+            (BorrowedBytesDeserializer::new(b"type"), json!("ack")),
+            (BorrowedBytesDeserializer::new(b"id"), json!(u64::MAX)),
+        ];
+        let legacy = cases::LegacyEnvelope::deserialize(MapAccessDeserializer::new(
+            MapDeserializer::new(entries.clone().into_iter()),
+        ))
+        .unwrap();
+        let current = ResponseEnvelope::deserialize(MapAccessDeserializer::new(
+            MapDeserializer::new(entries.into_iter()),
+        ))
+        .unwrap();
+        assert_eq!(current.id, legacy.id);
+        assert_eq!(current.result, legacy.result);
+    }
+}
