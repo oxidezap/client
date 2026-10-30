@@ -77,11 +77,13 @@ loop. Wasmi 2.0 meters each constant operator before folding the pair away;
 source define this behavior. The loop consumes the same production fuel
 budget with fewer interpreter dispatches. Its unconditional branch,
 ten-second deadline, stopped-state assertion and fuel-error assertion all
-remain. No runtime sandbox setting or budget changes.
+remain. A separate bounded 32-unit probe retains the original bare-branch
+case and asserts the precise OutOfFuel trap, so adding other billed work
+cannot hide a free-branch regression. No runtime sandbox setting or budget changes.
 
 With the same CPU contention, the adjusted fixture passed five consecutive
 runs in 0.60–0.68 seconds. Isolated, it passed in 0.25 seconds. The full
-plugin-host suite passed, 135 tests and one existing ignored test. Clippy
+plugin-host suite passed, 136 tests and one existing ignored test. Clippy
 for all plugin-host targets/features passed with warnings denied.
 
 ## Browser validation

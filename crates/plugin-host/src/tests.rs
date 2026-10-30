@@ -613,6 +613,37 @@ fn a_command_outside_the_declared_capabilities_never_reaches_the_daemon() {
     assert!(surface.is_running(), "but it is not stopped for trying");
 }
 
+/// Keep the original empty-loop case covered independently of the cheaper
+/// host fixture: adding billed work must not hide a free-branch regression.
+#[test]
+fn a_bare_branch_loop_consumes_fuel() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let mut config = wasmi::Config::default();
+        config.consume_fuel(true);
+        let engine = wasmi::Engine::new(&config);
+        let bytes = wat::parse_str("(module (func (export \"spin\") (loop (br 0))))")
+            .expect("valid bare-loop fixture");
+        let module = wasmi::Module::new(&engine, &bytes[..]).expect("the module validates");
+        let mut store = wasmi::Store::new(&engine, ());
+        store.set_fuel(32).expect("fuel metering is enabled");
+        let instance = wasmi::Linker::new(&engine)
+            .instantiate_and_start(&mut store, &module)
+            .expect("the module has no start function");
+        let spin = instance.get_typed_func::<(), ()>(&store, "spin").unwrap();
+        let error = spin
+            .call(&mut store, ())
+            .expect_err("the loop exhausts fuel");
+        tx.send(error.as_trap_code()).unwrap();
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("bare branches must consume fuel"),
+        Some(wasmi::TrapCode::OutOfFuel)
+    );
+    worker.join().expect("the fuel probe completed");
+}
+
 /// The number that makes running a stranger's code in this process
 /// defensible.
 #[test]
