@@ -233,6 +233,34 @@ mod tests {
         assert_eq!(alias.label(), "+1 202-555-0123");
     }
     #[test]
+    fn phone_metadata_patch_preserves_labels_and_error_fallback() {
+        // NANPA and Ofcom reserved fictional numbers. Device suffixes never
+        // participate in international formatting.
+        for (jid, expected) in [
+            ("12025550123:7@s.whatsapp.net", "+1 202-555-0123"),
+            ("442079460000@s.whatsapp.net", "+44 20 7946 0000"),
+            ("447700900123@s.whatsapp.net", "+44 7700 900123"),
+            ("9990000000@s.whatsapp.net", "+9990000000"),
+        ] {
+            assert_eq!(format_phone_jid(jid).as_deref(), Some(expected));
+        }
+        let mut contact = person("12025550123@s.whatsapp.net", Some("Alex"));
+        assert_eq!(contact.label(), "Alex");
+        contact.label = Some("Cached name".into());
+        assert_eq!(contact.label(), "Cached name");
+
+        // Only the immutable embedded database can skip runtime validation.
+        let invalid = phonenumber::metadata::loader::Metadata {
+            general: Some(phonenumber::metadata::loader::Descriptor {
+                national_number: Some("[".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(phonenumber::metadata::Database::from(vec![invalid]).is_err());
+    }
+
+    #[test]
     fn membership_grammar_and_identities_survive_serialization() {
         let a = person("559900000002@s.whatsapp.net", Some("Ana"));
         let b = person("111000033334444@lid", Some("Bruno"));

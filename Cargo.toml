@@ -117,6 +117,9 @@ whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rus
 # gpui-pre-web 0.3.10 still passes floats to web-sys 0.3.106's integer API.
 # Keep the published GPUI family unified; remove when upstream ships the fix.
 [patch.crates-io]
+# Validate immutable phone metadata during the build, not the first label.
+# See vendor/phonenumber/LOCAL_CHANGES.md.
+phonenumber = { path = "vendor/phonenumber" }
 gpui-pre-web = { path = "vendor/gpui-pre-web" }
 
 [profile.dev]

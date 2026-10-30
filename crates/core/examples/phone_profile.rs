@@ -92,6 +92,25 @@ fn sample(tag: &str, n: usize, left: bool) {
     );
 }
 fn main() {
+    if std::env::args().any(|arg| arg == "--equivalence") {
+        // Synthetic country-code candidates and deliberately repetitive NSNs.
+        // Include invalid codes and lengths. Nothing comes from an account.
+        for code in 1..1000 {
+            for len in 4..=12 {
+                for fill in ['0', '9'] {
+                    let digits = format!("{code}{}", fill.to_string().repeat(len));
+                    let jid = format!("{digits}@s.whatsapp.net");
+                    let result = oxidezap_core::format_phone_jid(&jid);
+                    assert_eq!(
+                        result,
+                        oxidezap_core::format_phone_jid(&format!("{digits}:7@s.whatsapp.net"))
+                    );
+                    println!("{digits}\t{result:?}");
+                }
+            }
+        }
+        return;
+    }
     let left = std::env::args().any(|arg| arg == "left");
     if std::env::args().any(|arg| arg == "--timing") {
         TRACK.store(false, Relaxed);
