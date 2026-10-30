@@ -56,13 +56,16 @@ jobs:
           text = mod.read_text()
           marker = 'mod native;'
           assert marker in text
-          mod.write_text(text.replace(marker, marker + '\n#[cfg(all(test, not(target_family = "wasm")))]\nmod probe;', 1))
+          if 'mod probe;' not in text:
+              mod.write_text(text.replace(marker, marker + '\n#[cfg(all(test, not(target_family = "wasm")))]\nmod probe;', 1))
           native = root / 'native.rs'
           text = native.read_text()
           marker = 'pub async fn read_persistent(key: &str) -> Option<Vec<u8>> {'
           assert marker in text
-          text = text.replace(marker, marker + '\n    #[cfg(test)]\n    PERSISTENT_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);', 1)
-          text += '\n#[cfg(test)]\npub(super) static PERSISTENT_READS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);\n'
+          if 'PERSISTENT_READS.fetch_add' not in text:
+              text = text.replace(marker, marker + '\n    #[cfg(test)]\n    PERSISTENT_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);', 1)
+          if 'static PERSISTENT_READS:' not in text:
+              text += '\n#[cfg(test)]\npub(super) static PERSISTENT_READS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);\n'
           native.write_text(text)
           PY
           cargo test -p oxidezap-gui --bin oxidezap --locked native_restore_probe -- --ignored --nocapture
