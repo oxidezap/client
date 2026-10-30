@@ -9,14 +9,11 @@ use std::sync::RwLock;
 static ACTIVE_ACCOUNT: RwLock<Option<oxidezap_core::AccountId>> = RwLock::new(None);
 
 #[cfg(test)]
-pub(super) static PERSISTENT_READS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(super) static PERSISTENT_READS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 #[cfg(test)]
-pub(super) static DECODE_COMPLETED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(super) static DECODE_COMPLETED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 #[cfg(test)]
-pub(super) static DECODE_PERFORMED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(super) static DECODE_PERFORMED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 pub fn set_active_account(account: Option<oxidezap_core::AccountId>) {
     if let Ok(mut lock) = ACTIVE_ACCOUNT.write() {

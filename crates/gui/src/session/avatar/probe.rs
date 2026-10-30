@@ -1,7 +1,7 @@
 //! Opt-in synthetic local-cache restore measurement. No account or network.
 
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as StdOrdering};
+use portable_atomic::{AtomicBool, AtomicU64, Ordering as StdOrdering};
 use std::time::Duration;
 
 fn cpu_ticks() -> u64 {
