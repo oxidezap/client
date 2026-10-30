@@ -218,9 +218,10 @@ impl<'a> Frames<'a> {
                 // Here rather than on the window's side, for the same reason
                 // a history load fills its media here: a page names photos,
                 // and getting them is I/O.
-                for message in &mut messages {
-                    fill(&mut message.media, self.media);
-                }
+                fill_many(
+                    messages.iter_mut().map(|message| &mut message.media),
+                    self.media,
+                );
                 self.publish(FromDaemon::Messages {
                     jid,
                     messages,
@@ -244,11 +245,13 @@ impl<'a> Frames<'a> {
                 // list's preview: its media is externalized like any other, so
                 // it has to be read back here like any other. Skipping it drew
                 // a photo the daemon had cached as a download-only bubble.
-                for chat in &mut chats {
-                    for message in &mut chat.messages {
-                        fill(&mut message.media, self.media);
-                    }
-                }
+                fill_many(
+                    chats
+                        .iter_mut()
+                        .flat_map(|chat| &mut chat.messages)
+                        .map(|message| &mut message.media),
+                    self.media,
+                );
                 self.publish(FromDaemon::Chats {
                     chats,
                     next,
@@ -848,11 +851,13 @@ fn load_media(event: &mut UiEvent, cache: &dyn MediaCache) {
     match event {
         UiEvent::MessageReceived { message, .. } => fill(&mut message.media, cache),
         UiEvent::HistoryLoaded { chats, .. } => {
-            for chat in chats {
-                for message in &mut chat.messages {
-                    fill(&mut message.media, cache);
-                }
-            }
+            fill_many(
+                chats
+                    .iter_mut()
+                    .flat_map(|chat| &mut chat.messages)
+                    .map(|message| &mut message.media),
+                cache,
+            );
         }
         UiEvent::AvatarReady { jid, key } if !key.is_empty() => {
             if let Err(_err) = materialize_avatar(key, cache) {
@@ -903,6 +908,33 @@ fn materialize_avatar(key: &str, cache: &dyn MediaCache) -> Result<(), Materiali
 }
 
 fn fill(media: &mut Option<MediaContent>, cache: &dyn MediaCache) {
+    fill_with(media, |key| cache.read(key));
+}
+
+/// A frame can repeat a content-addressed payload in many chats. Keep one
+/// handle while filling that frame, so native filesystem reads share bytes as
+/// the web cache already does. Nothing survives the frame or an account switch.
+fn fill_many<'a>(
+    media: impl IntoIterator<Item = &'a mut Option<MediaContent>>,
+    cache: &dyn MediaCache,
+) {
+    let mut held = std::collections::HashMap::<String, Arc<Vec<u8>>>::new();
+    for media in media {
+        fill_with(media, |key| {
+            if let Some(bytes) = held.get(key) {
+                return Ok(Arc::clone(bytes));
+            }
+            let bytes = cache.read(key)?;
+            held.insert(key.to_string(), Arc::clone(&bytes));
+            Ok(bytes)
+        });
+    }
+}
+
+fn fill_with(
+    media: &mut Option<MediaContent>,
+    read: impl FnOnce(&str) -> Result<Arc<Vec<u8>>, String>,
+) {
     let Some(media) = media else { return };
     let reference = media
         .cache_key
@@ -912,7 +944,7 @@ fn fill(media: &mut Option<MediaContent>, cache: &dyn MediaCache) {
     let Some((key, preview)) = reference else {
         return;
     };
-    match cache.read(&key) {
+    match read(&key) {
         // Inline fallback bytes have a separate reference. Only a full-media
         // key may change the preview flag or restore the original MIME type.
         Ok(bytes) if preview => media.data = bytes,
@@ -981,6 +1013,83 @@ mod tests {
         assert!(!loaded.data_is_preview);
         assert!(!loaded.data_is_server_preview);
         assert_eq!(loaded.mime_type, "image/webp");
+    }
+
+    #[test]
+    fn a_history_frame_shares_payloads_but_never_caches_across_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Cache(AtomicUsize);
+        impl MediaCache for Cache {
+            fn read(&self, _: &str) -> Result<Arc<Vec<u8>>, String> {
+                let generation = self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(Arc::new(vec![generation as u8; 1024]))
+            }
+            fn stage(&self, _: &str, _: &[u8]) -> Result<(), String> {
+                unreachable!()
+            }
+            fn discard(&self, _: &str) {
+                unreachable!()
+            }
+        }
+        let cache = Cache(AtomicUsize::new(0));
+        let rows = || {
+            (0..12)
+                .map(|_| {
+                    let mut media =
+                        MediaContent::image(Arc::new(Vec::new()), "image/jpeg".into(), true);
+                    media.preview_cache_key = Some("same-preview".into());
+                    Some(media)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut first = rows();
+        fill_many(&mut first, &cache);
+        assert_eq!(cache.0.load(Ordering::Relaxed), 1);
+        let bytes = &first[0].as_ref().unwrap().data;
+        for media in first.iter().flatten() {
+            assert!(Arc::ptr_eq(bytes, &media.data));
+            assert!(media.data_is_preview);
+            assert_eq!(media.mime_type, "image/jpeg");
+            assert!(media.preview_cache_key.is_none());
+        }
+        let mut next = rows();
+        fill_many(&mut next, &cache);
+        assert_eq!(cache.0.load(Ordering::Relaxed), 2);
+        assert_eq!(next[0].as_ref().unwrap().data[0], 1);
+        assert!(!Arc::ptr_eq(bytes, &next[0].as_ref().unwrap().data));
+    }
+
+    #[test]
+    fn a_failed_read_does_not_hide_a_later_available_payload() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Cache(AtomicBool);
+        impl MediaCache for Cache {
+            fn read(&self, _: &str) -> Result<Arc<Vec<u8>>, String> {
+                if self.0.swap(false, Ordering::Relaxed) {
+                    Err("temporarily unavailable".into())
+                } else {
+                    Ok(Arc::new(vec![42]))
+                }
+            }
+            fn stage(&self, _: &str, _: &[u8]) -> Result<(), String> {
+                unreachable!()
+            }
+            fn discard(&self, _: &str) {
+                unreachable!()
+            }
+        }
+        let mut rows: Vec<_> = (0..2)
+            .map(|_| {
+                let mut media =
+                    MediaContent::image(Arc::new(Vec::new()), "image/jpeg".into(), true);
+                media.cache_key = Some("full".into());
+                Some(media)
+            })
+            .collect();
+        fill_many(&mut rows, &Cache(AtomicBool::new(true)));
+        assert!(rows[0].as_ref().unwrap().data.is_empty());
+        assert_eq!(rows[1].as_ref().unwrap().data.as_slice(), [42]);
+        assert!(!rows[1].as_ref().unwrap().data_is_preview);
     }
 
     struct NoMedia;
