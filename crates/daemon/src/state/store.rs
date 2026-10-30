@@ -15,6 +15,8 @@
 //! lock is still held, and hands the result back with the record. See
 //! [`Published`] for why that hand-over-hand is load-bearing.
 
+use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Mutex;
 
 use oxidezap_ipc::{ChatSummary, ConnectionState, DaemonEvent, StateSnapshot, StateVersion};
@@ -153,6 +155,7 @@ struct Inner {
     /// can have both answered without the account leaving in between: see
     /// [`StateStore::apply_unless_stale`].
     account_generation: usize,
+    attention: Attention,
 }
 
 /// A change that has been recorded and is now owed to the readers.
@@ -203,6 +206,7 @@ impl StateStore {
                 chats: std::collections::HashMap::new(),
                 inactive_chats: std::collections::HashSet::new(),
                 account_generation: 0,
+                attention: Attention::new(i64::MIN),
             }),
         }
     }
@@ -260,6 +264,7 @@ impl StateStore {
     pub(super) fn forget_account(&self) {
         let mut inner = self.lock();
         inner.chats.clear();
+        inner.attention = Attention::new(i64::MIN);
         inner.inactive_chats.clear();
         inner.account = None;
         inner.calls = oxidezap_core::CallState::new();
@@ -294,20 +299,18 @@ impl StateStore {
 
     /// Recompute time-dependent attention under the state/publication locks.
     pub(super) fn refresh_tray(&self, publish: impl FnOnce(TrayState)) {
-        let inner = self.lock();
+        let mut inner = self.lock();
         publish(inner.tray_state());
     }
 
     pub(super) fn next_mute_expiry(&self, now_ms: i64) -> Option<i64> {
         self.lock()
-            .chats
-            .values()
-            .filter_map(|e| e.summary.muted_until_ms)
-            .filter(|until| {
-                *until > now_ms
-                    && *until < chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis()
-            })
-            .min()
+            .attention
+            .deadlines
+            .range((Excluded(now_ms), Unbounded))
+            .next()
+            .map(|(&until, _)| until)
+            .filter(|&until| until < chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis())
     }
 
     /// The summary held for `jid`, if any.
@@ -361,6 +364,7 @@ impl StateStore {
         if only_for.is_some_and(|asked| asked != inner.account_generation) {
             return None;
         }
+        inner.advance_attention(wacore::time::now_utc().timestamp_millis());
         inner.version = inner.version.next();
 
         match &event {
@@ -369,7 +373,10 @@ impl StateStore {
                 if from_store {
                     inner.inactive_chats.remove(&summary.jid);
                 }
-                match inner.chats.entry(summary.jid.clone()) {
+                let Inner {
+                    chats, attention, ..
+                } = &mut *inner;
+                match chats.entry(summary.jid.clone()) {
                     std::collections::hash_map::Entry::Occupied(mut slot) => {
                         let entry = slot.get_mut();
                         let mut updated = summary.clone();
@@ -380,6 +387,8 @@ impl StateStore {
                         if updated.group_hierarchy.is_none() {
                             updated.group_hierarchy = entry.summary.group_hierarchy.clone();
                         }
+                        attention.remove(&entry.summary);
+                        attention.add(&updated);
                         entry.summary = updated;
                         // Sticky: a live update to a chat the store has already
                         // published must not make it live-only again, or a
@@ -388,6 +397,7 @@ impl StateStore {
                         entry.from_store |= from_store;
                     }
                     std::collections::hash_map::Entry::Vacant(slot) => {
+                        attention.add(summary);
                         slot.insert(ChatEntry {
                             summary: summary.clone(),
                             from_store,
@@ -396,7 +406,9 @@ impl StateStore {
                 }
             }
             DaemonEvent::ChatRemoved { jid } => {
-                inner.chats.remove(jid);
+                if let Some(entry) = inner.chats.remove(jid) {
+                    inner.attention.remove(&entry.summary);
+                }
                 inner.inactive_chats.insert(jid.clone());
             }
             // Not the usual route in — [`Self::change_calls`] is — but the
@@ -475,27 +487,101 @@ impl StateStore {
     }
 }
 
+/// A running total and one bucket per distinct mute deadline.
+/// No JIDs or message payloads are retained here. Keep the unsaturated total
+/// so removing a chat after overflow can recover the exact u32 badge.
+struct Attention {
+    now_ms: i64,
+    total: u128,
+    deadlines: BTreeMap<i64, MuteBucket>,
+}
+
+#[derive(Default)]
+struct MuteBucket {
+    chats: usize,
+    unread: u128,
+}
+
+impl Attention {
+    fn new(now_ms: i64) -> Self {
+        Self {
+            now_ms,
+            total: 0,
+            deadlines: BTreeMap::new(),
+        }
+    }
+
+    fn weight(summary: &ChatSummary) -> u128 {
+        if !summary.counts_toward_unread() {
+            return 0;
+        }
+        u128::from(summary.unread.max(u32::from(summary.manually_unread)))
+    }
+
+    fn add(&mut self, summary: &ChatSummary) {
+        let weight = Self::weight(summary);
+        if summary.counts_toward_attention(self.now_ms) {
+            self.total += weight;
+        }
+        if let Some(until) = summary.muted_until_ms {
+            let bucket = self.deadlines.entry(until).or_default();
+            bucket.chats += 1;
+            bucket.unread += weight;
+        }
+    }
+
+    fn remove(&mut self, summary: &ChatSummary) {
+        let weight = Self::weight(summary);
+        if summary.counts_toward_attention(self.now_ms) {
+            self.total -= weight;
+        }
+        if let Some(until) = summary.muted_until_ms {
+            let bucket = self
+                .deadlines
+                .get_mut(&until)
+                .expect("indexed mute deadline");
+            bucket.chats -= 1;
+            bucket.unread -= weight;
+            if bucket.chats == 0 {
+                self.deadlines.remove(&until);
+            }
+        }
+    }
+}
+
 impl Inner {
-    fn tray_state(&self) -> TrayState {
-        let now_ms = wacore::time::now_utc().timestamp_millis();
+    fn advance_attention(&mut self, now_ms: i64) {
+        let before = self.attention.now_ms;
+        if before == now_ms {
+            return;
+        }
+        let (lower, upper) = if before <= now_ms {
+            (before, now_ms)
+        } else {
+            (now_ms, before)
+        };
+        // Keep past deadlines until their chats change or leave. A stale timer
+        // query and a clock reversal can then use the same index without
+        // rebuilding it or consulting every chat.
+        let crossed: u128 = self
+            .attention
+            .deadlines
+            .range((Excluded(lower), Included(upper)))
+            .map(|(_, bucket)| bucket.unread)
+            .sum();
+        if before <= now_ms {
+            self.attention.total += crossed;
+        } else {
+            self.attention.total -= crossed;
+        }
+        self.attention.now_ms = now_ms;
+    }
+
+    fn tray_state(&mut self) -> TrayState {
+        self.advance_attention(wacore::time::now_utc().timestamp_millis());
         TrayState {
             connected: self.connection.is_connected(),
-            // A manually-unread chat carries a badge with no number, so it
-            // counts as one for a tray that can only show a total. The status
-            // broadcast is left out of it entirely: see
-            // `ChatSummary::counts_toward_attention`.
-            unread: self
-                .chats
-                .values()
-                .map(|e| &e.summary)
-                .filter(|c| c.counts_toward_attention(now_ms))
-                .fold(0u32, |acc, c| {
-                    acc.saturating_add(if c.unread == 0 && c.manually_unread {
-                        1
-                    } else {
-                        c.unread
-                    })
-                }),
+            unread: self.attention.total.min(u128::from(u32::MAX)) as u32,
         }
     }
 }
@@ -503,6 +589,171 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "release performance workload"]
+    fn attention_workload() {
+        let count: usize = std::env::var("ATTENTION_CHATS")
+            .unwrap_or_else(|_| "10000".into())
+            .parse()
+            .unwrap();
+        let mute_every: usize = std::env::var("ATTENTION_MUTE_EVERY")
+            .unwrap_or_else(|_| "0".into())
+            .parse()
+            .unwrap();
+        let until = wacore::time::now_utc().timestamp_millis() + 3_600_000;
+        let make_chat = |i: usize, unread| {
+            let mut change = chat(&format!("synthetic-{i}@s.whatsapp.net"), unread);
+            if mute_every > 0
+                && i.is_multiple_of(mute_every)
+                && let DaemonEvent::ChatUpdated(summary) = &mut change.event
+            {
+                summary.muted_until_ms = Some(until + i as i64);
+            }
+            change
+        };
+        let store = store();
+        let mut expected = 0;
+        let start = wacore::time::Instant::now();
+        for unread in [1, 2] {
+            for i in 0..count {
+                let muted = mute_every > 0 && i.is_multiple_of(mute_every);
+                expected += u32::from(!muted);
+                let published = store
+                    .apply_unless_stale(make_chat(i, unread), None, || ())
+                    .unwrap();
+                assert_eq!(published.tray.unread, expected);
+                store.refresh_tray(|tray| assert_eq!(tray.unread, expected));
+                let deadline = store.next_mute_expiry(wacore::time::now_utc().timestamp_millis());
+                assert_eq!(deadline, (mute_every > 0).then_some(until));
+                let _ = std::hint::black_box(published);
+            }
+        }
+        println!(
+            "attention workload chats={count} mute_every={mute_every} elapsed_ns={}",
+            start.elapsed().as_nanos()
+        );
+        if let Ok(stats) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+            for line in stats.lines().filter(|line| {
+                line.starts_with("Rss:")
+                    || line.starts_with("Pss:")
+                    || line.starts_with("Private_Dirty:")
+            }) {
+                println!("attention memory {line}");
+            }
+        }
+        std::hint::black_box(&store);
+    }
+
+    fn assert_attention_matches_scan(store: &StateStore, now_ms: i64) {
+        let mut inner = store.lock();
+        inner.advance_attention(now_ms);
+        let expected: u128 = inner
+            .chats
+            .values()
+            .filter(|entry| entry.summary.counts_toward_attention(now_ms))
+            .map(|entry| {
+                u128::from(
+                    if entry.summary.unread == 0 && entry.summary.manually_unread {
+                        1
+                    } else {
+                        entry.summary.unread
+                    },
+                )
+            })
+            .sum();
+        assert_eq!(inner.attention.total, expected, "at {now_ms}");
+        let expected_deadline = inner
+            .chats
+            .values()
+            .filter_map(|entry| entry.summary.muted_until_ms)
+            .min();
+        assert_eq!(
+            inner
+                .attention
+                .deadlines
+                .first_key_value()
+                .map(|(&until, _)| until),
+            expected_deadline
+        );
+    }
+
+    #[test]
+    fn incremental_attention_matches_scan_through_updates_expiry_and_clock_reversal() {
+        let store = store();
+        let now = wacore::time::now_utc().timestamp_millis();
+        let forever = chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis();
+        let mut seed = 17u64;
+        for step in 0..2000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let jid = if seed.is_multiple_of(11) {
+                oxidezap_core::STATUS_BROADCAST_JID.to_string()
+            } else {
+                format!("{}@s.whatsapp.net", seed % 64)
+            };
+            let event = if seed.is_multiple_of(5) {
+                DaemonEvent::ChatRemoved { jid }
+            } else {
+                let mut summary = match chat(&jid, (seed >> 32) as u32).event {
+                    DaemonEvent::ChatUpdated(summary) => summary,
+                    _ => unreachable!(),
+                };
+                if step % 7 == 0 {
+                    summary.unread = 0;
+                }
+                summary.manually_unread = step % 3 == 0;
+                summary.muted_until_ms = match step % 6 {
+                    0 => Some(now - 100),
+                    1 => Some(now + 100),
+                    2 => Some(now + 200),
+                    3 => Some(forever),
+                    4 => Some(i64::MAX),
+                    _ => None,
+                };
+                DaemonEvent::ChatUpdated(summary)
+            };
+            let _published = store
+                .apply_unless_stale(Change::live(event), None, || ())
+                .unwrap();
+            for at in [now, now + 100, now + 200, now - 101, forever, i64::MAX, now] {
+                assert_attention_matches_scan(&store, at);
+            }
+        }
+        store.forget_account();
+        assert_attention_matches_scan(&store, now);
+        assert_eq!(store.lock().attention.total, 0);
+    }
+
+    #[test]
+    fn attention_recovers_after_saturation_and_removes_shared_deadlines() {
+        let store = store();
+        let until = wacore::time::now_utc().timestamp_millis() + 60_000;
+        for jid in ["a", "b", "c"] {
+            let mut change = chat(jid, u32::MAX);
+            if let DaemonEvent::ChatUpdated(summary) = &mut change.event {
+                summary.muted_until_ms = Some(until);
+            }
+            let published = store.apply_unless_stale(change, None, || ()).unwrap();
+            assert_eq!(published.tray.unread, 0);
+        }
+        assert_eq!(store.lock().attention.deadlines.len(), 1);
+        let _published = store.apply_unless_stale(chat("a", u32::MAX), None, || ());
+        let _published = store.apply_unless_stale(chat("b", 10), None, || ());
+        assert_eq!(store.lock().attention.total, u128::from(u32::MAX) + 10);
+        let published = store
+            .apply_unless_stale(
+                Change::live(DaemonEvent::ChatRemoved { jid: "a".into() }),
+                None,
+                || (),
+            )
+            .unwrap();
+        assert_eq!(published.tray.unread, 10);
+        assert_eq!(store.next_mute_expiry(until - 1), Some(until));
+        assert_eq!(store.next_mute_expiry(until), None);
+        assert_eq!(store.next_mute_expiry(until - 1), Some(until));
+        assert_attention_matches_scan(&store, until);
+        assert_attention_matches_scan(&store, until - 1);
+    }
 
     /// Nothing here has anywhere to send, and that is the point of the split:
     /// what the daemon *knows* can be driven, and asserted on, without four

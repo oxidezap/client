@@ -13,19 +13,17 @@ fn notice(id: &str, index: u32) -> Event {
             .participant(jid(PEER))
             .timestamp(ts(1_700_000_000))
             .is_lid_addressing_mode(true)
-            .action(Box::new(GroupNotificationAction::Add {
-                participants: vec![GroupParticipantInfo {
-                    jid: jid(PEER_LID),
-                    phone_number: Some(jid(PEER)),
-                    display_name: Some("Synthetic member".to_owned()),
-                    r#type: None,
-                    lid: None,
-                    username: None,
-                    join_time: None,
-                    group_history_sent_state: None,
-                }],
-                reason: None,
-            }))
+            .action(Box::new(
+                GroupNotificationAction::add()
+                    .participants(vec![
+                        GroupParticipantInfo::builder()
+                            .jid(jid(PEER_LID))
+                            .maybe_phone_number(Some(jid(PEER)))
+                            .maybe_display_name(Some("Synthetic member".to_owned()))
+                            .build(),
+                    ])
+                    .build(),
+            ))
             .build(),
     )
 }

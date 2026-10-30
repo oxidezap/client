@@ -13,12 +13,16 @@ The web uses a transparent ICO with separate 16, 32 and 48 pixel frames, a
 the same mark, with its empty margins reduced for legibility. The Apple icon
 uses the page's initial background color. There is no traced or recolored logo.
 
-To regenerate, install Python 3 with Pillow and put `oxipng` on `PATH`, then run:
+To regenerate, use Python 3.11 or newer and install the pinned tools:
 
 ```sh
-python3 packaging/generate-icons.py
+python3 -m venv .venv-icons
+. .venv-icons/bin/activate
+python -m pip install -r packaging/requirements.txt
+cargo install --locked --version 10.2.1 oxipng
+python packaging/generate-icons.py
 # Replace the source when the organization chooses a new identity:
-python3 packaging/generate-icons.py path/to/organization.png
+python packaging/generate-icons.py path/to/organization.png
 ```
 
 The checked-in assets were generated with Pillow 12.3.0 and oxipng 9.1.5.

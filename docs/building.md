@@ -109,7 +109,7 @@ take the pin from `Cargo.lock` rather than from this line:
 
 ```bash
 rustup target add wasm32-unknown-unknown          # for stable, not nightly
-cargo install wasm-bindgen-cli --version 0.2.127  # must match Cargo.lock
+cargo install wasm-bindgen-cli --version 0.2.129  # must match Cargo.lock
 # Chrome and a matching chromedriver, however your platform supplies them.
 ```
 

@@ -605,18 +605,27 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
     crate::components::InputAreaView::init_bindings(cx);
     // `secondary` is Command on macOS and Control elsewhere, which is what
     // makes one binding table correct on every platform.
-    cx.bind_keys([
+    // GPUI's static constructor no longer resolves the OS-dependent alias.
+    fn window_binding<A: gpui::Action>(
+        keys: &'static str,
+        action: A,
+        cx: &gpui::App,
+    ) -> KeyBinding {
+        KeyBinding::load(keys, Box::new(action), None, false, None, cx)
+            .expect("valid application shortcut")
+    }
+    let bindings = [
         KeyBinding::new("up", SelectUp, Some(CHAT_LIST_CONTEXT)),
         KeyBinding::new("down", SelectDown, Some(CHAT_LIST_CONTEXT)),
         // Exclude the Input context so matched Space remains available to the editor.
         KeyBinding::new("space", ToggleSelectedCommunity, Some("ChatList && !Input")),
         // Window-wide: reachable whatever owns focus, because both are ways
         // *out* of wherever the user currently is.
-        KeyBinding::new("secondary-k", FocusSearch, None),
-        KeyBinding::new(
+        window_binding("secondary-k", FocusSearch, cx),
+        window_binding(
             crate::platform::keyboard::conversation_search_key(),
             ToggleConversationSearch,
-            None,
+            cx,
         ),
         KeyBinding::new(
             crate::platform::keyboard::chat_history_page_keys().0,
@@ -628,7 +637,7 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
             PageChatHistoryDown,
             None,
         ),
-        KeyBinding::new("secondary-,", OpenSettings, None),
+        window_binding("secondary-,", OpenSettings, cx),
         // Scoped to the call so Enter and Escape keep their composer meaning
         // while nothing is ringing.
         KeyBinding::new("enter", AcceptCall, Some(CALL_CONTEXT)),
@@ -638,8 +647,8 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
         // *during* a call, with the caret back in the composer where someone
         // on a call is likely typing. A modifier chord has nothing to
         // collide with there, and it does nothing when no call is up.
-        KeyBinding::new("secondary-shift-m", ToggleMute, None),
-        KeyBinding::new("secondary-shift-c", ReturnToCall, None),
+        window_binding("secondary-shift-m", ToggleMute, cx),
+        window_binding("secondary-shift-c", ReturnToCall, cx),
         // Walking pictures, scoped to the viewer for the same reason: the
         // arrow keys belong to the composer's caret everywhere else.
         KeyBinding::new("left", ViewerPrev, Some(VIEWER_CONTEXT)),
@@ -647,7 +656,8 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
         // Dismissing the topmost surface is a window-level command; each
         // overlay decides in turn whether it is the one that closes.
         KeyBinding::new("escape", CloseOverlay, None),
-    ]);
+    ];
+    cx.bind_keys(bindings);
 }
 
 // Action to navigate back to chat list on mobile

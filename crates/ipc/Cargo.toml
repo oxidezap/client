@@ -30,13 +30,13 @@ thiserror = { workspace = true }
 [target.'cfg(target_family = "wasm")'.dependencies]
 # A oneshot to say the socket closed, and `or` to race the writer's receive
 # against it: a writer parked on a receive is not woken by a closed socket.
-futures-channel = "0.3"
-futures-lite = "2"
-js-sys = "0.3"
+futures-channel = "0.3.34"
+futures-lite = "2.6.1"
+js-sys = "0.3.106"
 tokio = { workspace = true, features = ["sync"] }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
     "AbortController",
     # The transport between two tabs of one origin, and the lock that says
     # which of them holds the account — see `endpoint/tab.rs`.
@@ -66,7 +66,7 @@ web-sys = { version = "0.3", features = [
 # and what the daemon's access-control entry names — and the overlapped pipe
 # I/O that keeps a read from blocking a write.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
@@ -75,7 +75,7 @@ rustix = { workspace = true }
 # end of this socket". Linux answers `SO_PEERCRED`, which rustix already has —
 # and which is why `libc` is not needed there.
 [target.'cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))'.dependencies]
-libc = "0.2"
+libc = "0.2.191"
 
 [lints]
 workspace = true

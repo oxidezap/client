@@ -14,3 +14,6 @@ crates/daemon/webdriver.json
 # this same repository, removed when the agent that owns one finishes; there
 # is nothing in here a commit should carry.
 .claude/
+
+# Optional icon-generation tools.
+.venv-icons/

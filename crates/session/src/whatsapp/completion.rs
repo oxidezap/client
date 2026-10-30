@@ -20,6 +20,22 @@ pub(super) fn completion_event(reason: &RunCompletionReason) -> Option<UiEvent> 
     }
 }
 
+/// Record the upstream shutdown observations before releasing local owners.
+/// These observations do not claim detached workers have released the store.
+pub(super) fn report_shutdown(report: &whatsapp_rust::client::ShutdownReport) {
+    use whatsapp_rust::client::DrainOutcome;
+    if !matches!(report.inbound, DrainOutcome::Completed)
+        || !matches!(report.outbound, DrainOutcome::Completed)
+        || !matches!(report.signal_settle, DrainOutcome::Completed)
+        || report.device.is_err()
+        || report.message_secrets.failed_batches != 0
+    {
+        log::warn!("WhatsApp shutdown has incomplete drains or persistence failures: {report:?}");
+    } else {
+        log::debug!("WhatsApp shutdown observations: {report:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

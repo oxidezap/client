@@ -84,7 +84,7 @@ pub fn render_media_viewer(
         // scrim still reached the timeline underneath and scrolled the
         // conversation nobody could see. Swallowing it here is what makes the
         // picture the only thing on screen that responds.
-        .on_scroll_wheel(|_, _window, cx| cx.stop_propagation())
+        .on_scroll(|_, _window, cx| cx.stop_propagation())
         // Mouse-up is where GPUI synthesizes click handlers. Stop both halves
         // of the pointer sequence at the modal, after a child control has had
         // its own chance to act, and occlude overlapping hitboxes behind it.

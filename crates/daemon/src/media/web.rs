@@ -55,7 +55,31 @@ struct Entry {
 struct Cache {
     entries: HashMap<String, Entry>,
     clock: u64,
-    held: u64,
+    budget: Budget,
+}
+
+/// Count only entries the sweep may reclaim. Updated with each mutation so
+/// inserting below the limits does not scan the whole cache.
+#[derive(Default)]
+struct Budget {
+    bytes: u64,
+    entries: usize,
+}
+
+impl Budget {
+    fn insert(&mut self, key: &str, size: u64) {
+        if is_disposable(key) {
+            self.bytes += size;
+            self.entries += 1;
+        }
+    }
+
+    fn remove(&mut self, key: &str, size: u64) {
+        if is_disposable(key) {
+            self.bytes -= size;
+            self.entries -= 1;
+        }
+    }
 }
 
 thread_local! {
@@ -126,7 +150,7 @@ fn store(key: &str, bytes: Vec<u8>, claims: usize) -> Result<String> {
         }
         cache.clock += 1;
         let touched = cache.clock;
-        cache.held += bytes.len() as u64;
+        cache.budget.insert(key, bytes.len() as u64);
         cache.entries.insert(
             key.to_string(),
             Entry {
@@ -147,7 +171,7 @@ fn store(key: &str, bytes: Vec<u8>, claims: usize) -> Result<String> {
 pub fn take(key: &str) -> Option<Vec<u8>> {
     with(|cache| {
         let entry = cache.entries.remove(key)?;
-        cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
+        cache.budget.remove(key, entry.bytes.len() as u64);
         // Moved out where this was the only handle, which is the ordinary
         // case for the two callers: a staged upload nobody else read, and a
         // download answering one request. A clone only where some reader is
@@ -256,7 +280,7 @@ pub(super) fn delete_unscoped(scope: Wipe) -> Result<()> {
             }
             let taken = scope.takes(name) && !(entry.claims > 0 && scope == Wipe::Cache);
             if taken {
-                cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
+                cache.budget.remove(name, entry.bytes.len() as u64);
                 removed += 1;
             }
             !taken
@@ -285,7 +309,7 @@ pub(super) fn delete_for(prefix: &str, scope: Wipe) -> Result<()> {
             // has any business outliving it.
             let taken = scope.takes(local_name) && !(entry.claims > 0 && scope == Wipe::Cache);
             if taken {
-                cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
+                cache.budget.remove(name, entry.bytes.len() as u64);
             }
             !taken
         });
@@ -332,18 +356,7 @@ pub(super) fn delete_for(prefix: &str, scope: Wipe) -> Result<()> {
 const MAX_CACHE_ENTRIES: usize = 4096;
 
 fn sweep(cache: &mut Cache, arriving: &str) {
-    let reclaimable: u64 = cache
-        .entries
-        .iter()
-        .filter(|(name, _)| is_disposable(name))
-        .map(|(_, entry)| entry.bytes.len() as u64)
-        .sum();
-    let mut count = cache
-        .entries
-        .keys()
-        .filter(|name| is_disposable(name))
-        .count();
-    if reclaimable <= CACHE_BUDGET_BYTES && count <= MAX_CACHE_ENTRIES {
+    if cache.budget.bytes <= CACHE_BUDGET_BYTES && cache.budget.entries <= MAX_CACHE_ENTRIES {
         return;
     }
 
@@ -366,9 +379,8 @@ fn sweep(cache: &mut Cache, arriving: &str) {
         .collect();
     oldest.sort_by_key(|(_, claimed, touched, _)| (*claimed, *touched));
 
-    let mut over = reclaimable.saturating_sub(CACHE_BUDGET_BYTES);
     for (name, claimed, _, size) in oldest {
-        if over == 0 && count <= MAX_CACHE_ENTRIES {
+        if cache.budget.bytes <= CACHE_BUDGET_BYTES && cache.budget.entries <= MAX_CACHE_ENTRIES {
             break;
         }
         if claimed {
@@ -378,9 +390,7 @@ fn sweep(cache: &mut Cache, arriving: &str) {
             );
         }
         cache.entries.remove(&name);
-        count -= 1;
-        cache.held = cache.held.saturating_sub(size);
-        over = over.saturating_sub(size);
+        cache.budget.remove(&name, size);
     }
 }
 
@@ -411,5 +421,132 @@ mod owned_tests {
                 .is_err()
         );
         assert!(!has(&account.key("d-stale-fixture")));
+    }
+
+    fn assert_budget_matches_entries() {
+        with(|cache| {
+            let mut bytes = 0;
+            let mut entries = 0;
+            for (key, entry) in &cache.entries {
+                if is_disposable(key) {
+                    bytes += entry.bytes.len() as u64;
+                    entries += 1;
+                }
+            }
+            assert_eq!(cache.budget.bytes, bytes);
+            assert_eq!(cache.budget.entries, entries);
+        });
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn budget_tracks_duplicates_takes_and_account_wipes() {
+        let prefix = "a990004-";
+        delete_for(prefix, Wipe::Everything).unwrap();
+        for suffix in [
+            "f-photo",
+            "d-download",
+            "a-avatar",
+            "m-legacy",
+            "u-send",
+            "other",
+        ] {
+            let key = format!("{prefix}{suffix}");
+            put_owned_evictable(&key, vec![7; 32]).unwrap();
+            assert_budget_matches_entries();
+            // The existing payload and its budget stay unchanged, while a
+            // requested write gains a claim even when its bytes differ.
+            put_owned(&key, vec![9; 64]).unwrap();
+            assert_eq!(read(&key).unwrap().len(), 32);
+            assert_budget_matches_entries();
+            deliver(&key).unwrap();
+        }
+        let claimed = format!("{prefix}d-claimed");
+        put_owned(&claimed, vec![1; 12]).unwrap();
+        delete_for(prefix, Wipe::Cache).unwrap();
+        assert!(has(&claimed));
+        assert!(has(&format!("{prefix}u-send")));
+        assert!(!has(&format!("{prefix}f-photo")));
+        assert_budget_matches_entries();
+        take(&format!("{prefix}u-send")).unwrap();
+        take(&claimed).unwrap();
+        assert_budget_matches_entries();
+        delete_for(prefix, Wipe::Everything).unwrap();
+        assert_budget_matches_entries();
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn budget_tracks_entry_limit_evictions_and_spares_staging() {
+        let prefix = "a990005-";
+        delete_for(prefix, Wipe::Everything).unwrap();
+        let staged = format!("{prefix}u-send");
+        put_owned_evictable(&staged, vec![1; 8]).unwrap();
+        for index in 0..MAX_CACHE_ENTRIES + 3 {
+            put_owned_evictable(&format!("{prefix}d-{index}"), Vec::new()).unwrap();
+        }
+        assert!(has(&staged));
+        assert!(!has(&format!("{prefix}d-0")));
+        assert!(has(&format!("{prefix}d-{}", MAX_CACHE_ENTRIES + 2)));
+        assert_budget_matches_entries();
+        delete_for(prefix, Wipe::Everything).unwrap();
+        assert_budget_matches_entries();
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn budget_tracks_unscoped_removal_and_oversized_arrivals() {
+        let key = "d-budget-unscoped-fixture";
+        put_owned_evictable(key, vec![1; 8]).unwrap();
+        delete_unscoped(Wipe::Cache).unwrap();
+        assert!(!has(key));
+        assert_budget_matches_entries();
+
+        let prefix = "a990006-";
+        let large = format!("{prefix}d-large");
+        put_owned(&large, vec![1; CACHE_BUDGET_BYTES as usize + 1]).unwrap();
+        assert!(has(&large), "an arrival cannot evict itself");
+        assert_budget_matches_entries();
+        put_owned_evictable(&format!("{prefix}d-next"), vec![2]).unwrap();
+        assert!(!has(&large), "a later arrival may evict a claimed entry");
+        assert_budget_matches_entries();
+        delete_for(prefix, Wipe::Everything).unwrap();
+        assert_budget_matches_entries();
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn account_clear_and_removal_keep_budget_and_other_accounts_intact() {
+        use super::super::AccountMedia;
+        use oxidezap_core::AccountId;
+
+        let a = AccountMedia::new(AccountId::new(990007).unwrap());
+        let b = AccountMedia::new(AccountId::new(990008).unwrap());
+        a.wipe(Wipe::Everything).unwrap();
+        b.wipe(Wipe::Everything).unwrap();
+        let a_epoch = a.epoch();
+        let b_epoch = b.epoch();
+        let a_download = a.put_owned_since(a_epoch, "d-clear", vec![1; 32]).unwrap();
+        let b_download = b.put_owned_since(b_epoch, "d-keep", vec![2; 64]).unwrap();
+        let staged = a.staged_key("budget-account-fixture");
+        super::super::put_owned(&staged, vec![3; 16]).unwrap();
+        assert_budget_matches_entries();
+
+        a.wipe(Wipe::Cache).unwrap();
+        assert!(!has(&a_download));
+        assert!(has(&b_download));
+        assert!(has(&staged));
+        assert_eq!(b.epoch(), b_epoch);
+        // A stale writer fails before mutation. B's pending writer remains
+        // valid because clearing A never changes B's epoch.
+        assert!(a.put_owned_since(a_epoch, "d-stale", vec![4; 128]).is_err());
+        assert!(!has(&a.key("d-stale")));
+        b.put_owned_since(b_epoch, "d-later", vec![5; 8]).unwrap();
+        assert_budget_matches_entries();
+
+        let claimed = a.put_owned("d-requested", vec![6; 12]).unwrap();
+        a.wipe(Wipe::Everything).unwrap();
+        assert!(!has(&claimed));
+        assert!(!has(&staged));
+        assert!(has(&b_download));
+        assert_budget_matches_entries();
+        b.wipe(Wipe::Everything).unwrap();
+        assert_budget_matches_entries();
     }
 }

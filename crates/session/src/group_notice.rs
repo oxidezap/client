@@ -29,8 +29,8 @@ pub fn participants_of(action: &GroupNotificationAction) -> &[GroupParticipantIn
     match action {
         GroupNotificationAction::Add { participants, .. }
         | GroupNotificationAction::Remove { participants, .. }
-        | GroupNotificationAction::Promote { participants }
-        | GroupNotificationAction::Demote { participants } => participants,
+        | GroupNotificationAction::Promote { participants, .. }
+        | GroupNotificationAction::Demote { participants, .. } => participants,
         _ => &[],
     }
 }
@@ -63,10 +63,10 @@ pub fn describe(
                 format!("{who} removed {}", names(participants, named))
             }
         }
-        GroupNotificationAction::Promote { participants } => {
+        GroupNotificationAction::Promote { participants, .. } => {
             format!("{who} made {} an admin", names(participants, named))
         }
-        GroupNotificationAction::Demote { participants } => {
+        GroupNotificationAction::Demote { participants, .. } => {
             format!("{who} removed {} as admin", names(participants, named))
         }
         GroupNotificationAction::Subject { subject, .. } => {
@@ -179,40 +179,23 @@ mod tests {
     use super::*;
 
     fn participant_jid(jid: &str) -> GroupParticipantInfo {
-        GroupParticipantInfo {
-            jid: jid.parse().expect("valid jid"),
-            phone_number: None,
-            display_name: None,
-            r#type: None,
-            lid: None,
-            username: None,
-            join_time: None,
-            group_history_sent_state: None,
-        }
+        GroupParticipantInfo::builder()
+            .jid(jid.parse().expect("valid jid"))
+            .build()
     }
 
     fn participant(user: &str, display: Option<&str>) -> GroupParticipantInfo {
-        GroupParticipantInfo {
-            jid: format!("{user}@s.whatsapp.net").parse().expect("valid jid"),
-            phone_number: None,
-            display_name: display.map(str::to_string),
-            r#type: None,
-            lid: None,
-            username: None,
-            join_time: None,
-            group_history_sent_state: None,
-        }
+        GroupParticipantInfo::builder()
+            .jid(format!("{user}@s.whatsapp.net").parse().expect("valid jid"))
+            .maybe_display_name(display.map(str::to_string))
+            .build()
     }
 
     #[test]
     fn a_rename_quotes_the_new_name() {
-        let action = GroupNotificationAction::Subject {
-            subject: "Trip".to_string(),
-            subject_owner: None,
-            subject_owner_pn: None,
-            subject_owner_username: None,
-            subject_time: None,
-        };
+        let action = GroupNotificationAction::subject()
+            .subject("Trip".to_string())
+            .build();
         assert_eq!(
             describe(&action, Some("Ana"), None, &ResolvedNames::new()).as_deref(),
             Some("Ana changed the group name to \"Trip\"")
@@ -225,10 +208,9 @@ mod tests {
 
     #[test]
     fn removing_only_yourself_is_leaving() {
-        let action = GroupNotificationAction::Remove {
-            participants: vec![participant("1", Some("Ana"))],
-            reason: None,
-        };
+        let action = GroupNotificationAction::remove()
+            .participants(vec![participant("1", Some("Ana"))])
+            .build();
         assert_eq!(
             describe(&action, Some("Ana"), Some(&jid("1")), &ResolvedNames::new()).as_deref(),
             Some("Ana left")
@@ -237,10 +219,9 @@ mod tests {
 
     #[test]
     fn removing_someone_else_is_a_removal() {
-        let action = GroupNotificationAction::Remove {
-            participants: vec![participant("2", Some("Bruno"))],
-            reason: None,
-        };
+        let action = GroupNotificationAction::remove()
+            .participants(vec![participant("2", Some("Bruno"))])
+            .build();
         assert_eq!(
             describe(&action, Some("Ana"), Some(&jid("1")), &ResolvedNames::new()).as_deref(),
             Some("Ana removed Bruno")
@@ -251,10 +232,9 @@ mod tests {
     /// namesake is not that namesake leaving.
     #[test]
     fn a_namesake_removal_is_not_a_departure() {
-        let action = GroupNotificationAction::Remove {
-            participants: vec![participant("2", Some("Ana"))],
-            reason: None,
-        };
+        let action = GroupNotificationAction::remove()
+            .participants(vec![participant("2", Some("Ana"))])
+            .build();
         assert_eq!(
             describe(&action, Some("Ana"), Some(&jid("1")), &ResolvedNames::new()).as_deref(),
             Some("Ana removed Ana")
@@ -263,14 +243,13 @@ mod tests {
 
     #[test]
     fn a_crowd_is_counted_rather_than_recited() {
-        let action = GroupNotificationAction::Add {
-            participants: vec![
+        let action = GroupNotificationAction::add()
+            .participants(vec![
                 participant("1", Some("Ana")),
                 participant("2", Some("Bruno")),
                 participant("3", Some("Cris")),
-            ],
-            reason: None,
-        };
+            ])
+            .build();
         assert_eq!(
             describe(&action, Some("You"), None, &ResolvedNames::new()).as_deref(),
             Some("You added Ana and 2 others")
@@ -279,10 +258,9 @@ mod tests {
 
     #[test]
     fn an_unnamed_participant_falls_back_the_way_every_surface_does() {
-        let action = GroupNotificationAction::Add {
-            participants: vec![participant("5511999", None)],
-            reason: None,
-        };
+        let action = GroupNotificationAction::add()
+            .participants(vec![participant("5511999", None)])
+            .build();
         assert_eq!(
             describe(&action, None, None, &ResolvedNames::new()).as_deref(),
             Some("Someone added +5511999")
@@ -293,10 +271,9 @@ mod tests {
     /// bubble that says "Unknown contact" is the same person under two names.
     #[test]
     fn an_unnamed_lid_participant_is_not_named_by_its_digits() {
-        let action = GroupNotificationAction::Add {
-            participants: vec![participant_jid("123456789012345@lid")],
-            reason: None,
-        };
+        let action = GroupNotificationAction::add()
+            .participants(vec![participant_jid("123456789012345@lid")])
+            .build();
         assert_eq!(
             describe(&action, None, None, &ResolvedNames::new()).as_deref(),
             Some("Someone added Unknown contact")
