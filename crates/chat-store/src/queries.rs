@@ -2166,18 +2166,20 @@ impl ChatStore {
         let row: Option<(ContactRow, Option<ContactLabels>)> = self
             .db()
             .read(move |conn| {
-                let row: Option<ContactRow> = dsl::contacts
-                    .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(&jid_str)))
-                    .select((
-                        dsl::jid,
-                        dsl::push_name,
-                        dsl::full_name,
-                        dsl::first_name,
-                        dsl::business_name,
-                    ))
-                    .first(conn)
-                    .optional()
-                    .map_err(db_err)?;
+                let row: Option<ContactRow> = crate::point_lookup::First(
+                    dsl::contacts
+                        .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(&jid_str)))
+                        .select((
+                            dsl::jid,
+                            dsl::push_name,
+                            dsl::full_name,
+                            dsl::first_name,
+                            dsl::business_name,
+                        )),
+                )
+                .get_result(conn)
+                .optional()
+                .map_err(db_err)?;
                 let labels = match &row {
                     Some((jid, _, _, _, _)) => {
                         labels_for(conn, device_id, std::slice::from_ref(jid))?.remove(jid)

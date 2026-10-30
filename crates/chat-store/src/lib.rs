@@ -38,6 +38,7 @@ mod error;
 mod fts;
 mod lid;
 mod materialize;
+mod point_lookup;
 mod queries;
 mod schema;
 mod spawn;

@@ -14,6 +14,8 @@ mod native;
 mod web;
 #[cfg(target_family = "wasm")]
 mod web_lock;
+#[cfg(target_family = "wasm")]
+mod web_platform;
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod probe;
@@ -21,7 +23,7 @@ mod probe;
 #[cfg(not(target_family = "wasm"))]
 use native as imp;
 #[cfg(target_family = "wasm")]
-use web as imp;
+use web_platform as imp;
 
 use portable_atomic::{AtomicU64, Ordering};
 use std::collections::{HashMap, HashSet};
