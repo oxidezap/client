@@ -217,10 +217,16 @@ fn read_loop(stream: oxidezap_ipc::Reader, frames: &mut Frames<'_>) {
     // killed.
     let mut buf = Vec::new();
     loop {
-        let frame =
-            oxidezap_ipc::read_frame(&mut reader, &mut buf, oxidezap_ipc::MAX_DAEMON_FRAME_BYTES);
-        let line = match frame {
-            Ok(Some(oxidezap_ipc::FrameRead::Line(line))) => line,
+        let frame = oxidezap_ipc::read_frame_with(
+            &mut reader,
+            &mut buf,
+            oxidezap_ipc::MAX_DAEMON_FRAME_BYTES,
+            |line| {
+                super::frames::parse(line).is_some_and(|message| frames.apply(message).is_break())
+            },
+        );
+        let stop = match frame {
+            Ok(Some(oxidezap_ipc::FrameRead::Line(stop))) => stop,
             Ok(Some(oxidezap_ipc::FrameRead::NotUtf8)) => {
                 log::warn!("the daemon sent a frame that is not text; ignoring it");
                 continue;
@@ -247,9 +253,7 @@ fn read_loop(stream: oxidezap_ipc::Reader, frames: &mut Frames<'_>) {
             }
         };
 
-        if let Some(message) = super::frames::parse(&line)
-            && frames.apply(message).is_break()
-        {
+        if stop {
             break;
         }
     }
