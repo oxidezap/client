@@ -89,7 +89,7 @@ fn main() {
         if !warm { buf = Vec::new(); }
         let malformed_result = if borrowed {
             match framing::read_frame_with(&mut reader, &mut buf, frame.len(), |line| black_box(parse(black_box(line))).is_err()).unwrap() {
-                Some(framing::FrameRead::Line(value)) => value,
+                Some(framing::FrameResult::Line(value)) => value,
                 other => panic!("unexpected outcome {other:?}"),
             }
         } else {

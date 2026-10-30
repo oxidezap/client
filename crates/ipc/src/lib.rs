@@ -48,7 +48,7 @@ pub use endpoint::web;
 #[cfg(not(target_family = "wasm"))]
 pub use endpoint::{Endpoint, Hangup, Reader, Writer};
 pub use framing::{
-    FrameRead, MAX_DAEMON_FRAME_BYTES, MAX_REQUEST_BYTES, read_frame, read_frame_with,
+    FrameRead, FrameResult, MAX_DAEMON_FRAME_BYTES, MAX_REQUEST_BYTES, read_frame, read_frame_with,
 };
 pub use link::Link;
 pub use oxidezap_wire as wire;

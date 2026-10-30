@@ -322,7 +322,7 @@ fn history_load_wire_cost() {
 
 #[test]
 fn borrowed_frame_decoding_preserves_message_fields() {
-    use oxidezap_ipc::{FrameRead, read_frame_with};
+    use oxidezap_ipc::{FrameResult, read_frame_with};
     let expected = DaemonMessage::Messages {
         id: 7,
         jid: "synthetic@s.whatsapp.net".into(),
@@ -342,7 +342,7 @@ fn borrowed_frame_decoding_preserves_message_fields() {
             serde_json::from_str::<DaemonMessage>(line.trim_end())
         })
         .unwrap();
-        assert!(matches!(frame, Some(FrameRead::Line(Ok(actual))) if actual == expected));
+        assert!(matches!(frame, Some(FrameResult::Line(Ok(actual))) if actual == expected));
         assert!(buf.is_empty());
     }
 }

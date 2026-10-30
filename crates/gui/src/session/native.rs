@@ -226,12 +226,12 @@ fn read_loop(stream: oxidezap_ipc::Reader, frames: &mut Frames<'_>) {
             },
         );
         let stop = match frame {
-            Ok(Some(oxidezap_ipc::FrameRead::Line(stop))) => stop,
-            Ok(Some(oxidezap_ipc::FrameRead::NotUtf8)) => {
+            Ok(Some(oxidezap_ipc::FrameResult::Line(stop))) => stop,
+            Ok(Some(oxidezap_ipc::FrameResult::NotUtf8)) => {
                 log::warn!("the daemon sent a frame that is not text; ignoring it");
                 continue;
             }
-            Ok(Some(oxidezap_ipc::FrameRead::TooLong)) => {
+            Ok(Some(oxidezap_ipc::FrameResult::TooLong)) => {
                 // Named rather than left to the outage screen: this ending
                 // arms no countdown, because the frame that overran is one
                 // the daemon rebuilds on every attach and reconnecting meets

@@ -44,15 +44,25 @@ pub const MAX_DAEMON_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 /// The outcome of reading one frame.
 #[derive(Debug)]
-pub enum FrameRead<T = String> {
-    /// Complete UTF-8 text, or the callback result from [`read_frame_with`].
-    Line(T),
+pub enum FrameRead {
+    Line(String),
     /// Well-framed bytes that are not text. Answerable, so a connection
     /// survives a peer with an encoding bug.
     NotUtf8,
     /// No newline within the cap. The stream cannot be resynchronized, since
     /// there is no way to tell where this frame was meant to end, so this
     /// ends the connection — unlike the other two, which are recoverable.
+    TooLong,
+}
+
+/// The outcome of [`read_frame_with`], containing the callback's owned result.
+///
+/// Framing errors have the same meaning as in [`FrameRead`]. Keeping this
+/// separate leaves the original enum's variants usable without type annotations.
+#[derive(Debug)]
+pub enum FrameResult<T> {
+    Line(T),
+    NotUtf8,
     TooLong,
 }
 
@@ -70,7 +80,13 @@ pub fn read_frame<R: BufRead>(
     buf: &mut Vec<u8>,
     limit: usize,
 ) -> Result<Option<FrameRead>> {
-    read_frame_with(reader, buf, limit, str::to_owned)
+    Ok(
+        read_frame_with(reader, buf, limit, str::to_owned)?.map(|frame| match frame {
+            FrameResult::Line(line) => FrameRead::Line(line),
+            FrameResult::NotUtf8 => FrameRead::NotUtf8,
+            FrameResult::TooLong => FrameRead::TooLong,
+        }),
+    )
 }
 
 /// Read a frame and parse its text directly from the connection buffer.
@@ -86,11 +102,11 @@ pub fn read_frame_with<R: BufRead, T>(
     buf: &mut Vec<u8>,
     limit: usize,
     parse: impl FnOnce(&str) -> T,
-) -> Result<Option<FrameRead<T>>> {
+) -> Result<Option<FrameResult<T>>> {
     let carried = buf.len();
     if carried >= limit {
         buf.clear();
-        return Ok(Some(FrameRead::TooLong));
+        return Ok(Some(FrameResult::TooLong));
     }
 
     let read = {
@@ -113,13 +129,13 @@ pub fn read_frame_with<R: BufRead, T>(
         // away mid-frame.
         let hit_the_cap = buf.len() == limit;
         buf.clear();
-        return Ok(hit_the_cap.then_some(FrameRead::TooLong));
+        return Ok(hit_the_cap.then_some(FrameResult::TooLong));
     }
 
     buf.pop();
     let frame = match std::str::from_utf8(buf) {
-        Ok(line) => FrameRead::Line(parse(line)),
-        Err(_) => FrameRead::NotUtf8,
+        Ok(line) => FrameResult::Line(parse(line)),
+        Err(_) => FrameResult::NotUtf8,
     };
     buf.clear();
     Ok(Some(frame))
@@ -191,11 +207,11 @@ mod tests {
                     assert!(borrowed_buf.is_empty());
                     assert_eq!(borrowed_buf.capacity(), 32);
                     match (expected, actual) {
-                        (Some(FrameRead::Line(a)), Some(FrameRead::Line(b))) => {
+                        (Some(FrameRead::Line(a)), Some(FrameResult::Line(b))) => {
                             assert_eq!(a.as_bytes(), b);
                         }
-                        (Some(FrameRead::NotUtf8), Some(FrameRead::NotUtf8))
-                        | (Some(FrameRead::TooLong), Some(FrameRead::TooLong)) => {}
+                        (Some(FrameRead::NotUtf8), Some(FrameResult::NotUtf8))
+                        | (Some(FrameRead::TooLong), Some(FrameResult::TooLong)) => {}
                         (None, None) => break,
                         pair => panic!("different outcomes: {pair:?}"),
                     }
@@ -224,9 +240,9 @@ mod tests {
             assert!(buf.is_empty());
             assert_eq!(calls, usize::from(expected.is_some()));
             if let Some(expected) = expected {
-                assert!(matches!(actual, Some(FrameRead::Line(line)) if line == expected));
+                assert!(matches!(actual, Some(FrameResult::Line(line)) if line == expected));
             } else {
-                assert!(matches!(actual, None | Some(FrameRead::TooLong)));
+                assert!(matches!(actual, None | Some(FrameResult::TooLong)));
             }
         }
     }
@@ -250,6 +266,15 @@ mod tests {
         assert!(read_frame_with(&mut reader, &mut buf, 8, |_| panic!("incomplete")).is_err());
         assert_eq!(buf, b"a");
         let result = read_frame_with(&mut b"b\n".as_slice(), &mut buf, 8, str::to_owned).unwrap();
-        assert!(matches!(result, Some(FrameRead::Line(line)) if line == "ab"));
+        assert!(matches!(result, Some(FrameResult::Line(line)) if line == "ab"));
+    }
+
+    #[test]
+    fn owned_variants_keep_their_original_type_inference_and_imports() {
+        use FrameRead::{NotUtf8, TooLong};
+        let invalid = NotUtf8;
+        let oversized = TooLong;
+        assert!(matches!(invalid, FrameRead::NotUtf8));
+        assert!(matches!(oversized, FrameRead::TooLong));
     }
 }
