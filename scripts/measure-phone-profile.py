@@ -12,6 +12,7 @@ parser.add_argument("launcher", type=Path)
 parser.add_argument("base", type=Path)
 parser.add_argument("head", type=Path)
 parser.add_argument("--samples", type=int, default=9)
+parser.add_argument("--cold-only", action="store_true")
 parser.add_argument("--output", type=Path, required=True)
 args = parser.parse_args()
 if args.samples < 1:
@@ -22,6 +23,8 @@ for mode in ["heap", "timing"]:
         for pair in range(-1, args.samples):  # Discard one warmup pair.
             for rev in (["base", "head"] if pair % 2 else ["head", "base"]):
                 command = [str(args.launcher.resolve()), str(getattr(args, rev).resolve())]
+                if args.cold_only:
+                    command.append("--cold-only")
                 if case == "left":
                     command.append("left")
                 if mode == "timing":
@@ -31,7 +34,7 @@ for mode in ["heap", "timing"]:
                 for line in process.stdout.splitlines():
                     tag = line.split()[0]
                     values.update({tag + "_" + k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)})
-                if values.get("cold_n") != 1 or values.get("warm_n") != 10000:
+                if values.get("cold_n") != 1 or (not args.cold_only and values.get("warm_n") != 10000):
                     raise RuntimeError(f"Unexpected probe output: {process.stdout}")
                 if pair >= 0:
                     rows.append(dict(mode=mode, case=case, pair=pair, rev=rev, **values))

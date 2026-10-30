@@ -43,7 +43,9 @@ See `docs/measurements/phone-prevalidation.md` for the measurement and reproduct
 Immutable descriptor lengths, format lists and leading-digit lists use boxed
 slices. Their public getters remain slices, the loader still accepts vectors,
 and the regex implementation and 100-entry LRU are unchanged. This removes
-unused vector capacity and capacity words from retained metadata. See
+unused vector capacity and capacity words from retained metadata. Conversion
+reserves the input length once before validating and pushing each element,
+avoiding collect-then-shrink reallocations. See
 `docs/measurements/phone-compaction.md` for paired measurements and limits.
 
 ## Update procedure

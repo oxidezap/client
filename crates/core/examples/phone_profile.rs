@@ -7,6 +7,7 @@ use wacore::time::Instant;
 struct Count;
 static TRACK: AtomicBool = AtomicBool::new(true);
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static REALLOCS: AtomicUsize = AtomicUsize::new(0);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -30,6 +31,7 @@ unsafe impl GlobalAlloc for Count {
     unsafe fn realloc(&self, p: *mut u8, old: Layout, size: usize) -> *mut u8 {
         let q = unsafe { System.realloc(p, old, size) };
         if !q.is_null() && TRACK.load(Relaxed) {
+            REALLOCS.fetch_add(1, Relaxed);
             ALLOCS.fetch_add(1, Relaxed);
             BYTES.fetch_add(size, Relaxed);
             let live = LIVE.fetch_add(size, Relaxed) + size;
@@ -64,6 +66,7 @@ fn sample(tag: &str, n: usize, left: bool) {
         BYTES.load(Relaxed),
         LIVE.load(Relaxed),
     ];
+    let reallocs_before = REALLOCS.load(Relaxed);
     PEAK.store(before[2], Relaxed);
     let start = Instant::now();
     for _ in 0..n {
@@ -83,9 +86,10 @@ fn sample(tag: &str, n: usize, left: bool) {
         PEAK.load(Relaxed),
     ];
     println!(
-        "{tag} n={n} ns={} allocs={} bytes={} retained={} peak_delta={}",
+        "{tag} n={n} ns={} allocs={} reallocs={} bytes={} retained={} peak_delta={}",
         elapsed.as_nanos(),
         after[0] - before[0],
+        REALLOCS.load(Relaxed) - reallocs_before,
         after[1] - before[1],
         after[2] - before[2],
         after[3] - before[2]
@@ -149,5 +153,7 @@ fn main() {
         TRACK.store(false, Relaxed);
     }
     sample("cold", 1, left);
-    sample("warm", 10000, left);
+    if !std::env::args().any(|arg| arg == "--cold-only") {
+        sample("warm", 10000, left);
+    }
 }
