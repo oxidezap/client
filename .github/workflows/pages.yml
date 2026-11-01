@@ -95,7 +95,8 @@ jobs:
       # not compiled for that. `rust-src` is what build-std compiles from.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: nightly
+          # The November 1 nightly reports an async-drop cycle in GPUI's TaskState.
+          toolchain: nightly-2026-10-30
           targets: wasm32-unknown-unknown
           components: rust-src
 
