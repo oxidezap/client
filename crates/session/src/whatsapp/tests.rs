@@ -3507,3 +3507,72 @@ async fn membership_wire_phone_outranks_a_masked_lid_contact_label() {
         assert_eq!(event.summary(), expected);
     }
 }
+
+#[tokio::test]
+async fn offline_phone_delivery_hydrates_two_ticks_in_a_scoped_reload() {
+    use whatsapp_rust::wacore::types::events::{
+        BatchOrigin, InboundMessage, MessageBatch, Receipt,
+    };
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+    use whatsapp_rust::wacore::types::presence::ReceiptType;
+
+    let (store, client) = test_session("offline-phone-delivery-ticks").await;
+    let chat: Jid = TEST_PEER.parse().unwrap();
+    let timestamp = whatsapp_rust::wacore::time::from_secs(1_700_000_000).unwrap();
+    let source = MessageSource {
+        chat: chat.clone(),
+        sender: chat.clone(),
+        ..Default::default()
+    };
+    let handler = store.handler();
+    handler.handle_event(Arc::new(Event::Receipt(
+        Receipt::builder()
+            .source(source.clone())
+            .message_ids(vec!["PHONE-OFFLINE-TICKS".into()])
+            .timestamp(timestamp)
+            .r#type(ReceiptType::Delivered)
+            .offline(true)
+            .build(),
+    )));
+    store.flush().await.unwrap();
+    handler.handle_event(Arc::new(Event::Messages(
+        MessageBatch::builder()
+            .messages(Arc::from([InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("synthetic phone send")))
+                .info(Arc::new(MessageInfo {
+                    source: MessageSource {
+                        is_from_me: true,
+                        ..source
+                    },
+                    id: "PHONE-OFFLINE-TICKS".into(),
+                    timestamp,
+                    is_offline: true,
+                    ..Default::default()
+                }))
+                .build()]))
+            .origin(BatchOrigin::Live)
+            .build(),
+    )));
+    store.flush().await.unwrap();
+    let mut scope = ReloadScope::empty();
+    scope.widen(Some(&StoreChange::Messages { chat }));
+    let loaded = WhatsAppClient::load_history_for_scope(
+        &store,
+        &client,
+        &scope,
+        &NameBook::new(Some(store.clone())),
+        100,
+        50,
+    )
+    .await
+    .unwrap();
+    assert!(!loaded.complete);
+    assert_eq!(loaded.chats.len(), 1);
+    let message = loaded.chats[0]
+        .messages
+        .iter()
+        .find(|m| m.id == "PHONE-OFFLINE-TICKS")
+        .unwrap();
+    assert_eq!(message.status, MessageStatus::Delivered);
+    assert!(!message.is_read, "delivery evidence must not invent a read");
+}

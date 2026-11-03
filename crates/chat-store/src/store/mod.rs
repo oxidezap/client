@@ -21,6 +21,7 @@ mod history_sync;
 mod inbound;
 pub(crate) mod message_identity;
 mod message_rows;
+mod offline_receipts;
 mod reaction;
 pub(crate) mod read_state;
 mod receipt;

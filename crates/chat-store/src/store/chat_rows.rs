@@ -492,6 +492,9 @@ pub(super) fn delete_chat_rows(
             }
         },
     }
+    // Keep evidence for newer/starred outgoing rows that survived this action.
+    // Unowned observations must not attach to a later redelivery of deleted rows.
+    super::offline_receipts::forget_unowned(conn, device_id, chat)?;
     // Satellites of messages that no longer exist.
     diesel::sql_query(
         "DELETE FROM reactions WHERE device_id = ? AND chat_jid = ? AND msg_id NOT IN \

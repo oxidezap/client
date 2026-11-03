@@ -49,8 +49,7 @@ pub(super) fn apply_history_sync(
         Ok(rest) => {
             for pushname in &rest.pushnames {
                 if let (Some(jid), Some(name)) = (&pushname.id, &pushname.pushname) {
-                    upsert_contact_push_name(conn, device_id, jid, name)?;
-                    cs.contacts = true;
+                    cs.contacts |= upsert_contact_push_name(conn, device_id, jid, name)?;
                 }
             }
         }
@@ -355,8 +354,7 @@ pub(super) fn apply_history_message(
         && !from_me
         && !sender.is_empty()
     {
-        upsert_contact_push_name(conn, device_id, sender, name)?;
-        cs.contacts = true;
+        cs.contacts |= upsert_contact_push_name(conn, device_id, sender, name)?;
     }
 
     if let Some(message) = wmi.message.as_option() {

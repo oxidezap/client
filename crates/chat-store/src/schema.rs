@@ -155,6 +155,7 @@ diesel::table! {
 }
 
 diesel::allow_tables_to_appear_in_same_query!(
+    offline_receipts,
     chats,
     messages,
     reactions,
@@ -174,5 +175,17 @@ diesel::table! {
         author_jid -> Text,
         received_at_ms -> BigInt,
         ambiguous -> Bool,
+    }
+}
+
+diesel::table! {
+    offline_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type) {
+        device_id -> Integer,
+        chat_jid -> Text,
+        msg_id -> Text,
+        user_jid -> Text,
+        receipt_type -> Integer,
+        ts_ms -> BigInt,
+        received_at_ms -> BigInt,
     }
 }

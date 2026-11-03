@@ -65,25 +65,11 @@ async fn invalidation_broadcast_fires_per_batch() {
     )
     .await;
 
-    let mut got_chats = false;
-    let mut got_messages = false;
-    // Both signals were sent before flush() returned; drain with a timeout so
-    // a regression fails fast instead of hanging.
-    for _ in 0..3 {
-        match tokio::time::timeout(Duration::from_secs(5), changes.recv()).await {
-            Ok(Ok(StoreChange::Chats)) => got_chats = true,
-            Ok(Ok(StoreChange::Messages { chat })) => {
-                assert_eq!(chat, jid(PEER));
-                got_messages = true;
-            }
-            Ok(Ok(StoreChange::Contacts)) => {}
-            Ok(Err(_)) | Err(_) => break,
-        }
-        if got_chats && got_messages {
-            break;
-        }
-    }
-    assert!(got_chats && got_messages);
+    assert!(matches!(changes.try_recv(), Ok(StoreChange::Messages { chat }) if chat == jid(PEER)));
+    assert!(
+        changes.try_recv().is_err(),
+        "one committed chat change is enough"
+    );
 }
 
 /// A pin moves one chat without touching membership, so it names the chat
@@ -204,13 +190,11 @@ async fn post_commit_barrier_failure_replays_without_duplicate_invalidation() {
             .unwrap()
             .is_some()
     );
-    for _ in 0..2 {
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), changes.recv())
-                .await
-                .is_ok()
-        );
-    }
+    assert!(matches!(changes.try_recv(), Ok(StoreChange::Messages { chat }) if chat == jid(PEER)));
+    assert!(
+        changes.try_recv().is_err(),
+        "the commit publishes one scoped invalidation"
+    );
 
     failed.store(false, Ordering::Release);
     chat_store
