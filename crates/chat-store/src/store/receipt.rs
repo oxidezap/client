@@ -212,6 +212,7 @@ pub(super) fn apply_receipt(
                     super::offline_receipts::retain(
                         conn, device_id, &chat, msg_id, &user, status, ts_ms,
                     )?;
+                    cs.retained_offline_receipts = true;
                     cs.pending_receipt_chats.insert(chat.clone());
                 }
                 continue;

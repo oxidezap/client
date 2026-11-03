@@ -1769,8 +1769,11 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   to the account, known PN/LID aliases and message id; incoming rows cannot
   consume it. It creates no chat or visible receipt before an outgoing row
   exists, never lowers delivery state and cannot revive a failed send.
-  Retention is bounded to 4096 observations per account and seven days from
-  local receipt. Clearing/deleting the chat discards unmatched evidence.
+  Retention is pruned once per batch to 4096 observations per account and seven
+  days from local receipt. Learning PN/LID mappings retries the affected
+  components even when no existing row needs repair. Clearing/deleting discards
+  unowned evidence after selecting survivors, preserving receipts for newer
+  or starred outgoing rows that survive the action.
   Ordinary live misses still disappear. A phone echo or server ACK alone is
   still one tick; two ticks require recipient delivery evidence.
 - **Migration versions are shared with `whatsapp-rust-sqlite-storage`, so name

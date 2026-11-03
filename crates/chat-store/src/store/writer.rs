@@ -42,6 +42,7 @@ pub(crate) struct ChangeSet {
     pub(crate) chats: bool,
     pub(crate) contacts: bool,
     pub(crate) message_chats: BTreeSet<String>,
+    pub(crate) retained_offline_receipts: bool,
     pub(crate) pending_receipt_chats: BTreeSet<String>,
     pub(crate) pending_audio_chats: BTreeSet<String>,
 }
@@ -253,9 +254,8 @@ async fn attempt_batch(
                             return Err(error);
                         }
                     }
-                    if !cs.pending_receipt_chats.is_empty()
-                        || (!cs.message_chats.is_empty()
-                            && super::offline_receipts::has_pending(conn, device_id)?)
+                    if (!cs.pending_receipt_chats.is_empty() || !cs.message_chats.is_empty())
+                        && super::offline_receipts::has_pending(conn, device_id)?
                     {
                         let chats: Vec<_> = cs
                             .message_chats
@@ -265,6 +265,9 @@ async fn attempt_batch(
                         for chat in chats {
                             super::offline_receipts::apply(conn, device_id, &chat, &mut cs)?;
                         }
+                    }
+                    if cs.retained_offline_receipts {
+                        super::offline_receipts::prune(conn, device_id)?;
                     }
                     if !cs.pending_audio_chats.is_empty()
                         || (!cs.message_chats.is_empty()
@@ -433,7 +436,16 @@ fn apply_writer_msg(
             crate::store::message_identity::mark_mapping_repair_current(conn, device_id)
         }
         WriterMsg::ReconcileMappings(mappings) => {
-            crate::store::message_identity::reconcile_mappings(conn, device_id, mappings, cs)
+            crate::store::message_identity::reconcile_mappings(conn, device_id, mappings, cs)?;
+            // Learning an alias can make evidence answerable even when there
+            // is only one chat and no message row needed identity repair.
+            for (lid, pn) in mappings {
+                cs.pending_receipt_chats
+                    .insert(Jid::new(lid.clone(), wacore_binary::Server::Lid).to_string());
+                cs.pending_receipt_chats
+                    .insert(Jid::new(pn.clone(), wacore_binary::Server::Pn).to_string());
+            }
+            Ok(())
         }
         WriterMsg::Outgoing {
             chat,

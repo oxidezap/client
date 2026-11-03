@@ -451,8 +451,6 @@ pub(super) fn delete_chat_rows(
 ) -> QueryResult<()> {
     use schema::messages::dsl as m;
     super::shared_history::retire_for_deletion(conn, device_id, chat, bound)?;
-    // A deletion must not leave unmatched delivery evidence to attach later.
-    super::offline_receipts::forget(conn, device_id, chat)?;
     // Every branch below deletes from the same set — this chat's rows, minus
     // the starred ones when they are spared — and differs only in the time
     // window it adds. A boxed statement is consumed by `execute`, and the
@@ -494,6 +492,9 @@ pub(super) fn delete_chat_rows(
             }
         },
     }
+    // Keep evidence for newer/starred outgoing rows that survived this action.
+    // Unowned observations must not attach to a later redelivery of deleted rows.
+    super::offline_receipts::forget_unowned(conn, device_id, chat)?;
     // Satellites of messages that no longer exist.
     diesel::sql_query(
         "DELETE FROM reactions WHERE device_id = ? AND chat_jid = ? AND msg_id NOT IN \

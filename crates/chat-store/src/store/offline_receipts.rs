@@ -9,6 +9,7 @@ use crate::schema::{messages, offline_receipts as pending};
 const MAX_PENDING: i64 = 4096;
 const RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// Check for deferred evidence before scanning affected chat components.
 pub(super) fn has_pending(conn: &mut SqliteConnection, device: i32) -> QueryResult<bool> {
     diesel::select(diesel::dsl::exists(
         pending::table.filter(pending::device_id.eq(device)),
@@ -16,6 +17,7 @@ pub(super) fn has_pending(conn: &mut SqliteConnection, device: i32) -> QueryResu
     .get_result(conn)
 }
 
+/// Retain one offline observation without publishing it; the batch prunes once.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn retain(
     conn: &mut SqliteConnection,
@@ -49,6 +51,12 @@ pub(super) fn retain(
         .set(pending::ts_ms.eq(timestamp))
         .filter(pending::ts_ms.gt(timestamp))
         .execute(conn)?;
+    Ok(())
+}
+
+/// Enforce retention once per batch, after matching available outgoing rows.
+pub(super) fn prune(conn: &mut SqliteConnection, device: i32) -> QueryResult<()> {
+    let now = wacore::time::now_utc().timestamp_millis();
     diesel::sql_query(
         "DELETE FROM offline_receipts WHERE device_id = ? AND \
         (received_at_ms < ? OR rowid IN (SELECT rowid FROM offline_receipts \
@@ -62,6 +70,8 @@ pub(super) fn retain(
     Ok(())
 }
 
+/// Match outgoing owners across known aliases and invalidate both chat keys.
+/// Applied evidence is consumed in the same transaction as the message update.
 pub(super) fn apply(
     conn: &mut SqliteConnection,
     device: i32,
@@ -101,6 +111,7 @@ pub(super) fn apply(
                     conn, device, &key, &id, &user, status, timestamp,
                 )?;
                 if advanced || recorded {
+                    changes.message_chats.insert(wire_chat.clone());
                     changes.message_chats.insert(key);
                 }
             }
@@ -118,12 +129,23 @@ pub(super) fn apply(
     Ok(())
 }
 
-pub(super) fn forget(conn: &mut SqliteConnection, device: i32, chat: &str) -> QueryResult<()> {
+/// Discard unowned evidence after deletion, preserving receipts for survivors.
+pub(super) fn forget_unowned(
+    conn: &mut SqliteConnection,
+    device: i32,
+    chat: &str,
+) -> QueryResult<()> {
     let keys = crate::lid::chat_key_candidates(conn, device, chat)?;
+    let surviving = messages::table
+        .filter(messages::device_id.eq(device))
+        .filter(messages::chat_jid.eq_any(&keys))
+        .filter(messages::msg_id.eq(pending::msg_id))
+        .filter(messages::from_me.eq(true));
     diesel::delete(
         pending::table
             .filter(pending::device_id.eq(device))
-            .filter(pending::chat_jid.eq_any(keys)),
+            .filter(pending::chat_jid.eq_any(&keys))
+            .filter(diesel::dsl::not(diesel::dsl::exists(surviving))),
     )
     .execute(conn)?;
     Ok(())

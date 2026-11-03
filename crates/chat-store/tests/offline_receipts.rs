@@ -80,6 +80,7 @@ async fn offline_delivery_resolves_aliases_and_both_event_orders() {
     for reversed in [false, true] {
         let (db, store) = test_store().await;
         add_lid_mapping(&db).await;
+        let mut changes = store.subscribe();
         let mut events = vec![
             offline(ReceiptType::Delivered, "ALIASED-PHONE", PEER_LID),
             phone_send(PEER, "ALIASED-PHONE"),
@@ -88,6 +89,13 @@ async fn offline_delivery_resolves_aliases_and_both_event_orders() {
             events.reverse();
         }
         feed(&store, events).await;
+        let changed: Vec<_> = std::iter::from_fn(|| changes.try_recv().ok()).collect();
+        for key in [PEER, PEER_LID] {
+            assert!(
+                changed.contains(&StoreChange::Messages { chat: jid(key) }),
+                "missing invalidation for {key}: {changed:?}"
+            );
+        }
         assert_eq!(
             store
                 .own_message(&jid(PEER), "ALIASED-PHONE")
@@ -294,6 +302,142 @@ async fn offline_receipts_are_bounded_per_account() {
     assert_eq!(
         store
             .own_message(&jid(PEER), "NEW-PHONE")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Delivered
+    );
+}
+
+#[tokio::test]
+async fn learning_a_mapping_retries_receipts_without_rewriting_the_lone_message() {
+    let (db, store) = test_store().await;
+    feed(
+        &store,
+        [offline(ReceiptType::Delivered, "LATE-MAPPING", PEER_LID)],
+    )
+    .await;
+    feed(&store, [phone_send(PEER, "LATE-MAPPING")]).await;
+    assert_eq!(
+        store
+            .own_message(&jid(PEER), "LATE-MAPPING")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::ServerAck
+    );
+    add_lid_mapping(&db).await;
+    let mut changes = store.subscribe();
+    store
+        .reconcile_message_mappings(&[("111000011112222".into(), "559900000001".into())])
+        .unwrap();
+    store.flush().await.unwrap();
+    assert_eq!(
+        store
+            .own_message(&jid(PEER), "LATE-MAPPING")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Delivered
+    );
+    let changed: Vec<_> = std::iter::from_fn(|| changes.try_recv().ok()).collect();
+    for key in [PEER, PEER_LID] {
+        assert!(
+            changed.contains(&StoreChange::Messages { chat: jid(key) }),
+            "missing {key}: {changed:?}"
+        );
+    }
+}
+
+fn clear(
+    range: MessageField<wa::sync_action_value::SyncActionMessageRange>,
+    delete_starred: bool,
+) -> Event {
+    let mut action = wa::sync_action_value::ClearChatAction::default();
+    action.message_range = range;
+    Event::ClearChatUpdate(
+        wacore::types::events::ClearChatUpdate::builder()
+            .jid(jid(PEER))
+            .delete_starred(delete_starred)
+            .delete_media(false)
+            .timestamp(ts(103))
+            .action(Box::new(action))
+            .from_full_sync(false)
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn ranged_clear_and_delete_preserve_receipts_for_surviving_messages_in_the_batch() {
+    let mut delete = wa::sync_action_value::DeleteChatAction::default();
+    delete.message_range = range_up_to(99);
+    let delete = Event::DeleteChatUpdate(
+        wacore::types::events::DeleteChatUpdate::builder()
+            .jid(jid(PEER))
+            .delete_media(false)
+            .timestamp(ts(103))
+            .action(Box::new(delete))
+            .from_full_sync(false)
+            .build(),
+    );
+    for removal in [clear(range_up_to(99), true), delete] {
+        let (_db, store) = test_store().await;
+        feed(
+            &store,
+            [
+                offline(ReceiptType::Delivered, "SURVIVOR", PEER),
+                phone_send(PEER, "SURVIVOR"),
+                removal,
+            ],
+        )
+        .await;
+        assert_eq!(
+            store
+                .own_message(&jid(PEER), "SURVIVOR")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MessageStatus::Delivered
+        );
+        assert_eq!(
+            store.receipts(&jid(PEER), "SURVIVOR").await.unwrap().len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn clear_preserving_starred_messages_keeps_their_pending_receipts() {
+    let (_db, store) = test_store().await;
+    let mut action = wa::sync_action_value::StarAction::default();
+    action.starred = Some(true);
+    let star = Event::StarUpdate(
+        wacore::types::events::StarUpdate::builder()
+            .chat_jid(jid(PEER))
+            .message_id("STARRED-SURVIVOR".into())
+            .from_me(true)
+            .timestamp(ts(101))
+            .action(Box::new(action))
+            .from_full_sync(false)
+            .build(),
+    );
+    feed(
+        &store,
+        [
+            offline(ReceiptType::Delivered, "STARRED-SURVIVOR", PEER),
+            phone_send(PEER, "STARRED-SURVIVOR"),
+            star,
+            clear(MessageField::none(), false),
+        ],
+    )
+    .await;
+    assert_eq!(
+        store
+            .own_message(&jid(PEER), "STARRED-SURVIVOR")
             .await
             .unwrap()
             .unwrap()
