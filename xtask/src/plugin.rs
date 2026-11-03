@@ -40,9 +40,9 @@ pub fn build(dir: &Path) -> Result<PathBuf> {
     let artifact =
         artifact_name(&text).ok_or_else(|| err!("{} names no package", manifest.display()))?;
 
-    // The cargo this task was started by, so a `cargo +nightly xtask` builds
+    // The cargo this task was started by, so a `cargo +1.99.1 xtask` builds
     // the plugin with the same toolchain, and a plain one stays on stable —
-    // which is what a plugin wants: nothing in it needs nightly.
+    // which is what a plugin wants: no bootstrap or shared-memory flags.
     Run::new(env_or("CARGO", "cargo"))
         .args(["build", "--release", "--target", TARGET])
         .arg("--manifest-path")

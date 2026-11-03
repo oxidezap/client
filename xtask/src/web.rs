@@ -1,24 +1,9 @@
 //! Build the web front end into `web/dist`.
 //!
-//! Three things are not defaults and all three are required:
-//!
-//!   nightly      `build-std` is nightly-only, and gpui's own head uses
-//!                unstable library features besides.
-//!   build-std    the standard library has to be rebuilt with the atomics
-//!                target feature on; the prebuilt one is not, and linking
-//!                against it produces a module with no working threads.
-//!   public-url   a project page is served from a subdirectory, so the
-//!                generated glue has to be told where it is loading from.
-//!
-//! The first two are passed as environment rather than as flags: trunk has no
-//! way to forward arguments to cargo, and `[unstable]` in a config file would
-//! apply to the native build too — which is meant to stay on stable. Cargo
-//! reads the same setting from `CARGO_UNSTABLE_BUILD_STD`, and here it reaches
-//! only the child rather than this process and everything after it.
-//!
-//! The link flags themselves are in /.cargo/config.toml, under the wasm
-//! target, so an ordinary `cargo build --target wasm32-unknown-unknown` gets
-//! them too.
+//! The shared-memory target needs std rebuilt with atomics. Rust 1.99.1 is
+//! used throughout the repository; build-std and wasm_thread still require
+//! unstable features, so bootstrap is scoped to the Trunk child process.
+//! Target flags live in /.cargo/config.toml.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -115,7 +100,7 @@ pub fn build() -> Result<()> {
         // the build from and `Trunk.toml`'s own `target` is what it overrides.
         trunk = trunk.arg(index);
     }
-    let toolchain = env_or("RUSTUP_TOOLCHAIN", "nightly");
+    let toolchain = env_or("RUSTUP_TOOLCHAIN", "1.99.1");
     let cargo_bin = Run::new("rustup")
         .args(["which", "cargo", "--toolchain", &toolchain])
         .read()
@@ -129,7 +114,7 @@ pub fn build() -> Result<()> {
         // Trunk finds `Trunk.toml` and `index.html` beside it.
         .current_dir(&web)
         // Named rather than exported, so nothing else this process goes on to
-        // do is silently a nightly build.
+        // do inherits the web build's unstable features.
         .env_remove("RUSTC")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
@@ -139,6 +124,7 @@ pub fn build() -> Result<()> {
         .env("MBX_DISABLE", "1")
         .env("CARGO", cargo_bin)
         .env("RUSTUP_TOOLCHAIN", toolchain)
+        .env("RUSTC_BOOTSTRAP", "1")
         .env("CARGO_UNSTABLE_BUILD_STD", "std,panic_abort")
         // The standard library, which `build-std` is already paying to rebuild
         // and was rebuilding at the defaults. `optimize_for_size` is what

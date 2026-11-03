@@ -39,10 +39,11 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: "1.99.1"
           components: rustfmt, clippy
           # For the example plugins below. Stable's own wasm target: a plugin
           # needs no `build-std`, which is the whole reason it can be checked
-          # here rather than beside the nightly web build.
+          # here rather than beside the shared-memory web build.
           targets: wasm32-unknown-unknown
       # Installed rather than cached. The caching action decides for itself
       # whether a package is already present, and when it decides wrong it
@@ -179,6 +180,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: "1.99.1"
           components: rustfmt, clippy
       # No git identity step: the publisher's end-to-end test drives a real
       # `git` against a bare repository in a temporary directory, and every
@@ -222,6 +224,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99.1"
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc
@@ -274,10 +278,11 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: "1.99.1"
           targets: wasm32-unknown-unknown
           # For the shared-view ban below. This action installs only what it
           # is told to, so an unnamed component is an absent one.
-          components: clippy
+          components: clippy, rust-src
       # `waproto` generates code with protoc, which is a host build even
       # though the artifact is wasm.
       #
@@ -290,7 +295,7 @@ jobs:
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           # Its own cache: a different target shares nothing with the Linux
-          # job's, and pages.yml's is a nightly with a rebuilt std.
+          # job's, and pages.yml rebuilds std for shared memory.
           # The root manifest's hash, for the reason spelled out over the
           # `Check` job: the profiles live there, a profile decides every
           # dependency's fingerprint, and rust-cache's automatic key does not
@@ -348,10 +353,10 @@ jobs:
           CARGO_TARGET_DIR=target/call-playout-browser cargo test \
             --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
             --locked --target wasm32-unknown-unknown --test browser
-      - name: Install nightly for shared WASM tests
-        run: rustup toolchain install nightly-2026-10-29 --profile minimal --component rust-src --target wasm32-unknown-unknown
       - name: Test production audio and WebCodecs with shared WASM memory
         env:
+          # Shared std and wasm_thread still use unstable features.
+          RUSTC_BOOTSTRAP: "1"
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
         run: |
           unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
@@ -359,14 +364,14 @@ jobs:
           test -x "$CHROMEDRIVER" || CHROMEDRIVER=$(command -v chromedriver)
           export WASM_BINDGEN_TEST_WEBDRIVER_JSON="$RUNNER_TEMP/call-playout-webdriver.json"
           # Inherit the web bundle's root flags and rebuild std, as Pages does.
-          CARGO_TARGET_DIR=target/webcodecs-shared cargo +nightly-2026-10-29 test \
+          CARGO_TARGET_DIR=target/webcodecs-shared cargo test \
             --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
             --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort \
             --test readback --test recovery --test transform
-          CARGO_TARGET_DIR=target/call-playout-shared cargo +nightly-2026-10-29 test \
+          CARGO_TARGET_DIR=target/call-playout-shared cargo test \
             --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
             --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort --test browser
-          CARGO_TARGET_DIR=target/call-audio-shared cargo +nightly-2026-10-29 test \
+          CARGO_TARGET_DIR=target/call-audio-shared cargo test \
             -p oxidezap-audio --target wasm32-unknown-unknown \
             -Z build-std=std,panic_abort --test call_audio_lifecycle
 
@@ -389,7 +394,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.99.1"
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc

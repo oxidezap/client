@@ -24,7 +24,7 @@ jobs:
 
   # The same client as a page, packaged so it can be hosted without being
   # built. It is a separate workflow rather than a fourth matrix entry because
-  # nothing about it matches: a nightly toolchain, a rebuilt standard library,
+  # nothing about it matches: a shared-memory target, a rebuilt standard library,
   # trunk, and one artifact rather than one per platform.
   web:
     uses: ./.github/workflows/web-bundle.yml

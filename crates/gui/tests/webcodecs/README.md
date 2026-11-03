@@ -76,7 +76,7 @@ If Chrome is not installed in its default location, set
 `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER` can likewise name an absolute path
 to the matching runner. Do not commit machine-specific paths.
 
-CI also runs all three targets in its shared-WASM step, using pinned nightly
+CI also runs all three targets in its shared-WASM step, using Rust 1.99.1 with scoped `RUSTC_BOOTSTRAP=1`
 with `rust-src` and the root's shared-memory flags. Run the same command locally
 after configuring ChromeDriver as above. The shared step reuses the audio
 WebDriver properties, including `--enable-features=SharedArrayBuffer` and
@@ -90,11 +90,11 @@ Set `WASM_BINDGEN_TEST_WEBDRIVER_JSON` to the absolute path of that file. Add
 `binary` under `goog:chromeOptions` if Chrome is not in its default location.
 
 ```bash
-rustup toolchain install nightly-2026-09-03 --profile minimal --component rust-src --target wasm32-unknown-unknown
+rustup toolchain install 1.99.1 --profile minimal --component rust-src --target wasm32-unknown-unknown
 env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
   CARGO_TARGET_DIR=target/webcodecs-shared \
   CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-  cargo +nightly-2026-09-03 test --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
+  RUSTC_BOOTSTRAP=1 cargo +1.99.1 test --manifest-path crates/gui/tests/webcodecs/Cargo.toml \
     --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort \
     --test readback --test recovery --test transform
 ```
@@ -141,7 +141,7 @@ guard in addition to the existing 23 tests. Its runtime check reported
 The recovery target decodes compressed reference chains but does not assert
 whether Chrome selects hardware or software codecs. These targets do not measure
 camera performance or draw through GPUI. The ordinary command omits the
-application's shared-memory configuration; the nightly command includes it.
+application's shared-memory configuration; the shared-memory command includes it.
 RGBA and BGRA copies are real; older-browser behavior is injected around the
 native copying method.
 

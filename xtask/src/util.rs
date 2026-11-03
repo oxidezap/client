@@ -38,11 +38,8 @@ macro_rules! err {
 
 /// A program to run, its arguments, its environment and where it runs.
 ///
-/// The environment is per child rather than per process, which is the one
-/// thing this arrangement gets for free over the script it replaces: the web
-/// build exported `RUSTUP_TOOLCHAIN=nightly` into its own process and every
-/// descendant, so anything else the script had gone on to do would silently
-/// have been a nightly build too.
+/// Environment changes apply only to the child. The web build uses this to
+/// enable bootstrap without exposing later native builds to unstable features.
 pub struct Run {
     cmd: Command,
     shown: String,
