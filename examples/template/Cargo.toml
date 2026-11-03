@@ -7,9 +7,9 @@ description = "Starting point for an oxidezap plugin"
 version = "0.1.0"
 edition = "2024"
 # The SDK's own floor, which a plugin inherits by depending on it: the
-# workspace this example is copied out of is pinned to 1.95, so anything
+# workspace this example is copied out of is pinned to 1.99.1, so anything
 # lower here is a promise cargo refuses on the first build.
-rust-version = "1.95"
+rust-version = "1.99.1"
 license = "MIT"
 publish = false
 

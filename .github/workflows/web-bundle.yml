@@ -49,13 +49,11 @@ jobs:
           # to `main` wants.
           ref: ${{ inputs.ref }}
 
-      # Nightly, and not by preference — the same three reasons `pages.yml`
-      # gives: `-Z build-std` is nightly-only, the standard library has to be
-      # rebuilt with the atomics target feature on for `gpui_web`'s executor,
-      # and `rust-src` is what build-std compiles from.
+      # Stable compiler; the WASM build task scopes bootstrap to its child
+      # because shared memory still requires unstable build-std.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: nightly
+          toolchain: "1.99.1"
           targets: wasm32-unknown-unknown
           components: rust-src
 

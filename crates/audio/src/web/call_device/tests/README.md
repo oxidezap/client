@@ -25,16 +25,16 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test -p oxidezap-audio --target wasm32-unknown-unknown --test call_audio_lifecycle
 
 # Inherits the root atomics/shared-memory flags and rebuilds std with them.
-rustup toolchain install nightly-2026-09-03 --profile minimal --component rust-src --target wasm32-unknown-unknown
+rustup toolchain install 1.99.1 --profile minimal --component rust-src --target wasm32-unknown-unknown
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 CARGO_TARGET_DIR=target/call-playout-shared \
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-  cargo +nightly-2026-09-03 test --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
+  RUSTC_BOOTSTRAP=1 cargo +1.99.1 test --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
   --locked --target wasm32-unknown-unknown -Z build-std=std,panic_abort --test browser
 
 CARGO_TARGET_DIR=target/call-audio-shared \
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-  cargo +nightly-2026-09-03 test -p oxidezap-audio --target wasm32-unknown-unknown \
+  RUSTC_BOOTSTRAP=1 cargo +1.99.1 test -p oxidezap-audio --target wasm32-unknown-unknown \
   -Z build-std=std,panic_abort --test call_audio_lifecycle
 ```
 

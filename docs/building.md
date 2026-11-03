@@ -1,5 +1,10 @@
 # Building & verifying
 
+All builds use Rust 1.99.1, pinned in `rust-toolchain.toml` and CI.
+The web build and shared-memory browser tests set `RUSTC_BOOTSTRAP=1` only
+for their build processes. This uses the stable compiler with unstable
+`build-std` and dependency features; it is not a stable-only WASM build.
+
 The GUI consumes GPUI Kit from its canonical git repository and the matching
 published `gpui-pre` family. `Cargo.lock` records the revisions and versions.
 Do not mix in Zed git GPUI, which would give the component library and client
@@ -46,18 +51,19 @@ cargo test -p oxidezap-plugin-host --all-features -- --ignored
 The same window as a page:
 
 ```bash
-# Needs nightly: `-Z build-std` is nightly-only, and the standard library has
+# Uses Rust 1.99.1 with bootstrap scoped to WASM: the standard library has
 # to be rebuilt with the atomics target feature on — gpui_web runs its
 # background executor on real workers, and the prebuilt std is not compiled
 # for that. The link flags are in /.cargo/config.toml.
-rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
+rustup toolchain install 1.99.1 --component rust-src --target wasm32-unknown-unknown
 cargo install trunk
 
 # Serves on http://127.0.0.1:8080 with the two isolation headers set. On
 # GitHub Pages a service worker adds them instead, because a static host has
 # no way to.
 # Through the task: trunk cannot forward arguments to cargo, so it is what
-# sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`. Run it from the root —
+# sets the toolchain, WASM-only bootstrap and `CARGO_UNSTABLE_BUILD_STD`.
+# Run it from the root —
 # the alias in /.cargo/config.toml names a manifest path.
 TRUNK_ACTION=serve cargo xtask web build
 
@@ -101,14 +107,13 @@ The web half of the daemon — the OPFS folder a page installs plugins into —
 is `cfg`-gated to wasm, so `cargo test --workspace` compiles none of it. It
 has tests that run in a real browser instead, and CI runs them:
 
-These run on **stable** with the wasm target, which is a different toolchain
-from the web *bundle* above — that one needs nightly, this one does not. On a
+These use the same stable compiler and prebuilt wasm target without bootstrap. On a
 clean machine, provision what CI provisions first. The runner and the
 `wasm-bindgen` crate this workspace resolves are two halves of one version, so
 take the pin from `Cargo.lock` rather than from this line:
 
 ```bash
-rustup target add wasm32-unknown-unknown          # for stable, not nightly
+rustup target add wasm32-unknown-unknown          # ordinary WASM tests
 cargo install wasm-bindgen-cli --version 0.2.129  # must match Cargo.lock
 # Chrome and a matching chromedriver, however your platform supplies them.
 ```
@@ -132,7 +137,7 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 ```
 
 CI also runs the standalone WebCodecs readback, recovery and transform targets
-in ordinary and shared-memory builds. The shared step uses pinned nightly with
+in ordinary and shared-memory builds. The shared step uses Rust 1.99.1 with scoped `RUSTC_BOOTSTRAP=1` and
 `rust-src`, inherits the root wasm flags and rebuilds `std` and `panic_abort`.
 The [WebCodecs test README](../crates/gui/tests/webcodecs/README.md) gives the
 commands, Chrome properties and runtime memory assertion.
@@ -140,7 +145,7 @@ commands, Chrome properties and runtime memory assertion.
 Type-checking the web build without the whole bundle:
 
 ```bash
-cargo +nightly check -p oxidezap-gui --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+RUSTC_BOOTSTRAP=1 cargo +1.99.1 check -p oxidezap-gui --target wasm32-unknown-unknown -Z build-std=std,panic_abort
 ```
 
 The session builds for that target too, and is checked separately because
@@ -148,7 +153,7 @@ nothing in the page depends on it yet — a break there would otherwise go
 unnoticed until something does:
 
 ```bash
-cargo +nightly check -p oxidezap-session --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+RUSTC_BOOTSTRAP=1 cargo +1.99.1 check -p oxidezap-session --target wasm32-unknown-unknown -Z build-std=std,panic_abort
 ```
 
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
