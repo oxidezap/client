@@ -498,17 +498,14 @@ pub(super) fn apply_server_ack(
     } else {
         false
     };
-    if timestamp_updated
-        && let Some(timestamp_ms) = server_timestamp_ms
-        && reconcile_chat_head_after_timestamp_change(
+    if timestamp_updated && let Some(timestamp_ms) = server_timestamp_ms {
+        reconcile_chat_head_after_timestamp_change(
             conn,
             device_id,
             &chat,
             old_timestamp_ms,
             timestamp_ms,
-        )?
-    {
-        cs.chats = true;
+        )?;
     }
     if status_updated || timestamp_updated {
         // Resolve the chat from the row itself: the ack's `from` is the wire

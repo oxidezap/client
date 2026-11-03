@@ -1756,7 +1756,23 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   crashes and failed closes can lose it. This is neither a durable outbox nor
   an exactly-once API. Callers needing that guarantee must own a durable journal.
 - **An invalidation is a claim that something changed.** A subscriber answers
-  `StoreChange` by re-querying, so emitting one for a batch that wro
+  `StoreChange` by re-querying. Sends, inbound messages and ACK timestamp
+  corrections name their chat through `Messages`, including newly created
+  chats. The front end merges and reorders that chat; it does not need the
+  first hundred chats hydrated again. Only list-wide changes, real contact
+  name changes and receiver gaps widen the reload. A repeated push or business
+  name neither writes a row nor invalidates contacts.
+- **Offline receipts can precede phone-sent messages.** Retain unmatched
+  delivery/read/played receipts from the offline queue in `offline_receipts`,
+  then resolve them against outgoing rows at the end of each writer batch,
+  in the same transaction. This survives separate batches and reopening the store. Evidence is scoped
+  to the account, known PN/LID aliases and message id; incoming rows cannot
+  consume it. It creates no chat or visible receipt before an outgoing row
+  exists, never lowers delivery state and cannot revive a failed send.
+  Retention is bounded to 4096 observations per account and seven days from
+  local receipt. Clearing/deleting the chat discards unmatched evidence.
+  Ordinary live misses still disappear. A phone echo or server ACK alone is
+  still one tick; two ticks require recipient delivery evidence.
 - **Migration versions are shared with `whatsapp-rust-sqlite-storage`, so name
   them apart.** `chat-store` and the device store migrate the *same SQLite
   file*, and diesel keeps one ledger — `__diesel_schema_migrations` — for both.

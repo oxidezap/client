@@ -35,10 +35,11 @@ pub(super) fn upsert_contact_push_name(
     device_id: i32,
     jid: &str,
     push_name: &str,
-) -> QueryResult<()> {
+) -> QueryResult<bool> {
+    use diesel::query_dsl::methods::FilterDsl;
     use schema::contacts::dsl;
     let jid = contact_key(jid);
-    diesel::insert_into(dsl::contacts)
+    let changed = diesel::insert_into(dsl::contacts)
         .values((
             dsl::device_id.eq(device_id),
             dsl::jid.eq(&jid),
@@ -47,8 +48,9 @@ pub(super) fn upsert_contact_push_name(
         .on_conflict((dsl::device_id, dsl::jid))
         .do_update()
         .set(dsl::push_name.eq(push_name))
+        .filter(dsl::push_name.is_null().or(dsl::push_name.ne(push_name)))
         .execute(conn)?;
-    Ok(())
+    Ok(changed > 0)
 }
 
 pub(super) fn upsert_contact_business_name(
@@ -56,10 +58,11 @@ pub(super) fn upsert_contact_business_name(
     device_id: i32,
     jid: &str,
     business_name: &str,
-) -> QueryResult<()> {
+) -> QueryResult<bool> {
+    use diesel::query_dsl::methods::FilterDsl;
     use schema::contacts::dsl;
     let jid = contact_key(jid);
-    diesel::insert_into(dsl::contacts)
+    let changed = diesel::insert_into(dsl::contacts)
         .values((
             dsl::device_id.eq(device_id),
             dsl::jid.eq(&jid),
@@ -68,8 +71,13 @@ pub(super) fn upsert_contact_business_name(
         .on_conflict((dsl::device_id, dsl::jid))
         .do_update()
         .set(dsl::business_name.eq(business_name))
+        .filter(
+            dsl::business_name
+                .is_null()
+                .or(dsl::business_name.ne(business_name)),
+        )
         .execute(conn)?;
-    Ok(())
+    Ok(changed > 0)
 }
 
 fn contact_keys(

@@ -201,19 +201,21 @@ pub(super) fn apply_receipt(
     // the state it reached, not the instant it got there — which is the half
     // WA Web's "Delivered hh:mm / Read hh:mm" is made of.
     //
-    // A receipt for a message no chat holds is dropped rather than parked. The
-    // id is the server's, not ours, and nothing here can tell "our send has not
-    // been recorded yet" from "this message was deleted and its receipts swept
-    // with it" — and the second reading is the common one, because a peer
-    // receipt costs a round trip to that peer and back, so it arrives well
-    // after the send it answers. Parking it re-created metadata for messages a
-    // user had deleted, which is a worse answer than a blank time on a race
-    // that resolves itself: the message's own status is only ever advanced by a
-    // receipt that finds it, and a later one for the same message will.
+    // Live misses remain unowned. Offline receipts may precede a phone-sent
+    // message during reconnect; retain bounded evidence without creating a
+    // chat, message, or visible receipt until an outgoing row owns it.
     for msg_id in &message_ids {
         let key = match relocated.get(msg_id) {
             Some(alt) => alt,
-            None if unowned.contains(&msg_id) => continue,
+            None if unowned.contains(&msg_id) => {
+                if receipt.offline {
+                    super::offline_receipts::retain(
+                        conn, device_id, &chat, msg_id, &user, status, ts_ms,
+                    )?;
+                    cs.pending_receipt_chats.insert(chat.clone());
+                }
+                continue;
+            }
             None => &chat,
         };
         wrote |= record_receipt(conn, device_id, key, msg_id, &user, status, ts_ms)?;
@@ -237,7 +239,7 @@ pub(super) fn apply_receipt(
 /// would show a send the user was already told had failed as delivered. A
 /// failure is terminal in this store: retrying is a fresh send under a new
 /// id, and the original keeps its bubble.
-fn advance_status(
+pub(super) fn advance_status(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
@@ -282,7 +284,7 @@ fn message_exists(
 /// Reports whether the row is new or its instant moved: a receipt repeated by
 /// another of the peer's devices lands on the row the first one filed and
 /// leaves it exactly as it was, which is not a change to announce.
-fn record_receipt(
+pub(super) fn record_receipt(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,

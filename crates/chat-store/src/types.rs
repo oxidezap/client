@@ -638,11 +638,12 @@ impl ChatNameWrite {
 /// data (query + invalidation, not cache duplication).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreChange {
-    /// Chat-list-level change: ordering, previews, unread counts, membership.
+    /// List-wide change, including deletions/archival that can require pruning.
+    /// Ordering, previews and unread counts confined to one chat use `Messages`.
     Chats,
     /// One chat changed and only that chat needs rebuilding: its message set
-    /// (insert/edit/revoke/reaction/status), or a list-row field that moves
-    /// it without touching membership (a pin). The reloader answers with a
+    /// (insert/edit/revoke/reaction/status), a newly created chat, or a list-row
+    /// field such as its activity timestamp or pin. The reloader answers with a
     /// scoped load that fetches the chat by JID, so it reaches one that has
     /// fallen past the first page.
     Messages { chat: Jid },

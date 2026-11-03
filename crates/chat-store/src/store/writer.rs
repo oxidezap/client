@@ -42,6 +42,7 @@ pub(crate) struct ChangeSet {
     pub(crate) chats: bool,
     pub(crate) contacts: bool,
     pub(crate) message_chats: BTreeSet<String>,
+    pub(crate) pending_receipt_chats: BTreeSet<String>,
     pub(crate) pending_audio_chats: BTreeSet<String>,
 }
 
@@ -250,6 +251,19 @@ async fn attempt_batch(
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .1 = Some(write_description(&queued.message));
                             return Err(error);
+                        }
+                    }
+                    if !cs.pending_receipt_chats.is_empty()
+                        || (!cs.message_chats.is_empty()
+                            && super::offline_receipts::has_pending(conn, device_id)?)
+                    {
+                        let chats: Vec<_> = cs
+                            .message_chats
+                            .union(&cs.pending_receipt_chats)
+                            .cloned()
+                            .collect();
+                        for chat in chats {
+                            super::offline_receipts::apply(conn, device_id, &chat, &mut cs)?;
                         }
                     }
                     if !cs.pending_audio_chats.is_empty()
@@ -467,7 +481,8 @@ fn apply_writer_msg(
                         unread_delta: 0,
                     },
                 )?;
-                cs.chats = true;
+                // The affected chat is published below, including new chats.
+                // A send does not require rehydrating the entire list.
                 // The row this send's ack was waiting for now exists. Applying
                 // it here also corrects the optimistic timestamp we just wrote
                 // to the server's, before anything renders the row.

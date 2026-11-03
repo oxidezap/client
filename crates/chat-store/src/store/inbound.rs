@@ -29,8 +29,7 @@ pub(super) fn apply_inbound(
 
     // Live push names ride on every message; keep contacts warm from them.
     if !info.push_name.is_empty() && !info.source.is_from_me {
-        upsert_contact_push_name(conn, device_id, &sender, &info.push_name)?;
-        cs.contacts = true;
+        cs.contacts |= upsert_contact_push_name(conn, device_id, &sender, &info.push_name)?;
     }
 
     // Same for business verified names, so display_name() can fall back to them.
@@ -41,8 +40,7 @@ pub(super) fn apply_inbound(
             .and_then(|vn| vn.name.as_deref())
         && !name.is_empty()
     {
-        upsert_contact_business_name(conn, device_id, &sender, name)?;
-        cs.contacts = true;
+        cs.contacts |= upsert_contact_business_name(conn, device_id, &sender, name)?;
     }
 
     match classify(&inbound.message) {
@@ -110,7 +108,6 @@ pub(super) fn apply_inbound(
                         unread_delta,
                     },
                 )?;
-                cs.chats = true;
             }
             if inserted != StoredRow::Skipped {
                 cs.message_chats.insert(chat);
