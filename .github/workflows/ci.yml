@@ -61,7 +61,7 @@ jobs:
             libxkbcommon-x11-dev libwayland-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig1-dev libfreetype6-dev
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: protoc,cargo-nextest@0.9.150,cargo-machete@0.9.2
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
@@ -226,7 +226,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.99.1"
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
@@ -289,7 +289,7 @@ jobs:
       # The runner has to match the `wasm-bindgen` crate this workspace
       # resolves, exactly — the generated glue and the runner are two halves
       # of one version — so it is pinned here and moves when Cargo.lock does.
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: protoc,wasm-bindgen-cli@0.2.129
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
@@ -395,7 +395,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.99.1"
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
