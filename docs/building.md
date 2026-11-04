@@ -11,8 +11,11 @@ components, assets and the application share the same entity types.
 `Cargo.lock` records the GPUI Kit revision and backend versions. The root's
 GPUI optimization overrides name `gpui-fast`.
 
-The vendored `gpui-pre-web` backend is no longer needed. `gpui-fast-web`
-0.1.13 passes integer timeouts to web-sys 0.3.106, including idle callbacks.
+The web backend still needs a patch. `vendor/gpui-fast-web` replaces
+`vendor/gpui-pre-web` and carries the same integer-coordinate fix for Canvas
+readback under `web_sys_unstable_apis`. The published gpui-fast-web 0.1.13
+still passes floats to that binding. See
+[its patch notes](../vendor/gpui-fast-web/LOCAL_CHANGES.md).
 `vendor/phonenumber` remains. The latest registry release is still
 0.3.10+9.0.33, whose default database validates regexes at runtime and retains
 vectors for immutable metadata. Removing our patch would undo build-time

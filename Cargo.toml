@@ -117,6 +117,8 @@ whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rus
 # Validate immutable phone metadata during the build, not the first label.
 # See vendor/phonenumber/LOCAL_CHANGES.md.
 phonenumber = { path = "vendor/phonenumber" }
+# Canvas readback needs integer coordinates with web_sys_unstable_apis.
+gpui-fast-web = { path = "vendor/gpui-fast-web" }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and
