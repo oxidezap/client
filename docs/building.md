@@ -9,7 +9,10 @@ The GUI uses the published `gpui-fast` family and GPUI Kit's `gpui-fast`
 feature. Enable it on `gpui-base`, `gpui-component` and `gpui-kit-assets` so
 components, assets and the application share the same entity types.
 `Cargo.lock` records the GPUI Kit revision and backend versions. The root's
-GPUI optimization overrides name `gpui-fast`.
+GPUI optimization overrides name `gpui-fast`. Keep `gpu-allocator` on the
+same `windows` version as `wgpu-hal` in the lockfile. Its broad version range
+also accepts GPUI Kit's older Win32 bindings, but those types cannot cross
+into wgpu's Direct3D allocator.
 
 The web backend still needs a patch. `vendor/gpui-fast-web` replaces
 `vendor/gpui-pre-web` and carries the same integer-coordinate fix for Canvas
