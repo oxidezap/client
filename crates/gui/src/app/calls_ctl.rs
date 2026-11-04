@@ -769,10 +769,6 @@ impl WhatsAppApp {
         self.calls.read(cx).card()
     }
 
-    pub fn active_call<'a>(&self, cx: &'a App) -> Option<&'a ActiveCall> {
-        self.calls.read(cx).state().active()
-    }
-
     /// The newest picture of one direction of the live call, when there is
     /// one to draw.
     pub fn call_picture<'a>(
