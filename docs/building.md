@@ -5,10 +5,20 @@ The web build and shared-memory browser tests set `RUSTC_BOOTSTRAP=1` only
 for their build processes. This uses the stable compiler with unstable
 `build-std` and dependency features; it is not a stable-only WASM build.
 
-The GUI consumes GPUI Kit from its canonical git repository and the matching
-published `gpui-pre` family. `Cargo.lock` records the revisions and versions.
-Do not mix in Zed git GPUI, which would give the component library and client
-different entity types. The root's GPUI optimization overrides name `gpui-pre`.
+The GUI uses the published `gpui-fast` family and GPUI Kit's `gpui-fast`
+feature. Enable it on `gpui-base`, `gpui-component` and `gpui-kit-assets` so
+components, assets and the application share the same entity types.
+`Cargo.lock` records the GPUI Kit revision and backend versions. The root's
+GPUI optimization overrides name `gpui-fast`.
+
+The vendored `gpui-pre-web` backend is no longer needed. `gpui-fast-web`
+0.1.13 passes integer timeouts to web-sys 0.3.106, including idle callbacks.
+`vendor/phonenumber` remains. The latest registry release is still
+0.3.10+9.0.33, whose default database validates regexes at runtime and retains
+vectors for immutable metadata. Removing our patch would undo build-time
+prevalidation and metadata compaction. See
+[its patch notes](../vendor/phonenumber/LOCAL_CHANGES.md) for removal criteria
+and the tests that cover it.
 
 ```bash
 # These mirror `.github/workflows/ci.yml`, which is the authority: check the
