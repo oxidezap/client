@@ -72,7 +72,7 @@ impl Render for Body {
                         render_settings_view(app, window, cx).into_any_element()
                     }
                     AppState::Connected | AppState::Offline | AppState::OfflineLoggedOut { .. } => {
-                        render_connected_view(app, window, cx).into_any_element()
+                        render_connected_view(app, &self.calls, window, cx).into_any_element()
                     }
                     AppState::Error(fault) => render_error_view(
                         fault,
