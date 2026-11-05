@@ -180,6 +180,7 @@ impl Sender {
             .closed = true;
         self.inner.wake.notify_waiters();
     }
+    /// Distinguish a closed receiver from a temporary admission rejection.
     pub(super) fn is_closed(&self) -> bool {
         self.inner
             .state
@@ -471,6 +472,7 @@ fn class_of(event: &UiEvent) -> Class {
 // A new snapshot covers an older snapshot of the same page. A narrowed page
 // cannot replace a complete list or a page containing other chats. Live events
 // can contain messages outside the hydrated tail, so they still request reload.
+/// Whether a new history snapshot makes an evicted snapshot redundant.
 fn snapshot_covers(replacement: &UiEvent, old: &UiEvent) -> bool {
     match (replacement, old) {
         (
@@ -642,6 +644,7 @@ fn message_bytes(message: &oxidezap_core::ChatMessage) -> usize {
         })
 }
 
+/// Estimate heap bytes held by the variable-sized fields of an event.
 fn event_strings(event: &UiEvent) -> usize {
     match event {
         UiEvent::QrCode { code, .. } | UiEvent::PairCode { code, .. } => string_bytes(code),
@@ -806,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    /// Replacing a covered snapshot must not trigger an endless recovery loop.
     fn recovery_snapshot_does_not_schedule_itself_when_consumer_is_stalled() {
         use std::future::Future;
         use std::task::{Context, Poll};
@@ -828,6 +832,7 @@ mod tests {
     }
 
     #[test]
+    /// Evicting a disjoint history page still requires recovery.
     fn disjoint_history_pages_still_request_recovery() {
         use std::future::Future;
         use std::task::{Context, Poll};
@@ -847,6 +852,7 @@ mod tests {
     }
 
     #[test]
+    /// Heap allocations in receipts, reactions and notices count toward the budget.
     fn oversized_receipt_reaction_and_notice_cannot_bypass_byte_budget() {
         let events = [
             UiEvent::ReceiptReceived {

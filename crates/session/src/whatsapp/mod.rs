@@ -143,6 +143,7 @@ struct InterestedEventHandler {
 }
 
 impl EventHandler for InterestedEventHandler {
+    /// Skip unused history copies before admitting events to this subscriber.
     fn handle_event(&self, event: Arc<Event>) {
         // Server-pushed history chunks are materialized by ChatStore's own
         // subscription. The control consumer intentionally does nothing for

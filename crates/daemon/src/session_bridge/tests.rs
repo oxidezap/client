@@ -12,6 +12,32 @@ use oxidezap_ipc::{ConnectionState, DaemonMessage};
 use super::translate::deadline_ms;
 use super::*;
 
+#[test]
+/// An incomplete close takes priority over every ordinary exit reason.
+fn failed_teardown_never_requests_recovery_or_a_clean_stop() {
+    for stopping in [false, true] {
+        for logged_out in [false, true] {
+            assert_eq!(
+                session_exit(false, true, stopping, logged_out),
+                AccountExit::SessionTeardownIncomplete
+            );
+            assert_eq!(
+                session_exit(true, false, stopping, logged_out),
+                AccountExit::SessionTeardownIncomplete
+            );
+        }
+    }
+    assert_eq!(
+        session_exit(true, true, false, false),
+        AccountExit::SessionEnded
+    );
+    assert_eq!(session_exit(true, true, true, false), AccountExit::Stopped);
+    assert_eq!(
+        session_exit(true, true, false, true),
+        AccountExit::SessionLoggedOut
+    );
+}
+
 pub(super) fn message(id: &str, sender: &str, secs: i64, from_me: bool, read: bool) -> ChatMessage {
     let mut message = fixtures::message(id, sender, "hi");
     // `secs` is the whole instant rather than an offset from [`fixtures::at`]:
@@ -975,6 +1001,7 @@ fn first_live_message_carries_mute_to_tray_before_chat_hydration() {
 }
 
 #[test]
+/// Overflow requests a replacement and a subsequent connection restores state.
 fn control_overflow_requests_session_replacement_and_reconnect_restores_state() {
     let mut bridge = bridge();
     bridge.observe(UiEvent::Connected);
@@ -997,6 +1024,7 @@ fn control_overflow_requests_session_replacement_and_reconnect_restores_state() 
 }
 
 #[test]
+/// A terminal logout must not be hidden by overflow recovery.
 fn overflow_cannot_restart_a_logged_out_account() {
     let mut bridge = bridge();
     bridge.observe(UiEvent::LoggedOut("rejected".into()));

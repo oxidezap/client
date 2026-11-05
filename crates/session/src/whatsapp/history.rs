@@ -233,8 +233,17 @@ impl WhatsAppClient {
                 {
                     Ok(loaded) if loaded.chats.is_empty() && !loaded.complete => {}
                     Ok(loaded) => {
-                        if ui_tx.send(loaded.into_event()).is_err() && ui_tx.is_closed() {
-                            break;
+                        if ui_tx.send(loaded.into_event()).is_err() {
+                            if ui_tx.is_closed() {
+                                break;
+                            }
+                            // A full control lane re-notifies `reload` during
+                            // rejection. Do not let that notification bypass
+                            // the quiet window and spin on full store loads.
+                            tokio::select! {
+                                _ = stopping.changed() => break,
+                                () = crate::exec::sleep(Self::RELOAD_DEBOUNCE) => {}
+                            }
                         }
                     }
                     Err(e) => warn!("failed to reload history after store change: {e}"),

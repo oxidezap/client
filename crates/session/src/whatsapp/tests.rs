@@ -23,6 +23,7 @@ use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
 #[test]
+/// Offline history cannot displace connection or on-demand history events.
 fn offline_history_burst_does_not_fill_control_mailbox() {
     use whatsapp_rust::wacore::types::events::{Connected, EventHandler, LazyHistorySync};
     let (handler, incoming, stats) = super::interested_channel(super::CONTROL_EVENT_KINDS, 64);
@@ -1801,6 +1802,7 @@ async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
     (chat_store, bot.client())
 }
 
+/// Construct a bot and its synthetic store for reloader integration tests.
 async fn test_bot(name: &str) -> (Arc<ChatStore>, whatsapp_rust::bot::Bot) {
     let store = SqliteStore::open(&format!(
         "file:oxidezap-session-{name}?mode=memory&cache=shared"
@@ -3649,6 +3651,7 @@ async fn offline_phone_delivery_hydrates_two_ticks_in_a_scoped_reload() {
 }
 
 #[tokio::test]
+/// A blocked handler cannot prevent control-lane overflow recovery.
 async fn a_saturated_control_lane_triggers_recovery_without_waiting_for_its_handler() {
     let (store, client) = test_session("saturated-control-lane").await;
     let (tx, mut rx) = super::ui_queue::channel(
@@ -3698,7 +3701,63 @@ async fn a_saturated_control_lane_triggers_recovery_without_waiting_for_its_hand
     ));
 }
 
+/// A full control queue must not make its recovery notification spin the
+/// reloader, and freeing capacity must allow the pending reload to complete.
 #[tokio::test]
+async fn history_reloader_backs_off_when_control_queue_is_full() {
+    let (store, bot) = test_bot("reloader-control-capacity").await;
+    let reload = Arc::new(tokio::sync::Notify::new());
+    let budget = Arc::new(super::ui_queue::HistoryBudget::new());
+    let (tx, mut rx) = super::ui_queue::channel(reload.clone(), budget.clone());
+    for _ in 0..256 {
+        tx.send(oxidezap_core::UiEvent::Error("synthetic control".into()))
+            .unwrap();
+    }
+    let (stop, stopping) = tokio::sync::watch::channel(());
+    WhatsAppClient::spawn_history_reloader(
+        store.subscribe(),
+        store.clone(),
+        &bot,
+        &tx,
+        reload.clone(),
+        budget,
+        Arc::new(book_with(&store)),
+        stopping,
+    );
+    reload.notify_one();
+    assert!(
+        crate::exec::with_timeout(
+            async {
+                while tx.stats().dropped_recoverable == 0 {
+                    crate::exec::breathe().await;
+                }
+            },
+            std::time::Duration::from_secs(3)
+        )
+        .await
+        .is_some()
+    );
+    crate::exec::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        tx.stats().dropped_recoverable,
+        1,
+        "rejection must wait before reloading again"
+    );
+    for _ in 0..256 {
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(oxidezap_core::UiEvent::Error(_))
+        ));
+    }
+    assert!(matches!(
+        crate::exec::with_timeout(rx.recv(), std::time::Duration::from_secs(3)).await,
+        Some(Some(oxidezap_core::UiEvent::HistoryLoaded { .. }))
+    ));
+    let _ = stop.send(());
+}
+
+#[tokio::test]
+/// Rejected oversized snapshots retry smaller pages and later store changes.
 async fn history_reloader_survives_oversized_pages_and_later_store_changes() {
     let (store, bot) = test_bot("reloader-admission-retry").await;
     let reload = Arc::new(tokio::sync::Notify::new());
