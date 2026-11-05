@@ -38,7 +38,6 @@ const LANE_CAPACITY: usize = 64;
 /// code never waits behind a conversation.
 pub(super) struct EventLanes {
     lanes: Vec<mpsc::Sender<(Arc<Event>, u64)>>,
-    stopping: tokio::sync::watch::Receiver<()>,
     calls: CallRegistry,
     ui: UiEventSender,
 }
@@ -82,12 +81,7 @@ impl EventLanes {
                 tx
             })
             .collect();
-        Self {
-            lanes,
-            stopping,
-            calls,
-            ui,
-        }
+        Self { lanes, calls, ui }
     }
 
     /// Dispatch an event and report recoverable events dropped because their
@@ -135,16 +129,11 @@ impl EventLanes {
                         lane,
                     );
                 }
-            } else {
-                let mut stopping = self.stopping.clone();
-                tokio::select! {
-                    result = self.lanes[lane].send((event, epoch)) => {
-                        if result.is_err() {
-                            return outcome;
-                        }
-                    }
-                    _ = stopping.changed() => return outcome,
-                }
+            } else if self.lanes[lane].try_send((event, epoch)).is_err() {
+                // Losing control requires replacing the session, but must
+                // never hold up every other lane behind this one.
+                self.ui.signal_control_overflow();
+                return outcome;
             }
         }
         outcome

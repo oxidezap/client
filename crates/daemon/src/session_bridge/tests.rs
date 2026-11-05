@@ -973,3 +973,39 @@ fn first_live_message_carries_mute_to_tray_before_chat_hydration() {
     assert!(summary.is_muted(wacore::time::now_utc().timestamp_millis()));
     assert_eq!(bridge.hub.watch_tray().borrow().unread, 0);
 }
+
+#[test]
+fn control_overflow_requests_session_replacement_and_reconnect_restores_state() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::Connected);
+    assert_eq!(
+        bridge.observe(UiEvent::SessionResyncRequired("overflow".into())),
+        Answer::Restart
+    );
+    assert!(matches!(
+        bridge.hub.snapshot().connection,
+        ConnectionState::Disconnected { .. }
+    ));
+    assert_eq!(
+        bridge.lifecycle.disposition(),
+        None,
+        "recovery must retain account storage"
+    );
+    bridge.observe(UiEvent::InitComplete);
+    bridge.observe(UiEvent::Connected);
+    assert_eq!(bridge.hub.snapshot().connection, ConnectionState::Connected);
+}
+
+#[test]
+fn overflow_cannot_restart_a_logged_out_account() {
+    let mut bridge = bridge();
+    bridge.observe(UiEvent::LoggedOut("rejected".into()));
+    assert_eq!(
+        bridge.observe(UiEvent::SessionResyncRequired("overflow".into())),
+        Answer::Nothing
+    );
+    assert!(matches!(
+        bridge.hub.snapshot().connection,
+        ConnectionState::LoggedOut { .. }
+    ));
+}

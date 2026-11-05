@@ -1102,6 +1102,16 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   only on disagreement is unversioned, and would let a failed announcement's
   answer stand over the success that came after it. Agreement costs nothing,
   because a call state that does not change sends no frame.
+- **Losing session control events requires replacing the daemon session.**
+  `SessionResyncRequired` ends the bridge loop and uses the account supervisor's
+  bounded restart path. Changing only the connection snapshot leaves a live
+  session behind a disconnected daemon state. The old client is closed before
+  reopening its retained credentials and history. A full control lane signals
+  the same fault without blocking unrelated lanes. Ordinary data loss still
+  reloads committed history. Admission rejection is not queue closure, so an
+  oversized history page must let the reloader retry its reduced budget.
+  A replacement snapshot covering an earlier page does not request another
+  reload just because it evicted that snapshot from a stalled consumer's queue.
 - **Logout is not a disconnect.** A server 401 means the stored credentials are
   dead. The classified completion from `Bot::run` must reach the daemon even
   when no `LoggedOut` callback was delivered. The terminal verdict is stored

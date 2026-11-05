@@ -1731,6 +1731,11 @@ async fn starred_and_pending_media_reads_project_rehydrated_quotes() {
 }
 
 async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
+    let (chat_store, bot) = test_bot(name).await;
+    (chat_store, bot.client())
+}
+
+async fn test_bot(name: &str) -> (Arc<ChatStore>, whatsapp_rust::bot::Bot) {
     let store = SqliteStore::open(&format!(
         "file:oxidezap-session-{name}?mode=memory&cache=shared"
     ))
@@ -1743,7 +1748,7 @@ async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
         .build()
         .await
         .expect("offline bot");
-    (chat_store, bot.client())
+    (chat_store, bot)
 }
 
 fn incoming(
@@ -3575,4 +3580,116 @@ async fn offline_phone_delivery_hydrates_two_ticks_in_a_scoped_reload() {
         .unwrap();
     assert_eq!(message.status, MessageStatus::Delivered);
     assert!(!message.is_read, "delivery evidence must not invent a read");
+}
+
+#[tokio::test]
+async fn a_saturated_control_lane_triggers_recovery_without_blocking_dispatch() {
+    let (store, client) = test_session("saturated-control-lane").await;
+    let (tx, mut rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let (_stop, stopping) = tokio::sync::watch::channel(());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let mut lanes = super::lanes::EventLanes::new(
+        {
+            let gate = gate.clone();
+            let entered = entered.clone();
+            move |_, _| {
+                let gate = gate.clone();
+                let entered = entered.clone();
+                async move {
+                    entered.notify_one();
+                    gate.notified().await;
+                }
+            }
+        },
+        stopping,
+        CallRegistry::default(),
+        tx,
+    );
+    let names = book_with(&store);
+    let event = Arc::new(Event::Connected(
+        whatsapp_rust::wacore::types::events::Connected::builder().build(),
+    ));
+    lanes.dispatch(&client, &names, event.clone()).await;
+    entered.notified().await;
+    for _ in 0..64 {
+        lanes.dispatch(&client, &names, event.clone()).await;
+    }
+    assert!(
+        crate::exec::with_timeout(
+            lanes.dispatch(&client, &names, event),
+            std::time::Duration::from_secs(1)
+        )
+        .await
+        .is_some()
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(oxidezap_core::UiEvent::SessionResyncRequired(_))
+    ));
+}
+
+#[tokio::test]
+async fn history_reloader_survives_oversized_pages_and_later_store_changes() {
+    let (store, bot) = test_bot("reloader-admission-retry").await;
+    let reload = Arc::new(tokio::sync::Notify::new());
+    let budget = Arc::new(super::ui_queue::HistoryBudget::new());
+    let (tx, mut rx) = super::ui_queue::channel(reload.clone(), budget.clone());
+    let (_stop, stopping) = tokio::sync::watch::channel(());
+    WhatsAppClient::spawn_history_reloader(
+        store.subscribe(),
+        store.clone(),
+        &bot,
+        &tx,
+        reload.clone(),
+        budget.clone(),
+        Arc::new(book_with(&store)),
+        stopping,
+    );
+    feed(
+        &store,
+        incoming(
+            wa::Message::text("x".repeat(5 * 1024 * 1024)),
+            "OVERSIZED",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    reload.notify_one();
+    assert!(
+        crate::exec::with_timeout(
+            async {
+                while !budget.exhausted() {
+                    crate::exec::breathe().await;
+                }
+            },
+            std::time::Duration::from_secs(5)
+        )
+        .await
+        .is_some(),
+        "reloader must retry every smaller budget instead of treating rejection as closure"
+    );
+    feed(
+        &store,
+        incoming(
+            wa::Message::text("small latest message"),
+            "FITS",
+            1_700_000_001,
+        ),
+    )
+    .await;
+    reload.notify_one();
+    let event = crate::exec::with_timeout(rx.recv(), std::time::Duration::from_secs(5)).await;
+    let Some(Some(oxidezap_core::UiEvent::HistoryLoaded { chats, .. })) = event else {
+        panic!("history reloader stopped after admission rejection");
+    };
+    assert!(
+        chats
+            .iter()
+            .flat_map(|chat| &chat.messages)
+            .any(|message| message.id == "FITS")
+    );
 }

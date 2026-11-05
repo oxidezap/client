@@ -26,6 +26,8 @@ use crate::state::StateHub;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Answer {
     Nothing,
+    /// Replace the session through the account supervisor, retaining storage.
+    Restart,
     /// An offer with nowhere to go. Nothing on this side holds its id, so no
     /// front end can be asked to refuse it.
     Decline(oxidezap_core::CallId),
@@ -46,6 +48,7 @@ impl Bridge {
                     | UiEvent::PairSuccess
                     | UiEvent::Disconnected(_)
                     | UiEvent::Error(_)
+                    | UiEvent::SessionResyncRequired(_)
                     | UiEvent::QrCode { .. }
                     | UiEvent::PairCode { .. }
                     | UiEvent::IncomingCall(_)
@@ -61,7 +64,11 @@ impl Bridge {
         // what remains.
         self.calls.observe(&event, &self.hub);
         prepare_avatars(&self.hub, &self.avatar_recorder, &mut event);
-        let mut answer = Answer::Nothing;
+        let mut answer = if matches!(event, UiEvent::SessionResyncRequired(_)) {
+            Answer::Restart
+        } else {
+            Answer::Nothing
+        };
         // Before anything is published, so a `MarkRead` that arrives right
         // behind a message already covers it. What it answers is whether the
         // message is new to this side, which is what the badge below counts.
@@ -167,7 +174,10 @@ impl Bridge {
             // the stage stood, `is_busy` went on refusing every new call after
             // the reconnect, and the only way out was a cancel naming an id no
             // attached window still had.
-            UiEvent::Disconnected(_) | UiEvent::LoggedOut(_) | UiEvent::Error(_) => {
+            UiEvent::Disconnected(_)
+            | UiEvent::LoggedOut(_)
+            | UiEvent::Error(_)
+            | UiEvent::SessionResyncRequired(_) => {
                 self.hub.calls(|s| {
                     s.end_all();
                 });
@@ -295,7 +305,7 @@ impl Bridge {
             // Without this the hub sits in `Connecting` forever: the session's
             // sender outlives its worker, so no disconnect follows to correct
             // it and every client waits on a state that will never change.
-            UiEvent::Error(detail) => {
+            UiEvent::Error(detail) | UiEvent::SessionResyncRequired(detail) => {
                 vec![connection(ConnectionState::Disconnected { reason: detail })]
             }
             // Live traffic, applied directly rather than waiting for the store

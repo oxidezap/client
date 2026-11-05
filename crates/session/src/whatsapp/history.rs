@@ -233,7 +233,7 @@ impl WhatsAppClient {
                 {
                     Ok(loaded) if loaded.chats.is_empty() && !loaded.complete => {}
                     Ok(loaded) => {
-                        if ui_tx.send(loaded.into_event()).is_err() {
+                        if ui_tx.send(loaded.into_event()).is_err() && ui_tx.is_closed() {
                             break;
                         }
                     }

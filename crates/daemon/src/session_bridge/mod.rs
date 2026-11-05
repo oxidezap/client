@@ -350,8 +350,12 @@ pub async fn run(
             },
             event = events.recv() => match event {
                 Some(event) => {
-                    if let Answer::Decline(call_id) = bridge.observe(event) {
-                        client.decline_call(&call_id);
+                    match bridge.observe(event) {
+                        Answer::Nothing => {}
+                        Answer::Decline(call_id) => client.decline_call(&call_id),
+                        // Teardown joins the old session before the supervisor
+                        // reopens this account. No reset/removal is requested.
+                        Answer::Restart => break,
                     }
                     mute_timer.set(wait_for_mute_expiry(bridge.hub.clone()));
                 }

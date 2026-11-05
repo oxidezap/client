@@ -334,6 +334,9 @@ pub enum UiEvent {
         notice: SystemNotice,
     },
     Error(String),
+    /// Control events were lost. The daemon must replace this session while
+    /// retaining its credentials and durable history.
+    SessionResyncRequired(String),
 }
 
 /// One chat's resolved profile picture, inside [`UiEvent::AvatarsResolved`].
