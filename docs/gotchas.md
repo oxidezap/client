@@ -1107,7 +1107,7 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   bounded restart path. Changing only the connection snapshot leaves a live
   session behind a disconnected daemon state. The old client is closed before
   reopening its retained credentials and history. A full control lane signals
-  the same fault without blocking unrelated lanes. Ordinary data loss still
+  the same fault after at most 25 ms waiting for capacity. Ordinary data loss still
   reloads committed history. Admission rejection is not queue closure, so an
   oversized history page must let the reloader retry its reduced budget.
   A replacement snapshot covering an earlier page does not request another

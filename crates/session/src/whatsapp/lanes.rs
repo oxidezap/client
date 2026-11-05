@@ -129,11 +129,19 @@ impl EventLanes {
                         lane,
                     );
                 }
-            } else if self.lanes[lane].try_send((event, epoch)).is_err() {
-                // Losing control requires replacing the session, but must
-                // never hold up every other lane behind this one.
-                self.ui.signal_control_overflow();
-                return outcome;
+            } else {
+                // Give a transient burst a bounded chance to drain. Awaiting
+                // capacity without a deadline lets one subject stall every
+                // unrelated lane, including connection and call control.
+                let admission = crate::exec::with_timeout(
+                    self.lanes[lane].send((event, epoch)),
+                    std::time::Duration::from_millis(25),
+                )
+                .await;
+                if !matches!(admission, Some(Ok(()))) {
+                    self.ui.signal_control_overflow();
+                    return outcome;
+                }
             }
         }
         outcome

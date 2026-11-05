@@ -3583,7 +3583,7 @@ async fn offline_phone_delivery_hydrates_two_ticks_in_a_scoped_reload() {
 }
 
 #[tokio::test]
-async fn a_saturated_control_lane_triggers_recovery_without_blocking_dispatch() {
+async fn a_saturated_control_lane_triggers_recovery_without_waiting_for_its_handler() {
     let (store, client) = test_session("saturated-control-lane").await;
     let (tx, mut rx) = super::ui_queue::channel(
         Arc::new(tokio::sync::Notify::new()),
