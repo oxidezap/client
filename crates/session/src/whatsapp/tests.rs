@@ -22,6 +22,72 @@ use whatsapp_rust::wacore::types::events::{Event, ServerAck};
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+#[test]
+fn offline_history_burst_does_not_fill_control_mailbox() {
+    use whatsapp_rust::wacore::types::events::{Connected, EventHandler, LazyHistorySync};
+    let (handler, incoming, stats) = super::interested_channel(super::CONTROL_EVENT_KINDS, 64);
+    for _ in 0..512 {
+        handler.handle_event(Arc::new(Event::HistorySync(Box::new(
+            LazyHistorySync::new(Vec::<u8>::new().into(), 0, 0, None, None),
+        ))));
+    }
+    handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+    handler.handle_event(Arc::new(Event::HistorySync(Box::new(
+        LazyHistorySync::new(Vec::<u8>::new().into(), 0, 0, None, None)
+            .with_peer_data_request_session_id(Some("synthetic-request".into())),
+    ))));
+    assert_eq!(
+        stats.stats().dropped_full,
+        0,
+        "history chunks must not displace control events"
+    );
+    assert!(matches!(
+        &*incoming.try_recv().unwrap(),
+        Event::Connected(_)
+    ));
+    assert!(
+        matches!(&*incoming.try_recv().unwrap(), Event::HistorySync(sync) if sync.peer_data_request_session_id() == Some("synthetic-request"))
+    );
+    assert!(incoming.try_recv().is_err());
+    assert_eq!(stats.stats().dropped_full, 0);
+}
+
+/// The control subscription is only one observer of history sync. Filtering it
+/// must not prevent the independent store subscriber from materializing a row.
+#[tokio::test]
+async fn offline_history_still_reaches_store_when_control_filters_it() {
+    use whatsapp_rust::wacore::types::events::{CoreEventBus, LazyHistorySync};
+    let (store, _) = test_session("history-control-independent-store").await;
+    let bus = CoreEventBus::new();
+    let (control, incoming, _) = super::interested_channel(super::CONTROL_EVENT_KINDS, 64);
+    let _control = bus.subscribe_handler(control);
+    let _store = bus.subscribe_handler(store.handler());
+    // Zlib-compressed synthetic HistorySync{RECENT, conversation{id:TEST_PEER,
+    // name:"Synthetic"}}. It contains no user data.
+    let compressed: Vec<u8> = vec![
+        120, 156, 227, 96, 22, 210, 224, 146, 54, 53, 181, 180, 52, 128, 0, 67, 135, 98, 189, 242,
+        140, 196, 146, 226, 196, 130, 2, 189, 188, 212, 146, 44, 206, 224, 202, 188, 146, 140, 212,
+        146, 204, 100, 0, 225, 140, 12, 180,
+    ];
+    bus.dispatch(Event::HistorySync(Box::new(LazyHistorySync::new(
+        compressed.into(),
+        44,
+        3,
+        None,
+        None,
+    ))));
+    store.flush().await.expect("commit synthetic history");
+    let jid = TEST_PEER.parse().expect("synthetic JID");
+    assert!(
+        store.chat(&jid).await.unwrap().is_some(),
+        "the store materializes the history"
+    );
+    assert!(
+        incoming.try_recv().is_err(),
+        "the no-op control copy was filtered"
+    );
+}
+
 #[tokio::test]
 async fn a_remote_delete_failure_skips_local_writes() {
     let result = super::mutations::delete_and_record(
