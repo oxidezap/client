@@ -32,6 +32,7 @@ use wasm_bindgen::prelude::*;
 pub struct WebPlatform {
     browser_window: web_sys::Window,
     platform_info: gpui::PlatformInfo,
+    dispatcher: Arc<WebDispatcher>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
@@ -196,6 +197,7 @@ impl WebPlatform {
         Self {
             browser_window,
             platform_info,
+            dispatcher,
             background_executor,
             foreground_executor,
             text_system,
@@ -215,7 +217,7 @@ impl WebPlatform {
 
     /// Returns an HTTP client that runs browser Fetch operations on this platform's main thread.
     pub fn fetch_http_client(&self) -> FetchHttpClient {
-        FetchHttpClient::new(self.foreground_executor.to_send())
+        FetchHttpClient::new(self.dispatcher.clone())
     }
 
     /// Returns a browser Fetch HTTP client with the given reported user agent.
@@ -223,7 +225,7 @@ impl WebPlatform {
         &self,
         user_agent: &str,
     ) -> anyhow::Result<FetchHttpClient> {
-        FetchHttpClient::with_user_agent(self.foreground_executor.to_send(), user_agent)
+        FetchHttpClient::with_user_agent(self.dispatcher.clone(), user_agent)
     }
 }
 

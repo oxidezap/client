@@ -69,7 +69,6 @@ impl MessageSelection {
 
 struct RetainedSelection {
     handle: TextSelectionHandle,
-    _selection_subscription: gpui::Subscription,
     text: SharedString,
     pressed_link: Rc<Cell<Option<LinkPress>>>,
     projection: Rc<RefCell<TextSelectionProjection>>,
@@ -102,24 +101,12 @@ struct RichTextSelectionRegistry(HashMap<(gpui::WindowId, MessageSelection), Ret
 
 impl Global for RichTextSelectionRegistry {}
 
-fn new_retained_selection(text: &SharedString, window: &Window, cx: &mut App) -> RetainedSelection {
-    retained_selection(
-        TextSelectionHandle::new(text.to_string(), cx),
-        text,
-        window,
-        cx,
-    )
+fn new_retained_selection(text: &SharedString, cx: &mut App) -> RetainedSelection {
+    retained_selection(TextSelectionHandle::new(text.to_string(), cx), text)
 }
 
-fn retained_selection(
-    handle: TextSelectionHandle,
-    text: &SharedString,
-    window: &Window,
-    cx: &mut App,
-) -> RetainedSelection {
+fn retained_selection(handle: TextSelectionHandle, text: &SharedString) -> RetainedSelection {
     RetainedSelection {
-        // Selection events must repaint even when GPUI retains the owning view.
-        _selection_subscription: handle.refresh_window_on_change(window, cx),
         handle,
         text: text.clone(),
         pressed_link: Rc::new(Cell::new(None)),
@@ -332,8 +319,7 @@ impl Element for RetainedSelectionKeepalive {
                 TextSelectionRegistration::new(hitbox.clone(), dormant_bounds)
                     .with_scroll_offset(scroll_offset)
                     .with_document_order(document_order)
-                    .with_text_bounds(vec![last_bounds])
-                    .with_rendered_element(&handle, window, cx),
+                    .with_text_bounds(vec![last_bounds]),
                 window,
                 cx,
             );
@@ -781,11 +767,11 @@ impl Element for SelectableRichText {
                             TextSelection::clear(window, cx);
                             forget_window_selection_registry(window_id, cx);
                         }
-                        new_retained_selection(&self.text, window, cx)
+                        new_retained_selection(&self.text, cx)
                     }
                     None => match registry_handle.clone() {
-                        Some(handle) => retained_selection(handle, &self.text, window, cx),
-                        None => new_retained_selection(&self.text, window, cx),
+                        Some(handle) => retained_selection(handle, &self.text),
+                        None => new_retained_selection(&self.text, cx),
                     },
                 };
                 let state = RichTextState {
@@ -825,8 +811,7 @@ impl Element for SelectableRichText {
         handle.handle.register(
             TextSelectionRegistration::new(hitbox.clone(), bounds)
                 .with_document_order(self.document_order)
-                .with_text_bounds(vec![bounds])
-                .with_rendered_element(&handle.handle, window, cx),
+                .with_text_bounds(vec![bounds]),
             window,
             cx,
         );

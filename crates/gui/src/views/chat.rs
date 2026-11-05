@@ -18,11 +18,10 @@ use crate::components::{
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
 
-use oxidezap_core::{CallState, Chat};
+use oxidezap_core::Chat;
 
 pub fn render_connected_view(
     app: &mut WhatsAppApp,
-    calls: &CallState,
     window: &mut Window,
     cx: &mut Context<WhatsAppApp>,
 ) -> impl IntoElement + use<> {
@@ -128,11 +127,8 @@ pub fn render_connected_view(
         .map(|jid| app.get_message_list_cache(jid, typing.clone(), layout, cx));
     // A call in a chat other than the one on screen is what the return banner
     // is for; a call in *this* chat is already obvious from the card.
-    // Body observes state changes separately from video-frame notifications.
-    // Reading the Calls entity here would make GPUI Fast invalidate the body
-    // for every picture even when this banner has not changed.
-    let banner = calls
-        .active()
+    let banner = app
+        .active_call(cx)
         .filter(|call| open_chat.as_deref().is_none_or(|jid| jid != call.peer_jid))
         .map(|call| (call.peer_name.clone(), call.elapsed_label()));
     // Rendered as an element here rather than passed down as state: the

@@ -1,10 +1,11 @@
+use crate::WebDispatcher;
 use anyhow::{Context as _, anyhow};
 use futures::{AsyncRead, AsyncReadExt as _, FutureExt as _, TryStreamExt as _, channel::oneshot};
-use gpui::SendForegroundExecutor;
 use http_client::{AsyncBody, HttpClient, RedirectPolicy};
 use std::{
     io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use wasm_bindgen::JsCast as _;
@@ -17,7 +18,7 @@ extern "C" {
 }
 
 pub struct FetchHttpClient {
-    foreground_executor: SendForegroundExecutor,
+    dispatcher: Arc<WebDispatcher>,
     user_agent: Option<http_client::http::header::HeaderValue>,
     credentials: FetchCredentials,
 }
@@ -35,22 +36,20 @@ pub enum FetchCredentials {
 }
 
 impl FetchHttpClient {
-    /// Creates a browser Fetch client using the web platform's foreground executor.
-    pub fn new(foreground_executor: SendForegroundExecutor) -> Self {
+    pub(crate) fn new(dispatcher: Arc<WebDispatcher>) -> Self {
         Self {
-            foreground_executor,
+            dispatcher,
             user_agent: None,
             credentials: FetchCredentials::default(),
         }
     }
 
-    /// Creates a browser Fetch client with the given reported user agent.
-    pub fn with_user_agent(
-        foreground_executor: SendForegroundExecutor,
+    pub(crate) fn with_user_agent(
+        dispatcher: Arc<WebDispatcher>,
         user_agent: &str,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            foreground_executor,
+            dispatcher,
             user_agent: Some(http_client::http::header::HeaderValue::from_str(
                 user_agent,
             )?),
@@ -80,22 +79,20 @@ impl HttpClient for FetchHttpClient {
     {
         let (parts, body) = req.into_parts();
         let credentials = self.credentials;
-        let foreground_executor = self.foreground_executor.clone();
+        let dispatcher = self.dispatcher.clone();
 
         Box::pin(async move {
             let body_bytes = read_body_to_bytes(body).await?;
             let (sender, receiver) = oneshot::channel();
 
-            foreground_executor
-                .spawn(async move {
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let result = fetch(parts, body_bytes, credentials).await;
-                        if sender.send(result).is_err() {
-                            log::debug!("fetch response receiver was dropped");
-                        }
-                    });
-                })
-                .detach();
+            dispatcher.dispatch_function_on_main_thread(move || {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let result = fetch(parts, body_bytes, credentials).await;
+                    if sender.send(result).is_err() {
+                        log::debug!("fetch response receiver was dropped");
+                    }
+                });
+            });
 
             receiver.await.context("browser fetch task was canceled")?
         })

@@ -113,12 +113,13 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
 whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
 
+# gpui-pre-web 0.3.10 still passes floats to web-sys 0.3.106's integer API.
+# Keep the published GPUI family unified; remove when upstream ships the fix.
 [patch.crates-io]
 # Validate immutable phone metadata during the build, not the first label.
 # See vendor/phonenumber/LOCAL_CHANGES.md.
 phonenumber = { path = "vendor/phonenumber" }
-# Canvas readback needs integer coordinates with web_sys_unstable_apis.
-gpui-fast-web = { path = "vendor/gpui-fast-web" }
+gpui-pre-web = { path = "vendor/gpui-pre-web" }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and
@@ -160,7 +161,7 @@ debug = false
 # package override and `"*"` both apply to gpui, and which of the two answers
 # for a setting the named one does not mention is a question this file should
 # not be asking about the largest dependency in the tree.
-[profile.dev.package.gpui-fast]
+[profile.dev.package.gpui-pre]
 opt-level = 3
 debug = false
 
@@ -628,7 +629,7 @@ debug = "full"
 # module at 10.6% of its code, and it is the one place where "fast" is worth
 # more than "small". Needed here precisely because the desktop leaves it to
 # the base setting, and this profile's base is "s".
-[profile.web.package.gpui-fast]
+[profile.web.package.gpui-pre]
 opt-level = 3
 
 # The protocol, for the reason `[profile.web]` exists at all. A page's
