@@ -187,6 +187,9 @@ pub enum AccountExit {
     /// backoff restart is the reasonable answer where doing nothing was the
     /// single-account daemon's only option.
     SessionEnded,
+    /// Teardown did not finish, so a writer may still hold the account. Keep
+    /// its runtime registered and require a process restart before retrying.
+    SessionTeardownIncomplete,
     /// The session ended on its own and the connection is in a terminal
     /// credential state: the server rejected the stored credentials. Retrying
     /// this loops forever — the cure is the user pairing again — so a

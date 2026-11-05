@@ -180,6 +180,15 @@ impl Sender {
             .closed = true;
         self.inner.wake.notify_waiters();
     }
+    /// Distinguish a closed receiver from a temporary admission rejection.
+    pub(super) fn is_closed(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("UI event queue poisoned")
+            .closed
+    }
+
     pub(super) fn signal_control_overflow(&self) {
         let mut state = self.inner.state.lock().expect("UI event queue poisoned");
         state.control_overflow = true;
@@ -243,7 +252,8 @@ impl Sender {
                     {
                         if let Some(old) = state.data.pop_front() {
                             state.bytes -= old.bytes;
-                            recover |= needs_recovery(&old.event);
+                            recover |=
+                                needs_recovery(&old.event) && !snapshot_covers(&event, &old.event);
                             state.dropped_recoverable +=
                                 u64::from(class_of(&old.event) == Class::Recoverable);
                             state.dropped_ephemeral +=
@@ -279,7 +289,8 @@ impl Sender {
                         };
                         state.bytes -= old.bytes;
                         let old_class = class_of(&old.event);
-                        recover |= needs_recovery(&old.event);
+                        recover |=
+                            needs_recovery(&old.event) && !snapshot_covers(&event, &old.event);
                         state.dropped_recoverable += u64::from(old_class == Class::Recoverable);
                         state.dropped_ephemeral += u64::from(old_class == Class::Ephemeral);
                     }
@@ -358,7 +369,7 @@ impl Receiver {
             if recover {
                 self.inner.recovery.notify_one();
             }
-            return Ok(UiEvent::Error(
+            return Ok(UiEvent::SessionResyncRequired(
                 "The session event queue overflowed; reconnecting to resynchronize.".to_string(),
             ));
         }
@@ -455,6 +466,32 @@ fn class_of(event: &UiEvent) -> Class {
         // next connection. Control is admitted ahead of data and never
         // reclaimed for age, which is the guarantee this event needs.
         _ => Class::Control,
+    }
+}
+
+// A new snapshot covers an older snapshot of the same page. A narrowed page
+// cannot replace a complete list or a page containing other chats. Live events
+// can contain messages outside the hydrated tail, so they still request reload.
+/// Whether a new history snapshot makes an evicted snapshot redundant.
+fn snapshot_covers(replacement: &UiEvent, old: &UiEvent) -> bool {
+    match (replacement, old) {
+        (
+            UiEvent::HistoryLoaded {
+                chats, complete, ..
+            },
+            UiEvent::HistoryLoaded {
+                chats: old_chats,
+                complete: old_complete,
+                ..
+            },
+        ) => {
+            *complete
+                || (!old_complete
+                    && old_chats
+                        .iter()
+                        .all(|old| chats.iter().any(|chat| chat.jid == old.jid)))
+        }
+        _ => false,
     }
 }
 
@@ -607,12 +644,14 @@ fn message_bytes(message: &oxidezap_core::ChatMessage) -> usize {
         })
 }
 
+/// Estimate heap bytes held by the variable-sized fields of an event.
 fn event_strings(event: &UiEvent) -> usize {
     match event {
         UiEvent::QrCode { code, .. } | UiEvent::PairCode { code, .. } => string_bytes(code),
-        UiEvent::Disconnected(reason) | UiEvent::LoggedOut(reason) | UiEvent::Error(reason) => {
-            string_bytes(reason)
-        }
+        UiEvent::Disconnected(reason)
+        | UiEvent::LoggedOut(reason)
+        | UiEvent::Error(reason)
+        | UiEvent::SessionResyncRequired(reason) => string_bytes(reason),
         UiEvent::MessageIdAssigned {
             chat_jid,
             local_id,
@@ -632,6 +671,26 @@ fn event_strings(event: &UiEvent) -> usize {
             string_bytes(chat_jid)
                 + string_bytes(sender_jid)
                 + sender_name.as_deref().map(string_bytes).unwrap_or_default()
+        }
+        UiEvent::ReceiptReceived {
+            chat_jid,
+            message_ids,
+            ..
+        } => {
+            string_bytes(chat_jid)
+                + message_ids.capacity() * std::mem::size_of::<String>()
+                + message_ids.iter().map(|id| id.capacity()).sum::<usize>()
+        }
+        UiEvent::ReactionReceived {
+            chat_jid,
+            message_id,
+            sender,
+            emoji,
+        } => {
+            string_bytes(chat_jid)
+                + string_bytes(message_id)
+                + string_bytes(sender)
+                + string_bytes(emoji)
         }
         UiEvent::PresenceUpdated { jid, .. } => string_bytes(jid),
         UiEvent::IncomingCall(call) => {
@@ -669,8 +728,43 @@ fn event_strings(event: &UiEvent) -> usize {
         UiEvent::SystemNotice {
             chat_jid,
             notice_id,
+            notice,
             ..
-        } => string_bytes(chat_jid) + string_bytes(notice_id),
+        } => {
+            string_bytes(chat_jid)
+                + string_bytes(notice_id)
+                + match notice {
+                    oxidezap_core::SystemNotice::GroupChanged(detail) => string_bytes(detail),
+                    oxidezap_core::SystemNotice::GroupMembership(membership) => {
+                        std::mem::size_of_val(&**membership)
+                            + membership.participants.capacity()
+                                * std::mem::size_of::<oxidezap_core::NoticeParticipant>()
+                            + membership
+                                .actor
+                                .iter()
+                                .chain(membership.participants.iter())
+                                .map(|p| {
+                                    [&p.jid]
+                                        .into_iter()
+                                        .chain(
+                                            [
+                                                &p.phone_jid,
+                                                &p.lid,
+                                                &p.offered_name,
+                                                &p.label,
+                                                &p.canonical_jid,
+                                            ]
+                                            .into_iter()
+                                            .filter_map(Option::as_ref),
+                                        )
+                                        .map(|s| s.capacity())
+                                        .sum::<usize>()
+                                })
+                                .sum::<usize>()
+                    }
+                    oxidezap_core::SystemNotice::Call(_) => 0,
+                }
+        }
         _ => 0,
     }
 }
@@ -715,6 +809,80 @@ mod tests {
     }
 
     #[test]
+    /// Replacing a covered snapshot must not trigger an endless recovery loop.
+    fn recovery_snapshot_does_not_schedule_itself_when_consumer_is_stalled() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        for complete in [true, false] {
+            let (sender, _receiver, recovery) = test_channel(1, 1, 4096, MAX_DATA_AGE);
+            for _ in 0..10 {
+                sender
+                    .send(UiEvent::HistoryLoaded {
+                        chats: Vec::new(),
+                        complete,
+                        next: None,
+                    })
+                    .unwrap();
+            }
+            let mut wake = std::pin::pin!(recovery.notified());
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(wake.as_mut().poll(&mut cx), Poll::Pending));
+            assert_eq!(sender.stats().dropped_recoverable, 9);
+        }
+    }
+
+    #[test]
+    /// Evicting a disjoint history page still requires recovery.
+    fn disjoint_history_pages_still_request_recovery() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let (sender, _receiver, recovery) = test_channel(1, 1, 4096, MAX_DATA_AGE);
+        for jid in ["first@g.us", "second@g.us"] {
+            sender
+                .send(UiEvent::HistoryLoaded {
+                    chats: vec![oxidezap_core::Chat::new(jid.into())],
+                    complete: false,
+                    next: None,
+                })
+                .unwrap();
+        }
+        let mut wake = std::pin::pin!(recovery.notified());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(wake.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
+
+    #[test]
+    /// Heap allocations in receipts, reactions and notices count toward the budget.
+    fn oversized_receipt_reaction_and_notice_cannot_bypass_byte_budget() {
+        let events = [
+            UiEvent::ReceiptReceived {
+                chat_jid: "test@s.whatsapp.net".into(),
+                message_ids: vec!["x".repeat(4096)],
+                receipt_type: oxidezap_core::ReceiptType::Read,
+            },
+            UiEvent::ReactionReceived {
+                chat_jid: "test@s.whatsapp.net".into(),
+                message_id: "id".into(),
+                sender: "test@s.whatsapp.net".into(),
+                emoji: "x".repeat(4096),
+            },
+            UiEvent::SystemNotice {
+                chat_jid: "test@g.us".into(),
+                notice_id: "id".into(),
+                at: wacore::time::from_secs(0).unwrap(),
+                notice: oxidezap_core::SystemNotice::GroupChanged("x".repeat(4096)),
+            },
+        ];
+        for event in events {
+            let (sender, _receiver, _) = test_channel(2, 2, 1024, MAX_DATA_AGE);
+            assert!(estimated_bytes(&event) > 4096);
+            assert!(sender.send(event).is_err());
+            assert_eq!(sender.inner.state.lock().unwrap().bytes, 0);
+            assert!(!sender.is_closed(), "admission rejection is not closure");
+        }
+    }
+
+    #[test]
     fn control_survives_data_overflow() {
         let (sender, mut receiver, _) = test_channel(2, 1, 4096, MAX_DATA_AGE);
         sender
@@ -736,7 +904,10 @@ mod tests {
         sender.send(UiEvent::Connected).unwrap();
         sender.send(UiEvent::PairSuccess).unwrap();
         assert!(sender.send(UiEvent::LoggedOut("done".into())).is_err());
-        assert!(matches!(receiver.try_recv(), Ok(UiEvent::Error(_))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(UiEvent::SessionResyncRequired(_))
+        ));
         assert_eq!(sender.stats().control_faults, 1);
     }
 
@@ -746,7 +917,10 @@ mod tests {
         for index in 0..65 {
             let _ = sender.send(UiEvent::CallEnded(format!("call-{index}")));
         }
-        assert!(matches!(receiver.try_recv(), Ok(UiEvent::Error(_))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(UiEvent::SessionResyncRequired(_))
+        ));
         assert_eq!(sender.stats().control_faults, 1);
     }
 

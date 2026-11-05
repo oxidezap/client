@@ -350,8 +350,12 @@ pub async fn run(
             },
             event = events.recv() => match event {
                 Some(event) => {
-                    if let Answer::Decline(call_id) = bridge.observe(event) {
-                        client.decline_call(&call_id);
+                    match bridge.observe(event) {
+                        Answer::Nothing => {}
+                        Answer::Decline(call_id) => client.decline_call(&call_id),
+                        // Teardown joins the old session before the supervisor
+                        // reopens this account. No reset/removal is requested.
+                        Answer::Restart => break,
                     }
                     mute_timer.set(wait_for_mute_expiry(bridge.hub.clone()));
                 }
@@ -489,21 +493,43 @@ pub async fn run(
             let _media = bridge.lifecycle.drain_media().await;
             finish_forget(account_id, &stores_for_reset, &bridge.hub, disposition).await
         }
-    } else if stopping || commands_closed {
-        // The daemon is stopping, or nothing on this side can ever ask the
-        // session for anything again. Not a fault to recover from: the
-        // process is leaving, and `join_all` is waiting for exactly this.
-        AccountExit::Stopped
-    } else if logged_out {
-        AccountExit::SessionLoggedOut
     } else {
-        AccountExit::SessionEnded
+        if !closed || !plugins_closed {
+            log::error!(
+                "account {} did not close; restart oxidezap before retrying",
+                account_id.get()
+            );
+        }
+        session_exit(
+            closed,
+            plugins_closed,
+            stopping || commands_closed,
+            logged_out,
+        )
     };
     crate::avatar::purge(&bridge.hub);
     if closed && plugins_closed {
         bridge.lifecycle.mark_quiesced();
     }
     Ok(exit)
+}
+
+/// Classify a normal end only after both session and plugin writers stop.
+fn session_exit(
+    closed: bool,
+    plugins_closed: bool,
+    stopping: bool,
+    logged_out: bool,
+) -> AccountExit {
+    if !closed || !plugins_closed {
+        AccountExit::SessionTeardownIncomplete
+    } else if stopping {
+        AccountExit::Stopped
+    } else if logged_out {
+        AccountExit::SessionLoggedOut
+    } else {
+        AccountExit::SessionEnded
+    }
 }
 
 /// Everything a reset or a remove does to storage, and nothing that needs a

@@ -415,7 +415,7 @@ impl AccountRegistry {
                 EmbeddedNext::Removed
             }
             AccountExit::SessionEnded => EmbeddedNext::Restart,
-            AccountExit::SessionLoggedOut => {
+            AccountExit::SessionLoggedOut | AccountExit::SessionTeardownIncomplete => {
                 self.set_status(id, AccountStatus::Error);
                 EmbeddedNext::Finished
             }
@@ -1097,6 +1097,23 @@ impl AccountSupervisor {
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .retain(|_, account| *account != id);
+        if matches!(
+            exit,
+            AccountExit::SessionTeardownIncomplete
+                | AccountExit::ResetIncomplete
+                | AccountExit::RemoveIncomplete
+        ) && self
+            .registry
+            .get(id)
+            .is_some_and(|runtime| !runtime.lifecycle().is_quiesced())
+        {
+            self.failed_runs
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id);
+            self.bump_generation(id);
+            self.registry.set_status(id, AccountStatus::Error);
+        }
         self.active_runs.send_modify(|active| {
             active.remove(&id);
         });
@@ -1142,6 +1159,9 @@ impl AccountSupervisor {
                 // user can still act on this account, and respawning or
                 // dropping it now would act on a request that was never
                 // actually carried out.
+            }
+            AccountExit::SessionTeardownIncomplete => {
+                self.registry.set_status(id, AccountStatus::Error);
             }
             AccountExit::SessionLoggedOut => {
                 // Terminal until the user pairs again. Retrying a login the
@@ -1231,6 +1251,14 @@ impl AccountSupervisor {
     /// still wants it.
     async fn restart_due(self: &Arc<Self>, id: AccountId, generation: u64) {
         if self.generation(id) != generation {
+            return;
+        }
+        if self
+            .failed_runs
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&id)
+        {
             return;
         }
         if self.shutting_down.load(Ordering::SeqCst) {
@@ -1785,6 +1813,14 @@ mod tests {
             registry.finish_embedded_exit(id, AccountExit::SessionLoggedOut),
             EmbeddedNext::Finished
         );
+        let retained = runtime(2);
+        assert!(registry.insert(Arc::clone(&retained)));
+        assert_eq!(
+            registry.finish_embedded_exit(id, AccountExit::SessionTeardownIncomplete),
+            EmbeddedNext::Finished
+        );
+        assert!(Arc::ptr_eq(&registry.get(id).unwrap(), &retained));
+        assert_eq!(retained.status(), AccountStatus::Error);
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -2005,6 +2041,26 @@ mod tests {
             "a logout must not respawn the account"
         );
         assert_eq!(after.status(), AccountStatus::Error);
+
+        // A timed-out close keeps the original runtime and forbids the
+        // direct reset/remove path while its writer could still be alive.
+        let id = AccountId::new(6).unwrap();
+        let before = runtime(6);
+        assert!(registry.insert(Arc::clone(&before)));
+        supervisor
+            .handle_exit(run(6, AccountExit::SessionTeardownIncomplete))
+            .await;
+        supervisor.restart_due(id, supervisor.generation(id)).await;
+        assert!(Arc::ptr_eq(&registry.get(id).unwrap(), &before));
+        assert_eq!(before.status(), AccountStatus::Error);
+        assert_eq!(
+            supervisor.remove_account(id).await,
+            super::LifecycleOutcome::Incomplete
+        );
+        assert_eq!(
+            supervisor.reset_account(id).await,
+            super::LifecycleOutcome::Incomplete
+        );
 
         let joined =
             tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.join_all()).await;

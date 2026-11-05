@@ -143,7 +143,18 @@ struct InterestedEventHandler {
 }
 
 impl EventHandler for InterestedEventHandler {
+    /// Skip unused history copies before admitting events to this subscriber.
     fn handle_event(&self, event: Arc<Event>) {
+        // Server-pushed history chunks are materialized by ChatStore's own
+        // subscription. The control consumer intentionally does nothing for
+        // them; sending the burst through its bounded mailbox can displace
+        // connection and call events before that no-op is reached. Preserve
+        // on-demand chunks, which trigger metadata revalidation below.
+        if let Event::HistorySync(history) = &*event
+            && history.peer_data_request_session_id().is_none()
+        {
+            return;
+        }
         if let Event::RawNode(node) = &*event
             && (node.get().tag != "call" || node.get().get_optional_child("accept").is_none())
         {

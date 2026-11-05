@@ -38,7 +38,6 @@ const LANE_CAPACITY: usize = 64;
 /// code never waits behind a conversation.
 pub(super) struct EventLanes {
     lanes: Vec<mpsc::Sender<(Arc<Event>, u64)>>,
-    stopping: tokio::sync::watch::Receiver<()>,
     calls: CallRegistry,
     ui: UiEventSender,
 }
@@ -82,12 +81,7 @@ impl EventLanes {
                 tx
             })
             .collect();
-        Self {
-            lanes,
-            stopping,
-            calls,
-            ui,
-        }
+        Self { lanes, calls, ui }
     }
 
     /// Dispatch an event and report recoverable events dropped because their
@@ -136,14 +130,17 @@ impl EventLanes {
                     );
                 }
             } else {
-                let mut stopping = self.stopping.clone();
-                tokio::select! {
-                    result = self.lanes[lane].send((event, epoch)) => {
-                        if result.is_err() {
-                            return outcome;
-                        }
-                    }
-                    _ = stopping.changed() => return outcome,
+                // Give a transient burst a bounded chance to drain. Awaiting
+                // capacity without a deadline lets one subject stall every
+                // unrelated lane, including connection and call control.
+                let admission = crate::exec::with_timeout(
+                    self.lanes[lane].send((event, epoch)),
+                    std::time::Duration::from_millis(25),
+                )
+                .await;
+                if !matches!(admission, Some(Ok(()))) {
+                    self.ui.signal_control_overflow();
+                    return outcome;
                 }
             }
         }

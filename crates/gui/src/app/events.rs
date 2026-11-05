@@ -261,7 +261,7 @@ impl WhatsAppApp {
                 self.adopt_calls(calls, cx);
                 cx.notify();
             }
-            UiEvent::Error(msg) => {
+            UiEvent::Error(msg) | UiEvent::SessionResyncRequired(msg) => {
                 self.connection_ended(oxidezap_core::Fault::unreachable(msg), cx);
             }
             UiEvent::MessageReceived {
