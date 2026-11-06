@@ -191,6 +191,7 @@ pub fn render_connected_view(
     // the feed for a frame that does not draw it is work for nothing. See
     // `reconcile_status_pane`.
     if destination == Destination::Status {
+        app.ensure_status_page(cx);
         app.reconcile_status_pane(cx);
     }
     let status_feed = (destination == Destination::Status).then(|| app.status_feed());
@@ -232,6 +233,7 @@ pub fn render_connected_view(
     app.note_media_surface(cx);
     let status_list = status_feed.map(|feed| StatusListProps {
         feed,
+        can_load_more: app.status_can_load_more(cx),
         selected: StatusSelection::of(app.status_pane().author()),
         scroll: app.status_list_scroll().clone(),
     });

@@ -233,6 +233,13 @@ impl Pages {
             return false;
         };
         let asked_from = from.clone();
+        if let (Some(from), Some(returned)) = (asked_from.as_ref(), next.as_ref())
+            && from == returned
+        {
+            self.timelines
+                .insert(jid.to_string(), Paging::Stalled { from: from.clone() });
+            return true;
+        }
         self.timelines
             .insert(jid.to_string(), Paging::arrived(asked_from, next));
         true
@@ -334,6 +341,40 @@ fn reconcile_departures(
 }
 
 impl WhatsAppApp {
+    /// An already open Status view also needs its first page after reconnect.
+    pub fn ensure_status_page(&mut self, cx: &mut App) {
+        self.ensure_timeline_page(oxidezap_core::STATUS_BROADCAST_JID, cx);
+    }
+
+    /// Whether the status feed has a page that can be requested or retried.
+    pub fn status_can_load_more(&self, cx: &App) -> bool {
+        self.client.is_some()
+            && self
+                .pages
+                .read(cx)
+                .timelines
+                .get(oxidezap_core::STATUS_BROADCAST_JID)
+                .unwrap_or(&Paging::Unasked)
+                .to_ask()
+                .is_some()
+    }
+
+    /// Request one status page, retaining its cursor across a failed request.
+    pub fn load_more_status(&mut self, cx: &mut App) {
+        let jid = oxidezap_core::STATUS_BROADCAST_JID;
+        if self
+            .pages
+            .read(cx)
+            .timelines
+            .get(jid)
+            .is_none_or(|state| matches!(state, Paging::Unasked))
+        {
+            self.ensure_timeline_page(jid, cx);
+        } else {
+            self.want_older_messages(jid, cx);
+        }
+    }
+
     /// Ask for a conversation's newest page, if nobody has yet.
     ///
     /// Called where a conversation becomes the one on screen. The rows the
@@ -447,7 +488,17 @@ impl WhatsAppApp {
             return;
         }
         if messages.is_empty() {
+            if jid == oxidezap_core::STATUS_BROADCAST_JID {
+                cx.notify();
+            }
             return;
+        }
+        // The status broadcast can be outside the reduced chat snapshot. Its
+        // page is explicitly requested by the status view, so materialize a
+        // store-backed row before merging the returned updates.
+        if jid == oxidezap_core::STATUS_BROADCAST_JID && self.find_chat(&jid).is_none() {
+            let status = Chat::from_store(jid.clone(), "Status".into(), 0);
+            self.chats.push(std::sync::Arc::new(status));
         }
         let Some(chat) = self.find_chat_mut(&jid) else {
             // The chat left while its page was in flight. The page describes
@@ -467,6 +518,9 @@ impl WhatsAppApp {
         // here rebuilt the rows and re-measured the timeline from scratch
         // every time a receipt landed.
         if !moved {
+            if jid == oxidezap_core::STATUS_BROADCAST_JID {
+                cx.notify();
+            }
             return;
         }
         // Invalidation compares selected identities and order against either
@@ -1121,6 +1175,61 @@ mod tests {
             !pages.open_timeline(CHAT),
             "an answered conversation does not start over"
         );
+    }
+
+    /// Status uses the same bounded pages even when its chat was not in the
+    /// initial snapshot; failures retain the cursor and loops are stopped.
+    #[test]
+    fn status_pages_continue_and_retry_without_repeating_a_cursor() {
+        let mut pages = Pages::new();
+        let jid = oxidezap_core::STATUS_BROADCAST_JID;
+        assert!(pages.open_timeline(jid));
+        assert!(pages.timeline_page_arrived(jid, Some(cursor("status-2"))));
+        assert_eq!(pages.older(jid), Some(cursor("status-2")));
+        pages.lost(Some(jid), false);
+        assert_eq!(pages.older(jid), Some(cursor("status-2")));
+        assert!(pages.timeline_page_arrived(jid, Some(cursor("status-2"))));
+        assert_eq!(pages.older(jid), None);
+        pages.reopen(&[jid.to_string()]);
+        assert_eq!(pages.older(jid), Some(cursor("status-2")));
+        assert!(pages.timeline_page_arrived(jid, None));
+        assert_eq!(pages.older(jid), None);
+    }
+
+    /// A status page can create the missing broadcast row and merge a later
+    /// bounded page without marking either update watched.
+    #[gpui::test]
+    fn status_pages_materialize_missing_broadcast_and_merge(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let app = cx.new(WhatsAppApp::new);
+            app.update(cx, |app, cx| {
+                let jid = oxidezap_core::STATUS_BROADCAST_JID;
+                assert!(app.find_chat(jid).is_none());
+                assert!(app.pages.update(cx, |pages, _| pages.open_timeline(jid)));
+                let first =
+                    ChatMessage::new_incoming("s1".into(), "1@s.whatsapp.net".into(), "one".into());
+                app.apply_message_page(jid.into(), vec![first], Some(cursor("status-2")), cx);
+                assert_eq!(app.find_chat(jid).unwrap().messages.len(), 1);
+                assert_eq!(
+                    app.pages.update(cx, |pages, _| pages.older(jid)),
+                    Some(cursor("status-2"))
+                );
+                let second =
+                    ChatMessage::new_incoming("s2".into(), "2@s.whatsapp.net".into(), "two".into());
+                app.apply_message_page(jid.into(), vec![second], None, cx);
+                assert_eq!(app.find_chat(jid).unwrap().messages.len(), 2);
+                assert!(
+                    app.find_chat(jid)
+                        .unwrap()
+                        .messages
+                        .iter()
+                        .all(|message| !message.is_read)
+                );
+            });
+        });
     }
 
     /// Paging backwards asks from where the last page ended, and never twice
