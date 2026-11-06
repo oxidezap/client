@@ -373,9 +373,9 @@ impl WhatsAppApp {
                 .read(cx)
                 .timelines
                 .get(oxidezap_core::STATUS_BROADCAST_JID)
-                .unwrap_or(&Paging::Unasked)
-                .to_ask()
-                .is_some()
+                .is_none_or(|state| {
+                    matches!(state, Paging::Stalled { .. }) || state.to_ask().is_some()
+                })
     }
 
     /// Request one status page, retaining its cursor across a failed request.
@@ -384,8 +384,14 @@ impl WhatsAppApp {
         if self.client.is_none() {
             return;
         }
-        self.pages
-            .update(cx, |pages, _| pages.status_page_failed = false);
+        self.pages.update(cx, |pages, _| {
+            pages.status_page_failed = false;
+            if let Some(Paging::Stalled { from }) = pages.timelines.get(jid) {
+                pages
+                    .timelines
+                    .insert(jid.to_string(), Paging::More(from.clone()));
+            }
+        });
         if self
             .pages
             .read(cx)
@@ -1252,6 +1258,39 @@ mod tests {
             !pages.open_timeline(jid),
             "a retry is still a single in-flight request"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn a_stalled_status_cursor_offers_an_explicit_retry(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let path = std::env::temp_dir().join(format!(
+            "oxidezap-status-cursor-{}.sock",
+            std::process::id()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let endpoint = oxidezap_ipc::Endpoint::connect_at(&path).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let app = cx.new(WhatsAppApp::new);
+            app.update(cx, |app, cx| {
+                app.client = Some(crate::session::Session::recording_test_session(endpoint));
+                let jid = oxidezap_core::STATUS_BROADCAST_JID;
+                assert!(app.pages.update(cx, |pages, _| pages.open_timeline(jid)));
+                assert!(app.pages.update(cx, |pages, _| pages.timeline_page_arrived(jid, Some(cursor("older")))));
+                assert_eq!(app.pages.update(cx, |pages, _| pages.older(jid)), Some(cursor("older")));
+                assert!(app.pages.update(cx, |pages, _| pages.timeline_page_arrived(jid, Some(cursor("older")))));
+                app.ensure_status_page(cx);
+                assert!(matches!(app.pages.read(cx).timelines.get(jid), Some(Paging::Stalled { .. })), "rendering must not retry automatically");
+                assert!(app.status_can_load_more(cx), "a stalled cursor should offer a manual retry");
+                app.load_more_status(cx);
+                assert!(matches!(app.pages.read(cx).timelines.get(jid), Some(Paging::Loading { from: Some(from) }) if *from == cursor("older")));
+                assert!(!app.status_can_load_more(cx), "the retry is already in flight");
+            });
+        });
+        std::fs::remove_file(path).unwrap();
     }
 
     #[gpui::test]
