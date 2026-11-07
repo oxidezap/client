@@ -32,24 +32,14 @@
 //! alongside them so cosmic-text can select it for Arabic-script clusters.
 //! It is registered before any line is cached, with no extra fetch to fail.
 //!
-//! Emoji are the other half, and they are *not* embedded. A page draws every
-//! glyph itself — `swash` rasterizes out of the database this file fills, on
-//! a canvas the browser's own text pipeline never touches — so the system's
-//! emoji font is unreachable no matter what the page is served with: CSS
-//! `local()` feeds the DOM, and the window is not the DOM. Without a face
-//! that covers them, every emoji in a chat title, a reaction or a message
-//! draws as a tofu box, which is what this looked like from the outside.
+//! The current web backend also has a browser Canvas fallback for eligible
+//! emoji, with optional independent horizontal CJK support. That path uses
+//! browser fonts without loading their bytes into cosmic-text. It does not
+//! cover contextual Arabic-script shaping. See vendor/gpui-fast-web/src/.
 //!
-//! Which face is decided by the rasterizer rather than by taste, and it
-//! rules out the obvious one. gpui only takes swash's *colour* path for a
-//! font whose PostScript name is exactly `NotoColorEmoji`
-//! (`check_is_known_emoji_font`), and swash reads COLR **version 0** plus
-//! CPAL, or CBDT bitmap strikes — while the Noto Color Emoji that Google
-//! Fonts and the npm mirrors serve today is COLRv1: 25 MB of TTF that this
-//! renderer would draw as nothing at all. The colour font that does work is
-//! the CBDT build, at about ten megabytes. So the page carries Noto Emoji,
-//! the monochrome outline face: 1,875 glyphs in 878 KB, drawn through the
-//! ordinary outline path in the colour of the text around it.
+//! The downloaded monochrome emoji face remains available to cosmic-text
+//! when the Canvas path cannot replace a grapheme. The restrictions on swash
+//! colour-font formats apply to this native rasterization path, not Canvas.
 //!
 //! And it is *fetched*, not `include_bytes!`d. The module is already twenty
 //! megabytes and the browser caches a second file beside it perfectly well,
@@ -70,14 +60,10 @@ pub fn fonts(cx: &mut gpui::App) {
 
 /// Fetch what could not be embedded, then start.
 ///
-/// The window opens *behind* the download rather than beside it, and that
-/// ordering is the whole reason this is a seam rather than a task spawned
-/// from the first frame. gpui caches a shaped line for as long as something
-/// keeps asking for it — `LineLayoutCache` holds the current frame and the
-/// previous one, and a row on screen is requested every frame — so a face
-/// added after the first frame reaches only the text that was scrolled away
-/// and back. The chat list a page opens onto would have kept its tofu until
-/// it was scrolled twice.
+/// Startup currently waits for the download to reduce first-frame fallback.
+/// This is a startup policy, not a cache limitation: gpui-fast 0.1.13
+/// invalidates cached font resolution and line layouts after `add_fonts`.
+/// A loader that installs fonts later must also request a window refresh.
 ///
 /// A deadline is what keeps that from being a page that never draws: the
 /// window opens either way, and a fetch that fails or hangs costs the emoji

@@ -390,32 +390,23 @@ exactly as its comment described, which says nothing about a function that
 never needed it. When a comment says something is impossible, reproduce the
 impossibility it describes before believing it.
 
-**A page has no fonts, and no way to borrow the browser's.** The window
-rasterizes every glyph itself — swash, out of a `fontdb` that
-`CosmicTextSystem::new_without_system_fonts` starts empty — onto a canvas the
-browser's own text pipeline never touches. So `local()` in CSS, `system-ui`,
-and whatever emoji font the machine has are all unreachable: a family the page
-was not handed is a family it cannot draw, and gpui *panics* rather than
-falling back. `platform::fonts` is the answer, and it makes the split the
-bundle's shape depends on: the base text families and Noto Sans Arabic are `include_bytes!`d,
-because a window that cannot resolve `.SystemUIFont` never draws a frame,
-and the Arabic-script fallback covers Persian without depending on host fonts,
-while the emoji face is a file fetched from beside `index.html`, because the
-worst it can cost is boxes where the emoji were. That is also why the emoji
-face is monochrome Noto Emoji rather than the colour one — gpui takes swash's
-colour path for exactly one PostScript name, `NotoColorEmoji`, and swash reads
-COLR **version 0** or CBDT strikes, while what Google Fonts serves today is
-COLRv1: 25 MB the renderer would draw as nothing. The colour build that does
-work is ten megabytes of bitmaps.
+**The page has two text paths.** The cosmic-text font database starts
+without system fonts, so the application registers its base text families
+before opening a window. The current `WebTextSystem` also uses browser Canvas
+fonts for eligible emoji by default. Optional `EmojiAndCjk` support covers
+independent horizontal CJK graphemes approximately. This is not general
+fallback for scripts requiring contextual shaping or mixed-direction editing.
 
-The fetch finishes *before* the window opens, and the deadline on it is what
-keeps that from being a page that never draws. Opening first and adding the
-face later looks cheaper and is not: gpui's `LineLayoutCache` keeps a shaped
-line for as long as something asks for it every frame, so the chat list a page
-opens onto would have kept its boxes until it was scrolled away and back.
-To prevent this fetch from adding an idle waterfall step after the WebAssembly
-module instantiates, `web/index.html` preloads the font (`rel="preload" as="fetch"`)
-so it downloads concurrently with the `.wasm` binary.
+The base families and Noto Sans Arabic are embedded in the current bundle.
+The separately downloaded monochrome emoji font remains available on the
+cosmic-text/swash path when Canvas cannot replace a grapheme. Swash's native
+colour-font format restrictions do not describe the browser Canvas path.
+
+The emoji download currently completes before the window opens, with a deadline.
+That ordering is a startup policy. In gpui-fast 0.1.13, `add_fonts` invalidates
+font resolution and line-layout caches, so fonts can also be installed later;
+a loader must request a window refresh after installation. `web/index.html`
+preloads the emoji file to overlap its download with the WASM module.
 
 **A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
 is there because cross-origin isolation needs two response headers GitHub Pages
