@@ -28,6 +28,8 @@ use oxidezap_core::{StatusAuthor, StatusFeed};
 
 pub struct StatusListProps {
     pub feed: StatusFeed,
+    /// A bounded older page can be requested or retried.
+    pub can_load_more: bool,
     /// Whose updates are open, so the row reads as selected.
     pub selected: StatusSelection,
     /// Where this list is scrolled to, which is also what its scrollbar
@@ -109,6 +111,8 @@ impl gpui::RenderOnce for StatusList {
             || focus.contains_focused(window, cx);
         let metrics = *layout.metrics();
         let scroll = props.scroll.clone();
+        let can_load_more = props.can_load_more;
+        let paging_entity = entity.clone();
 
         let base = if layout.is_mobile() {
             div().w_full()
@@ -147,6 +151,17 @@ impl gpui::RenderOnce for StatusList {
                             .child(Scrollbar::vertical(&scroll)),
                     ),
             )
+            .when(can_load_more, |el| {
+                el.child(
+                    Button::new("status-load-more")
+                        .ghost()
+                        .w_full()
+                        .child("Load more updates")
+                        .on_click(move |_, _, cx| {
+                            paging_entity.update(cx, |app, cx| app.load_more_status(cx));
+                        }),
+                )
+            })
     }
 }
 
@@ -587,6 +602,7 @@ mod visible_cost {
             render_status_list(
                 StatusListProps {
                     feed: self.feed.clone(),
+                    can_load_more: false,
                     selected: self.selected.clone(),
                     scroll: self.scroll.clone(),
                 },

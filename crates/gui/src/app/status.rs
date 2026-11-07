@@ -211,6 +211,12 @@ impl WhatsAppApp {
             .entry(destination.id())
             .or_insert(None);
         self.destination = destination;
+        // The status feed has no conversation view to request a timeline.
+        // Load its first bounded page when it becomes visible, including when
+        // an oversized initial snapshot reduced the history budget.
+        if destination == Destination::Status {
+            self.ensure_timeline_page(STATUS_BROADCAST_JID, cx);
+        }
         self.search
             .update(cx, |search, cx| search.clear_list_query(window, cx));
         self.chat_list_scroll

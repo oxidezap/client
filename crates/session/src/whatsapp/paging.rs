@@ -430,10 +430,30 @@ impl WhatsAppClient {
         page: Vec<oxidezap_chat_store::StoredMessage>,
         unread: i64,
     ) -> Vec<ChatMessage> {
+        // The broadcast's unread count is not a per-author view state. Each
+        // status update has its own durable watched verdict in its ack.
+        let status_views = chat.is_status_broadcast().then(|| {
+            page.iter()
+                .map(|row| {
+                    matches!(
+                        row.status,
+                        oxidezap_chat_store::MessageStatus::Read
+                            | oxidezap_chat_store::MessageStatus::Played
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         let mention_lists = crate::mentions::mention_lists_of(&page);
         let quoted_lists = crate::mentions::quoted_mention_lists_of(&page);
         let mut messages: Vec<ChatMessage> =
             stored_with_unread_tail(page, unread.clamp(0, u32::MAX as i64) as u32);
+        if let Some(status_views) = status_views {
+            for (message, watched) in messages.iter_mut().zip(status_views) {
+                if !message.is_from_me && message.system.is_none() {
+                    message.is_read = watched;
+                }
+            }
+        }
         crate::mentions::hydrate_mention_lists(client, names, &mention_lists, &mut messages).await;
         crate::mentions::hydrate_quoted_mention_lists(client, names, &quoted_lists, &mut messages)
             .await;

@@ -22,6 +22,58 @@ use whatsapp_rust::wacore::types::events::{Event, ServerAck};
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+#[tokio::test]
+async fn status_pages_use_each_updates_watched_state_across_cursors() {
+    let (store, client) = test_session("status-page-watched-state").await;
+    let jid = "status@broadcast";
+    for (id, time) in [
+        ("old", 1_700_000_000),
+        ("watched", 1_700_000_001),
+        ("new", 1_700_000_002),
+    ] {
+        feed(
+            &store,
+            from(jid, TEST_PEER, Some("Ana"), wa::Message::text(id), id, time),
+        )
+        .await;
+    }
+    store
+        .mark_status_watched(&jid.parse().unwrap(), vec!["watched".into()])
+        .unwrap();
+    store.flush().await.unwrap();
+    let mut before = None;
+    let mut seen = Vec::new();
+    loop {
+        let page = WhatsAppClient::message_page(
+            &store,
+            &client,
+            &book_with(&store),
+            jid.into(),
+            before,
+            1,
+        )
+        .await
+        .unwrap();
+        seen.extend(
+            page.items
+                .into_iter()
+                .map(|message| (message.id, message.is_read)),
+        );
+        before = page.next;
+        if before.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            ("new".into(), false),
+            ("watched".into(), true),
+            ("old".into(), false)
+        ]
+    );
+}
+
 #[test]
 /// Offline history cannot displace connection or on-demand history events.
 fn offline_history_burst_does_not_fill_control_mailbox() {

@@ -149,6 +149,9 @@ pub(super) struct Pages {
     /// A history change while an archived page is in flight invalidates its
     /// ordering. Let the response settle, then start a fresh scan at the top.
     restart_archived_after_load: bool,
+    /// A failed initial Status request waits for a deliberate retry, rather
+    /// than starting another request from every render of the status view.
+    status_page_failed: bool,
 }
 
 impl Pages {
@@ -158,6 +161,7 @@ impl Pages {
             chats: Paging::default(),
             archived_chats: Paging::default(),
             restart_archived_after_load: false,
+            status_page_failed: false,
         }
     }
 
@@ -175,6 +179,9 @@ impl Pages {
     /// Only ever true once per conversation: the first page is the one that
     /// fills a timeline the attach load left holding a preview.
     fn open_timeline(&mut self, jid: &str) -> bool {
+        if jid == oxidezap_core::STATUS_BROADCAST_JID && self.status_page_failed {
+            return false;
+        }
         let paging = self.timelines.entry(jid.to_string()).or_default();
         if !matches!(paging, Paging::Unasked) {
             return false;
@@ -233,6 +240,16 @@ impl Pages {
             return false;
         };
         let asked_from = from.clone();
+        if jid == oxidezap_core::STATUS_BROADCAST_JID {
+            self.status_page_failed = false;
+        }
+        if let (Some(from), Some(returned)) = (asked_from.as_ref(), next.as_ref())
+            && from == returned
+        {
+            self.timelines
+                .insert(jid.to_string(), Paging::Stalled { from: from.clone() });
+            return true;
+        }
         self.timelines
             .insert(jid.to_string(), Paging::arrived(asked_from, next));
         true
@@ -260,13 +277,18 @@ impl Pages {
 
     /// A page that was refused. Put the position back so it can be asked for
     /// again; a list that stayed `Loading` would never ask anything again.
-    /// Return whether a history-triggered archived restart is ready to ask.
+    /// Return whether a visible state changed and needs a notification.
     fn lost(&mut self, jid: Option<&str>, archived: bool) -> bool {
         match jid {
             Some(jid) => {
                 let paging = self.timelines.entry(jid.to_string()).or_default();
+                let status_failed = jid == oxidezap_core::STATUS_BROADCAST_JID
+                    && matches!(paging, Paging::Loading { .. });
                 *paging = paging.lost();
-                false
+                if status_failed {
+                    self.status_page_failed = true;
+                }
+                status_failed
             }
             None => {
                 if archived && std::mem::take(&mut self.restart_archived_after_load) {
@@ -285,6 +307,9 @@ impl Pages {
     fn forget_chats(&mut self, gone: &[String]) {
         for jid in gone {
             self.timelines.remove(jid);
+            if jid == oxidezap_core::STATUS_BROADCAST_JID {
+                self.status_page_failed = false;
+            }
         }
     }
 
@@ -317,6 +342,7 @@ impl Pages {
         self.chats = Paging::Unasked;
         self.archived_chats = Paging::Unasked;
         self.restart_archived_after_load = false;
+        self.status_page_failed = false;
     }
 }
 
@@ -334,6 +360,51 @@ fn reconcile_departures(
 }
 
 impl WhatsAppApp {
+    /// An already open Status view also needs its first page after reconnect.
+    pub fn ensure_status_page(&mut self, cx: &mut App) {
+        self.ensure_timeline_page(oxidezap_core::STATUS_BROADCAST_JID, cx);
+    }
+
+    /// Whether the status feed has a page that can be requested or retried.
+    pub fn status_can_load_more(&self, cx: &App) -> bool {
+        self.client.is_some()
+            && self
+                .pages
+                .read(cx)
+                .timelines
+                .get(oxidezap_core::STATUS_BROADCAST_JID)
+                .is_none_or(|state| {
+                    matches!(state, Paging::Stalled { .. }) || state.to_ask().is_some()
+                })
+    }
+
+    /// Request one status page, retaining its cursor across a failed request.
+    pub fn load_more_status(&mut self, cx: &mut App) {
+        let jid = oxidezap_core::STATUS_BROADCAST_JID;
+        if self.client.is_none() {
+            return;
+        }
+        self.pages.update(cx, |pages, _| {
+            pages.status_page_failed = false;
+            if let Some(Paging::Stalled { from }) = pages.timelines.get(jid) {
+                pages
+                    .timelines
+                    .insert(jid.to_string(), Paging::More(from.clone()));
+            }
+        });
+        if self
+            .pages
+            .read(cx)
+            .timelines
+            .get(jid)
+            .is_none_or(|state| matches!(state, Paging::Unasked))
+        {
+            self.ensure_timeline_page(jid, cx);
+        } else {
+            self.want_older_messages(jid, cx);
+        }
+    }
+
     /// Ask for a conversation's newest page, if nobody has yet.
     ///
     /// Called where a conversation becomes the one on screen. The rows the
@@ -432,7 +503,7 @@ impl WhatsAppApp {
     pub(super) fn apply_message_page(
         &mut self,
         jid: String,
-        messages: Vec<ChatMessage>,
+        mut messages: Vec<ChatMessage>,
         next: Option<PageCursor>,
         cx: &mut Context<Self>,
     ) {
@@ -447,7 +518,33 @@ impl WhatsAppApp {
             return;
         }
         if messages.is_empty() {
+            if jid == oxidezap_core::STATUS_BROADCAST_JID {
+                cx.notify();
+            }
             return;
+        }
+        if jid == oxidezap_core::STATUS_BROADCAST_JID && !self.watched_status.is_empty() {
+            // Only the rows in this page can confirm a local view. A page
+            // read before a click may still arrive after that click.
+            let agreed: HashSet<&str> = messages
+                .iter()
+                .filter(|m| m.is_read)
+                .map(|m| m.id.as_str())
+                .collect();
+            self.watched_status
+                .retain(|id| !agreed.contains(id.as_str()));
+            for message in &mut messages {
+                if !message.is_from_me && self.watched_status.contains(&message.id) {
+                    message.is_read = true;
+                }
+            }
+        }
+        // The status broadcast can be outside the reduced chat snapshot. Its
+        // page is explicitly requested by the status view, so materialize a
+        // store-backed row before merging the returned updates.
+        if jid == oxidezap_core::STATUS_BROADCAST_JID && self.find_chat(&jid).is_none() {
+            let status = Chat::from_store(jid.clone(), "Status".into(), 0);
+            self.chats.push(std::sync::Arc::new(status));
         }
         let Some(chat) = self.find_chat_mut(&jid) else {
             // The chat left while its page was in flight. The page describes
@@ -467,6 +564,9 @@ impl WhatsAppApp {
         // here rebuilt the rows and re-measured the timeline from scratch
         // every time a receipt landed.
         if !moved {
+            if jid == oxidezap_core::STATUS_BROADCAST_JID {
+                cx.notify();
+            }
             return;
         }
         // Invalidation compares selected identities and order against either
@@ -1121,6 +1221,158 @@ mod tests {
             !pages.open_timeline(CHAT),
             "an answered conversation does not start over"
         );
+    }
+
+    /// Status uses the same bounded pages even when its chat was not in the
+    /// initial snapshot; failures retain the cursor and loops are stopped.
+    #[test]
+    fn status_pages_continue_and_retry_without_repeating_a_cursor() {
+        let mut pages = Pages::new();
+        let jid = oxidezap_core::STATUS_BROADCAST_JID;
+        assert!(pages.open_timeline(jid));
+        assert!(pages.timeline_page_arrived(jid, Some(cursor("status-2"))));
+        assert_eq!(pages.older(jid), Some(cursor("status-2")));
+        pages.lost(Some(jid), false);
+        assert_eq!(pages.older(jid), Some(cursor("status-2")));
+        assert!(pages.timeline_page_arrived(jid, Some(cursor("status-2"))));
+        assert_eq!(pages.older(jid), None);
+        pages.reopen(&[jid.to_string()]);
+        assert_eq!(pages.older(jid), Some(cursor("status-2")));
+        assert!(pages.timeline_page_arrived(jid, None));
+        assert_eq!(pages.older(jid), None);
+    }
+
+    #[test]
+    fn failed_first_status_page_exposes_retry_without_automatic_request_loop() {
+        let mut pages = Pages::new();
+        let jid = oxidezap_core::STATUS_BROADCAST_JID;
+        assert!(pages.open_timeline(jid));
+        assert!(pages.lost(Some(jid), false), "the view must be notified");
+        assert!(
+            !pages.open_timeline(jid),
+            "rendering must not immediately retry"
+        );
+        pages.status_page_failed = false; // The load-more action permits a retry.
+        assert!(pages.open_timeline(jid));
+        assert!(
+            !pages.open_timeline(jid),
+            "a retry is still a single in-flight request"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn a_stalled_status_cursor_offers_an_explicit_retry(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let path = std::env::temp_dir().join(format!(
+            "oxidezap-status-cursor-{}.sock",
+            std::process::id()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let endpoint = oxidezap_ipc::Endpoint::connect_at(&path).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let app = cx.new(WhatsAppApp::new);
+            app.update(cx, |app, cx| {
+                app.client = Some(crate::session::Session::recording_test_session(endpoint));
+                let jid = oxidezap_core::STATUS_BROADCAST_JID;
+                assert!(app.pages.update(cx, |pages, _| pages.open_timeline(jid)));
+                assert!(app.pages.update(cx, |pages, _| pages.timeline_page_arrived(jid, Some(cursor("older")))));
+                assert_eq!(app.pages.update(cx, |pages, _| pages.older(jid)), Some(cursor("older")));
+                assert!(app.pages.update(cx, |pages, _| pages.timeline_page_arrived(jid, Some(cursor("older")))));
+                app.ensure_status_page(cx);
+                assert!(matches!(app.pages.read(cx).timelines.get(jid), Some(Paging::Stalled { .. })), "rendering must not retry automatically");
+                assert!(app.status_can_load_more(cx), "a stalled cursor should offer a manual retry");
+                app.load_more_status(cx);
+                assert!(matches!(app.pages.read(cx).timelines.get(jid), Some(Paging::Loading { from: Some(from) }) if *from == cursor("older")));
+                assert!(!app.status_can_load_more(cx), "the retry is already in flight");
+            });
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
+    fn stale_status_page_preserves_a_view_made_after_the_query(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let app = cx.new(WhatsAppApp::new);
+            app.update(cx, |app, cx| {
+                let jid = oxidezap_core::STATUS_BROADCAST_JID;
+                assert!(app.pages.update(cx, |pages, _| pages.open_timeline(jid)));
+                let message = ChatMessage::new_incoming(
+                    "seen".into(),
+                    "1@s.whatsapp.net".into(),
+                    "one".into(),
+                );
+                app.apply_message_page(
+                    jid.into(),
+                    vec![message.clone()],
+                    Some(cursor("older")),
+                    cx,
+                );
+                app.watched_status.insert("seen".into());
+                app.find_chat_mut(jid).unwrap().messages[0].is_read = true;
+                assert_eq!(
+                    app.pages.update(cx, |pages, _| pages.older(jid)),
+                    Some(cursor("older"))
+                );
+                app.apply_message_page(jid.into(), vec![message], None, cx);
+                assert!(app.find_chat(jid).unwrap().messages[0].is_read);
+                assert!(app.watched_status.contains("seen"));
+                app.watched_status.insert("other".into());
+                app.pages
+                    .update(cx, |pages, _| pages.reopen(&[jid.to_string()]));
+                assert_eq!(
+                    app.pages.update(cx, |pages, _| pages.older(jid)),
+                    Some(cursor("older"))
+                );
+                let mut confirmed = app.find_chat(jid).unwrap().messages[0].clone();
+                confirmed.is_read = true;
+                app.apply_message_page(jid.into(), vec![confirmed], None, cx);
+                assert!(!app.watched_status.contains("seen"));
+                assert!(app.watched_status.contains("other"));
+            });
+        });
+    }
+
+    /// A status page can create the missing broadcast row and merge a later
+    /// bounded page without marking either update watched.
+    #[gpui::test]
+    fn status_pages_materialize_missing_broadcast_and_merge(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let app = cx.new(WhatsAppApp::new);
+            app.update(cx, |app, cx| {
+                let jid = oxidezap_core::STATUS_BROADCAST_JID;
+                assert!(app.find_chat(jid).is_none());
+                assert!(app.pages.update(cx, |pages, _| pages.open_timeline(jid)));
+                let first =
+                    ChatMessage::new_incoming("s1".into(), "1@s.whatsapp.net".into(), "one".into());
+                app.apply_message_page(jid.into(), vec![first], Some(cursor("status-2")), cx);
+                assert_eq!(app.find_chat(jid).unwrap().messages.len(), 1);
+                assert_eq!(
+                    app.pages.update(cx, |pages, _| pages.older(jid)),
+                    Some(cursor("status-2"))
+                );
+                let second =
+                    ChatMessage::new_incoming("s2".into(), "2@s.whatsapp.net".into(), "two".into());
+                app.apply_message_page(jid.into(), vec![second], None, cx);
+                assert_eq!(app.find_chat(jid).unwrap().messages.len(), 2);
+                assert!(
+                    app.find_chat(jid)
+                        .unwrap()
+                        .messages
+                        .iter()
+                        .all(|message| !message.is_read)
+                );
+            });
+        });
     }
 
     /// Paging backwards asks from where the last page ended, and never twice
