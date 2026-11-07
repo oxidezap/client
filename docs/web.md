@@ -427,8 +427,10 @@ visible. Reports after failure do not automatically retry. One later browser
 `online` event permits a second attempt; further recovery requires reloading.
 
 Cache Storage is best effort, with two-second storage deadlines. Reads validate
-the bytes again; invalid entries are removed, and old versions outside the
-current bounded catalog are pruned. A stored font works offline in the same
+the bytes again; invalid entries are removed, and retired font versions are
+pruned only from the exact application directory. The cache is shared by origin,
+but installations and nested previews cannot delete one another's entries.
+The existing cache name and keys remain compatible, preserving valid saved bytes. A stored font works offline in the same
 origin/profile. Cold offline use, denied storage or browser cache eviction can
 leave missing glyphs. Cache failures do not block an online download or prevent
 installation of a verified font. No app font request is needed for Latin or

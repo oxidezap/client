@@ -1,6 +1,6 @@
 //! Browser I/O for the bounded catalog. No session data enters an asset URL.
 
-use super::{Asset, CATALOG, Loader, Store, load};
+use super::{Asset, CATALOG, Loader, Store, load, should_remove_cached_key};
 use std::{borrow::Cow, cell::RefCell, rc::Rc, time::Duration};
 use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
@@ -77,13 +77,15 @@ fn window() -> Result<web_sys::Window, String> {
     web_sys::window().ok_or_else(|| "font loading has no window".into())
 }
 
-fn url(asset: &Asset) -> Result<String, String> {
+fn application_directory() -> Result<String, String> {
     // Location rather than document.baseURI: an HTML <base> must not retarget
-    // font requests. Resolving a filename removes the page's query and fragment.
+    // font requests. Resolving "." removes the filename, query and fragment.
     let page = window()?.location().href().map_err(js)?;
-    Ok(web_sys::Url::new_with_base(asset.file, &page)
-        .map_err(js)?
-        .href())
+    Ok(web_sys::Url::new_with_base(".", &page).map_err(js)?.href())
+}
+
+fn url(asset: &Asset) -> Result<String, String> {
+    Ok(format!("{}{}", application_directory()?, asset.file))
 }
 
 async fn cache() -> Result<web_sys::Cache, String> {
@@ -93,13 +95,18 @@ async fn cache() -> Result<web_sys::Cache, String> {
         .map_err(js)?
         .dyn_into()
         .map_err(js)?;
-    // Only this bounded catalog belongs here. Retire old content-hashed versions
-    // so upgrades do not accumulate unlimited font assets in this cache.
-    let allowed = CATALOG.iter().map(url).collect::<Result<Vec<_>, _>>()?;
+    // The cache is origin-wide. Retire only this directory's obsolete keys;
+    // another installation or nested preview must keep its offline font bytes.
+    // Retain the cache name/key format so existing valid entries remain usable.
+    let directory = application_directory()?;
+    let allowed: Vec<_> = CATALOG
+        .iter()
+        .map(|asset| format!("{directory}{}", asset.file))
+        .collect();
     let keys = JsFuture::from(cache.keys()).await.map_err(js)?;
     for key in js_sys::Array::from(&keys).iter() {
         let request: web_sys::Request = key.dyn_into().map_err(js)?;
-        if !allowed.contains(&request.url()) {
+        if should_remove_cached_key(&request.url(), &directory, &allowed) {
             JsFuture::from(cache.delete_with_request(&request))
                 .await
                 .map_err(js)?;

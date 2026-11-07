@@ -108,6 +108,17 @@ impl Loader {
     }
 }
 
+/// Decide which keys this installation may retire from the origin-wide cache.
+fn should_remove_cached_key(key: &str, directory: &str, allowed: &[String]) -> bool {
+    // Compare the exact parent, not a prefix: an installation at the origin's
+    // root must not own a nested preview's keys. Font keys have no query/fragment.
+    let owned = directory.strip_suffix('/').is_some_and(|parent| {
+        key.rsplit_once('/')
+            .is_some_and(|(key_parent, _)| key_parent == parent)
+    });
+    owned && !allowed.iter().any(|url| url == key)
+}
+
 /// Shared load policy, exercised with deterministic I/O on the host. Browser
 /// implementations bound read sizes and cancel outstanding work on timeout.
 trait Store {
@@ -319,6 +330,35 @@ mod tests {
         assert!(store.cache.borrow().is_none());
         store.invalid_network.set(false);
         run(&store).unwrap();
+    }
+
+    #[test]
+    fn pruning_one_directory_preserves_the_other_installations_offline_font() {
+        use std::collections::HashMap;
+        let roots = [
+            "https://example.invalid/",
+            "https://example.invalid/previews/306/",
+        ];
+        let mut saved = HashMap::<String, Vec<u8>>::new();
+        for root in roots {
+            saved.insert(format!("{root}{}", CATALOG[0].file), FACE.to_vec());
+            saved.insert(format!("{root}retired-font.ttf"), vec![1]);
+        }
+        for (current, other) in [(roots[0], roots[1]), (roots[1], roots[0])] {
+            let allowed = vec![format!("{current}{}", CATALOG[0].file)];
+            let other_key = format!("{other}{}", CATALOG[0].file);
+            saved.retain(|key, _| !should_remove_cached_key(key, current, &allowed));
+            let store = MemoryStore::default();
+            *store.cache.borrow_mut() = saved.get(&other_key).cloned();
+            store.offline.set(true);
+            assert_eq!(
+                run(&store).expect("another installation's font remains available offline"),
+                FACE
+            );
+            assert_eq!(store.fetches.get(), 0);
+            assert!(saved.contains_key(&allowed[0]));
+            assert!(!saved.contains_key(&format!("{current}retired-font.ttf")));
+        }
     }
 
     #[test]
