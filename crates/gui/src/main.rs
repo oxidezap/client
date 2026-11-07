@@ -50,8 +50,8 @@ fn main() {
     crate::platform::watch_for_departure();
     // Behind whatever this platform has to fetch before it can draw, which on
     // a desktop is nothing and in a page is the emoji face: a font that lands
-    // after the first frame leaves the rows already on screen shaped without
-    // it. See `platform::fonts`.
+    // before the first frame avoids initial fallback. Later installations are
+    // supported through add_fonts plus a window refresh. See `platform::fonts`.
     crate::platform::with_downloaded_fonts(open_the_window);
 }
 

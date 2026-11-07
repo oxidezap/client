@@ -1155,10 +1155,12 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   call that has ended would put the last person's face on this one, and a
   frame for a direction just turned off would light a pane nothing will come
   to clear again.
-- **A page has no fonts but the ones it embeds, and the failure is a panic.**
+- **The page must register its base font families before drawing.**
   A desktop's text system reads the system's families through font-kit; the
   web backend builds `CosmicTextSystem::new_without_system_fonts`, and a
-  browser hands wasm no font files, so the database starts empty. `gpui_web`
+  browser hands this database no system font files, so it starts empty. The
+  separate Canvas path can use browser fonts for eligible emoji, and optionally
+  independent horizontal CJK graphemes. It is not contextual-script fallback. `gpui_web`
   used to fill it — it bundled IBM Plex Sans and Lilex and added them as it
   built the platform — and a revision bump took that out with the note that
   applications must add their own before opening a window.

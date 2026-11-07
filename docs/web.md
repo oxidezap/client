@@ -390,31 +390,51 @@ exactly as its comment described, which says nothing about a function that
 never needed it. When a comment says something is impossible, reproduce the
 impossibility it describes before believing it.
 
-**A page has no fonts, and no way to borrow the browser's.** The window
-rasterizes every glyph itself — swash, out of a `fontdb` that
-`CosmicTextSystem::new_without_system_fonts` starts empty — onto a canvas the
-browser's own text pipeline never touches. So `local()` in CSS, `system-ui`,
-and whatever emoji font the machine has are all unreachable: a family the page
-was not handed is a family it cannot draw, and gpui *panics* rather than
-falling back. `platform::fonts` is the answer, and it makes the split the
-bundle's shape depends on: the two text families are `include_bytes!`d,
-because a window that cannot resolve `.SystemUIFont` never draws a frame,
-while the emoji face is a file fetched from beside `index.html`, because the
-worst it can cost is boxes where the emoji were. That is also why the emoji
-face is monochrome Noto Emoji rather than the colour one — gpui takes swash's
-colour path for exactly one PostScript name, `NotoColorEmoji`, and swash reads
-COLR **version 0** or CBDT strikes, while what Google Fonts serves today is
-COLRv1: 25 MB the renderer would draw as nothing. The colour build that does
-work is ten megabytes of bitmaps.
+**The page has two text paths.** The cosmic-text font database starts
+without system fonts, so the application registers its base text families
+before opening a window. The current `WebTextSystem` also uses browser Canvas
+fonts for eligible emoji by default. Optional `EmojiAndCjk` support covers
+independent horizontal CJK graphemes approximately. This is not general
+fallback for scripts requiring contextual shaping or mixed-direction editing.
 
-The fetch finishes *before* the window opens, and the deadline on it is what
-keeps that from being a page that never draws. Opening first and adding the
-face later looks cheaper and is not: gpui's `LineLayoutCache` keeps a shaped
-line for as long as something asks for it every frame, so the chat list a page
-opens onto would have kept its boxes until it was scrolled away and back.
-To prevent this fetch from adding an idle waterfall step after the WebAssembly
-module instantiates, `web/index.html` preloads the font (`rel="preload" as="fetch"`)
-so it downloads concurrently with the `.wasm` binary.
+The base UI families are embedded. Noto Sans Arabic is a versioned static asset
+requested only after an Arabic-script grapheme exhausts fallback. Its bytes are
+not embedded in WASM, and it is not preloaded.
+The separately downloaded monochrome emoji font remains available on the
+cosmic-text/swash path when Canvas cannot replace a grapheme. Swash's native
+colour-font format restrictions do not describe the browser Canvas path.
+
+The emoji download currently completes before the window opens, with a deadline.
+That ordering is a startup policy. In gpui-fast 0.1.13, `add_fonts` invalidates
+font resolution and line-layout caches, so fonts can also be installed later;
+a loader must request a window refresh after installation. `web/index.html`
+preloads the emoji file to overlap its download with the WASM module.
+
+Script-font requests use the page's own origin and application directory, with
+redirects refused. The limited catalog maps Unicode ranges to pinned assets;
+requests contain filenames only, never message text. The host can observe which
+font is requested. Adding a script requires a suitable licensed font, a catalog
+entry, a same-origin bundle asset and validation, rather than more embedded bytes.
+The catalog currently covers Persian via Noto Sans Arabic, not every writing
+system or every character in the routed blocks.
+
+A verified font is installed through `add_fonts`, then `refresh_windows` wakes
+visible rows. A per-asset state coalesces concurrent missing-glyph reports.
+Requests have a 15-second overall deadline and at most the catalog's exact byte
+length; size and SHA-256 are checked before parsing or persistence. Network,
+HTTP, invalid-byte and installation failures leave the existing fallback text
+visible. Reports after failure do not automatically retry. One later browser
+`online` event permits a second attempt; further recovery requires reloading.
+
+Cache Storage is best effort, with two-second storage deadlines. Reads validate
+the bytes again; invalid entries are removed, and retired font versions are
+pruned only from the exact application directory. The cache is shared by origin,
+but installations and nested previews cannot delete one another's entries.
+The existing cache name and keys remain compatible, preserving valid saved bytes. A stored font works offline in the same
+origin/profile. Cold offline use, denied storage or browser cache eviction can
+leave missing glyphs. Cache failures do not block an online download or prevent
+installation of a verified font. No app font request is needed for Latin or
+scripts without a catalog entry. Desktop font loading is unchanged.
 
 **A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
 is there because cross-origin isolation needs two response headers GitHub Pages
