@@ -68,6 +68,8 @@ rust-embed = { version = "8.13.0", features = ["include-exclude", "interpolate-f
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 smallvec = "1.16.4"
+# Verify same-origin script-font assets before parsing or caching their bytes.
+sha2 = { version = "0.11.1", default-features = false }
 # Racing two futures, and nothing else. The executor-free half of `smol`,
 # which is all the window ever used it for besides timers — and the only half
 # that builds for a page, since `smol`'s timer is an epoll loop.
@@ -163,6 +165,14 @@ web-sys = { version = "0.3.106", features = [
     # The emoji face, fetched from beside `index.html` rather than embedded;
     # see `platform/fonts.rs`.
     "Response",
+    "AbortController",
+    "AbortSignal",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "RequestInit",
+    "RequestCache",
+    "RequestMode",
+    "RequestRedirect",
     "Storage",
     "StorageEvent",
     "Url",

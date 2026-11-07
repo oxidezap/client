@@ -16,14 +16,22 @@ use crate::{err, say};
 /// Files the bundle has to carry whether or not the emitted document names
 /// them.
 ///
-/// Both arrive through a `data-trunk rel="copy-file"` link, and trunk consumes
+/// These arrive through `data-trunk rel="copy-file"` links, and trunk consumes
 /// those links rather than emitting them — so the reference check below, which
 /// reads the document trunk produced, sees a copied file only where something
 /// *else* names it. The service worker is named by its own `<script src>` and
-/// so is covered twice; the emoji face is fetched from Rust and named nowhere
+/// so is covered twice; the font assets are fetched from Rust and named nowhere
 /// in the document at all, which makes its absence silent at build time and
 /// visible only as boxes in a browser. Hence the list.
 const REQUIRED: &[(&str, &str)] = &[
+    (
+        "NotoSansArabic-OFL.txt",
+        "the distributed script font must carry its license",
+    ),
+    (
+        "NotoSansArabic-Regular.ceea25b464a656dc.ttf",
+        "the Arabic-script fallback requests this versioned asset on demand",
+    ),
     (
         "coi-serviceworker.js",
         "the page will load without cross-origin isolation and the window \
@@ -31,8 +39,7 @@ const REQUIRED: &[(&str, &str)] = &[
     ),
     (
         "NotoEmoji-Regular.ttf",
-        "the window fetches it before opening and every emoji in a chat name, \
-         a reaction or a message will draw as a box",
+        "the window fetches the monochrome emoji fallback before opening",
     ),
 ];
 

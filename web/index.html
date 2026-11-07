@@ -46,22 +46,21 @@
     <link data-trunk rel="copy-file" href="coi-serviceworker.js" />
     <script src="coi-serviceworker.js"></script>
 
-    <!-- What the window draws emoji with, copied in rather than embedded.
+    <!-- Script fonts are copied as versioned assets, never preloaded or embedded
+         in WASM. Rust requests one only after a matching missing grapheme. -->
+    <link
+      data-trunk
+      rel="copy-file"
+      href="../crates/gui/assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ceea25b464a656dc.ttf"
+    />
 
-         The page rasterizes every glyph itself, out of a font database that
-         starts empty — a browser hands wasm no font files, and the canvas is
-         not the DOM, so `local()` and the system's emoji font are both out of
-         reach. Without a face that covers them every emoji in a chat name, a
-         reaction or a message drew as a box.
+    <link data-trunk rel="copy-file" href="../crates/gui/assets/fonts/noto-sans-arabic/NotoSansArabic-OFL.txt" />
 
-         It is copied beside the module instead of `include_bytes!`d into it
-         because a font is a file a browser caches perfectly well on its own,
-         and 878 KB is 878 KB the module does not have to carry. The window
-         fetches it by this name, relative to the document, before it opens —
-         see `platform/fonts.rs`, which also says why it is the monochrome
-         Noto Emoji and not the colour one. Nothing generates this name from
-         that one, so a test in that file reads this document and fails when
-         the two stop matching. -->
+    <!-- Monochrome emoji fallback, copied beside the module. The current
+         GPUI web backend can render eligible emoji with browser Canvas fonts;
+         this face remains available on the native cosmic-text/swash path when
+         Canvas cannot replace a grapheme. It is fetched before opening the
+         window. platform/fonts.rs and xtask's bundle check name the same file. -->
     <link
       data-trunk
       rel="copy-file"
