@@ -397,7 +397,9 @@ fonts for eligible emoji by default. Optional `EmojiAndCjk` support covers
 independent horizontal CJK graphemes approximately. This is not general
 fallback for scripts requiring contextual shaping or mixed-direction editing.
 
-The base families and Noto Sans Arabic are embedded in the current bundle.
+The base UI families are embedded. Noto Sans Arabic is a versioned static asset
+requested only after an Arabic-script grapheme exhausts fallback. Its bytes are
+not embedded in WASM, and it is not preloaded.
 The separately downloaded monochrome emoji font remains available on the
 cosmic-text/swash path when Canvas cannot replace a grapheme. Swash's native
 colour-font format restrictions do not describe the browser Canvas path.
@@ -407,6 +409,30 @@ That ordering is a startup policy. In gpui-fast 0.1.13, `add_fonts` invalidates
 font resolution and line-layout caches, so fonts can also be installed later;
 a loader must request a window refresh after installation. `web/index.html`
 preloads the emoji file to overlap its download with the WASM module.
+
+Script-font requests use the page's own origin and application directory, with
+redirects refused. The limited catalog maps Unicode ranges to pinned assets;
+requests contain filenames only, never message text. The host can observe which
+font is requested. Adding a script requires a suitable licensed font, a catalog
+entry, a same-origin bundle asset and validation, rather than more embedded bytes.
+The catalog currently covers Persian via Noto Sans Arabic, not every writing
+system or every character in the routed blocks.
+
+A verified font is installed through `add_fonts`, then `refresh_windows` wakes
+visible rows. A per-asset state coalesces concurrent missing-glyph reports.
+Requests have a 15-second overall deadline and at most the catalog's exact byte
+length; size and SHA-256 are checked before parsing or persistence. Network,
+HTTP, invalid-byte and installation failures leave the existing fallback text
+visible. Reports after failure do not automatically retry. One later browser
+`online` event permits a second attempt; further recovery requires reloading.
+
+Cache Storage is best effort, with two-second storage deadlines. Reads validate
+the bytes again; invalid entries are removed, and old versions outside the
+current bounded catalog are pruned. A stored font works offline in the same
+origin/profile. Cold offline use, denied storage or browser cache eviction can
+leave missing glyphs. Cache failures do not block an online download or prevent
+installation of a verified font. No app font request is needed for Latin or
+scripts without a catalog entry. Desktop font loading is unchanged.
 
 **A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
 is there because cross-origin isolation needs two response headers GitHub Pages
