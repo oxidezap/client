@@ -28,6 +28,10 @@
 //! through gpui's fallback stack — so these are the files that were bundled,
 //! at the revision they were bundled from.
 //!
+//! Those Latin families do not cover Persian. Noto Sans Arabic is embedded
+//! alongside them so cosmic-text can select it for Arabic-script clusters.
+//! It is registered before any line is cached, with no extra fetch to fail.
+//!
 //! Emoji are the other half, and they are *not* embedded. A page draws every
 //! glyph itself — `swash` rasterizes out of the database this file fills, on
 //! a canvas the browser's own text pipeline never touches — so the system's
@@ -91,11 +95,14 @@ pub fn with_downloaded_fonts(start: impl FnOnce() + 'static) {
 #[cfg(test)]
 const WEB_SYSTEM_FONT: &str = "IBM Plex Sans";
 
-/// What a page carries, and what it costs: eight faces, about 1.6 MB before
-/// compression, the same files and the same revision `gpui_web` used to embed
-/// itself.
+/// The base text families and an Arabic-script fallback for Persian chat text.
+/// All are registered before the first frame to avoid cached missing glyphs.
 #[cfg(any(target_family = "wasm", test))]
 const BUNDLED: &[(&str, &[u8])] = &[
+    (
+        "NotoSansArabic-Regular",
+        include_bytes!("../../assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ttf"),
+    ),
     (
         "IBMPlexSans-Regular",
         include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
@@ -337,6 +344,90 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn persian_and_mixed_chat_text_have_no_missing_glyphs() {
+        let text_system = a_page_that_also_fetched_its_emoji();
+        for text in [
+            "سلام فارسی پ چ ژ گ ک ی",
+            "می\u{200c}روم، پیام شما؟ ۱۲۳۴۵۶۷۸۹۰",
+            "Hello سلام 123 ۱۲۳ 🧪 ✅",
+        ] {
+            let drawn = glyphs(&text_system, text);
+            assert!(
+                !drawn.is_empty() && drawn.iter().all(|&id| id != 0),
+                "{text:?} contains missing glyphs: {drawn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arabic_fallback_does_not_change_latin_or_emoji() {
+        let without_arabic = a_page_without_fonts();
+        without_arabic
+            .add_fonts(
+                BUNDLED
+                    .iter()
+                    .filter(|(name, _)| !name.starts_with("NotoSansArabic"))
+                    .map(|(_, bytes)| Cow::Borrowed(*bytes))
+                    .chain([Cow::Borrowed(EMOJI_FACE)])
+                    .collect(),
+            )
+            .unwrap();
+        let without_arabic = gpui::WindowTextSystem::new(Arc::new(without_arabic));
+        let with_arabic = a_page_that_also_fetched_its_emoji();
+        for text in ["Notes/Save 12:34", "🧪 ✅"] {
+            assert_eq!(glyphs(&without_arabic, text), glyphs(&with_arabic, text));
+        }
+    }
+
+    #[test]
+    fn shaped_persian_glyphs_rasterize_to_visible_pixels() {
+        use gpui::PlatformTextSystem as _;
+
+        let backend = Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
+            WEB_SYSTEM_FONT,
+        ));
+        backend
+            .add_fonts(
+                BUNDLED
+                    .iter()
+                    .map(|(_, bytes)| Cow::Borrowed(*bytes))
+                    .collect(),
+            )
+            .unwrap();
+        let text_system =
+            gpui::WindowTextSystem::new(Arc::new(gpui::TextSystem::new(backend.clone())));
+        let text = "سلام";
+        let runs = [gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(".SystemUIFont"),
+            color: gpui::Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        let line = text_system.layout_line(text, gpui::px(16.0), &runs, None);
+        assert!(!line.runs.is_empty());
+        for run in &line.runs {
+            for glyph in &run.glyphs {
+                assert_ne!(glyph.id.0, 0);
+                let params = gpui::RenderGlyphParams {
+                    font_id: run.font_id,
+                    glyph_id: glyph.id,
+                    font_size: gpui::px(16.0),
+                    subpixel_variant: gpui::point(0, 0),
+                    scale_factor: 1.0,
+                    is_emoji: glyph.is_emoji,
+                    subpixel_rendering: false,
+                    dilation: 0,
+                };
+                let bounds = backend.glyph_raster_bounds(&params).unwrap();
+                let (_, pixels) = backend.rasterize_glyph(&params, bounds).unwrap();
+                assert!(pixels.iter().any(|&value| value != 0));
+            }
+        }
+    }
+
     /// Every family the page asks for by default, resolved without falling
     /// off the end of the stack. `.SystemUIFont` is what the theme sets,
     /// `.ZedSans` and `.ZedMono` are what gpui's own fallback stack names,
@@ -420,7 +511,7 @@ mod tests {
 
     /// Each file is a font, and each is the face its name claims: an empty or
     /// truncated asset loads as a database with nothing in it, which the two
-    /// tests above would not notice as long as one of the eight was intact.
+    /// tests above would not notice as long as another bundled face was intact.
     #[test]
     fn every_bundled_face_is_a_font_on_its_own() {
         for (name, bytes) in BUNDLED {
@@ -431,6 +522,16 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{name} did not load: {e}"));
             let family = if name.starts_with("Lilex") {
                 "Lilex"
+            } else if name.starts_with("NotoSansArabic") {
+                // GPUI rejects a primary family without Latin `m`. This face
+                // is used through cosmic-text fallback, exercised above.
+                assert!(
+                    text_system
+                        .all_font_names()
+                        .iter()
+                        .any(|family| family == "Noto Sans Arabic")
+                );
+                continue;
             } else {
                 "IBM Plex Sans"
             };

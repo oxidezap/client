@@ -397,8 +397,9 @@ browser's own text pipeline never touches. So `local()` in CSS, `system-ui`,
 and whatever emoji font the machine has are all unreachable: a family the page
 was not handed is a family it cannot draw, and gpui *panics* rather than
 falling back. `platform::fonts` is the answer, and it makes the split the
-bundle's shape depends on: the two text families are `include_bytes!`d,
+bundle's shape depends on: the base text families and Noto Sans Arabic are `include_bytes!`d,
 because a window that cannot resolve `.SystemUIFont` never draws a frame,
+and the Arabic-script fallback covers Persian without depending on host fonts,
 while the emoji face is a file fetched from beside `index.html`, because the
 worst it can cost is boxes where the emoji were. That is also why the emoji
 face is monochrome Noto Emoji rather than the colour one — gpui takes swash's
