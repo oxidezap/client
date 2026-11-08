@@ -152,6 +152,9 @@ pub(super) struct Pages {
     /// A failed initial Status request waits for a deliberate retry, rather
     /// than starting another request from every render of the status view.
     status_page_failed: bool,
+    /// Views confirmed by history while a status page is in flight. That page
+    /// may have read its rows before the confirmations reached the store.
+    status_confirmed_in_flight: HashSet<String>,
 }
 
 impl Pages {
@@ -162,6 +165,7 @@ impl Pages {
             archived_chats: Paging::default(),
             restart_archived_after_load: false,
             status_page_failed: false,
+            status_confirmed_in_flight: HashSet::new(),
         }
     }
 
@@ -186,6 +190,9 @@ impl Pages {
         if !matches!(paging, Paging::Unasked) {
             return false;
         }
+        if jid == oxidezap_core::STATUS_BROADCAST_JID {
+            self.status_confirmed_in_flight.clear();
+        }
         *paging = Paging::Loading { from: None };
         true
     }
@@ -199,6 +206,9 @@ impl Pages {
         let Some(Some(cursor)) = paging.to_ask() else {
             return None;
         };
+        if jid == oxidezap_core::STATUS_BROADCAST_JID {
+            self.status_confirmed_in_flight.clear();
+        }
         *paging = Paging::Loading {
             from: Some(cursor.clone()),
         };
@@ -287,6 +297,7 @@ impl Pages {
                 *paging = paging.lost();
                 if status_failed {
                     self.status_page_failed = true;
+                    self.status_confirmed_in_flight.clear();
                 }
                 status_failed
             }
@@ -309,6 +320,7 @@ impl Pages {
             self.timelines.remove(jid);
             if jid == oxidezap_core::STATUS_BROADCAST_JID {
                 self.status_page_failed = false;
+                self.status_confirmed_in_flight.clear();
             }
         }
     }
@@ -343,6 +355,18 @@ impl Pages {
         self.archived_chats = Paging::Unasked;
         self.restart_archived_after_load = false;
         self.status_page_failed = false;
+        self.status_confirmed_in_flight.clear();
+    }
+
+    /// Keep confirmations only until the currently requested page settles.
+    pub(super) fn note_status_confirmations(&mut self, agreed: &HashSet<String>) {
+        if matches!(
+            self.timelines.get(oxidezap_core::STATUS_BROADCAST_JID),
+            Some(Paging::Loading { .. })
+        ) {
+            self.status_confirmed_in_flight
+                .extend(agreed.iter().cloned());
+        }
     }
 }
 
@@ -507,10 +531,16 @@ impl WhatsAppApp {
         next: Option<PageCursor>,
         cx: &mut Context<Self>,
     ) {
-        if !self
-            .pages
-            .update(cx, |pages, _| pages.timeline_page_arrived(&jid, next))
-        {
+        let (arrived, confirmed) = self.pages.update(cx, |pages, _| {
+            let arrived = pages.timeline_page_arrived(&jid, next);
+            let confirmed = if arrived && jid == oxidezap_core::STATUS_BROADCAST_JID {
+                std::mem::take(&mut pages.status_confirmed_in_flight)
+            } else {
+                HashSet::new()
+            };
+            (arrived, confirmed)
+        });
+        if !arrived {
             debug!(
                 "a page arrived for {}, which nobody asked for",
                 observe_str(&jid)
@@ -523,7 +553,7 @@ impl WhatsAppApp {
             }
             return;
         }
-        if jid == oxidezap_core::STATUS_BROADCAST_JID && !self.watched_status.is_empty() {
+        if jid == oxidezap_core::STATUS_BROADCAST_JID {
             // Only the rows in this page can confirm a local view. A page
             // read before a click may still arrive after that click.
             let agreed: HashSet<&str> = messages
@@ -534,7 +564,10 @@ impl WhatsAppApp {
             self.watched_status
                 .retain(|id| !agreed.contains(id.as_str()));
             for message in &mut messages {
-                if !message.is_from_me && self.watched_status.contains(&message.id) {
+                if !message.is_from_me
+                    && (self.watched_status.contains(&message.id)
+                        || confirmed.contains(&message.id))
+                {
                     message.is_read = true;
                 }
             }
@@ -1291,6 +1324,100 @@ mod tests {
             });
         });
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
+    fn stale_status_page_after_confirmed_history_keeps_view(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let app = cx.new(WhatsAppApp::new);
+            app.update(cx, |app, cx| {
+                let jid = oxidezap_core::STATUS_BROADCAST_JID;
+                let stale = ChatMessage::new_incoming(
+                    "seen".into(),
+                    "1@s.whatsapp.net".into(),
+                    "one".into(),
+                );
+                let unseen = ChatMessage::new_incoming(
+                    "unseen".into(),
+                    "1@s.whatsapp.net".into(),
+                    "two".into(),
+                );
+                let mut status = Chat::from_store(jid.into(), "Status".into(), 0);
+                status.messages.push(stale.clone());
+                app.handle_event(
+                    oxidezap_core::UiEvent::HistoryLoaded {
+                        chats: vec![status.clone()],
+                        complete: false,
+                        next: None,
+                    },
+                    cx,
+                );
+                // The pending page has already captured `stale` before this view.
+                assert!(app.pages.update(cx, |pages, _| pages.open_timeline(jid)));
+                app.open_status("1@s.whatsapp.net".into(), cx);
+                assert!(app.watched_status.contains("seen"));
+                assert!(app.find_chat(jid).unwrap().messages[0].is_read);
+                status.messages[0].is_read = true;
+                app.handle_event(
+                    oxidezap_core::UiEvent::HistoryLoaded {
+                        chats: vec![status],
+                        complete: false,
+                        next: None,
+                    },
+                    cx,
+                );
+                assert!(!app.watched_status.contains("seen"));
+                assert!(app.find_chat(jid).unwrap().messages[0].is_read);
+                app.apply_message_page(jid.into(), vec![stale, unseen], None, cx);
+                assert!(
+                    app.find_chat(jid)
+                        .unwrap()
+                        .messages
+                        .iter()
+                        .find(|m| m.id == "seen")
+                        .unwrap()
+                        .is_read,
+                    "a page captured before the view must not undo a confirmed view"
+                );
+                assert!(
+                    !app.find_chat(jid)
+                        .unwrap()
+                        .messages
+                        .iter()
+                        .find(|m| m.id == "unseen")
+                        .unwrap()
+                        .is_read,
+                    "an unrelated status must remain unseen"
+                );
+                assert!(app.pages.read(cx).status_confirmed_in_flight.is_empty());
+            });
+        });
+    }
+
+    #[test]
+    fn confirmed_status_protection_is_discarded_when_page_is_lost_or_forgotten() {
+        let jid = oxidezap_core::STATUS_BROADCAST_JID;
+        let mut pages = Pages::new();
+        let agreed = HashSet::from(["seen".to_string()]);
+        pages.note_status_confirmations(&agreed);
+        assert!(pages.status_confirmed_in_flight.is_empty());
+        assert!(pages.open_timeline(jid));
+        pages.note_status_confirmations(&agreed);
+        assert_eq!(pages.status_confirmed_in_flight, agreed);
+        assert!(pages.lost(Some(jid), false));
+        assert!(pages.status_confirmed_in_flight.is_empty());
+        pages.status_page_failed = false;
+        assert!(pages.open_timeline(jid));
+        pages.note_status_confirmations(&agreed);
+        pages.forget_chats(&[jid.to_string()]);
+        assert!(pages.status_confirmed_in_flight.is_empty());
+        assert!(pages.open_timeline(jid));
+        pages.note_status_confirmations(&agreed);
+        pages.forget();
+        assert!(pages.status_confirmed_in_flight.is_empty());
     }
 
     #[gpui::test]
