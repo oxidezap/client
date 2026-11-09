@@ -259,6 +259,8 @@ impl WhatsAppApp {
         watched: &std::collections::HashSet<String>,
         cx: &mut Context<Self>,
     ) {
+        self.pages
+            .update(cx, |pages, _| pages.note_status_confirmations(watched));
         self.merge_chats(chats, cx);
         // A selection that no longer names a chat is a selection of nothing:
         // the conversation pane resolves it every frame and would draw the
