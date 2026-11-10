@@ -178,7 +178,11 @@ async fn history_anchor_skips_notices_and_orders_messages_by_timestamp_then_arri
     assert_eq!(anchor.kind, MessageKind::Text);
     let rows = chat_store.messages(&group, None, 20).await.unwrap();
     assert_eq!(rows.len(), 4);
-    assert_eq!(rows[0].kind, MessageKind::GroupMembership);
+    assert_eq!(
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["NEWEST", "AAA", "group-REAL-0", "group-BEFORE-0"]
+    );
+    assert_eq!(rows.last().unwrap().kind, MessageKind::GroupMembership);
     let following = chat_store
         .messages_after(&group, (&anchor).into(), 20)
         .await
