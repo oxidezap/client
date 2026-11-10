@@ -137,3 +137,83 @@ async fn deleting_a_newer_message_restores_the_membership_preview() {
     assert_eq!(after.last_message_kind, Some(MessageKind::GroupMembership));
     assert_eq!(after.last_message_preview, before.last_message_preview);
 }
+
+#[tokio::test]
+async fn notice_only_chat_has_no_history_anchor() {
+    let (_store, chat_store) = test_store().await;
+    feed(&chat_store, [notice("ONLY", 0)]).await;
+    assert!(
+        chat_store
+            .oldest_message(&jid(GROUP))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let rows = chat_store.messages(&jid(GROUP), None, 20).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, MessageKind::GroupMembership);
+}
+
+#[tokio::test]
+async fn history_anchor_skips_notices_and_orders_messages_by_timestamp_then_arrival() {
+    let (_store, chat_store) = test_store().await;
+    let group = jid(GROUP);
+    feed(&chat_store, [notice("BEFORE", 0)]).await;
+    // Arrival order differs from timestamp order, and the first tied row's
+    // stanza ID sorts last. Neither an ID prefix nor its lexical order is a key.
+    for (id, at) in [
+        ("NEWEST", 1_700_000_020),
+        ("group-REAL-0", 1_700_000_010),
+        ("AAA", 1_700_000_010),
+    ] {
+        chat_store
+            .record_outgoing(&group, id, &wa::Message::text("synthetic message"), ts(at))
+            .unwrap();
+    }
+    chat_store.flush().await.unwrap();
+    let anchor = chat_store.oldest_message(&group).await.unwrap().unwrap();
+    assert_eq!(anchor.id, "group-REAL-0");
+    assert!(anchor.from_me);
+    assert_eq!(anchor.timestamp, ts(1_700_000_010));
+    assert_eq!(anchor.kind, MessageKind::Text);
+    let rows = chat_store.messages(&group, None, 20).await.unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].kind, MessageKind::GroupMembership);
+    let following = chat_store
+        .messages_after(&group, (&anchor).into(), 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        following
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        ["AAA", "NEWEST"]
+    );
+}
+
+#[tokio::test]
+async fn incoming_message_with_notice_id_remains_a_history_anchor() {
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [
+            notice("COLLISION", 0),
+            message_event(
+                wa::Message::text("synthetic incoming message"),
+                incoming_info(GROUP, PEER, "group-COLLISION-0", 1_700_000_001),
+            ),
+        ],
+    )
+    .await;
+    let anchor = chat_store
+        .oldest_message(&jid(GROUP))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(anchor.id, "group-COLLISION-0");
+    assert_eq!(anchor.sender_jid, jid(PEER));
+    assert!(!anchor.from_me);
+    assert_eq!(anchor.timestamp, ts(1_700_000_001));
+    assert_eq!(anchor.kind, MessageKind::Text);
+}

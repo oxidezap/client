@@ -971,7 +971,8 @@ impl WhatsAppClient {
     /// Backfill history: warm the chat page and report the coverage.
     ///
     /// Asks the primary phone first, through PDO, for whatever came before the
-    /// oldest row the store holds — the library's `fetch_message_history`,
+    /// oldest message the store can use as an anchor, excluding locally minted
+    /// membership notices — the library's `fetch_message_history`,
     /// which is the on-demand sync WA Web itself uses. What arrives lands on
     /// the normal history-sync path, so the local re-read that follows drains
     /// it. A phone that refuses the request is not fatal: the local backfill is
