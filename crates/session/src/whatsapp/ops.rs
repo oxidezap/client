@@ -1017,11 +1017,7 @@ impl WhatsAppClient {
                     .chat_store
                     .message_coverage(Some(&chat))
                     .await
-                    .unwrap_or(MessageCoverage {
-                        stored_count: 0,
-                        oldest_ms: None,
-                        newest_ms: None,
-                    });
+                    .map_err(|e| format!("database query failed: {e}"))?;
                 if let Err(e) = live
                     .client
                     .fetch_message_history(
