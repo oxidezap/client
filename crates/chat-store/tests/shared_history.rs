@@ -388,6 +388,10 @@ async fn notices_are_system_rows_only_for_nonreceivers_and_never_unread() {
     let rows = store.messages(&jid(GROUP), None, 100).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].kind, MessageKind::HistoryNotice);
+    // This notice arrived as a message, so its wire ID is still an anchor.
+    let anchor = store.oldest_message(&jid(GROUP)).await.unwrap().unwrap();
+    assert_eq!(anchor.id, "VISIBLE-NOTICE");
+    assert_eq!(anchor.kind, MessageKind::HistoryNotice);
     assert!(
         rows[0]
             .text

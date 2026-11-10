@@ -1706,10 +1706,11 @@ impl ChatStore {
         Ok(messages)
     }
 
-    /// The oldest stored message of one chat, if it holds any.
+    /// The oldest stored message usable as a history anchor, if the chat has one.
     ///
-    /// What an on-demand history request anchors on: the phone is asked for
-    /// what came before this row, so the row itself is the argument.
+    /// Membership notifications remain in timeline queries, but their locally
+    /// minted IDs cannot identify a message in an on-demand history request.
+    /// A chat containing only those notifications has no anchor.
     pub async fn oldest_message(&self, chat: &Jid) -> Result<Option<StoredMessage>> {
         use schema::messages::dsl;
         let device_id = self.device_id();
@@ -1721,6 +1722,7 @@ impl ChatStore {
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 let rows: Vec<MessageRow> = dsl::messages
                     .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
+                    .filter(dsl::kind.ne("group_membership"))
                     .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
                     .limit(1)
                     .load(conn)

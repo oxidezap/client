@@ -6,6 +6,7 @@
 //! wire in them. The daemon maps each onto its protocol DTOs, which is
 //! what keeps this crate from depending on the transport it serves.
 
+use oxidezap_chat_store::MessageCoverage;
 use whatsapp_rust::wacore::proto_helpers::MessageExt as _;
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _};
 use whatsapp_rust::waproto::whatsapp as wa;
@@ -20,6 +21,14 @@ use crate::exec::Task;
 /// history-sync path. Long enough for a cold phone to wake and answer, short
 /// enough that an unreachable one costs a wait and not a hung command.
 const HISTORY_SYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+pub(super) fn history_sync_progressed(before: MessageCoverage, after: MessageCoverage) -> bool {
+    after.stored_count > before.stored_count
+        || after
+            .oldest_ms
+            .zip(before.oldest_ms)
+            .is_some_and(|(after, before)| after < before)
+}
 
 /// One poll, as its creation message describes it.
 ///
@@ -971,7 +980,8 @@ impl WhatsAppClient {
     /// Backfill history: warm the chat page and report the coverage.
     ///
     /// Asks the primary phone first, through PDO, for whatever came before the
-    /// oldest row the store holds — the library's `fetch_message_history`,
+    /// oldest message the store can use as an anchor, excluding locally minted
+    /// membership notices — the library's `fetch_message_history`,
     /// which is the on-demand sync WA Web itself uses. What arrives lands on
     /// the normal history-sync path, so the local re-read that follows drains
     /// it. A phone that refuses the request is not fatal: the local backfill is
@@ -1001,13 +1011,13 @@ impl WhatsAppClient {
                 // land before a post-request read would already be inside the
                 // count, so the wait would never see it grow and would spend
                 // the whole budget on an answer it had.
-                let before_oldest = oldest.timestamp.timestamp_millis();
-                let before_count = live
+                // Coverage includes membership notices; compare it with the
+                // same population, not with the filtered request anchor.
+                let before = live
                     .chat_store
                     .message_coverage(Some(&chat))
                     .await
-                    .map(|coverage| coverage.stored_count)
-                    .unwrap_or(0);
+                    .map_err(|e| format!("database query failed: {e}"))?;
                 if let Err(e) = live
                     .client
                     .fetch_message_history(
@@ -1033,8 +1043,8 @@ impl WhatsAppClient {
                     // not a hang.
                     //
                     // Two ways the wait ends early, because either alone can
-                    // miss an answer. An older row means the sync reached past
-                    // the anchor. A higher count means rows arrived without
+                    // miss an answer. An older row means the sync extended the
+                    // stored time span. A higher count means rows arrived without
                     // moving it, which is what an out-of-order or
                     // same-timestamp batch does, and waiting the whole budget
                     // for a second signal that already arrived would spend
@@ -1043,11 +1053,7 @@ impl WhatsAppClient {
                     loop {
                         match live.chat_store.message_coverage(Some(&chat)).await {
                             Ok(coverage) => {
-                                let went_back = coverage
-                                    .oldest_ms
-                                    .is_some_and(|oldest| oldest < before_oldest);
-                                let grew = coverage.stored_count > before_count;
-                                if went_back || grew {
+                                if history_sync_progressed(before, coverage) {
                                     break;
                                 }
                             }
