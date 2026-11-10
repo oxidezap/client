@@ -182,7 +182,7 @@ fn render_name_row(
                         .flex_shrink_0()
                         .text_size(metrics.text_meta())
                         .text_color(parts::subtle(cx))
-                        .child("Muted")
+                        .child(crate::tr!(Muted))
                 }),
         )
         .children(row.pinned.then(|| {
@@ -191,7 +191,7 @@ fn render_name_row(
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_size(metrics.text_meta())
                 .text_color(parts::subtle(cx))
-                .child("Pinned")
+                .child(crate::tr!(Pinned))
         }))
         .children(row.timestamp.map(|timestamp| {
             div()
@@ -262,14 +262,16 @@ fn render_preview(
         Preview::Empty => line()
             .text_color(parts::subtle(cx))
             .italic()
-            .child("No messages")
+            .child(crate::tr!(NoMessages))
             .into_any_element(),
 
         // Typing is the one preview that is happening right now, so it takes
         // the accent colour the rest of the row spends on unread state.
         Preview::Typing(summary) => line()
             .text_color(cx.theme().primary)
-            .child(text(summary.compact_label(is_group)))
+            .child(text(
+                crate::i18n::Language::current().typing(summary, is_group, true),
+            ))
             .into_any_element(),
 
         Preview::Draft(draft) => line()
@@ -277,7 +279,7 @@ fn render_preview(
                 div()
                     .flex_shrink_0()
                     .text_color(cx.theme().warning)
-                    .child("Draft:"),
+                    .child(crate::tr!(Draft)),
             )
             .text_color(cx.theme().muted_foreground)
             .child(text(draft.clone()))

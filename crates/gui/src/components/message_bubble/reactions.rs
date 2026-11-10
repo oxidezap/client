@@ -104,7 +104,7 @@ pub fn render_reaction_picker(
             .ghost()
             .xsmall()
             .label(emoji)
-            .tooltip(format!("React {emoji}"))
+            .tooltip(crate::tr!(react_emoji, emoji))
             .on_click(move |_, window, cx| {
                 picker_entity.update(cx, |app, cx| {
                     app.toggle_reaction(&picker_id, &picker_emoji, window, cx)
@@ -146,18 +146,25 @@ pub fn render_hover_actions(
             // rather than as a popup the virtual list cannot anchor. The
             // same emojis are on the message's context menu, which is the
             // route keyboard users take.
-            action(ids.react.clone(), ProductIcon::Smile.into(), "React").on_click(
-                move |_, _window, cx| {
-                    picker_entity.update(cx, |app, cx| app.toggle_reaction_picker(&picker_id, cx));
-                },
-            ),
+            action(
+                ids.react.clone(),
+                ProductIcon::Smile.into(),
+                crate::tr!(React),
+            )
+            .on_click(move |_, _window, cx| {
+                picker_entity.update(cx, |app, cx| app.toggle_reaction_picker(&picker_id, cx));
+            }),
         )
         .child(
-            action(ids.reply.clone(), ProductIcon::Reply.into(), "Reply")
-                .cursor_pointer()
-                .on_click(move |_, window, cx| {
-                    reply_entity.update(cx, |app, cx| app.begin_reply(&reply_id, window, cx));
-                }),
+            action(
+                ids.reply.clone(),
+                ProductIcon::Reply.into(),
+                crate::tr!(Reply),
+            )
+            .cursor_pointer()
+            .on_click(move |_, window, cx| {
+                reply_entity.update(cx, |app, cx| app.begin_reply(&reply_id, window, cx));
+            }),
         )
         .when(has_text, |el| {
             el.child(gpui_component::clipboard::Clipboard::new(ids.copy.clone()).value(content))

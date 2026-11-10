@@ -131,7 +131,7 @@ fn plugins(
         }));
 
     group(
-        label("PLUGINS", metrics, cx),
+        label(crate::tr!(Plugins), metrics, cx),
         div()
             .flex()
             .flex_col()
@@ -180,14 +180,14 @@ fn removal(
                 .flex_shrink_0()
                 .text_size(metrics.text_meta())
                 .text_color(cx.theme().muted_foreground)
-                .child("Removed")
+                .child(crate::tr!(Removed))
                 .into_any_element(),
         );
     }
     let id = id.to_owned();
     Some(
         Button::new(gpui::SharedString::from(format!("remove-plugin-{id}")))
-            .label("Remove")
+            .label(crate::tr!(Remove))
             .ghost()
             .small()
             .cursor_pointer()
@@ -242,11 +242,13 @@ fn plugin_controls(
                 .min_w_0()
                 .text_size(metrics.text_meta())
                 .text_color(cx.theme().muted_foreground)
-                .child("Reloading stops every plugin and starts what is in the folder now."),
+                .child(crate::tr!(
+                    ReloadingStopsEveryPluginAndStartsWhatIsInTheFolderNow
+                )),
         )
         .child(
             Button::new("reload-plugins")
-                .label("Reload plugins")
+                .label(crate::tr!(ReloadPlugins))
                 .ghost()
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
@@ -255,7 +257,7 @@ fn plugin_controls(
         )
         .child(
             Button::new("install-plugin")
-                .label("Add a plugin…")
+                .label(crate::tr!(AddAPlugin))
                 .outline()
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
@@ -379,7 +381,7 @@ fn account(
     let account = app.account_summary();
 
     let mut lines = vec![(
-        "Name".to_string(),
+        crate::tr!(Name).to_string(),
         account
             .as_ref()
             .map(|a| a.name.clone())
@@ -387,22 +389,22 @@ fn account(
     )];
     if let Some(jid) = app.account_jid() {
         lines.push((
-            "Number".to_string(),
+            crate::tr!(Number).to_string(),
             // The user part alone: the server suffix is noise to a reader
             // checking which account this is.
             jid.split('@').next().unwrap_or(jid).to_string(),
         ));
     }
     lines.push((
-        "Status".to_string(),
+        crate::tr!(Status).to_string(),
         account
             .as_ref()
             .map(|a| a.status.clone())
-            .unwrap_or_else(|| "not linked".to_string()),
+            .unwrap_or_else(|| crate::tr!(NotLinked).to_string()),
     ));
 
     group(
-        label("LINKED DEVICE", metrics, cx),
+        label(crate::tr!(LinkedDevice), metrics, cx),
         div()
             .flex()
             .flex_col()
@@ -411,7 +413,7 @@ fn account(
             .when(app.has_retained_history(), |this| {
                 this.child(
                     Button::new("account-retained-history")
-                        .label("Open retained history")
+                        .label(crate::tr!(OpenRetainedHistory))
                         .on_click(move |_, window, cx| {
                             entity.update(cx, |app, cx| app.open_retained_history(window, cx));
                         }),
@@ -424,15 +426,8 @@ fn account(
 
 fn notifications(metrics: Metrics, cx: &App) -> AnyElement {
     group(
-        label("NOTIFICATIONS", metrics, cx),
-        pending(
-            "When system permissions allow, eligible incoming messages may raise desktop \
-             notifications while this window is running. Muted, archived, policy-blocked, \
-             self-sent, and currently visible messages are suppressed; an explicit group \
-             mention may still alert. Clicking a notification opens that conversation.",
-            metrics,
-            cx,
-        ),
+        label(crate::tr!(Notifications), metrics, cx),
+        pending(crate::tr!(NotificationsGuidance), metrics, cx),
         metrics,
     )
     .into_any_element()
@@ -444,7 +439,7 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
         .flex_col()
         .gap(metrics.space_xxl())
         .child(group(
-            label("ENCRYPTION", metrics, cx),
+            label(crate::tr!(Encryption), metrics, cx),
             div()
                 .w_full()
                 .flex()
@@ -467,15 +462,12 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
                         .min_w_0()
                         .text_size(metrics.text_small())
                         .text_color(cx.theme().muted_foreground)
-                        .child(
-                            "Messages are end-to-end encrypted. Keys live in this \
-                             device's store and never leave it.",
-                        ),
+                        .child(crate::tr!(PrivacyGuidance)),
                 ),
             metrics,
         ))
         .child(group(
-            label("START OVER", metrics, cx),
+            label(crate::tr!(StartOver), metrics, cx),
             div()
                 .flex()
                 .flex_col()
@@ -486,11 +478,7 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
                         .text_color(cx.theme().muted_foreground)
                         // Named before it is offered: this is the one action
                         // here that cannot be undone.
-                        .child(
-                            "Unlinking clears this device's local data — messages, \
-                             contacts, keys and downloaded media — and starts a new link \
-                             from the QR code.",
-                        ),
+                        .child(crate::tr!(UnlinkGuidance)),
                 )
                 .child(
                     div().flex().child(
@@ -503,7 +491,7 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
                         // surfaces drawn in one frame would share it, for the
                         // one action in the app that erases the account.
                         Button::new("settings-pair-again")
-                            .label("Clear data and pair again")
+                            .label(crate::tr!(ClearDataAndPairAgain))
                             .danger()
                             .outline()
                             .cursor_pointer()
@@ -531,7 +519,7 @@ fn storage(
         .flex_col()
         .gap(metrics.space_xxl())
         .child(group(
-            label("ON DISK", metrics, cx),
+            label(crate::tr!(OnDisk), metrics, cx),
             card(
                 vec![
                     (
@@ -539,20 +527,20 @@ fn storage(
                         // database file, and SQLite cannot report one account's
                         // share of it. Said as the file it is rather than as
                         // this account's private usage.
-                        "Message store (shared)".to_string(),
+                        crate::tr!(MessageStoreShared).to_string(),
                         // Until the first answer arrives. The daemon measures,
                         // and it is another process: there is a frame or two
                         // where the honest thing to show is that nobody has
                         // counted yet.
                         usage.map_or_else(
-                            || "measuring…".to_string(),
+                            || crate::tr!(Measuring).to_string(),
                             |u| format_bytes(u.database_bytes),
                         ),
                     ),
                     (
-                        "Downloaded media".to_string(),
+                        crate::tr!(DownloadedMedia).to_string(),
                         usage.map_or_else(
-                            || "measuring…".to_string(),
+                            || crate::tr!(Measuring).to_string(),
                             |u| {
                                 format!(
                                     "{} · {}",
@@ -569,7 +557,7 @@ fn storage(
             metrics,
         ))
         .child(group(
-            label("MEDIA CACHE", metrics, cx),
+            label(crate::tr!(MediaCache), metrics, cx),
             div()
                 .flex()
                 .flex_col()
@@ -581,15 +569,12 @@ fn storage(
                         // What it costs, so the button is a decision rather
                         // than a dare: the history is untouched and every
                         // message keeps the means to fetch its media again.
-                        .child(
-                            "Clearing the cache keeps every message. Anything you \
-                             open again is downloaded again.",
-                        ),
+                        .child(crate::tr!(CacheGuidance)),
                 )
                 .child(
                     div().flex().child(
                         Button::new("clear-media-cache")
-                            .label("Clear cached media")
+                            .label(crate::tr!(ClearCachedMedia))
                             .outline()
                             .disabled(!can_clear_media)
                             .when(can_clear_media, |button| button.cursor_pointer())
@@ -627,9 +612,9 @@ fn format_bytes(bytes: u64) -> String {
 
 fn files(count: u64) -> String {
     if count == 1 {
-        "1 file".to_string()
+        crate::tr!(OneFile).to_string()
     } else {
-        format!("{count} files")
+        crate::tr!(files, count)
     }
 }
 
@@ -650,7 +635,7 @@ fn advanced(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyEleme
     let kept = oxidezap_logging::location();
 
     group(
-        label("DIAGNOSTICS", metrics, cx),
+        label(crate::tr!(Diagnostics), metrics, cx),
         div()
             .flex()
             .flex_col()
@@ -684,16 +669,16 @@ fn advanced(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyEleme
                 div()
                     .text_size(metrics.text_meta())
                     .text_color(cx.theme().muted_foreground)
-                    .child(active.note()),
+                    .child(crate::i18n::Language::current().log_note(active)),
             )
             .child(card(
                 vec![
-                    ("Log level".to_string(), active.label().to_string()),
+                    (crate::tr!(LogLevel).to_string(), active.label().to_string()),
                     (
-                        "Kept in".to_string(),
-                        kept.unwrap_or_else(|| "nowhere — it lasts for this run".to_string()),
+                        crate::tr!(KeptIn).to_string(),
+                        kept.unwrap_or_else(|| crate::tr!(NowhereItLastsForThisRun).to_string()),
                     ),
-                    ("Renderer".to_string(), "GPUI".to_string()),
+                    (crate::tr!(Renderer).to_string(), "GPUI".to_string()),
                 ],
                 metrics,
                 cx,

@@ -63,10 +63,10 @@ impl AudioLoadState {
     fn status(self) -> Option<&'static str> {
         match self {
             Self::Ready => None,
-            Self::Downloadable => Some("Download"),
-            Self::Downloading => Some("Downloading…"),
-            Self::Preparing => Some("Preparing…"),
-            Self::Unavailable => Some("Unavailable"),
+            Self::Downloadable => Some(crate::tr!(Download)),
+            Self::Downloading => Some(crate::tr!(Downloading)),
+            Self::Preparing => Some(crate::tr!(Preparing)),
+            Self::Unavailable => Some(crate::tr!(Unavailable)),
         }
     }
 
@@ -186,13 +186,13 @@ fn render_play_button(
         AudioLoadState::Unavailable => Icon::from(ProductIcon::Play),
     };
     let tooltip = match state {
-        AudioLoadState::Ready if is_playing => "Pause",
-        AudioLoadState::Ready => "Play",
-        AudioLoadState::Downloadable => "Download audio",
-        AudioLoadState::Downloading => "Downloading audio…",
-        AudioLoadState::Preparing if is_playing => "Pause when audio is ready",
-        AudioLoadState::Preparing => "Play when audio is ready",
-        AudioLoadState::Unavailable => "Audio unavailable",
+        AudioLoadState::Ready if is_playing => crate::tr!(Pause),
+        AudioLoadState::Ready => crate::tr!(Play),
+        AudioLoadState::Downloadable => crate::tr!(DownloadAudio),
+        AudioLoadState::Downloading => crate::tr!(DownloadingAudio),
+        AudioLoadState::Preparing if is_playing => crate::tr!(PauseWhenAudioIsReady),
+        AudioLoadState::Preparing => crate::tr!(PlayWhenAudioIsReady),
+        AudioLoadState::Unavailable => crate::tr!(AudioUnavailable),
     };
 
     Button::new(id)
@@ -330,7 +330,7 @@ fn render_speed_chip(
     } else {
         cx.theme().primary
     })
-    .tooltip("Playback speed")
+    .tooltip(crate::tr!(PlaybackSpeed))
     .cursor_pointer()
     .on_click(move |_, _window, cx| {
         entity.update(cx, |app, cx| app.cycle_playback_speed(cx));

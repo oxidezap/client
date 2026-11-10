@@ -40,10 +40,10 @@ impl ChatFilter {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::All => "All",
-            Self::Unread => "Unread",
-            Self::Groups => "Groups",
-            Self::Archived => "Archived",
+            Self::All => crate::tr!(All),
+            Self::Unread => crate::tr!(Unread),
+            Self::Groups => crate::tr!(Groups),
+            Self::Archived => crate::tr!(Archived),
         }
     }
 
@@ -161,6 +161,7 @@ pub struct ChatListCache {
     /// while a search is running, spent on every frame to conclude that
     /// nothing had changed.
     pub version: u64,
+    pub language: crate::i18n::Language,
     /// How many chats there were in total, unfiltered. `Vec::len`, so it is
     /// free, and it catches an addition or a removal that reached the list
     /// without announcing itself.

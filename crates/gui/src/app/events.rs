@@ -421,7 +421,7 @@ impl WhatsAppApp {
             UiEvent::CallMediaFailed { call_id, reason } => {
                 warn!("Call {call_id} could not bring up media: {reason}");
                 self.notify_user(
-                    format!("The call could not be connected: {reason}"),
+                    crate::tr!(call_failed, reason),
                     crate::app::notices::Tone::Problem,
                     cx,
                 );
@@ -434,7 +434,7 @@ impl WhatsAppApp {
             UiEvent::CallVideoUnavailable { call_id, reason } => {
                 warn!("Call {call_id} is continuing without video: {reason}");
                 self.notify_user(
-                    format!("The camera could not be opened: {reason}"),
+                    crate::tr!(camera_failed, reason),
                     crate::app::notices::Tone::Problem,
                     cx,
                 );

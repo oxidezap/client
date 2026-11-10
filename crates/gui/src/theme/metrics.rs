@@ -105,8 +105,8 @@ impl Density {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Compact => "Compact",
-            Self::Comfortable => "Comfortable",
+            Self::Compact => crate::tr!(Compact),
+            Self::Comfortable => crate::tr!(Comfortable),
         }
     }
 

@@ -84,7 +84,7 @@ impl DeviceUi {
         } else {
             format!(
                 "{} Camera is still stopping. Press Stop camera preview to retry.",
-                failure.unwrap_or_else(|| "Preview ended.".into())
+                failure.unwrap_or_else(|| crate::tr!(PreviewEnded).into())
             )
         };
     }
@@ -176,19 +176,45 @@ impl WhatsAppApp {
         cx.spawn(async move |_, cx| {
             if let Some(id) = id {
                 let waiting = client.call_devices(Action::CancelPreview { preview_id: id });
-                if !matches!(crate::platform::with_timeout(waiting, Duration::from_secs(7)).await, Some(Ok(Ok(Reply::Stopped { .. })))) {
+                if !matches!(
+                    crate::platform::with_timeout(waiting, Duration::from_secs(7)).await,
+                    Some(Ok(Ok(Reply::Stopped { .. })))
+                ) {
                     let _ = entity.update(cx, |app, cx| {
-                        app.settings.update(cx, |s, cx| { if s.epoch() != epoch || s.devices.pending_call.as_ref() != Some(&(jid.clone(), video)) { return; } s.devices.confirming = false; s.devices.status = "Camera has not finished stopping. Try again before placing the call.".into(); cx.notify(); });
+                        app.settings.update(cx, |s, cx| {
+                            if s.epoch() != epoch
+                                || s.devices.pending_call.as_ref() != Some(&(jid.clone(), video))
+                            {
+                                return;
+                            }
+                            s.devices.confirming = false;
+                            s.devices.status = crate::tr!(
+                                CameraHasNotFinishedStoppingTryAgainBeforePlacingTheCall
+                            )
+                            .into();
+                            cx.notify();
+                        });
                     });
                     return;
                 }
             }
             let _ = entity.update(cx, |app, cx| {
-                if app.settings.read(cx).epoch() != epoch || app.settings.read(cx).devices.pending_call.as_ref() != Some(&(jid.clone(), video)) { return; }
-                app.settings.update(cx, |s, cx| { s.devices.confirming = false; s.devices.pending_call = None; s.devices.approved_call = Some((jid.clone(), video)); s.close(cx); });
+                if app.settings.read(cx).epoch() != epoch
+                    || app.settings.read(cx).devices.pending_call.as_ref()
+                        != Some(&(jid.clone(), video))
+                {
+                    return;
+                }
+                app.settings.update(cx, |s, cx| {
+                    s.devices.confirming = false;
+                    s.devices.pending_call = None;
+                    s.devices.approved_call = Some((jid.clone(), video));
+                    s.close(cx);
+                });
                 app.start_call(jid, video, cx);
             });
-        }).detach();
+        })
+        .detach();
     }
 
     pub fn refresh_call_device_preferences(&mut self, cx: &mut Context<Self>) {
@@ -211,7 +237,7 @@ impl WhatsAppApp {
             self.settings.update(cx, |s, cx| {
                 if !s.devices.preferences_ready {
                     s.devices.status =
-                        "Refresh saved device settings before making changes.".into();
+                        crate::tr!(RefreshSavedDeviceSettingsBeforeMakingChanges).into();
                 }
                 cx.notify();
             });
@@ -233,7 +259,7 @@ impl WhatsAppApp {
     fn device_request(&mut self, action: Action, cx: &mut Context<Self>) {
         let Some(client) = &self.client else {
             self.settings.update(cx, |s, cx| {
-                s.devices.status = "Connect to the daemon to configure devices".into();
+                s.devices.status = crate::tr!(ConnectToTheDaemonToConfigureDevices).into();
                 cx.notify();
             });
             return;
@@ -284,7 +310,7 @@ impl WhatsAppApp {
                     Some(Ok(Err(e))) => s.devices.status = e,
                     _ => {
                         s.devices.status =
-                            "Device request did not finish. Refresh devices and try again.".into()
+                            crate::tr!(DeviceRequestDidNotFinishRefreshDevicesAndTryAgain).into()
                     }
                 }
                 let preview = inventory_finished
@@ -323,20 +349,33 @@ impl WhatsAppApp {
             let settings = self.settings.clone();
             let epoch = settings.read(cx).epoch();
             cx.spawn(async move |_, cx| {
-                let stopped = matches!(crate::platform::with_timeout(waiting, Duration::from_secs(7)).await, Some(Ok(Ok(Reply::Stopped { .. }))));
+                let stopped = matches!(
+                    crate::platform::with_timeout(waiting, Duration::from_secs(7)).await,
+                    Some(Ok(Ok(Reply::Stopped { .. })))
+                );
                 settings.update(cx, |s, cx| {
-                    if s.epoch() != epoch || s.devices.stopping != Some(id) { return; }
-                    if stopped { s.devices.stopping = None; } else { s.devices.status = "Camera is still stopping. Press Stop camera preview to retry before calling.".into(); }
+                    if s.epoch() != epoch || s.devices.stopping != Some(id) {
+                        return;
+                    }
+                    if stopped {
+                        s.devices.stopping = None;
+                    } else {
+                        s.devices.status = crate::tr!(
+                            CameraIsStillStoppingPressStopCameraPreviewToRetryBeforeCalling
+                        )
+                        .into();
+                    }
                     cx.notify();
                 });
-            }).detach();
+            })
+            .detach();
         }
     }
 
     pub fn start_camera_preview(&mut self, cx: &mut Context<Self>) {
         if self.call_state(cx).is_busy() {
             self.settings.update(cx, |s, cx| {
-                s.devices.status = "End the current call before opening a camera preview.".into();
+                s.devices.status = crate::tr!(EndTheCurrentCallBeforeOpeningACameraPreview).into();
                 cx.notify();
             });
             return;
@@ -352,7 +391,7 @@ impl WhatsAppApp {
         let id = settings.update(cx, |s, cx| {
             let id = s.devices.admission.begin()?;
             s.devices.preview = Some(id);
-            s.devices.status = "Opening camera preview…".into();
+            s.devices.status = crate::tr!(OpeningCameraPreview).into();
             cx.notify();
             Some(id)
         });
@@ -365,7 +404,7 @@ impl WhatsAppApp {
             let mut failure = match started {
                 Some(Ok(Ok(Reply::Preview { .. }))) => None,
                 Some(Ok(Err(e))) => Some(e),
-                _ => Some("Camera preview did not start".into()),
+                _ => Some(crate::tr!(CameraPreviewDidNotStart).into()),
             };
             let decoder = Arc::new(std::sync::Mutex::new(PreviewDecoder::default()));
             while failure.is_none() {
@@ -409,7 +448,7 @@ impl WhatsAppApp {
                                         s.devices.image = Some(image);
                                     }
                                     s.devices.status =
-                                        "Preview only. Your camera is not being sent to anyone."
+                                        crate::tr!(PreviewOnlyYourCameraIsNotBeingSentToAnyone)
                                             .into();
                                     cx.notify();
                                 });
@@ -420,7 +459,7 @@ impl WhatsAppApp {
                         }
                     }
                     Some(Ok(Err(e))) => failure = Some(e),
-                    _ => failure = Some("Camera preview stopped responding".into()),
+                    _ => failure = Some(crate::tr!(CameraPreviewStoppedResponding).into()),
                 }
                 crate::platform::sleep(Duration::from_millis(30)).await;
             }

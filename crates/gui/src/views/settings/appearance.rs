@@ -22,18 +22,18 @@ pub fn render(
     cx: &App,
 ) -> impl IntoElement + use<> {
     div()
+        .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
         .gap(metrics.space_xxl())
         .max_w(metrics.reading_width())
+        .child(render_language(settings, entity.clone(), metrics, cx))
         .child(render_presets(settings, entity.clone(), metrics, cx))
-        .child(
-            div()
-                .flex()
-                .gap(metrics.space_xxl())
-                .child(render_density(settings, entity.clone(), metrics, cx))
-                .child(render_font_size(settings, entity.clone(), metrics, cx)),
-        )
+        // Each control group gets the reading column. Translated descriptions
+        // must wrap within it instead of sizing a neighbouring flex column.
+        .child(render_density(settings, entity.clone(), metrics, cx))
+        .child(render_font_size(settings, entity.clone(), metrics, cx))
         .child(render_theme_file(settings, entity, metrics, cx))
 }
 
@@ -53,7 +53,7 @@ fn render_presets(
     let is_custom = settings.draft.palette != active.palette();
 
     group(
-        label("THEME PRESET", metrics, cx),
+        label(crate::tr!(ThemePreset), metrics, cx),
         div()
             .flex()
             .flex_wrap()
@@ -224,7 +224,7 @@ fn render_custom_card(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(metrics.text_micro())
                         .text_color(cx.theme().muted_foreground)
-                        .child("edited by hand"),
+                        .child(crate::tr!(EditedByHand)),
                 ),
         )
         .child(
@@ -232,7 +232,7 @@ fn render_custom_card(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
                 .w_full()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().foreground)
-                .child("Custom"),
+                .child(crate::tr!(Custom)),
         )
 }
 
@@ -245,9 +245,10 @@ fn render_density(
     let active = settings.draft.density;
 
     group(
-        label("DENSITY", metrics, cx),
+        label(crate::tr!(Density), metrics, cx),
         div()
             .flex()
+            .flex_wrap()
             .gap(metrics.space_md())
             // `Button`s, because picking a density changes application
             // state: a styled `div` carries no focus handle and no keyboard
@@ -290,10 +291,11 @@ fn render_font_size(
     group(
         div()
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap(metrics.space_lg())
-            .child(label("BASE FONT SIZE", metrics, cx))
+            .child(label(crate::tr!(BaseFontSize), metrics, cx))
             .child(
                 div()
                     .font_family(cx.theme().mono_font_family.clone())
@@ -307,6 +309,9 @@ fn render_font_size(
             .gap(metrics.space_md())
             .child(
                 div()
+                    .debug_selector(|| "settings-font-controls".into())
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .gap(metrics.space_md())
@@ -315,7 +320,7 @@ fn render_font_size(
                             .icon(IconName::Minus)
                             .outline()
                             .small()
-                            .tooltip("Smaller")
+                            .tooltip(crate::tr!(Smaller))
                             .disabled(size <= MIN_FONT_SIZE)
                             .when(size > MIN_FONT_SIZE, |button| button.cursor_pointer())
                             .on_click(move |_, window, cx| {
@@ -328,7 +333,7 @@ fn render_font_size(
                             .icon(IconName::Plus)
                             .outline()
                             .small()
-                            .tooltip("Larger")
+                            .tooltip(crate::tr!(Larger))
                             .disabled(size >= MAX_FONT_SIZE)
                             .when(size < MAX_FONT_SIZE, |button| button.cursor_pointer())
                             .on_click(move |_, window, cx| {
@@ -338,9 +343,11 @@ fn render_font_size(
             )
             .child(
                 div()
+                    .debug_selector(|| "settings-font-description".into())
+                    .min_w_0()
                     .text_size(metrics.text_small())
                     .text_color(cx.theme().muted_foreground)
-                    .child("Spacing, controls and icons scale with this, not just text."),
+                    .child(crate::tr!(SpacingControlsAndIconsScaleWithThisNotJustText)),
             ),
         metrics,
     )
@@ -372,7 +379,7 @@ fn render_theme_file(
 ) -> impl IntoElement + use<> {
     let path = settings
         .config_location()
-        .unwrap_or_else(|| "nowhere to keep a theme on this platform".to_string());
+        .unwrap_or_else(|| crate::tr!(NowhereToKeepAThemeOnThisPlatform).to_string());
     let problems = settings.draft.problems.clone();
     let is_dirty = settings.is_dirty();
 
@@ -382,19 +389,23 @@ fn render_theme_file(
 
     group(
         div()
+            .debug_selector(|| "settings-theme-file-header".into())
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap(metrics.space_lg())
-            .child(label("THEME FILE", metrics, cx))
+            .child(label(crate::tr!(ThemeFile), metrics, cx))
             .child(
                 div()
+                    .debug_selector(|| "settings-theme-file-actions".into())
                     .flex()
+                    .flex_wrap()
                     .gap(metrics.space_md())
                     .when(is_dirty, |el| {
                         el.child(
                             Button::new("theme-revert")
-                                .label("Revert")
+                                .label(crate::tr!(Revert))
                                 .ghost()
                                 .small()
                                 .cursor_pointer()
@@ -406,10 +417,10 @@ fn render_theme_file(
                     })
                     .child(
                         Button::new("theme-reload")
-                            .label("Reload")
+                            .label(crate::tr!(Reload))
                             .outline()
                             .small()
-                            .tooltip("Re-read the file from disk")
+                            .tooltip(crate::tr!(ReReadTheFileFromDisk))
                             .cursor_pointer()
                             .on_click(move |_, window, cx| {
                                 reload_entity.update(cx, |app, cx| app.reload_theme(window, cx));
@@ -417,7 +428,7 @@ fn render_theme_file(
                     )
                     .child(
                         Button::new("theme-save")
-                            .label("Save")
+                            .label(crate::tr!(Save))
                             .primary()
                             .small()
                             .disabled(!is_dirty)
@@ -433,6 +444,9 @@ fn render_theme_file(
             .gap(metrics.space_md())
             .child(
                 div()
+                    .id("theme-location")
+                    .min_w_0()
+                    .overflow_x_scroll()
                     .p(metrics.space_lg())
                     .rounded(metrics.radius_md())
                     .bg(cx.theme().background)
@@ -449,6 +463,8 @@ fn render_theme_file(
             .child(
                 div()
                     .id("theme-json")
+                    .min_w_0()
+                    .overflow_x_scroll()
                     .max_h(metrics.config_block_height())
                     .overflow_y_scroll()
                     .p(metrics.space_lg())
@@ -487,8 +503,7 @@ fn render_theme_file(
                                 .child(
                                     // The point of the fallback: nothing broke,
                                     // some keys were simply not applied.
-                                    "Some of the file could not be applied. \
-                                     The rest of the theme is unchanged.",
+                                    crate::tr!(ThemeWarning),
                                 ),
                         )
                         .children(problems.into_iter().map(|problem| {
@@ -500,6 +515,42 @@ fn render_theme_file(
                         })),
                 )
             }),
+        metrics,
+    )
+}
+
+fn render_language(
+    settings: &SettingsState,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    group(
+        label(crate::tr!(Language), metrics, cx),
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_md())
+            .child(div().flex().flex_wrap().gap(metrics.space_md()).children(
+                crate::i18n::Language::ALL.into_iter().map(|language| {
+                    let entity = entity.clone();
+                    Button::new(SharedString::from(format!("language-{}", language.code())))
+                        .label(language.name())
+                        .outline()
+                        .selected(settings.draft.language == language)
+                        .on_click(move |_, window, cx| {
+                            entity.update(cx, |app, cx| app.set_language(language, window, cx));
+                        })
+                }),
+            ))
+            .child(
+                div()
+                    .text_size(metrics.text_small())
+                    .text_color(cx.theme().muted_foreground)
+                    .child(crate::tr!(
+                        LanguageChangesApplyImmediatelySaveToKeepThisChoice
+                    )),
+            ),
         metrics,
     )
 }

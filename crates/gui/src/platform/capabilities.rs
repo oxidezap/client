@@ -116,7 +116,7 @@ mod imp {
         let global = js_sys::global();
         match js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("VideoDecoder")) {
             Ok(found) if !found.is_undefined() && !found.is_null() => None,
-            _ => Some("Videos cannot be played in this browser."),
+            _ => Some(crate::tr!(VideosNotSupported)),
         }
     }
 
@@ -141,10 +141,7 @@ mod imp {
             // `Rejected` answered like `Nobody`, as above: the window is on
             // the refusal screen and drawing no call control either way.
             _ if has_peer_connection() => None,
-            _ => Some(
-                "This browser has no RTCPeerConnection, which is what carries \
-                 a call's media here.",
-            ),
+            _ => Some(crate::tr!(NoPeerConnection)),
         }
     }
 
@@ -175,10 +172,7 @@ mod imp {
         {
             return None;
         }
-        Some(
-            "This tab is showing an account another tab is running, so a call \
-             would use that tab's microphone and speakers. Use that tab.",
-        )
+        Some(crate::tr!(CallInOtherTab))
     }
 
     /// Whether the agent this page runs in defines `RTCPeerConnection`.

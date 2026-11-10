@@ -28,18 +28,18 @@ impl Step {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Loading => "Opening your message store",
-            Self::Connecting => "Connecting to WhatsApp",
-            Self::Syncing => "Syncing recent chats",
+            Self::Loading => crate::tr!(OpeningYourMessageStore),
+            Self::Connecting => crate::tr!(ConnectingToWhatsapp),
+            Self::Syncing => crate::tr!(SyncingRecentChats),
         }
     }
 
     /// The headline while this step is the current one.
     fn title(self) -> &'static str {
         match self {
-            Self::Loading => "Starting up",
-            Self::Connecting => "Connecting",
-            Self::Syncing => "Almost there",
+            Self::Loading => crate::tr!(StartingUp),
+            Self::Connecting => crate::tr!(Connecting),
+            Self::Syncing => crate::tr!(AlmostThere),
         }
     }
 }

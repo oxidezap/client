@@ -74,9 +74,9 @@ pub fn live_header(
                         .ghost()
                         .xsmall()
                         .tooltip(if maximized {
-                            "Restore call view"
+                            crate::tr!(RestoreCallView)
                         } else {
-                            "Maximize call view"
+                            crate::tr!(MaximizeCallView)
                         })
                         .cursor_pointer()
                         .on_click(move |_, _window, cx| {
@@ -88,7 +88,7 @@ pub fn live_header(
                         .icon(ProductIcon::MinimizeCard)
                         .ghost()
                         .xsmall()
-                        .tooltip("Minimise")
+                        .tooltip(crate::tr!(Minimise))
                         .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             minimize_entity.update(cx, |app, cx| app.set_call_minimized(true, cx));
@@ -99,7 +99,7 @@ pub fn live_header(
                         .icon(ProductIcon::PhoneOff)
                         .ghost()
                         .xsmall()
-                        .tooltip("End call")
+                        .tooltip(crate::tr!(EndCall))
                         .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             end_entity.update(cx, |app, cx| app.hang_up(cx));
@@ -121,7 +121,7 @@ pub fn active_audio(
         .flex()
         .flex_col()
         .child(live_header(
-            "on call".to_string(),
+            crate::tr!(OnCall).to_string(),
             entity.clone(),
             metrics,
             maximized,
@@ -175,9 +175,9 @@ pub fn active_audio(
                         .id("call-mic-state")
                         .tooltip({
                             let label = if call.muted {
-                                "Your microphone is muted"
+                                crate::tr!(YourMicrophoneIsMuted)
                             } else {
-                                "Your microphone is on"
+                                crate::tr!(YourMicrophoneIsOn)
                             };
                             move |window, cx| {
                                 gpui_component::tooltip::Tooltip::new(label).build(window, cx)
@@ -253,7 +253,11 @@ fn controls(
         .justify_center()
         .gap(metrics.space_lg())
         .child(labelled(
-            if muted { "Unmute" } else { "Mute" },
+            if muted {
+                crate::tr!(Unmute)
+            } else {
+                crate::tr!(Mute)
+            },
             metrics,
             cx,
             round(
@@ -263,7 +267,11 @@ fn controls(
                 } else {
                     ProductIcon::Mic.into()
                 },
-                if muted { "Unmute" } else { "Mute" },
+                if muted {
+                    crate::tr!(Unmute)
+                } else {
+                    crate::tr!(Mute)
+                },
             )
             // Muted is a persistent state, not a hover: it stays lit until
             // it is turned off.
@@ -277,13 +285,13 @@ fn controls(
         // these land, and a tooltip explains the state rather than leaving a
         // dead button to be discovered.
         .child(labelled(
-            "Output",
+            crate::tr!(Output),
             metrics,
             cx,
             round(
                 "call-audio-device",
                 ProductIcon::Volume.into(),
-                "Choosing an output device is not supported yet",
+                crate::tr!(ChoosingAnOutputDeviceIsNotSupportedYet),
             )
             .disabled(true),
         ))
@@ -297,18 +305,18 @@ fn controls(
         // reads as a click that did nothing — so the next click cancels the
         // enable it was meant to repeat.
         .child(labelled(
-            "Video",
+            crate::tr!(Video),
             metrics,
             cx,
             round(
                 "call-video",
                 ProductIcon::Video.into(),
                 if coming_on {
-                    "Turning the camera on…"
+                    crate::tr!(TurningTheCameraOn)
                 } else if asked {
-                    "They asked for video — turn the camera on"
+                    crate::tr!(TheyAskedForVideoTurnTheCameraOn)
                 } else {
-                    "Turn the camera on"
+                    crate::tr!(TurnTheCameraOn)
                 },
             )
             .selected(asked || coming_on)
@@ -318,26 +326,30 @@ fn controls(
             }),
         ))
         .child(labelled(
-            "Add",
+            crate::tr!(Add),
             metrics,
             cx,
             round(
                 "call-add",
                 ProductIcon::UserPlus.into(),
-                "Group calls are not supported yet",
+                crate::tr!(GroupCallsAreNotSupportedYet),
             )
             .disabled(true),
         ))
         .child(labelled(
-            "End",
+            crate::tr!(End),
             metrics,
             cx,
-            round("call-end", ProductIcon::PhoneOff.into(), "End call")
-                .danger()
-                .cursor_pointer()
-                .on_click(move |_, _window, cx| {
-                    end_entity.update(cx, |app, cx| app.hang_up(cx));
-                }),
+            round(
+                "call-end",
+                ProductIcon::PhoneOff.into(),
+                crate::tr!(EndCall),
+            )
+            .danger()
+            .cursor_pointer()
+            .on_click(move |_, _window, cx| {
+                end_entity.update(cx, |app, cx| app.hang_up(cx));
+            }),
         ))
 }
 

@@ -19,6 +19,7 @@
 mod app;
 mod assets;
 mod components;
+mod i18n;
 mod platform;
 mod responsive;
 mod retained_image;

@@ -183,7 +183,7 @@ fn waiting_strip(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let label = format!("{} is also calling", crate::utils::capped_name(caller_name));
+    let label = crate::tr!(also_calling, crate::utils::capped_name(caller_name));
 
     div()
         .flex()
@@ -208,7 +208,7 @@ fn waiting_strip(
                 .icon(ProductIcon::PhoneOff)
                 .danger()
                 .small()
-                .tooltip("Decline the waiting call")
+                .tooltip(crate::tr!(DeclineTheWaitingCall))
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| app.decline_waiting_call(cx));
@@ -425,7 +425,7 @@ fn minimized_pill(
                 .icon(Icon::new(IconName::Maximize))
                 .ghost()
                 .small()
-                .tooltip("Return to call")
+                .tooltip(crate::tr!(ReturnToCall))
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     expand_entity.update(cx, |app, cx| app.set_call_minimized(false, cx));
@@ -436,7 +436,7 @@ fn minimized_pill(
                 .icon(ProductIcon::PhoneOff)
                 .danger()
                 .small()
-                .tooltip("End call")
+                .tooltip(crate::tr!(EndCall))
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     end_entity.update(cx, |app, cx| app.hang_up(cx));
@@ -469,7 +469,7 @@ fn mobile_banner(
     let name = stage.peer_name().to_string();
     let detail = match stage {
         Stage::Active(call) => call.elapsed_label(),
-        Stage::Incoming(_) => "incoming call".to_string(),
+        Stage::Incoming(_) => crate::tr!(IncomingCall).to_string(),
         Stage::Outgoing(call) => outgoing_label(call).to_string(),
     };
 
@@ -530,7 +530,7 @@ fn mobile_banner(
                 Button::new("call-accept")
                     .icon(ProductIcon::Phone)
                     .primary()
-                    .tooltip("Accept")
+                    .tooltip(crate::tr!(Accept))
                     .h(metrics.touch_target())
                     .cursor_pointer()
                     .on_click(move |_, _window, cx| {
@@ -548,11 +548,11 @@ fn mobile_banner(
                 .ghost()
                 .selected(on || asked_for_video)
                 .tooltip(if on {
-                    "Turn the camera off"
+                    crate::tr!(TurnTheCameraOff)
                 } else if asked_for_video {
-                    "They asked for video — turn the camera on"
+                    crate::tr!(TheyAskedForVideoTurnTheCameraOn)
                 } else {
-                    "Turn the camera on"
+                    crate::tr!(TurnTheCameraOn)
                 })
                 .h(metrics.touch_target())
                 .cursor_pointer()
@@ -565,9 +565,9 @@ fn mobile_banner(
                 .icon(ProductIcon::PhoneOff)
                 .danger()
                 .tooltip(match stage {
-                    Stage::Incoming(_) => "Decline",
-                    Stage::Outgoing(_) => "Cancel",
-                    Stage::Active(_) => "End call",
+                    Stage::Incoming(_) => crate::tr!(Decline),
+                    Stage::Outgoing(_) => crate::tr!(Cancel),
+                    Stage::Active(_) => crate::tr!(EndCall),
                 })
                 .h(metrics.touch_target())
                 .cursor_pointer()
@@ -581,10 +581,10 @@ fn mobile_banner(
 fn outgoing_label(call: &oxidezap_core::OutgoingCall) -> &'static str {
     use oxidezap_core::OutgoingCallState;
     match call.state {
-        OutgoingCallState::Initiating => "calling…",
-        OutgoingCallState::Ringing => "ringing…",
+        OutgoingCallState::Initiating => crate::tr!(Calling),
+        OutgoingCallState::Ringing => crate::tr!(Ringing),
         OutgoingCallState::Connected => "connected",
         OutgoingCallState::Declined => "declined",
-        OutgoingCallState::Timeout => "no answer",
+        OutgoingCallState::Timeout => crate::tr!(NoAnswer),
     }
 }

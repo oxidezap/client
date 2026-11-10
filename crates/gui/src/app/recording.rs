@@ -104,15 +104,15 @@ impl Recorder {
         // anything else that reaches the action directly.
         if !oxidezap_audio::can_record() {
             warn!("this build cannot record a voice note");
-            return Err("Voice messages cannot be recorded in this browser.".to_string());
+            return Err(crate::tr!(VoiceMessagesCannotBeRecordedInThisBrowserNotice).to_string());
         }
         if let Err(e) = self.device.init() {
             error!("Failed to initialize audio recorder: {}", e);
-            return Err("The microphone could not be opened.".to_string());
+            return Err(crate::tr!(TheMicrophoneCouldNotBeOpened).to_string());
         }
         if let Err(e) = self.device.start() {
             error!("Failed to start recording: {}", e);
-            return Err("Recording could not be started.".to_string());
+            return Err(crate::tr!(RecordingCouldNotBeStarted).to_string());
         }
 
         self.state = RecordingState::Recording;
@@ -152,7 +152,7 @@ impl Recorder {
                 // microphone after that — a notice about a microphone that is
                 // still open is the worse half of that bug, not a fix for it.
                 self.cancel(composer, cx);
-                Stopped::Refused("The recording could not be stopped.".to_string())
+                Stopped::Refused(crate::tr!(TheRecordingCouldNotBeStopped).to_string())
             }
         }
     }
@@ -301,7 +301,7 @@ impl WhatsAppApp {
             // vanishes with the reason only in a log is the worst of the
             // three ways this can end.
             self.notify_user(
-                "That recording could not be sent: not connected.".to_string(),
+                crate::tr!(ThatRecordingCouldNotBeSentNotConnected).to_string(),
                 crate::app::notices::Tone::Problem,
                 cx,
             );
@@ -334,7 +334,7 @@ impl WhatsAppApp {
         if self.client.is_none() {
             warn!("Cannot send audio: not connected to the daemon");
             self.notify_user(
-                "That recording could not be sent: not connected.".to_string(),
+                crate::tr!(ThatRecordingCouldNotBeSentNotConnected).to_string(),
                 crate::app::notices::Tone::Problem,
                 cx,
             );
@@ -410,18 +410,18 @@ impl WhatsAppApp {
                 // else drops that receiver. Said rather than swallowed,
                 // because the person watched themselves record this.
                 if prepared.send(ready).is_err() {
-                    return Err("the recording ended before it was encoded".to_string());
+                    return Err(crate::tr!(TheRecordingEndedBeforeItWasEncoded).to_string());
                 }
                 let note = note
                     .await
-                    .map_err(|_| "the recording ended before it was encoded".to_string())?
+                    .map_err(|_| crate::tr!(TheRecordingEndedBeforeItWasEncoded).to_string())?
                     .map_err(|e| e.to_string())?;
                 (note.bytes, note.waveform, note.duration_secs)
             }
         };
 
         if duration_secs < 1 {
-            return Err("that recording was too short to send".to_string());
+            return Err(crate::tr!(ThatRecordingWasTooShortToSend).to_string());
         }
         Ok((bytes, waveform, duration_secs))
     }
@@ -450,7 +450,7 @@ impl WhatsAppApp {
         if self.client.is_none() {
             warn!("Cannot send audio: client is unavailable");
             self.notify_user(
-                "That recording could not be sent: not connected.".to_string(),
+                crate::tr!(ThatRecordingCouldNotBeSentNotConnected).to_string(),
                 crate::app::notices::Tone::Problem,
                 cx,
             );

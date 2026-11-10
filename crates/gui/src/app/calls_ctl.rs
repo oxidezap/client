@@ -581,9 +581,9 @@ impl Calls {
             tag: key.tag().into(),
             title: crate::utils::capped_name(&call.caller_name).into(),
             body: if call.is_video {
-                "Incoming video call"
+                crate::tr!(IncomingVideoCallNotice)
             } else {
-                "Incoming voice call"
+                crate::tr!(IncomingVoiceCallNotice)
             }
             .into(),
             actions: Vec::new(),
@@ -837,7 +837,7 @@ impl WhatsAppApp {
         {
             self.cancel_camera_preview(cx);
             self.notify_user(
-                "Camera preview is still stopping. Answer again when it closes.",
+                crate::tr!(CameraPreviewIsStillStoppingAnswerAgainWhenItCloses),
                 crate::app::notices::Tone::Problem,
                 cx,
             );
@@ -864,7 +864,7 @@ impl WhatsAppApp {
         {
             warn!("Accepting a video call this window cannot draw: {reason}");
             self.notify_user(
-                "This browser cannot show video, so you will hear this call but not see it.",
+                crate::tr!(ThisBrowserCannotShowVideoSoYouWillHearThisCallButNotSeeIt),
                 crate::app::notices::Tone::Problem,
                 cx,
             );
@@ -1131,7 +1131,7 @@ impl WhatsAppApp {
                 Some(reason) => {
                     warn!("Placing this call as voice: {reason}");
                     self.notify_user(
-                        "This browser cannot show video, so this is a voice call.",
+                        crate::tr!(ThisBrowserCannotShowVideoSoThisIsAVoiceCall),
                         crate::app::notices::Tone::Problem,
                         cx,
                     );
@@ -1151,7 +1151,7 @@ impl WhatsAppApp {
         let recipient_name = self
             .find_chat(&recipient_jid)
             .map(|chat| chat.name.clone())
-            .unwrap_or_else(|| "Unknown contact".to_string());
+            .unwrap_or_else(|| crate::tr!(UnknownContact).to_string());
 
         info!(
             "Starting {} call to {}",

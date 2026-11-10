@@ -51,11 +51,11 @@ pub fn render_poll(
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().muted_foreground)
                 .child(if poll.selectable_count > 1 {
-                    "Multiple choices · voting unavailable here"
+                    crate::tr!(MultipleChoicesVotingUnavailableHere)
                 } else if attempted_vote.is_some() {
-                    "Vote requested · not confirmed · tap to retry"
+                    crate::tr!(VoteRequestedNotConfirmedTapToRetry)
                 } else {
-                    "Select one"
+                    crate::tr!(SelectOne)
                 }),
         )
         .children(
@@ -87,9 +87,9 @@ pub fn render_poll(
                         .w_full()
                         .disabled(poll.selectable_count > 1)
                         .tooltip(if poll.selectable_count > 1 {
-                            "Multiple-choice voting requires synchronized ballots".to_string()
+                            crate::tr!(MultipleChoiceVotingRequiresSynchronizedBallots).to_string()
                         } else {
-                            format!("Vote for {option}")
+                            crate::tr!(vote_for, option)
                         })
                         .on_click(move |_, _, cx| {
                             vote_entity.update(cx, |app, cx| {
@@ -119,7 +119,7 @@ pub fn render_poll(
                                                 .flex_shrink_0()
                                                 .text_size(metrics.text_small())
                                                 .text_color(cx.theme().primary)
-                                                .child("Requested")
+                                                .child(crate::tr!(Requested))
                                         }))
                                         .children(count.map(|count| {
                                             div()

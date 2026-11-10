@@ -576,7 +576,7 @@ impl WhatsAppApp {
         // page is explicitly requested by the status view, so materialize a
         // store-backed row before merging the returned updates.
         if jid == oxidezap_core::STATUS_BROADCAST_JID && self.find_chat(&jid).is_none() {
-            let status = Chat::from_store(jid.clone(), "Status".into(), 0);
+            let status = Chat::from_store(jid.clone(), crate::tr!(Status).into(), 0);
             self.chats.push(std::sync::Arc::new(status));
         }
         let Some(chat) = self.find_chat_mut(&jid) else {

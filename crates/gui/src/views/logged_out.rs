@@ -29,14 +29,11 @@ pub fn render_logged_out_view(
             cx,
         ))
         .child(
-            parts::screen_message("Session ended", message.to_string(), cx).child(
+            parts::screen_message(crate::tr!(SessionEnded), message.to_string(), cx).child(
                 div()
                     .text_size(metrics.text_small())
                     .text_color(parts::subtle(cx))
-                    .child(
-                        "Read retained messages and cached media locally. WhatsApp requests are blocked offline. \
-                         Pairing again uses a separate local account and keeps this history.",
-                    ),
+                    .child(crate::tr!(OfflineHistoryGuidance)),
             ),
         )
         .child(
@@ -46,7 +43,7 @@ pub fn render_logged_out_view(
                 .gap(metrics.space_lg())
                 .child(
                     Button::new("logged-out-offline")
-                        .label("Read local history offline")
+                        .label(crate::tr!(ReadLocalHistoryOffline))
                         .primary()
                         .on_click(move |_, _, cx| {
                             entity.update(cx, |this, cx| this.work_offline(cx));
@@ -54,12 +51,13 @@ pub fn render_logged_out_view(
                 )
                 .child(
                     Button::new("logged-out-pair-again")
-                        .label("Pair again")
+                        .label(crate::tr!(PairAgain))
                         .outline()
                         .cursor_pointer()
                         .on_click(move |_, window, cx| {
-                            pair_entity
-                                .update(cx, |this, cx| this.pair_again_retaining_history(window, cx));
+                            pair_entity.update(cx, |this, cx| {
+                                this.pair_again_retaining_history(window, cx)
+                            });
                         }),
                 ),
         )

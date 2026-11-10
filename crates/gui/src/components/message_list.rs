@@ -82,9 +82,9 @@ pub fn render_message_list(
             .items_center()
             .p(metrics.space_xxxl())
             .child(
-                EmptyState::new("No messages yet")
+                EmptyState::new(crate::tr!(NoMessagesYet))
                     .icon(ProductIcon::MessageSquare)
-                    .description("Say something to start this conversation."),
+                    .description(crate::tr!(SaySomethingToStartThisConversation)),
             )
             .into_any_element();
     }
@@ -367,7 +367,7 @@ fn render_typing(
 ) -> impl IntoElement + use<> {
     let typists = summary.typists.clone();
     let overflow = summary.overflow();
-    let label = summary.label();
+    let label = crate::i18n::Language::current().typing(summary, is_group, false);
     // A single typist in a group gets their own colour on the dots; a crowd
     // stays neutral, because no one hue would be honest.
     let dot_colour = if is_group && summary.total == 1 {

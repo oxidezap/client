@@ -117,7 +117,7 @@ pub fn render_paste_preview(props: PastePreviewProps<'_>, cx: &App) -> impl Into
                         .debug_selector(|| "paste-preview-cancel".into())
                         .child(
                             Button::new("paste-preview-cancel-button")
-                                .label("Cancel")
+                                .label(crate::tr!(Cancel))
                                 .cursor_pointer()
                                 .on_click({
                                     let app = app.clone();
@@ -135,7 +135,7 @@ pub fn render_paste_preview(props: PastePreviewProps<'_>, cx: &App) -> impl Into
                         .debug_selector(|| "paste-preview-send".into())
                         .child(
                             Button::new("paste-preview-send-button")
-                                .label("Send")
+                                .label(crate::tr!(Send))
                                 .primary()
                                 .disabled(!can_send)
                                 .when(can_send, |button| button.cursor_pointer())
@@ -151,12 +151,12 @@ pub fn render_paste_preview(props: PastePreviewProps<'_>, cx: &App) -> impl Into
 /// What the modal is confirming, in one line.
 fn title_for(files: &[PreviewFile]) -> String {
     if files.len() > 1 {
-        return format!("Send {} files?", files.len());
+        return crate::tr!(send_files, files.len());
     }
     match files.first().map(PreviewFile::kind) {
-        Some(OutgoingMedia::Image) => "Send this image?",
-        Some(OutgoingMedia::Video) => "Send this video?",
-        _ => "Send this file?",
+        Some(OutgoingMedia::Image) => crate::tr!(SendThisImage),
+        Some(OutgoingMedia::Video) => crate::tr!(SendThisVideo),
+        _ => crate::tr!(SendThisFile),
     }
     .to_string()
 }

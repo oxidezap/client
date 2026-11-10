@@ -31,6 +31,7 @@ pub fn render_error_view(
     let retry_entity = entity.clone();
     let detail_entity = entity;
     let detail = fault.detail.clone();
+    let (headline, body) = crate::i18n::Language::current().fault_labels(fault);
 
     centered_view("error-screen", metrics.space_xxl())
         .child(parts::hero_icon(
@@ -42,7 +43,7 @@ pub fn render_error_view(
         ))
         // What it means and what happens next, in the order a reader needs
         // them. Not the raw transport error, which is folded away below.
-        .child(parts::screen_message(fault.headline, fault.body, cx))
+        .child(parts::screen_message(headline, body, cx))
         .child(
             div()
                 .flex()
@@ -57,8 +58,8 @@ pub fn render_error_view(
                         .label(match retry_in {
                             // A countdown answers "is it stuck?" without the
                             // user having to guess.
-                            Some(secs) if secs > 0 => format!("Retry in {secs}s"),
-                            _ => "Retry now".to_string(),
+                            Some(secs) if secs > 0 => crate::tr!(retry_in, secs),
+                            _ => crate::tr!(RetryNow).to_string(),
                         })
                         .primary()
                         .cursor_pointer()
@@ -70,7 +71,7 @@ pub fn render_error_view(
                     // The app is usable offline — history is local. Saying so
                     // is what stops this screen from being a dead end.
                     Button::new("work-offline")
-                        .label("Work offline")
+                        .label(crate::tr!(WorkOffline))
                         .outline()
                         .cursor_pointer()
                         .on_click({
@@ -124,9 +125,9 @@ fn render_detail(
                     .size(metrics.icon_small()),
                 )
                 .child(if is_open {
-                    "Hide technical detail"
+                    crate::tr!(HideTechnicalDetail)
                 } else {
-                    "Technical detail"
+                    crate::tr!(TechnicalDetail)
                 })
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
@@ -182,13 +183,13 @@ pub fn render_refused_view(
         // the whole reason it travels as a sentence rather than a code — so
         // the headline above it says only where the reason applies.
         .child(parts::screen_message(
-            "This window won't open the account",
+            crate::tr!(ThisWindowWonTOpenTheAccount),
             detail.clone(),
             cx,
         ))
         .child(
             Button::new("retry")
-                .label("Try again")
+                .label(crate::tr!(TryAgain))
                 .primary()
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {

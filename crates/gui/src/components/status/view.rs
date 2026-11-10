@@ -70,9 +70,9 @@ pub fn render_status_view(
             .items_center()
             .p(metrics.space_xxxl())
             .child(
-                EmptyState::new("Status")
+                EmptyState::new(crate::tr!(Status))
                     .icon(ProductIcon::CircleDashed)
-                    .description("Pick someone on the left to see what they posted."),
+                    .description(crate::tr!(PickSomeoneOnTheLeftToSeeWhatTheyPosted)),
             );
     };
 
@@ -103,7 +103,7 @@ pub fn render_status_view(
                 .child(step_button(
                     "status-prev",
                     IconName::ChevronLeft,
-                    "Previous update",
+                    crate::tr!(PreviousUpdate),
                     can_prev,
                     move |cx| {
                         prev_entity.update(cx, |app, cx| app.step_status(false, cx));
@@ -113,7 +113,7 @@ pub fn render_status_view(
                 .child(step_button(
                     "status-next",
                     IconName::ChevronRight,
-                    "Next update",
+                    crate::tr!(NextUpdate),
                     can_next,
                     move |cx| {
                         next_entity.update(cx, |app, cx| app.step_status(true, cx));
@@ -193,7 +193,7 @@ fn render_header(
             Button::new("status-close")
                 .icon(Icon::new(IconName::Close))
                 .ghost()
-                .tooltip("Close")
+                .tooltip(crate::tr!(Close))
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     close_entity.update(cx, |app, cx| app.close_status(cx));
@@ -256,11 +256,11 @@ fn render_update(props: &StatusViewProps, metrics: Metrics, cx: &App) -> impl In
                 .text_color(cx.theme().foreground)
                 .child(caption.clone().unwrap_or_else(|| {
                     if props.is_loading {
-                        "Loading this update…".to_string()
+                        crate::tr!(LoadingThisUpdate).to_string()
                     } else {
                         // Video, or bytes that would not come. Text updates
                         // land here too, and they *are* their caption.
-                        "This update cannot be shown here.".to_string()
+                        crate::tr!(ThisUpdateCannotBeShownHere).to_string()
                     }
                 }))
                 .into_any_element(),

@@ -61,6 +61,7 @@ pub struct MessageListCache {
     /// exactly the signal that its measurements have stopped describing the
     /// rows.
     pub build: usize,
+    pub language: crate::i18n::Language,
     /// Message count when the rows were built (invalidation check).
     pub message_count: usize,
     /// Group flag, which decides sender names and therefore run breaks.
@@ -204,6 +205,7 @@ impl MessageListCache {
         Self {
             build: BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             message_count: messages.len(),
+            language: crate::i18n::Language::current(),
             is_group,
             items: build_items(messages, typing.clone()).into(),
             typing,
@@ -220,7 +222,8 @@ impl MessageListCache {
         is_group: bool,
         typing: Option<&TypingSummary>,
     ) -> bool {
-        self.message_count == message_count
+        self.language == crate::i18n::Language::current()
+            && self.message_count == message_count
             && self.is_group == is_group
             && self.typing.as_ref() == typing
     }
@@ -334,6 +337,17 @@ mod tests {
         // about is where the day dividers fall.
         msg.timestamp = when;
         msg
+    }
+
+    #[test]
+    fn a_cached_timeline_is_invalid_in_another_language() {
+        let mut cache = MessageListCache::new(&[], false, None);
+        assert!(cache.is_valid_for(0, false, None));
+        cache.language = match crate::i18n::Language::current() {
+            crate::i18n::Language::English => crate::i18n::Language::Portuguese,
+            crate::i18n::Language::Portuguese => crate::i18n::Language::English,
+        };
+        assert!(!cache.is_valid_for(0, false, None));
     }
 
     #[test]

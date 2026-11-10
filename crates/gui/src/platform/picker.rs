@@ -229,9 +229,7 @@ fn kind_for_category(
         Some(AttachmentCategory::PhotosVideos) => match kind_for(mime_type) {
             OutgoingMedia::Image => Ok(OutgoingMedia::Image),
             OutgoingMedia::Video => Ok(OutgoingMedia::Video),
-            OutgoingMedia::Document => Err(format!(
-                "{file_name} is not a supported photo or video; choose Documento to send the original file."
-            )),
+            OutgoingMedia::Document => Err(crate::tr!(unsupported_media, file_name)),
         },
     }
 }
@@ -270,9 +268,7 @@ fn selected_kind_and_mime(
             OutgoingMedia::Document => false,
         };
         if !valid {
-            return Err(format!(
-                "{file_name} could not be verified as a supported photo or video; choose Documento to send the original file."
-            ));
+            return Err(crate::tr!(unverified_media, file_name));
         }
     }
     let mime_type =
@@ -423,9 +419,9 @@ impl Budget {
             .checked_add(size)
             .is_some_and(|total| total <= SELECTION_BUDGET_BYTES);
         (!fits).then(|| {
-            format!(
-                "{file_name} did not fit: one trip to the file chooser can \
-                 carry {} in total. Send it on its own.",
+            crate::tr!(
+                selection_full,
+                file_name,
                 crate::utils::format_size(SELECTION_BUDGET_BYTES)
             )
         })
@@ -452,11 +448,12 @@ impl Budget {
 pub fn unsendable(file_name: &str, size: u64) -> Option<String> {
     let ceiling = oxidezap_ipc::MAX_STAGED_BYTES;
     if size == 0 {
-        return Some(format!("{file_name} is empty."));
+        return Some(crate::tr!(file_empty, file_name));
     }
     (size > ceiling).then(|| {
-        format!(
-            "{file_name} is {} and the most that can be sent is {}.",
+        crate::tr!(
+            file_too_big,
+            file_name,
             crate::utils::format_size(size),
             crate::utils::format_size(ceiling)
         )
@@ -999,7 +996,7 @@ mod tests {
             )
             .expect_err(file_name);
             assert!(refusal.contains(file_name), "{refusal}");
-            assert!(refusal.contains("Documento"), "{refusal}");
+            assert!(refusal.contains("Document"), "{refusal}");
         }
         let refusal = selected_kind_and_mime(
             "false.jpg",

@@ -51,7 +51,7 @@ impl WhatsAppApp {
             });
         if !self.can_send() || !eligible {
             self.notify_user(
-                "This message can no longer be deleted.",
+                crate::tr!(ThisMessageCanNoLongerBeDeleted),
                 notices::Tone::Problem,
                 cx,
             );
@@ -64,11 +64,7 @@ impl WhatsAppApp {
         let generation = self.edit_generation;
         let Some(client) = self.client.as_ref() else {
             self.pending_message_actions.remove(&key);
-            self.notify_user(
-                "Could not delete message: the daemon is unavailable.",
-                notices::Tone::Problem,
-                cx,
-            );
+            self.notify_user(crate::tr!(DeleteUnavailable), notices::Tone::Problem, cx);
             return;
         };
         let answer = client.revoke_message(jid.to_owned(), message_id.to_owned(), for_everyone);
@@ -101,15 +97,13 @@ impl WhatsAppApp {
                         cx.notify();
                     }
                     Ok(Err(failure)) => app.notify_user(
-                        what_went_wrong("Could not delete message", &failure),
+                        what_went_wrong(crate::tr!(DeleteFailed), &failure),
                         notices::Tone::Problem,
                         cx,
                     ),
-                    Err(_) => app.notify_user(
-                        "Could not delete message: the daemon connection ended.",
-                        notices::Tone::Problem,
-                        cx,
-                    ),
+                    Err(_) => {
+                        app.notify_user(crate::tr!(DeleteDisconnected), notices::Tone::Problem, cx)
+                    }
                 }
             });
         })
@@ -206,9 +200,9 @@ pub(super) fn render_message_delete(
 ) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
     let scope = if confirmation.for_everyone {
-        "Apagar para todos"
+        crate::tr!(DeleteForEveryone)
     } else {
-        "Apagar para mim"
+        crate::tr!(DeleteForMe)
     };
     let chat_name = &confirmation.chat_name;
     let preview = &confirmation.message_preview;
@@ -247,21 +241,21 @@ pub(super) fn render_message_delete(
                     div()
                         .id("message-delete-chat")
                         .debug_selector(|| "message-delete-chat".into())
-                        .child(format!("Conversa: {chat_name}")),
+                        .child(crate::tr!(conversation, chat_name)),
                 )
                 .child(
                     div()
                         .id("message-delete-preview")
                         .debug_selector(|| "message-delete-preview".into())
-                        .child(format!("Mensagem: {preview}")),
+                        .child(crate::tr!(message_preview, preview)),
                 )
                 .child(
                     div()
                         .id("message-delete-time")
                         .debug_selector(|| "message-delete-time".into())
-                        .child(format!("Horário: {message_time}")),
+                        .child(crate::tr!(message_time, message_time)),
                 )
-                .child("Confirmar exclusão desta mensagem?")
+                .child(crate::tr!(ConfirmDeletionOfThisMessage))
                 .child(
                     div()
                         .flex()
@@ -273,7 +267,7 @@ pub(super) fn render_message_delete(
                                 .debug_selector(|| "message-delete-cancel".into())
                                 .child(
                                     Button::new("message-delete-cancel-button")
-                                        .label("Cancelar")
+                                        .label(crate::tr!(Cancel))
                                         .on_click(move |_, _, cx| {
                                             cancel.update(cx, |app, cx| {
                                                 app.cancel_message_delete(cx);

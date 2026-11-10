@@ -202,6 +202,14 @@ colours out of the theme but retain nothing borrowed, and without `use<>` the
 2024 capture rules would make them inherit the lifetime, which the virtual
 list's `&mut Context` closure rejects.
 
+## UI languages
+
+The GUI owns English and Portuguese catalogs, with English as the default.
+The language preference shares the existing theme document and its Save,
+Revert and Reload behavior. Domain and IPC data remain language-independent.
+See [localization](localization.md) for translation keys, interpolation, caches,
+fallbacks and adding a locale.
+
 ## Responsiveness
 
 One number, in one place. The window's size reaches the interface as a factor

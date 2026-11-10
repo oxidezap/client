@@ -158,7 +158,7 @@ pub fn render_connected_view(
             .flatten();
         let frame = app.video_current_frame(&message.id);
         let author = if message.is_from_me {
-            SharedString::from("You")
+            SharedString::from(crate::tr!(You))
         } else {
             SharedString::from(app.author_label(open_chat.as_deref(), &message))
         };
@@ -447,20 +447,20 @@ fn render_chat_area(
                 super::centered_view("empty-conversation", metrics.space_xxxl())
                     .surface(cx.theme().background)
                     .child(
-                        EmptyState::new("Pick a conversation")
+                        EmptyState::new(crate::tr!(PickAConversation))
                             .icon(ProductIcon::MessageSquare)
-                            .description(
-                                "Choose a chat on the left, or search for one by name or message.",
-                            )
+                            .description(crate::tr!(
+                                ChooseAChatOnTheLeftOrSearchForOneByNameOrMessage
+                            ))
                             .shortcut(
                                 if cfg!(target_os = "macos") {
                                     "⌘K"
                                 } else {
                                     "Ctrl K"
                                 },
-                                "Search",
+                                crate::tr!(Search),
                             )
-                            .shortcut("↑ ↓", "Move between chats"),
+                            .shortcut("↑ ↓", crate::tr!(MoveBetweenChats)),
                     ),
             ),
             Some(chat) => {
@@ -546,17 +546,17 @@ pub(crate) fn render_offline_strip(
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().muted_foreground)
                 .child(if terminal {
-                    "Logged out. Only messages and media stored locally are available."
+                    crate::tr!(LoggedOutOnlyMessagesAndMediaStoredLocallyAreAvailable)
                 } else {
-                    "Offline. Your messages stay readable. Reconnect to send."
+                    crate::tr!(OfflineYourMessagesStayReadableReconnectToSend)
                 }),
         )
         .child(
             Button::new("reconnect")
                 .label(if terminal {
-                    "Session options"
+                    crate::tr!(SessionOptions)
                 } else {
-                    "Reconnect"
+                    crate::tr!(Reconnect)
                 })
                 .ghost()
                 .cursor_pointer()
@@ -597,7 +597,7 @@ fn render_return_banner(
                 .min_w_0()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().foreground)
-                .child(format!("On call with {name}")),
+                .child(crate::tr!(on_call_with, name)),
         )
         .child(
             div()
@@ -608,7 +608,7 @@ fn render_return_banner(
         )
         .child(
             Button::new("return-to-call")
-                .label("Return to call")
+                .label(crate::tr!(ReturnToCall))
                 .icon(Icon::new(IconName::ArrowRight))
                 .ghost()
                 .cursor_pointer()

@@ -59,7 +59,7 @@ fn members_line(roster: &GroupRoster) -> Option<String> {
         .members
         .iter()
         .filter(|member| member.is_self)
-        .map(|_| "You")
+        .map(|_| crate::tr!(You))
         .chain(
             roster
                 .members
@@ -75,12 +75,22 @@ fn members_line(roster: &GroupRoster) -> Option<String> {
     let line = named.join(", ");
     match total - named.len() {
         0 => Some(line),
-        rest => Some(format!("{line} and {}", count_of("other", rest))),
+        rest => Some(crate::tr!(others, line, count_of("other", rest))),
     }
 }
 
 /// `n` of something, pluralised.
 fn count_of(thing: &str, n: usize) -> String {
+    if crate::i18n::Language::current() == crate::i18n::Language::Portuguese {
+        let noun = match (thing, n == 1) {
+            ("member", true) => "membro",
+            ("member", false) => "membros",
+            ("other", true) => "outro",
+            ("other", false) => "outros",
+            _ => thing,
+        };
+        return format!("{n} {noun}");
+    }
     if n == 1 {
         format!("{n} {thing}")
     } else {
@@ -103,7 +113,10 @@ fn subtitle(
     members: Option<&GroupRoster>,
 ) -> Option<(String, bool)> {
     if let Some(summary) = typing {
-        return Some((summary.compact_label(chat.is_group), true));
+        return Some((
+            crate::i18n::Language::current().typing(summary, chat.is_group, true),
+            true,
+        ));
     }
     if chat.is_group {
         // Only from the roster. `chat.participants` is not one — it is filled
@@ -114,9 +127,9 @@ fn subtitle(
         return members.and_then(members_line).map(|line| (line, false));
     }
     match availability {
-        Some(Availability::Online) => Some(("online".to_string(), false)),
+        Some(Availability::Online) => Some((crate::tr!(Online).to_string(), false)),
         Some(Availability::LastSeen(at)) => Some((
-            format!("last seen {}", crate::utils::format_list_time(at)),
+            crate::tr!(last_seen, crate::utils::format_list_time(at)),
             false,
         )),
         Some(Availability::Unknown) | None => None,
@@ -228,7 +241,7 @@ fn render_identity(
                 Button::new("back")
                     .icon(IconName::ArrowLeft)
                     .ghost()
-                    .tooltip("Back to chats")
+                    .tooltip(crate::tr!(BackToChats))
                     .cursor_pointer()
                     .on_click(move |_, _window, cx| {
                         back_entity.update(cx, |app, cx| app.navigate_back(cx));
@@ -322,7 +335,7 @@ fn render_actions(
                 action(
                     "search-in-chat",
                     Icon::new(IconName::Search),
-                    "Search in conversation",
+                    crate::tr!(SearchInConversation),
                 )
                 .cursor_pointer()
                 .on_click(move |_, window, cx| {
@@ -332,20 +345,26 @@ fn render_actions(
         })
         .when(callable && layout.show_call_buttons(), |el| {
             el.child(
-                action("voice-call", ProductIcon::Phone.into(), "Voice call")
-                    .cursor_pointer()
-                    .on_click(move |_, _window, cx| {
-                        call_entity
-                            .update(cx, |app, cx| app.start_call(call_jid.clone(), false, cx));
-                    }),
+                action(
+                    "voice-call",
+                    ProductIcon::Phone.into(),
+                    crate::tr!(VoiceCall),
+                )
+                .cursor_pointer()
+                .on_click(move |_, _window, cx| {
+                    call_entity.update(cx, |app, cx| app.start_call(call_jid.clone(), false, cx));
+                }),
             )
             .child(
-                action("video-call", ProductIcon::Video.into(), "Video call")
-                    .cursor_pointer()
-                    .on_click(move |_, _window, cx| {
-                        video_entity
-                            .update(cx, |app, cx| app.start_call(video_jid.clone(), true, cx));
-                    }),
+                action(
+                    "video-call",
+                    ProductIcon::Video.into(),
+                    crate::tr!(VideoCall),
+                )
+                .cursor_pointer()
+                .on_click(move |_, _window, cx| {
+                    video_entity.update(cx, |app, cx| app.start_call(video_jid.clone(), true, cx));
+                }),
             )
         })
         .child(render_overflow_menu(
@@ -375,7 +394,7 @@ fn render_overflow_menu(
     parts::icon_button(
         "chat-menu",
         Icon::new(IconName::EllipsisVertical),
-        "More",
+        crate::tr!(More),
         layout.icon_button_size(),
     )
     .cursor_pointer()
@@ -387,7 +406,7 @@ fn render_overflow_menu(
         let jid = jid.clone();
 
         let menu = menu.item(
-            PopupMenuItem::new("Search in conversation")
+            PopupMenuItem::new(crate::tr!(SearchInConversation))
                 .icon(IconName::Search)
                 .on_click(move |_, window, cx| {
                     search_entity.update(cx, |app, cx| app.toggle_conversation_search(window, cx));
@@ -399,14 +418,14 @@ fn render_overflow_menu(
         }
         menu.separator()
             .item(
-                PopupMenuItem::new("Voice call")
+                PopupMenuItem::new(crate::tr!(VoiceCall))
                     .icon(Icon::from(ProductIcon::Phone))
                     .on_click(move |_, _window, cx| {
                         call_entity.update(cx, |app, cx| app.start_call(jid.clone(), false, cx));
                     }),
             )
             .item(
-                PopupMenuItem::new("Video call")
+                PopupMenuItem::new(crate::tr!(VideoCall))
                     .icon(Icon::from(ProductIcon::Video))
                     .on_click(move |_, _window, cx| {
                         video_entity

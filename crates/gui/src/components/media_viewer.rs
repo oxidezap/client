@@ -141,7 +141,7 @@ pub fn render_media_viewer(
                 .child(step_button(
                     "viewer-prev",
                     IconName::ChevronLeft,
-                    "Previous",
+                    crate::tr!(Previous),
                     can_step,
                     move |cx| {
                         prev_entity.update(cx, |app, cx| app.step_media_viewer(false, cx));
@@ -190,7 +190,7 @@ pub fn render_media_viewer(
                 .child(step_button(
                     "viewer-next",
                     IconName::ChevronRight,
-                    "Next",
+                    crate::tr!(Next),
                     can_step,
                     move |cx| {
                         next_entity.update(cx, |app, cx| app.step_media_viewer(true, cx));
@@ -284,9 +284,9 @@ fn render_bar(
                 .ghost()
                 .disabled(!can_save)
                 .tooltip(if can_save {
-                    "Save to Downloads"
+                    crate::tr!(SaveToDownloads)
                 } else {
-                    "Nothing to save: this file could not be read"
+                    crate::tr!(NothingToSaveThisFileCouldNotBeRead)
                 })
                 .when(can_save, |button| button.cursor_pointer())
                 .on_click(move |_, _window, cx| {
@@ -297,7 +297,7 @@ fn render_bar(
             Button::new("viewer-close")
                 .icon(Icon::new(IconName::Close))
                 .ghost()
-                .tooltip("Close")
+                .tooltip(crate::tr!(Close))
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     close_entity.update(cx, |app, cx| {
@@ -355,7 +355,7 @@ fn render_frame(
                 div()
                     .text_size(metrics.text_secondary())
                     .text_color(parts::on_scrim(cx).opacity(0.6))
-                    .child("Loading image..."),
+                    .child(crate::tr!(LoadingImage)),
             )
             .into_any_element();
     }
@@ -382,7 +382,7 @@ fn render_frame(
             div()
                 .text_size(metrics.text_secondary())
                 .text_color(parts::on_scrim(cx).opacity(0.6))
-                .child("This file cannot be shown here."),
+                .child(crate::tr!(ThisFileCannotBeShownHere)),
         )
         .into_any_element()
 }

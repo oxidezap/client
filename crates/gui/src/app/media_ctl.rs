@@ -677,7 +677,7 @@ impl WhatsAppApp {
                         Err(error) => {
                             error!("Failed to start prepared audio: {error}");
                             app.notify_user(
-                                format!("Could not start that audio: {error}"),
+                                crate::tr!(audio_start_failed, error),
                                 crate::app::notices::Tone::Problem,
                                 cx,
                             );
@@ -688,7 +688,7 @@ impl WhatsAppApp {
                     Err(error) => {
                         error!("Failed to prepare audio: {error}");
                         app.notify_user(
-                            format!("Could not prepare that audio: {error}"),
+                            crate::tr!(audio_prepare_failed, error),
                             crate::app::notices::Tone::Problem,
                             cx,
                         );
@@ -807,7 +807,7 @@ impl WhatsAppApp {
             warn!("Cannot download audio: client is unavailable");
             self.finish_download(&message_id);
             self.notify_user(
-                "Cannot download audio while disconnected",
+                crate::tr!(CannotDownloadAudioWhileDisconnected),
                 crate::app::notices::Tone::Problem,
                 cx,
             );
@@ -856,7 +856,7 @@ impl WhatsAppApp {
                     say(
                         &entity,
                         cx,
-                        what_went_wrong("Could not download that audio", &e),
+                        what_went_wrong(crate::tr!(CouldNotDownloadThatAudio), &e),
                     );
                     let _ = entity.update(cx, |app, cx| {
                         app.finish_download(&msg_id);
@@ -949,7 +949,7 @@ impl WhatsAppApp {
                     }
                     Err(e) => {
                         error!("Failed to download image: {}", e);
-                        failed = Some(what_went_wrong("Could not download that image", &e));
+                        failed = Some(what_went_wrong(crate::tr!(CouldNotDownloadThatImage), &e));
                     }
                 }
                 cx.notify();
@@ -1149,7 +1149,7 @@ impl WhatsAppApp {
                         cx,
                         expected_generation,
                         &expected_scope.0,
-                        what_went_wrong("Could not download that file", &e),
+                        what_went_wrong(crate::tr!(CouldNotDownloadThatFile), &e),
                     );
                 }
             }
@@ -1204,7 +1204,7 @@ impl WhatsAppApp {
             self.saved_documents.remove(&scope);
             cx.notify();
             self.notify_user(
-                "That file is no longer in Downloads. Save it again to open it.",
+                crate::tr!(ThatFileIsNoLongerInDownloadsSaveItAgainToOpenIt),
                 crate::app::notices::Tone::Problem,
                 cx,
             );
@@ -1222,7 +1222,7 @@ impl WhatsAppApp {
             self.saved_documents.remove(&scope);
             cx.notify();
             self.notify_user(
-                "That file is no longer in Downloads. Save it again to show it.",
+                crate::tr!(ThatFileIsNoLongerInDownloadsSaveItAgainToShowIt),
                 crate::app::notices::Tone::Problem,
                 cx,
             );
@@ -1764,7 +1764,10 @@ impl WhatsAppApp {
                             .get_mut(&msg_id)
                             .filter(|player| player.owns_preparation(&preparation))
                         {
-                            player.set_error(what_went_wrong("Could not download that video", &e));
+                            player.set_error(what_went_wrong(
+                                crate::tr!(CouldNotDownloadThatVideo),
+                                &e,
+                            ));
                         }
                         cx.notify();
                     });

@@ -149,9 +149,9 @@ fn waiting_for(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let label = match (stream, call.video.is_on(stream)) {
-        (_, true) => "connecting…",
-        (VideoStream::Local, false) => "camera off",
-        (VideoStream::Remote, false) => "no camera",
+        (_, true) => crate::tr!(ConnectingText),
+        (VideoStream::Local, false) => crate::tr!(CameraOff),
+        (VideoStream::Remote, false) => crate::tr!(NoCamera),
     };
     div()
         .flex()
@@ -243,9 +243,9 @@ fn participant_tile(jid: &str, name: &str, metrics: Metrics, cx: &App) -> impl I
 /// What the camera button says it will do.
 fn camera_tooltip(on: bool, asked: bool) -> &'static str {
     match (on, asked) {
-        (true, _) => "Turn the camera off",
-        (false, true) => "They asked for video — turn the camera on",
-        (false, false) => "Turn the camera on",
+        (true, _) => crate::tr!(TurnTheCameraOff),
+        (false, true) => crate::tr!(TheyAskedForVideoTurnTheCameraOn),
+        (false, false) => crate::tr!(TurnTheCameraOn),
     }
 }
 
@@ -298,7 +298,11 @@ fn video_controls(
                 } else {
                     ProductIcon::Mic.into()
                 },
-                if muted { "Unmute" } else { "Mute" },
+                if muted {
+                    crate::tr!(Unmute)
+                } else {
+                    crate::tr!(Mute)
+                },
             )
             .selected(muted)
             .cursor_pointer()
@@ -329,7 +333,7 @@ fn video_controls(
             round(
                 "call-grid",
                 ProductIcon::Grid.into(),
-                "Group calls are not supported yet",
+                crate::tr!(GroupCallsAreNotSupportedYet),
             )
             .disabled(true),
         )
@@ -337,16 +341,20 @@ fn video_controls(
             round(
                 "call-add",
                 ProductIcon::UserPlus.into(),
-                "Group calls are not supported yet",
+                crate::tr!(GroupCallsAreNotSupportedYet),
             )
             .disabled(true),
         )
         .child(
-            round("call-end", ProductIcon::PhoneOff.into(), "End call")
-                .danger()
-                .cursor_pointer()
-                .on_click(move |_, _window, cx| {
-                    end_entity.update(cx, |app, cx| app.hang_up(cx));
-                }),
+            round(
+                "call-end",
+                ProductIcon::PhoneOff.into(),
+                crate::tr!(EndCall),
+            )
+            .danger()
+            .cursor_pointer()
+            .on_click(move |_, _window, cx| {
+                end_entity.update(cx, |app, cx| app.hang_up(cx));
+            }),
         )
 }

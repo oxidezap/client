@@ -562,7 +562,7 @@ impl WhatsAppApp {
                     let _ = entity.update(cx, |app, cx| {
                         log::warn!("cannot install a plugin: {e}");
                         app.notify_user(
-                            format!("That plugin could not be installed: {e}"),
+                            crate::tr!(plugin_install_failed, e),
                             super::notices::Tone::Problem,
                             cx,
                         );
@@ -580,7 +580,7 @@ impl WhatsAppApp {
                     // waited for it to be read, and nothing on screen would
                     // otherwise change.
                     app.notify_user(
-                        "There is no daemon to install into right now.".to_string(),
+                        crate::tr!(ThereIsNoDaemonToInstallIntoRightNow).to_string(),
                         super::notices::Tone::Problem,
                         cx,
                     );
@@ -601,7 +601,7 @@ impl WhatsAppApp {
                     app.refresh_installed_plugins(cx);
                     app.reload_plugins(cx);
                     app.notify_user(
-                        format!("{id} installed. Starting it…"),
+                        crate::tr!(plugin_installed, id),
                         super::notices::Tone::Info,
                         cx,
                     );
@@ -609,7 +609,7 @@ impl WhatsAppApp {
                 Err(e) => {
                     log::warn!("cannot install a plugin: {e}");
                     app.notify_user(
-                        format!("That plugin could not be installed: {e}"),
+                        crate::tr!(plugin_install_failed, e),
                         super::notices::Tone::Problem,
                         cx,
                     );
@@ -637,7 +637,7 @@ impl WhatsAppApp {
             // connection there is nothing to ask, and a press that changed
             // nothing has to say so.
             self.notify_user(
-                format!("{id} cannot be removed while this window is not attached."),
+                crate::tr!(plugin_not_attached, id),
                 super::notices::Tone::Problem,
                 cx,
             );
@@ -652,7 +652,7 @@ impl WhatsAppApp {
                     app.refresh_installed_plugins(cx);
                     app.reload_plugins(cx);
                     app.notify_user(
-                        format!("{id} removed. Stopping it…"),
+                        crate::tr!(plugin_removed, id),
                         super::notices::Tone::Info,
                         cx,
                     );
@@ -660,7 +660,7 @@ impl WhatsAppApp {
                 Err(e) => {
                     log::warn!("cannot remove the plugin {id}: {e}");
                     app.notify_user(
-                        format!("{id} could not be removed: {e}"),
+                        crate::tr!(plugin_remove_failed, id, e),
                         super::notices::Tone::Problem,
                         cx,
                     );

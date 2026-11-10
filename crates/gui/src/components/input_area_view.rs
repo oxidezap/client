@@ -107,6 +107,7 @@ pub struct InputAreaView {
     /// The field itself. A textarea rather than a single line: a message is
     /// not always one, and the design asks it to grow with what is typed.
     input: Entity<TextareaState>,
+    language: crate::i18n::Language,
     /// Whether PTT recording is active
     is_recording: bool,
     editing: bool,
@@ -161,7 +162,7 @@ impl InputAreaView {
             TextareaState::new(window, cx)
                 .auto_grow(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS)
                 .submit_on_enter(true)
-                .placeholder("Type a message")
+                .placeholder(crate::tr!(TypeAMessage))
         });
 
         // Subscribe to input events (for Enter key to send, etc.)
@@ -170,6 +171,7 @@ impl InputAreaView {
 
         Self {
             input,
+            language: crate::i18n::Language::current(),
             is_recording: false,
             editing: false,
             edit_pending: false,
@@ -398,7 +400,14 @@ impl InputAreaView {
 }
 
 impl Render for InputAreaView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = crate::i18n::Language::current();
+        if self.language != language {
+            self.language = language;
+            self.input.update(cx, |input, cx| {
+                input.set_placeholder(crate::tr!(TypeAMessage), window, cx)
+            });
+        }
         let is_recording = self.is_recording;
         let entity = cx.entity().clone();
         // The composer draws itself into the slot the layout gave it. Owning
@@ -428,14 +437,14 @@ impl Render for InputAreaView {
                     .items_center()
                     .justify_between()
                     .child(if self.edit_pending {
-                        "Saving edit..."
+                        crate::tr!(SavingEdit)
                     } else {
-                        "Editing message"
+                        crate::tr!(EditingMessage)
                     })
                     .child(
                         Button::new("cancel-edit")
                             .ghost()
-                            .label("Cancel")
+                            .label(crate::tr!(Cancel))
                             .disabled(self.edit_pending)
                             .on_click(move |_, _, cx| {
                                 entity.update(cx, |_, cx| cx.emit(InputAreaEvent::CancelEdit));
@@ -496,7 +505,7 @@ impl InputAreaView {
                 parts::icon_button(
                     "attach",
                     Icon::new(ProductIcon::Paperclip),
-                    "Attach a photo, a video or a document",
+                    crate::tr!(AttachAPhotoAVideoOrADocument),
                     control,
                 )
                 .disabled(self.editing)
@@ -506,7 +515,7 @@ impl InputAreaView {
                     let photos_entity = attach_entity.clone();
                     let document_entity = attach_entity.clone();
                     menu.item(
-                        PopupMenuItem::new("Documento")
+                        PopupMenuItem::new(crate::tr!(Document))
                             .icon(Icon::from(ProductIcon::FileText))
                             .on_click(move |_, _window, cx| {
                                 document_entity.update(cx, |_view, cx| {
@@ -517,7 +526,7 @@ impl InputAreaView {
                             }),
                     )
                     .item(
-                        PopupMenuItem::new("Fotos e vídeos")
+                        PopupMenuItem::new(crate::tr!(PhotosAndVideos))
                             .icon(Icon::from(ProductIcon::Image))
                             .on_click(move |_, _window, cx| {
                                 photos_entity.update(cx, |_view, cx| {
@@ -546,7 +555,7 @@ impl InputAreaView {
                 parts::icon_button(
                     "emoji",
                     Icon::new(ProductIcon::Smile),
-                    "The emoji picker is not available yet",
+                    crate::tr!(TheEmojiPickerIsNotAvailableYet),
                     control,
                 )
                 .disabled(true),
@@ -558,7 +567,11 @@ impl InputAreaView {
                 Button::new("send")
                     .icon(IconName::ArrowRight)
                     .primary()
-                    .tooltip(if self.editing { "Save edit" } else { "Send" })
+                    .tooltip(if self.editing {
+                        crate::tr!(SaveEdit)
+                    } else {
+                        crate::tr!(Send)
+                    })
                     .disabled(self.edit_pending || (self.editing && !has_text))
                     .w(control)
                     .h(control)
@@ -579,9 +592,9 @@ impl InputAreaView {
                     .ghost()
                     .disabled(!can_record || self.editing)
                     .tooltip(if can_record {
-                        "Hold to record a voice message"
+                        crate::tr!(HoldToRecordAVoiceMessage)
                     } else {
-                        "Voice messages cannot be recorded in this browser"
+                        crate::tr!(VoiceMessagesCannotBeRecordedInThisBrowser)
                     })
                     .w(control)
                     .h(control)
@@ -616,7 +629,7 @@ impl InputAreaView {
                 parts::icon_button(
                     "cancel-recording",
                     Icon::new(ProductIcon::Trash),
-                    "Discard recording",
+                    crate::tr!(DiscardRecording),
                     control,
                 )
                 .cursor_pointer()
@@ -648,13 +661,13 @@ impl InputAreaView {
                 div()
                     .text_size(metrics.text_small())
                     .text_color(parts::subtle(cx))
-                    .child("Recording"),
+                    .child(crate::tr!(Recording)),
             )
             .child(
                 Button::new("send-recording")
                     .icon(IconName::ArrowRight)
                     .primary()
-                    .tooltip("Send voice message")
+                    .tooltip(crate::tr!(SendVoiceMessage))
                     .w(control)
                     .h(control)
                     .cursor_pointer()
@@ -698,6 +711,15 @@ fn render_reply_bar(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let hue = cx.product().speaker(&reply.sender);
+    let summary = if reply.preview.is_empty() {
+        reply
+            .kind
+            .map(|kind| crate::i18n::Language::current().quoted_kind(kind))
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        reply.preview
+    };
 
     div()
         .flex()
@@ -719,13 +741,13 @@ fn render_reply_bar(
                         .text_size(metrics.text_small())
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(hue)
-                        .child(format!("Replying to {}", reply.sender_name)),
+                        .child(crate::tr!(replying_to, reply.sender_name)),
                 )
                 .child(
                     parts::one_line()
                         .text_size(metrics.text_secondary())
                         .text_color(cx.theme().muted_foreground)
-                        .child(reply.preview),
+                        .child(summary),
                 ),
         )
         .child(
@@ -733,7 +755,7 @@ fn render_reply_bar(
                 .icon(IconName::Close)
                 .ghost()
                 .xsmall()
-                .tooltip("Cancel reply")
+                .tooltip(crate::tr!(CancelReply))
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |view, cx| view.clear_reply(cx));
