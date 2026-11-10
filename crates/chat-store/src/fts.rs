@@ -429,6 +429,8 @@ mod tests {
         detail: String,
     }
 
+    /// Search must scan FTS before looking up content rows, while preserving
+    /// ranked and recency pages across account, chat and attachment filters.
     #[test]
     fn search_drives_from_fts_and_preserves_filtered_pages() {
         use diesel::sql_types::{BigInt, Integer, Text};
