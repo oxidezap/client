@@ -443,6 +443,48 @@ pub(super) mod tests {
         crate::i18n::Language::English.activate();
     }
 
+    #[gpui::test]
+    fn own_reply_retains_identity_without_storing_a_translated_role(cx: &mut gpui::TestAppContext) {
+        let (mut visual, app) = connected_app_fixture(cx);
+        visual.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.account_jid = Some("1@s.whatsapp.net".into());
+                app.account_name = Some("Account owner".into());
+                app.find_chat_mut("peer@example.invalid")
+                    .unwrap()
+                    .messages
+                    .push(oxidezap_core::ChatMessage::new_outgoing(
+                        "own-reply-target".into(),
+                        "Synthetic body".into(),
+                    ));
+                app.begin_reply("own-reply-target", window, cx);
+                let draft = app.reply_to.as_ref().unwrap();
+                assert!(draft.sender_is_self);
+                assert_eq!(draft.sender_name, "Account owner");
+                assert_eq!(
+                    draft.sender_label(crate::i18n::Language::Portuguese),
+                    "Você"
+                );
+                assert_eq!(draft.sender_label(crate::i18n::Language::English), "You");
+                let quote: oxidezap_core::QuotedMessage = draft.clone().into();
+                assert!(app.is_own_number(&quote.sender));
+                assert_eq!(quote.sender_name, "Account owner");
+                let mut reply = oxidezap_core::ChatMessage::new_outgoing(
+                    "own-reply".into(),
+                    "Synthetic reply".into(),
+                );
+                reply.quoted = Some(quote);
+                app.find_chat_mut("peer@example.invalid")
+                    .unwrap()
+                    .messages
+                    .push(reply);
+                cx.notify();
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
     pub(crate) fn connected_app_fixture(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {

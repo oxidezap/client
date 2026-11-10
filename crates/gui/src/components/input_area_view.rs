@@ -67,6 +67,8 @@ pub struct ReplyDraft {
     pub message_id: String,
     pub sender: String,
     pub sender_name: String,
+    /// A display role, never a translated name stored in the outgoing quote.
+    pub sender_is_self: bool,
     pub preview: String,
     /// What the message being answered *is*, so the quote sent to the other
     /// side is a photo rather than the word "Photo".
@@ -75,6 +77,16 @@ pub struct ReplyDraft {
     /// client draws. Dropped here, the kind-aware quote builder in the
     /// session had nothing to be aware of.
     pub kind: Option<oxidezap_core::QuotedKind>,
+}
+
+impl ReplyDraft {
+    pub fn sender_label(&self, language: crate::i18n::Language) -> &str {
+        if self.sender_is_self {
+            language.text(crate::i18n::TextKey::You)
+        } else {
+            &self.sender_name
+        }
+    }
 }
 
 impl From<ReplyDraft> for oxidezap_core::QuotedMessage {
@@ -711,6 +723,10 @@ fn render_reply_bar(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let hue = cx.product().speaker(&reply.sender);
+    let replying_to = crate::tr!(
+        replying_to,
+        reply.sender_label(crate::i18n::Language::current())
+    );
     let summary = if reply.preview.is_empty() {
         reply
             .kind
@@ -741,7 +757,7 @@ fn render_reply_bar(
                         .text_size(metrics.text_small())
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(hue)
-                        .child(crate::tr!(replying_to, reply.sender_name)),
+                        .child(replying_to),
                 )
                 .child(
                     parts::one_line()
@@ -772,7 +788,7 @@ mod tests {
         ParentElement, Render, Styled as _, Subscription, Window, div, px, size,
     };
 
-    use super::{InputAreaEvent, InputAreaView};
+    use super::{InputAreaEvent, InputAreaView, ReplyDraft};
     use crate::platform::picker::AttachmentCategory;
 
     struct ComposerHarness {
@@ -802,6 +818,26 @@ mod tests {
         ) -> impl IntoElement {
             div().size_full().child(self.input.clone())
         }
+    }
+
+    #[test]
+    fn reply_drafts_keep_self_identity_separate_from_contact_names() {
+        use crate::i18n::Language;
+        let mut draft = ReplyDraft {
+            message_id: "synthetic".into(),
+            sender: "1@s.whatsapp.net".into(),
+            sender_name: "Account owner".into(),
+            sender_is_self: true,
+            preview: String::new(),
+            kind: None,
+        };
+        assert_eq!(draft.sender_label(Language::Portuguese), "Você");
+        assert_eq!(draft.sender_label(Language::English), "You");
+        let quote: oxidezap_core::QuotedMessage = draft.clone().into();
+        assert_eq!(quote.sender_name, "Account owner");
+        draft.sender_is_self = false;
+        draft.sender_name = "Você".into();
+        assert_eq!(draft.sender_label(Language::English), "Você");
     }
 
     fn setup() -> ComposerFixture {

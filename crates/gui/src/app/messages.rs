@@ -310,6 +310,7 @@ mod tests {
                         playing_message_id: None,
                         is_group,
                         is_own_number: false,
+                        quoted_sender_is_self: false,
                         starts_run: true,
                         video_player_state: None,
                         video_frame: None,

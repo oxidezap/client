@@ -63,7 +63,7 @@ impl WhatsAppApp {
         };
 
         let sender_name = if message.is_from_me {
-            crate::tr!(You).to_string()
+            self.account_name.clone().unwrap_or_default()
         } else {
             chat.author_name(message)
                 .map(str::to_owned)
@@ -89,6 +89,7 @@ impl WhatsAppApp {
             message_id: message_id.to_string(),
             sender,
             sender_name,
+            sender_is_self: message.is_from_me,
             preview,
             kind: message
                 .media

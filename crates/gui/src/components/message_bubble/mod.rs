@@ -71,6 +71,8 @@ pub struct BubbleProps {
     /// Whether the conversation is with your own number, which is what makes
     /// a sent message read the moment it lands.
     pub is_own_number: bool,
+    /// Resolved while the list holds the app, so rendering never re-enters it.
+    pub quoted_sender_is_self: bool,
     /// First message of a run by this author, which is what earns the sender
     /// name and the wider gap above.
     pub starts_run: bool,
@@ -268,7 +270,13 @@ pub fn render_message_bubble(
                                         .child(name)
                                 }))
                                 .children(message.quoted.as_ref().map(|quoted| {
-                                    render_quote(quoted, entity.clone(), metrics, cx)
+                                    render_quote(
+                                        quoted,
+                                        props.quoted_sender_is_self,
+                                        entity.clone(),
+                                        metrics,
+                                        cx,
+                                    )
                                 }))
                                 .children(message.business.as_ref().map(|_| {
                                     business::render_header(

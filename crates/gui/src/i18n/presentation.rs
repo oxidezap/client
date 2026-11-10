@@ -44,6 +44,28 @@ impl Language {
         })
     }
 
+    pub fn outgoing_status(self, state: oxidezap_core::OutgoingCallState) -> &'static str {
+        use super::TextKey;
+        use oxidezap_core::OutgoingCallState;
+        self.text(match state {
+            OutgoingCallState::Initiating => TextKey::OutgoingCalling,
+            OutgoingCallState::Ringing => TextKey::OutgoingRinging,
+            OutgoingCallState::Connected => TextKey::OutgoingConnected,
+            OutgoingCallState::Declined => TextKey::CallDeclined,
+            OutgoingCallState::Timeout => TextKey::NoAnswer,
+        })
+    }
+
+    pub fn quote_author(self, quoted: &QuotedMessage, sender_is_self: bool) -> &str {
+        if sender_is_self {
+            self.text(super::TextKey::You)
+        } else if quoted.sender_name.is_empty() {
+            self.text(super::TextKey::Message)
+        } else {
+            &quoted.sender_name
+        }
+    }
+
     pub fn typing(self, summary: &TypingSummary, is_group: bool, compact: bool) -> String {
         if self != Language::Portuguese {
             return if compact {
@@ -199,6 +221,38 @@ impl Language {
 mod tests {
     use super::*;
     use oxidezap_core::Typist;
+
+    #[test]
+    fn every_outgoing_call_state_uses_the_selected_language() {
+        use oxidezap_core::OutgoingCallState::*;
+        for (state, english, portuguese) in [
+            (Initiating, "calling", "chamando"),
+            (Ringing, "ringing", "tocando"),
+            (Connected, "connected", "conectada"),
+            (Declined, "call declined", "chamada recusada"),
+            (Timeout, "no answer", "sem resposta"),
+        ] {
+            assert_eq!(Language::English.outgoing_status(state), english);
+            assert_eq!(Language::Portuguese.outgoing_status(state), portuguese);
+        }
+    }
+
+    #[test]
+    fn quote_authorship_is_localized_from_identity_not_a_saved_label() {
+        let mut quote = QuotedMessage {
+            message_id: "synthetic".into(),
+            sender: "1@s.whatsapp.net".into(),
+            sender_name: "Account owner".into(),
+            preview: String::new(),
+            kind: None,
+        };
+        assert_eq!(Language::Portuguese.quote_author(&quote, true), "Você");
+        assert_eq!(Language::English.quote_author(&quote, true), "You");
+        assert_eq!(quote.sender_name, "Account owner");
+        quote.sender_name = "Você".into();
+        assert_eq!(Language::English.quote_author(&quote, false), "Você");
+        assert_eq!(Language::Portuguese.quote_author(&quote, false), "Você");
+    }
 
     #[test]
     fn translated_faults_follow_the_domain_constructors() {

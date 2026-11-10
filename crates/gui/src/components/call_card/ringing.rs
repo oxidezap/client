@@ -11,7 +11,7 @@ use gpui::{App, Entity, InteractiveElement, IntoElement, ParentElement, Styled, 
 use gpui_component::ActiveTheme as _;
 use gpui_component::Icon;
 use gpui_component::button::{Button, ButtonVariants as _};
-use oxidezap_core::{IncomingCall, OutgoingCall, OutgoingCallState};
+use oxidezap_core::{IncomingCall, OutgoingCall};
 
 use crate::app::WhatsAppApp;
 use crate::components::parts;
@@ -92,13 +92,7 @@ pub fn outgoing(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let cancel_entity = entity;
-    let status = match call.state {
-        OutgoingCallState::Initiating => "calling",
-        OutgoingCallState::Ringing => "ringing",
-        OutgoingCallState::Connected => "connected",
-        OutgoingCallState::Declined => crate::tr!(CallDeclined),
-        OutgoingCallState::Timeout => crate::tr!(NoAnswer),
-    };
+    let status = crate::i18n::Language::current().outgoing_status(call.state);
 
     body(metrics, cx)
         .child(pulsing_avatar(

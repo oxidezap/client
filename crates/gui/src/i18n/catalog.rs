@@ -384,4 +384,7 @@ catalog! {
     LogDebugNote => ("Every stanza the library reads, and every step of a pairing.", "Cada stanza recebida pela biblioteca e cada etapa da vinculação.");
     LogTraceNote => ("Everything, including the protocol's own bookkeeping.", "Tudo, incluindo os registros internos do protocolo.");
     MessageDeleted => ("[Message deleted]", "[Mensagem apagada]");
+    OutgoingCalling => ("calling", "chamando");
+    OutgoingRinging => ("ringing", "tocando");
+    OutgoingConnected => ("connected", "conectada");
 }

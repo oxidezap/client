@@ -308,6 +308,10 @@ fn render_row(
                 playing_message_id: app.playing_message_id().map(|s| s.to_string()),
                 is_group,
                 is_own_number,
+                quoted_sender_is_self: msg
+                    .quoted
+                    .as_ref()
+                    .is_some_and(|quote| quote.sender == "Me" || app.is_own_number(&quote.sender)),
                 starts_run: *starts_run,
                 video_player_state: app.video_player_state(message_id),
                 video_frame: app.video_current_frame(message_id),

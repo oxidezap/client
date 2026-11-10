@@ -16,17 +16,17 @@ use crate::theme::{ActiveProductTheme as _, Metrics};
 /// before the name is read.
 pub fn render_quote(
     quoted: &QuotedMessage,
+    sender_is_self: bool,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let target = quoted.message_id.clone();
     let hue = cx.product().speaker(&quoted.sender);
-    let name: SharedString = if quoted.sender_name.is_empty() {
-        SharedString::from(crate::tr!(Message))
-    } else {
-        quoted.sender_name.clone().into()
-    };
+    let name: SharedString = crate::i18n::Language::current()
+        .quote_author(quoted, sender_is_self)
+        .to_owned()
+        .into();
     // One line with nowhere to put emphasis: the markers come out, the same
     // way they do in a chat row's preview.
     let summary: SharedString =

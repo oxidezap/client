@@ -31,7 +31,9 @@ and quoted media. The stored data and wire types have no language preference.
 Contact names, captions, message bodies, plugin-provided text and filenames are
 never translation keys. New media replies retain an empty caption when the source
 has none; the view derives the media label from its kind, rather than putting a
-translated label into the outgoing quote.
+translated label into the outgoing quote. Self-authored replies retain their
+identity separately from their display role: the composer and quote choose
+“You” or “Você” when rendered, while outgoing metadata keeps the account name.
 
 A chat-row cache includes the locale in its key. Timeline measurement keys also
 include it because a translation can wrap differently. Retained composer and
