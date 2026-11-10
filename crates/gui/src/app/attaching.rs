@@ -108,9 +108,9 @@ impl WhatsAppApp {
     pub(crate) fn warn_preview_busy(&mut self, cx: &mut Context<Self>) {
         self.notify_user(
             if self.edit_draft.is_some() {
-                "Finish editing the message before adding a file."
+                crate::tr!(FinishEditingTheMessageBeforeAddingAFile)
             } else {
-                "Finish or cancel the pending file first, then drop again."
+                crate::tr!(FinishOrCancelThePendingFileFirstThenDropAgain)
             },
             notices::Tone::Problem,
             cx,
@@ -140,7 +140,7 @@ impl WhatsAppApp {
         }
         if !self.is_connected() {
             self.notify_user(
-                "Files cannot be sent right now: not connected.",
+                crate::tr!(FilesCannotBeSentRightNowNotConnected),
                 notices::Tone::Problem,
                 cx,
             );
@@ -198,7 +198,7 @@ impl WhatsAppApp {
         let caption = self.modal_window.and_then(|window| {
             window
                 .update(cx, |_, window, cx| {
-                    cx.new(|cx| InputState::new(window, cx).placeholder("Add a caption"))
+                    cx.new(|cx| InputState::new(window, cx).placeholder(crate::tr!(AddACaption)))
                 })
                 .ok()
         });

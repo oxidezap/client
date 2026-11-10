@@ -191,14 +191,14 @@ fn render_title_bar(
                         .ghost()
                         .small()
                         .disabled(true)
-                        .tooltip("Starting a new conversation is not available yet"),
+                        .tooltip(crate::tr!(StartingANewConversationIsNotAvailableYet)),
                 )
                 .child(
                     Button::new("open-settings")
                         .icon(IconName::Settings)
                         .ghost()
                         .small()
-                        .tooltip("Settings")
+                        .tooltip(crate::tr!(Settings))
                         .cursor_pointer()
                         .on_click(move |_, window, cx| {
                             settings_entity.update(cx, |app, cx| app.open_settings(window, cx));
@@ -332,36 +332,38 @@ fn render_empty(
     let reset_entity = entity;
 
     let empty = if props.loading {
-        EmptyState::new("Loading...")
+        EmptyState::new(crate::tr!(Loading))
             .icon(IconName::Inbox)
-            .description("Fetching more conversations.")
+            .description(crate::tr!(FetchingMoreConversations))
     } else if props.is_searching {
-        EmptyState::new("No matches")
+        EmptyState::new(crate::tr!(NoMatches))
             .icon(IconName::Search)
-            .description("No conversation or message matches your search.")
-            .action("Clear search", move |window, cx| {
+            .description(crate::tr!(NoConversationOrMessageMatchesYourSearch))
+            .action(crate::tr!(ClearSearch), move |window, cx| {
                 clear_entity.update(cx, |app, cx| app.clear_search(window, cx));
             })
     } else if props.destination == Destination::Chats && props.filter != ChatFilter::All {
         EmptyState::new(match props.filter {
-            ChatFilter::Unread => "Nothing unread",
-            ChatFilter::Groups => "No groups",
-            ChatFilter::Archived => "No archived chats",
-            ChatFilter::All => "No chats",
+            ChatFilter::Unread => crate::tr!(NothingUnread),
+            ChatFilter::Groups => crate::tr!(NoGroups),
+            ChatFilter::Archived => crate::tr!(NoArchivedChats),
+            ChatFilter::All => crate::tr!(NoChats),
         })
         .icon(IconName::Inbox)
-        .description("Nothing here under the current filter.")
-        .action("Show all chats", move |_window, cx| {
+        .description(crate::tr!(NothingHereUnderTheCurrentFilter))
+        .action(crate::tr!(ShowAllChats), move |_window, cx| {
             reset_entity.update(cx, |app, cx| app.set_chat_filter(ChatFilter::All, cx));
         })
     } else {
         EmptyState::new(match props.destination {
-            Destination::Channels => "No channels yet",
-            Destination::Communities => "No communities yet",
-            _ => "No chats yet",
+            Destination::Channels => crate::tr!(NoChannelsYet),
+            Destination::Communities => crate::tr!(NoCommunitiesYet),
+            _ => crate::tr!(NoChatsYet),
         })
         .icon(IconName::Inbox)
-        .description("Conversations appear here once your phone finishes syncing.")
+        .description(crate::tr!(
+            ConversationsAppearHereOnceYourPhoneFinishesSyncing
+        ))
     };
 
     div()

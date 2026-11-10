@@ -54,7 +54,7 @@ pub fn render_pairing_view(
     centered_view("pairing-screen", metrics.space_xxl())
         .children(retained.map(|entity| {
             gpui_component::button::Button::new("pairing-retained-history")
-                .label("Back to retained history")
+                .label(crate::tr!(BackToRetainedHistory))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |app, cx| app.open_retained_history(window, cx));
                 })
@@ -70,13 +70,13 @@ pub fn render_pairing_view(
                         .text_size(metrics.text_title())
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(cx.theme().foreground)
-                        .child("Link your phone"),
+                        .child(crate::tr!(LinkYourPhone)),
                 )
                 .child(
                     div()
                         .text_size(metrics.text_secondary())
                         .text_color(cx.theme().muted_foreground)
-                        .child("This device stays linked until you unlink it."),
+                        .child(crate::tr!(ThisDeviceStaysLinkedUntilYouUnlinkIt)),
                 ),
         )
         .child(render_steps(metrics, cx))
@@ -86,7 +86,7 @@ pub fn render_pairing_view(
         // the other was left claiming its neighbour's remaining life.
         .child(render_expiry(
             qr_code.map(|qr| qr.life),
-            "code refreshes in",
+            crate::tr!(CodeRefreshesIn),
             metrics,
             cx,
         ))
@@ -99,7 +99,7 @@ pub fn render_pairing_view(
                 .child(render_pair_code(code.value, metrics, cx))
                 .child(render_expiry(
                     Some(code.life),
-                    "code expires in",
+                    crate::tr!(CodeExpiresIn),
                     metrics,
                     cx,
                 ))
@@ -111,10 +111,10 @@ pub fn render_pairing_view(
 /// The QR code is meaningless without them: it is the last step, not the
 /// instruction.
 fn render_steps(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
-    const STEPS: [&str; 3] = [
-        "Open WhatsApp on your phone",
-        "Go to Settings → Linked devices",
-        "Tap Link a device and scan this code",
+    let steps: [&str; 3] = [
+        crate::tr!(OpenWhatsappOnYourPhone),
+        crate::tr!(GoToSettingsLinkedDevices),
+        crate::tr!(TapLinkADeviceAndScanThisCode),
     ];
     let subtle = parts::subtle(cx);
 
@@ -122,7 +122,7 @@ fn render_steps(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
         .flex()
         .flex_col()
         .gap(metrics.space_md())
-        .children(STEPS.into_iter().enumerate().map(move |(ix, step)| {
+        .children(steps.into_iter().enumerate().map(move |(ix, step)| {
             div()
                 .flex()
                 .items_center()
@@ -181,7 +181,7 @@ fn render_qr(
                 // surface, so it is not a theme colour to resolve.
                 .text_color(gpui::black())
                 .text_size(metrics.text_small())
-                .child("Waiting for a code…")
+                .child(crate::tr!(WaitingForACode))
                 .into_any_element(),
         })
 }
@@ -199,7 +199,7 @@ fn render_pair_code(code: String, metrics: Metrics, cx: &App) -> impl IntoElemen
             div()
                 .text_size(metrics.text_small())
                 .text_color(subtle)
-                .child("Or enter this code on your phone"),
+                .child(crate::tr!(OrEnterThisCodeOnYourPhone)),
         )
         .child(div().flex().gap(metrics.space_md()).children(
             code.chars().filter(|c| !c.is_whitespace()).map(|ch| {
@@ -267,7 +267,7 @@ fn render_expiry(
                 .child(if left > 0 {
                     format!("{verb} {left}s")
                 } else {
-                    "refreshing…".to_string()
+                    crate::tr!(Refreshing).to_string()
                 }),
         )
 }

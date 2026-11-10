@@ -53,6 +53,7 @@ pub(super) struct Search {
     /// The sidebar's field. Created the first time a window has one to build
     /// it in.
     list_input: Option<Entity<InputState>>,
+    language: crate::i18n::Language,
     /// What the list is filtered by: lowercase, trimmed, and one debounce
     /// behind what is in the box.
     list_query: String,
@@ -70,10 +71,29 @@ impl Search {
     pub(super) fn new() -> Self {
         Self {
             list_input: None,
+            language: crate::i18n::Language::current(),
             list_query: String::new(),
             debounce: None,
             conversation: None,
             conversation_input: None,
+        }
+    }
+
+    pub(super) fn refresh_language(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = crate::i18n::Language::current();
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        if let Some(input) = &self.list_input {
+            input.update(cx, |input, cx| {
+                input.set_placeholder(crate::tr!(SearchChats), window, cx)
+            });
+        }
+        if let Some(input) = &self.conversation_input {
+            input.update(cx, |input, cx| {
+                input.set_placeholder(crate::tr!(SearchInThisConversation), window, cx)
+            });
         }
     }
 
@@ -340,9 +360,13 @@ impl ConversationSearch {
             return None;
         }
         if self.matches.is_empty() {
-            return Some("No matches in the loaded messages".to_string());
+            return Some(crate::tr!(NoMatchesInTheLoadedMessages).to_string());
         }
-        Some(format!("{} of {}", self.current + 1, self.matches.len()))
+        Some(crate::tr!(
+            match_count,
+            self.current + 1,
+            self.matches.len()
+        ))
     }
 
     pub fn has_matches(&self) -> bool {

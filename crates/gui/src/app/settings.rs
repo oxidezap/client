@@ -46,14 +46,14 @@ impl SettingsSection {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Account => "Account",
-            Self::Appearance => "Appearance",
-            Self::Notifications => "Notifications",
-            Self::AudioVideo => "Audio & video",
-            Self::Privacy => "Privacy & keys",
-            Self::Storage => "Storage & media",
-            Self::Plugins => "Plugins",
-            Self::Advanced => "Advanced",
+            Self::Account => crate::tr!(Account),
+            Self::Appearance => crate::tr!(Appearance),
+            Self::Notifications => crate::tr!(NotificationsText),
+            Self::AudioVideo => crate::tr!(AudioVideo),
+            Self::Privacy => crate::tr!(PrivacyKeys),
+            Self::Storage => crate::tr!(StorageMedia),
+            Self::Plugins => crate::tr!(PluginsText),
+            Self::Advanced => crate::tr!(Advanced),
         }
     }
 
@@ -98,6 +98,7 @@ impl SettingsState {
             || self.draft.preset != self.original.preset
             || self.draft.density != self.original.density
             || self.draft.font_size != self.original.font_size
+            || self.draft.language != self.original.language
     }
 
     /// Where the theme document is kept, for the pane that names it.
@@ -327,6 +328,18 @@ impl Settings {
         self.apply_draft(window, cx);
     }
 
+    pub(super) fn set_language(
+        &mut self,
+        language: crate::i18n::Language,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(settings) = &mut self.open {
+            settings.draft.language = language;
+        }
+        self.apply_draft(window, cx);
+    }
+
     pub(super) fn set_density(
         &mut self,
         density: crate::theme::metrics::Density,
@@ -401,7 +414,7 @@ impl Settings {
             }
             Err(err) => {
                 error!("Could not save the theme: {err}");
-                settings.draft.problems = vec![format!("could not save: {err}")];
+                settings.draft.problems = vec![crate::tr!(save_failed, err)];
             }
         }
         cx.notify();
@@ -542,7 +555,7 @@ impl WhatsAppApp {
                 log::warn!("the log level was changed but not stored: {e}");
                 let _ = entity.update(cx, |app, cx| {
                     app.notify_user(
-                        "Logging at that level now, but the choice will not survive a restart.",
+                        crate::tr!(LoggingAtThatLevelNowButTheChoiceWillNotSurviveARestart),
                         Tone::Problem,
                         cx,
                     );
@@ -601,7 +614,13 @@ impl WhatsAppApp {
             if let Err(error) = crate::session::avatar::clear_cache_storage(Some(account)).await {
                 log::warn!("browser avatar cache clear failed: {error}");
                 let _ = entity.update(cx, |app, cx| {
-                    app.notify_user("Some cached profile photos could not be cleared. Free browser storage and try again.", Tone::Problem, cx);
+                    app.notify_user(
+                        crate::tr!(
+                            SomeCachedProfilePhotosCouldNotBeClearedFreeBrowserStorageAndTryAgain
+                        ),
+                        Tone::Problem,
+                        cx,
+                    );
                     app.refresh_storage_usage(cx);
                 });
                 return;
@@ -684,6 +703,7 @@ mod tests {
         for mutate in [
             (|s: &mut SettingsState| s.draft.density = Density::Compact) as fn(&mut SettingsState),
             |s: &mut SettingsState| s.draft.font_size = 18.0,
+            |s: &mut SettingsState| s.draft.language = crate::i18n::Language::Portuguese,
             |s: &mut SettingsState| s.draft.preset = Preset::TokyoNightLight,
             |s: &mut SettingsState| s.draft.palette.primary = crate::theme::Rgb::new(0xff00ff),
         ] {

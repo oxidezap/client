@@ -141,7 +141,7 @@ impl WhatsAppApp {
     fn save_account_selection(&mut self, cx: &mut Context<Self>) {
         if let Err(error) = self.account_selection.save() {
             self.notify_user(
-                format!("Could not remember the selected account: {error}"),
+                crate::tr!(could_not_remember_account, error),
                 notices::Tone::Problem,
                 cx,
             );
@@ -215,7 +215,7 @@ impl WhatsAppApp {
         let message = message.clone();
         let Some(control) = &self.control else {
             self.notify_user(
-                "The daemon's control connection is unavailable. Reopen the app to pair again.",
+                crate::tr!(TheDaemonSControlConnectionIsUnavailableReopenTheAppToPairAgain),
                 notices::Tone::Problem,
                 cx,
             );
@@ -248,7 +248,7 @@ impl WhatsAppApp {
                         _ => {
                             app.app_state = AppState::LoggedOut { message };
                             app.notify_user(
-                                "Pairing could not start. Local history has been kept. Try again.",
+                                crate::tr!(PairingCouldNotStartLocalHistoryHasBeenKeptTryAgain),
                                 notices::Tone::Problem,
                                 cx,
                             );

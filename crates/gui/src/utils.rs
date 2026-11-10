@@ -1,6 +1,6 @@
 //! Shared utility functions for the WhatsApp UI
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Datelike as _, Local, Utc};
 use gpui::ImageFormat;
 
 /// How GPUI should decode these bytes, when they are a still picture at all.
@@ -49,6 +49,32 @@ pub fn mime_to_image_format(mime: &str) -> Option<ImageFormat> {
     None
 }
 
+fn weekday(day: chrono::Weekday, short: bool) -> &'static str {
+    use crate::i18n::{Language, TextKey};
+    let names = if short {
+        [
+            TextKey::Mon,
+            TextKey::Tue,
+            TextKey::Wed,
+            TextKey::Thu,
+            TextKey::Fri,
+            TextKey::Sat,
+            TextKey::Sun,
+        ]
+    } else {
+        [
+            TextKey::Monday,
+            TextKey::Tuesday,
+            TextKey::Wednesday,
+            TextKey::Thursday,
+            TextKey::Friday,
+            TextKey::Saturday,
+            TextKey::Sunday,
+        ]
+    };
+    Language::current().text(names[day.num_days_from_monday() as usize])
+}
+
 /// Scale media dimensions to fit within `max_size` without upscaling, with a
 /// ~50px floor on the short side. Both fit and floor are single uniform
 /// factors so aspect ratio is always preserved; the floor yields to the
@@ -76,10 +102,10 @@ pub fn format_list_time(timestamp: &DateTime<Utc>) -> String {
 
     match (today - date).num_days() {
         0 => local.format("%H:%M").to_string(),
-        1 => "Yesterday".to_string(),
+        1 => crate::tr!(Yesterday).to_string(),
         // Inside the last week a weekday is both shorter and easier to place
         // than a date.
-        2..=6 => local.format("%a").to_string(),
+        2..=6 => weekday(local.weekday(), true).to_owned(),
         _ => local.format("%d/%m/%Y").to_string(),
     }
 }
@@ -95,9 +121,9 @@ pub fn format_status_time(timestamp: &DateTime<Utc>) -> String {
     let today = wacore::time::now_utc().with_timezone(&Local).date_naive();
 
     match (today - local.date_naive()).num_days() {
-        0 => local.format("Today at %H:%M").to_string(),
-        1 => local.format("Yesterday at %H:%M").to_string(),
-        _ => local.format("%d/%m/%Y at %H:%M").to_string(),
+        0 => local.format(crate::tr!(TodayAtHM)).to_string(),
+        1 => local.format(crate::tr!(YesterdayAtHM)).to_string(),
+        _ => local.format(crate::tr!(DMYAtHM)).to_string(),
     }
 }
 
@@ -107,10 +133,19 @@ pub fn format_date_divider(timestamp: &DateTime<Utc>) -> String {
     let today = wacore::time::now_utc().with_timezone(&Local).date_naive();
 
     match (today - local.date_naive()).num_days() {
-        0 => "TODAY".to_string(),
-        1 => "YESTERDAY".to_string(),
-        2..=6 => local.format("%A").to_string().to_uppercase(),
-        _ => local.format("%d %b %Y").to_string().to_uppercase(),
+        0 => crate::tr!(Today).to_string(),
+        1 => crate::tr!(YesterdayText).to_string(),
+        2..=6 => weekday(local.weekday(), false).to_uppercase(),
+        _ => local
+            .format(
+                if crate::i18n::Language::current() == crate::i18n::Language::Portuguese {
+                    "%d/%m/%Y"
+                } else {
+                    "%d %b %Y"
+                },
+            )
+            .to_string()
+            .to_uppercase(),
     }
 }
 

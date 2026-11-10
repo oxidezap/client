@@ -55,16 +55,16 @@ pub enum Home {
 impl Home {
     /// What to tell somebody looking at an empty list.
     #[must_use]
-    pub const fn nothing_loaded(self) -> &'static str {
+    pub fn nothing_loaded(self) -> &'static str {
         match self {
             // The same sentence for both, because they are the same act now:
             // the file goes to whichever process holds the folder, and that
             // process is the one that starts it.
             Self::Folder | Self::Page => {
-                "Add a .wasm file below. It starts as soon as it is added."
+                crate::tr!(AddPluginHere)
             }
             Self::AnotherTab => {
-                "Add a .wasm file below. It starts in the tab holding this account."
+                crate::tr!(AddPluginOtherTab)
             }
         }
     }
@@ -118,7 +118,7 @@ fn one_module(chosen: crate::platform::picker::Chosen) -> Result<Option<Module>,
         // Refused rather than quietly installing the first: a reload retires
         // every running plugin, so "add these three" is a different act from
         // three adds and is not one this asks for.
-        return Err("Choose one .wasm at a time.".to_string());
+        return Err(crate::tr!(OnePluginAtATime).to_string());
     }
     let Some(file) = files.pop() else {
         return Ok(None);

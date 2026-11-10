@@ -39,6 +39,7 @@ pub mod identity;
 pub mod keyboard;
 pub mod launch;
 pub mod lifecycle;
+pub mod locale;
 pub mod log_store;
 pub(crate) mod notifications;
 pub mod picker;

@@ -156,7 +156,7 @@ impl gpui::RenderOnce for StatusList {
                     Button::new("status-load-more")
                         .ghost()
                         .w_full()
-                        .child("Load more updates")
+                        .child(crate::tr!(LoadMoreUpdates))
                         .on_click(move |_, _, cx| {
                             paging_entity.update(cx, |app, cx| app.load_more_status(cx));
                         }),
@@ -210,7 +210,7 @@ fn render_rows(
                 let row = match ix {
                     0 => render_mine(&props, rows_entity.clone(), layout, true, cx)
                         .into_any_element(),
-                    1 => section_label("Recent", metrics, cx).into_any_element(),
+                    1 => section_label(crate::tr!(Recent), metrics, cx).into_any_element(),
                     _ => {
                         let author = &props.feed.authors()[ix - 2];
                         render_author_row(
@@ -280,7 +280,7 @@ fn render_title_bar(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
                 .text_size(metrics.text_title())
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(cx.theme().foreground)
-                .child("Status"),
+                .child(crate::tr!(Status)),
         )
 }
 
@@ -305,7 +305,7 @@ fn render_mine(
             format_status_time(&author.latest)
         )
         .into(),
-        None => "Posting is not available yet".into(),
+        None => crate::tr!(PostingIsNotAvailableYet).into(),
     };
 
     div()
@@ -348,16 +348,16 @@ fn render_recent(
                 .flex()
                 .justify_center()
                 .child(
-                    EmptyState::new("No status updates")
+                    EmptyState::new(crate::tr!(NoStatusUpdates))
                         .icon(ProductIcon::CircleDashed)
-                        .description("Updates from your contacts show up here for 24 hours."),
+                        .description(crate::tr!(UpdatesFromYourContactsShowUpHereFor24Hours)),
                 )
                 .into_any_element(),
         ];
     }
 
     let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(authors.len() + 1);
-    rows.push(section_label("Recent", metrics, cx).into_any_element());
+    rows.push(section_label(crate::tr!(Recent), metrics, cx).into_any_element());
     rows.extend(authors.iter().map(|author| {
         let is_selected = props.selected.is(&author.jid);
         render_author_row(author, is_selected, None, entity.clone(), layout, cx).into_any_element()

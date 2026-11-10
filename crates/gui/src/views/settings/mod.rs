@@ -125,7 +125,7 @@ fn render_nav(
                         .icon(IconName::ArrowLeft)
                         .ghost()
                         .small()
-                        .tooltip("Back to chats")
+                        .tooltip(crate::tr!(BackToChats))
                         .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             close_entity.update(cx, |app, cx| {
@@ -138,7 +138,7 @@ fn render_nav(
                         .text_size(metrics.text_title())
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(cx.theme().foreground)
-                        .child("Settings"),
+                        .child(crate::tr!(Settings)),
                 ),
         )
         .child(
@@ -277,7 +277,8 @@ fn render_header(
         .items_center()
         .justify_between()
         .gap(metrics.space_lg())
-        .h(metrics.header_height())
+        .min_h(metrics.header_height())
+        .py(metrics.space_md())
         .px(metrics.space_xxl())
         .border_b_1()
         .border_color(cx.theme().border)
@@ -287,9 +288,10 @@ fn render_header(
             el.child(
                 Button::new("settings-back-mobile")
                     .icon(IconName::ArrowLeft)
+                    .flex_shrink_0()
                     .ghost()
                     .small()
-                    .tooltip("Back to chats")
+                    .tooltip(crate::tr!(BackToChats))
                     .cursor_pointer()
                     .on_click(move |_, _window, cx| {
                         back_entity.update(cx, |app, cx| app.close_settings(cx));
@@ -298,10 +300,14 @@ fn render_header(
         })
         .child(
             div()
+                .debug_selector(|| "settings-header-text".into())
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .child(
                     div()
+                        .min_w_0()
                         .text_size(metrics.text_heading())
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(cx.theme().foreground)
@@ -309,6 +315,7 @@ fn render_header(
                 )
                 .children(description_for(section).map(|text| {
                     div()
+                        .min_w_0()
                         .text_size(metrics.text_small())
                         .text_color(cx.theme().muted_foreground)
                         .child(text)
@@ -317,9 +324,10 @@ fn render_header(
         .child(
             Button::new("settings-close")
                 .icon(IconName::Close)
+                .flex_shrink_0()
                 .ghost()
                 .small()
-                .tooltip("Close settings")
+                .tooltip(crate::tr!(CloseSettings))
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     entity.update(cx, |app, cx| {
@@ -394,19 +402,19 @@ fn library_version() -> &'static str {
 fn description_for(section: SettingsSection) -> Option<&'static str> {
     match section {
         SettingsSection::Appearance => {
-            Some("Presets write to the same theme.json you can edit by hand.")
+            Some(crate::tr!(PresetsWriteToTheSameThemeJsonYouCanEditByHand))
         }
-        SettingsSection::Privacy => Some("This device's identity, and how to start over."),
-        SettingsSection::Storage => Some("What this client keeps on disk."),
+        SettingsSection::Privacy => Some(crate::tr!(ThisDeviceSIdentityAndHowToStartOver)),
+        SettingsSection::Storage => Some(crate::tr!(WhatThisClientKeepsOnDisk)),
         SettingsSection::Plugins => Some(match crate::platform::plugins::home() {
             crate::platform::PluginHome::Folder => {
-                "Loaded from the plugins folder. Each one says what it may do."
+                crate::tr!(LoadedFromThePluginsFolderEachOneSaysWhatItMayDo)
             }
             crate::platform::PluginHome::Page => {
-                "Kept in this browser. Each one says what it may do."
+                crate::tr!(KeptInThisBrowserEachOneSaysWhatItMayDo)
             }
             crate::platform::PluginHome::AnotherTab => {
-                "Kept in this browser, and loaded by the tab holding this account."
+                crate::tr!(KeptInThisBrowserAndLoadedByTheTabHoldingThisAccount)
             }
         }),
         _ => None,

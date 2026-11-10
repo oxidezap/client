@@ -176,7 +176,7 @@ impl WhatsAppApp {
                 use gpui_component::input::InputEvent;
 
                 let input = cx.new(|cx| {
-                    InputState::new(window, cx).placeholder("Search in this conversation")
+                    InputState::new(window, cx).placeholder(crate::tr!(SearchInThisConversation))
                 });
                 cx.subscribe(&input, |this, input, event: &InputEvent, cx| match event {
                     InputEvent::Change => {
@@ -394,6 +394,18 @@ impl WhatsAppApp {
     ) {
         self.settings
             .update(cx, |settings, cx| settings.set_preset(preset, window, cx));
+    }
+
+    pub fn set_language(
+        &mut self,
+        language: crate::i18n::Language,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.update(cx, |settings, cx| {
+            settings.set_language(language, window, cx)
+        });
+        cx.notify();
     }
 
     pub fn set_theme_density(

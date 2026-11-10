@@ -1,0 +1,41 @@
+// Named placeholders may be reordered by a translator. Rust checks both formats.
+formatted_catalog! {
+    replying_to(name) => ("Replying to {name}", "Respondendo a {name}");
+    send_files(count) => ("Send {count} files?", "Enviar {count} arquivos?");
+    on_call_with(name) => ("On call with {name}", "Em chamada com {name}");
+    retry_in(secs) => ("Retry in {secs}s", "Tentar em {secs}s");
+    also_calling(name) => ("{name} is also calling", "{name} também está ligando");
+    react_emoji(emoji) => ("React {emoji}", "Reagir com {emoji}");
+    vote_for(option) => ("Vote for {option}", "Votar em {option}");
+    open_target(target) => ("Open {target}", "Abrir {target}");
+    allowed_to(capabilities) => ("Allowed to: {capabilities}", "Permitido: {capabilities}");
+    wants_to(capabilities) => ("Wants to: {capabilities}", "Solicita: {capabilities}");
+    also(capabilities) => ("Also: {capabilities}", "Também: {capabilities}");
+    files(count) => ("{count} files", "{count} arquivos");
+    system_default_device(device) => ("{device} (system default)", "{device} (padrão do sistema)");
+    requested_camera(width, height, fps) => ("Requested camera mode: {width} × {height} · {fps} FPS", "Modo de câmera solicitado: {width} × {height} · {fps} FPS");
+    opened_camera(width, height, fps) => ("Camera opened at {width} × {height} · {fps} FPS", "Câmera aberta em {width} × {height} · {fps} FPS");
+    last_seen(time) => ("last seen {time}", "visto por último {time}");
+    others(line, count) => ("{line} and {count}", "{line} e {count}");
+    own_name(name) => ("{name} (You)", "{name} (Você)");
+    match_count(current, total) => ("{current} of {total}", "{current} de {total}");
+    could_not_remember_account(error) => ("Could not remember the selected account: {error}", "Não foi possível lembrar a conta selecionada: {error}");
+    call_failed(reason) => ("The call could not be connected: {reason}", "Não foi possível conectar a chamada: {reason}");
+    camera_failed(reason) => ("The camera could not be opened: {reason}", "Não foi possível abrir a câmera: {reason}");
+    plugin_install_failed(e) => ("That plugin could not be installed: {e}", "Não foi possível instalar o plugin: {e}");
+    plugin_installed(id) => ("{id} installed. Starting it…", "{id} instalado. Iniciando…");
+    plugin_not_attached(id) => ("{id} cannot be removed while this window is not attached.", "Não é possível remover {id} enquanto esta janela estiver desconectada.");
+    plugin_removed(id) => ("{id} removed. Stopping it…", "{id} removido. Encerrando…");
+    plugin_remove_failed(id, e) => ("{id} could not be removed: {e}", "Não foi possível remover {id}: {e}");
+    save_failed(err) => ("could not save: {err}", "não foi possível salvar: {err}");
+    audio_start_failed(error) => ("Could not start that audio: {error}", "Não foi possível iniciar o áudio: {error}");
+    audio_prepare_failed(error) => ("Could not prepare that audio: {error}", "Não foi possível preparar o áudio: {error}");
+    unsupported_media(file_name) => ("{file_name} is not a supported photo or video; choose Document to send the original file.", "{file_name} não é uma foto ou vídeo compatível; escolha Documento para enviar o arquivo original.");
+    unverified_media(file_name) => ("{file_name} could not be verified as a supported photo or video; choose Document to send the original file.", "Não foi possível verificar {file_name} como foto ou vídeo compatível; escolha Documento para enviar o arquivo original.");
+    conversation(value) => ("Conversation: {value}", "Conversa: {value}");
+    message_preview(value) => ("Message: {value}", "Mensagem: {value}");
+    message_time(value) => ("Time: {value}", "Horário: {value}");
+    file_empty(file_name) => ("{file_name} is empty.", "{file_name} está vazio.");
+    file_too_big(file_name, size, maximum) => ("{file_name} is {size} and the most that can be sent is {maximum}.", "{file_name} tem {size}, mas o limite de envio é {maximum}.");
+    selection_full(file_name, maximum) => ("{file_name} did not fit: one trip to the file chooser can carry {maximum} in total. Send it on its own.", "{file_name} excede o limite total de {maximum} por seleção. Envie o arquivo separadamente.");
+}

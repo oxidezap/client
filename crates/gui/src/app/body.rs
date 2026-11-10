@@ -374,6 +374,117 @@ pub(super) mod tests {
         ]
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    #[gpui::test]
+    fn localized_settings_controls_stay_inside_the_viewport(cx: &mut gpui::TestAppContext) {
+        // Locale is process-wide. Exercise both languages in a child so the
+        // suite's other tests keep their own default-language assumptions.
+        const CHILD: &str = "OXIDE_SETTINGS_LAYOUT_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::body::tests::localized_settings_controls_stay_inside_the_viewport",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let (mut visual, app) = connected_app_fixture(cx);
+        for language in crate::i18n::Language::ALL {
+            for width in [1000.0, 360.0] {
+                // Enough height to measure the complete form without scrolling;
+                // the production pane still scrolls at ordinary window heights.
+                visual.simulate_resize(gpui::size(gpui::px(width), gpui::px(2000.0)));
+                visual.update(|window, cx| {
+                    let settings = crate::theme::ThemeSettings {
+                        language,
+                        ..crate::theme::ThemeSettings::default()
+                    };
+                    crate::theme::install(settings, cx);
+                    app.update(cx, |app, cx| {
+                        app.close_settings(cx);
+                        app.open_settings(window, cx);
+                        // Show Revert as well as Reload and Save.
+                        app.set_theme_preset(crate::theme::Preset::TokyoNightStorm, window, cx);
+                    });
+                });
+                visual.run_until_parked();
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let viewport = visual.update(|window, _| window.viewport_size());
+                for selector in [
+                    "settings-header-text",
+                    "settings-font-controls",
+                    "settings-font-description",
+                    "settings-theme-file-header",
+                    "settings-theme-file-actions",
+                ] {
+                    let bounds = visual
+                        .debug_bounds(selector)
+                        .unwrap_or_else(|| panic!("{language:?}, {width}: missing {selector}"));
+                    assert!(
+                        bounds.origin.x >= gpui::px(-0.1)
+                            && bounds.right() <= viewport.width + gpui::px(0.1),
+                        "{language:?}, {width}, {selector}: {bounds:?} outside {viewport:?}"
+                    );
+                    assert!(bounds.size.width > gpui::px(0.0), "{selector} has no width");
+                }
+            }
+        }
+        crate::i18n::Language::English.activate();
+    }
+
+    #[gpui::test]
+    fn own_reply_retains_identity_without_storing_a_translated_role(cx: &mut gpui::TestAppContext) {
+        let (mut visual, app) = connected_app_fixture(cx);
+        visual.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.account_jid = Some("1@s.whatsapp.net".into());
+                app.account_name = Some("Account owner".into());
+                app.find_chat_mut("peer@example.invalid")
+                    .unwrap()
+                    .messages
+                    .push(oxidezap_core::ChatMessage::new_outgoing(
+                        "own-reply-target".into(),
+                        "Synthetic body".into(),
+                    ));
+                app.begin_reply("own-reply-target", window, cx);
+                let draft = app.reply_to.as_ref().unwrap();
+                assert!(draft.sender_is_self);
+                assert_eq!(draft.sender_name, "Account owner");
+                assert_eq!(
+                    draft.sender_label(crate::i18n::Language::Portuguese),
+                    "Você"
+                );
+                assert_eq!(draft.sender_label(crate::i18n::Language::English), "You");
+                let quote: oxidezap_core::QuotedMessage = draft.clone().into();
+                assert!(app.is_own_number(&quote.sender));
+                assert_eq!(quote.sender_name, "Account owner");
+                let mut reply = oxidezap_core::ChatMessage::new_outgoing(
+                    "own-reply".into(),
+                    "Synthetic reply".into(),
+                );
+                reply.quoted = Some(quote);
+                app.find_chat_mut("peer@example.invalid")
+                    .unwrap()
+                    .messages
+                    .push(reply);
+                cx.notify();
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
     pub(crate) fn connected_app_fixture(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {

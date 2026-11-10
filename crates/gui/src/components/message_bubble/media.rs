@@ -133,7 +133,7 @@ pub(super) fn render_media_content(
                 // image fetchable on tap, like audio/video already are.
                 el.child(render_download_placeholder(
                     "img-dl",
-                    "[Image] Tap to download",
+                    crate::tr!(ImageTapToDownload),
                     chat_jid,
                     message_id,
                     dl,
@@ -145,7 +145,10 @@ pub(super) fn render_media_content(
                 ))
             } else {
                 el.child(render_media_placeholder(
-                    "[Image]", display_w, display_h, cx,
+                    crate::tr!(Image),
+                    display_w,
+                    display_h,
+                    cx,
                 ))
             }
         }
@@ -252,7 +255,7 @@ pub(super) fn render_media_content(
                         } else if let Some(dl) = media_content.downloadable.clone() {
                             el.child(render_download_placeholder(
                                 "sticker-dl",
-                                "[Sticker] Tap to download",
+                                crate::tr!(StickerTapToDownload),
                                 chat_jid,
                                 message_id,
                                 dl,
@@ -264,7 +267,7 @@ pub(super) fn render_media_content(
                             ))
                         } else {
                             el.child(render_media_placeholder(
-                                "[Sticker]",
+                                crate::tr!(Sticker),
                                 display_w,
                                 display_h,
                                 cx,
@@ -363,7 +366,7 @@ fn render_download_placeholder(
                     div()
                         .text_size(metrics.text_small())
                         .text_color(cx.theme().muted_foreground)
-                        .child("Downloading…"),
+                        .child(crate::tr!(Downloading)),
                 )
             } else {
                 el.child(
@@ -602,7 +605,7 @@ fn render_document_placeholder(
     let name = media_content
         .file_name
         .clone()
-        .unwrap_or_else(|| "Document".to_string());
+        .unwrap_or_else(|| crate::tr!(Document).to_string());
     let extension = extension_of(&name);
     let size = media_content
         .downloadable
@@ -612,7 +615,7 @@ fn render_document_placeholder(
         (Some(ext), Some(size)) => format!("{ext} · {size}"),
         (Some(ext), None) => ext.clone(),
         (None, Some(size)) => size.clone(),
-        (None, None) => "Document".to_string(),
+        (None, None) => crate::tr!(Document).to_string(),
     };
 
     let row = div()
@@ -662,7 +665,7 @@ fn render_document_placeholder(
                         .text_size(metrics.text_micro())
                         .text_color(parts::subtle(cx))
                         .child(if is_downloading {
-                            "Saving…".to_string()
+                            crate::tr!(Saving).to_string()
                         } else {
                             detail
                         }),
@@ -682,7 +685,7 @@ fn render_document_placeholder(
                 parts::icon_button(
                     SharedString::from(format!("save-{message_id}")),
                     Icon::new(IconName::ArrowDown).size(metrics.icon_small()),
-                    "Save to Downloads",
+                    crate::tr!(SaveToDownloads),
                     metrics.icon_button(),
                 )
                 .disabled(is_downloading)
@@ -703,7 +706,7 @@ fn render_document_placeholder(
                     let open = parts::icon_button(
                         SharedString::from(format!("open-{id}")),
                         Icon::new(IconName::ArrowRight).size(metrics.icon_small()),
-                        "Open",
+                        crate::tr!(Open),
                         metrics.icon_button(),
                     )
                     .cursor_pointer()
@@ -717,7 +720,7 @@ fn render_document_placeholder(
                     let reveal = parts::icon_button(
                         SharedString::from(format!("reveal-{id}")),
                         Icon::new(IconName::Folder).size(metrics.icon_small()),
-                        "Show in folder",
+                        crate::tr!(ShowInFolder),
                         metrics.icon_button(),
                     )
                     .cursor_pointer()
@@ -873,7 +876,7 @@ fn render_video_player(
                     .child(
                         div()
                             .text_color(cx.theme().muted_foreground)
-                            .child("[Video]"),
+                            .child(crate::tr!(VideoText)),
                     )
                     .into_any_element()
             },

@@ -62,7 +62,7 @@ pub fn render_conversation_search(
                 .icon(IconName::ChevronUp)
                 .ghost()
                 .small()
-                .tooltip("Previous match")
+                .tooltip(crate::tr!(PreviousMatch))
                 .disabled(!can_step)
                 .when(can_step, |button| button.cursor_pointer())
                 .on_click(move |_, _window, cx| {
@@ -74,7 +74,7 @@ pub fn render_conversation_search(
                 .icon(IconName::ChevronDown)
                 .ghost()
                 .small()
-                .tooltip("Next match")
+                .tooltip(crate::tr!(NextMatch))
                 .disabled(!can_step)
                 .when(can_step, |button| button.cursor_pointer())
                 .on_click(move |_, _window, cx| {
@@ -86,7 +86,7 @@ pub fn render_conversation_search(
                 .icon(IconName::Close)
                 .ghost()
                 .small()
-                .tooltip("Close search")
+                .tooltip(crate::tr!(CloseSearch))
                 .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     close_entity.update(cx, |app, cx| {

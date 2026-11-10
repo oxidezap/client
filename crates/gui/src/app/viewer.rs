@@ -189,7 +189,7 @@ impl MediaViewer {
 
     /// "3 of 12", or nothing when there is only the one.
     pub fn position(&self) -> Option<String> {
-        (self.items.len() > 1).then(|| format!("{} of {}", self.current + 1, self.items.len()))
+        (self.items.len() > 1).then(|| crate::tr!(match_count, self.current + 1, self.items.len()))
     }
 
     pub fn can_step(&self) -> bool {

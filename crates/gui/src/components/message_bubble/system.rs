@@ -63,14 +63,14 @@ pub fn render_call_record(
                     div()
                         .text_size(metrics.text_secondary())
                         .text_color(cx.theme().foreground)
-                        .child(record.title()),
+                        .child(crate::i18n::Language::current().call_title(&record)),
                 )
                 .child(
                     div()
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(metrics.text_micro())
                         .text_color(accent)
-                        .child(record.detail()),
+                        .child(crate::i18n::Language::current().call_detail(&record)),
                 ),
         )
         // Calling back is a command, so it is a Button rather than a click on
@@ -82,7 +82,7 @@ pub fn render_call_record(
                     .icon(Icon::new(ProductIcon::Phone))
                     .ghost()
                     .small()
-                    .tooltip("Call back")
+                    .tooltip(crate::tr!(CallBack))
                     .cursor_pointer()
                     .on_click(move |_, _window, cx| {
                         entity.update(cx, |app, cx| app.start_call(peer_jid.clone(), false, cx));
@@ -141,9 +141,9 @@ pub fn render_encryption_notice(metrics: Metrics, cx: &App) -> impl IntoElement 
                 .min_w_0()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().muted_foreground)
-                .child(
-                    "Messages are end-to-end encrypted. Nobody outside this chat can read them.",
-                ),
+                .child(crate::tr!(
+                    MessagesAreEndToEndEncryptedNobodyOutsideThisChatCanReadThem
+                )),
         )
 }
 
@@ -161,9 +161,12 @@ pub fn render_system_row(
             render_call_record(*record, peer_jid, message_id, entity, metrics, cx)
                 .into_any_element()
         }
-        SystemNotice::GroupMembership(event) => {
-            render_notice(event.summary(), metrics, cx).into_any_element()
-        }
+        SystemNotice::GroupMembership(event) => render_notice(
+            crate::i18n::Language::current().membership(event),
+            metrics,
+            cx,
+        )
+        .into_any_element(),
         SystemNotice::GroupChanged(text) => {
             render_notice(text.clone(), metrics, cx).into_any_element()
         }

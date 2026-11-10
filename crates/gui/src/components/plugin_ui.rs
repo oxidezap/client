@@ -290,7 +290,7 @@ fn unsaved_row(
                 .min_w_0()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().warning)
-                .child("Not saved yet. Press Enter, or click Save."),
+                .child(crate::tr!(NotSavedYetPressEnterOrClickSave)),
         )
         .child(
             // Its own namespace, and the slot in it. A widget id may hold
@@ -301,7 +301,7 @@ fn unsaved_row(
             Button::new(SharedString::from(format!(
                 "plugin-save/{plugin}/{slot:?}/{id}"
             )))
-            .label("Save")
+            .label(crate::tr!(Save))
             .primary()
             .small()
             .cursor_pointer()
@@ -338,11 +338,11 @@ pub enum Standing {
 }
 
 impl Standing {
-    const fn word(self) -> &'static str {
+    fn word(self) -> &'static str {
         match self {
-            Self::Running => "Running",
-            Self::Stopped => "Stopped",
-            Self::NotLoaded => "Not loaded",
+            Self::Running => crate::tr!(Running),
+            Self::Stopped => crate::tr!(Stopped),
+            Self::NotLoaded => crate::tr!(NotLoaded),
         }
     }
 }
@@ -487,7 +487,7 @@ pub fn settings_entry(
                         div()
                             .text_size(metrics.text_small())
                             .text_color(subtle)
-                            .child("It is in the plugins folder but the host would not run it."),
+                            .child(crate::tr!(ItIsInThePluginsFolderButTheHostWouldNotRunIt)),
                     )
                     .child(
                         div()
@@ -513,11 +513,11 @@ pub fn settings_entry(
     // has not been allowed is running and refused — it watches, and every
     // gated command it issues comes back denied.
     let permissions = if surface.gated.is_empty() {
-        "Watches only. It cannot act on your account.".to_string()
+        crate::tr!(WatchesOnlyItCannotActOnYourAccount).to_string()
     } else if surface.approved {
-        format!("Allowed to: {}", surface.gated.join(", "))
+        crate::tr!(allowed_to, surface.gated.join(", "))
     } else {
-        format!("Wants to: {}", surface.gated.join(", "))
+        crate::tr!(wants_to, surface.gated.join(", "))
     };
     // What it does only to itself, said plainly and never as a question. It
     // holds these by declaring them, so offering a switch over them would be
@@ -529,7 +529,7 @@ pub fn settings_entry(
         .filter(|c| !surface.gated.contains(c))
         .map(String::as_str)
         .collect();
-    let own = (!own.is_empty()).then(|| format!("Also: {}", own.join(", ")));
+    let own = (!own.is_empty()).then(|| crate::tr!(also, own.join(", ")));
 
     let mut body: Vec<gpui::AnyElement> = Vec::new();
     body.push(
@@ -574,7 +574,7 @@ pub fn settings_entry(
         let approved = surface.approved;
         body.push(
             row_with_label(
-                "Let it act on your account",
+                crate::tr!(LetItActOnYourAccount),
                 Switch::new(SharedString::from(format!("plugin-allow-{}", surface.id)))
                     .checked(approved)
                     .cursor_pointer()
@@ -652,11 +652,7 @@ pub fn unloaded_entry(
             div()
                 .text_size(metrics.text_small())
                 .text_color(subtle)
-                .child(
-                    "It is in the plugins folder but the host did not run it, and did \
-                     not say why here. The daemon's log has the reason; a file another \
-                     user can write is skipped before it is opened.",
-                )
+                .child(crate::tr!(PluginNotRunGuidance))
                 .into_any_element(),
         ],
         metrics,

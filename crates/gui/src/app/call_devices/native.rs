@@ -21,13 +21,13 @@ impl PreviewDecoder {
         let decoder = self
             .decoder
             .as_mut()
-            .ok_or("Preview decoder is unavailable")?;
+            .ok_or(crate::tr!(PreviewDecoderIsUnavailable))?;
         let Some(yuv) = decoder.decode(&frame.data).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
         let (width, height) = yuv.dimensions();
         if width == 0 || height == 0 || width.saturating_mul(height) > 1280 * 720 {
-            return Err("Preview dimensions exceed the supported limit".into());
+            return Err(crate::tr!(PreviewDimensionsExceedTheSupportedLimit).into());
         }
         self.started = true;
         let mut bytes = vec![0; width * height * 4];
@@ -36,7 +36,7 @@ impl PreviewDecoder {
             pixel.swap(0, 2);
         }
         let image = image::RgbaImage::from_raw(width as u32, height as u32, bytes)
-            .ok_or("Invalid preview image")?;
+            .ok_or(crate::tr!(InvalidPreviewImage))?;
         Ok(Some(Arc::new(RenderImage::new(
             smallvec::SmallVec::from_elem(image::Frame::new(image), 1),
         ))))

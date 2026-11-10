@@ -43,8 +43,8 @@ impl ChatKind {
     pub fn label(self) -> Option<&'static str> {
         match self {
             Self::Direct => None,
-            Self::Group => Some("Group"),
-            Self::Channel => Some("Channel"),
+            Self::Group => Some(crate::tr!(Group)),
+            Self::Channel => Some(crate::tr!(Channel)),
         }
     }
 }
@@ -73,11 +73,11 @@ impl PreviewGlyph {
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Image => "Photo",
-            Self::Video => "Video",
-            Self::Audio => "Voice message",
-            Self::Document => "Document",
-            Self::Sticker => "Sticker",
+            Self::Image => crate::tr!(Photo),
+            Self::Video => crate::tr!(Video),
+            Self::Audio => crate::tr!(VoiceMessage),
+            Self::Document => crate::tr!(Document),
+            Self::Sticker => crate::tr!(StickerText),
         }
     }
 }
@@ -174,11 +174,11 @@ impl ChatRow {
 
 fn hierarchy_label(hierarchy: Option<&GroupHierarchy>) -> Option<&'static str> {
     match hierarchy? {
-        GroupHierarchy::Community => Some("Community"),
+        GroupHierarchy::Community => Some(crate::tr!(Community)),
         GroupHierarchy::Subgroup { kind, .. } => Some(match kind {
-            SubgroupKind::Announcement => "Announcement",
-            SubgroupKind::General => "General",
-            SubgroupKind::Regular | SubgroupKind::Other => "Subgroup",
+            SubgroupKind::Announcement => crate::tr!(Announcement),
+            SubgroupKind::General => crate::tr!(General),
+            SubgroupKind::Regular | SubgroupKind::Other => crate::tr!(Subgroup),
         }),
         GroupHierarchy::Standalone => None,
     }
@@ -256,7 +256,7 @@ fn prefix_for(chat: &Chat, last: &ChatMessage) -> Option<String> {
     if last.is_from_me {
         // The tick already says it is ours in a 1:1 chat; in a group the name
         // column is the group's, so the sender still needs saying.
-        return chat.is_group.then(|| "You".to_string());
+        return chat.is_group.then(|| crate::tr!(You).to_string());
     }
     if !chat.is_group {
         return None;
@@ -267,14 +267,19 @@ fn prefix_for(chat: &Chat, last: &ChatMessage) -> Option<String> {
 
 /// The preview text: a caption if there is one, otherwise the media's name.
 fn body_for(last: &ChatMessage) -> String {
+    if last.revoked {
+        return crate::tr!(MessageDeleted).to_owned();
+    }
     // A row nobody typed still happened, and a call is exactly the thing a
     // reader scans the list for. Its own sentence rather than the empty
     // string a message with no content would otherwise leave behind.
     if let Some(notice) = &last.system {
         return match notice {
-            SystemNotice::Call(record) => record.summary(),
+            SystemNotice::Call(record) => crate::i18n::Language::current().call_summary(record),
             SystemNotice::GroupChanged(text) => single_line(text),
-            SystemNotice::GroupMembership(event) => single_line(&event.summary()),
+            SystemNotice::GroupMembership(event) => {
+                single_line(&crate::i18n::Language::current().membership(event))
+            }
         };
     }
     if !last.content.is_empty() {
@@ -310,7 +315,7 @@ fn body_for(last: &ChatMessage) -> String {
 pub fn display_name(name: &str, is_own_number: bool) -> String {
     let name = crate::utils::capped_name(&single_line(name));
     if is_own_number {
-        format!("{name} (You)")
+        crate::tr!(own_name, name)
     } else {
         name
     }

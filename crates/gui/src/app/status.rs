@@ -29,10 +29,10 @@ impl Destination {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Chats => "Chats",
-            Self::Status => "Status",
-            Self::Channels => "Channels",
-            Self::Communities => "Communities",
+            Self::Chats => crate::tr!(Chats),
+            Self::Status => crate::tr!(Status),
+            Self::Channels => crate::tr!(Channels),
+            Self::Communities => crate::tr!(Communities),
         }
     }
 

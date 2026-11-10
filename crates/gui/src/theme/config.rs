@@ -48,6 +48,8 @@ pub struct ThemeFile {
     pub density: Option<String>,
     /// Base font size in pixels; the whole rem scale follows it.
     pub font_size: Option<f32>,
+    /// UI language tag. Missing or unsupported tags use English.
+    pub language: Option<String>,
 }
 
 /// A resolved, always-valid theme.
@@ -57,6 +59,7 @@ pub struct ThemeSettings {
     pub palette: Palette,
     pub density: Density,
     pub font_size: f32,
+    pub language: crate::i18n::Language,
     /// What the file asked for that could not be honoured, in the order the
     /// keys appear. Empty means the file was fully applied — or absent.
     pub problems: Vec<String>,
@@ -70,6 +73,7 @@ impl Default for ThemeSettings {
             palette: preset.palette(),
             density: Density::default(),
             font_size: DEFAULT_FONT_SIZE,
+            language: crate::i18n::Language::default(),
             problems: Vec::new(),
         }
     }
@@ -136,6 +140,11 @@ impl ThemeSettings {
             palette,
             density,
             font_size,
+            language: file
+                .language
+                .as_deref()
+                .map(crate::i18n::Language::parse)
+                .unwrap_or_default(),
             problems,
         }
     }
@@ -159,6 +168,7 @@ impl ThemeSettings {
             brand: diff(BRAND_KEYS),
             density: Some(self.density.id().to_string()),
             font_size: Some(self.font_size),
+            language: Some(self.language.code().to_string()),
         }
     }
 }
@@ -312,6 +322,21 @@ mod tests {
     /// Asserted against the empty document rather than a missing one, because
     /// the store is what decides absence now and a test may not have one.
     #[test]
+    fn old_and_unsupported_language_preferences_fall_back_to_english() {
+        use crate::i18n::Language;
+        for raw in [r#"{}"#, r#"{"language":"fr","font_size":18}"#] {
+            let settings = resolve(raw);
+            assert_eq!(settings.language, Language::English);
+            assert!(settings.problems.is_empty());
+        }
+        let settings = resolve(r#"{"language":"pt-BR","font_size":18}"#);
+        assert_eq!(settings.language, Language::Portuguese);
+        assert_eq!(settings.font_size, 18.0);
+        let saved = serde_json::to_string(&settings.to_file()).unwrap();
+        assert_eq!(parse(&saved).language, Language::Portuguese);
+    }
+
+    #[test]
     fn nothing_configured_is_the_product_default() {
         let settings = ThemeSettings::default();
         assert_eq!(settings.preset, Preset::TokyoNight);
@@ -388,6 +413,7 @@ mod tests {
             palette: Preset::TokyoNightStorm.palette(),
             density: Density::Compact,
             font_size: 18.0,
+            language: crate::i18n::Language::Portuguese,
             problems: Vec::new(),
         };
         settings.palette.primary = Rgb(0xff00ff);
@@ -400,6 +426,7 @@ mod tests {
         assert_eq!(reloaded.palette, settings.palette);
         assert_eq!(reloaded.density, settings.density);
         assert_eq!(reloaded.font_size, settings.font_size);
+        assert_eq!(reloaded.language, settings.language);
     }
 
     #[test]

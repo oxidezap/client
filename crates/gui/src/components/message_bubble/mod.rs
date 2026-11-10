@@ -71,6 +71,8 @@ pub struct BubbleProps {
     /// Whether the conversation is with your own number, which is what makes
     /// a sent message read the moment it lands.
     pub is_own_number: bool,
+    /// Resolved while the list holds the app, so rendering never re-enters it.
+    pub quoted_sender_is_self: bool,
     /// First message of a run by this author, which is what earns the sender
     /// name and the wider gap above.
     pub starts_run: bool,
@@ -268,7 +270,13 @@ pub fn render_message_bubble(
                                         .child(name)
                                 }))
                                 .children(message.quoted.as_ref().map(|quoted| {
-                                    render_quote(quoted, entity.clone(), metrics, cx)
+                                    render_quote(
+                                        quoted,
+                                        props.quoted_sender_is_self,
+                                        entity.clone(),
+                                        metrics,
+                                        cx,
+                                    )
                                 }))
                                 .children(message.business.as_ref().map(|_| {
                                     business::render_header(
@@ -395,10 +403,10 @@ pub fn render_message_bubble(
                                 Button::new(SharedString::from(format!(
                                     "open-link-{message_id}-{ix}"
                                 )))
-                                .label(format!("Open {target}"))
+                                .label(crate::tr!(open_target, target))
                                 .ghost()
                                 .xsmall()
-                                .tooltip(format!("Open {target}"))
+                                .tooltip(crate::tr!(open_target, target))
                                 .cursor_pointer()
                                 .on_click(move |_, _, cx| {
                                     cx.open_url(&url);
@@ -413,11 +421,11 @@ pub fn render_message_bubble(
                     el.child(
                         div().mt(metrics.space_xs()).child(
                             Button::new(ids.retry.clone())
-                                .label("Not sent · retry")
+                                .label(crate::tr!(NotSentRetry))
                                 .ghost()
                                 .danger()
                                 .xsmall()
-                                .tooltip("Send this message again")
+                                .tooltip(crate::tr!(SendThisMessageAgain))
                                 .cursor_pointer()
                                 .on_click(move |_, window, cx| {
                                     retry_entity.update(cx, |app, cx| {
@@ -471,7 +479,7 @@ pub fn render_message_bubble(
             let mut menu = menu;
             if crate::app::editing::can_edit_text(&menu_message, wacore::time::now_millis()) {
                 menu = menu.menu(
-                    "Edit",
+                    crate::tr!(Edit),
                     Box::new(EditMessage {
                         id: menu_id.clone().into(),
                     }),
@@ -480,7 +488,7 @@ pub fn render_message_bubble(
             for emoji in WhatsAppApp::QUICK_REACTIONS {
                 let react_id = menu_id.clone();
                 menu = menu.menu(
-                    format!("React {emoji}"),
+                    crate::tr!(react_emoji, emoji),
                     Box::new(ReactToMessage {
                         id: react_id.into(),
                         emoji: SharedString::from(emoji),
@@ -488,7 +496,7 @@ pub fn render_message_bubble(
                 );
             }
             let menu = menu.menu(
-                "Reply",
+                crate::tr!(Reply),
                 Box::new(ReplyToMessage {
                     id: menu_id.clone().into(),
                 }),
@@ -497,7 +505,7 @@ pub fn render_message_bubble(
                 menu
             } else {
                 menu.menu(
-                    "Copy text",
+                    crate::tr!(CopyText),
                     Box::new(CopyMessage {
                         text: menu_text.clone().into(),
                     }),
@@ -509,7 +517,7 @@ pub fn render_message_bubble(
             let mut menu = menu;
             for target in menu_links.iter() {
                 menu = menu.menu(
-                    format!("Open {target}"),
+                    crate::tr!(open_target, target),
                     Box::new(OpenMessageLink {
                         url: target.clone(),
                     }),
@@ -517,7 +525,7 @@ pub fn render_message_bubble(
             }
             if menu_delete_for_everyone {
                 menu = menu.separator().menu(
-                    "Apagar para todos",
+                    crate::tr!(DeleteForEveryone),
                     Box::new(DeleteSentMessage {
                         jid: menu_jid.clone(),
                         id: menu_id.clone().into(),
@@ -527,7 +535,7 @@ pub fn render_message_bubble(
             }
             if menu_delete_for_me {
                 menu = menu.menu(
-                    "Apagar para mim",
+                    crate::tr!(DeleteForMe),
                     Box::new(DeleteSentMessage {
                         jid: menu_jid.clone(),
                         id: menu_id.clone().into(),
@@ -537,7 +545,7 @@ pub fn render_message_bubble(
             }
             if menu_failed {
                 menu.separator().menu(
-                    "Send again",
+                    crate::tr!(SendAgain),
                     Box::new(RetryMessage {
                         id: menu_id.clone().into(),
                     }),

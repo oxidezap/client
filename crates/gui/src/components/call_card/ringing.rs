@@ -11,7 +11,7 @@ use gpui::{App, Entity, InteractiveElement, IntoElement, ParentElement, Styled, 
 use gpui_component::ActiveTheme as _;
 use gpui_component::Icon;
 use gpui_component::button::{Button, ButtonVariants as _};
-use oxidezap_core::{IncomingCall, OutgoingCall, OutgoingCallState};
+use oxidezap_core::{IncomingCall, OutgoingCall};
 
 use crate::app::WhatsAppApp;
 use crate::components::parts;
@@ -28,9 +28,9 @@ pub fn incoming(
     let accept_entity = entity.clone();
     let decline_entity = entity;
     let kind = if call.is_video {
-        "incoming video call"
+        crate::tr!(IncomingVideoCall)
     } else {
-        "incoming voice call"
+        crate::tr!(IncomingVoiceCall)
     };
 
     body(metrics, cx)
@@ -56,7 +56,7 @@ pub fn incoming(
                 .child(
                     Button::new("call-decline")
                         .icon(ProductIcon::PhoneOff)
-                        .label("Decline")
+                        .label(crate::tr!(Decline))
                         .danger()
                         .outline()
                         .flex_1()
@@ -71,7 +71,7 @@ pub fn incoming(
                     // default key have to name the same action.
                     Button::new("call-accept")
                         .icon(ProductIcon::Phone)
-                        .label("Accept")
+                        .label(crate::tr!(Accept))
                         .primary()
                         .flex_1()
                         .h(metrics.call_action_height())
@@ -81,7 +81,7 @@ pub fn incoming(
                         }),
                 ),
         )
-        .child(hint("enter accepts · esc declines", metrics, cx))
+        .child(hint(crate::tr!(EnterAcceptsEscDeclines), metrics, cx))
 }
 
 /// We are calling out.
@@ -92,13 +92,7 @@ pub fn outgoing(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let cancel_entity = entity;
-    let status = match call.state {
-        OutgoingCallState::Initiating => "calling",
-        OutgoingCallState::Ringing => "ringing",
-        OutgoingCallState::Connected => "connected",
-        OutgoingCallState::Declined => "call declined",
-        OutgoingCallState::Timeout => "no answer",
-    };
+    let status = crate::i18n::Language::current().outgoing_status(call.state);
 
     body(metrics, cx)
         .child(pulsing_avatar(
@@ -126,7 +120,7 @@ pub fn outgoing(
                     // someone, so it is an outline rather than a filled red.
                     Button::new("call-cancel")
                         .icon(ProductIcon::PhoneOff)
-                        .label("Cancel")
+                        .label(crate::tr!(Cancel))
                         .danger()
                         .outline()
                         .flex_1()
@@ -137,7 +131,7 @@ pub fn outgoing(
                         }),
                 ),
         )
-        .child(hint("esc cancels", metrics, cx))
+        .child(hint(crate::tr!(EscCancels), metrics, cx))
 }
 
 fn body(metrics: Metrics, _cx: &App) -> gpui::Div {

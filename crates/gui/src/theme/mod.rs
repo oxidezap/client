@@ -43,6 +43,7 @@ pub struct ProductTheme {
     /// say. Settings shows and saves this — a scale the window imposed is not
     /// a preference to write back.
     base_font_size: f32,
+    language: crate::i18n::Language,
     /// What the window's size did to that base. Kept so a theme reload — a
     /// palette edit, a font-size step — does not silently restore a design
     /// scale the screen has no room for.
@@ -75,6 +76,7 @@ impl ProductTheme {
         Self {
             metrics,
             base_font_size: settings.font_size,
+            language: settings.language,
             fit,
             palette: settings.palette,
             preset: settings.preset,
@@ -92,6 +94,7 @@ impl ProductTheme {
             palette: self.palette,
             density: self.metrics.density(),
             font_size: self.base_font_size,
+            language: self.language,
             problems: self.problems.clone(),
         }
     }
@@ -197,6 +200,15 @@ fn install_resolved(
     // every hairline and focus ring stops resolving — and a second multiplied
     // value computed beside it is a second answer: the library's buttons
     // would then sit at 7.7px in a header our own chrome drew at 10.
+    if crate::i18n::Language::current() != settings.language {
+        settings.language.activate();
+    }
+    crate::platform::locale::apply(settings.language.code());
+    // GPUI Kit ships its own translated control strings under regional tags.
+    gpui_component::set_locale(match settings.language {
+        crate::i18n::Language::English => "en",
+        crate::i18n::Language::Portuguese => "pt-BR",
+    });
     let metrics = Metrics::new(settings.font_size * fit, settings.density);
     apply::apply(&settings, metrics.rem_size(), cx);
     cx.set_global(ProductTheme::from_settings(

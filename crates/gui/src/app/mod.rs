@@ -203,6 +203,8 @@ struct PendingPastePreview {
 /// width without crossing a step.
 #[derive(Clone, Copy, PartialEq)]
 struct MeasuredAgainst {
+    /// Translated labels can wrap differently at the same width and font size.
+    language: crate::i18n::Language,
     /// The base font in force, which every dimension in a bubble resolves
     /// from.
     rem: f32,
@@ -1704,6 +1706,7 @@ impl WhatsAppApp {
         // search misses on every keystroke.
         let version = self.chat_cache_version.get();
         if let Some(cached) = cache.as_ref()
+            && cached.language == crate::i18n::Language::current()
             && cached.version == version
             && cached.chats_len == self.chats.len()
         {
@@ -1751,6 +1754,7 @@ impl WhatsAppApp {
 
         let new_cache = ChatListCache {
             version,
+            language: crate::i18n::Language::current(),
             chats_len: self.chats.len(),
             rows,
         };
@@ -1868,15 +1872,15 @@ impl WhatsAppApp {
                 .account_name
                 .clone()
                 .or_else(|| self.account_jid.clone())
-                .unwrap_or_else(|| "This device".to_string()),
+                .unwrap_or_else(|| crate::tr!(ThisDevice).to_string()),
             // Offline is a state the user chose, so it is named rather than
             // described as a connection still being attempted.
             status: match self.app_state {
-                AppState::Connected => "linked device · synced".to_string(),
+                AppState::Connected => crate::tr!(LinkedSynced).to_string(),
                 AppState::Offline | AppState::OfflineLoggedOut { .. } => {
-                    "local history · offline".to_string()
+                    crate::tr!(LocalOffline).to_string()
                 }
-                _ => "linked device · reconnecting".to_string(),
+                _ => crate::tr!(LinkedReconnecting).to_string(),
             },
             is_healthy: connected,
         })
@@ -2000,6 +2004,7 @@ impl WhatsAppApp {
             chat_jid,
             &rows,
             MeasuredAgainst {
+                language: crate::i18n::Language::current(),
                 rem: layout.metrics().rem_size(),
                 width: layout.message_list_width(),
             },
@@ -2821,7 +2826,7 @@ impl WhatsAppApp {
         if self.search.read(cx).list_input().is_some() {
             return;
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search chats..."));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::tr!(SearchChats)));
         cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
                 let query = input.read(cx).value().to_string();
@@ -4391,6 +4396,8 @@ impl Focusable for WhatsAppApp {
 
 impl Render for WhatsAppApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.search
+            .update(cx, |search, cx| search.refresh_language(window, cx));
         self.reconcile_media_owner(cx);
         self.observe_window_activation(window, cx);
         // First, because every dimension below resolves from the scale this
@@ -5598,6 +5605,7 @@ mod tests {
 
     fn same_layout() -> MeasuredAgainst {
         MeasuredAgainst {
+            language: crate::i18n::Language::current(),
             rem: 16.0,
             width: 600.0,
         }
@@ -5907,6 +5915,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_language_change_remeasures_without_losing_the_timeline_anchor() {
+        let rows = timeline_of(&["m1", "m2"]);
+        let mut english = same_layout();
+        english.language = crate::i18n::Language::English;
+        let anchor = anchored("peer@example.invalid", &rows, english);
+        let portuguese = MeasuredAgainst {
+            language: crate::i18n::Language::Portuguese,
+            ..english
+        };
+        assert_eq!(
+            timeline_sync(Some(&anchor), "peer@example.invalid", &rows, portuguese),
+            TimelineSync::Remeasure
+        );
+    }
+
     /// The same rows against a layout that has moved under them: every height
     /// is stale, and none of the rows are.
     #[test]
@@ -5914,6 +5938,7 @@ mod tests {
         let rows = timeline_of(&["m1", "m2"]);
         let anchor = anchored("a@s.whatsapp.net", &rows, same_layout());
         let wider = MeasuredAgainst {
+            language: crate::i18n::Language::current(),
             rem: 16.0,
             width: 900.0,
         };

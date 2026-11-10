@@ -63,25 +63,13 @@ impl WhatsAppApp {
         };
 
         let sender_name = if message.is_from_me {
-            "You".to_string()
+            self.account_name.clone().unwrap_or_default()
         } else {
             chat.author_name(message)
                 .map(str::to_owned)
                 .unwrap_or_else(|| chat.name.clone())
         };
-        let preview = if message.content.is_empty() {
-            message
-                .media
-                .as_ref()
-                .map(|m| {
-                    crate::app::chat_row::PreviewGlyph::of(&m.media_type)
-                        .label()
-                        .to_string()
-                })
-                .unwrap_or_default()
-        } else {
-            message.content.clone()
-        };
+        let preview = message.content.clone();
 
         // `sender` is sent as the quote's participant, so it has to be a JID.
         // A message this window composed carries the literal `"Me"` — that is
@@ -101,6 +89,7 @@ impl WhatsAppApp {
             message_id: message_id.to_string(),
             sender,
             sender_name,
+            sender_is_self: message.is_from_me,
             preview,
             kind: message
                 .media

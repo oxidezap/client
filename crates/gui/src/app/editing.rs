@@ -54,7 +54,7 @@ impl WhatsAppApp {
         };
         if !can_edit_text(message, wacore::time::now_millis()) {
             self.notify_user(
-                "This message can no longer be edited.",
+                crate::tr!(ThisMessageCanNoLongerBeEdited),
                 notices::Tone::Problem,
                 cx,
             );
@@ -147,7 +147,7 @@ impl WhatsAppApp {
                 .is_some_and(|message| can_edit_text(message, wacore::time::now_millis()))
         {
             self.notify_user(
-                "This message can no longer be edited.",
+                crate::tr!(ThisMessageCanNoLongerBeEdited),
                 notices::Tone::Problem,
                 cx,
             );
@@ -166,9 +166,9 @@ impl WhatsAppApp {
         let handle = window.window_handle();
         cx.spawn(async move |entity, cx| {
             let result = answer.await.unwrap_or_else(|_| {
-                Err(crate::session::Failure::worth_retrying(
-                    "The daemon disconnected before confirming the edit.",
-                ))
+                Err(crate::session::Failure::worth_retrying(crate::tr!(
+                    TheDaemonDisconnectedBeforeConfirmingTheEdit
+                )))
             });
             let _ = handle.update(cx, |_, window, cx| {
                 let _ = entity.update(cx, |app, cx| {

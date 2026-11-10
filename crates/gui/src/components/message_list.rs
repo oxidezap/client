@@ -82,9 +82,9 @@ pub fn render_message_list(
             .items_center()
             .p(metrics.space_xxxl())
             .child(
-                EmptyState::new("No messages yet")
+                EmptyState::new(crate::tr!(NoMessagesYet))
                     .icon(ProductIcon::MessageSquare)
-                    .description("Say something to start this conversation."),
+                    .description(crate::tr!(SaySomethingToStartThisConversation)),
             )
             .into_any_element();
     }
@@ -308,6 +308,10 @@ fn render_row(
                 playing_message_id: app.playing_message_id().map(|s| s.to_string()),
                 is_group,
                 is_own_number,
+                quoted_sender_is_self: msg
+                    .quoted
+                    .as_ref()
+                    .is_some_and(|quote| quote.sender == "Me" || app.is_own_number(&quote.sender)),
                 starts_run: *starts_run,
                 video_player_state: app.video_player_state(message_id),
                 video_frame: app.video_current_frame(message_id),
@@ -367,7 +371,7 @@ fn render_typing(
 ) -> impl IntoElement + use<> {
     let typists = summary.typists.clone();
     let overflow = summary.overflow();
-    let label = summary.label();
+    let label = crate::i18n::Language::current().typing(summary, is_group, false);
     // A single typist in a group gets their own colour on the dots; a crowd
     // stays neutral, because no one hue would be honest.
     let dot_colour = if is_group && summary.total == 1 {
