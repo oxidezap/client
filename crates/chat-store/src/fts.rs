@@ -295,6 +295,32 @@ fn fts_hits(
 ) -> wacore::store::error::Result<Vec<FtsHit>> {
     use diesel::sql_types::{BigInt, Integer, Text};
 
+    let sql = fts_hit_sql(!keys.is_empty(), ranked, has_media);
+    let Some(first_key) = keys.first() else {
+        return diesel::sql_query(sql)
+            .bind::<Text, _>(match_query)
+            .bind::<Integer, _>(device_id)
+            .bind::<BigInt, _>(limit)
+            .load(conn)
+            .map_err(db_err);
+    };
+    // Each bounded key chunk has at most two storage identities. Padding the
+    // single-key case to two placeholders keeps one statically bound statement
+    // instead of a variadic one; `IN (x, x)` is `IN (x)`.
+    let second_key = keys.get(1).unwrap_or(first_key);
+    diesel::sql_query(sql)
+        .bind::<Text, _>(match_query)
+        .bind::<Integer, _>(device_id)
+        .bind::<Text, _>(first_key)
+        .bind::<Text, _>(second_key)
+        .bind::<BigInt, _>(limit)
+        .load(conn)
+        .map_err(db_err)
+}
+
+/// Keep the FTS cursor outside the content-table lookup even on SQLite versions
+/// that otherwise prefer scanning every message in an unanalyzed store.
+fn fts_hit_sql(scoped: bool, ranked: bool, has_media: bool) -> String {
     // Constant fragments, never caller input. `rank` is qualified because it is
     // only unambiguous today by accident — `messages` has no such column, and
     // an unqualified reference would silently start resolving to it if one were
@@ -319,36 +345,19 @@ fn fts_hits(
     } else {
         String::new()
     };
-    let Some(first_key) = keys.first() else {
-        return diesel::sql_query(format!(
-            "SELECT f.rowid AS id, f.rank AS rank
-             FROM messages_fts f JOIN messages m ON m.id = f.rowid
-             WHERE messages_fts MATCH ? AND m.device_id = ?{media_filter}
-             ORDER BY {order} LIMIT ?"
-        ))
-        .bind::<Text, _>(match_query)
-        .bind::<Integer, _>(device_id)
-        .bind::<BigInt, _>(limit)
-        .load(conn)
-        .map_err(db_err);
+    let scope = if scoped {
+        " AND m.chat_jid IN (?, ?)"
+    } else {
+        ""
     };
-    // Each bounded key chunk has at most two storage identities. Padding the
-    // single-key case to two placeholders keeps one statically bound statement
-    // instead of a variadic one; `IN (x, x)` is `IN (x)`.
-    let second_key = keys.get(1).unwrap_or(first_key);
-    diesel::sql_query(format!(
+    // SQLite never reorders CROSS JOIN operands. ON still filters the same
+    // inner-join pairs, so each FTS hit looks up its content row by primary key.
+    format!(
         "SELECT f.rowid AS id, f.rank AS rank
-         FROM messages_fts f JOIN messages m ON m.id = f.rowid
-         WHERE messages_fts MATCH ? AND m.device_id = ? AND m.chat_jid IN (?, ?){media_filter}
+         FROM messages_fts f CROSS JOIN messages m ON m.id = f.rowid
+         WHERE messages_fts MATCH ? AND m.device_id = ?{scope}{media_filter}
          ORDER BY {order} LIMIT ?"
-    ))
-    .bind::<Text, _>(match_query)
-    .bind::<Integer, _>(device_id)
-    .bind::<Text, _>(first_key)
-    .bind::<Text, _>(second_key)
-    .bind::<BigInt, _>(limit)
-    .load(conn)
-    .map_err(db_err)
+    )
 }
 
 #[cfg(test)]
@@ -393,14 +402,7 @@ mod tests {
         .n
     }
 
-    /// A migration that rewrites `messages` — the `_new`/`INSERT SELECT`/
-    /// `DROP`/`RENAME` shape this crate's own migrations use — takes the
-    /// triggers with it (the stable ids survive, but nothing maintains the
-    /// index). The table surviving used to be the whole test, so the next
-    /// open skipped the rebuild and the index went on describing rows that
-    /// were no longer there.
-    #[test]
-    fn an_index_whose_triggers_went_out_from_under_it_is_rebuilt() {
+    fn migrated_connection() -> SqliteConnection {
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
         // This connection's SQLite is built with foreign keys enabled by
         // default (see the account/device cascade migration), so the account
@@ -418,6 +420,131 @@ mod tests {
             .execute(&mut conn)
             .expect("mapping parent for the repair-generation triggers");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
+        conn
+    }
+
+    #[derive(QueryableByName, Debug)]
+    struct PlanStep {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        detail: String,
+    }
+
+    #[test]
+    fn search_drives_from_fts_and_preserves_filtered_pages() {
+        use diesel::sql_types::{BigInt, Integer, Text};
+
+        let mut conn = migrated_connection();
+        ensure_fts(&mut conn).expect("create index");
+        diesel::sql_query("INSERT INTO device (id) VALUES (2)")
+            .execute(&mut conn)
+            .expect("second account");
+        // Deliberately no ANALYZE or optimize. Interleave accounts, chats,
+        // content classes and relevance, with many hits outside each scope.
+        diesel::sql_query(
+            "WITH RECURSIVE rows(n) AS (
+                 SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < 1200
+             ) INSERT INTO messages
+                 (device_id, chat_jid, msg_id, sender_jid, timestamp_ms, kind, text_content)
+             SELECT 1 + n % 2, CASE WHEN n % 3 = 0 THEN 'a' ELSE 'b' END,
+                    printf('fixture-%d', n), 'sender', n,
+                    CASE WHEN n % 5 = 0 THEN 'image' ELSE 'text' END,
+                    CASE WHEN n % 7 = 0 THEN 'synthetic synthetic' ELSE 'synthetic filler' END
+             FROM rows",
+        )
+        .execute(&mut conn)
+        .expect("seed messages");
+        for keys in [
+            vec![],
+            vec!["a".to_owned()],
+            vec!["a".to_owned(), "b".to_owned()],
+        ] {
+            for ranked in [false, true] {
+                for has_media in [false, true] {
+                    let term = if ranked { "\"synthetic\"*" } else { "\"s\"*" };
+                    let sql = fts_hit_sql(!keys.is_empty(), ranked, has_media);
+                    let mut plan = diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
+                        .into_boxed::<diesel::sqlite::Sqlite>()
+                        .bind::<Text, _>(term)
+                        .bind::<Integer, _>(1);
+                    if let Some(first) = keys.first() {
+                        plan = plan
+                            .bind::<Text, _>(first)
+                            .bind::<Text, _>(keys.get(1).unwrap_or(first));
+                    }
+                    let plan = plan
+                        .bind::<BigInt, _>(20)
+                        .load::<PlanStep>(&mut conn)
+                        .expect("explain production search");
+                    // Assert loop order and point lookup, not the full unstable
+                    // EXPLAIN text or virtual-index numbers.
+                    assert!(
+                        plan[0].detail.starts_with("SCAN f VIRTUAL TABLE"),
+                        "{plan:?}"
+                    );
+                    assert!(
+                        plan[1]
+                            .detail
+                            .starts_with("SEARCH m USING INTEGER PRIMARY KEY"),
+                        "{plan:?}"
+                    );
+                    let scope = if keys.is_empty() {
+                        ""
+                    } else {
+                        " AND chat_jid IN (?, ?)"
+                    };
+                    let media = if has_media { " AND kind = 'image'" } else { "" };
+                    let order = if ranked {
+                        "rank, rowid DESC"
+                    } else {
+                        "rowid DESC"
+                    };
+                    // Independent FTS-only reference. Filter eligible ids before
+                    // LIMIT; FTS still ranks against the same complete corpus.
+                    let mut reference = diesel::sql_query(format!(
+                        "SELECT rowid AS id, rank FROM messages_fts
+                         WHERE messages_fts MATCH ? AND rowid IN
+                             (SELECT id FROM messages WHERE device_id = ?{scope}{media})
+                         ORDER BY {order} LIMIT ?"
+                    ))
+                    .into_boxed::<diesel::sqlite::Sqlite>()
+                    .bind::<Text, _>(term)
+                    .bind::<Integer, _>(1);
+                    if let Some(first) = keys.first() {
+                        reference = reference
+                            .bind::<Text, _>(first)
+                            .bind::<Text, _>(keys.get(1).unwrap_or(first));
+                    }
+                    let expected = reference
+                        .bind::<BigInt, _>(20)
+                        .load::<FtsHit>(&mut conn)
+                        .expect("reference page");
+                    let actual = fts_hits(&mut conn, 1, term, &keys, ranked, has_media, 20)
+                        .expect("production page");
+                    assert_eq!(actual.len(), 20);
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|hit| (hit.id, hit.rank))
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|hit| (hit.id, hit.rank))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A migration that rewrites `messages` — the `_new`/`INSERT SELECT`/
+    /// `DROP`/`RENAME` shape this crate's own migrations use — takes the
+    /// triggers with it (the stable ids survive, but nothing maintains the
+    /// index). The table surviving used to be the whole test, so the next
+    /// open skipped the rebuild and the index went on describing rows that
+    /// were no longer there.
+    #[test]
+    fn an_index_whose_triggers_went_out_from_under_it_is_rebuilt() {
+        let mut conn = migrated_connection();
         ensure_fts(&mut conn).expect("create the index");
 
         for statement in [
