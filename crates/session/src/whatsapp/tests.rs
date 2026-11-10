@@ -3870,3 +3870,93 @@ async fn history_reloader_survives_oversized_pages_and_later_store_changes() {
             .any(|message| message.id == "FITS")
     );
 }
+
+#[tokio::test]
+async fn history_backfill_wait_uses_coverage_even_when_notice_predates_anchor() {
+    use super::ops::history_sync_progressed;
+    use whatsapp_rust::wacore::stanza::groups::{GroupNotificationAction, GroupParticipantInfo};
+    use whatsapp_rust::wacore::types::events::GroupUpdate;
+    let (store, _client) = test_session("history-membership-baseline").await;
+    let group: Jid = "120363000000000099@g.us".parse().unwrap();
+    let update = GroupUpdate::builder()
+        .group_jid(group.clone())
+        .notification_id("BASELINE-NOTICE".to_owned())
+        .participant(TEST_PEER.parse().unwrap())
+        .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_000).unwrap())
+        .is_lid_addressing_mode(false)
+        .action(Box::new(
+            GroupNotificationAction::add()
+                .participants(vec![
+                    GroupParticipantInfo::builder()
+                        .jid(TEST_PEER.parse().unwrap())
+                        .build(),
+                ])
+                .build(),
+        ))
+        .build();
+    feed(&store, Event::GroupUpdate(update)).await;
+    feed(
+        &store,
+        from(
+            &group.to_string(),
+            TEST_PEER,
+            None,
+            wa::Message::text("anchor"),
+            "ANCHOR",
+            1_700_000_010,
+        ),
+    )
+    .await;
+    let anchor = store.oldest_message(&group).await.unwrap().unwrap();
+    let before = store.message_coverage(Some(&group)).await.unwrap();
+    assert_eq!(anchor.id, "ANCHOR");
+    assert!(before.oldest_ms.unwrap() < anchor.timestamp.timestamp_millis());
+    let unchanged = store.message_coverage(Some(&group)).await.unwrap();
+    assert!(
+        !history_sync_progressed(before, unchanged),
+        "the existing notice is not a phone reply"
+    );
+    // A reply may fill the gap after the notice without moving oldest_ms.
+    feed(
+        &store,
+        from(
+            &group.to_string(),
+            TEST_PEER,
+            None,
+            wa::Message::text("backfilled"),
+            "BACKFILLED",
+            1_700_000_005,
+        ),
+    )
+    .await;
+    let after = store.message_coverage(Some(&group)).await.unwrap();
+    assert_eq!(after.oldest_ms, before.oldest_ms);
+    assert!(history_sync_progressed(before, after));
+}
+
+#[test]
+fn history_backfill_wait_detects_older_rows_without_count_growth() {
+    use super::ops::history_sync_progressed;
+    use oxidezap_chat_store::MessageCoverage;
+    let before = MessageCoverage {
+        stored_count: 2,
+        oldest_ms: Some(20),
+        newest_ms: Some(30),
+    };
+    assert!(!history_sync_progressed(before, before));
+    assert!(history_sync_progressed(
+        before,
+        MessageCoverage {
+            oldest_ms: Some(10),
+            ..before
+        }
+    ));
+    assert!(!history_sync_progressed(
+        before,
+        MessageCoverage {
+            stored_count: 1,
+            oldest_ms: Some(30),
+            ..before
+        }
+    ));
+}
