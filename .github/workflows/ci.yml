@@ -292,6 +292,9 @@ jobs:
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: protoc,wasm-bindgen-cli@0.2.129
+      # rust-cache hashes installed compilers; include the shared-test pin.
+      - name: Install nightly for shared WASM tests
+        run: rustup toolchain install nightly-2026-10-29 --profile minimal --component rust-src --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           # Its own cache: a different target shares nothing with the Linux
@@ -353,8 +356,6 @@ jobs:
           CARGO_TARGET_DIR=target/call-playout-browser cargo test \
             --manifest-path crates/audio/src/web/call_device/tests/Cargo.toml \
             --locked --target wasm32-unknown-unknown --test browser
-      - name: Install nightly for shared WASM tests
-        run: rustup toolchain install nightly-2026-10-29 --profile minimal --component rust-src --target wasm32-unknown-unknown
       - name: Test production audio and WebCodecs with shared WASM memory
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner

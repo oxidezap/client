@@ -176,3 +176,55 @@ They retain their flags and tests, with no `RUSTC_BOOTSTRAP` or benchmark
 backend changes. No CI time saving from removing nightly is claimed.
 The `nightly` release tag names a rolling release and does not select a Rust
 compiler.
+
+### Useful 1.100 changes and limits
+
+Cargo's new unused-dependency warning exposed `oxidezap-wire` in the WASM
+session build. Its only session use is the native store's account-id
+validator, so it is now a native-target dependency. Desktop validation stays
+intact. No dev-dependency was removed: a single target's warnings do not
+cover its tests or other platforms. `cargo machete` remains a separate gate.
+
+The source-map writer now uses stable `std::mem::DropGuard` to remove its
+scratch file on both write and rename errors. Previously only rename errors
+cleaned up; a failed write could leave a partial `.new` file. Regression tests
+check destination preservation, failed renames and Linux ENOSPC writes.
+Existing resource-owner guards in the application remain: their transfer and
+cancellation semantics warrant separate changes, not a mechanical rewrite.
+
+The build-directory audit found no scripts depending on Cargo's old
+`deps/<name>-<hash>` layout. Native packaging uses the final target/profile
+paths; `scripts/build-memory-workload.py` reads Cargo's JSON
+`compiler-artifact.executable`; plugin builds return the final WASM path. A
+plugin build with separate `CARGO_BUILD_BUILD_DIR` and `CARGO_TARGET_DIR`
+verified that intermediate layout changes do not alter that path. The pinned
+[rust-cache v2.9.3 cleanup](https://github.com/Swatinem/rust-cache/blob/v2.9.3/src/cleanup.ts)
+already handles bare package directories with nested configuration hashes.
+Keep the existing cache policy; compiler identity is part of its key. The
+web-test job installs both compilers before the cache step so that identity
+also includes the shared-test nightly pin. No remote restore/save timing is
+inferred from local builds.
+
+Custom allocators were not introduced without a measured allocation problem
+and a demonstrated ownership benefit. The application's edition is already
+2024; public `Infallible` signatures remain unchanged instead of being
+rewritten to `!`. Native and WASM builds exercise the dependency editions
+affected by 1.100's never-type fallback change. There are no Miri, sanitizer
+or unstable-rustfmt jobs to migrate in this repository.
+
+### Separate proposal: dependency cooldown
+
+No cooldown is enabled by this PR. A possible follow-up policy is
+`[registry] global-min-publish-age = "3 days"` for routine registry updates,
+with an explicit urgent-security exception. Cargo applies this to new
+resolution candidates, not versions already in the lockfile, and it does not
+cover git dependencies. It does not replace advisory, license or source
+auditing such as cargo-deny.
+
+An urgent fixed version must be allowed immediately, for example with
+`CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p PACKAGE --precise VERSION`,
+then reviewed and tested normally. A follow-up should decide the normal age
+and record when that exception is used. The
+[official configuration semantics](https://doc.rust-lang.org/cargo/reference/config.html#registryglobal-min-publish-age)
+and [release announcement](https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/)
+describe the scope and override.
