@@ -108,13 +108,13 @@ reconnecting, with nothing lost.
 Building and serving it locally:
 
 ```bash
-# Rust 1.99.1 with WASM-only bootstrap: std is rebuilt with the atomics
+# Pinned nightly for build-std and wasm_thread: std is rebuilt with the atomics
 # target feature on: the window runs its background work on real workers.
-rustup toolchain install 1.99.1 --component rust-src --target wasm32-unknown-unknown
+rustup toolchain install nightly-2026-10-29 --component rust-src --target wasm32-unknown-unknown
 cargo install trunk
 
 # Through the task: trunk cannot forward arguments to cargo, so this is what
-# sets the toolchain, WASM-only bootstrap and `CARGO_UNSTABLE_BUILD_STD`.
+# sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`.
 TRUNK_ACTION=serve cargo xtask web build
 ```
 

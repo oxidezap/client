@@ -88,13 +88,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # Stable compiler; the WASM build task scopes bootstrap to its child
-      # because shared memory still requires unstable build-std.
+      # Stable runs xtask. Only its shared-memory build child uses nightly:
+      # build-std and wasm_thread still require unstable features.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.99.1"
-          targets: wasm32-unknown-unknown
-          components: rust-src
+          toolchain: "1.100.0"
+      - name: Install nightly for the shared-memory web bundle
+        run: rustup toolchain install nightly-2026-10-29 --profile minimal --component rust-src --target wasm32-unknown-unknown
 
       # The build script that embeds gpui-component's icons runs on the host,
       # and `waproto` generates code with protoc — both are host builds even
@@ -235,6 +235,10 @@ jobs:
           persist-credentials: false
           sparse-checkout: xtask
 
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.100.0"
+
       - name: Work out where this goes
         id: where
         env:
@@ -337,6 +341,10 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: xtask
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.100.0"
 
       # `--check still-closed` is re-asked before every attempt at the branch,
       # exactly as publication re-asks the opposite. A pull request reopened

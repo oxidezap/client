@@ -153,3 +153,26 @@ Build artifact, so after that window use **Re-run all jobs** to recreate it.
 Run 37649799287 uploaded its bundle on October 7 with one-day retention; its
 Publish rerun on October 9 could no longer download it. Draft pull requests
 build the bundle but do not publish a preview.
+
+## Rust 1.100.0 and the remaining nightly builds
+
+The official distribution manifest for Rust 1.100.0 is dated 2026-11-12:
+<https://static.rust-lang.org/dist/channel-rust-1.100.0.toml>. Native checks,
+release builds, ordinary browser tests, example plugins and Pages publishing
+use that exact stable compiler. The workspace compiler floor and library
+MSRV job move together to 1.100.0. Historical measurements above keep their
+original compiler versions.
+
+Nightly is confined to the shared-memory web bundle and browser tests. Both
+use `nightly-2026-10-29`, replacing the previous stable compiler bootstrap
+workaround with an explicit nightly compiler. Rust 1.100.0 rejects
+`-Z build-std` on the stable channel. The precompiled `wasm32-unknown-unknown` standard library
+cannot replace the atomics-enabled rebuild needed by the worker executor.
+The locked `wasm_thread` 0.3.3 also enables `stdarch_wasm_atomic_wait`, which
+is still unstable in Rust 1.100.0's shipped standard-library source.
+
+Removing these builds would remove coverage of the production memory model.
+They retain their flags and tests, with no `RUSTC_BOOTSTRAP` or benchmark
+backend changes. No CI time saving from removing nightly is claimed.
+The `nightly` release tag names a rolling release and does not select a Rust
+compiler.
