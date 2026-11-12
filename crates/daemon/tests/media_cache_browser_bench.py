@@ -6,7 +6,7 @@ matching browser/WebDriver binaries. Set CHROMEDRIVER and, if needed,
 WASM_BINDGEN_TEST_WEBDRIVER_JSON as for the project's browser tests, then run:
   RUSTFLAGS='--cfg web_sys_unstable_apis' python3 crates/daemon/tests/media_cache_browser_bench.py BASE_REF
 
-For shared memory, install Rust 1.99.1 with rust-src, configure the
+For shared memory, install nightly-2026-10-29 with rust-src, configure the
 browser's SharedArrayBuffer flag as in CI, unset RUSTFLAGS and
 CARGO_ENCODED_RUSTFLAGS, then append --shared. The probe asserts the actual
 memory type before measuring. It inherits the repository's production wasm
@@ -111,8 +111,8 @@ if __name__ == "__main__":
         if args.shared:
             if env.get("RUSTFLAGS") or env.get("CARGO_ENCODED_RUSTFLAGS"):
                 raise RuntimeError("Unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS to inherit production flags")
-            command.append("+1.99.1")
-            env["RUSTC_BOOTSTRAP"] = "1"
+            command.append("+nightly-2026-10-29")
+            env.pop("RUSTC_BOOTSTRAP", None)
         command += ["test", "--manifest-path", str(directory / "Cargo.toml"),
                     "--target", "wasm32-unknown-unknown", "--release"]
         if args.shared:

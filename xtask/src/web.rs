@@ -1,8 +1,8 @@
 //! Build the web front end into `web/dist`.
 //!
-//! The shared-memory target needs std rebuilt with atomics. Rust 1.99.1 is
-//! used throughout the repository; build-std and wasm_thread still require
-//! unstable features, so bootstrap is scoped to the Trunk child process.
+//! The shared-memory target needs std rebuilt with atomics. Stable Rust runs
+//! xtask; its Trunk child uses pinned nightly for build-std and wasm_thread's
+//! unstable WASM atomic wait intrinsics. WEB_TOOLCHAIN overrides that pin.
 //! Target flags live in /.cargo/config.toml.
 
 use std::fs;
@@ -100,7 +100,7 @@ pub fn build() -> Result<()> {
         // the build from and `Trunk.toml`'s own `target` is what it overrides.
         trunk = trunk.arg(index);
     }
-    let toolchain = env_or("RUSTUP_TOOLCHAIN", "1.99.1");
+    let toolchain = env_or("WEB_TOOLCHAIN", "nightly-2026-10-29");
     let cargo_bin = Run::new("rustup")
         .args(["which", "cargo", "--toolchain", &toolchain])
         .read()
@@ -124,7 +124,7 @@ pub fn build() -> Result<()> {
         .env("MBX_DISABLE", "1")
         .env("CARGO", cargo_bin)
         .env("RUSTUP_TOOLCHAIN", toolchain)
-        .env("RUSTC_BOOTSTRAP", "1")
+        .env_remove("RUSTC_BOOTSTRAP")
         .env("CARGO_UNSTABLE_BUILD_STD", "std,panic_abort")
         // The standard library, which `build-std` is already paying to rebuild
         // and was rebuilding at the defaults. `optimize_for_size` is what

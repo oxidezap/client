@@ -1,9 +1,11 @@
 # Building & verifying
 
-All builds use Rust 1.99.1, pinned in `rust-toolchain.toml` and CI.
-The web build and shared-memory browser tests set `RUSTC_BOOTSTRAP=1` only
-for their build processes. This uses the stable compiler with unstable
-`build-std` and dependency features; it is not a stable-only WASM build.
+Native builds, ordinary WASM tests and repository tooling use Rust 1.100.0,
+pinned in `rust-toolchain.toml` and CI. The workspace and example compiler
+floor and library MSRV check use the same version. Shared-memory WASM builds
+retain `nightly-2026-10-29` for `build-std` and `wasm_thread`'s unstable features.
+`cargo xtask web build` selects that compiler independently of the stable
+compiler running xtask; set `WEB_TOOLCHAIN` to explicitly test another one.
 
 The GUI uses the published `gpui-fast` family and GPUI Kit's `gpui-fast`
 feature. Enable it on `gpui-base`, `gpui-component` and `gpui-kit-assets` so
@@ -67,18 +69,18 @@ cargo test -p oxidezap-plugin-host --all-features -- --ignored
 The same window as a page:
 
 ```bash
-# Uses Rust 1.99.1 with bootstrap scoped to WASM: the standard library has
+# Needs pinned nightly for build-std and wasm_thread: the standard library has
 # to be rebuilt with the atomics target feature on — gpui_web runs its
 # background executor on real workers, and the prebuilt std is not compiled
 # for that. The link flags are in /.cargo/config.toml.
-rustup toolchain install 1.99.1 --component rust-src --target wasm32-unknown-unknown
+rustup toolchain install nightly-2026-10-29 --component rust-src --target wasm32-unknown-unknown
 cargo install trunk
 
 # Serves on http://127.0.0.1:8080 with the two isolation headers set. On
 # GitHub Pages a service worker adds them instead, because a static host has
 # no way to.
 # Through the task: trunk cannot forward arguments to cargo, so it is what
-# sets the toolchain, WASM-only bootstrap and `CARGO_UNSTABLE_BUILD_STD`.
+# sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`.
 # Run it from the root —
 # the alias in /.cargo/config.toml names a manifest path.
 TRUNK_ACTION=serve cargo xtask web build
@@ -153,7 +155,7 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 ```
 
 CI also runs the standalone WebCodecs readback, recovery and transform targets
-in ordinary and shared-memory builds. The shared step uses Rust 1.99.1 with scoped `RUSTC_BOOTSTRAP=1` and
+in ordinary and shared-memory builds. The shared step uses pinned nightly and
 `rust-src`, inherits the root wasm flags and rebuilds `std` and `panic_abort`.
 The [WebCodecs test README](../crates/gui/tests/webcodecs/README.md) gives the
 commands, Chrome properties and runtime memory assertion.
@@ -161,7 +163,7 @@ commands, Chrome properties and runtime memory assertion.
 Type-checking the web build without the whole bundle:
 
 ```bash
-RUSTC_BOOTSTRAP=1 cargo +1.99.1 check -p oxidezap-gui --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+cargo +nightly-2026-10-29 check -p oxidezap-gui --target wasm32-unknown-unknown -Z build-std=std,panic_abort
 ```
 
 The session builds for that target too, and is checked separately because
@@ -169,7 +171,7 @@ nothing in the page depends on it yet — a break there would otherwise go
 unnoticed until something does:
 
 ```bash
-RUSTC_BOOTSTRAP=1 cargo +1.99.1 check -p oxidezap-session --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+cargo +nightly-2026-10-29 check -p oxidezap-session --target wasm32-unknown-unknown -Z build-std=std,panic_abort
 ```
 
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is

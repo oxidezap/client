@@ -41,9 +41,6 @@ wacore = { workspace = true }
 oxidezap-audio = { workspace = true }
 oxidezap-chat-store = { workspace = true, features = ["search"] }
 oxidezap-core = { workspace = true }
-# The account-id rule: one shared validator, so a profile name can never mean
-# one thing for the socket and another for the database.
-oxidezap-wire = { workspace = true }
 # Where a task runs and how it waits, for both targets. `exec` is still the
 # module the session asks; what it asks is one crate down, because the plugin
 # host sits beside the session and cannot ask it — which is how the browser
@@ -70,6 +67,8 @@ tokio = { workspace = true, features = ["macros", "sync", "time"] }
 # takes none of them and supplies its own through the library's own plugin
 # traits.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Native store paths validate account ids; the browser store has no paths.
+oxidezap-wire = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 # The workspace names no defaults, so the host half lists the full set it
 # used to get implicitly: the six upstream defaults plus `voip`.

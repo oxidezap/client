@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
 
 use crate::err;
@@ -131,12 +132,13 @@ pub fn write(wasm: &Path, root: &Path) -> Result<Summary> {
 fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut scratch = path.as_os_str().to_os_string();
     scratch.push(".new");
-    let scratch = PathBuf::from(scratch);
-    fs::write(&scratch, bytes).map_err(|e| err!("could not write {}: {e}", scratch.display()))?;
-    fs::rename(&scratch, path).map_err(|e| {
-        let _ = fs::remove_file(&scratch);
-        err!("could not put {} in place: {e}", path.display())
-    })
+    // Register cleanup before writing: write_all may leave a partial file
+    // when it fails. The destination stays intact until the rename succeeds.
+    let scratch = DropGuard::new(PathBuf::from(scratch), |path| {
+        let _ = fs::remove_file(path);
+    });
+    fs::write(&*scratch, bytes).map_err(|e| err!("could not write {}: {e}", scratch.display()))?;
+    fs::rename(&*scratch, path).map_err(|e| err!("could not put {} in place: {e}", path.display()))
 }
 
 /// The module without any `sourceMappingURL` section, or `None` if it had
@@ -1100,6 +1102,33 @@ fn json_string(out: &mut String, s: &str) {
 mod tests {
     use super::*;
     use crate::util::TempDir;
+
+    #[test]
+    fn a_failed_replacement_cleans_the_scratch_and_preserves_the_destination() {
+        let dir = TempDir::new("xtask-map-replace").unwrap();
+        let destination = dir.path().join("existing");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("keep"), b"original").unwrap();
+        assert!(replace(&destination, b"replacement").is_err());
+        assert_eq!(fs::read(destination.join("keep")).unwrap(), b"original");
+        assert!(!dir.path().join("existing.new").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_write_cleans_the_scratch_before_the_rename_is_attempted() {
+        let dir = TempDir::new("xtask-map-write").unwrap();
+        let destination = dir.path().join("module.wasm");
+        let scratch = dir.path().join("module.wasm.new");
+        fs::write(&destination, b"original").unwrap();
+        // /dev/full reliably fails writes with ENOSPC, without filling a disk.
+        std::os::unix::fs::symlink("/dev/full", &scratch).unwrap();
+        let error = replace(&destination, b"replacement").unwrap_err();
+        assert!(error.to_string().contains("could not write"));
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
+        assert!(fs::symlink_metadata(&scratch).is_err());
+        assert!(Path::new("/dev/full").exists());
+    }
 
     /// A version 4 line program, assembled by hand.
     ///
