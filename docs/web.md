@@ -405,7 +405,8 @@ not embedded in WASM, and it is not preloaded.
 emoji. Picker choices and composer tokens extract its PNGs as images.
 Its sbix PNG artwork is rasterized by Swash in message text, so a
 covered color glyph does not fall through to the browser's emoji design.
-If the download fails, the client still opens and Canvas may provide a fallback.
+If the download fails, the client still opens. Picker choices and composer
+tokens render their original Unicode text so Canvas can provide a fallback.
 
 The emoji download currently completes before the window opens, with a deadline.
 That ordering is a startup policy. In gpui-fast 0.1.13, `add_fonts` invalidates
