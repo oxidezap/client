@@ -539,7 +539,7 @@ mod tests {
                     };
                     let bounds = backend.glyph_raster_bounds(&params).unwrap();
                     let (size, pixels) = backend.rasterize_glyph(&params, bounds).unwrap();
-                    for (pixel_ix, pixel) in pixels.chunks_exact(4).enumerate() {
+                    for (pixel_ix, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
                         if pixel[3] != 0 && (pixel[0] != pixel[1] || pixel[1] != pixel[2]) {
                             color_pixels += 1;
                         }
