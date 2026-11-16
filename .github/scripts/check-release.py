@@ -52,6 +52,12 @@ def check(path, version, platform):
     binaries = [f'{root}/{name}' + ('.exe' if windows else '')
                 for name in ('oxidezap', 'oxidezapd', 'oxidezap-cli')]
     expected = set(binaries)
+    notice = f'{root}/NotoColorEmoji-OFL.txt'
+    expected.add(notice)
+    assert notice in files, 'missing bundled emoji license'
+    license_text = files[notice][0].decode('utf-8')
+    assert 'Copyright 2022 Google Inc.' in license_text, 'missing emoji copyright notice'
+    assert 'SIL OPEN FONT LICENSE Version 1.1' in license_text, 'missing emoji license text'
     if platform.startswith('linux-'):
         expected.update(f'{root}/{name}' for name in ('install-desktop.sh', 'org.oxidezap.client.local.png'))
         assert files[f'{root}/install-desktop.sh'][1] & 0o111, 'installer not executable'

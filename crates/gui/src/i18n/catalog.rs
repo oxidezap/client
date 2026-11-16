@@ -13,7 +13,10 @@ catalog! {
     AttachAPhotoAVideoOrADocument => ("Attach a photo, a video or a document", "Anexar foto, vídeo ou documento");
     Document => ("Document", "Documento");
     PhotosAndVideos => ("Photos and videos", "Fotos e vídeos");
-    TheEmojiPickerIsNotAvailableYet => ("The emoji picker is not available yet", "O seletor de emojis ainda não está disponível");
+    ChooseEmoji => ("Choose emoji", "Escolher emoji");
+    SearchEmoji => ("Search emoji by English name or :shortcode:", "Buscar emoji pelo nome em inglês ou :código:");
+    NoEmojiFound => ("No emoji found", "Nenhum emoji encontrado");
+    EmojiSkinTone => ("Skin tone", "Tom de pele");
     SaveEdit => ("Save edit", "Salvar edição");
     Send => ("Send", "Enviar");
     HoldToRecordAVoiceMessage => ("Hold to record a voice message", "Segure para gravar uma mensagem de voz");

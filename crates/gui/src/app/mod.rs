@@ -4420,6 +4420,12 @@ impl Render for WhatsAppApp {
         // happens to be, which is the point of a window-level command.
         let root = div()
             .size_full()
+            .map(|mut root| {
+                root.text_style().font_fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
+                    crate::emoji::FAMILY.into(),
+                ]));
+                root
+            })
             // The window's own keyboard target. Every frame draws it, which
             // is what makes it somewhere focus can always be put — and what
             // brings the handlers below into the dispatch path, since a

@@ -309,10 +309,4 @@ impl WhatsAppApp {
         self.reaction_picker_for = None;
         cx.notify();
     }
-
-    /// Entry point reserved for the emoji and sticker picker.
-    #[expect(dead_code, reason = "the picker UI is not built yet")]
-    pub fn open_emoji_picker(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        debug!("emoji and sticker picker is not implemented yet");
-    }
 }

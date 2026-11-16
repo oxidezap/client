@@ -392,17 +392,21 @@ impossibility it describes before believing it.
 
 **The page has two text paths.** The cosmic-text font database starts
 without system fonts, so the application registers its base text families
-before opening a window. The current `WebTextSystem` also uses browser Canvas
-fonts for eligible emoji by default. Optional `EmojiAndCjk` support covers
+before opening a window. Covered emoji use the same bundled color artwork as
+desktop. `WebTextSystem` can also use browser Canvas fonts for eligible emoji
+when native glyphs are missing or lack color. Optional `EmojiAndCjk` support covers
 independent horizontal CJK graphemes approximately. This is not general
 fallback for scripts requiring contextual shaping or mixed-direction editing.
 
 The base UI families are embedded. Noto Sans Arabic is a versioned static asset
 requested only after an Arabic-script grapheme exhausts fallback. Its bytes are
 not embedded in WASM, and it is not preloaded.
-The separately downloaded monochrome emoji font remains available on the
-cosmic-text/swash path when Canvas cannot replace a grapheme. Swash's native
-colour-font format restrictions do not describe the browser Canvas path.
+`OxideZapEmoji.ttf` is downloaded separately and explicitly selected for message
+emoji. Picker choices and composer tokens extract its PNGs as images.
+Its sbix PNG artwork is rasterized by Swash in message text, so a
+covered color glyph does not fall through to the browser's emoji design.
+If the download fails, the client still opens. Picker choices and composer
+tokens render their original Unicode text so Canvas can provide a fallback.
 
 The emoji download currently completes before the window opens, with a deadline.
 That ordering is a startup policy. In gpui-fast 0.1.13, `add_fonts` invalidates

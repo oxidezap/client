@@ -58,6 +58,7 @@ pub struct BubbleText {
     /// `SharedString` on every frame copied peer-controlled text with the
     /// message length, over and over, for no new information.
     link_targets: Arc<[SharedString]>,
+    emoji: Arc<[Range<usize>]>,
     business: Option<Arc<super::message_bubble::business::BusinessText>>,
 }
 
@@ -70,6 +71,7 @@ impl BubbleText {
         // removed delimiter stood — see `find_links_in` — so an address
         // starting where formatting ends is still found.
         let links: Arc<[LinkSpan]> = find_links_in(&rich).into();
+        let emoji = crate::emoji::ranges(&rich.text).into();
         let link_targets: Arc<[SharedString]> = links
             .iter()
             .map(|link| SharedString::from(link.target.as_str()))
@@ -80,6 +82,7 @@ impl BubbleText {
                 runs: Arc::from([]),
                 links,
                 link_targets,
+                emoji,
                 business: None,
             };
         }
@@ -89,6 +92,7 @@ impl BubbleText {
             runs: runs.into(),
             links,
             link_targets,
+            emoji,
             business: None,
         }
     }
@@ -158,7 +162,7 @@ pub(crate) fn render_message_segment(
     document_order: u64,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    if !parsed.links.is_empty() {
+    if !parsed.links.is_empty() || !parsed.emoji.is_empty() {
         return render_with_links(parsed, selection_key, document_order, cx).into_any_element();
     }
     if parsed.runs.is_empty() {
@@ -263,12 +267,17 @@ fn render_with_links(
         edges.push(link.range.start);
         edges.push(link.range.end);
     }
+    for range in parsed.emoji.iter() {
+        edges.push(range.start);
+        edges.push(range.end);
+    }
     edges.sort_unstable();
     edges.dedup();
     let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
     let mut code: Vec<(Range<usize>, SharedString)> = Vec::new();
     let mut run_ix = 0;
     let mut link_ix = 0;
+    let mut emoji_ix = 0;
     for cell in edges.windows(2) {
         let (start, end) = (cell[0], cell[1]);
         if start == end {
@@ -288,7 +297,14 @@ fn render_with_links(
             .links
             .get(link_ix)
             .is_some_and(|link| link.range.start <= start && start < link.range.end);
-        if emphasis.is_plain() && !linked {
+        while emoji_ix < parsed.emoji.len() && parsed.emoji[emoji_ix].end <= start {
+            emoji_ix += 1;
+        }
+        let is_emoji = parsed
+            .emoji
+            .get(emoji_ix)
+            .is_some_and(|range| range.start <= start && start < range.end);
+        if emphasis.is_plain() && !linked && !is_emoji {
             continue;
         }
         if linked {
@@ -296,7 +312,9 @@ fn render_with_links(
         } else {
             highlights.push((start..end, style_for(emphasis, metrics)));
         }
-        if emphasis.code {
+        if is_emoji {
+            code.push((start..end, crate::emoji::FAMILY.into()));
+        } else if emphasis.code {
             code.push((start..end, mono.clone()));
         }
     }
@@ -801,6 +819,13 @@ mod tests {
         let (selected, clipboard, _) = drag_text(source, 1., 380., cx);
         assert_eq!(selected, source);
         assert_eq!(clipboard_text(clipboard).as_deref(), Some(source));
+    }
+
+    #[gpui::test]
+    fn colored_emoji_copy_as_unicode_with_formatting_and_joiners(cx: &mut TestAppContext) {
+        let (selected, clipboard, _) = drag_text("*hi* 👩🏽‍💻 🇧🇷 ❤️", 1., 380., cx);
+        assert_eq!(selected, "hi 👩🏽‍💻 🇧🇷 ❤️");
+        assert_eq!(clipboard_text(clipboard).as_deref(), Some("hi 👩🏽‍💻 🇧🇷 ❤️"));
     }
 
     #[gpui::test]

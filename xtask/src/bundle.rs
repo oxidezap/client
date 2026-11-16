@@ -38,8 +38,12 @@ const REQUIRED: &[(&str, &str)] = &[
          will have no executor",
     ),
     (
-        "NotoEmoji-Regular.ttf",
-        "the window fetches the monochrome emoji fallback before opening",
+        "OxideZapEmoji.ttf",
+        "the window fetches the bundled color emoji artwork before opening",
+    ),
+    (
+        "NotoColorEmoji-OFL.txt",
+        "the distributed emoji font must carry its license",
     ),
 ];
 

@@ -54,7 +54,12 @@ pub fn render_reactions(
                 .bg(cx.theme().secondary)
                 .border_1()
                 .border_color(cx.theme().border)
-                .child(div().text_size(metrics.text_small()).child(emoji))
+                .child(
+                    div()
+                        .font_family(crate::emoji::FAMILY)
+                        .text_size(metrics.text_small())
+                        .child(emoji),
+                )
                 // A lone reaction needs no "1" beside it; the chip is the count.
                 .when(count > 1, |el| {
                     el.child(
@@ -102,6 +107,7 @@ pub fn render_reaction_picker(
                 "quick-react-{message_id}-{emoji}"
             )))
             .ghost()
+            .font_family(crate::emoji::FAMILY)
             .xsmall()
             .label(emoji)
             .tooltip(crate::tr!(react_emoji, emoji))

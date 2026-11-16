@@ -13,8 +13,10 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     input::{Enter, InputEvent, Paste, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
+    popover::Popover,
 };
 
+use super::emoji_picker::{EmojiPicked, EmojiPicker};
 use crate::components::{ProductIcon, parts};
 use crate::platform::picker::AttachmentCategory;
 use crate::theme::{ActiveProductTheme as _, Metrics};
@@ -119,6 +121,8 @@ pub struct InputAreaView {
     /// The field itself. A textarea rather than a single line: a message is
     /// not always one, and the design asks it to grow with what is typed.
     input: Entity<TextareaState>,
+    emoji_picker: Entity<EmojiPicker>,
+    emoji_open: bool,
     language: crate::i18n::Language,
     /// Whether PTT recording is active
     is_recording: bool,
@@ -180,9 +184,20 @@ impl InputAreaView {
         // Subscribe to input events (for Enter key to send, etc.)
         cx.subscribe_in(&input, window, Self::handle_input_event)
             .detach();
+        let emoji_picker = cx.new(|cx| EmojiPicker::new(window, cx));
+        cx.subscribe_in(
+            &emoji_picker,
+            window,
+            |this, _, event: &EmojiPicked, window, cx| {
+                this.insert_emoji(event.0, window, cx);
+            },
+        )
+        .detach();
 
         Self {
             input,
+            emoji_picker,
+            emoji_open: false,
             language: crate::i18n::Language::current(),
             is_recording: false,
             editing: false,
@@ -312,9 +327,10 @@ impl InputAreaView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> String {
+        self.emoji_open = false;
         let old = self.input.read(cx).text().to_string();
         self.input.update(cx, |state, cx| {
-            state.set_value(new_text, window, cx);
+            state.set_value(crate::emoji::content(new_text), window, cx);
         });
         old
     }
@@ -333,7 +349,29 @@ impl InputAreaView {
             state.set_value("", window, cx);
         });
         self.stop_typing_internal(cx);
+        self.emoji_open = false;
         cx.emit(InputAreaEvent::SendMessage(text));
+    }
+
+    fn insert_emoji(&mut self, emoji: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit_pending || self.is_recording {
+            return;
+        }
+        self.input.update(cx, |state, cx| {
+            // Replace uses the retained selection and the editor's atomic undo
+            // transaction. set_value would discard both cursor and undo history.
+            state
+                .replace_with_token(
+                    gpui_component::input::InlineToken::new("emoji", emoji),
+                    window,
+                    cx,
+                )
+                .expect("picker choices are valid single emoji tokens");
+            state.focus(window, cx);
+        });
+        self.emoji_open = false;
+        self.on_keystroke(cx);
+        cx.notify();
     }
 
     /// Toggle PTT recording
@@ -371,6 +409,7 @@ impl InputAreaView {
             return;
         }
         self.is_recording = is_recording;
+        self.emoji_open = false;
         self.recording_started_at = is_recording.then(Instant::now);
         if !is_recording {
             self.level = 0.0;
@@ -387,6 +426,9 @@ impl InputAreaView {
     pub fn set_edit_state(&mut self, editing: bool, pending: bool, cx: &mut Context<Self>) {
         self.editing = editing;
         self.edit_pending = pending;
+        if pending {
+            self.emoji_open = false;
+        }
         cx.notify();
     }
 
@@ -490,6 +532,8 @@ impl InputAreaView {
         let entity = cx.entity().clone();
         let record_entity = entity.clone();
         let attach_entity = entity.clone();
+        let emoji_entity = entity.clone();
+        let picker = self.emoji_picker.clone();
         // Asked of the rope rather than of a copy of it. `text()` hands back
         // the document itself; `to_string` copied all of it, on every
         // keystroke, to answer whether the send button or the microphone
@@ -559,18 +603,43 @@ impl InputAreaView {
                     )
                     .child(
                         Textarea::new(&self.input)
+                            .token(|token, window, cx| {
+                                crate::emoji::picture(
+                                    token.token().text(),
+                                    token.line_height(),
+                                    window,
+                                    cx,
+                                )
+                                .when(token.is_selected(), |element| {
+                                    element.bg(cx.theme().selection)
+                                })
+                            })
                             .readonly(self.edit_pending)
                             .w_full(),
                     ),
             )
             .child(
-                parts::icon_button(
-                    "emoji",
-                    Icon::new(ProductIcon::Smile),
-                    crate::tr!(TheEmojiPickerIsNotAvailableYet),
-                    control,
-                )
-                .disabled(true),
+                Popover::new("emoji-popover")
+                    .anchor(gpui::Anchor::BottomRight)
+                    .open(self.emoji_open)
+                    .on_open_change(move |open, _, cx| {
+                        emoji_entity.update(cx, |view, cx| {
+                            view.emoji_open = *open && !view.edit_pending && !view.is_recording;
+                            cx.notify();
+                        });
+                    })
+                    .track_focus(&self.emoji_picker.read(cx).focus_handle(cx))
+                    .trigger(
+                        parts::icon_button(
+                            "emoji",
+                            Icon::new(ProductIcon::Smile),
+                            crate::tr!(ChooseEmoji),
+                            control,
+                        )
+                        .disabled(self.edit_pending)
+                        .debug_selector(|| "emoji-trigger".into()),
+                    )
+                    .content(move |_, _, _| picker.clone()),
             )
             // Record or send, never both: which one is available follows
             // whether there is anything to send, the way every messaging
@@ -846,6 +915,7 @@ mod tests {
             Arc::new(crate::assets::Assets),
         );
         cx.update(|cx| {
+            crate::platform::fonts::fonts(cx);
             gpui_component::init(cx);
             crate::theme::init(cx);
             crate::app::init_app_bindings(cx);
@@ -901,12 +971,14 @@ mod tests {
 
     struct VisualComposerFixture {
         cx: gpui::VisualTestContext,
+        input: Entity<InputAreaView>,
         attachment_categories: Rc<RefCell<Vec<AttachmentCategory>>>,
         _events: Subscription,
     }
 
     fn visual_setup(cx: &mut gpui::TestAppContext) -> VisualComposerFixture {
         cx.update(|cx| {
+            crate::platform::fonts::fonts(cx);
             gpui_component::init(cx);
             crate::theme::init(cx);
         });
@@ -931,6 +1003,7 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         VisualComposerFixture {
             cx,
+            input,
             attachment_categories,
             _events: events,
         }
@@ -987,6 +1060,81 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(&*sent.borrow(), &["hello\n\n"]);
         cx.update(|cx| assert!(input.read(cx).input.read(cx).text().to_string().is_empty()));
+    }
+
+    #[test]
+    fn emoji_replaces_selection_keeps_unicode_and_waits_for_explicit_send() {
+        let ComposerFixture {
+            mut cx,
+            window,
+            input,
+            ..
+        } = setup();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let observed = sent.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
+                if let InputAreaEvent::SendMessage(text) = event {
+                    observed.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        cx.update_window(*window, |_, window, cx| {
+            input.update(cx, |view, cx| {
+                view.swap_text("Olá world!", window, cx);
+                view.input
+                    .update(cx, |field, cx| field.set_selected_range(5..10, cx));
+                view.emoji_open = true;
+                view.insert_emoji("👩🏽‍💻", window, cx);
+                assert!(!view.emoji_open);
+                assert_eq!(view.input.read(cx).text().to_string(), "Olá 👩🏽‍💻!");
+                // A second sequence goes after the first, before the suffix.
+                view.insert_emoji("🇧🇷", window, cx);
+                assert_eq!(view.input.read(cx).text().to_string(), "Olá 👩🏽‍💻🇧🇷!");
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(sent.borrow().is_empty());
+        cx.update_window(*window, |_, window, cx| {
+            window.dispatch_action(Box::new(gpui_component::input::Undo), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(input.read(cx).input.read(cx).text().to_string(), "Olá 👩🏽‍💻!");
+        });
+        cx.update_window(*window, |_, window, cx| {
+            input.update(cx, |view, cx| {
+                view.insert_emoji("🇧🇷", window, cx);
+                view.submit_input(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(&*sent.borrow(), &["Olá 👩🏽‍💻🇧🇷!"]);
+    }
+
+    #[test]
+    fn emoji_cannot_change_a_pending_edit_and_chat_switch_closes_the_picker() {
+        let ComposerFixture {
+            mut cx,
+            window,
+            input,
+            ..
+        } = setup();
+        cx.update_window(*window, |_, window, cx| {
+            input.update(cx, |view, cx| {
+                view.swap_text("draft", window, cx);
+                view.set_edit_state(true, true, cx);
+                view.insert_emoji("❤️", window, cx);
+                assert_eq!(view.input.read(cx).text().to_string(), "draft");
+                view.emoji_open = true;
+                assert_eq!(view.swap_text("other chat", window, cx), "draft");
+                assert!(!view.emoji_open);
+            });
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1069,6 +1217,37 @@ mod tests {
 
         cx.update(|cx| assert_eq!(input.read(cx).input.read(cx).text(), "hello"));
         assert_eq!(*paste_requests.borrow(), 1);
+    }
+
+    #[gpui::test]
+    fn emoji_picker_opens_searches_and_returns_text_to_the_composer(
+        test_cx: &mut gpui::TestAppContext,
+    ) {
+        let VisualComposerFixture { mut cx, input, .. } = visual_setup(test_cx);
+        let trigger = cx
+            .debug_bounds("emoji-trigger")
+            .expect("emoji button is visible");
+        cx.update(|window, cx| {
+            input.update(cx, |view, cx| {
+                view.swap_text("hello world", window, cx);
+                view.input
+                    .update(cx, |field, cx| field.set_selected_range(6..11, cx));
+                view.focus_handle(cx).focus(window, cx);
+            })
+        });
+        cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(input.read(cx).emoji_open));
+        cx.simulate_keystrokes("rocket");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let view = input.read(cx);
+            assert!(!view.emoji_open);
+            assert_eq!(view.input.read(cx).text().to_string(), "hello 🚀");
+            assert!(view.focus_handle(cx).is_focused(window));
+        });
     }
 
     #[gpui::test]
