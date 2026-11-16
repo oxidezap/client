@@ -32,21 +32,17 @@
 //! reported. The same-origin asset is verified and cached separately from WASM;
 //! see `on_demand`. Shaping stays in cosmic-text.
 //!
-//! The current web backend also has a browser Canvas fallback for eligible
-//! emoji, with optional independent horizontal CJK support. That path uses
-//! browser fonts without loading their bytes into cosmic-text. It does not
-//! cover contextual Arabic-script shaping. See vendor/gpui-fast-web/src/.
+//! Emoji artwork is supplied by the application on both targets. The pinned
+//! Noto PNGs are packaged as `OxideZap Emoji`, using sbix so Swash, CoreText
+//! and DirectWrite can consume the same artwork. See the font's README and
+//! regeneration script. The distinct family avoids installed-font collisions.
+//! Message emoji runs select it explicitly; picker and composer controls
+//! extract its PNG artwork as images.
 //!
-//! The downloaded monochrome emoji face remains available to cosmic-text
-//! when the Canvas path cannot replace a grapheme. The restrictions on swash
-//! colour-font formats apply to this native rasterization path, not Canvas.
-//!
-//! And it is fetched, not embedded. A browser can cache that file separately,
-//! so the bundle does not grow and a build with no emoji font next to it
-//! still runs. The file is copied into `dist` by `web/index.html`; nothing in
-//! the document trunk emits names it, so `cargo xtask bundle check` carries
-//! it in `REQUIRED` and a bundle without it fails there rather than in a
-//! browser.
+//! Desktop embeds the face. The web fetches it as a separately cacheable
+//! same-origin asset, copied by `web/index.html` and required by the bundle
+//! check. Covered color graphemes stay on the native Swash path; browser Canvas
+//! remains a fallback if the face could not be loaded or lacks a grapheme.
 
 #[cfg(any(target_family = "wasm", test))]
 mod on_demand;
@@ -129,6 +125,11 @@ const BUNDLED: &[(&str, &[u8])] = &[
 #[cfg(target_family = "wasm")]
 static DOWNLOADED: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
+/// The same artwork backs font rendering and image-based emoji controls.
+pub(crate) fn emoji_bytes() -> Option<&'static [u8]> {
+    imp::emoji_bytes()
+}
+
 /// What the emoji face is called in `dist`, and what the page asks for.
 ///
 /// Relative, like every other asset in the bundle: the deployment lives in a
@@ -136,16 +137,25 @@ static DOWNLOADED: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 /// would be fetched from that domain's root. `web/index.html` is what copies
 /// the file in under this name.
 #[cfg(any(target_family = "wasm", test))]
-const EMOJI: &str = "NotoEmoji-Regular.ttf";
+const EMOJI: &str = "OxideZapEmoji.ttf";
 
 #[cfg(not(target_family = "wasm"))]
 mod imp {
-    /// Nothing to add: the system's own families are what font-kit reads, and
-    /// a binary that embedded its own would draw in a font the rest of the
-    /// desktop does not use. Emoji included — a desktop that draws them is
-    /// one with an emoji font installed, and gpui takes swash's colour path
-    /// for exactly one PostScript name, `NotoColorEmoji`.
-    pub(super) fn fonts(_cx: &mut gpui::App) {}
+    pub(super) fn emoji_bytes() -> Option<&'static [u8]> {
+        Some(include_bytes!(
+            "../../assets/fonts/noto-color-emoji/OxideZapEmoji.ttf"
+        ))
+    }
+
+    /// Always supply the application's color artwork, independently of the
+    /// installed font set. Message runs explicitly select this family.
+    pub(super) fn fonts(cx: &mut gpui::App) {
+        if let Err(error) = cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(
+            include_bytes!("../../assets/fonts/noto-color-emoji/OxideZapEmoji.ttf").as_slice(),
+        )]) {
+            log::warn!("emoji fallback could not be loaded: {error:#}");
+        }
+    }
 
     /// Nothing to wait for either.
     pub(super) fn with_downloaded_fonts(start: impl FnOnce() + 'static) {
@@ -169,15 +179,18 @@ mod imp {
     /// host answering nothing costs a visitor a pause rather than the page.
     const DEADLINE: Duration = Duration::from_secs(10);
 
+    pub(super) fn emoji_bytes() -> Option<&'static [u8]> {
+        super::DOWNLOADED.get().map(Vec::as_slice)
+    }
+
     /// A failure here is a window that cannot draw, so it is said out loud —
     /// but it is not a refusal to start: the panic it precedes names the
     /// family and the fallbacks, and a page that reached that panic with this
     /// line above it in the console is one whose report says which of the two
     /// went wrong.
     ///
-    /// Downloaded fallbacks are allowed to be missing. The emoji face
-    /// is fetched rather than embedded. If unavailable, native monochrome
-    /// fallback is lost; eligible Canvas emoji may still render.
+    /// The color emoji face is fetched rather than embedded. If unavailable,
+    /// eligible Canvas emoji may still render using browser fonts.
     pub(super) fn fonts(cx: &mut gpui::App) {
         let fonts: Vec<Cow<'static, [u8]>> = super::BUNDLED
             .iter()
@@ -206,13 +219,10 @@ mod imp {
                     let _ = super::DOWNLOADED.set(face);
                 }
                 Some(Err(why)) => {
-                    log::warn!(
-                        "monochrome emoji fallback {} was not loaded: {why}",
-                        super::EMOJI
-                    )
+                    log::warn!("bundled color emoji {} was not loaded: {why}", super::EMOJI)
                 }
                 None => log::warn!(
-                    "monochrome emoji fallback {} did not arrive within {DEADLINE:?}",
+                    "bundled color emoji {} did not arrive within {DEADLINE:?}",
                     super::EMOJI
                 ),
             }
@@ -295,7 +305,8 @@ mod tests {
     /// for the sake of an assertion. Reading it from the same path the copy
     /// is made from is what keeps the tested face and the served one the
     /// same file.
-    const EMOJI_FACE: &[u8] = include_bytes!("../../assets/fonts/noto-emoji/NotoEmoji-Regular.ttf");
+    const EMOJI_FACE: &[u8] =
+        include_bytes!("../../assets/fonts/noto-color-emoji/OxideZapEmoji.ttf");
 
     const ARABIC_FACE: &[u8] = include_bytes!(
         "../../assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ceea25b464a656dc.ttf"
@@ -462,12 +473,92 @@ mod tests {
         let text_system = a_page_with_downloaded_fonts();
         // A test tube, a flag (two regional indicators), a document and a
         // tick: the four shapes the reported window had a box for.
-        for emoji in ["\u{1f9ea}", "\u{1f1e7}\u{1f1f7}", "\u{1f4c4}", "\u{2705}"] {
+        for emoji in ["🧪", "🇧🇷", "📄", "✅", "👩🏽‍💻", "👨‍👩‍👧‍👦", "1️⃣", "❤️"]
+        {
             let drawn = glyphs(&text_system, emoji);
             assert!(
                 !drawn.is_empty() && drawn.iter().all(|&id| id != 0),
                 "{emoji:?} still shapes to {drawn:?}"
             );
+        }
+    }
+
+    #[test]
+    fn bundled_emoji_rasterizes_in_color_without_any_system_fonts() {
+        use gpui::PlatformTextSystem as _;
+        let backend = Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
+            WEB_SYSTEM_FONT,
+        ));
+        backend
+            .add_fonts(
+                BUNDLED
+                    .iter()
+                    .map(|(_, bytes)| Cow::Borrowed(*bytes))
+                    .chain([Cow::Borrowed(EMOJI_FACE)])
+                    .collect(),
+            )
+            .unwrap();
+        let requested = gpui::font(crate::emoji::FAMILY);
+        let direct = backend
+            .font_id(&requested)
+            .expect("emoji family must resolve without fallback");
+        assert!(backend.glyph_for_char(direct, 'm').is_some());
+        let system = gpui::WindowTextSystem::new(Arc::new(gpui::TextSystem::new(backend.clone())));
+        let mut preview = image::RgbaImage::new(360, 72);
+        for (ix, text) in ["😀", "❤️", "👩🏽‍💻", "🇧🇷", "👍🏿"].into_iter().enumerate()
+        {
+            let runs = [gpui::TextRun {
+                len: text.len(),
+                font: gpui::font(crate::emoji::FAMILY),
+                color: gpui::Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
+            let line = system.layout_line(text, gpui::px(40.), &runs, None);
+            let mut color_pixels = 0;
+            for run in &line.runs {
+                assert_eq!(
+                    run.font_id, direct,
+                    "emoji must use the explicitly requested face"
+                );
+                for glyph in &run.glyphs {
+                    assert!(
+                        glyph.is_emoji && glyph.id.0 != 0,
+                        "{text} must use the color path"
+                    );
+                    let params = gpui::RenderGlyphParams {
+                        font_id: run.font_id,
+                        glyph_id: glyph.id,
+                        font_size: gpui::px(40.),
+                        subpixel_variant: gpui::point(0, 0),
+                        scale_factor: 1.,
+                        is_emoji: true,
+                        subpixel_rendering: false,
+                        dilation: 0,
+                    };
+                    let bounds = backend.glyph_raster_bounds(&params).unwrap();
+                    let (size, pixels) = backend.rasterize_glyph(&params, bounds).unwrap();
+                    for (pixel_ix, pixel) in pixels.chunks_exact(4).enumerate() {
+                        if pixel[3] != 0 && (pixel[0] != pixel[1] || pixel[1] != pixel[2]) {
+                            color_pixels += 1;
+                        }
+                        let x = ix as u32 * 72 + pixel_ix as u32 % size.width.0 as u32;
+                        let y = pixel_ix as u32 / size.width.0 as u32;
+                        if x < preview.width() && y < preview.height() {
+                            preview.put_pixel(
+                                x,
+                                y,
+                                image::Rgba([pixel[2], pixel[1], pixel[0], pixel[3]]),
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(color_pixels > 20, "{text} rendered without color artwork");
+        }
+        if let Some(path) = std::env::var_os("OXIDEZAP_EMOJI_PREVIEW") {
+            preview.save(path).unwrap();
         }
     }
 

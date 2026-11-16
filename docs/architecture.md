@@ -210,6 +210,33 @@ Revert and Reload behavior. Domain and IPC data remain language-independent.
 See [localization](localization.md) for translation keys, interpolation, caches,
 fallbacks and adding a locale.
 
+## Emoji
+
+The composer's smile button opens a searchable Unicode emoji grid. Search uses
+English Unicode names or GitHub shortcodes, with a skin-tone selector for
+supported sequences. Enter picks the first search result. Picking replaces the
+textarea's selection as one undoable edit and returns focus to the draft;
+sending still uses the ordinary Send or Enter action. Replies, edits and saved
+drafts therefore use the same text path as typed or pasted emoji. No emoji image
+URLs or shortcode substitutions enter the protocol.
+
+The `emojis` crate supplies the catalog rather than a hand-maintained subset.
+Visible rows alone create buttons. The picker is bounded to the Unicode version
+of the bundled Noto color artwork. Picker buttons and composer tokens display
+PNG images extracted from the bundled asset, with a bounded decoded-image cache.
+Message emoji runs and reaction controls explicitly select the application's
+`OxideZap Emoji` family, independently of installed emoji families. Grapheme
+boundaries retain joiners, skin tones, flags and variation selectors; explicit
+text presentation is left as text. Source messages and clipboard exports remain
+Unicode. Draft restoration rebuilds presentation tokens without changing text.
+
+The PNG artwork is stored in a color font so the existing native text layout
+continues to own wrapping, hit testing and selection. The font is embedded on
+desktop and downloaded separately on the web, where it stays outside WASM.
+The [asset README](../crates/gui/assets/fonts/noto-color-emoji/README.md) records
+the source, license and reproducible format conversion. See [web](web.md) for
+the download failure fallback.
+
 ## Responsiveness
 
 One number, in one place. The window's size reaches the interface as a factor

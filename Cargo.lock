@@ -2423,6 +2423,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "emojis"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589871e639330783bc20ad89d32ac1b049e02c273d96c907ca27478c8bc674a2"
+dependencies = [
+ "phf 0.13.1",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3546,6 +3555,7 @@ dependencies = [
  "gpui-fast",
  "gpui-pre-collections",
  "gpui-pre-util",
+ "image",
  "itertools 0.14.0",
  "log",
  "parking_lot",
@@ -6663,6 +6673,7 @@ dependencies = [
  "anyhow",
  "block2 0.6.2",
  "chrono",
+ "emojis",
  "futures-channel",
  "futures-lite",
  "getrandom 0.4.3",
@@ -6699,6 +6710,7 @@ dependencies = [
  "smol",
  "symphonia",
  "tokio",
+ "unicode-segmentation",
  "wacore",
  "wacore-binary",
  "wasm-bindgen",

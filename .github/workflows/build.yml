@@ -165,6 +165,7 @@ jobs:
           # would survive into the release.
           out="oxidezap-$VERSION-$PLATFORM"
           mkdir -p "$out"
+          cp crates/gui/assets/fonts/noto-color-emoji/NotoColorEmoji-OFL.txt "$out/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             mv "target/$TARGET/release/oxidezap.exe" "$out/"
             mv "target/$TARGET/release/oxidezapd.exe" "$out/"

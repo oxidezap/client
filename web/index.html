@@ -56,23 +56,22 @@
 
     <link data-trunk rel="copy-file" href="../crates/gui/assets/fonts/noto-sans-arabic/NotoSansArabic-OFL.txt" />
 
-    <!-- Monochrome emoji fallback, copied beside the module. The current
-         GPUI web backend can render eligible emoji with browser Canvas fonts;
-         this face remains available on the native cosmic-text/swash path when
-         Canvas cannot replace a grapheme. It is fetched before opening the
-         window. platform/fonts.rs and xtask's bundle check name the same file. -->
+    <!-- The same pinned color artwork used by the desktop. Loaded by the
+         native text path before opening the window, independently of the
+         browser's own emoji design. -->
     <link
       data-trunk
       rel="copy-file"
-      href="../crates/gui/assets/fonts/noto-emoji/NotoEmoji-Regular.ttf"
+      href="../crates/gui/assets/fonts/noto-color-emoji/OxideZapEmoji.ttf"
     />
+    <link data-trunk rel="copy-file" href="../crates/gui/assets/fonts/noto-color-emoji/NotoColorEmoji-OFL.txt" />
     <!-- Preload the emoji font so the browser downloads it in parallel with
          the wasm module rather than waiting until the module has loaded and
          run `main()`. `as="fetch"` and `crossorigin` match the `fetch()` call
          in `crates/gui/src/platform/fonts.rs`. -->
     <link
       rel="preload"
-      href="NotoEmoji-Regular.ttf"
+      href="OxideZapEmoji.ttf"
       as="fetch"
       crossorigin="anonymous"
     />
