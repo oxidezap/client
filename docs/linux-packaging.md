@@ -31,7 +31,7 @@ dependency on libc.
   pairs the window with the launcher. `install-desktop.sh` writes the same file;
   when the AppImage finds such an entry it keeps its `Exec` as a user
   customization rather than taking the launcher over.
-- **AppStream id `io.github.oxidezap.client`**: reverse-DNS on a
+- **AppStream and Flatpak id `io.github.oxidezap.client`**: reverse-DNS on a
   name the project owns (the GitHub organization).
 - **Package version.** A tag's version is the package version. A name that is
   not a version (`nightly`, `pr-<n>`) becomes a pre-release of the
@@ -51,3 +51,20 @@ dependency on libc.
 - **No self-update to suppress.** The client has no self-install or update
   mechanism; `install-desktop.sh` belongs to the archive and is not shipped in
   the packages.
+
+## Flatpak: built, broken, not released
+
+`packaging/linux/flatpak-bundle.sh` repackages the binaries as a Flatpak
+bundle with `packaging/linux/flatpak/io.github.oxidezap.client.yml`. It is
+not attached to releases, because the daemon's tray icon cannot register in the
+sandbox: ksni owns a D-Bus name `org.kde.StatusNotifierItem-<pid>-<n>` first,
+and the sandbox's bus proxy does not let an app own it. The daemon logs `no tray
+presence` and keeps running without one, and the tray is the only control the
+daemon has once the window is closed. Granting `--own-name=org.kde.*` makes the
+icon register, but lets the app own any KDE name, the tray watcher's included,
+and the exact name cannot be granted because its pid is the sandbox's. The fix
+belongs in `crates/daemon/src/tray/linux.rs`: `disable_dbus_name(true)` when
+running sandboxed, as ksni documents for Flatpak. The window's Wayland app id should
+follow `$FLATPAK_ID` too, or the launcher and window do not pair on Wayland.
+The manifest repackages the release binaries rather than compiling, because
+flatpak-builder builds offline and the workspace has git dependencies.
