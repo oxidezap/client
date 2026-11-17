@@ -17,6 +17,25 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use crate::tray::TrayHub;
 use crate::tray::macos::MacTray;
 
+/// Whether Settings → Advanced → Background is on. The front end owns that
+/// file (`platform::background`); this only reads it, and anything unreadable
+/// means off.
+fn keep_running_requested() -> bool {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".config"))
+        });
+    dir.map(|dir| dir.join("oxidezap").join("background.json"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("keep_running")?.as_bool())
+        .unwrap_or(false)
+}
+
 /// Run the daemon with the tray on this thread.
 ///
 /// Builds the icon first, since nothing else may: AppKit answers the main
@@ -35,12 +54,22 @@ pub fn run(runtime: tokio::runtime::Runtime, hub: Arc<TrayHub>) -> Result<()> {
         log::warn!("AppKit refused the accessory activation policy; a Dock icon may appear");
     }
 
-    let mut tray = match MacTray::start(&hub) {
-        Ok(tray) => Some(tray),
-        Err(e) => {
-            log::warn!("no tray presence: {e}");
-            None
+    // A menu-bar item is for a daemon that is meant to stay once the window
+    // is gone, and Mac apps do not otherwise have one. With the window closing
+    // the daemon too (the default), the icon would only ever be a second way
+    // to do what the window already does, so it is drawn only when the person
+    // asked for the background behaviour.
+    let mut tray = if keep_running_requested() {
+        match MacTray::start(&hub) {
+            Ok(tray) => Some(tray),
+            Err(e) => {
+                log::warn!("no tray presence: {e}");
+                None
+            }
         }
+    } else {
+        log::info!("no menu-bar icon: the daemon stops with the window");
+        None
     };
 
     let worker = std::thread::Builder::new()

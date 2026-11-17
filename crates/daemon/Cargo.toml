@@ -170,6 +170,7 @@ objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSRunningApplication"] }
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
 rustix = { workspace = true }
 
 [lints]

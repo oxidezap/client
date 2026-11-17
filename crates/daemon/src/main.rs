@@ -25,7 +25,33 @@ use oxidezap_session::StoreRegistry;
 #[cfg(target_os = "macos")]
 mod macos_main;
 
+/// Start from default signal handling, whoever started this.
+///
+/// A daemon the window starts inherits the window's signal state across the
+/// spawn: a blocked mask or an ignored disposition reaches the child intact,
+/// and the child's own handlers never run. That was observed — a daemon
+/// started by the GUI ignored SIGTERM and SIGINT entirely while the same
+/// binary started from a shell stopped in a second — which left a process
+/// nobody could end but with SIGKILL. Done first, while this is still one
+/// thread, so every thread the runtime starts inherits the clean mask.
+#[cfg(unix)]
+fn restore_default_signals() {
+    // SAFETY: `sigemptyset` and `pthread_sigmask` act on a local set and this
+    // thread's own mask, and `signal` with `SIG_DFL` only resets a
+    // disposition. Nothing here is shared with another thread yet.
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(unix)]
+    restore_default_signals();
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
             "Usage: oxidezapd [OPTIONS]\n\nOptions:\n      --headless       Run headless without system tray integration\n      --account <id>   Run as a named account profile (own socket, lock,\n                       database and media cache; also OXIDEZAP_ACCOUNT)\n  -h, --help           Print help"
@@ -268,14 +294,31 @@ async fn run(hub: Arc<tray::TrayHub>) -> Result<()> {
     // While that drains, a repeated signal escalates rather than queues
     // behind it: the teardown has joins without a deadline, and a second
     // signal is somebody saying the first one is taking too long.
+    //
+    // And a deadline of its own: a teardown that never finishes left a
+    // process nobody could stop but with a second signal, which a person
+    // quitting from a tray has no way to send.
     tokio::select! {
-        () = supervisor.join_all() => finish(tray, server_outcome),
+        drained = tokio::time::timeout(TEARDOWN_DEADLINE, supervisor.join_all()) => {
+            if drained.is_err() {
+                log::warn!(
+                    "the accounts did not finish disconnecting within {}s; exiting anyway",
+                    TEARDOWN_DEADLINE.as_secs()
+                );
+            }
+            finish(tray, server_outcome)
+        }
         code = termination.escalation() => {
             log::warn!("a second stop signal arrived while shutting down; exiting without finishing the teardown");
             std::process::exit(code);
         }
     }
 }
+
+/// How long the accounts get to disconnect and close their stores before the
+/// daemon leaves without them. A disconnect that has not finished by now is
+/// not going to, and SQLite's write-ahead log recovers whatever it left.
+const TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Drop the tray and return the server's outcome.
 ///
