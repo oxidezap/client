@@ -359,10 +359,19 @@ fn reap(child: Option<std::process::Child>) {
     let Some(mut child) = child else {
         return;
     };
+    let pid = child.id();
     let _ = std::thread::Builder::new()
         .name("oxidezap-daemon-wait".to_string())
         .spawn(move || {
             let _ = child.wait();
+            // Gone, and its number may be somebody else's by now: forget it,
+            // so nothing signals a process that merely inherited the id.
+            let _ = STARTED_DAEMON.compare_exchange(
+                pid,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            );
         });
 }
 
@@ -682,6 +691,20 @@ pub fn terminate_started_daemon() {
     let pid = STARTED_DAEMON.swap(0, std::sync::atomic::Ordering::SeqCst);
     if pid == 0 {
         return;
+    }
+    // Asked of the system rather than assumed: the id was ours when it was
+    // saved, and only a process still called the daemon is signalled.
+    #[cfg(unix)]
+    {
+        let named = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .is_some_and(|name| name.trim().ends_with("oxidezapd"));
+        if !named {
+            return;
+        }
     }
     #[cfg(unix)]
     if let Err(error) = std::process::Command::new("kill")
