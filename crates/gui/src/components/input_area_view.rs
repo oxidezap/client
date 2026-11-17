@@ -339,7 +339,7 @@ impl InputAreaView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> String {
-        self.emoji_open = false;
+        self.close_picker();
         let old = self.input.read(cx).text().to_string();
         self.input.update(cx, |state, cx| {
             state.set_value(crate::emoji::content(new_text), window, cx);
@@ -361,7 +361,7 @@ impl InputAreaView {
             state.set_value("", window, cx);
         });
         self.stop_typing_internal(cx);
-        self.emoji_open = false;
+        self.close_picker();
         cx.emit(InputAreaEvent::SendMessage(text));
     }
 
@@ -381,7 +381,7 @@ impl InputAreaView {
                 .expect("picker choices are valid single emoji tokens");
             state.focus(window, cx);
         });
-        self.emoji_open = false;
+        self.close_picker();
         self.on_keystroke(cx);
         cx.notify();
     }
@@ -421,7 +421,7 @@ impl InputAreaView {
             return;
         }
         self.is_recording = is_recording;
-        self.emoji_open = false;
+        self.close_picker();
         self.recording_started_at = is_recording.then(Instant::now);
         if !is_recording {
             self.level = 0.0;
@@ -439,7 +439,7 @@ impl InputAreaView {
         self.editing = editing;
         self.edit_pending = pending;
         if pending {
-            self.emoji_open = false;
+            self.close_picker();
         }
         cx.notify();
     }

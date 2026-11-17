@@ -326,9 +326,11 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
             Some(Ok(None)) => {}
             _ => {
                 info!("no daemon on {}; starting one", path.display());
-                started = Some(detached_command(&program).spawn().map_err(|e| {
+                let child = detached_command(&program).spawn().map_err(|e| {
                     std::io::Error::other(format!("could not start {}: {e}", program.display()))
-                })?);
+                })?;
+                STARTED_DAEMON.store(child.id(), std::sync::atomic::Ordering::SeqCst);
+                started = Some(child);
             }
         }
 
@@ -665,5 +667,28 @@ mod tests {
             peer.quiet(),
             "and the request the hangup tried to make never reached the daemon"
         );
+    }
+}
+
+/// The daemon this window started, by process id, or zero. Kept so a window
+/// that is closed before it ever attached can still stop what it started.
+static STARTED_DAEMON: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Ask the daemon this window started to stop, without a connection to ask it
+/// through. For the one case where there is none: the window closed while the
+/// daemon was still coming up. A daemon that was already running is not ours
+/// to stop this way, and nothing is done for it.
+pub fn terminate_started_daemon() {
+    let pid = STARTED_DAEMON.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    if let Err(error) = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+    {
+        log::warn!("could not stop the daemon this window started: {error}");
     }
 }

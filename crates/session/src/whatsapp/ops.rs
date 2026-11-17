@@ -115,6 +115,19 @@ pub struct BackfillReport {
     pub files: Vec<BackfillFile>,
 }
 
+/// One key for one person, whichever address they are known by.
+///
+/// The phone number when the LID/PN mapping is known, otherwise the address
+/// as given and tagged with its kind, so an unmapped LID never equals a phone
+/// number that merely shares digits with it.
+async fn person_key(client: &std::sync::Arc<whatsapp_rust::Client>, jid: &Jid) -> String {
+    match client.get_lid_pn_entry(jid).await {
+        Ok(Some(entry)) => format!("pn:{}", entry.phone_number),
+        _ if jid.is_lid() => format!("lid:{}", jid.user),
+        _ => format!("pn:{}", jid.user),
+    }
+}
+
 /// Who a status goes to, and under which setting.
 ///
 /// Anybody named explicitly is an allow list, which is what "share only with
@@ -174,12 +187,21 @@ async fn status_audience(
         None | Some(2) => (book().await?, StatusPrivacySetting::Contacts),
         Some(1) => {
             let book = book().await?;
-            (
-                book.into_iter()
-                    .filter(|jid| !listed.iter().any(|excluded| excluded.user == jid.user))
-                    .collect(),
-                StatusPrivacySetting::DenyList,
-            )
+            // Compared as people, not as addresses: a contact saved under a
+            // phone number and the same person excluded under a LID share no
+            // digits, and comparing the raw users would send the status to
+            // someone the account said not to.
+            let mut excluded = std::collections::HashSet::new();
+            for jid in &listed {
+                excluded.insert(person_key(client, jid).await);
+            }
+            let mut audience = Vec::with_capacity(book.len());
+            for jid in book {
+                if !excluded.contains(&person_key(client, &jid).await) {
+                    audience.push(jid);
+                }
+            }
+            (audience, StatusPrivacySetting::DenyList)
         }
         // An allow list, close friends or a custom list: a fixed set of people.
         Some(_) => (listed, StatusPrivacySetting::AllowList),

@@ -548,13 +548,19 @@ pub(crate) async fn serve_client_with_registry(
                         }
 
                         let answer = handle_wire_request(env, &hub, &plugins, &commands, &outbox).await;
-                        if let Some(frame) = answer.frame {
-                            write_line(&mut writer, &frame).await?;
-                        }
+                        let written = match answer.frame {
+                            Some(frame) => write_line(&mut writer, &frame).await,
+                            None => Ok(()),
+                        };
+                        // Honoured even when the answer could not be written:
+                        // a client that asks and leaves, as a closing window
+                        // does, must not turn its own departure into a
+                        // refusal.
                         if answer.shutdown {
                             crate::shutdown::request("ipc client");
                             return Ok(());
                         }
+                        written?;
                         continue;
                     }
 
@@ -613,17 +619,22 @@ pub(crate) async fn serve_client_with_registry(
                         awaiting_resync = false;
                     }
                     let answer = handle_request(request, &hub, &plugins, &commands, &outbox).await;
-                    if let Some(frame) = answer.frame {
-                        write_line(&mut writer, &frame).await?;
-                    }
+                    let written = match answer.frame {
+                        Some(frame) => write_line(&mut writer, &frame).await,
+                        None => Ok(()),
+                    };
                     if answer.shutdown {
-                        // After the write, not before. Signalling first lets
+                        // After the write, not before: signalling first lets
                         // the daemon tear this task down mid-answer, and a
                         // client that asked politely to stop the daemon would
-                        // see EOF where the protocol promised it a reply.
+                        // see EOF where the protocol promised it a reply. But
+                        // not *because of* the write either: a window that
+                        // closes the moment it asks has no one to read the
+                        // answer, and a failed write must not cancel the stop.
                         crate::shutdown::request("ipc client");
                         return Ok(());
                     }
+                    written?;
                 }
                 Some(oxidezap_ipc::FrameRead::NotUtf8) => {
                     write_line(&mut writer, &not_utf8()?).await?;

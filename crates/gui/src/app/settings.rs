@@ -511,11 +511,15 @@ impl WhatsAppApp {
     /// asked for it to keep running, or the window is only leaving because
     /// the tray said so. See `platform::background`.
     pub fn stop_daemon_with_window(&self) {
-        if crate::platform::background::stops_daemon_on_exit()
-            && let Some(control) = self.control()
-        {
-            info!("the window is closing and the daemon is not meant to outlive it");
-            control.shutdown_daemon();
+        if !crate::platform::background::stops_daemon_on_exit() {
+            return;
+        }
+        info!("the window is closing and the daemon is not meant to outlive it");
+        match self.control() {
+            Some(control) => control.shutdown_daemon(),
+            // Closed before it ever attached: there is no connection to ask
+            // through, but there is a process this window started.
+            None => crate::session::terminate_started_daemon(),
         }
     }
 

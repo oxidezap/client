@@ -33,6 +33,11 @@ pub use media::MediaCache;
 pub(crate) use media::{clear_image_sources, get_avatar_image};
 #[cfg(not(target_family = "wasm"))]
 mod native;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use native::terminate_started_daemon;
+/// A page owns no daemon process to stop.
+#[cfg(target_family = "wasm")]
+pub(crate) fn terminate_started_daemon() {}
 mod recovery;
 mod sink;
 #[cfg(target_family = "wasm")]

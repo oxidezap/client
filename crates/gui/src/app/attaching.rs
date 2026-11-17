@@ -211,12 +211,19 @@ impl WhatsAppApp {
                     })
                     .collect();
                 for (request, download, format) in downloads {
-                    let (Ok(bytes), Some(format)) = (download_with_timeout(download).await, format)
-                    else {
-                        let _ = app.update(cx, |_, cx| {
-                            input.update(cx, |view, cx| view.drop_picker_item(request, cx));
-                        });
-                        continue;
+                    let downloaded = download_with_timeout(download).await;
+                    let (bytes, format) = match (downloaded, format) {
+                        (Ok(bytes), Some(format)) => (bytes, format),
+                        // The network let go for a moment: the tile stays, as
+                        // a label, and the sticker is still there to be sent.
+                        (Err(failure), Some(_)) if failure.retryable => continue,
+                        // Expired or not an image: nothing will ever draw it.
+                        _ => {
+                            let _ = app.update(cx, |_, cx| {
+                                input.update(cx, |view, cx| view.drop_picker_item(request, cx));
+                            });
+                            continue;
+                        }
                     };
                     let _ = app.update(cx, |app, cx| {
                         if app.document_state_generation != generation {

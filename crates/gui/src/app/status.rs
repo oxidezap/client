@@ -511,6 +511,10 @@ impl WhatsAppApp {
         if !self.can_send() || self.status_post.as_ref().is_none_or(|post| post.pending) {
             return;
         }
+        // Which draft asked: the chooser and the read take as long as they
+        // take, and a draft cancelled and replaced meanwhile must not be
+        // handed the old one's file.
+        let origin = self.status_post.as_ref().map(|post| post.text.downgrade());
         let chosen = crate::platform::picker::choose_category(
             cx,
             crate::platform::picker::AttachmentCategory::PhotosVideos,
@@ -521,6 +525,12 @@ impl WhatsAppApp {
                 let Some(post) = &mut app.status_post else {
                     return;
                 };
+                if post.pending
+                    || origin.as_ref().and_then(|origin| origin.upgrade()).as_ref()
+                        != Some(&post.text)
+                {
+                    return;
+                }
                 match chosen {
                     Ok(chosen) => {
                         for refusal in chosen.refused {
@@ -647,7 +657,11 @@ impl WhatsAppApp {
                 post.pending = false;
                 match result {
                     Ok(()) => {
-                        app.cancel_status_post(cx);
+                        // Not `cancel_status_post`: it also puts a phone's
+                        // layout back on the chat list, which would take the
+                        // person out of whatever they opened while this was
+                        // posting.
+                        app.status_post = None;
                         app.notify_user(
                             crate::tr!(StatusPublished),
                             super::notices::Tone::Info,
@@ -696,6 +710,12 @@ impl WhatsAppApp {
         // Read before the selection moves, because afterwards there is no way
         // to ask what was on screen. Opening an image or a text update does
         // not touch the player, so a video left this way went on playing.
+        // While a post is in flight its composer stays on screen, so a
+        // reader opened now would play behind it. Navigation resumes when the
+        // post settles.
+        if self.status_post.as_ref().is_some_and(|post| post.pending) {
+            return;
+        }
         self.cancel_status_post(cx);
         let leaving = self.shown_status_message_id();
         self.status_reply = None;

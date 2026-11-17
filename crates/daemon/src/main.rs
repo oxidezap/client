@@ -129,7 +129,14 @@ fn main() -> Result<()> {
     #[cfg(target_os = "macos")]
     return macos_main::run(runtime, hub);
     #[cfg(not(target_os = "macos"))]
-    return runtime.block_on(run(hub));
+    {
+        let outcome = runtime.block_on(run(hub));
+        // Dropping a runtime waits, without limit, for its blocking tasks, and
+        // one that never returns (a plugin thread, a device open) would keep
+        // the process alive past the teardown deadline above.
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_DEADLINE);
+        return outcome;
+    }
 }
 
 async fn run(hub: Arc<tray::TrayHub>) -> Result<()> {
@@ -319,6 +326,10 @@ async fn run(hub: Arc<tray::TrayHub>) -> Result<()> {
 /// daemon leaves without them. A disconnect that has not finished by now is
 /// not going to, and SQLite's write-ahead log recovers whatever it left.
 const TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the runtime may take to wind down its blocking tasks once the
+/// daemon has finished: past this they are abandoned and the process exits.
+pub(crate) const RUNTIME_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Drop the tray and return the server's outcome.
 ///

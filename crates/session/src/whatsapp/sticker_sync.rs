@@ -163,7 +163,15 @@ impl WhatsAppClient {
                         }
                         let mut media = super::media::media_of(message.get_base_message(), None)?
                             .downloadable?;
-                        if !seen.insert(media.content_hash().to_vec()) {
+                        // The plaintext hash names the picture; the encrypted
+                        // one names one upload of it, so two copies of the
+                        // same sticker differ in it. Used only where known.
+                        let identity = if media.file_sha256.is_empty() {
+                            media.content_hash().to_vec()
+                        } else {
+                            media.file_sha256.clone()
+                        };
+                        if !seen.insert(identity) {
                             return None;
                         }
                         media.is_thumbnail = false;

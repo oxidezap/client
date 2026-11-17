@@ -93,6 +93,17 @@ impl InputAreaView {
             .any(|item| &item.request == request)
     }
 
+    /// Close the popover and forget what it showed. For every close the
+    /// owner makes itself: the popover reports only the ones it starts, and a
+    /// tab and a list left from the previous chat would offer that chat's
+    /// stickers to this one.
+    pub(super) fn close_picker(&mut self) {
+        self.emoji_open = false;
+        self.picker_items.clear();
+        self.picker_status = None;
+        self.picker_tab = PickerTab::Emoji;
+    }
+
     /// A tile whose picture cannot be had — the media has expired on
     /// WhatsApp's side — is removed rather than left as a word in a box.
     pub(crate) fn drop_picker_item(&mut self, request: &PickerRequest, cx: &mut Context<Self>) {
