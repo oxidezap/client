@@ -1,0 +1,93 @@
+# .deb and .rpm packages (nfpm: https://nfpm.goreleaser.com). Run by package.sh, which stages
+# the file tree, substitutes its path for ${STAGE} and the binaries' glibc floor for ${GLIBC_MIN}
+# (nfpm doesn't expand env vars in `src` or `depends`) and exports VERSION, NFPM_ARCH and
+# OXIDEZAP_MAINTAINER.
+#
+#   packaging/linux/package.sh --formats "deb rpm"
+name: oxidezap
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+# semver: 0.1.0-nightly.202611171200 becomes 0.1.0~nightly.202611171200 in deb/rpm, so a
+# nightly sorts before the release it leads up to and after the nightly before it.
+version_schema: semver
+release: 1
+section: net
+priority: optional
+maintainer: ${OXIDEZAP_MAINTAINER}
+homepage: https://github.com/oxidezap/client
+license: MIT
+description: |-
+  Unofficial WhatsApp client.
+  A background process (oxidezapd) holds the WhatsApp session and shows a tray
+  icon; the window (oxidezap) and the command-line client (oxidezap-cli) are
+  front ends onto it. Not affiliated with WhatsApp or Meta.
+
+# Linked directly (ELF NEEDED): glibc, libstdc++, libgcc_s, ALSA, xcb, xkbcommon and
+# xkbcommon-x11. Loaded at runtime with dlopen, so the package tools can't see them: Wayland
+# (libwayland-client, libwayland-egl) for the window, Vulkan or EGL for wgpu. X11 goes through
+# libxcb alone, fonts are read by a Rust fontconfig parser (no libfontconfig), the camera through
+# V4L2 ioctls and the tray and notifications over D-Bus in Rust, so none of those add a library.
+# Sound is ALSA: on PipeWire or PulseAudio desktops their ALSA plugin carries it, which those
+# desktops install already. File pickers and opening links go through xdg-desktop-portal.
+overrides:
+  deb:
+    depends:
+      - libc6 (>= ${GLIBC_MIN})
+      - libgcc-s1
+      - libstdc++6
+      - libasound2
+      - libxcb1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libvulkan1 | libegl1
+    recommends:
+      - mesa-vulkan-drivers
+      - libegl1
+      - libwayland-egl1
+      - xdg-desktop-portal
+  rpm:
+    # Soname provides rather than package names, so the same requirements resolve on Fedora/RHEL
+    # (libxkbcommon-x11, libwayland-client, ...) and openSUSE (libxkbcommon-x11-0, ...).
+    depends:
+      - libc.so.6(GLIBC_${GLIBC_MIN})(64bit)
+      - libgcc_s.so.1()(64bit)
+      - libstdc++.so.6()(64bit)
+      - libasound.so.2()(64bit)
+      - libxcb.so.1()(64bit)
+      - libxkbcommon.so.0()(64bit)
+      - libxkbcommon-x11.so.0()(64bit)
+      - libwayland-client.so.0()(64bit)
+      - (libvulkan.so.1()(64bit) or libEGL.so.1()(64bit))
+    recommends:
+      - mesa-vulkan-drivers
+      - libEGL.so.1()(64bit)
+      - libwayland-egl.so.1()(64bit)
+      - xdg-desktop-portal
+
+# The three binaries stay in one directory: the window and the CLI start the daemon beside
+# themselves, and the daemon's tray starts the window beside itself.
+contents:
+  - src: ${STAGE}/usr/bin/oxidezap
+    dst: /usr/bin/oxidezap
+    file_info: { mode: 0755 }
+  - src: ${STAGE}/usr/bin/oxidezapd
+    dst: /usr/bin/oxidezapd
+    file_info: { mode: 0755 }
+  - src: ${STAGE}/usr/bin/oxidezap-cli
+    dst: /usr/bin/oxidezap-cli
+    file_info: { mode: 0755 }
+  - src: ${STAGE}/usr/share/
+    dst: /usr/share/
+    type: tree
+  # Debian's zsh reads vendor-completions, not /usr/share/zsh/site-functions as Fedora's and
+  # openSUSE's do (its debian/rules sets --enable-additional-fpath).
+  - src: /usr/share/zsh/site-functions/_oxidezap-cli
+    dst: /usr/share/zsh/vendor-completions/_oxidezap-cli
+    type: symlink
+    packager: deb
+
+scripts:
+  postinstall: packaging/linux/postinst.sh
+  postremove: packaging/linux/postinst.sh

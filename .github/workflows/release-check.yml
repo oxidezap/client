@@ -36,5 +36,11 @@ jobs:
             if [ "$platform" = windows-x86_64 ]; then suffix=zip; fi
             python3 .github/scripts/check-release.py "artifacts/oxidezap-$VERSION-$platform.$suffix" "$VERSION" "$platform"
           done
-          test "$(find artifacts -type f | wc -l)" -eq 4
+          # The Linux packages from packaging/linux/package.sh, four per architecture.
+          for arch in x86_64 aarch64; do
+            for suffix in AppImage AppImage.zsync deb rpm; do
+              test -s "artifacts/oxidezap-$VERSION-linux-$arch.$suffix"
+            done
+          done
+          test "$(find artifacts -type f | wc -l)" -eq 12
           (cd artifacts && sha256sum oxidezap-* > checksums.sha256 && sha256sum -c checksums.sha256)

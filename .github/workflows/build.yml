@@ -39,7 +39,8 @@ jobs:
       matrix:
         include:
           # 22.04, not latest: the binary links against the runner's glibc, and
-          # this keeps the floor low enough for stable distributions.
+          # this keeps the floor low enough for stable distributions. The deb and
+          # rpm depend on that floor, which package.sh reads from the binaries.
           - name: linux-x86_64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -137,6 +138,47 @@ jobs:
       # undiscoverable from the releases page.
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} --bin oxidezap --bin oxidezapd --bin oxidezap-cli
+
+      # The AppImage, deb and rpm, from the binaries just built and before the step below moves
+      # them into the archive. nfpm builds the deb and rpm, zsync the AppImage's .zsync;
+      # desktop-file-utils and appstream validate the metadata. AppImage tooling is downloaded by
+      # package.sh at pinned digests.
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        env:
+          NFPM_VERSION: 2.48.0
+          NFPM_SHA256_AMD64: 787af76e172dd5fc7cedf4d7c5a090a2f62be9001557a4db1103e270f90ddefd
+          NFPM_SHA256_ARM64: 8e9cd8b4ed372a5e8af555a997dfe5e111cb6c7d4d757fd0a0368a35ad84a9b0
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends zsync desktop-file-utils appstream
+          arch="$(dpkg --print-architecture)"
+          case "$arch" in
+            amd64) sha="$NFPM_SHA256_AMD64" ;;
+            arm64) sha="$NFPM_SHA256_ARM64" ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/nfpm.deb" \
+            "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_$arch.deb"
+          echo "$sha  $RUNNER_TEMP/nfpm.deb" | sha256sum -c -
+          sudo dpkg -i "$RUNNER_TEMP/nfpm.deb"
+
+      # oxidezap-<version>-linux-<arch>.{AppImage,AppImage.zsync,deb,rpm}. The version is
+      # validated by packaging/env.sh as the step below validates it; a name that is not a
+      # version (`nightly`, `pr-<n>`) becomes a pre-release of the Cargo.toml version inside
+      # the packages, and a nightly AppImage looks for its updates in the `nightly` release.
+      - name: Package for Linux distributions
+        if: runner.os == 'Linux'
+        env:
+          OXIDEZAP_VERSION: ${{ inputs.version }}
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: packaging/linux/package.sh --skip-build --formats "appimage deb rpm"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: runner.os == 'Linux'
+        with:
+          name: oxidezap-${{ matrix.name }}-packages
+          path: dist/release/oxidezap-*
+          if-no-files-found: error
 
       - name: Package the binaries for their platform
         shell: bash

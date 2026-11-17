@@ -63,6 +63,13 @@ For a source build,
 copy `packaging/linux/install-desktop.sh` and
 `packaging/linux/org.oxidezap.client.local.png` beside the three binaries first.
 
+Linux also has packages that hold all three binaries and their launcher: a
+`.deb` (Debian, Ubuntu), an `.rpm` (Fedora, openSUSE) and an `.AppImage`, which
+runs in place, adds its own menu entry and updates through the `.zsync` beside
+it. `oxidezap-<version>-linux-x86_64.AppImage --cli ...` runs the CLI.
+`packaging/linux/package.sh` builds them from source;
+[docs/linux-packaging.md](docs/linux-packaging.md) says how and why.
+
 The web front end ships beside them as `oxidezap-<version>-web.zip`: static
 files to serve from any web server, with hosting notes in the archive.
 

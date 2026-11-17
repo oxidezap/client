@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=OxideZap
+GenericName=WhatsApp client
+Comment=Unofficial WhatsApp client
+Exec=oxidezap
+TryExec=oxidezap
+Icon=org.oxidezap.client.local
+# The window's app id (APP_ID in crates/gui/src/platform/window_identity.rs) is this file's
+# name, which is how Wayland docks pair the window with this entry and its icon.
+StartupWMClass=org.oxidezap.client.local
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=WhatsApp;Chat;Messenger;
+StartupNotify=true
+# AppRun registers the desktop entry and icons itself; tell external AppImage
+# integrators (AppImageLauncher, appimaged) not to add a duplicate.
+X-AppImage-Integrate=false

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata (software centres). Template: package.sh substitutes @VERSION@ and
+     @DATE@ from Cargo.toml (or the release's version) and the build date. -->
+<component type="desktop-application">
+  <id>io.github.oxidezap.client</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>OxideZap</name>
+  <summary>Unofficial WhatsApp client</summary>
+  <developer id="io.github.oxidezap">
+    <name>João Lucas</name>
+  </developer>
+  <description>
+    <p>
+      OxideZap is an unofficial WhatsApp client written in Rust, built on whatsapp-rust.
+      It is not affiliated with, endorsed by, or connected to WhatsApp or Meta.
+    </p>
+    <p>
+      A background process holds the WhatsApp session and shows a tray icon; the window
+      and a command-line client are front ends onto it.
+    </p>
+    <ul>
+      <li>Pairing with the phone, chats with durable, searchable history</li>
+      <li>Media, voice and video calls</li>
+      <li>WebAssembly plugins</li>
+    </ul>
+  </description>
+  <!-- The desktop id is the window's app id, so docks pair the window with it. -->
+  <launchable type="desktop-id">org.oxidezap.client.local.desktop</launchable>
+  <icon type="stock">org.oxidezap.client.local</icon>
+  <!-- Only url types known to appstream 0.15 (Ubuntu 22.04, where CI validates): no vcs-browser. -->
+  <url type="homepage">https://github.com/oxidezap/client</url>
+  <url type="bugtracker">https://github.com/oxidezap/client/issues</url>
+  <categories>
+    <category>Network</category>
+    <category>InstantMessaging</category>
+    <category>Chat</category>
+  </categories>
+  <keywords>
+    <keyword>WhatsApp</keyword>
+    <keyword>Chat</keyword>
+    <keyword>Messenger</keyword>
+  </keywords>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <provides>
+    <binary>oxidezap</binary>
+    <binary>oxidezapd</binary>
+    <binary>oxidezap-cli</binary>
+  </provides>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-audio">intense</content_attribute>
+    <content_attribute id="social-contacts">intense</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>
