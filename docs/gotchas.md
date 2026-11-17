@@ -174,6 +174,24 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   shutdown; a second one while it drains exits on 128-plus-signal-number
   rather than waiting it out, because the teardown has joins without a
   deadline and a repeated signal is somebody saying the wait is the problem.
+- **Closing the window stops the daemon unless the person said otherwise.**
+  The daemon outliving the window is a choice, not a law: Settings → Advanced
+  → Background keeps it in `background.json` beside `theme.json`, default off.
+  The window's quit hook (`main.rs`, `on_app_quit`) sends `Shutdown` on the
+  control connection when `platform::background::stops_daemon_on_exit()` says
+  so. The tray's Hide is exempt — `platform::leave` marks the departure first,
+  because Hide exists so the daemon stays. The daemon's own teardown has a
+  ten-second deadline (`TEARDOWN_DEADLINE`) so a disconnect that hangs cannot
+  leave a process only a second signal could end. On macOS the status item
+  exists only when that setting is on (`macos_main::keep_running_requested`),
+  since a Mac app that dies with its window has nothing for an icon to do, and
+  it opens its menu on a left click.
+- **A daemon the window starts must reset its own signals.** It inherits the
+  window's signal state across the spawn, and the GUI's left SIGTERM and
+  SIGINT without effect: the same binary stopped in a second from a shell and
+  never from the window. `restore_default_signals` at the top of the daemon's
+  `main` clears the mask and the dispositions before any thread exists. Test
+  it by starting the front end, not the daemon, and signalling the child.
 - **The front end owns no session.** `oxidezap` starts `oxidezapd` when none is
   listening and speaks to it; the two ship together and the release packages
   them in one directory. A front end that cannot reach the daemon has no

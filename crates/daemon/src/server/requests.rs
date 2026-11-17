@@ -103,6 +103,81 @@ pub(super) async fn handle_request(
         ClientRequest::SendText(request) => {
             acted(dispatch(hub, commands, Action::SendText(*request)).await)
         }
+        ClientRequest::SyncedStickers { favorites } => {
+            let id = match addressed(id, "sticker sync needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::SyncedStickers {
+                    id,
+                    favorites,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::ReuseComposerMedia {
+            source,
+            message_id,
+            target,
+        } => {
+            let id = match addressed(id, "a composer media send needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::ReuseComposerMedia {
+                    id,
+                    source,
+                    message_id,
+                    target,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::PublishStatus { text, recipients } => {
+            let id = match addressed(id, "a status post needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::PublishStatus {
+                    id,
+                    text,
+                    recipients,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
+        ClientRequest::PublishStatusMedia(request) => {
+            let id = match addressed(id, "a status post needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::PublishStatusMedia {
+                    id,
+                    request: *request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
         ClientRequest::EditMessage(request) => {
             let id = match addressed(id, "an edit needs an id to answer under") {
                 Ok(id) => id,

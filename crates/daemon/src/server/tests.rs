@@ -770,6 +770,7 @@ async fn a_picked_file_reaches_the_session_as_it_was_described() {
         caption: Some("olha isso".into()),
         local_id: Some("local-1".into()),
         quoted: Some(oxidezap_core::QuotedMessage {
+            remote_jid: None,
             message_id: "3EB0A".into(),
             sender: "b@s.whatsapp.net".into(),
             sender_name: "quem quer que seja".into(),
@@ -859,6 +860,94 @@ async fn gui_edit_and_delete_reach_the_session_without_an_early_ack() {
             action => panic!("unexpected action: {action:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn status_post_keeps_its_explicit_audience_until_the_session_confirms() {
+    let hub = connected_hub();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let recipients = vec![
+        "15550001111@s.whatsapp.net".to_owned(),
+        "123456@lid".to_owned(),
+    ];
+    let answer = handle_request(
+        Request {
+            id: Some(42),
+            request: ClientRequest::PublishStatus {
+                text: "A status update".into(),
+                recipients: recipients.clone(),
+            },
+        },
+        &hub,
+        &no_plugins(),
+        &commands,
+        &outbox(),
+    )
+    .await;
+
+    assert!(answer.frame.is_none(), "the send has not completed yet");
+    let Action::PublishStatus {
+        id,
+        text,
+        recipients: dispatched,
+        ..
+    } = taken.await.unwrap().unwrap()
+    else {
+        panic!("expected a status post");
+    };
+    assert_eq!(id, 42);
+    assert_eq!(text, "A status update");
+    assert_eq!(dispatched, recipients);
+}
+
+#[tokio::test]
+async fn status_media_post_names_its_staged_file_and_audience_and_needs_an_id() {
+    let hub = connected_hub();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let request = || {
+        ClientRequest::PublishStatusMedia(Box::new(oxidezap_ipc::PublishStatusMedia {
+            upload: "staged-status-1".into(),
+            kind: oxidezap_core::OutgoingMedia::Image,
+            mime_type: "image/jpeg".into(),
+            file_name: "foto.jpg".into(),
+            caption: Some("hoje".into()),
+            recipients: vec!["15550001111@s.whatsapp.net".into()],
+        }))
+    };
+
+    // No id, nothing to answer under: refused before anything is dispatched.
+    let refused = handle_request(
+        Request {
+            id: None,
+            request: request(),
+        },
+        &hub,
+        &no_plugins(),
+        &commands,
+        &outbox(),
+    )
+    .await;
+    assert!(refused.frame.is_some(), "an unaddressed post is refused");
+
+    let answer = handle_request(
+        Request {
+            id: Some(7),
+            request: request(),
+        },
+        &hub,
+        &no_plugins(),
+        &commands,
+        &outbox(),
+    )
+    .await;
+    assert!(answer.frame.is_none(), "the post has not completed yet");
+    let Action::PublishStatusMedia { id, request, .. } = taken.await.unwrap().unwrap() else {
+        panic!("expected a status media post");
+    };
+    assert_eq!(id, 7);
+    assert_eq!(request.upload, "staged-status-1");
+    assert_eq!(request.caption.as_deref(), Some("hoje"));
+    assert_eq!(request.recipients, ["15550001111@s.whatsapp.net"]);
 }
 
 #[tokio::test]

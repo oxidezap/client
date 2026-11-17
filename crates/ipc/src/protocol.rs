@@ -420,6 +420,11 @@ pub enum DaemonMessage {
         protocol: u32,
         snapshot: Box<StateSnapshot>,
     },
+    /// The linked account’s favorite or recently sent stickers.
+    SyncedStickers {
+        id: RequestId,
+        items: Vec<oxidezap_core::PickerSticker>,
+    },
     /// Device work answered only to the front end that requested it.
     CallDevices {
         id: RequestId,
@@ -826,6 +831,27 @@ pub struct SendReaction {
     pub emoji: String,
 }
 
+/// A photo or video status. See [`ClientRequest::PublishStatusMedia`].
+///
+/// Staged exactly as [`SendMedia`] is: the bytes travel through the media
+/// cache under [`upload`](Self::upload) and this names them. Only the two
+/// kinds a status can be are accepted, and the daemon refuses the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishStatusMedia {
+    /// Cache key the client wrote the file under.
+    pub upload: String,
+    /// Image or video. Anything else is refused.
+    pub kind: OutgoingMedia,
+    pub mime_type: String,
+    /// What the file was called where it was picked; a name, never a path.
+    pub file_name: String,
+    /// The line drawn over the media, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// The contacts allowed to see it.
+    pub recipients: Vec<String>,
+}
+
 /// Put a `.wasm` in the daemon's plugin folder. See
 /// [`ClientRequest::InstallPlugin`].
 ///
@@ -1009,6 +1035,22 @@ pub enum ClientRequest {
     /// — and the serde working set — of every request. The wire is unchanged:
     /// `Box` is transparent to serde, and the round-trip test pins the bytes.
     SendText(Box<SendText>),
+    SyncedStickers {
+        favorites: bool,
+    },
+    ReuseComposerMedia {
+        source: Option<String>,
+        message_id: String,
+        target: String,
+    },
+    PublishStatus {
+        text: String,
+        recipients: Vec<String>,
+    },
+    /// Publish a photo or video as a status. The bytes are staged through
+    /// the media cache like [`SendMedia`]'s, and the answer is the daemon's
+    /// acknowledgement once the post is on WhatsApp.
+    PublishStatusMedia(Box<PublishStatusMedia>),
     RevokeMessage(RevokeMessage),
     /// Send a recorded voice note.
     ///
@@ -1975,6 +2017,7 @@ mod tests {
     #[test]
     fn every_request_payload_puts_the_same_bytes_on_the_wire() {
         let quoted = QuotedMessage {
+            remote_jid: None,
             message_id: "3EB0A".into(),
             sender: "559900000001@s.whatsapp.net".into(),
             sender_name: "quem quer que seja".into(),
@@ -2066,6 +2109,17 @@ mod tests {
                     quoted: None,
                 })),
                 r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-2","kind":"document","mime_type":"application/pdf","file_name":"nota.pdf","local_id":null}"#.to_string(),
+            ),
+            (
+                ClientRequest::PublishStatusMedia(Box::new(PublishStatusMedia {
+                    upload: "u-status-1".into(),
+                    kind: OutgoingMedia::Image,
+                    mime_type: "image/jpeg".into(),
+                    file_name: "pôr-do-sol.jpg".into(),
+                    caption: None,
+                    recipients: vec!["559900000001@s.whatsapp.net".into()],
+                })),
+                r#"{"request":"publish_status_media","upload":"u-status-1","kind":"image","mime_type":"image/jpeg","file_name":"pôr-do-sol.jpg","recipients":["559900000001@s.whatsapp.net"]}"#.to_string(),
             ),
             (
                 ClientRequest::SendReaction(Box::new(SendReaction {

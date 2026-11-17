@@ -626,6 +626,45 @@ fn files(count: u64) -> String {
 /// not have, and one a page has never had at all. What is drawn now takes
 /// effect in this window and in the daemon at once, and is remembered.
 fn advanced(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElement {
+    let diagnostics = diagnostics(entity.clone(), metrics, cx);
+    if !crate::platform::background::is_configurable() {
+        return diagnostics;
+    }
+    let keep = crate::platform::background::keep_running();
+    div()
+        .flex()
+        .flex_col()
+        .gap(metrics.space_xl())
+        .child(group(
+            label(crate::tr!(Background), metrics, cx),
+            div()
+                .flex()
+                .flex_col()
+                .gap(metrics.space_md())
+                .child(
+                    gpui_component::checkbox::Checkbox::new("keep-running")
+                        .label(crate::tr!(KeepRunningInBackground))
+                        .checked(keep)
+                        .on_click({
+                            let entity = entity.clone();
+                            move |checked, _, cx| {
+                                entity.update(cx, |app, cx| app.set_keep_running(*checked, cx));
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_meta())
+                        .text_color(cx.theme().muted_foreground)
+                        .child(crate::tr!(KeepRunningNote)),
+                ),
+            metrics,
+        ))
+        .child(diagnostics)
+        .into_any_element()
+}
+
+fn diagnostics(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElement {
     let active = oxidezap_logging::current();
     // A level given for this run from outside — `RUST_LOG` on a desktop,
     // `?log=` in a page — is what the process *started* at. Said rather than

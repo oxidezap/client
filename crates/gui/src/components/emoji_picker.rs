@@ -13,7 +13,10 @@ use gpui_component::{
 
 use crate::theme::ActiveProductTheme as _;
 
-const COLUMNS: usize = 8;
+/// What the grid starts at, before the popover that holds it says how much
+/// room there is. See [`EmojiPicker::fit`].
+const COLUMNS: usize = 10;
+const VISIBLE_ROWS: f32 = 7.;
 const TONES: [SkinTone; 6] = [
     SkinTone::Default,
     SkinTone::Light,
@@ -26,6 +29,10 @@ const TONES: [SkinTone; 6] = [
 pub(super) struct EmojiPicked(pub &'static str);
 
 pub(super) struct EmojiPicker {
+    columns: usize,
+    rows: f32,
+    /// The side of one emoji cell, when the popover has chosen one.
+    cell: Option<gpui::Pixels>,
     search: Entity<InputState>,
     matches: Vec<&'static Emoji>,
     tone: SkinTone,
@@ -68,12 +75,30 @@ impl EmojiPicker {
         })
         .detach();
         Self {
+            columns: COLUMNS,
+            rows: VISIBLE_ROWS,
+            cell: None,
             search: input,
             matches: search("", SkinTone::Default),
             tone: SkinTone::Default,
             scroll: UniformListScrollHandle::new(),
             language: crate::i18n::Language::current(),
         }
+    }
+
+    /// Take the room the popover has: as many columns and rows as fit, so the
+    /// picker is as large as the window allows rather than one fixed size.
+    ///
+    /// Reports whether anything changed, because a view is drawn from its own
+    /// cache until it is told it is dirty: a size set without a notify left
+    /// the grid drawn at the old one, with only the gaps between cells new.
+    pub fn fit(&mut self, columns: usize, rows: f32, cell: gpui::Pixels) -> bool {
+        let (columns, rows) = (columns.max(1), rows.max(3.0));
+        let changed = self.columns != columns || self.rows != rows || self.cell != Some(cell);
+        self.columns = columns;
+        self.rows = rows;
+        self.cell = Some(cell);
+        changed
     }
 
     pub fn focus_handle(&self, cx: &gpui::App) -> gpui::FocusHandle {
@@ -101,13 +126,14 @@ impl Render for EmojiPicker {
             });
         }
         let metrics = cx.product().metrics;
-        let cell = metrics.icon_button();
+        let small = metrics.icon_button();
+        let cell = self.cell.unwrap_or(small);
         let entity = cx.entity();
         div()
             .flex()
             .flex_col()
             .gap(metrics.space_sm())
-            .w(cell * COLUMNS as f32)
+            .w(cell * self.columns as f32)
             .text_color(cx.theme().popover_foreground)
             .child(crate::tr!(ChooseEmoji))
             .child(Input::new(&self.search).w_full())
@@ -122,12 +148,12 @@ impl Render for EmojiPicker {
                         Button::new(("emoji-tone", ix))
                             .ghost()
                             .p_0()
-                            .w(cell)
-                            .h(cell)
+                            .w(small)
+                            .h(small)
                             .selected(self.tone == tone)
                             .child(crate::emoji::picture(
                                 emoji.as_str(),
-                                cell * 0.7,
+                                small * 0.7,
                                 window,
                                 cx,
                             ))
@@ -145,13 +171,16 @@ impl Render for EmojiPicker {
             .child(
                 uniform_list(
                     "emoji-grid",
-                    self.matches.len().div_ceil(COLUMNS),
+                    self.matches.len().div_ceil(self.columns),
                     cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                         range
                             .map(|row| {
                                 div().flex().h(cell).children(
-                                    this.matches.iter().skip(row * COLUMNS).take(COLUMNS).map(
-                                        |emoji| {
+                                    this.matches
+                                        .iter()
+                                        .skip(row * this.columns)
+                                        .take(this.columns)
+                                        .map(|emoji| {
                                             let emoji = *emoji;
                                             let entity = entity.clone();
                                             Button::new(gpui::SharedString::from(emoji.as_str()))
@@ -172,14 +201,13 @@ impl Render for EmojiPicker {
                                                         cx.emit(EmojiPicked(emoji.as_str()))
                                                     });
                                                 })
-                                        },
-                                    ),
+                                        }),
                                 )
                             })
                             .collect::<Vec<_>>()
                     }),
                 )
-                .h(cell * 5.)
+                .h(cell * self.rows)
                 .track_scroll(&self.scroll),
             )
     }
@@ -228,6 +256,47 @@ mod tests {
             yellow > 1000,
             "picker did not paint its yellow PNG artwork: {yellow}"
         );
+        if let Some(path) = std::env::var_os("OXIDEZAP_PICKER_PREVIEW") {
+            screenshot.save(path).unwrap();
+        }
+    }
+
+    /// The same renderer, with the popover's sizing applied: the glyphs have
+    /// to grow with the cell, not only the gaps between them.
+    #[test]
+    #[ignore = "requires a WGPU adapter; exports the sized picker when requested"]
+    fn sized_picker_artwork_probe() {
+        use gpui::{AppContext as _, px, size};
+        use std::sync::Arc;
+        let mut cx = gpui::HeadlessAppContext::with_platform(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("DejaVu Sans")),
+            Arc::new(crate::assets::Assets),
+            || Ok(Some(Box::new(gpui_wgpu::WgpuHeadlessRenderer::new()?))),
+        );
+        cx.update(|cx| {
+            crate::platform::fonts::fonts(cx);
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let window = cx
+            .open_window(size(px(800.), px(700.)), |window, cx| {
+                cx.new(|cx| {
+                    let mut picker = EmojiPicker::new(window, cx);
+                    let _ = picker.fit(11, 6.0, px(70.));
+                    picker
+                })
+            })
+            .unwrap();
+        for _ in 0..5 {
+            cx.run_until_parked();
+            cx.update_window(*window, |_, window, cx| {
+                window.refresh();
+                cx.refresh_windows();
+            })
+            .unwrap();
+            let _ = cx.capture_screenshot(*window).unwrap();
+        }
+        let screenshot = cx.capture_screenshot(*window).unwrap();
         if let Some(path) = std::env::var_os("OXIDEZAP_PICKER_PREVIEW") {
             screenshot.save(path).unwrap();
         }

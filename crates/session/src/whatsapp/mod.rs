@@ -29,6 +29,7 @@ mod ops;
 mod profile;
 /// Sends a scriptable front end asks for, read from daemon-local paths.
 mod sends;
+mod sticker_sync;
 
 /// Store rows read back as the chats a front end draws.
 mod history;
@@ -337,6 +338,7 @@ pub(crate) struct Session {
     /// The name resolver signal used by outgoing writes as well as inbound
     /// sightings, so a locally created special-chat row is not left nameless.
     resolve_chat_names: chat_names::ChatNameResolveSignal,
+    stickers: Arc<sticker_sync::StickerSync>,
 }
 
 /// Where the one session lives: `None` until it is open, and `None` again the
@@ -1219,7 +1221,10 @@ impl WhatsAppClient {
         // one at a time is what this replaced, and the gap between any two of
         // them was a real one — a paged read that had the store but not the
         // book, a send that had the client but nothing recording it.
+        let stickers = Arc::new(sticker_sync::StickerSync::default());
+        bot.client().subscribe_handler(stickers.clone()).detach();
         let live = Arc::new(Session {
+            stickers,
             client: bot.client(),
             chat_store: chat_store.clone(),
             names: Arc::new(NameBook::new(Some(chat_store))),

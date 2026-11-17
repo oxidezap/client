@@ -29,6 +29,10 @@ pub fn watch_for_departure() {
 /// cannot be withdrawn and brought back by its owner. A page cannot close
 /// itself, and no tray reaches one anyway.
 pub fn leave(cx: &mut App) {
+    // The tray's Hide says the daemon should stay. Whether this window
+    // closing on its own account takes the daemon along is the person's
+    // choice (`platform::background`); this departure is never that one.
+    crate::platform::background::left_for_tray();
     imp::leave(cx);
 }
 

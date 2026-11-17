@@ -1052,6 +1052,28 @@ impl ChatStore {
         Ok(messages)
     }
 
+    /// Recent outgoing stickers across the linked account's stored chats.
+    pub async fn own_recent_stickers(&self) -> Result<Vec<StoredMessage>> {
+        let device_id = self.device_id();
+        let rows = self
+            .db()
+            .read(move |conn| {
+                use schema::messages::dsl as m;
+                m::messages
+                    .filter(m::device_id.eq(device_id))
+                    .filter(m::from_me.eq(true))
+                    .filter(m::kind.eq("sticker"))
+                    .filter(m::revoked.eq(false))
+                    .filter(m::proto.is_not_null())
+                    .order((m::timestamp_ms.desc(), m::id.desc()))
+                    .limit(512)
+                    .load::<MessageRow>(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// One page of a chat's messages *after* a cursor, in the same oldest-first
     /// order a timeline is drawn in.
     ///

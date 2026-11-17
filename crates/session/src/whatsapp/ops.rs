@@ -388,39 +388,145 @@ impl WhatsAppClient {
     }
 
     /// Publish a text status broadcast.
-    pub fn send_status(&self, text: String) -> Task<Result<(String, i64), String>> {
+    pub fn send_status(
+        &self,
+        text: String,
+        recipients: Vec<String>,
+    ) -> Task<Result<(String, i64), String>> {
         use whatsapp_rust::features::{StatusPrivacySetting, StatusSendOptions};
 
         let session = self.session.clone();
         self.exec.spawn(async move {
+            let text = text.trim();
             if text.is_empty() {
                 return Err("status text must not be empty".to_string());
             }
+            if recipients.is_empty() {
+                return Err("choose at least one status recipient".to_string());
+            }
+            let recipients = recipients
+                .iter()
+                .map(|jid| jid.parse::<Jid>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "invalid status recipient".to_string())?;
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let jid = Jid::status_broadcast();
+            let mut message = wa::Message::default();
+            let mut body = wa::message::ExtendedTextMessage::default();
+            body.text = Some(text.to_owned());
+            body.background_argb = Some(0xFF1E_6E4F);
+            body.font = Some(wa::message::extended_text_message::FontType::System);
+            message.extended_text_message = whatsapp_rust::buffa::MessageField::some(body);
             let result = live
                 .client
                 .status()
-                .send_text(
-                    &text,
-                    0xFF1E_6E4F,
-                    wa::message::extended_text_message::FontType::System,
-                    &[],
-                    StatusSendOptions::default().with_privacy(StatusPrivacySetting::Contacts),
+                .send_raw(
+                    message.clone(),
+                    &recipients,
+                    StatusSendOptions::default().with_privacy(StatusPrivacySetting::AllowList),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Err(error) = live
-                .chat_store
-                .record_operation(&Jid::status_broadcast(), result.message_id.as_str())
+
+            // The post is already on WhatsApp. A local write failure must
+            // never prompt the user to send it a second time.
+            let now = whatsapp_rust::wacore::time::now_utc();
+            if let Err(error) =
+                live.chat_store
+                    .record_outgoing(&jid, result.message_id.as_str(), &message, now)
             {
-                log::warn!("status was sent but its acknowledgement could not be tracked: {error}");
+                log::warn!("published status could not be cached: {error}");
             }
-            Ok((
-                result.message_id.to_string(),
-                whatsapp_rust::wacore::time::now_millis(),
-            ))
+            Ok((result.message_id.to_string(), now.timestamp_millis()))
+        })
+    }
+
+    /// Publish a photo or video status broadcast.
+    ///
+    /// The same prepare, upload and message-building the chat sends use, so a
+    /// status carries the thumbnail and dimensions a chat message would; only
+    /// the destination differs. Documents, audio and stickers are not a status.
+    ///
+    /// `take` fetches the staged bytes; it runs off the caller's thread, so a
+    /// large video never blocks the loop that dispatched the post.
+    pub fn send_status_media(
+        &self,
+        take: impl FnOnce() -> Option<Vec<u8>> + Send + 'static,
+        kind: oxidezap_core::OutgoingMedia,
+        mime_type: String,
+        file_name: String,
+        caption: Option<String>,
+        recipients: Vec<String>,
+    ) -> Task<Result<(String, i64), String>> {
+        use whatsapp_rust::features::{StatusPrivacySetting, StatusSendOptions};
+
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            if !matches!(
+                kind,
+                oxidezap_core::OutgoingMedia::Image | oxidezap_core::OutgoingMedia::Video
+            ) {
+                return Err("a status can be text, a photo or a video".to_string());
+            }
+            let data = match crate::exec::unblock(take).await {
+                Ok(Some(data)) if !data.is_empty() => data,
+                Ok(_) => return Err("nothing staged for that status; stage it first".to_string()),
+                Err(e) => return Err(format!("the staged file could not be read: {e}")),
+            };
+            let file = super::OutgoingFile {
+                data,
+                kind,
+                mime_type,
+                file_name,
+                caption,
+            };
+            if recipients.is_empty() {
+                return Err("choose at least one status recipient".to_string());
+            }
+            let recipients = recipients
+                .iter()
+                .map(|jid| jid.parse::<Jid>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "invalid status recipient".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let (shape, mut file) =
+                match crate::exec::unblock(move || super::outgoing::prepare_for_send(file)).await {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(reason)) => return Err(reason),
+                    Err(e) => return Err(format!("that file could not be prepared: {e}")),
+                };
+            let data = std::mem::take(&mut file.data);
+            let (media_type, options) = file.upload_options();
+            let uploaded = match live.client.upload(data, media_type, options).await {
+                Ok(response) => super::outgoing::Uploaded::from(response),
+                Err(e) => return Err(e.to_string()),
+            };
+            let message = super::outgoing::message(&file, shape, uploaded, None);
+            let result = live
+                .client
+                .status()
+                .send_raw(
+                    message.clone(),
+                    &recipients,
+                    StatusSendOptions::default().with_privacy(StatusPrivacySetting::AllowList),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            // Already on WhatsApp: a failed local write must not invite a
+            // second post.
+            let jid = Jid::status_broadcast();
+            let now = whatsapp_rust::wacore::time::now_utc();
+            if let Err(error) =
+                live.chat_store
+                    .record_outgoing(&jid, result.message_id.as_str(), &message, now)
+            {
+                log::warn!("published status could not be cached: {error}");
+            }
+            Ok((result.message_id.to_string(), now.timestamp_millis()))
         })
     }
 

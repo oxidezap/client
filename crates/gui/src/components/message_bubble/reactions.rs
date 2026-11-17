@@ -140,7 +140,11 @@ pub fn render_hover_actions(
     let has_text = !content.is_empty();
 
     let action = |id: SharedString, icon: Icon, tip: &'static str| {
-        parts::icon_button(id, icon, tip, metrics.icon_button()).xsmall()
+        use gpui::InteractiveElement as _;
+        let selector = id.to_string();
+        parts::icon_button(id, icon, tip, metrics.icon_button())
+            .xsmall()
+            .debug_selector(move || selector.clone())
     };
 
     div()

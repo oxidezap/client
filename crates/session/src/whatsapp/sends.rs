@@ -369,6 +369,7 @@ pub(super) async fn quoted_for_reply(
         .map_err(|e| format!("database query failed: {e}"))?
         .ok_or_else(|| format!("no message {message_id} to reply to"))?;
     Ok(oxidezap_core::QuotedMessage {
+        remote_jid: None,
         message_id: stored.id,
         sender: stored.sender_jid.to_string(),
         sender_name: String::new(),

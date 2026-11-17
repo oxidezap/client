@@ -22,6 +22,25 @@ use whatsapp_rust::wacore::types::events::{Event, ServerAck};
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+#[test]
+fn a_status_reply_preserves_the_broadcast_source_in_its_quote() {
+    let quote = oxidezap_core::QuotedMessage {
+        remote_jid: Some(oxidezap_core::STATUS_BROADCAST_JID.to_owned()),
+        message_id: "status-id".to_owned(),
+        sender: TEST_PEER.to_owned(),
+        sender_name: String::new(),
+        preview: "An update".to_owned(),
+        kind: None,
+    };
+    let mut reply = wa::Message::default();
+    let mut body = wa::message::ExtendedTextMessage::default();
+    body.text = Some("A private reply".to_owned());
+    body.context_info = MessageField::some(super::convert::quote_context(&quote));
+    reply.extended_text_message = MessageField::some(body);
+
+    assert_eq!(crate::quoting::quoted_from(&reply), Some(quote));
+}
+
 #[tokio::test]
 async fn status_pages_use_each_updates_watched_state_across_cursors() {
     let (store, client) = test_session("status-page-watched-state").await;
@@ -1592,6 +1611,7 @@ async fn a_quote_of_your_own_message_is_left_for_the_chat_to_name() {
 
     let mut message = ChatMessage::new_outgoing("MSG-REPLY".into(), "e o áudio?".into());
     message.quoted = Some(oxidezap_core::QuotedMessage {
+        remote_jid: None,
         message_id: "MSG-ORIGINAL".to_string(),
         sender_name: String::new(),
         sender: TEST_PEER.to_string(),

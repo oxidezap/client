@@ -1,20 +1,18 @@
 //! One person's updates, played back in the pane a conversation would use.
 //!
-//! No timer. WhatsApp advances on its own because it is competing for a
-//! phone's attention; on a desktop an update that vanishes while it is being
-//! read is a bug wearing a feature's clothes, so this steps when the reader
-//! says so.
+//! The progress strip tracks playback while navigation remains manual.
 
 use crate::retained_image::RetainedImage;
 use std::sync::Arc;
 
 use gpui::StyledImage as _;
 use gpui::{
-    App, Entity, InteractiveElement as _, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement as _, Styled, div, img, prelude::FluentBuilder as _,
+    Animation, AnimationExt as _, App, Entity, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement as _, Styled, div, img, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 
 use crate::app::WhatsAppApp;
@@ -31,6 +29,10 @@ use oxidezap_core::ChatMessage;
 /// the app's to hand over, and this is drawn where the app is already
 /// borrowed.
 pub struct StatusViewProps {
+    pub playback_revision: u64,
+    pub video_progress: Option<f32>,
+    pub reply_input: Option<Entity<InputState>>,
+    pub can_reply: bool,
     pub author_jid: String,
     pub author_name: SharedString,
     pub message: ChatMessage,
@@ -80,9 +82,9 @@ pub fn render_status_view(
     let can_next = props.index + 1 < props.count;
     let prev_entity = entity.clone();
     let next_entity = entity.clone();
-    let close_entity = entity;
+    let close_entity = entity.clone();
 
-    base.child(render_segments(props.index, props.count, metrics, cx))
+    base.child(render_segments(&props, metrics, cx))
         .child(render_header(
             &props,
             close_entity,
@@ -120,13 +122,35 @@ pub fn render_status_view(
                     },
                 )),
         )
+        .children(props.reply_input.map(|input| {
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.space_lg())
+                .px(metrics.space_xl())
+                .pb(metrics.space_lg())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&input).w_full().disabled(!props.can_reply)),
+                )
+                .child(
+                    Button::new("send-status-reply")
+                        .primary()
+                        .label(crate::tr!(Send))
+                        .disabled(!props.can_reply)
+                        .on_click(move |_, window, cx| {
+                            entity.update(cx, |app, cx| app.send_status_reply(&input, window, cx));
+                        }),
+                )
+        }))
 }
 
-/// A bar per update, the current one lit. This is the only thing that says
-/// how much of someone's run is left.
+/// Completed updates fill their segment. The active segment follows video
+/// playback or fills once for a still update.
 fn render_segments(
-    index: usize,
-    count: usize,
+    props: &StatusViewProps,
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -139,12 +163,26 @@ fn render_segments(
         .gap(metrics.space_xs())
         .px(metrics.space_xl())
         .pt(metrics.space_lg())
-        .children((0..count).map(|at| {
-            div()
+        .children((0..props.count).map(|at| {
+            let bar = div()
                 .flex_1()
                 .h(metrics.selection_bar_width())
                 .rounded_full()
-                .bg(if at <= index { watched } else { remaining })
+                .overflow_hidden()
+                .bg(if at < props.index { watched } else { remaining });
+            if at != props.index {
+                return bar;
+            }
+            let fill = div().h_full().bg(watched);
+            if let Some(progress) = props.video_progress {
+                bar.child(fill.w(gpui::relative(progress)))
+            } else {
+                bar.child(fill.with_animation(
+                    SharedString::from(format!("status-progress-{}", props.playback_revision)),
+                    Animation::new(std::time::Duration::from_secs(5)),
+                    |fill, progress| fill.w(gpui::relative(progress)),
+                ))
+            }
         }))
 }
 

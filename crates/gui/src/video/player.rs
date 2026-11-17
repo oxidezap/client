@@ -47,6 +47,7 @@ pub struct VideoPlayer {
     error: Option<String>,
     current_frame: Option<Arc<RenderImage>>,
     current_timestamp: Duration,
+    completed: bool,
     audio: Option<Arc<VideoAudio>>,
     needs_audio_start: bool,
     completion_tx: Option<oneshot::Sender<()>>,
@@ -69,6 +70,7 @@ impl VideoPlayer {
             error: None,
             current_frame: None,
             current_timestamp: Duration::ZERO,
+            completed: false,
             audio: None,
             needs_audio_start: false,
             completion_tx: None,
@@ -131,6 +133,7 @@ impl VideoPlayer {
             return false;
         };
 
+        self.completed = false;
         let offset = self.paused_at.unwrap_or(Duration::ZERO);
         self.playback_start = Some(Instant::now() - offset);
         self.paused_at = None;
@@ -161,6 +164,7 @@ impl VideoPlayer {
     }
 
     pub fn stop(&mut self) {
+        self.completed = false;
         self.playback_start = None;
         self.paused_at = Some(Duration::ZERO);
         self.state = VideoPlayerState::Paused;
@@ -204,6 +208,20 @@ impl VideoPlayer {
             .unwrap_or(Duration::ZERO)
     }
 
+    pub fn progress(&self) -> f32 {
+        if self.completed {
+            return 1.0;
+        }
+        let Some(decoder) = &self.decoder else {
+            return 0.0;
+        };
+        let duration = decoder.duration().as_secs_f32();
+        if duration == 0.0 {
+            return 0.0;
+        }
+        (self.current_time().as_secs_f32() / duration).clamp(0.0, 1.0)
+    }
+
     /// Update the current frame based on playback time. Returns true if frame changed.
     pub fn update(&mut self) -> bool {
         let Some(decoder) = &self.decoder else {
@@ -224,6 +242,7 @@ impl VideoPlayer {
             // stop() clears completion_tx, so take it first or the notification is lost
             let completion_tx = self.completion_tx.take();
             self.stop();
+            self.completed = true;
             if let Some(tx) = completion_tx {
                 let _ = tx.send(());
             }

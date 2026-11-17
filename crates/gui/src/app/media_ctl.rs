@@ -1278,6 +1278,12 @@ impl WhatsAppApp {
     pub fn video_player_state(&self, message_id: &str) -> Option<VideoPlayerState> {
         self.video_players.get(message_id).map(|p| p.state())
     }
+    pub fn video_progress(&self, message_id: &str) -> f32 {
+        self.video_players
+            .get(message_id)
+            .map_or(0.0, |player| player.progress())
+    }
+
     /// Get current video frame for a message (if playing).
     /// Returns an `Arc<RenderImage>` — YUV→RGBA was already converted when
     /// the frame was decoded (same pattern Zed uses on Linux).

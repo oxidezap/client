@@ -12,7 +12,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::Scrollbar;
-use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
+use gpui_component::{Disableable as _, IconName, Selectable as _};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use std::{cell::RefCell, rc::Rc};
 
@@ -132,7 +132,7 @@ impl gpui::RenderOnce for StatusList {
             .h_full()
             .min_h_0()
             .bg(cx.theme().sidebar)
-            .child(render_title_bar(metrics, cx))
+            .child(render_title_bar(entity.clone(), metrics, cx))
             .child(
                 div()
                     .flex_1()
@@ -267,11 +267,17 @@ fn status_row_sizes(authors: usize, layout: ResponsiveLayout) -> Rc<Vec<Size<Pix
     })
 }
 
-fn render_title_bar(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+fn render_title_bar(
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let can_post = entity.read(cx).can_send();
     div()
         .flex_shrink_0()
         .h(metrics.sidebar_header_height())
         .flex()
+        .justify_between()
         .items_center()
         .pl(metrics.space_xl())
         .pr(metrics.space_lg())
@@ -282,13 +288,21 @@ fn render_title_bar(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
                 .text_color(cx.theme().foreground)
                 .child(crate::tr!(Status)),
         )
+        .child(
+            Button::new("status-add")
+                .icon(IconName::Plus)
+                .ghost()
+                .tooltip(crate::tr!(AddStatus))
+                .disabled(!can_post)
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |app, cx| app.begin_status_post(window, cx));
+                }),
+        )
 }
 
 /// Our own updates, whether or not there are any.
 ///
-/// The row is here even when empty because it is also the answer to "where do
-/// I post one" — and it says plainly that posting is not built yet rather than
-/// offering a button that does nothing.
+/// Keep the account row visible even when there are no recent updates.
 fn render_mine(
     props: &StatusListProps,
     entity: Entity<WhatsAppApp>,
@@ -305,7 +319,7 @@ fn render_mine(
             format_status_time(&author.latest)
         )
         .into(),
-        None => crate::tr!(PostingIsNotAvailableYet).into(),
+        None => crate::tr!(NoStatusUpdates).into(),
     };
 
     div()
@@ -467,7 +481,7 @@ fn render_author_row(
         )
 }
 
-/// "My status", with nothing behind it yet.
+/// "My status" when no updates have been posted recently.
 fn render_placeholder_row(
     subtitle: SharedString,
     metrics: Metrics,
@@ -483,14 +497,6 @@ fn render_placeholder_row(
         .gap(metrics.space_lg())
         .px(metrics.chat_row_padding_x())
         .py(metrics.space_md())
-        .child(
-            Button::new("status-add")
-                .icon(Icon::new(IconName::Plus))
-                .ghost()
-                .large()
-                .disabled(true)
-                .tooltip("Posting a status update is not available yet"),
-        )
         .child(
             parts::detail_stack()
                 .gap(metrics.space_xs())

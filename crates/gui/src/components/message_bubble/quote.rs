@@ -22,6 +22,7 @@ pub fn render_quote(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let target = quoted.message_id.clone();
+    let is_status = quoted.remote_jid.as_deref() == Some(oxidezap_core::STATUS_BROADCAST_JID);
     let hue = cx.product().speaker(&quoted.sender);
     let name: SharedString = crate::i18n::Language::current()
         .quote_author(quoted, sender_is_self)
@@ -71,7 +72,13 @@ pub fn render_quote(
                 ),
         )
         .cursor_pointer()
-        .on_click(move |_, _window, cx| {
-            entity.update(cx, |app, cx| app.jump_to_message(&target, cx));
+        .on_click(move |_, window, cx| {
+            entity.update(cx, |app, cx| {
+                if is_status {
+                    app.open_quoted_status(&target, window, cx);
+                } else {
+                    app.jump_to_message(&target, cx);
+                }
+            });
         })
 }

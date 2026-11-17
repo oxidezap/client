@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 /// snapshot is what it falls back to when it is not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotedMessage {
+    /// The source chat for a quote sent to another conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_jid: Option<String>,
     /// Id of the original, for the jump-to-original gesture.
     pub message_id: String,
     /// JID of whoever wrote it, which is what colours the quote bar — the
@@ -85,6 +88,7 @@ mod tests {
 
     fn quoted(preview: &str, kind: Option<QuotedKind>) -> QuotedMessage {
         QuotedMessage {
+            remote_jid: None,
             message_id: "ABC".to_string(),
             sender: "a@s.whatsapp.net".to_string(),
             sender_name: "Ana".to_string(),

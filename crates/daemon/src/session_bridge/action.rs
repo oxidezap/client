@@ -24,6 +24,29 @@ use oxidezap_ipc::{CallAction, RequestId};
 #[derive(Debug)]
 pub enum Action {
     SendText(oxidezap_ipc::SendText),
+    SyncedStickers {
+        id: RequestId,
+        favorites: bool,
+        answer_to: Outbox,
+    },
+    ReuseComposerMedia {
+        id: RequestId,
+        source: Option<String>,
+        message_id: String,
+        target: String,
+        answer_to: Outbox,
+    },
+    PublishStatus {
+        id: RequestId,
+        text: String,
+        recipients: Vec<String>,
+        answer_to: Outbox,
+    },
+    PublishStatusMedia {
+        id: RequestId,
+        request: oxidezap_ipc::PublishStatusMedia,
+        answer_to: Outbox,
+    },
     EditMessage {
         id: RequestId,
         request: oxidezap_ipc::EditMessage,
