@@ -605,7 +605,7 @@ impl WhatsAppApp {
         };
         let text = post.text.read(cx).value();
         let text = text.trim();
-        if post.pending || post.recipients.is_empty() || (text.is_empty() && post.media.is_none()) {
+        if post.pending || (text.is_empty() && post.media.is_none()) {
             return;
         }
         post.pending = true;

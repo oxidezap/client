@@ -115,6 +115,84 @@ pub struct BackfillReport {
     pub files: Vec<BackfillFile>,
 }
 
+/// Who a status goes to, and under which setting.
+///
+/// Anybody named explicitly is an allow list, which is what "share only with
+/// these" means. Nobody named is what WhatsApp does by default: the account's
+/// own status privacy setting, which a phone keeps in app state — *My
+/// contacts* unless somebody changed it, with or without exceptions, or a
+/// fixed list. A client that posted to nobody unless told otherwise was a
+/// different product from the one on the phone.
+async fn status_audience(
+    client: &std::sync::Arc<whatsapp_rust::Client>,
+    store: &oxidezap_chat_store::ChatStore,
+    explicit: Vec<Jid>,
+) -> Result<(Vec<Jid>, whatsapp_rust::features::StatusPrivacySetting), String> {
+    use whatsapp_rust::features::StatusPrivacySetting;
+
+    if !explicit.is_empty() {
+        return Ok((explicit, StatusPrivacySetting::AllowList));
+    }
+    let setting = client.status().audience();
+    let mode = setting
+        .as_ref()
+        .and_then(|action| action.mode.as_ref())
+        .map(|mode| mode.to_i32());
+    let listed: Vec<Jid> = setting
+        .as_ref()
+        .map(|action| {
+            action
+                .user_jid
+                .iter()
+                .filter_map(|jid| jid.parse::<Jid>().ok())
+                .filter(|jid| jid.is_pn() || jid.is_lid())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // The address book: people saved under a name, not everybody who ever
+    // messaged. Excludes the account itself.
+    let own = super::history::own_jids(client);
+    let book = || async {
+        store
+            .contacts(None, 100_000)
+            .await
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.full_name.is_some() || entry.first_name.is_some())
+                    .map(|entry| entry.jid)
+                    .filter(|jid| jid.is_pn() || jid.is_lid())
+                    .filter(|jid| !own.contains(&jid.to_non_ad_string()))
+                    .collect::<Vec<Jid>>()
+            })
+            .map_err(|e| format!("loading contacts failed: {e}"))
+    };
+
+    let (audience, privacy) = match mode {
+        // The phone's own default.
+        None | Some(2) => (book().await?, StatusPrivacySetting::Contacts),
+        Some(1) => {
+            let book = book().await?;
+            (
+                book.into_iter()
+                    .filter(|jid| !listed.iter().any(|excluded| excluded.user == jid.user))
+                    .collect(),
+                StatusPrivacySetting::DenyList,
+            )
+        }
+        // An allow list, close friends or a custom list: a fixed set of people.
+        Some(_) => (listed, StatusPrivacySetting::AllowList),
+    };
+    if audience.is_empty() {
+        return Err(
+            "there is nobody to share this status with: your status privacy setting selects no contacts"
+                .to_string(),
+        );
+    }
+    Ok((audience, privacy))
+}
+
 impl WhatsAppClient {
     /// Interrupt the library's current reconnect wait. Pause/resume wakes the
     /// running supervisor; it does not construct another bot or open a store.
@@ -393,7 +471,7 @@ impl WhatsAppClient {
         text: String,
         recipients: Vec<String>,
     ) -> Task<Result<(String, i64), String>> {
-        use whatsapp_rust::features::{StatusPrivacySetting, StatusSendOptions};
+        use whatsapp_rust::features::StatusSendOptions;
 
         let session = self.session.clone();
         self.exec.spawn(async move {
@@ -401,10 +479,7 @@ impl WhatsAppClient {
             if text.is_empty() {
                 return Err("status text must not be empty".to_string());
             }
-            if recipients.is_empty() {
-                return Err("choose at least one status recipient".to_string());
-            }
-            let recipients = recipients
+            let explicit = recipients
                 .iter()
                 .map(|jid| jid.parse::<Jid>())
                 .collect::<Result<Vec<_>, _>>()
@@ -412,6 +487,8 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let (recipients, privacy) =
+                status_audience(&live.client, &live.chat_store, explicit).await?;
             let jid = Jid::status_broadcast();
             let mut message = wa::Message::default();
             let mut body = wa::message::ExtendedTextMessage::default();
@@ -425,7 +502,7 @@ impl WhatsAppClient {
                 .send_raw(
                     message.clone(),
                     &recipients,
-                    StatusSendOptions::default().with_privacy(StatusPrivacySetting::AllowList),
+                    StatusSendOptions::default().with_privacy(privacy),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -460,7 +537,7 @@ impl WhatsAppClient {
         caption: Option<String>,
         recipients: Vec<String>,
     ) -> Task<Result<(String, i64), String>> {
-        use whatsapp_rust::features::{StatusPrivacySetting, StatusSendOptions};
+        use whatsapp_rust::features::StatusSendOptions;
 
         let session = self.session.clone();
         self.exec.spawn(async move {
@@ -482,10 +559,7 @@ impl WhatsAppClient {
                 file_name,
                 caption,
             };
-            if recipients.is_empty() {
-                return Err("choose at least one status recipient".to_string());
-            }
-            let recipients = recipients
+            let explicit = recipients
                 .iter()
                 .map(|jid| jid.parse::<Jid>())
                 .collect::<Result<Vec<_>, _>>()
@@ -493,6 +567,8 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let (recipients, privacy) =
+                status_audience(&live.client, &live.chat_store, explicit).await?;
             let (shape, mut file) =
                 match crate::exec::unblock(move || super::outgoing::prepare_for_send(file)).await {
                     Ok(Ok(prepared)) => prepared,
@@ -512,7 +588,7 @@ impl WhatsAppClient {
                 .send_raw(
                     message.clone(),
                     &recipients,
-                    StatusSendOptions::default().with_privacy(StatusPrivacySetting::AllowList),
+                    StatusSendOptions::default().with_privacy(privacy),
                 )
                 .await
                 .map_err(|e| e.to_string())?;

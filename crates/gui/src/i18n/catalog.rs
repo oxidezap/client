@@ -32,7 +32,7 @@ catalog! {
     Gifs => ("GIFs", "GIFs");
     AddStatus => ("Add status", "Adicionar status");
     WriteAStatus => ("Write a status", "Escreva um status");
-    ChooseStatusAudience => ("Only the contacts you select can see this status.", "Somente os contatos selecionados podem ver este status.");
+    ChooseStatusAudience => ("Shared with everyone your WhatsApp status privacy allows, usually all your contacts. Select people only to share with just them.", "Compartilhado com todos que a privacidade de status do WhatsApp permite, normalmente todos os seus contatos. Selecione pessoas apenas para compartilhar somente com elas.");
     StatusPublished => ("Status published", "Status publicado");
     NoStatusRecipientsFound => ("No matching chats", "Nenhuma conversa correspondente");
     StatusPosting => ("Posting…", "Publicando…");

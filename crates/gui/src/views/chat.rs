@@ -476,7 +476,6 @@ fn render_status_post(
                         })
                         .disabled(
                             !editable
-                                || post.recipients.is_empty()
                                 || (post.media.is_none()
                                     && post.text.read(cx).value().trim().is_empty()),
                         )
