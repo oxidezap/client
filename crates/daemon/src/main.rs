@@ -43,9 +43,10 @@ fn restore_default_signals() {
         let mut empty: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut empty);
         libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
-        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-            libc::signal(signal, libc::SIG_DFL);
-        }
+        // Only SIGTERM, which a daemon must always be able to be sent. SIGHUP
+        // and SIGINT are left as the spawner set them: `nohup`, a service
+        // manager or a background job may have ignored them on purpose.
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
     }
 }
 

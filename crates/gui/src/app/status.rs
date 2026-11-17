@@ -546,7 +546,12 @@ impl WhatsAppApp {
                                     | oxidezap_core::OutgoingMedia::Video
                             )
                         }) {
-                            let preview = (file.kind == oxidezap_core::OutgoingMedia::Image)
+                            // A still is a second copy of the picture, so only
+                            // a modest one is drawn; the file itself is sent
+                            // either way.
+                            const PREVIEW_LIMIT: usize = 16 * 1024 * 1024;
+                            let preview = (file.kind == oxidezap_core::OutgoingMedia::Image
+                                && file.bytes.len() <= PREVIEW_LIMIT)
                                 .then(|| crate::utils::mime_to_image_format(&file.mime_type))
                                 .flatten()
                                 .map(|format| {
@@ -621,7 +626,10 @@ impl WhatsAppApp {
         post.pending = true;
         let draft = post.text.downgrade();
         let recipients = post.recipients.iter().cloned().collect();
-        let result = match post.media.clone() {
+        // Moved, not cloned: the file can be tens of megabytes. A failed post
+        // therefore asks for the file again, which is cheaper than holding two
+        // copies of every draft.
+        let result = match post.media.take() {
             Some(media) => {
                 let crate::platform::picker::Picked {
                     file_name,

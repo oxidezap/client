@@ -22,6 +22,8 @@
 // /AGENTS.md); everything above it gets [`Link`] and never mentions any of
 // them.
 #[cfg(not(target_family = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
+pub mod background;
 pub mod client;
 mod endpoint;
 /// Where a frame ends, and how long one may be — the framing this crate

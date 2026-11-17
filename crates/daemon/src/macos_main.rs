@@ -17,29 +17,18 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use crate::tray::TrayHub;
 use crate::tray::macos::MacTray;
 
-/// Whether Settings → Advanced → Background is on. The front end owns that
-/// file (`platform::background`); this only reads it, and anything unreadable
-/// means off.
-fn keep_running_requested() -> bool {
-    let dir = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map(|home| std::path::PathBuf::from(home).join(".config"))
-        });
-    dir.map(|dir| dir.join("oxidezap").join("background.json"))
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|value| value.get("keep_running")?.as_bool())
-        .unwrap_or(false)
-}
-
 /// Make the tray match the setting: build it when the setting is on and there
 /// is none, drop it when the setting is off.
-fn settle_tray(tray: Option<MacTray>, hub: &Arc<TrayHub>) -> Option<MacTray> {
-    match (tray, keep_running_requested()) {
+///
+/// `gave_up` remembers a start that failed, so it is not retried (and logged)
+/// every second: the next attempt waits for the setting to turn off and on.
+fn settle_tray(tray: Option<MacTray>, hub: &Arc<TrayHub>, gave_up: &mut bool) -> Option<MacTray> {
+    let wanted = oxidezap_ipc::background::keep_running();
+    if !wanted {
+        *gave_up = false;
+    }
+    match (tray, wanted) {
+        (None, true) if *gave_up => None,
         (None, true) => match MacTray::start(hub) {
             Ok(tray) => {
                 log::info!("menu-bar icon on: the daemon is meant to outlive the window");
@@ -47,6 +36,7 @@ fn settle_tray(tray: Option<MacTray>, hub: &Arc<TrayHub>) -> Option<MacTray> {
             }
             Err(e) => {
                 log::warn!("no tray presence: {e}");
+                *gave_up = true;
                 None
             }
         },
@@ -81,7 +71,8 @@ pub fn run(runtime: tokio::runtime::Runtime, hub: Arc<TrayHub>) -> Result<()> {
     // the daemon too (the default), the icon would only ever be a second way
     // to do what the window already does, so it is drawn only when the person
     // asked for the background behaviour.
-    let mut tray = settle_tray(None, &hub);
+    let mut tray_failed = false;
+    let mut tray = settle_tray(None, &hub, &mut tray_failed);
 
     let worker = std::thread::Builder::new()
         .name("oxidezap-main".to_string())
@@ -112,7 +103,7 @@ pub fn run(runtime: tokio::runtime::Runtime, hub: Arc<TrayHub>) -> Result<()> {
         // it away: the icon exists exactly while the daemon is meant to stay.
         checks += 1;
         if checks.is_multiple_of(20) {
-            tray = settle_tray(tray, &hub);
+            tray = settle_tray(tray, &hub, &mut tray_failed);
         }
         if let Some(tray) = tray.as_mut() {
             tray.pump(&hub);

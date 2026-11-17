@@ -47,50 +47,16 @@ pub const fn is_configurable() -> bool {
 
 #[cfg(not(target_family = "wasm"))]
 mod imp {
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    use serde::{Deserialize, Serialize};
 
     static LEFT_FOR_TRAY: AtomicBool = AtomicBool::new(false);
 
-    #[derive(Default, Serialize, Deserialize)]
-    #[serde(default)]
-    struct File {
-        keep_running: bool,
-    }
-
-    /// Beside `theme.json`, which is where this front end keeps what a person
-    /// chose.
-    fn path() -> Option<PathBuf> {
-        let theme = crate::platform::prefs::location()?;
-        Some(PathBuf::from(theme).parent()?.join("background.json"))
-    }
-
     pub(super) fn keep_running() -> bool {
-        // Unreadable or absent is the default, and the default is to stop:
-        // a file that cannot be read must not leave a process nobody asked for.
-        path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|raw| serde_json::from_str::<File>(&raw).ok())
-            .is_some_and(|file| file.keep_running)
+        oxidezap_ipc::background::keep_running()
     }
 
     pub(super) fn set_keep_running(keep: bool) -> Result<(), String> {
-        let path = path().ok_or_else(|| "no config directory to keep that in".to_string())?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| "the settings path has no directory".to_string())?;
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let raw = serde_json::to_string_pretty(&File { keep_running: keep })
-            .map_err(|e| e.to_string())?;
-        let temp = path.with_extension(format!("tmp{}", std::process::id()));
-        std::fs::write(&temp, raw)
-            .map_err(|e| format!("could not write {}: {e}", temp.display()))?;
-        std::fs::rename(&temp, &path).map_err(|e| {
-            let _ = std::fs::remove_file(&temp);
-            format!("could not replace {}: {e}", path.display())
-        })
+        oxidezap_ipc::background::set_keep_running(keep)
     }
 
     pub(super) fn left_for_tray() {

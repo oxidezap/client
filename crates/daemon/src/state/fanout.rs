@@ -278,6 +278,10 @@ impl Fanout {
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(super) fn window_count(&self) -> usize {
+        self.windows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(super) fn windows_attached(&self) -> bool {
         self.windows.load(std::sync::atomic::Ordering::Relaxed) > 0
     }

@@ -140,11 +140,15 @@ pub fn render_hover_actions(
     let has_text = !content.is_empty();
 
     let action = |id: SharedString, icon: Icon, tip: &'static str| {
-        use gpui::InteractiveElement as _;
-        let selector = id.to_string();
-        parts::icon_button(id, icon, tip, metrics.icon_button())
-            .xsmall()
-            .debug_selector(move || selector.clone())
+        let button = parts::icon_button(id.clone(), icon, tip, metrics.icon_button()).xsmall();
+        // A test finds the buttons by id; the allocation is not paid by a
+        // build that has no test to find them.
+        #[cfg(test)]
+        let button = {
+            use gpui::InteractiveElement as _;
+            button.debug_selector(move || id.to_string())
+        };
+        button
     };
 
     div()

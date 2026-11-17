@@ -1758,7 +1758,7 @@ impl SessionHandle {
     /// Written before it returns and not waited on, because the one caller is
     /// a window that is closing and will not be there for the answer.
     pub fn shutdown_daemon(&self) {
-        self.tell(ClientRequest::Shutdown);
+        self.tell(ClientRequest::ShutdownUnlessOtherWindows);
     }
 
     /// Put a `.wasm` somebody chose into the daemon's plugin folder.

@@ -660,6 +660,7 @@ impl ClientRequest {
                 | Self::RemovePlugin { .. }
                 | Self::ListInstalledPlugins
                 | Self::Shutdown
+                | Self::ShutdownUnlessOtherWindows
         )
     }
 
@@ -1312,6 +1313,11 @@ pub enum ClientRequest {
     ListInstalledPlugins,
     /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,
+    /// What a closing window asks: stop the daemon unless another window is
+    /// still attached. The caller is itself one of the windows counted, so
+    /// the daemon stops only when that is one or none. Control-scoped, like
+    /// [`Shutdown`](Self::Shutdown), and answered the same way either way.
+    ShutdownUnlessOtherWindows,
     /// Demand avatar profile pictures for visible rows and overscan.
     EnsureAvatars(EnsureAvatars),
 }
@@ -2109,6 +2115,10 @@ mod tests {
                     quoted: None,
                 })),
                 r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-2","kind":"document","mime_type":"application/pdf","file_name":"nota.pdf","local_id":null}"#.to_string(),
+            ),
+            (
+                ClientRequest::ShutdownUnlessOtherWindows,
+                r#"{"request":"shutdown_unless_other_windows"}"#.to_string(),
             ),
             (
                 ClientRequest::PublishStatusMedia(Box::new(PublishStatusMedia {

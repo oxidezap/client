@@ -608,6 +608,9 @@ pub(super) async fn handle_request(
         | ClientRequest::RemoveAccount { .. } => acted(Err(ProtocolError::Refused {
             detail: "control requests require a control-scoped connection".to_string(),
         })),
+        ClientRequest::ShutdownUnlessOtherWindows => acted(Err(ProtocolError::Refused {
+            detail: "control requests require a control-scoped connection".to_string(),
+        })),
         ClientRequest::Shutdown => Answer {
             frame: answer(id, Ok(())),
             shutdown: true,

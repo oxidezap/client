@@ -321,6 +321,11 @@ impl StateHub {
         self.out.windows_attached()
     }
 
+    /// How many windows have said so in their hello, for this account.
+    pub fn window_count(&self) -> usize {
+        self.out.window_count()
+    }
+
     /// Record a change and publish it.
     ///
     /// Returns the version it produced. The state lock covers the mutation and

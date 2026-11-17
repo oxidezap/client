@@ -147,9 +147,11 @@ async fn status_audience(
         return Ok((explicit, StatusPrivacySetting::AllowList));
     }
     let setting = client.status().audience();
+    // `mode` is the current one; `modes` is the newer repeated form a newer
+    // phone may have written instead.
     let mode = setting
         .as_ref()
-        .and_then(|action| action.mode.as_ref())
+        .and_then(|action| action.mode.as_ref().or_else(|| action.modes.first()))
         .map(|mode| mode.to_i32());
     let listed: Vec<Jid> = setting
         .as_ref()
@@ -191,20 +193,41 @@ async fn status_audience(
             // phone number and the same person excluded under a LID share no
             // digits, and comparing the raw users would send the status to
             // someone the account said not to.
-            let mut excluded = std::collections::HashSet::new();
-            for jid in &listed {
-                excluded.insert(person_key(client, jid).await);
-            }
-            let mut audience = Vec::with_capacity(book.len());
-            for jid in book {
-                if !excluded.contains(&person_key(client, &jid).await) {
-                    audience.push(jid);
-                }
-            }
+            use futures_util::StreamExt as _;
+            // Sixteen at a time, as the library resolves a status audience:
+            // each lookup can be a cache-miss read.
+            const LOOKUPS: usize = 16;
+            let excluded: std::collections::HashSet<String> =
+                futures_util::stream::iter(listed.iter().cloned())
+                    .map(|jid| async move { person_key(client, &jid).await })
+                    .buffer_unordered(LOOKUPS)
+                    .collect()
+                    .await;
+            let keyed: Vec<(Jid, String)> = futures_util::stream::iter(book)
+                .map(|jid| async move {
+                    let key = person_key(client, &jid).await;
+                    (jid, key)
+                })
+                .buffer_unordered(LOOKUPS)
+                .collect()
+                .await;
+            let audience = keyed
+                .into_iter()
+                .filter(|(_, key)| !excluded.contains(key))
+                .map(|(jid, _)| jid)
+                .collect();
             (audience, StatusPrivacySetting::DenyList)
         }
-        // An allow list, close friends or a custom list: a fixed set of people.
-        Some(_) => (listed, StatusPrivacySetting::AllowList),
+        Some(0) => (listed, StatusPrivacySetting::AllowList),
+        // Close friends and custom lists are kept under names this client does
+        // not read. Refused rather than guessed at as an allow list, which
+        // would post to nobody or to the wrong people.
+        Some(_) => {
+            return Err(
+                "your status privacy uses a close-friends or custom list this app cannot read yet; choose people explicitly to share"
+                    .to_string(),
+            );
+        }
     };
     if audience.is_empty() {
         return Err(
@@ -569,6 +592,16 @@ impl WhatsAppClient {
             ) {
                 return Err("a status can be text, a photo or a video".to_string());
             }
+            let explicit = recipients
+                .iter()
+                .map(|jid| jid.parse::<Jid>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "invalid status recipient".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let (recipients, privacy) =
+                status_audience(&live.client, &live.chat_store, explicit).await?;
             let data = match crate::exec::unblock(take).await {
                 Ok(Some(data)) if !data.is_empty() => data,
                 Ok(_) => return Err("nothing staged for that status; stage it first".to_string()),
@@ -581,16 +614,6 @@ impl WhatsAppClient {
                 file_name,
                 caption,
             };
-            let explicit = recipients
-                .iter()
-                .map(|jid| jid.parse::<Jid>())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| "invalid status recipient".to_string())?;
-            let Some(live) = session.lock().await.clone() else {
-                return Err("no session yet".to_string());
-            };
-            let (recipients, privacy) =
-                status_audience(&live.client, &live.chat_store, explicit).await?;
             let (shape, mut file) =
                 match crate::exec::unblock(move || super::outgoing::prepare_for_send(file)).await {
                     Ok(Ok(prepared)) => prepared,
