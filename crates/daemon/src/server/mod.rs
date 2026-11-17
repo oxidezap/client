@@ -785,24 +785,12 @@ where
                             crate::shutdown::request("ipc client");
                             return Ok(());
                         }
-                        // A window going away stops the daemon only if it was
-                        // the last one: the CLI, a second window or the web
-                        // bridge may be using it. The caller counts as one.
+                        // A window going away stops the daemon once no window is
+                        // left: a second window, or one opened since, keeps it.
+                        // See `stop_when_no_windows`.
                         ClientRequest::ShutdownUnlessOtherWindows => {
-                            let windows: usize = registry
-                                .runtimes()
-                                .into_iter()
-                                .map(|runtime| runtime.hub().window_count())
-                                .sum();
-                            if windows > 1 {
-                                Some(answer_shutdown(id)?)
-                            } else {
-                                // Honoured whether or not the answer can be
-                                // written: the window is closing as it asks.
-                                let _ = write_line(&mut writer, &answer_shutdown(id)?).await;
-                                crate::shutdown::request("last window closed");
-                                return Ok(());
-                            }
+                            crate::state::stop_when_no_windows();
+                            Some(answer_shutdown(id)?)
                         }
                         // The log level is the process's, not an account's:
                         // one daemon logs once, so a control connection is

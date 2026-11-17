@@ -20,6 +20,7 @@
 //! loop in `main`.
 
 mod fanout;
+pub(crate) use fanout::stop_when_no_windows;
 mod store;
 
 use std::sync::Arc;
@@ -319,11 +320,6 @@ impl StateHub {
     /// can observe distinguishes a window from any other subscriber.
     pub fn windows_attached(&self) -> bool {
         self.out.windows_attached()
-    }
-
-    /// How many windows have said so in their hello, for this account.
-    pub fn window_count(&self) -> usize {
-        self.out.window_count()
     }
 
     /// Record a change and publish it.

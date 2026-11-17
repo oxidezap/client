@@ -136,7 +136,7 @@ fn main() -> Result<()> {
         // one that never returns (a plugin thread, a device open) would keep
         // the process alive past the teardown deadline above.
         runtime.shutdown_timeout(RUNTIME_SHUTDOWN_DEADLINE);
-        return outcome;
+        outcome
     }
 }
 

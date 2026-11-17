@@ -271,15 +271,19 @@ impl Fanout {
     pub(super) fn attach_window(&self) {
         self.windows
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ALL_WINDOWS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // A window opening is somebody still using the daemon: whatever an
+        // earlier window asked on its way out no longer applies.
+        STOP_WHEN_NO_WINDOWS.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(super) fn detach_window(&self) {
         self.windows
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(super) fn window_count(&self) -> usize {
-        self.windows.load(std::sync::atomic::Ordering::Relaxed)
+        let was = ALL_WINDOWS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if was == 1 && STOP_WHEN_NO_WINDOWS.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::shutdown::request("last window closed");
+        }
     }
 
     pub(super) fn windows_attached(&self) -> bool {
@@ -327,6 +331,27 @@ impl Claim<'_> {
                 true
             }
         });
+    }
+}
+
+/// Windows attached across every account, because a window is global even
+/// though ownership is counted per account.
+static ALL_WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A closing window asked for the daemon to stop once no window is left.
+static STOP_WHEN_NO_WINDOWS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What a window going away asks: stop the daemon when no window remains.
+///
+/// A request rather than a count taken now, because the window is closing as
+/// it asks and its own connection may already be gone: a count would see
+/// either one window too many or one too few. Recorded, then checked, and the
+/// detach checks it too, so whichever of the two happens last decides.
+pub(crate) fn stop_when_no_windows() {
+    STOP_WHEN_NO_WINDOWS.store(true, std::sync::atomic::Ordering::SeqCst);
+    if ALL_WINDOWS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        crate::shutdown::request("last window closed");
     }
 }
 
