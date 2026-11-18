@@ -23,6 +23,7 @@ use super::{Task, WhatsAppClient};
 struct Entry {
     timestamp: i64,
     lottie: bool,
+    animated: Option<bool>,
     media: Option<DownloadableMedia>,
 }
 
@@ -96,18 +97,38 @@ impl EventHandler for StickerSync {
                 .get(&update.filehash)
                 .is_some_and(|entry| entry.lottie)
         });
+        let animated = entries
+            .get(&update.filehash)
+            .filter(|entry| media.is_some() && entry.media == media && entry.lottie == lottie)
+            .and_then(|entry| entry.animated);
         entries.insert(
             update.filehash.clone(),
             Entry {
                 timestamp,
                 media,
                 lottie,
+                animated,
             },
         );
     }
 }
 
 impl StickerSync {
+    pub(super) fn remember_animation(&self, id: &str, encrypted_hash: &[u8], animated: bool) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = entries.get_mut(id)
+            && entry
+                .media
+                .as_ref()
+                .is_some_and(|media| media.file_enc_sha256 == encrypted_hash)
+        {
+            entry.animated = Some(animated);
+        }
+    }
+
     pub(super) fn message(&self, id: &str) -> Option<wa::Message> {
         let entries = self
             .entries
@@ -121,6 +142,7 @@ impl StickerSync {
         sticker.file_sha256 = Some(media.file_sha256.clone());
         sticker.file_enc_sha256 = Some(media.file_enc_sha256.clone());
         sticker.file_length = (media.file_length != 0).then_some(media.file_length);
+        sticker.is_animated = entry.animated;
         sticker.mimetype = Some(media.mime_type.clone());
         let mut message = wa::Message::default();
         if entry.lottie {
@@ -256,6 +278,17 @@ mod tests {
         let message = sync.message(&hash).expect("synced favorite");
         let sticker = message.sticker_message.as_option().unwrap();
         assert_eq!(sticker.file_sha256.as_deref(), Some([3; 32].as_slice()));
+        sync.remember_animation(&hash, &[9; 32], true);
+        assert_eq!(
+            sync.message(&hash).unwrap().sticker_message.is_animated,
+            None
+        );
+        sync.remember_animation(&hash, &[7; 32], true);
+        sync.handle_event(event(true, 1_700_000_000_000));
+        assert_eq!(
+            sync.message(&hash).unwrap().sticker_message.is_animated,
+            Some(true)
+        );
         sync.handle_event(event(false, 1_700_000_000_001));
         sync.handle_event(event(true, 1_700_000_000_000));
         assert!(sync.message(&hash).is_none());

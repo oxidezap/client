@@ -447,12 +447,17 @@ impl WhatsAppClient {
             let client = &live.client;
             if source_chat_jid.is_none()
                 && let Some(sticker) = message.sticker_message.as_option_mut()
-            {
-                let bytes = client
+                && sticker.is_animated.is_none()
+                && let Ok(bytes) = client
                     .download(sticker, whatsapp_rust::download::DownloadLimits::default())
                     .await
-                    .map_err(|error| error.to_string())?;
-                sticker.is_animated = Some(super::outgoing::image_has_animation(&bytes)?);
+                && let Ok(animated) = super::outgoing::image_has_animation(&bytes)
+            {
+                if let Some(hash) = &sticker.file_enc_sha256 {
+                    live.stickers
+                        .remember_animation(&message_id, hash, animated);
+                }
+                sticker.is_animated = Some(animated);
             }
             let id = client.generate_message_id();
             super::record_outgoing(
