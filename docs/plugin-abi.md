@@ -106,8 +106,10 @@ plugin's whole published tree.
 `oxi_kv_set_durable` applies the same limits as `oxi_kv_set`. It returns
 `ACCEPTED` only after the backing store acknowledges the write. It refuses
 writes without persistent storage, during the normal one-second storage
-write interval, or when the backing write fails. A refused change is not
-queued. Use it before an external action that must not be replayed on restart.
+write interval, or when the backing write fails before replacing the entry.
+A refused change is not queued. If replacement succeeded but the backing
+store could not confirm persistence, it returns `UNCONFIRMED` and keeps
+the new value visible. Use it before an external action that must not be replayed on restart.
 Modules importing it need a host that provides this import.
 
 `oxi_now_ms` is the only clock: Unix milliseconds, which is the resolution a
@@ -125,6 +127,7 @@ call's fuel, so nothing here is a promise about timing side channels.
 | `-2` | `REFUSED` | The daemon will not do this as asked. |
 | `-3` | `DENIED` | The plugin did not declare this capability, or the user has not agreed to it. |
 | `-4` | `INVALID` | A pointer outside memory, bytes that are not UTF-8, a length past what the host accepts. |
+| `-6` | `UNCONFIRMED` | The store replaced the value but could not confirm persistence. |
 | `-5` | `STATE` | Right call, wrong moment — declaring outside `oxi_init`, or acting inside it. |
 
 `-1` is also `ABSENT` for the field reads, where there is no outcome to

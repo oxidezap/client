@@ -69,10 +69,12 @@ fn save(queue: &Queue, durable: bool) -> Result<(), &'static str> {
     } else {
         oxidezap_plugin::set(STORE, &raw)
     };
-    if outcome == Outcome::Accepted {
-        Ok(())
-    } else {
-        Err("The schedule could not be saved. Try again in a moment.")
+    match outcome {
+        Outcome::Accepted => Ok(()),
+        Outcome::Unconfirmed => Err(
+            "The schedule changed, but storage could not confirm the write. Check the list before retrying.",
+        ),
+        _ => Err("The schedule could not be saved. Try again in a moment."),
     }
 }
 
@@ -171,7 +173,7 @@ fn tick(queue: &mut Queue) -> Result<bool, &'static str> {
         Outcome::NoSession | Outcome::Denied | Outcome::Refused => {
             queue.jobs[index].attempting = false;
         }
-        Outcome::Invalid | Outcome::State => return Ok(true),
+        Outcome::Invalid | Outcome::State | Outcome::Unconfirmed => return Ok(true),
     }
     save(queue, false)?;
     Ok(true)
@@ -184,7 +186,7 @@ fn handle(event: &Event) {
             let mut proposed = queue.clone();
             match proposed.as_mut().map(|queue| edit_queue(action, queue)) {
                 Ok(Ok(status)) => draw(&proposed, status),
-                Ok(Err(error)) => draw(&queue, error),
+                Ok(Err(error)) => draw(&read_queue(), error),
                 Err(error) => draw(&queue, error),
             }
         }
@@ -217,6 +219,9 @@ fn draw(queue: &Result<Queue, &'static str>, notice: &str) {
             }
         });
         ui.section(ui::slot::SETTINGS, "Scheduled messages", |section| {
+            if !notice.is_empty() {
+                section.label(notice);
+            }
             let queue = match queue {
                 Ok(queue) => queue,
                 Err(error) => {

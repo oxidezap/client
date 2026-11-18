@@ -275,6 +275,8 @@ pub enum Outcome {
     /// [`Invalid`]: Self::Invalid
     /// [`Denied`]: Self::Denied
     State,
+    /// The entry changed, but its persistence could not be confirmed.
+    Unconfirmed,
 }
 
 impl Outcome {
@@ -285,6 +287,7 @@ impl Outcome {
             abi::outcome::DENIED => Self::Denied,
             abi::outcome::REFUSED => Self::Refused,
             abi::outcome::STATE => Self::State,
+            abi::outcome::UNCONFIRMED => Self::Unconfirmed,
             _ => Self::Invalid,
         }
     }
@@ -1209,7 +1212,7 @@ pub fn set(key: &str, value: &str) -> Outcome {
 
 /// Store a value and wait for the backing store to accept the write.
 ///
-/// Shares the normal storage write limit. A refused change is not queued.
+/// Shares the normal storage write limit. A refused change is not queued. An unconfirmed change is visible in memory.
 pub fn set_durable(key: &str, value: &str) -> Outcome {
     Outcome::of(unsafe {
         raw::kv_set_durable(

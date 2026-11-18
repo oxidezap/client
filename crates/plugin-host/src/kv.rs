@@ -14,7 +14,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::store::Backing;
+use crate::store::{Backing, ReplaceError};
+use oxidezap_plugin_abi::outcome;
 
 /// How much one plugin may keep.
 ///
@@ -180,23 +181,24 @@ impl Kv {
     }
 
     /// Replace one entry and acknowledge only after the backing store writes it.
-    pub fn set_durable(&mut self, key: &str, value: &str) -> bool {
+    pub fn set_durable(&mut self, key: &str, value: &str) -> i32 {
         if !self.store.keeps_answers()
             || self
                 .wrote_at
                 .is_some_and(|at| at.elapsed() < MIN_WRITE_INTERVAL)
         {
-            return false;
+            return outcome::REFUSED;
         }
         let previous = self.entries.get(key).cloned();
         let dirty = self.dirty;
         let bytes = self.bytes;
         if !self.set(key, value) {
-            return false;
+            return outcome::REFUSED;
         }
-        self.write_out();
-        if !self.dirty {
-            return true;
+        match self.write_out() {
+            Ok(()) => return outcome::ACCEPTED,
+            Err(ReplaceError::Unconfirmed(_)) => return outcome::UNCONFIRMED,
+            Err(ReplaceError::Unchanged(_)) => {}
         }
 
         // A failed write must not turn into a delayed commit of a rejected change.
@@ -207,7 +209,7 @@ impl Kv {
         }
         self.dirty = dirty;
         self.bytes = bytes;
-        false
+        outcome::REFUSED
     }
 
     /// Write out whatever the call changed, if it changed anything.
@@ -225,7 +227,7 @@ impl Kv {
         {
             return;
         }
-        self.write_out();
+        let _ = self.write_out();
     }
 
     /// When the pending change may be written, if there is one.
@@ -251,18 +253,17 @@ impl Kv {
     /// For the one place where there is no next commit: a plugin that is
     /// stopping. Everything else goes through [`commit`](Self::commit).
     pub fn flush_pending(&mut self) {
-        self.write_out();
+        let _ = self.write_out();
     }
 
-    fn write_out(&mut self) {
-        if self.dirty {
-            // Cleared only by a write that landed. Taking the flag first
-            // meant a full disk lost the change silently: the map held it,
-            // nothing was dirty any more, and the next restart read back the
-            // older file.
-            self.dirty = !self.flush();
-            self.wrote_at = Some(wacore::time::Instant::now());
+    fn write_out(&mut self) -> Result<(), ReplaceError> {
+        if !self.dirty {
+            return Ok(());
         }
+        let result = self.flush();
+        self.dirty = result.is_err();
+        self.wrote_at = Some(wacore::time::Instant::now());
+        result
     }
 
     /// What the entries weigh, computed once when the store is opened.
@@ -280,27 +281,22 @@ impl Kv {
     /// Answers whether what is held is now stored. `true` for a memory-only
     /// store: there is nothing it could fail to write, so nothing stays
     /// pending.
-    fn flush(&mut self) -> bool {
-        let Ok(json) = serde_json::to_vec(&self.entries) else {
-            return false;
-        };
-        match self.store.write(&self.name, &json) {
-            Ok(()) => {
-                self.complained = false;
-                true
+    fn flush(&mut self) -> Result<(), ReplaceError> {
+        let json = serde_json::to_vec(&self.entries)
+            .map_err(|error| ReplaceError::Unchanged(error.to_string()))?;
+        let result = self.store.replace(&self.name, &json);
+        if let Err(error) = &result {
+            if !self.complained {
+                self.complained = true;
+                log::warn!(
+                    "cannot confirm write to {}: {error:?}",
+                    self.store.describe(&self.name)
+                );
             }
-            Err(e) => {
-                if !self.complained {
-                    self.complained = true;
-                    log::warn!(
-                        "cannot write {}: {e}. This plugin's settings will not survive a \
-                         restart.",
-                        self.store.describe(&self.name)
-                    );
-                }
-                false
-            }
+        } else {
+            self.complained = false;
         }
+        result
     }
 }
 
@@ -428,22 +424,60 @@ mod tests {
     fn durable_writes_acknowledge_persistence_and_refusals_preserve_the_entry() {
         let dir = TempDir::new("durable");
         let mut kv = Kv::open(files(&dir.0), "p");
-        assert!(kv.set_durable("k", "committed"));
+        assert_eq!(kv.set_durable("k", "committed"), outcome::ACCEPTED);
         assert_eq!(Kv::open(files(&dir.0), "p").get("k"), Some("committed"));
-        assert!(!kv.set_durable("k", "too soon"));
+        assert_eq!(kv.set_durable("k", "too soon"), outcome::REFUSED);
         assert_eq!(kv.get("k"), Some("committed"));
 
         let blocked = dir.0.join("blocked");
         std::fs::write(&blocked, "").unwrap();
         let mut kv = Kv::open(files(&blocked), "p");
         assert!(kv.set("k", "buffered"));
-        assert!(!kv.set_durable("k", "write failed"));
+        assert_eq!(kv.set_durable("k", "write failed"), outcome::REFUSED);
         assert_eq!(kv.get("k"), Some("buffered"));
         assert!(kv.due_at().is_some());
 
         let mut memory_only = Kv::open(Arc::new(crate::store::Nowhere), "p");
-        assert!(!memory_only.set_durable("k", "no backing store"));
+        assert_eq!(
+            memory_only.set_durable("k", "no backing store"),
+            outcome::REFUSED
+        );
         assert_eq!(memory_only.get("k"), None);
+    }
+
+    #[test]
+    fn a_replacement_with_unconfirmed_persistence_remains_visible() {
+        struct Unsynced(Files);
+
+        impl Backing for Unsynced {
+            fn read(&self, name: &str, max: usize) -> Option<Vec<u8>> {
+                self.0.read(name, max)
+            }
+
+            fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+                self.0.write(name, bytes)
+            }
+
+            fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), ReplaceError> {
+                self.write(name, bytes).map_err(ReplaceError::Unchanged)?;
+                Err(ReplaceError::Unconfirmed("directory sync failed".into()))
+            }
+
+            fn remove(&self, name: &str) -> Result<(), String> {
+                self.0.remove(name)
+            }
+
+            fn describe(&self, name: &str) -> String {
+                self.0.describe(name)
+            }
+        }
+
+        let dir = TempDir::new("unconfirmed");
+        let mut kv = Kv::open(Arc::new(Unsynced(Files::at(&dir.0))), "p");
+        assert_eq!(kv.set_durable("k", "replacement"), outcome::UNCONFIRMED);
+        assert_eq!(kv.get("k"), Some("replacement"));
+        assert_eq!(Kv::open(files(&dir.0), "p").get("k"), kv.get("k"));
+        assert!(kv.due_at().is_some());
     }
 
     #[test]

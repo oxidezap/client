@@ -55,7 +55,7 @@ pub use registry::Sink;
 pub use store::Files;
 #[cfg(target_family = "wasm")]
 pub use store::Origin;
-pub use store::{Backing, Nowhere};
+pub use store::{Backing, Nowhere, ReplaceError};
 
 // What the store beside it asks of the filesystem: whether a file is one
 // another local account could have written, and how a write and a rename

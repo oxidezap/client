@@ -981,12 +981,9 @@ fn link_acting(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                     Err(code) => return code,
                 };
                 let kv = &mut c.data_mut().kv;
-                let stored = if durable {
+                if durable {
                     kv.set_durable(&key, &value)
-                } else {
-                    kv.set(&key, &value)
-                };
-                if stored {
+                } else if kv.set(&key, &value) {
                     abi::outcome::ACCEPTED
                 } else {
                     abi::outcome::REFUSED

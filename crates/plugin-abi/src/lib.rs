@@ -493,6 +493,7 @@ pub mod outcome {
     /// Called at a moment this is not allowed — a declaration outside
     /// `oxi_init`.
     pub const STATE: i32 = -5;
+    pub const UNCONFIRMED: i32 = -6;
 }
 
 /// A string field that is not there at all, distinct from one that is present
