@@ -1,0 +1,29 @@
+[package]
+name = "schedule"
+description = "Schedule text messages from the OxideZap composer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100.0"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oxidezap-plugin = { path = "../../crates/plugin-sdk" }
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+oxidezap-plugin = { path = "../../crates/plugin-sdk", features = ["testing"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
