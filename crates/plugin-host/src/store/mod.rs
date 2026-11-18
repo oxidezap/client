@@ -53,6 +53,10 @@ pub trait Backing: Send + Sync + 'static {
     /// writes about it.
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String>;
 
+    /// Like `write`, preserving whether failure happened before replacement
+    /// or while confirming a replacement already visible to readers.
+    ///
+    /// Backends that can fail after replacement must override this method.
     fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), ReplaceError> {
         self.write(name, bytes).map_err(ReplaceError::Unchanged)
     }

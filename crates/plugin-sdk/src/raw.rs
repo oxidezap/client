@@ -207,7 +207,7 @@ mod off_target {
         val: super::Ptr,
         val_len: i32,
     ) -> i32 {
-        testing::kv_set(unsafe { borrow(key, key_len) }, unsafe {
+        testing::kv_set_durable(unsafe { borrow(key, key_len) }, unsafe {
             borrow(val, val_len)
         })
     }

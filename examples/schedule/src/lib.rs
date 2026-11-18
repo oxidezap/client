@@ -164,7 +164,13 @@ fn tick(queue: &mut Queue) -> Result<bool, &'static str> {
     };
     // A restart between this write and the send cannot replay an uncertain send.
     queue.jobs[index].attempting = true;
-    save(queue, true)?;
+    if let Err(error) = save(queue, true) {
+        // No send was attempted. Undo a marker that may have replaced the
+        // file so a later timer can try again.
+        queue.jobs[index].attempting = false;
+        save(queue, false)?;
+        return Err(error);
+    }
     let job = &queue.jobs[index];
     match oxidezap_plugin::send_text(&job.jid, &job.text) {
         Outcome::Accepted => {
@@ -304,6 +310,21 @@ mod tests {
         host.set_now_ms(60_000);
         host.deliver(In::timer(TICK), handle);
         assert!(host.sent().is_empty());
+    }
+
+    #[test]
+    fn an_unconfirmed_marker_is_retried_without_sending_early() {
+        let mut host = Host::new();
+        host.init(setup);
+        schedule(&mut host, CHAT, "1");
+        host.set_now_ms(60_000);
+        host.unconfirm_next_durable_write();
+        host.deliver(In::timer(TICK), handle);
+        assert!(host.sent().is_empty());
+        let stored: Queue = serde_json::from_str(&host.stored(STORE).unwrap()).unwrap();
+        assert!(!stored.jobs[0].attempting);
+        host.deliver(In::timer(TICK), handle);
+        assert_eq!(host.sent().len(), 1);
     }
 
     #[test]

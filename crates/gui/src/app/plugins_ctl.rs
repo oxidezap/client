@@ -6,7 +6,7 @@
 //! which needs somewhere to hold what is being typed before anybody commits
 //! it — and that is what this file is.
 
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gpui_component::input::{InputEvent, InputState};
@@ -58,6 +58,7 @@ impl PluginField {
 /// oversized setting would disconnect the window. A plugin setting is a
 /// keyword or a sentence; anything of this size is a mistake either way.
 const MAX_FIELD_BYTES: usize = 64 * 1024;
+const MAX_INACTIVE_COMPOSER_FIELDS: usize = 64;
 
 /// A field's address. Two plugins may both call a widget `keyword`, and one
 /// plugin may draw the same id in two slots.
@@ -72,8 +73,8 @@ const MAX_FIELD_BYTES: usize = 64 * 1024;
 /// selection when Enter is pressed, so a box shared across chats would take
 /// what somebody typed in one and commit it carrying the other's JID — a
 /// plugin storing or sending it for the wrong conversation. Switching chats
-/// therefore drops what was half-typed in the old one, which is the honest
-/// trade: the alternative is not a preserved draft, it is a misdirected one.
+/// drops legacy header fields. Composer drafts stay keyed to their own chat
+/// until the plugin removes the field, the account changes, or the cache fills.
 ///
 /// Which is why the *same* answer `send_plugin_action` gives is taken here
 /// rather than the selection itself: a Settings action carries no chat, so
@@ -289,14 +290,39 @@ impl Plugins {
             }
         }
 
-        // Gone means gone: a plugin that stopped drawing a field has taken it
-        // back, and holding the entity would keep a subscription alive that
-        // fires into a widget nobody can see.
         let live: std::collections::HashSet<FieldKey> = wanted
             .iter()
             .map(|f| key(&f.plugin, f.slot, chat, &f.id))
             .collect();
-        self.fields.retain(|k, _| live.contains(k));
+        let composers: std::collections::HashSet<_> = wanted
+            .iter()
+            .filter(|f| f.slot == PluginSlot::Composer)
+            .map(|f| (f.plugin.as_str(), f.id.as_str()))
+            .collect();
+        let mut inactive = 0;
+        self.fields.retain(|key, field| {
+            if live.contains(key) {
+                return true;
+            }
+            if key.slot != PluginSlot::Composer
+                || !composers.contains(&(key.plugin.as_str(), key.id.as_str()))
+            {
+                return false;
+            }
+            let typed = field.state.read(cx).value();
+            let keep = typed.len() <= MAX_FIELD_BYTES && typed.as_ref() != field.published;
+            inactive += usize::from(keep);
+            keep
+        });
+        let mut excess = inactive.saturating_sub(MAX_INACTIVE_COMPOSER_FIELDS);
+        self.fields.retain(|key, _| {
+            if excess == 0 || live.contains(key) {
+                true
+            } else {
+                excess -= 1;
+                false
+            }
+        });
 
         // What is left is what has no box yet. The ones that do are brought
         // up to date here, and only when the *plugin* moved them: a tree
@@ -706,7 +732,7 @@ impl WhatsAppApp {
         cx.notify();
     }
 
-    fn composer_form(&self, plugin: &str, cx: &App) -> Option<String> {
+    fn composer_form(&self, plugin: &str, chat: &str, cx: &App) -> Option<String> {
         let surface = self
             .plugins(cx)
             .iter()
@@ -716,7 +742,8 @@ impl WhatsAppApp {
             collect_fields(plugin, PluginSlot::Composer, node, &mut fields);
         }
         let mut values = std::collections::BTreeMap::new();
-        let mut remaining = MAX_FIELD_BYTES;
+        let limit = MAX_FIELD_BYTES.checked_sub(chat.len())?;
+        let mut remaining = limit;
         for field in fields {
             let value = self
                 .plugin_field(plugin, PluginSlot::Composer, &field.id, cx)?
@@ -727,7 +754,7 @@ impl WhatsAppApp {
         }
         serde_json::to_string(&values)
             .ok()
-            .filter(|value| value.len() <= MAX_FIELD_BYTES)
+            .filter(|value| value.len() <= limit)
     }
 
     /// Tell a plugin one of its widgets was used.
@@ -751,7 +778,10 @@ impl WhatsAppApp {
             PluginSlot::Settings => None,
         };
         let value = if slot == PluginSlot::Composer && widget == PluginWidget::Button {
-            let Some(form) = self.composer_form(plugin, cx) else {
+            let Some(form) = chat
+                .as_deref()
+                .and_then(|chat| self.composer_form(plugin, chat, cx))
+            else {
                 self.notify_user(
                     crate::tr!(ComposerPluginFormUnavailable),
                     super::notices::Tone::Problem,
@@ -799,7 +829,7 @@ fn collect_fields(plugin: &str, slot: PluginSlot, node: &PluginNode, out: &mut V
 }
 
 /// The boxes, keyed by what names each one.
-type PluginFields = HashMap<FieldKey, PluginField>;
+type PluginFields = IndexMap<FieldKey, PluginField>;
 
 #[cfg(test)]
 mod tests {
