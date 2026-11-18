@@ -197,6 +197,9 @@ rm -rf "$XDG_DATA_HOME"
 # 6. External AppImage integrator: if another .desktop file in $XDG_DATA_HOME/applications
 #    already launches this AppImage (e.g. AppImageLauncher's appimagekit-*.desktop), AppRun removes
 #    its own duplicate .desktop entry while keeping the hicolor icons installed.
+unreadable="$XDG_DATA_HOME/applications/00-unreadable.desktop"
+printf '[Desktop Entry]\nExec=/bin/false\n' >"$unreadable"
+chmod a-r "$unreadable"
 ext_desktop="$XDG_DATA_HOME/applications/appimagekit-oxidezap.desktop"
 printf '[Desktop Entry]\nType=Application\nName=OxideZap\nExec="%s"\nIcon=%s\n' "$(readlink -f "$APPIMAGE")" "$APP_ID" >"$ext_desktop"
 "$APPDIR/AppRun" >/dev/null || fail "launch with external integrator desktop entry exited non-zero"

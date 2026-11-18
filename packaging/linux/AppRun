@@ -99,7 +99,7 @@ integrate() {
   external=0
   set --
   for f in "$apps"/*.desktop; do
-    if [ -f "$f" ] && [ "$f" != "$desktop" ]; then
+    if [ -f "$f" ] && [ -r "$f" ] && [ "$f" != "$desktop" ]; then
       set -- "$@" "$f"
     fi
   done
