@@ -24,20 +24,6 @@ use oxidezap_ipc::{CallAction, RequestId};
 #[derive(Debug)]
 pub enum Action {
     SendText(oxidezap_ipc::SendText),
-    ScheduleMessage {
-        jid: String,
-        text: String,
-        send_at_ms: i64,
-    },
-    ListScheduledMessages {
-        id: RequestId,
-        jid: String,
-        answer_to: Outbox,
-    },
-    CancelScheduledMessage {
-        jid: String,
-        scheduled_id: i64,
-    },
     SyncedStickers {
         id: RequestId,
         favorites: bool,
@@ -271,9 +257,6 @@ impl Action {
             _ => !matches!(
                 self,
                 Self::CallDevices { .. }
-                    | Self::ScheduleMessage { .. }
-                    | Self::ListScheduledMessages { .. }
-                    | Self::CancelScheduledMessage { .. }
                     | Self::ReloadHistory
                     | Self::ReconnectSession
                     | Self::RefreshVideo

@@ -750,28 +750,6 @@ async fn a_command_reaches_the_session_rather_than_being_refused() {
     ));
 }
 
-#[tokio::test]
-async fn an_offline_account_can_schedule_a_text_message() {
-    let hub = StateHub::for_account(oxidezap_core::AccountId::LEGACY);
-    let (commands, taken) = bridge(CommandOutcome::Accepted);
-    let deadline = 2_100_000_000_000;
-    let request = bare(ClientRequest::ScheduleMessage {
-        jid: "120363000000000001@g.us".into(),
-        text: "on time".into(),
-        send_at_ms: deadline,
-    });
-    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
-    assert!(matches!(
-        parse(answer.frame),
-        DaemonMessage::Accepted { .. }
-    ));
-    assert!(matches!(
-        taken.await.unwrap(),
-        Some(Action::ScheduleMessage { jid, text, send_at_ms })
-            if jid == "120363000000000001@g.us" && text == "on time" && send_at_ms == deadline
-    ));
-}
-
 /// The payload moves rather than being unpacked and rebuilt, so what the
 /// session is handed is the struct the client sent. A field dropped between
 /// the two compiles and arrives as a document called "file" with no type on

@@ -126,23 +126,6 @@ impl Bridge {
                 });
                 None
             }
-            Action::ListScheduledMessages { id, jid, answer_to } => {
-                let Some(permit) = self.permit() else {
-                    let _ = reply.send(too_busy());
-                    return None;
-                };
-                let task = client.scheduled_messages(jid);
-                oxidezap_session::spawn(async move {
-                    let result = match task.await {
-                        Ok(Ok(items)) => Ok(DaemonMessage::ScheduledMessages { id, items }),
-                        other => mutation_answer(id, other),
-                    };
-                    answer_now(&answer_to, answered(id, result));
-                    let _ = reply.send(CommandOutcome::Accepted);
-                    drop(permit);
-                });
-                None
-            }
             Action::SyncedStickers {
                 id,
                 favorites,
@@ -1590,32 +1573,8 @@ impl Bridge {
             | Action::PublishStatus { .. }
             | Action::PublishStatusMedia { .. }
             | Action::SyncedStickers { .. }
-            | Action::ListScheduledMessages { .. }
             | Action::ReuseComposerMedia { .. } => {
                 unreachable!("addressed actions are handled in begin_slow")
-            }
-            Action::ScheduleMessage {
-                jid,
-                text,
-                send_at_ms,
-            } => match client.schedule_message(&jid, text, send_at_ms).await {
-                Ok(()) => {
-                    self.next_scheduled = Some(
-                        self.next_scheduled
-                            .map_or(send_at_ms, |current| current.min(send_at_ms)),
-                    );
-                    CommandOutcome::Accepted
-                }
-                Err(error) => CommandOutcome::Refused(error),
-            },
-            Action::CancelScheduledMessage { jid, scheduled_id } => {
-                match client.cancel_scheduled_message(jid, scheduled_id).await {
-                    Ok(()) => {
-                        self.refresh_schedule(client).await;
-                        CommandOutcome::Accepted
-                    }
-                    Err(error) => CommandOutcome::Refused(error),
-                }
             }
             Action::SendText(oxidezap_ipc::SendText {
                 jid,
@@ -2239,10 +2198,7 @@ impl Bridge {
 /// where it was taken; a task that outlives this one holds it until every
 /// handle has resolved. `JoinHandle` errors are the session's runtime going
 /// away, which is a shutdown, not something to report.
-pub(super) fn hold<const N: usize>(
-    permit: OwnedSemaphorePermit,
-    work: [oxidezap_session::Task<()>; N],
-) {
+fn hold<const N: usize>(permit: OwnedSemaphorePermit, work: [oxidezap_session::Task<()>; N]) {
     oxidezap_session::spawn(async move {
         for handle in work {
             let _ = handle.await;

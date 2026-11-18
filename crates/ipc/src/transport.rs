@@ -5,8 +5,6 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
-/// 44: The scheduling requests save, list and cancel account-scoped text sends.
-///
 /// 40: `ReconnectSession` interrupts the WhatsApp reconnect wait without
 /// replacing the account session. Older daemons cannot act on this request.
 ///
@@ -293,7 +291,7 @@ use std::path::PathBuf;
 /// 43 adds the status, sticker-library and composer-media requests, among them
 /// `PublishStatusMedia`, which an older daemon would refuse as malformed after
 /// the file had been staged.
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 43;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

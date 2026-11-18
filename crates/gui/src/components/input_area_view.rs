@@ -29,8 +29,6 @@ pub(crate) use composer_picker::{PickerItem, PickerRequest, PickerTab};
 pub enum InputAreaEvent {
     /// User wants to send the current message
     SendMessage(String),
-    ScheduleMessage(String),
-    ListScheduledMessages,
     LoadPickerMedia(PickerTab),
     SendPickerMedia(PickerRequest),
     /// User picked an attachment category from the composer menu.
@@ -349,18 +347,6 @@ impl InputAreaView {
         old
     }
 
-    pub(crate) fn clear_scheduled_draft(
-        &mut self,
-        text: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.editing && self.reply.is_none() && self.input.read(cx).text() == text {
-            self.swap_text("", window, cx);
-            self.stop_typing_internal(cx);
-        }
-    }
-
     /// Read, trim-check, clear and emit the composed message (Enter and the
     /// send button share this path).
     fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -569,7 +555,6 @@ impl InputAreaView {
             .chars()
             .any(|c| !c.is_whitespace());
 
-        let schedule_entity = entity.clone();
         div()
             .key_context("MessageComposer")
             .on_action(|action: &Enter, _, cx| {
@@ -644,47 +629,6 @@ impl InputAreaView {
                     ),
             )
             .child(self.render_picker(control, cx))
-            .when(!self.editing, |row| {
-                let can_schedule = has_text && self.reply.is_none();
-                row.child(
-                    parts::icon_button(
-                        "schedule-message",
-                        Icon::new(ProductIcon::Clock),
-                        crate::tr!(ScheduledMessages),
-                        control,
-                    )
-                    .dropdown_menu(move |menu, _, _| {
-                        let list = schedule_entity.clone();
-                        let mut menu =
-                            menu.item(PopupMenuItem::new(crate::tr!(ScheduledMessages)).on_click(
-                                move |_, _, cx| {
-                                    list.update(cx, |_, cx| {
-                                        cx.emit(InputAreaEvent::ListScheduledMessages)
-                                    });
-                                },
-                            ));
-                        if can_schedule {
-                            let schedule = schedule_entity.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(crate::tr!(ScheduleMessage)).on_click(
-                                    move |_, _, cx| {
-                                        schedule.update(cx, |view, cx| {
-                                            let text = view.input.read(cx).text().to_string();
-                                            if !view.editing
-                                                && view.reply.is_none()
-                                                && !text.trim().is_empty()
-                                            {
-                                                cx.emit(InputAreaEvent::ScheduleMessage(text));
-                                            }
-                                        });
-                                    },
-                                ),
-                            );
-                        }
-                        menu
-                    }),
-                )
-            })
             // Record or send, never both: which one is available follows
             // whether there is anything to send, the way every messaging
             // client behaves.

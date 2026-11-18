@@ -374,7 +374,7 @@ fn is_commit_barrier_error(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-pub(super) fn emit_changes(changes: &broadcast::Sender<StoreChange>, cs: ChangeSet) {
+fn emit_changes(changes: &broadcast::Sender<StoreChange>, cs: ChangeSet) {
     if cs.chats {
         let _ = changes.send(StoreChange::Chats);
     }
@@ -388,7 +388,7 @@ pub(super) fn emit_changes(changes: &broadcast::Sender<StoreChange>, cs: ChangeS
     }
 }
 
-pub(super) fn apply_writer_msg(
+fn apply_writer_msg(
     conn: &mut SqliteConnection,
     device_id: i32,
     msg: &WriterMsg,

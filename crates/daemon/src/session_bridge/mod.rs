@@ -344,11 +344,7 @@ pub async fn run(
     let mute_timer = wait_for_mute_expiry(bridge.hub.clone());
     tokio::pin!(mute_timer);
     loop {
-        let was_connected = bridge.hub.connection().is_connected();
         tokio::select! {
-            () = wait_for_schedule(bridge.next_scheduled.filter(|_| was_connected)) => {
-                bridge.send_scheduled(&client).await;
-            }
             () = &mut mute_timer => {
                 mute_timer.set(wait_for_mute_expiry(bridge.hub.clone()));
             },
@@ -360,9 +356,6 @@ pub async fn run(
                         // Teardown joins the old session before the supervisor
                         // reopens this account. No reset/removal is requested.
                         Answer::Restart => break,
-                    }
-                    if !was_connected && bridge.hub.connection().is_connected() {
-                        bridge.refresh_schedule(&client).await;
                     }
                     mute_timer.set(wait_for_mute_expiry(bridge.hub.clone()));
                 }
@@ -683,7 +676,6 @@ const FORGET_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Everything the event loop carries between one event and the next.
 struct Bridge {
     devices: call_devices::Devices,
-    next_scheduled: Option<i64>,
     hub: Arc<StateHub>,
     lifecycle: RuntimeLifecycle,
     /// The plugins, fed the same events the front ends get.
@@ -723,52 +715,7 @@ struct Bridge {
     avatar_recorder: oxidezap_session::AvatarRecorder,
 }
 
-async fn wait_for_schedule(deadline: Option<i64>) {
-    let Some(deadline) = deadline else {
-        return std::future::pending().await;
-    };
-    let delay = deadline
-        .saturating_sub(wacore::time::now_millis())
-        .clamp(0, 60_000);
-    if delay > 0 {
-        oxidezap_platform::sleep(std::time::Duration::from_millis(delay as u64)).await;
-    }
-}
-
 impl Bridge {
-    async fn refresh_schedule(&mut self, client: &WhatsAppClient) {
-        self.next_scheduled = match client.next_scheduled_message().await {
-            Ok(next) => next,
-            Err(error) => {
-                log::warn!("could not read scheduled messages: {error}");
-                Some(wacore::time::now_millis().saturating_add(5_000))
-            }
-        };
-    }
-
-    async fn send_scheduled(&mut self, client: &WhatsAppClient) {
-        if self
-            .next_scheduled
-            .is_some_and(|due| due > wacore::time::now_millis())
-        {
-            return;
-        }
-        let Some(permit) = self.permit() else {
-            self.next_scheduled = Some(wacore::time::now_millis().saturating_add(1_000));
-            return;
-        };
-        match client.send_scheduled_message().await {
-            Ok(Some(task)) => act::hold(permit, [task]),
-            Ok(None) => {}
-            Err(error) => {
-                log::warn!("could not claim a scheduled message: {error}");
-                self.next_scheduled = Some(wacore::time::now_millis().saturating_add(5_000));
-                return;
-            }
-        }
-        self.refresh_schedule(client).await;
-    }
-
     #[cfg(test)]
     fn new(hub: Arc<StateHub>, plugins: Arc<oxidezap_plugin_host::Plugins>) -> Self {
         // No session behind it: these tests fold events without opening a
@@ -799,7 +746,6 @@ impl Bridge {
 
         Self {
             devices: call_devices::Devices::new(&hub),
-            next_scheduled: None,
             hub,
             lifecycle,
             plugins,

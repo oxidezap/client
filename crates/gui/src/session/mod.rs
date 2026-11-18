@@ -308,10 +308,7 @@ impl From<&oxidezap_ipc::ProtocolError> for Failure {
 /// drew is already able to render.
 type SyncedStickers = Vec<oxidezap_core::PickerSticker>;
 
-type ScheduledMessages = Vec<oxidezap_core::ScheduledMessage>;
-
 enum Awaiting {
-    ScheduledMessages(oneshot::Sender<Result<ScheduledMessages, Failure>>),
     SyncedStickers(oneshot::Sender<Result<SyncedStickers, Failure>>),
     Account(oneshot::Sender<Result<oxidezap_core::AccountId, String>>),
     /// A message mutation whose result must reach the action that opened it.
@@ -399,7 +396,6 @@ impl Awaiting {
             Self::Mutation(tx) => tx.is_closed(),
             Self::StagedMutation { tx, .. } => tx.is_closed(),
             Self::SyncedStickers(tx) => tx.is_closed(),
-            Self::ScheduledMessages(tx) => tx.is_closed(),
             Self::Download(tx) => tx.is_closed(),
             Self::Storage(tx) => tx.is_closed(),
             Self::CallDevices(tx) => tx.is_closed(),
@@ -438,9 +434,6 @@ impl Awaiting {
             }
             Self::CallDevices(tx) => {
                 let _ = tx.send(Err(detail.to_string()));
-            }
-            Self::ScheduledMessages(tx) => {
-                let _ = tx.send(Err(failure.clone()));
             }
             Self::SyncedStickers(tx) => {
                 let _ = tx.send(Err(failure.clone()));
@@ -1149,49 +1142,6 @@ impl SessionHandle {
                 staged: None,
             },
         );
-    }
-
-    pub fn scheduled_messages(
-        &self,
-        jid: String,
-    ) -> oneshot::Receiver<Result<ScheduledMessages, Failure>> {
-        let (tx, rx) = oneshot::channel();
-        self.ask(
-            ClientRequest::ListScheduledMessages { jid },
-            Awaiting::ScheduledMessages(tx),
-        );
-        rx
-    }
-
-    pub fn cancel_scheduled_message(
-        &self,
-        jid: String,
-        scheduled_id: i64,
-    ) -> oneshot::Receiver<Result<(), Failure>> {
-        let (tx, rx) = oneshot::channel();
-        self.ask(
-            ClientRequest::CancelScheduledMessage { jid, scheduled_id },
-            Awaiting::Mutation(tx),
-        );
-        rx
-    }
-
-    pub fn schedule_message(
-        &self,
-        jid: String,
-        text: String,
-        send_at_ms: i64,
-    ) -> oneshot::Receiver<Result<(), Failure>> {
-        let (tx, rx) = oneshot::channel();
-        self.ask(
-            ClientRequest::ScheduleMessage {
-                jid,
-                text,
-                send_at_ms,
-            },
-            Awaiting::Mutation(tx),
-        );
-        rx
     }
 
     pub fn sticker_library(

@@ -29,7 +29,6 @@ mod paging;
 mod plugins_ctl;
 mod recording;
 mod recovery;
-mod scheduled_messages;
 mod search;
 mod settings;
 mod status;
@@ -3276,10 +3275,6 @@ impl WhatsAppApp {
                 } else {
                     self.send_message(text, cx);
                 }
-            }
-            InputAreaEvent::ListScheduledMessages => self.open_scheduled_messages(window, cx),
-            InputAreaEvent::ScheduleMessage(text) => {
-                self.open_schedule_message(text, input_area, window, cx);
             }
             InputAreaEvent::LoadPickerMedia(tab) => self.load_picker_media(*tab, input_area, cx),
             InputAreaEvent::SendPickerMedia(request) => self.send_picker_media(request, cx),

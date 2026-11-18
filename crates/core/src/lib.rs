@@ -83,11 +83,3 @@ pub use video::{CallVideo, CallVideoFrame, VideoStream};
 
 mod business;
 pub use business::{BusinessAction, BusinessButton, BusinessContent, BusinessKind};
-
-/// A pending text message preview for the scheduling dialog.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ScheduledMessage {
-    pub id: i64,
-    pub preview: String,
-    pub send_at_ms: i64,
-}
