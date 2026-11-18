@@ -6,6 +6,7 @@ case "$0" in
     *) script_dir=. ;;
 esac
 # The delimiter preserves newline bytes that belong to a directory name.
+# shellcheck disable=SC1007 # CDPATH= empties CDPATH for this cd only.
 archive_dir=$(CDPATH= cd -P -- "$script_dir" && printf '%s.' "$PWD")
 archive_dir=${archive_dir%.}
 case "$archive_dir" in
@@ -37,6 +38,7 @@ case "$data_dir" in
     *) printf 'XDG_DATA_HOME must be an absolute path\n' >&2; exit 1 ;;
 esac
 # Desktop entries have two escaping layers: entry values, then Exec quoting.
+# shellcheck disable=SC2016 # the sed expressions match a literal $ and backquote.
 exec_path=$(printf '%s' "$archive_dir/oxidezap" | sed \
     -e 's/\\/\\\\\\\\/g' -e 's/"/\\\\"/g' -e 's/`/\\\\`/g' -e 's/\$/\\\\$/g')
 

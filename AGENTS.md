@@ -179,6 +179,8 @@ the detail and the measurements this file deliberately does not.
 - **[docs/building.md](docs/building.md)** — every build beyond the ones above.
 - **[docs/ci.md](docs/ci.md)** — the library dependency, and why the Actions
   cache budget decides how long a pull request waits.
+- **[docs/linux-packaging.md](docs/linux-packaging.md)** — the AppImage, deb
+  and rpm, their ids and dependencies, and why the Flatpak is not released.
 - **[docs/plugin-abi.md](docs/plugin-abi.md)** — the contract for anyone not
   using the SDK. Load-bearing: a test loads the module it prints.
 - **[docs/roadmap.md](docs/roadmap.md)** — known gaps and their reasoning.

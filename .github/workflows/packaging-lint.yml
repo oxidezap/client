@@ -1,0 +1,56 @@
+# Quick static checks for the Linux packaging (seconds, no Rust build): the packaging shell
+# scripts, the desktop entry and AppStream metadata, AppRun's desktop integration and CLI
+# selection, and the verified AppImage tool downloads. The packages themselves are built in
+# build.yml, which release-check.yml runs on every pull request.
+name: Packaging lint
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/packaging-lint.yml", "packaging/**"]
+  pull_request:
+    paths: [".github/workflows/packaging-lint.yml", "packaging/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Linux packaging
+    # Same Ubuntu as the package build in build.yml, so the validators match.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck desktop-file-utils appstream
+
+      - name: shellcheck
+        run: shellcheck packaging/env.sh packaging/linux/*.sh packaging/linux/AppRun
+
+      - name: Desktop entry and AppStream metadata
+        run: |
+          desktop-file-validate packaging/linux/org.oxidezap.client.local.desktop
+          metainfo="$RUNNER_TEMP/io.github.oxidezap.client.metainfo.xml"
+          sed -e 's/@VERSION@/0.0.0/' -e "s/@DATE@/$(date -u +%Y-%m-%d)/" \
+            packaging/linux/org.oxidezap.client.local.metainfo.xml.in >"$metainfo"
+          appstreamcli validate --no-net --explain "$metainfo"
+
+      - name: AppRun desktop integration
+        run: bash packaging/linux/apprun-test.sh
+
+      - name: AppRun CLI selection
+        run: bash packaging/linux/apprun-cli-test.sh
+
+      - name: Verified AppImage inputs
+        run: bash packaging/linux/verified-download-test.sh

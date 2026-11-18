@@ -146,7 +146,9 @@ ships `oxidezap-<version>-linux-aarch64.tar.gz` with all three binaries and
 the desktop installer. Each native runner checks the archive's complete member
 set, binary format, architecture and executable permissions, then runs the
 packaged CLI's help command. This smoke test does not exercise the GUI or a
-WhatsApp session. Publishing still requires every build to succeed.
+WhatsApp session. The Linux runners also build the AppImage, deb and rpm
+([linux-packaging.md](linux-packaging.md)), and the check expects all four per
+architecture. Publishing still requires every build to succeed.
 
 Pages bundles are retained for 14 days. A failed-job rerun reuses the original
 Build artifact, so after that window use **Re-run all jobs** to recreate it.

@@ -17,3 +17,6 @@ crates/daemon/webdriver.json
 
 # Optional icon-generation tools.
 .venv-icons/
+
+# Packages written by packaging/linux/package.sh.
+/dist/

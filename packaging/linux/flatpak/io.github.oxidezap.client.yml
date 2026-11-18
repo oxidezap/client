@@ -1,0 +1,56 @@
+# Experimental Flatpak manifest for OxideZap. Not attached to releases.
+#
+# It repackages the prebuilt binaries from package.sh's -fhs.tar.gz (packaging/linux/flatpak-bundle.sh)
+# instead of compiling inside flatpak-builder, whose build has no network: the workspace pulls
+# git dependencies (whatsapp-rust, gpui-kit) and needs protoc, cmake and clang, so a from-source
+# manifest would need every crate vendored (flatpak-cargo-generator) first. The binaries are the
+# ones the AppImage, deb and rpm carry, built on Ubuntu 22.04 (glibc 2.35); the runtime is newer.
+#
+# The app id must be reverse-DNS and owned by the project, so it is the AppStream id; the desktop
+# file and icon are renamed to it.
+id: io.github.oxidezap.client
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+command: oxidezap
+rename-desktop-file: org.oxidezap.client.local.desktop
+rename-icon: org.oxidezap.client.local
+finish-args:
+  # Display: Wayland first; X11 only when no Wayland compositor is running.
+  - --socket=wayland
+  - --socket=fallback-x11
+  # X11 shared memory (MIT-SHM).
+  - --share=ipc
+  # The WhatsApp servers.
+  - --share=network
+  # GPU for wgpu (Vulkan, or GL as a fallback) and V4L2 cameras for video calls.
+  - --device=all
+  # Microphone and speakers for calls: the runtime's ALSA routes through PulseAudio.
+  - --socket=pulseaudio
+  # Desktop notifications and the StatusNotifierItem tray icon.
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Saved media (XDG_DOWNLOAD_DIR, else ~/Downloads). Attachments are picked through the
+  # file-chooser portal, which needs no grant.
+  - --filesystem=xdg-download
+build-options:
+  no-debuginfo: true
+modules:
+  - name: oxidezap
+    buildsystem: simple
+    build-commands:
+      # The three stay together in /app/bin: the window and the CLI start the daemon beside
+      # themselves. All run in one sandbox per app id, which shares $XDG_RUNTIME_DIR (the
+      # daemon's socket and lock) between `flatpak run` instances.
+      - install -Dm755 -t /app/bin bin/oxidezap bin/oxidezapd bin/oxidezap-cli
+      - install -Dm644 share/applications/org.oxidezap.client.local.desktop /app/share/applications/org.oxidezap.client.local.desktop
+      # rename-desktop-file and rename-icon do not touch the metainfo: point it at the new names.
+      - >-
+        sed -e 's|<launchable type="desktop-id">org.oxidezap.client.local.desktop<|<launchable type="desktop-id">io.github.oxidezap.client.desktop<|'
+        -e 's|<icon type="stock">org.oxidezap.client.local<|<icon type="stock">io.github.oxidezap.client<|'
+        share/metainfo/io.github.oxidezap.client.metainfo.xml
+        | install -Dm644 /dev/stdin /app/share/metainfo/io.github.oxidezap.client.metainfo.xml
+      - mkdir -p /app/share/icons /app/share/doc && cp -R share/icons/hicolor /app/share/icons/ && cp -R share/doc/oxidezap /app/share/doc/
+    sources:
+      - type: dir
+        path: stage

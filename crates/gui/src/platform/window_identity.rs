@@ -11,6 +11,9 @@ pub fn apply(options: &mut gpui::WindowOptions, cx: &gpui::App) {
 #[cfg(target_os = "linux")]
 mod imp {
     pub(super) fn apply(options: &mut gpui::WindowOptions, cx: &gpui::App) {
+        if let Ok(id) = std::env::var("FLATPAK_ID") {
+            options.app_id = Some(id);
+        }
         match icon(cx) {
             Ok(icon) => options.icon = Some(std::sync::Arc::new(icon)),
             Err(error) => log::warn!("could not load the window icon: {error}"),
@@ -37,7 +40,14 @@ mod tests {
         cx.update(|cx| {
             let mut options = gpui::WindowOptions::default();
             super::apply(&mut options, cx);
-            assert_eq!(options.app_id.as_deref(), Some(super::APP_ID));
+            assert_eq!(
+                options.app_id.as_deref(),
+                Some(
+                    std::env::var("FLATPAK_ID")
+                        .as_deref()
+                        .unwrap_or(super::APP_ID)
+                )
+            );
             let icon = options
                 .icon
                 .expect("organization PNG produces a window icon");
