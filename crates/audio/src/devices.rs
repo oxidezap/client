@@ -45,7 +45,7 @@ pub fn call_preferences_with_origin() -> (oxidezap_core::CallDevicePreferences, 
         .clone()
 }
 
-/// A deterministic, quiet two-tone signal with a silent interval.
+/// A quiet periodic tone with a silent interval.
 pub fn ringtone_sample(tone: Ringtone, frame: u64, rate: u32) -> i16 {
     if tone == Ringtone::Silent || rate == 0 || frame % (u64::from(rate) * 3) >= u64::from(rate) {
         return 0;
@@ -55,8 +55,9 @@ pub fn ringtone_sample(tone: Ringtone, frame: u64, rate: u32) -> i16 {
     } else {
         660.0
     };
-    let phase = frame as f64 / f64::from(rate);
-    let envelope = (phase % 3.0 * 40.0).min(1.0);
+    let phase = (frame % u64::from(rate)) as f64 / f64::from(rate);
+    let release = 1.0 - phase - 1.0 / f64::from(rate);
+    let envelope = (phase.min(release) * 40.0).clamp(0.0, 1.0);
     ((phase * hz * std::f64::consts::TAU).sin() * 2000.0 * envelope) as i16
 }
 
@@ -66,7 +67,6 @@ mod imp {
     use anyhow::anyhow;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use portable_atomic::AtomicU64;
-    use ringbuf::traits::{Producer, Split};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -175,8 +175,12 @@ mod imp {
             move |stop| {
                 let device = select(output.as_deref(), false)?;
                 let (config, format) = crate::call_device::default_config(&device, false)?;
-                let (producer, consumer) =
-                    ringbuf::HeapRb::<i16>::new(config.sample_rate as usize).split();
+                let rate = config.sample_rate;
+                anyhow::ensure!(rate > 0, "ringtone output sample rate is zero");
+                let samples: Box<[_]> = (0..u64::from(rate) * 3)
+                    .map(|frame| ringtone_sample(tone, frame, rate))
+                    .collect();
+                let mut cursor = 0;
                 let on_error = {
                     let stop = stop.clone();
                     Arc::new(move || stop.store(true, Ordering::Release))
@@ -186,7 +190,11 @@ mod imp {
                     &config,
                     format,
                     config.channels as usize,
-                    consumer,
+                    move || {
+                        let sample = samples[cursor];
+                        cursor = (cursor + 1) % samples.len();
+                        Some(sample)
+                    },
                     crate::call_device::SpeakerCounters {
                         pops: Arc::new(AtomicU64::new(0)),
                         underruns: Arc::new(AtomicU64::new(0)),
@@ -197,21 +205,11 @@ mod imp {
                     anyhow::bail!("ringtone cancelled");
                 }
                 stream.play()?;
-                Ok((stream, config.sample_rate, producer))
+                Ok(stream)
             },
-            move |(_stream, rate, mut producer), stop| {
-                let mut frame = 0;
+            move |_stream, stop| {
                 while !stop.load(Ordering::Acquire) {
-                    for _ in 0..(rate / 100) {
-                        if producer
-                            .try_push(ringtone_sample(tone, frame, rate))
-                            .is_err()
-                        {
-                            break;
-                        }
-                        frame += 1;
-                    }
-                    std::thread::park_timeout(Duration::from_millis(5));
+                    std::thread::park_timeout(Duration::from_millis(20));
                 }
             },
         )
@@ -408,6 +406,18 @@ pub(crate) use imp::{MicrophoneChoice, microphone_choice, select};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ringtone_loop_starts_and_ends_at_silence() {
+        for tone in [Ringtone::Classic, Ringtone::Gentle] {
+            for rate in [44_100, 48_000] {
+                let end = u64::from(rate);
+                assert_eq!(ringtone_sample(tone, 0, rate), 0);
+                assert_eq!(ringtone_sample(tone, end - 1, rate), 0);
+                assert_eq!(ringtone_sample(tone, end * 3, rate), 0);
+            }
+        }
+    }
+
     #[test]
     fn tones_are_bounded_and_have_silent_gaps() {
         for tone in [Ringtone::Classic, Ringtone::Gentle, Ringtone::Silent] {
