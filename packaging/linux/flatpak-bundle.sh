@@ -3,10 +3,7 @@
 #
 #   $DIST/oxidezap-<label>-linux-<arch>.flatpak
 #
-# BROKEN: the daemon's tray icon cannot register inside the sandbox, so once the window is
-# closed nothing shows or controls the session left running (details and the fix in
-# packaging/linux/flatpak/io.github.oxidezap.client.yml). Not part of the release; kept to work
-# on the sandbox support.
+# Experimental package built separately from releases.
 #
 # Usage: packaging/linux/flatpak-bundle.sh [--no-test] [TARBALL]
 #
@@ -47,7 +44,6 @@ for tool in flatpak flatpak-builder; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found (apt install flatpak flatpak-builder)" >&2; exit 1; }
 done
 
-warn "the Flatpak is known broken: the daemon's tray icon cannot register inside the sandbox"
 echo "==> OxideZap $VERSION Flatpak bundle for $ARCH from $(basename "$TARBALL")"
 
 WORK="$CARGO_TARGET_DIR/flatpak-bundle"

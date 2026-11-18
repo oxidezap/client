@@ -203,6 +203,7 @@ pub async fn start(hub: Arc<TrayHub>) -> Result<Box<dyn super::Tray>> {
         click: crate::window::Toggle::default(),
     };
     let handle = item
+        .disable_dbus_name(std::path::Path::new("/.flatpak-info").is_file())
         .spawn()
         .await
         .context("registering a StatusNotifierItem (is a tray host running?)")?;

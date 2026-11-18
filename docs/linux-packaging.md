@@ -42,6 +42,9 @@ dependency on libc.
   ones they `dlopen` (Wayland, Vulkan or EGL); `packaging/linux/nfpm.yaml` lists
   them with the reasoning. The rpm names sonames, so one package resolves on
   Fedora and openSUSE.
+- **AppImage libraries.** The AppImage bundles the linked application libraries
+  and their dependencies, plus Wayland. It uses the host's glibc, C++ runtime,
+  and graphics loaders and drivers.
 - **Maintainer** is the project's creator as the first commit records him.
 - **The AppImage runs the CLI too**: `--cli <args>`, or a symlink to it named
   `oxidezap-cli`, without desktop integration. A daemon started from the
@@ -52,19 +55,14 @@ dependency on libc.
   mechanism; `install-desktop.sh` belongs to the archive and is not shipped in
   the packages.
 
-## Flatpak: built, broken, not released
+## Experimental Flatpak
 
 `packaging/linux/flatpak-bundle.sh` repackages the binaries as a Flatpak
-bundle with `packaging/linux/flatpak/io.github.oxidezap.client.yml`. It is
-not attached to releases, because the daemon's tray icon cannot register in the
-sandbox: ksni owns a D-Bus name `org.kde.StatusNotifierItem-<pid>-<n>` first,
-and the sandbox's bus proxy does not let an app own it. The daemon logs `no tray
-presence` and keeps running without one, and the tray is the only control the
-daemon has once the window is closed. Granting `--own-name=org.kde.*` makes the
-icon register, but lets the app own any KDE name, the tray watcher's included,
-and the exact name cannot be granted because its pid is the sandbox's. The fix
-belongs in `crates/daemon/src/tray/linux.rs`: `disable_dbus_name(true)` when
-running sandboxed, as ksni documents for Flatpak. The window's Wayland app id should
-follow `$FLATPAK_ID` too, or the launcher and window do not pair on Wayland.
+bundle with `packaging/linux/flatpak/io.github.oxidezap.client.yml`. The bundle
+is built separately from releases. The daemon registers the status notifier
+using its unique bus name inside the sandbox, where the bus proxy does not
+allow it to own a generated KDE name. The window uses the Flatpak ID so
+Wayland can match it to its launcher.
+
 The manifest repackages the release binaries rather than compiling, because
 flatpak-builder builds offline and the workspace has git dependencies.
