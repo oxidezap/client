@@ -424,7 +424,7 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".into());
             };
-            let message = if let Some(source) = source_chat_jid {
+            let mut message = if let Some(source) = source_chat_jid.as_deref() {
                 let source: Jid = source
                     .parse()
                     .map_err(|_| "not a chat address".to_string())?;
@@ -445,6 +445,15 @@ impl WhatsAppClient {
             }
             .ok_or_else(|| "that sticker or GIF is no longer available".to_string())?;
             let client = &live.client;
+            if source_chat_jid.is_none()
+                && let Some(sticker) = message.sticker_message.as_option_mut()
+            {
+                let bytes = client
+                    .download(sticker, whatsapp_rust::download::DownloadLimits::default())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                sticker.is_animated = Some(super::outgoing::image_has_animation(&bytes)?);
+            }
             let id = client.generate_message_id();
             super::record_outgoing(
                 &live.chat_store,

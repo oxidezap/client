@@ -626,17 +626,14 @@ impl WhatsAppApp {
         post.pending = true;
         let draft = post.text.downgrade();
         let recipients = post.recipients.iter().cloned().collect();
-        // Moved, not cloned: the file can be tens of megabytes. A failed post
-        // therefore asks for the file again, which is cheaper than holding two
-        // copies of every draft.
-        let result = match post.media.take() {
+        let result = match &post.media {
             Some(media) => {
                 let crate::platform::picker::Picked {
                     file_name,
                     mime_type,
                     kind,
                     bytes,
-                } = media.file;
+                } = media.file.clone();
                 client.publish_status_media(
                     crate::session::Attachment {
                         bytes,

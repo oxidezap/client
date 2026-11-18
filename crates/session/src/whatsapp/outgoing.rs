@@ -317,7 +317,7 @@ fn native_image_source_extension(data: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn image_has_animation(data: &[u8]) -> Result<bool, String> {
+pub(super) fn image_has_animation(data: &[u8]) -> Result<bool, String> {
     use image::ImageDecoder as _;
 
     const ERROR: &str = "Não foi possível verificar esta animação. Envie como Documento.";

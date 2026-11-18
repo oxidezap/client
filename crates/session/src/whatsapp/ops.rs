@@ -115,17 +115,19 @@ pub struct BackfillReport {
     pub files: Vec<BackfillFile>,
 }
 
-/// One key for one person, whichever address they are known by.
-///
-/// The phone number when the LID/PN mapping is known, otherwise the address
-/// as given and tagged with its kind, so an unmapped LID never equals a phone
-/// number that merely shares digits with it.
-async fn person_key(client: &std::sync::Arc<whatsapp_rust::Client>, jid: &Jid) -> String {
-    match client.get_lid_pn_entry(jid).await {
-        Ok(Some(entry)) => format!("pn:{}", entry.phone_number),
-        _ if jid.is_lid() => format!("lid:{}", jid.user),
-        _ => format!("pn:{}", jid.user),
+async fn audience_phone_number(
+    client: &std::sync::Arc<whatsapp_rust::Client>,
+    jid: &Jid,
+) -> Result<String, String> {
+    if jid.is_pn() {
+        return Ok(jid.user.to_string());
     }
+    client
+        .get_lid_pn_entry(jid)
+        .await
+        .map_err(|_| "could not verify a status recipient's identity")?
+        .map(|entry| entry.phone_number.to_string())
+        .ok_or_else(|| "could not verify a status recipient's phone number".into())
 }
 
 /// Who a status goes to, and under which setting.
@@ -153,17 +155,19 @@ async fn status_audience(
         .as_ref()
         .and_then(|action| action.mode.as_ref().or_else(|| action.modes.first()))
         .map(|mode| mode.to_i32());
-    let listed: Vec<Jid> = setting
-        .as_ref()
-        .map(|action| {
-            action
-                .user_jid
-                .iter()
-                .filter_map(|jid| jid.parse::<Jid>().ok())
-                .filter(|jid| jid.is_pn() || jid.is_lid())
-                .collect()
-        })
-        .unwrap_or_default();
+    let listed = || {
+        setting
+            .iter()
+            .flat_map(|action| &action.user_jid)
+            .map(|address| {
+                address
+                    .parse::<Jid>()
+                    .ok()
+                    .filter(|jid| jid.is_pn() || jid.is_lid())
+                    .ok_or_else(|| "status privacy contains an unsupported recipient".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
 
     // The address book: people saved under a name, not everybody who ever
     // messaged. Excludes the account itself.
@@ -186,39 +190,41 @@ async fn status_audience(
 
     let (audience, privacy) = match mode {
         // The phone's own default.
-        None | Some(2) => (book().await?, StatusPrivacySetting::Contacts),
+        Some(2) => (book().await?, StatusPrivacySetting::Contacts),
+        None => return Err("status privacy is not known yet; choose recipients explicitly or try again after syncing".into()),
         Some(1) => {
+            let listed = listed()?;
             let book = book().await?;
             // Compared as people, not as addresses: a contact saved under a
             // phone number and the same person excluded under a LID share no
             // digits, and comparing the raw users would send the status to
             // someone the account said not to.
-            use futures_util::StreamExt as _;
-            // Sixteen at a time, as the library resolves a status audience:
-            // each lookup can be a cache-miss read.
+            use futures_util::{StreamExt as _, TryStreamExt as _};
             const LOOKUPS: usize = 16;
-            let excluded: std::collections::HashSet<String> =
-                futures_util::stream::iter(listed.iter().cloned())
-                    .map(|jid| async move { person_key(client, &jid).await })
+            let identities: std::collections::HashSet<_> = listed
+                .iter()
+                .chain(&book)
+                .map(Jid::to_non_ad_string)
+                .collect();
+            let keys: std::collections::HashMap<String, String> =
+                futures_util::stream::iter(identities)
+                    .map(|address| async move {
+                        let jid = address.parse::<Jid>().map_err(|e| e.to_string())?;
+                        let key = audience_phone_number(client, &jid).await?;
+                        Ok::<_, String>((address, key))
+                    })
                     .buffer_unordered(LOOKUPS)
-                    .collect()
-                    .await;
-            let keyed: Vec<(Jid, String)> = futures_util::stream::iter(book)
-                .map(|jid| async move {
-                    let key = person_key(client, &jid).await;
-                    (jid, key)
-                })
-                .buffer_unordered(LOOKUPS)
-                .collect()
-                .await;
-            let audience = keyed
+                    .try_collect()
+                    .await?;
+            let excluded: std::collections::HashSet<_> =
+                listed.iter().map(|jid| &keys[&jid.to_non_ad_string()]).collect();
+            let audience = book
                 .into_iter()
-                .filter(|(_, key)| !excluded.contains(key))
-                .map(|(jid, _)| jid)
+                .filter(|jid| !excluded.contains(&keys[&jid.to_non_ad_string()]))
                 .collect();
             (audience, StatusPrivacySetting::DenyList)
         }
-        Some(0) => (listed, StatusPrivacySetting::AllowList),
+        Some(0) => (listed()?, StatusPrivacySetting::AllowList),
         // Close friends and custom lists are kept under names this client does
         // not read. Refused rather than guessed at as an allow list, which
         // would post to nobody or to the wrong people.
