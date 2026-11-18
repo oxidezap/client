@@ -119,6 +119,8 @@ whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rus
 phonenumber = { path = "vendor/phonenumber" }
 # Canvas readback needs integer coordinates with web_sys_unstable_apis.
 gpui-fast-web = { path = "vendor/gpui-fast-web" }
+# Preserve the requested Media Foundation frame-rate ratio.
+nokhwa-bindings-windows = { path = "vendor/nokhwa-bindings-windows" }
 
 [profile.dev]
 # Dependencies carry no debug information. Nobody here steps into diesel, and

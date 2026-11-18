@@ -276,6 +276,7 @@ catalog! {
     Gentle => ("Gentle", "Suave");
     TestRingtone => ("Test ringtone", "Testar toque");
     Camera => ("CAMERA", "CÂMERA");
+    CameraModesUnavailable => ("No modes reported for this camera", "Nenhum modo informado para esta câmera");
     ResolutionAndFrameRate => ("RESOLUTION AND FRAME RATE", "RESOLUÇÃO E TAXA DE QUADROS");
     StopCameraPreview => ("Stop camera preview", "Parar prévia da câmera");
     PreviewCamera => ("Preview camera", "Prévia da câmera");

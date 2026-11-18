@@ -21,6 +21,11 @@ The web backend still needs a patch. `vendor/gpui-fast-web` replaces
 readback under `web_sys_unstable_apis`. The published gpui-fast-web 0.1.13
 still passes floats to that binding. See
 [its patch notes](../vendor/gpui-fast-web/LOCAL_CHANGES.md).
+
+The Windows camera backend uses a local Nokhwa patch to read and apply
+Media Foundation frame-rate ratios. See
+[the patch notes](../vendor/nokhwa-bindings-windows/LOCAL_CHANGES.md).
+
 `vendor/phonenumber` remains. The latest registry release is still
 0.3.10+9.0.33, whose default database validates regexes at runtime and retains
 vectors for immutable metadata. Removing our patch would undo build-time

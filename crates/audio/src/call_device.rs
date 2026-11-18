@@ -420,12 +420,13 @@ pub fn spawn_speaker() -> Result<async_channel::Sender<Vec<i16>>> {
                 rx_close.close();
             })
         };
+        let mut cons = cons;
         let started = build_output_stream(
             &device,
             &config,
             format,
             channels,
-            cons,
+            move || cons.try_pop(),
             SpeakerCounters { pops, underruns },
             on_error,
         )
@@ -475,18 +476,15 @@ pub(crate) struct SpeakerCounters {
     pub(crate) underruns: Arc<AtomicU64>,
 }
 
-pub(crate) fn build_output_stream<C>(
+pub(crate) fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     format: SampleFormat,
     channels: usize,
-    mut cons: C,
+    mut next_sample: impl FnMut() -> Option<i16> + Send + 'static,
     counters: SpeakerCounters,
     on_error: Arc<dyn Fn() + Send + Sync>,
-) -> Result<cpal::Stream>
-where
-    C: ringbuf::traits::Consumer<Item = i16> + Send + 'static,
-{
+) -> Result<cpal::Stream> {
     let SpeakerCounters { pops, underruns } = counters;
     macro_rules! build {
         ($t:ty) => {{
@@ -506,7 +504,7 @@ where
                         let mut under = 0u64;
                         for frame in data.chunks_mut(channels) {
                             // Pop one mono sample (silence on underrun) and fan it across channels.
-                            let s: i16 = match cons.try_pop() {
+                            let s: i16 = match next_sample() {
                                 Some(s) => s,
                                 None => {
                                     under += 1;

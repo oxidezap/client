@@ -656,6 +656,10 @@ impl Calls {
                 if !current {
                     break;
                 }
+                let window = app.update(cx, |app, _| app.account_window).ok().flatten();
+                if let Some(window) = window {
+                    let _ = window.update(cx, |_, window, _| window.request_attention());
+                }
                 let client = app
                     .update(cx, |app, _| {
                         app.client

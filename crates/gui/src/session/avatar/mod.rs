@@ -280,18 +280,16 @@ impl AvatarManager {
             }
         }
 
-        // If a network fetch is already active for this JID, avoid redundant checks
-        if self
-            .network_in_flight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(jid)
-        {
-            return;
-        }
-
         if let Some(key) = &chat.cache_key {
             if get_avatar_image(key).is_some() {
+                if self
+                    .network_in_flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(jid)
+                {
+                    return;
+                }
                 // Cache hit in RAM: check if revalidation is needed for this connection
                 let mut reval = self.revalidated.lock().unwrap_or_else(|e| e.into_inner());
                 if note_revalidation(&mut reval, jid) {
@@ -329,8 +327,8 @@ impl AvatarManager {
                         .unwrap_or_else(|e| e.into_inner());
                     network.len() < MAX_PENDING_DEMANDS && network.insert(jid.clone())
                 };
-                if reserved {
-                    if self.enqueue_demand(
+                if reserved
+                    && !self.enqueue_demand(
                         AvatarDemand {
                             jid: jid.clone(),
                             known_picture_id: None,
@@ -339,17 +337,12 @@ impl AvatarManager {
                             cache_miss: true,
                         },
                         priority,
-                    ) {
-                        self.deferred_misses
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .shift_remove(jid);
-                    } else {
-                        self.network_in_flight
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(jid);
-                    }
+                    )
+                {
+                    self.network_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(jid);
                 }
                 return;
             }
@@ -479,6 +472,13 @@ impl AvatarManager {
                                 session.notify_avatar_loaded();
                             }
 
+                            if network_in_flight
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .contains(&jid_clone)
+                            {
+                                return;
+                            }
                             // Conditional freshness revalidation:
                             let mut reval = revalidated.lock().unwrap_or_else(|e| e.into_inner());
                             if note_revalidation(&mut reval, &jid_clone) {
@@ -532,12 +532,7 @@ impl AvatarManager {
                         }
                         p.remove(&read_key);
                     }
-                    let reserved = {
-                        let mut n_flight =
-                            network_in_flight.lock().unwrap_or_else(|e| e.into_inner());
-                        n_flight.len() < MAX_PENDING_DEMANDS && n_flight.insert(jid_clone.clone())
-                    };
-                    if !reserved {
+                    {
                         let mut deferred =
                             deferred_misses.lock().unwrap_or_else(|e| e.into_inner());
                         if deferred.len() >= MAX_TRACKED_AVATARS
@@ -547,6 +542,11 @@ impl AvatarManager {
                         }
                         deferred.insert(jid_clone.clone(), key_clone.clone());
                     }
+                    let reserved = {
+                        let mut n_flight =
+                            network_in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                        n_flight.len() < MAX_PENDING_DEMANDS && n_flight.insert(jid_clone.clone())
+                    };
                     // A miss also releases visible local admission. Wake the
                     // viewport even offline, so deferred overscan can recover
                     // without waiting for a successful network response.
@@ -862,6 +862,33 @@ mod tests {
                 assert_eq!(demands.len(), 1);
                 demands.remove(0)
             }
+            let waiting = AvatarManager::new();
+            waiting
+                .network_in_flight
+                .lock()
+                .unwrap()
+                .insert(chat.jid.clone());
+            waiting.demand_chat(&chat);
+            assert!(
+                waiting
+                    .persistent_in_flight
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(chat.jid.clone(), key.into()))
+                    || get_avatar_image(key).is_some(),
+                "a network fetch must not block local recovery"
+            );
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while get_avatar_image(key).is_none() {
+                assert!(Instant::now() < deadline, "local recovery did not finish");
+                crate::platform::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert!(
+                waiting.take_demands().is_empty(),
+                "local recovery must not enqueue another fetch"
+            );
+            clear_image_sources();
+
             let first = AvatarManager::new();
             first.demand_chat(&chat);
             let demand = next(&first).await;
