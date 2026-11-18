@@ -179,6 +179,8 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   `theme.json`. The closing window sends `ShutdownUnlessOtherWindows` on its
   control connection. The daemon checks for other windows as it releases
   that connection, independently of any work on the account connection.
+  Before that connection is set up, closing the window stops only a daemon
+  that the window started itself.
   The tray's Hide uses `platform::leave` to close without a stop request.
   Teardown gives accounts ten seconds to disconnect, followed by a separate
   three-second deadline for the runtime. On macOS the status item appears

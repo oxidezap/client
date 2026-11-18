@@ -2120,7 +2120,7 @@ fn deliver(conn: &Conn, id: RequestId, request: ClientRequest, how: Delivery) {
     {
         // Nothing to send, but the queue behind it is still waiting.
         if let Delivery::Staged(ticket) = how {
-            let _ = release(conn, ticket, None);
+            fail_unwritten(conn, release(conn, ticket, None));
         }
         return;
     }
@@ -2131,7 +2131,7 @@ fn deliver(conn: &Conn, id: RequestId, request: ClientRequest, how: Delivery) {
         Ok(frame) => frame,
         Err(e) => {
             if let Delivery::Staged(ticket) = how {
-                let _ = release(conn, ticket, None);
+                fail_unwritten(conn, release(conn, ticket, None));
             }
             fail_reserved(conn, id, format!("unserializable: {e}"));
             return;
@@ -2141,6 +2141,10 @@ fn deliver(conn: &Conn, id: RequestId, request: ClientRequest, how: Delivery) {
         Delivery::Staged(ticket) => release(conn, ticket, Some((id, frame))),
         Delivery::Ordinary => write_or_queue(conn, Some(id), frame),
     };
+    fail_unwritten(conn, written);
+}
+
+fn fail_unwritten(conn: &Conn, written: Result<(), Unwritten>) {
     if let Err(Unwritten { lost, reason }) = written {
         error!("could not reach the daemon: {reason}");
         for id in lost {
