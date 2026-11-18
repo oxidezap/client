@@ -757,11 +757,8 @@ impl Bridge {
             self.next_scheduled = Some(wacore::time::now_millis().saturating_add(1_000));
             return;
         };
-        match client.take_scheduled_message().await {
-            Ok(Some((jid, text))) => act::hold(
-                permit,
-                [client.send_message(&jid, &text, act::next_local_id(), None)],
-            ),
+        match client.send_scheduled_message().await {
+            Ok(Some(task)) => act::hold(permit, [task]),
             Ok(None) => {}
             Err(error) => {
                 log::warn!("could not claim a scheduled message: {error}");

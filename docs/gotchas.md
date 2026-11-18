@@ -189,9 +189,10 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   schedules a direct or group message in local time and lists or cancels
   pending messages in that chat. The daemon uses UTC deadlines. It attempts
   overdue sends when the account reconnects, including after a restart.
-  The web daemon needs a running tab. A claim removes the row before the
-  regular send path starts, so a crash after the claim can lose the attempt
-  but a restart cannot dispatch it again. A network send failure uses the
+  The web daemon needs a running tab. The claim replaces the scheduled row with an
+  outgoing history row in one transaction. After a crash between that
+  commit and delivery, the message remains in history and is not sent
+  again automatically. A network send failure uses the
   regular failed message bubble and retry UI. Resetting or removing an
   account deletes its schedule.
 - **A daemon the window starts must reset its own signals.** It inherits the

@@ -2377,7 +2377,7 @@ fn answered(id: RequestId, result: Result<DaemonMessage, ProtocolError>) -> Stri
 /// A millisecond timestamp alone collides on fast double-sends, and the
 /// session renames the bubble by this id when the server assigns the real
 /// one, so a collision would rename the wrong message.
-pub(super) fn next_local_id() -> String {
+fn next_local_id() -> String {
     use portable_atomic::AtomicU64;
     use std::sync::atomic::Ordering;
     static SEQ: AtomicU64 = AtomicU64::new(0);

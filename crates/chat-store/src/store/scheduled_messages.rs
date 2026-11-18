@@ -32,7 +32,19 @@ impl ChatStore {
         Ok(inserted == 1)
     }
 
-    pub async fn take_scheduled_message(&self, now_ms: i64) -> Result<Option<(String, String)>> {
+    /// Transfer one due row to outgoing history before attempting network delivery.
+    pub async fn claim_scheduled_message(
+        &self,
+        now_ms: i64,
+        message_id: String,
+    ) -> Result<Option<(wacore_binary::Jid, waproto::whatsapp::Message)>> {
+        use super::{
+            WriterMsg,
+            ack::DeferredAcks,
+            writer::{ChangeSet, apply_writer_msg, emit_changes},
+        };
+        use waproto::whatsapp as wa;
+
         #[derive(QueryableByName)]
         struct ScheduledMessage {
             #[diesel(sql_type = Text)]
@@ -42,23 +54,54 @@ impl ChatStore {
         }
 
         let account = self.device_id();
-        let due = self
+        let claimed = self
             .db()
             .run(move |conn| {
-                diesel::sql_query(
-                    "DELETE FROM scheduled_messages WHERE id = (
-                     SELECT id FROM scheduled_messages WHERE device_id = ?1 AND send_at_ms <= ?2
-                     ORDER BY send_at_ms, id LIMIT 1
-                 ) RETURNING jid, text",
-                )
-                .bind::<Integer, _>(account)
-                .bind::<BigInt, _>(now_ms)
-                .get_result::<ScheduledMessage>(conn)
-                .optional()
+                conn.immediate_transaction(|conn| {
+                    let due = diesel::sql_query(
+                        "DELETE FROM scheduled_messages WHERE id = (
+                        SELECT id FROM scheduled_messages WHERE device_id = ?1 AND send_at_ms <= ?2
+                        ORDER BY send_at_ms, id LIMIT 1
+                     ) RETURNING jid, text",
+                    )
+                    .bind::<Integer, _>(account)
+                    .bind::<BigInt, _>(now_ms)
+                    .get_result::<ScheduledMessage>(conn)
+                    .optional()?;
+                    let Some(due) = due else {
+                        return Ok(None);
+                    };
+                    let jid = due.jid.parse::<wacore_binary::Jid>().map_err(|error| {
+                        diesel::result::Error::DeserializationError(Box::new(error))
+                    })?;
+                    let mut message = wa::Message::default();
+                    message.conversation = Some(due.text.clone());
+                    let mut changes = ChangeSet::default();
+                    // The network has not seen this fresh stanza ID, so no
+                    // deferred ACK for this send can exist.
+                    apply_writer_msg(
+                        conn,
+                        account,
+                        &WriterMsg::Outgoing {
+                            chat: jid.clone(),
+                            msg_id: message_id,
+                            proto: waproto::codec::message_to_vec(&message),
+                            kind: crate::materialize::message_kind(&message),
+                            text: Some(due.text),
+                            timestamp_ms: now_ms,
+                        },
+                        &mut changes,
+                        &mut DeferredAcks::default(),
+                    )?;
+                    Ok(Some((jid, message, changes)))
+                })
                 .map_err(db_err)
             })
             .await?;
-        Ok(due.map(|message| (message.jid, message.text)))
+        Ok(claimed.map(|(jid, message, changes)| {
+            emit_changes(&self.changes, changes);
+            (jid, message)
+        }))
     }
 
     pub async fn next_scheduled_message(&self) -> Result<Option<i64>> {

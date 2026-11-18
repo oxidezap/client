@@ -2,6 +2,14 @@ mod common;
 
 use common::*;
 
+async fn claim(queue: &ChatStore, now_ms: i64, id: &str) -> Option<(String, String)> {
+    queue
+        .claim_scheduled_message(now_ms, id.into())
+        .await
+        .unwrap()
+        .map(|(jid, message)| (jid.to_string(), message.conversation.unwrap()))
+}
+
 #[tokio::test]
 async fn scheduled_messages_survive_reopen_and_are_claimed_once() {
     let (device, queue) = test_store().await;
@@ -21,22 +29,19 @@ async fn scheduled_messages_survive_reopen_and_are_claimed_once() {
 
     let queue = ChatStore::new(&device).await.unwrap();
     assert_eq!(queue.next_scheduled_message().await.unwrap(), Some(100));
-    assert_eq!(queue.take_scheduled_message(99).await.unwrap(), None);
+    assert_eq!(claim(&queue, 99, "before").await, None);
     let (one, two) = tokio::join!(
-        queue.take_scheduled_message(100),
-        queue.take_scheduled_message(100),
+        claim(&queue, 100, "first"),
+        claim(&queue, 100, "concurrent"),
     );
-    let claims = [one.unwrap(), two.unwrap()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let claims = [one, two].into_iter().flatten().collect::<Vec<_>>();
     assert_eq!(claims, vec![(PEER.into(), "first".into())]);
     assert_eq!(
-        queue.take_scheduled_message(200).await.unwrap(),
+        claim(&queue, 200, "second").await,
         Some((PEER.into(), "second".into()))
     );
     assert_eq!(
-        queue.take_scheduled_message(200).await.unwrap(),
+        claim(&queue, 200, "third").await,
         Some((GROUP.into(), "third".into()))
     );
     assert_eq!(queue.next_scheduled_message().await.unwrap(), None);
@@ -80,7 +85,7 @@ async fn cancellation_and_reset_only_affect_the_owning_account() {
             .await
             .unwrap()
     );
-    assert_eq!(queue.take_scheduled_message(100).await.unwrap(), None);
+    assert_eq!(claim(&queue, 100, "cancelled").await, None);
 
     drop(queue);
     device
@@ -91,7 +96,7 @@ async fn cancellation_and_reset_only_affect_the_owning_account() {
     let queue = ChatStore::new(&device).await.unwrap();
     assert_eq!(queue.next_scheduled_message().await.unwrap(), None);
     assert_eq!(
-        other.take_scheduled_message(100).await.unwrap(),
+        claim(&other, 100, "other").await,
         Some((PEER.into(), "retain me".into()))
     );
 }
@@ -112,5 +117,59 @@ async fn a_chat_can_cancel_a_send_scheduled_under_its_previous_address() {
             .await
             .unwrap()
     );
-    assert_eq!(queue.take_scheduled_message(100).await.unwrap(), None);
+    assert_eq!(claim(&queue, 100, "cancelled").await, None);
+}
+
+#[tokio::test]
+async fn failed_outgoing_insert_leaves_the_due_message_scheduled() {
+    let (device, queue) = test_store().await;
+    queue
+        .schedule_message(PEER.into(), "keep me".into(), 100)
+        .await
+        .unwrap();
+    device
+        .shared()
+        .run(|conn| {
+            diesel::sql_query(
+                "CREATE TRIGGER refuse_scheduled_insert BEFORE INSERT ON messages
+             BEGIN SELECT RAISE(ABORT, 'forced outgoing write failure'); END",
+            )
+            .execute(conn)
+            .map_err(db_err)
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        queue
+            .claim_scheduled_message(100, "failed".into())
+            .await
+            .is_err()
+    );
+    assert_eq!(queue.next_scheduled_message().await.unwrap(), Some(100));
+    assert_eq!(
+        queue.scheduled_messages(PEER.into()).await.unwrap()[0].preview,
+        "keep me"
+    );
+
+    device
+        .shared()
+        .run(|conn| {
+            diesel::sql_query("DROP TRIGGER refuse_scheduled_insert")
+                .execute(conn)
+                .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        claim(&queue, 100, "recorded").await,
+        Some((PEER.into(), "keep me".into()))
+    );
+    let outgoing = queue
+        .message(&jid(PEER), "recorded")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outgoing.text.as_deref(), Some("keep me"));
+    assert_eq!(queue.next_scheduled_message().await.unwrap(), None);
 }

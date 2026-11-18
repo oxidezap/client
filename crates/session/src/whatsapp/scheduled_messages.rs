@@ -42,12 +42,38 @@ impl WhatsAppClient {
             .map_err(|error| error.to_string())
     }
 
-    pub async fn take_scheduled_message(&self) -> Result<Option<(String, String)>, String> {
+    pub async fn send_scheduled_message(&self) -> Result<Option<super::Task<()>>, String> {
         let live = self.session.lock().await.clone().ok_or("no session yet")?;
-        live.chat_store
-            .take_scheduled_message(wacore::time::now_millis())
+        let id = live.client.generate_message_id();
+        let Some((jid, message)) = live
+            .chat_store
+            .claim_scheduled_message(wacore::time::now_millis(), id.to_string())
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        if jid.is_group() {
+            live.resolve_chat_names
+                .request_named([jid.to_non_ad_string()]);
+        }
+        let ui_sender = self.ui_sender.clone();
+        Ok(Some(self.exec.spawn(async move {
+            let options = whatsapp_rust::SendOptions::default().with_message_id(id.clone());
+            if let Err(error) = live
+                .client
+                .send(whatsapp_rust::SendRequest::new(&jid, message).with_options(options))
+                .await
+            {
+                super::mark_send_failed(&live.chat_store, &jid, id.as_str());
+                super::notify_send_failed(
+                    &ui_sender,
+                    &jid.to_string(),
+                    id.as_str(),
+                    error.to_string(),
+                );
+            }
+        })))
     }
 
     pub fn scheduled_messages(
