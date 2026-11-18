@@ -215,7 +215,7 @@ pub(crate) async fn serve_client_with_registry(
 
     let (hub, plugins, commands) = match attached.scope {
         oxidezap_ipc::ClientScope::Control => {
-            return serve_control_client(reader, writer, registry).await;
+            return serve_control_client(reader, writer, registry, attached.owns_window).await;
         }
         oxidezap_ipc::ClientScope::Account { account } => {
             if let Some(successor) = registry.retirement_target(account) {
@@ -656,6 +656,61 @@ pub(crate) async fn serve_client_with_registry(
     }
 }
 
+#[derive(Default)]
+struct ControlWindows {
+    attached: usize,
+    stopping: bool,
+}
+
+impl ControlWindows {
+    fn attach(&mut self) -> bool {
+        if self.stopping {
+            return false;
+        }
+        self.attached += 1;
+        true
+    }
+
+    fn detach(&mut self, stop_on_close: bool) -> bool {
+        self.attached -= 1;
+        self.stopping = self.attached == 0 && stop_on_close;
+        self.stopping
+    }
+}
+
+static CONTROL_WINDOWS: std::sync::Mutex<ControlWindows> = std::sync::Mutex::new(ControlWindows {
+    attached: 0,
+    stopping: false,
+});
+
+struct ControlWindow {
+    stop_on_close: bool,
+}
+
+impl ControlWindow {
+    fn attach() -> Option<Self> {
+        CONTROL_WINDOWS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach()
+            .then(|| Self {
+                stop_on_close: false,
+            })
+    }
+}
+
+impl Drop for ControlWindow {
+    fn drop(&mut self) {
+        if CONTROL_WINDOWS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .detach(self.stop_on_close && !oxidezap_ipc::background::keep_running())
+        {
+            crate::shutdown::request("last window closed");
+        }
+    }
+}
+
 /// Serve the control plane without subscribing to any account state.
 ///
 /// The control plane lists the registry and carries the account lifecycle:
@@ -669,10 +724,16 @@ async fn serve_control_client<S>(
     mut reader: BufReader<ReadHalf<S>>,
     mut writer: WriteHalf<S>,
     registry: Arc<AccountRegistry>,
+    owns_window: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut window = if owns_window {
+        Some(ControlWindow::attach().context("daemon is shutting down")?)
+    } else {
+        None
+    };
     let mut accounts = registry.subscribe();
     let mut retirements = registry.watch_retirements();
     let hello = serde_json::to_string(&DaemonMessage::ControlHello {
@@ -785,12 +846,15 @@ where
                             crate::shutdown::request("ipc client");
                             return Ok(());
                         }
-                        // A window going away stops the daemon once no window is
-                        // left: a second window, or one opened since, keeps it.
-                        // See `stop_when_no_windows`.
                         ClientRequest::ShutdownUnlessOtherWindows => {
-                            crate::state::stop_when_no_windows();
-                            Some(answer_shutdown(id)?)
+                            if let Some(window) = window.as_mut() {
+                                window.stop_on_close = true;
+                                write_line(&mut writer, &answer_shutdown(id)?).await?;
+                                return Ok(());
+                            }
+                            Some(error_frame(id, ProtocolError::Refused {
+                                detail: "only a window can request shutdown on close".into(),
+                            })?)
                         }
                         // The log level is the process's, not an account's:
                         // one daemon logs once, so a control connection is

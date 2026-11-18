@@ -1758,7 +1758,13 @@ impl SessionHandle {
     /// Written before it returns and not waited on, because the one caller is
     /// a window that is closing and will not be there for the answer.
     pub fn shutdown_daemon(&self) {
-        self.tell(ClientRequest::ShutdownUnlessOtherWindows);
+        let request = Request::bare(ClientRequest::ShutdownUnlessOtherWindows);
+        let result = serde_json::to_vec(&request)
+            .map_err(std::io::Error::other)
+            .and_then(|frame| self.conn.wire.send_line(&frame));
+        if let Err(error) = result {
+            error!("could not send the window close request: {error}");
+        }
     }
 
     /// Put a `.wasm` somebody chose into the daemon's plugin folder.

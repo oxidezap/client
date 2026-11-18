@@ -155,11 +155,10 @@ impl InputAreaView {
             )
             .on_open_change(move |open: &bool, _, cx| {
                 closing.update(cx, |view, cx| {
-                    view.emoji_open = *open && !view.edit_pending && !view.is_recording;
-                    if !*open {
-                        view.picker_items.clear();
-                        view.picker_status = None;
-                        view.picker_tab = PickerTab::Emoji;
+                    if *open && !view.edit_pending && !view.is_recording {
+                        view.emoji_open = true;
+                    } else {
+                        view.close_picker();
                     }
                     cx.notify();
                 });

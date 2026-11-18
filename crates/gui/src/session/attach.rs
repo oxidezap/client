@@ -102,7 +102,7 @@ pub(super) fn begin_for_account(
 /// A second, account-less connection beside the account one, carrying the
 /// requests that belong to the process rather than to an account: the log
 /// level, a window, the shared plugin catalogue, and the account lifecycle.
-/// It has no session events, no window and no call video — none of those mean
+/// It has no session events and no call video — none of those mean
 /// anything without an account — so the reader it starts answers requests and
 /// the control frames, and nothing else.
 ///
@@ -119,7 +119,7 @@ pub(super) fn begin_control(link: Link, media: Arc<dyn MediaCache>) -> std::io::
         AccountId::LEGACY,
         ClientScope::Control,
         false,
-        false,
+        cfg!(not(target_arch = "wasm32")),
         false,
     )
 }

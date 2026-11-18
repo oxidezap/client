@@ -986,7 +986,7 @@ pub enum ClientRequest {
         /// chats before the next thing that happens to change.
         #[serde(default)]
         session_events: bool,
-        /// Whether this connection owns the global application window.
+        /// Whether this connection represents an application window.
         ///
         /// This is independent from the account connection's video stream:
         /// the active workspace may request call frames without counting as a
@@ -1314,9 +1314,7 @@ pub enum ClientRequest {
     /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,
     /// What a closing window asks: stop the daemon unless another window is
-    /// still attached. The caller is itself one of the windows counted, so
-    /// the daemon stops only when that is one or none. Control-scoped, like
-    /// [`Shutdown`](Self::Shutdown), and answered the same way either way.
+    /// still attached. Sent on the departing window's control connection.
     ShutdownUnlessOtherWindows,
     /// Demand avatar profile pictures for visible rows and overscan.
     EnsureAvatars(EnsureAvatars),

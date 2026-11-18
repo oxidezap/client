@@ -290,22 +290,10 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
         )
     })?;
     let deadline = wacore::time::Instant::now() + START_TIMEOUT;
-    // The daemon this call started, kept so it can be asked whether it is
-    // still running rather than left to become a zombie.
-    let mut started: Option<std::process::Child> = None;
-
     loop {
         match Endpoint::connect() {
-            Ok(stream) => {
-                reap(started.take());
-                return Ok(stream);
-            }
+            Ok(stream) => return Ok(stream),
             Err(e) if wacore::time::Instant::now() >= deadline => {
-                // The last one this call started, on the way out. Dropping a
-                // `Child` waits for nothing: on unix the process stays a
-                // zombie until this window exits, and the error screen retries
-                // startup, so repeated failures accumulate them.
-                reap(started.take());
                 return Err(std::io::Error::other(format!(
                     "no daemon listening on {} after {START_TIMEOUT:?}: {e}",
                     path.display()
@@ -314,23 +302,25 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
             Err(_) => {}
         }
 
-        // Only if the last one is not still coming up. The connect above can
-        // fail for reasons that are not "nobody is listening" — a socket this
-        // user may not open, a peer that is not us — and each turn of the
-        // loop launching another daemon meant five of them per attempt, all
-        // but one losing the per-user lock and exiting. Held rather than
-        // dropped, and reaped: a `Child` nobody waits on is a zombie for as
-        // long as this window lives, and the error screen retries every
-        // fifteen seconds for as long as the user leaves it up.
-        match started.as_mut().map(std::process::Child::try_wait) {
-            Some(Ok(None)) => {}
-            _ => {
+        {
+            let mut startup = DAEMON_STARTUP.lock().unwrap_or_else(|e| e.into_inner());
+            if startup.closing {
+                return Err(std::io::Error::other("the window is closing"));
+            }
+            let active = startup.child.as_ref().is_some_and(|child| {
+                matches!(
+                    child.lock().unwrap_or_else(|e| e.into_inner()).try_wait(),
+                    Ok(None)
+                )
+            });
+            if !active {
                 info!("no daemon on {}; starting one", path.display());
                 let child = detached_command(&program).spawn().map_err(|e| {
                     std::io::Error::other(format!("could not start {}: {e}", program.display()))
                 })?;
-                STARTED_DAEMON.store(child.id(), std::sync::atomic::Ordering::SeqCst);
-                started = Some(child);
+                let child = Arc::new(std::sync::Mutex::new(child));
+                startup.child = Some(child.clone());
+                reap(child);
             }
         }
 
@@ -340,7 +330,6 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
         let attempt = wacore::time::Instant::now() + START_ATTEMPT;
         while wacore::time::Instant::now() < attempt {
             if let Ok(stream) = Endpoint::connect() {
-                reap(started.take());
                 return Ok(stream);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -355,23 +344,28 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
 /// does, and the daemon outliving the window is the ordinary case — so the
 /// wait belongs somewhere that can outlive the connect loop. One parked
 /// thread per daemon this process started, which is at most one.
-fn reap(child: Option<std::process::Child>) {
-    let Some(mut child) = child else {
-        return;
-    };
-    let pid = child.id();
+fn reap(child: DaemonChild) {
     let _ = std::thread::Builder::new()
         .name("oxidezap-daemon-wait".to_string())
         .spawn(move || {
-            let _ = child.wait();
-            // Gone, and its number may be somebody else's by now: forget it,
-            // so nothing signals a process that merely inherited the id.
-            let _ = STARTED_DAEMON.compare_exchange(
-                pid,
-                0,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            loop {
+                let running = matches!(
+                    child.lock().unwrap_or_else(|e| e.into_inner()).try_wait(),
+                    Ok(None)
+                );
+                if !running {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            let mut startup = DAEMON_STARTUP.lock().unwrap_or_else(|e| e.into_inner());
+            if startup
+                .child
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &child))
+            {
+                startup.child = None;
+            }
         });
 }
 
@@ -679,39 +673,45 @@ mod tests {
     }
 }
 
-/// The daemon this window started, by process id, or zero. Kept so a window
-/// that is closed before it ever attached can still stop what it started.
-static STARTED_DAEMON: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+type DaemonChild = Arc<std::sync::Mutex<std::process::Child>>;
 
-/// Ask the daemon this window started to stop, without a connection to ask it
-/// through. For the one case where there is none: the window closed while the
-/// daemon was still coming up. A daemon that was already running is not ours
-/// to stop this way, and nothing is done for it.
+struct DaemonStartup {
+    closing: bool,
+    child: Option<DaemonChild>,
+}
+
+static DAEMON_STARTUP: std::sync::Mutex<DaemonStartup> = std::sync::Mutex::new(DaemonStartup {
+    closing: false,
+    child: None,
+});
+
 pub fn terminate_started_daemon() {
-    let pid = STARTED_DAEMON.swap(0, std::sync::atomic::Ordering::SeqCst);
-    if pid == 0 {
+    let mut startup = DAEMON_STARTUP.lock().unwrap_or_else(|e| e.into_inner());
+    startup.closing = true;
+    let Some(child) = startup.child.take() else {
+        return;
+    };
+    let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
+    if !matches!(child.try_wait(), Ok(None)) {
         return;
     }
-    // Asked of the system rather than assumed: the id was ours when it was
-    // saved, and only a process still called the daemon is signalled.
+    // Hold the child lock until the signal is sent so the reaper cannot
+    // release the PID between checking the child and signalling it.
     #[cfg(unix)]
-    {
-        let named = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-            .ok()
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .is_some_and(|name| name.trim().ends_with("oxidezapd"));
-        if !named {
-            return;
-        }
-    }
-    #[cfg(unix)]
-    if let Err(error) = std::process::Command::new("kill")
+    let result = std::process::Command::new("kill")
         .arg("-TERM")
-        .arg(pid.to_string())
+        .arg(child.id().to_string())
         .status()
-    {
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(status.to_string()))
+            }
+        });
+    #[cfg(windows)]
+    let result = child.kill();
+    if let Err(error) = result {
         log::warn!("could not stop the daemon this window started: {error}");
     }
 }

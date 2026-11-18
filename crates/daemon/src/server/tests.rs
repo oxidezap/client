@@ -2678,3 +2678,15 @@ async fn scoped_wire_hello_confirms_successor_and_never_rebinds_after_selection_
     );
     served.abort();
 }
+
+#[test]
+fn close_request_belongs_to_the_departing_control_window() {
+    let mut windows = super::ControlWindows::default();
+    assert!(windows.attach());
+    assert!(windows.attach());
+    assert!(!windows.detach(true));
+    assert!(!windows.detach(false));
+    assert!(windows.attach());
+    assert!(windows.detach(true));
+    assert!(!windows.attach());
+}

@@ -20,7 +20,6 @@
 //! loop in `main`.
 
 mod fanout;
-pub(crate) use fanout::stop_when_no_windows;
 mod store;
 
 use std::sync::Arc;
