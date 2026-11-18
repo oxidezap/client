@@ -1207,6 +1207,20 @@ pub fn set(key: &str, value: &str) -> Outcome {
     })
 }
 
+/// Store a value and wait for the backing store to accept the write.
+///
+/// Shares the normal storage write limit. A refused change is not queued.
+pub fn set_durable(key: &str, value: &str) -> Outcome {
+    Outcome::of(unsafe {
+        raw::kv_set_durable(
+            raw::at(key.as_bytes()),
+            key.len() as i32,
+            raw::at(value.as_bytes()),
+            value.len() as i32,
+        )
+    })
+}
+
 /// A plugin's own small store, in the shapes a plugin actually keeps.
 ///
 /// Values are strings on the wire, because that is what the ABI carries. The

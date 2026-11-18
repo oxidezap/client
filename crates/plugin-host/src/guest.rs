@@ -940,44 +940,60 @@ fn link_acting(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         },
     )?;
 
-    linker.func_wrap(
-        m,
-        abi::imports::KV_SET,
-        |mut c: Caller<'_, Guest>, key: i32, key_len: i32, val: i32, val_len: i32| -> i32 {
-            if !c.data().allows(abi::caps::STORAGE) {
-                return abi::outcome::DENIED;
-            }
-            // Refused from the *lengths*, before either string is copied. The
-            // store rejects an oversized entry anyway, but by then the host
-            // has already allocated and copied up to 64 KiB twice — a cost
-            // charged as one fixed-price wasm call, so a loop turns a fuel
-            // budget into allocation traffic the sandbox never sees.
-            let too_big = |len: i32| !(0..=(crate::kv::MAX_ENTRY as i32)).contains(&len);
-            if too_big(key_len) || too_big(val_len) {
-                return abi::outcome::REFUSED;
-            }
-            // And the same question about the call as a whole. One entry is
-            // bounded; the number of them was not, so a loop rewriting one
-            // key kept nothing and still moved as much memory as it liked —
-            // the store's budget bounds what is *kept*, and this bounds what
-            // is copied to keep it.
-            let spent = &mut c.data_mut().kv_bytes;
-            let asked = key_len as usize + val_len as usize;
-            if asked > MAX_KV_BYTES_PER_CALL.saturating_sub(*spent) {
-                return abi::outcome::REFUSED;
-            }
-            *spent += asked;
-            let [key, value] = match read_strs(&mut c, [(key, key_len), (val, val_len)]) {
-                Ok(read) => read,
-                Err(code) => return code,
-            };
-            if c.data_mut().kv.set(&key, &value) {
-                abi::outcome::ACCEPTED
-            } else {
-                abi::outcome::REFUSED
-            }
-        },
-    )?;
+    for (name, durable) in [
+        (abi::imports::KV_SET, false),
+        (abi::imports::KV_SET_DURABLE, true),
+    ] {
+        linker.func_wrap(
+            m,
+            name,
+            move |mut c: Caller<'_, Guest>,
+                  key: i32,
+                  key_len: i32,
+                  val: i32,
+                  val_len: i32|
+                  -> i32 {
+                if !c.data().allows(abi::caps::STORAGE) {
+                    return abi::outcome::DENIED;
+                }
+                // Refused from the *lengths*, before either string is copied. The
+                // store rejects an oversized entry anyway, but by then the host
+                // has already allocated and copied up to 64 KiB twice — a cost
+                // charged as one fixed-price wasm call, so a loop turns a fuel
+                // budget into allocation traffic the sandbox never sees.
+                let too_big = |len: i32| !(0..=(crate::kv::MAX_ENTRY as i32)).contains(&len);
+                if too_big(key_len) || too_big(val_len) {
+                    return abi::outcome::REFUSED;
+                }
+                // And the same question about the call as a whole. One entry is
+                // bounded; the number of them was not, so a loop rewriting one
+                // key kept nothing and still moved as much memory as it liked —
+                // the store's budget bounds what is *kept*, and this bounds what
+                // is copied to keep it.
+                let spent = &mut c.data_mut().kv_bytes;
+                let asked = key_len as usize + val_len as usize;
+                if asked > MAX_KV_BYTES_PER_CALL.saturating_sub(*spent) {
+                    return abi::outcome::REFUSED;
+                }
+                *spent += asked;
+                let [key, value] = match read_strs(&mut c, [(key, key_len), (val, val_len)]) {
+                    Ok(read) => read,
+                    Err(code) => return code,
+                };
+                let kv = &mut c.data_mut().kv;
+                let stored = if durable {
+                    kv.set_durable(&key, &value)
+                } else {
+                    kv.set(&key, &value)
+                };
+                if stored {
+                    abi::outcome::ACCEPTED
+                } else {
+                    abi::outcome::REFUSED
+                }
+            },
+        )?;
+    }
 
     linker.func_wrap(
         m,

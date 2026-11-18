@@ -1170,6 +1170,7 @@ fn the_schedule_plugin_submits_chat_forms_and_cancels_pending_messages() {
             .roots_in(PluginSlot::Settings)
             .any(|root| root.children.iter().any(|child| child.id == "cancel-1"))
     });
+    std::thread::sleep(Duration::from_millis(1100));
     plugins.act(&PluginAction {
         plugin: "schedule".into(),
         action: "cancel-1".into(),
@@ -1185,6 +1186,7 @@ fn the_schedule_plugin_submits_chat_forms_and_cancels_pending_messages() {
     });
     assert!(commands.sent().is_empty());
 
+    std::thread::sleep(Duration::from_millis(1100));
     assert!(plugins.approve("schedule", true));
     let due = wacore::time::now_utc() + Duration::from_secs(3);
     plugins.act(&PluginAction {

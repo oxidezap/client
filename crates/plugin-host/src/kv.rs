@@ -179,6 +179,37 @@ impl Kv {
         true
     }
 
+    /// Replace one entry and acknowledge only after the backing store writes it.
+    pub fn set_durable(&mut self, key: &str, value: &str) -> bool {
+        if !self.store.keeps_answers()
+            || self
+                .wrote_at
+                .is_some_and(|at| at.elapsed() < MIN_WRITE_INTERVAL)
+        {
+            return false;
+        }
+        let previous = self.entries.get(key).cloned();
+        let dirty = self.dirty;
+        let bytes = self.bytes;
+        if !self.set(key, value) {
+            return false;
+        }
+        self.write_out();
+        if !self.dirty {
+            return true;
+        }
+
+        // A failed write must not turn into a delayed commit of a rejected change.
+        if let Some(previous) = previous {
+            self.entries.insert(key.to_owned(), previous);
+        } else {
+            self.entries.remove(key);
+        }
+        self.dirty = dirty;
+        self.bytes = bytes;
+        false
+    }
+
     /// Write out whatever the call changed, if it changed anything.
     ///
     /// Called once when a wasm call returns, which is what bounds the I/O a
@@ -391,6 +422,28 @@ mod tests {
         // And nothing is lost: the plugin stopping writes what is pending.
         kv.flush_pending();
         assert_eq!(Kv::open(files(&dir.0), "p").get("k"), Some("second"));
+    }
+
+    #[test]
+    fn durable_writes_acknowledge_persistence_and_refusals_preserve_the_entry() {
+        let dir = TempDir::new("durable");
+        let mut kv = Kv::open(files(&dir.0), "p");
+        assert!(kv.set_durable("k", "committed"));
+        assert_eq!(Kv::open(files(&dir.0), "p").get("k"), Some("committed"));
+        assert!(!kv.set_durable("k", "too soon"));
+        assert_eq!(kv.get("k"), Some("committed"));
+
+        let blocked = dir.0.join("blocked");
+        std::fs::write(&blocked, "").unwrap();
+        let mut kv = Kv::open(files(&blocked), "p");
+        assert!(kv.set("k", "buffered"));
+        assert!(!kv.set_durable("k", "write failed"));
+        assert_eq!(kv.get("k"), Some("buffered"));
+        assert!(kv.due_at().is_some());
+
+        let mut memory_only = Kv::open(Arc::new(crate::store::Nowhere), "p");
+        assert!(!memory_only.set_durable("k", "no backing store"));
+        assert_eq!(memory_only.get("k"), None);
     }
 
     #[test]

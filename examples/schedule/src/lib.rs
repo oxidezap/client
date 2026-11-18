@@ -8,6 +8,7 @@ plugin!(init = setup, event = handle, panic = own);
 
 const STORE: &str = "messages";
 const TICK: i64 = 1;
+const MAX_QUEUE_BYTES: usize = 8192;
 const MAX_JOBS: usize = 8;
 const MAX_MESSAGE: usize = 512;
 const POLL_MS: i64 = 5_000;
@@ -21,7 +22,7 @@ struct Job {
     attempting: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Queue {
     last_id: u64,
     jobs: Vec<Job>,
@@ -44,7 +45,7 @@ fn setup(p: Setup) -> impl Declared {
 }
 
 fn read_queue() -> Result<Queue, &'static str> {
-    let stored = oxidezap_plugin::get::<8192>(STORE);
+    let stored = oxidezap_plugin::get::<MAX_QUEUE_BYTES>(STORE);
     let Some(raw) = stored.whole().filter(|_| !stored.refused()) else {
         return if stored.refused() || stored.present() {
             Err("The schedule could not be read.")
@@ -58,12 +59,20 @@ fn read_queue() -> Result<Queue, &'static str> {
     serde_json::from_str(raw).map_err(|_| "The stored schedule could not be read.")
 }
 
-fn save(queue: &Queue) -> Result<(), &'static str> {
+fn save(queue: &Queue, durable: bool) -> Result<(), &'static str> {
     let raw = serde_json::to_string(queue).map_err(|_| "The schedule could not be saved.")?;
-    if oxidezap_plugin::set(STORE, &raw) == Outcome::Accepted {
+    if raw.len() > MAX_QUEUE_BYTES {
+        return Err("The schedule is past its storage limit.");
+    }
+    let outcome = if durable {
+        oxidezap_plugin::set_durable(STORE, &raw)
+    } else {
+        oxidezap_plugin::set(STORE, &raw)
+    };
+    if outcome == Outcome::Accepted {
         Ok(())
     } else {
-        Err("The schedule could not be saved.")
+        Err("The schedule could not be saved. Try again in a moment.")
     }
 }
 
@@ -95,7 +104,7 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         .and_then(|id| id.parse::<u64>().ok())
     {
         queue.jobs.retain(|job| job.id != id);
-        save(queue)?;
+        save(queue, true)?;
         return Ok("Removed from the schedule.");
     }
     if !chat_supported(jid) {
@@ -135,7 +144,7 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         at,
         attempting: false,
     });
-    save(queue)?;
+    save(queue, true)?;
     Ok("Message scheduled. Manage it in the plugin settings.")
 }
 
@@ -153,7 +162,7 @@ fn tick(queue: &mut Queue) -> Result<bool, &'static str> {
     };
     // A restart between this write and the send cannot replay an uncertain send.
     queue.jobs[index].attempting = true;
-    save(queue)?;
+    save(queue, true)?;
     let job = &queue.jobs[index];
     match oxidezap_plugin::send_text(&job.jid, &job.text) {
         Outcome::Accepted => {
@@ -164,27 +173,26 @@ fn tick(queue: &mut Queue) -> Result<bool, &'static str> {
         }
         Outcome::Invalid | Outcome::State => return Ok(true),
     }
-    save(queue)?;
+    save(queue, false)?;
     Ok(true)
 }
 
 fn handle(event: &Event) {
     match event.which() {
         Which::Action(action) => {
-            let mut queue = read_queue();
-            let status = match queue.as_mut() {
-                Ok(queue) => match edit_queue(action, queue) {
-                    Ok(status) | Err(status) => status,
-                },
-                Err(error) => error,
-            };
-            draw(&queue, status);
+            let queue = read_queue();
+            let mut proposed = queue.clone();
+            match proposed.as_mut().map(|queue| edit_queue(action, queue)) {
+                Ok(Ok(status)) => draw(&proposed, status),
+                Ok(Err(error)) => draw(&queue, error),
+                Err(error) => draw(&queue, error),
+            }
         }
         Which::Timer(timer) if timer.token() == TICK => {
             let mut queue = read_queue();
             match queue.as_mut().map(tick) {
                 Ok(Ok(true)) => draw(&queue, ""),
-                Ok(Err(error)) => draw(&queue, error),
+                Ok(Err(error)) => draw(&read_queue(), error),
                 _ => {}
             }
             oxidezap_plugin::after(POLL_MS, TICK);
@@ -311,6 +319,30 @@ mod tests {
         host.set_now_ms(100);
         host.deliver(In::timer(TICK), handle);
         assert!(host.sent().is_empty());
+    }
+
+    #[test]
+    fn an_oversized_serialized_queue_does_not_publish_an_unsaved_job() {
+        let mut host = Host::new();
+        host.init(setup);
+        let value = serde_json::json!({"message": "\0".repeat(512), "when": "1"}).to_string();
+        for n in 0..3 {
+            host.set_now_ms(n * 60_000);
+            host.deliver(
+                In::action("schedule", &value).str(abi::fields::CHAT_JID, CHAT),
+                handle,
+            );
+        }
+        let saved: Queue = serde_json::from_str(&host.stored(STORE).unwrap()).unwrap();
+        assert_eq!(saved.jobs.len(), 2);
+        let tree = host.ui().unwrap().unwrap();
+        assert_eq!(
+            tree.iter()
+                .flat_map(|node| &node.children)
+                .filter(|node| node.id.starts_with("cancel-"))
+                .count(),
+            2
+        );
     }
 
     #[test]
