@@ -6,6 +6,7 @@
 //! keyed by what it is about and a key always reaches the same lane, which is
 //! what [`EventLanes`] is.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -167,30 +168,40 @@ pub(super) fn split_by_subject(event: &Arc<Event>) -> Vec<Arc<Event>> {
     let Event::Messages(batch) = &**event else {
         return vec![Arc::clone(event)];
     };
-    let mut chats: Vec<String> = Vec::new();
-    for inbound in batch.iter() {
-        let chat = inbound.info.source.chat.to_string();
-        if !chats.contains(&chat) {
-            chats.push(chat);
-        }
-    }
-    if chats.len() <= 1 {
+    let Some(first) = batch.iter().next() else {
+        return vec![Arc::clone(event)];
+    };
+    let first_chat = &first.info.source.chat;
+    if batch
+        .iter()
+        .skip(1)
+        .all(|inbound| inbound.info.source.chat.display_eq_jid(first_chat))
+    {
         return vec![Arc::clone(event)];
     }
-    chats
+
+    let mut slots = HashMap::new();
+    let mut groups = Vec::<Vec<_>>::new();
+    for inbound in batch.iter() {
+        let slot = slots
+            .entry(inbound.info.source.chat.to_string())
+            .or_insert_with(|| {
+                let slot = groups.len();
+                groups.push(Vec::new());
+                slot
+            });
+        groups[*slot].push(inbound.clone());
+    }
+    groups
         .into_iter()
-        .map(|chat| {
-            let messages: Arc<[whatsapp_rust::wacore::types::events::InboundMessage]> = batch
-                .iter()
-                .filter(|inbound| inbound.info.source.chat.to_string() == chat)
-                .cloned()
-                .collect();
+        .map(|messages| {
             // The origin travels with every part: it says how the batch was
             // delivered, which is as true of one chat's share of it as of the
             // whole, and it is what decides whether media is fetched eagerly.
             Arc::new(Event::Messages(
                 whatsapp_rust::wacore::types::events::MessageBatch::builder()
-                    .messages(messages)
+                    .messages(messages.into())
+                    .hook_committed(batch.hook_committed)
                     .origin(batch.origin)
                     .build(),
             ))
