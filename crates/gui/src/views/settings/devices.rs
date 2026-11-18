@@ -2,6 +2,7 @@
 use super::panes::{group, label};
 use crate::app::WhatsAppApp;
 use crate::theme::Metrics;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{App, Entity, IntoElement, ParentElement, Styled, div, img};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _};
@@ -101,6 +102,20 @@ fn supported_mode(mode: CameraMode) -> bool {
     .is_ok()
 }
 
+fn camera_modes(cameras: &[CallDevice], selected: Option<&str>) -> Vec<CameraMode> {
+    let camera = match selected {
+        Some(id) => cameras.iter().find(|camera| camera.id == id),
+        None => cameras.iter().find(|camera| camera.is_default),
+    };
+    let mut modes = camera
+        .map(|camera| camera.modes.clone())
+        .unwrap_or_default();
+    modes.retain(|mode| supported_mode(*mode));
+    modes.sort_by_key(|mode| (mode.width, mode.height, mode.fps));
+    modes.dedup();
+    modes
+}
+
 pub fn render(
     app: &WhatsAppApp,
     entity: Entity<WhatsAppApp>,
@@ -120,18 +135,8 @@ pub fn render(
     let confirm = entity.clone();
     let cancel = entity.clone();
     let active = app.camera_preview_active(cx);
-    let camera = preferences
-        .camera
-        .as_ref()
-        .and_then(|id| inventory.cameras.iter().find(|d| &d.id == id))
-        .or_else(|| inventory.cameras.iter().find(|d| d.is_default));
-    let mut modes = camera.map(|d| d.modes.clone()).unwrap_or_default();
-    modes.retain(|mode| supported_mode(*mode));
-    modes.sort_by_key(|m| (m.width, m.height, m.fps));
-    modes.dedup();
-    if modes.is_empty() {
-        modes.push(CameraMode::default());
-    }
+    let modes = camera_modes(&inventory.cameras, preferences.camera.as_deref());
+    let modes_unavailable = modes.is_empty();
     let mut content = div().flex().flex_col().gap(m.space_xl())
         .child(div().text_size(m.text_small()).text_color(cx.theme().muted_foreground).child(crate::tr!(PreferencesApplyToYourNextCallTestEachDeviceBeforeCallingDeviceTestsAccessOnlyTheDeviceYou)))
         .child(Button::new("refresh-call-devices").label(crate::tr!(RefreshDevices)).outline().disabled(busy || active).on_click(move |_, _, cx| refresh.update(cx, |app, cx| app.refresh_call_devices(cx))))
@@ -150,6 +155,10 @@ pub fn render(
             let entity = entity.clone(); let mut p = preferences.clone(); p.camera_mode = mode;
             Button::new(gpui::SharedString::from(format!("camera-mode-{index}"))).label(format!("{} × {} · {} FPS", mode.width, mode.height, mode.fps)).outline().small().selected(preferences.camera_mode == mode).disabled(edits_disabled).on_click(move |_, _, cx| { let p = p.clone(); entity.update(cx, |app, cx| app.save_call_devices(p, cx)); })
         })), m))
+        .when(modes_unavailable, |content| content.child(
+            div().text_size(m.text_small()).text_color(cx.theme().muted_foreground)
+                .child(crate::tr!(CameraModesUnavailable))
+        ))
         .child(div().text_size(m.text_small()).child(crate::tr!(requested_camera, preferences.camera_mode.width, preferences.camera_mode.height, preferences.camera_mode.fps)))
         .child(Button::new("camera-preview").label(if active { crate::tr!(StopCameraPreview) } else { crate::tr!(PreviewCamera) }).outline().disabled((busy || !ready) && !active).on_click(move |_, _, cx| preview.update(cx, |app, cx| if active { app.cancel_camera_preview(cx); } else { app.start_camera_preview(cx); })));
     if let Some(image) = app.camera_preview_image(cx) {
@@ -206,6 +215,37 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn camera_modes_are_from_the_selected_device() {
+        let default = CameraMode::default();
+        let selected = CameraMode { fps: 15, ..default };
+        let cameras = [
+            CallDevice {
+                id: "default".into(),
+                label: "Default".into(),
+                is_default: true,
+                modes: vec![default],
+            },
+            CallDevice {
+                id: "usb".into(),
+                label: "USB".into(),
+                is_default: false,
+                modes: vec![selected, selected],
+            },
+            CallDevice {
+                id: "busy".into(),
+                label: "Busy".into(),
+                is_default: false,
+                modes: vec![],
+            },
+        ];
+
+        assert_eq!(camera_modes(&cameras, None), vec![default]);
+        assert_eq!(camera_modes(&cameras, Some("usb")), vec![selected]);
+        assert!(camera_modes(&cameras, Some("removed")).is_empty());
+        assert!(camera_modes(&cameras, Some("busy")).is_empty());
+    }
+
     #[test]
     fn choices_follow_the_capture_codecs_mode_limits() {
         assert!(!supported_mode(CameraMode {
