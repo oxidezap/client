@@ -84,58 +84,57 @@ impl ChatStore {
             .await?;
         Ok(deadline.due)
     }
-}
 
-impl ChatStore {
     pub async fn scheduled_messages(
         &self,
         jid: String,
     ) -> Result<Vec<oxidezap_core::ScheduledMessage>> {
-        #[derive(QueryableByName)]
-        struct ScheduledRow {
-            #[diesel(sql_type = BigInt)]
-            id: i64,
-            #[diesel(sql_type = Text)]
-            preview: String,
-            #[diesel(sql_type = BigInt)]
-            send_at_ms: i64,
-        }
+        use crate::schema::scheduled_messages as scheduled;
 
         let account = self.device_id();
         let rows = self
             .db()
             .read(move |conn| {
-                diesel::sql_query(
-                    "SELECT id, substr(text, 1, 120) AS preview, send_at_ms FROM scheduled_messages
-                 WHERE device_id = ? AND jid = ? ORDER BY send_at_ms, id",
-                )
-                .bind::<Integer, _>(account)
-                .bind::<Text, _>(jid)
-                .load::<ScheduledRow>(conn)
-                .map_err(db_err)
+                let keys = crate::lid::chat_key_candidates(conn, account, &jid).map_err(db_err)?;
+                scheduled::table
+                    .filter(scheduled::device_id.eq(account))
+                    .filter(scheduled::jid.eq_any(keys))
+                    .order((scheduled::send_at_ms.asc(), scheduled::id.asc()))
+                    .select((
+                        scheduled::id,
+                        diesel::dsl::sql::<Text>("substr(text, 1, 120)"),
+                        scheduled::send_at_ms,
+                    ))
+                    .load::<(i64, String, i64)>(conn)
+                    .map_err(db_err)
             })
             .await?;
         Ok(rows
             .into_iter()
-            .map(|row| oxidezap_core::ScheduledMessage {
-                id: row.id,
-                preview: row.preview,
-                send_at_ms: row.send_at_ms,
-            })
+            .map(
+                |(id, preview, send_at_ms)| oxidezap_core::ScheduledMessage {
+                    id,
+                    preview,
+                    send_at_ms,
+                },
+            )
             .collect())
     }
 
     pub async fn cancel_scheduled_message(&self, jid: String, id: i64) -> Result<bool> {
+        use crate::schema::scheduled_messages as scheduled;
+
         let account = self.device_id();
         let removed = self
             .db()
             .run(move |conn| {
-                diesel::sql_query(
-                    "DELETE FROM scheduled_messages WHERE device_id = ? AND jid = ? AND id = ?",
+                let keys = crate::lid::chat_key_candidates(conn, account, &jid).map_err(db_err)?;
+                diesel::delete(
+                    scheduled::table
+                        .filter(scheduled::device_id.eq(account))
+                        .filter(scheduled::id.eq(id))
+                        .filter(scheduled::jid.eq_any(keys)),
                 )
-                .bind::<Integer, _>(account)
-                .bind::<Text, _>(jid)
-                .bind::<BigInt, _>(id)
                 .execute(conn)
                 .map_err(db_err)
             })

@@ -189,3 +189,13 @@ diesel::table! {
         received_at_ms -> BigInt,
     }
 }
+
+diesel::table! {
+    scheduled_messages (id) {
+        id -> BigInt,
+        device_id -> Integer,
+        jid -> Text,
+        text -> Text,
+        send_at_ms -> BigInt,
+    }
+}

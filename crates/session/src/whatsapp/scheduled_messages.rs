@@ -49,9 +49,7 @@ impl WhatsAppClient {
             .await
             .map_err(|error| error.to_string())
     }
-}
 
-impl WhatsAppClient {
     pub fn scheduled_messages(
         &self,
         jid: String,

@@ -95,3 +95,22 @@ async fn cancellation_and_reset_only_affect_the_owning_account() {
         Some((PEER.into(), "retain me".into()))
     );
 }
+
+#[tokio::test]
+async fn a_chat_can_cancel_a_send_scheduled_under_its_previous_address() {
+    let (device, queue) = test_store().await;
+    queue
+        .schedule_message(PEER.into(), "pending before migration".into(), 100)
+        .await
+        .unwrap();
+    add_lid_mapping(&device).await;
+    let rows = queue.scheduled_messages(PEER_LID.into()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        queue
+            .cancel_scheduled_message(PEER_LID.into(), rows[0].id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(queue.take_scheduled_message(100).await.unwrap(), None);
+}
