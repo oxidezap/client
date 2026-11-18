@@ -704,7 +704,7 @@ impl Drop for ControlWindow {
         if CONTROL_WINDOWS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .detach(self.stop_on_close && !oxidezap_ipc::background::keep_running())
+            .detach(self.stop_on_close && !crate::window::keeps_daemon_running())
         {
             crate::shutdown::request("last window closed");
         }
