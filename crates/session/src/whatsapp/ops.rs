@@ -618,6 +618,11 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            // Reject an unusable account audience before the upload. Resolve it
+            // again afterwards because privacy and LID mappings can change meanwhile.
+            if explicit.is_empty() {
+                status_audience(&live.client, &live.chat_store, Vec::new()).await?;
+            }
             let data = match crate::exec::unblock(take).await {
                 Ok(Some(data)) if !data.is_empty() => data,
                 Ok(_) => return Err("nothing staged for that status; stage it first".to_string()),
