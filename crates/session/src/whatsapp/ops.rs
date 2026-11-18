@@ -115,19 +115,47 @@ pub struct BackfillReport {
     pub files: Vec<BackfillFile>,
 }
 
-async fn audience_phone_number(
-    client: &std::sync::Arc<whatsapp_rust::Client>,
-    jid: &Jid,
-) -> Result<String, String> {
-    if jid.is_pn() {
-        return Ok(jid.user.to_string());
+async fn status_exclusion_audience<Fut: std::future::Future<Output = Result<Jid, String>>>(
+    book: Vec<Jid>,
+    excluded: Vec<Jid>,
+    lookup_lid: impl Fn(Jid) -> Fut,
+) -> Result<Vec<Jid>, String> {
+    use futures_util::{StreamExt as _, TryStreamExt as _};
+    use std::collections::{HashMap, HashSet};
+
+    if excluded.is_empty() {
+        return Ok(book);
     }
-    client
-        .get_lid_pn_entry(jid)
-        .await
-        .map_err(|_| "could not verify a status recipient's identity")?
-        .map(|entry| entry.phone_number.to_string())
-        .ok_or_else(|| "could not verify a status recipient's phone number".into())
+
+    // The sender resolves PN addresses again. Use the same LID for checking
+    // exclusions and delivering, even if the mapping changes during upload.
+    let phones: HashSet<_> = book
+        .iter()
+        .chain(&excluded)
+        .filter(|jid| jid.is_pn())
+        .map(Jid::to_non_ad)
+        .collect();
+    let lids: HashMap<_, _> = futures_util::stream::iter(phones)
+        .map(|phone| {
+            let lookup = lookup_lid(phone.clone());
+            async move {
+                let lid = lookup.await?;
+                Ok::<_, String>((phone, lid))
+            }
+        })
+        .buffer_unordered(16)
+        .try_collect()
+        .await?;
+    let canonical = |jid: Jid| {
+        let jid = jid.to_non_ad();
+        lids.get(&jid).cloned().unwrap_or(jid)
+    };
+    let excluded: HashSet<_> = excluded.into_iter().map(canonical).collect();
+    Ok(book
+        .into_iter()
+        .map(canonical)
+        .filter(|jid| !excluded.contains(jid))
+        .collect())
 }
 
 /// Who a status goes to, and under which setting.
@@ -195,37 +223,14 @@ async fn status_audience(
         Some(1) => {
             let listed = listed()?;
             let book = book().await?;
-            let audience = if listed.is_empty() {
-                book
-            } else {
-            // Compared as people, not as addresses: a contact saved under a
-            // phone number and the same person excluded under a LID share no
-            // digits, and comparing the raw users would send the status to
-            // someone the account said not to.
-            use futures_util::{StreamExt as _, TryStreamExt as _};
-            const LOOKUPS: usize = 16;
-            let identities: std::collections::HashSet<_> = listed
-                .iter()
-                .chain(&book)
-                .map(Jid::to_non_ad_string)
-                .collect();
-            let keys: std::collections::HashMap<String, String> =
-                futures_util::stream::iter(identities)
-                    .map(|address| async move {
-                        let jid = address.parse::<Jid>().map_err(|e| e.to_string())?;
-                        let key = audience_phone_number(client, &jid).await?;
-                        Ok::<_, String>((address, key))
-                    })
-                    .buffer_unordered(LOOKUPS)
-                    .try_collect()
-                    .await?;
-            let excluded: std::collections::HashSet<_> =
-                listed.iter().map(|jid| &keys[&jid.to_non_ad_string()]).collect();
-            book
-                .into_iter()
-                .filter(|jid| !excluded.contains(&keys[&jid.to_non_ad_string()]))
-                .collect()
-            };
+            let audience = status_exclusion_audience(book, listed, |phone| async move {
+                client
+                    .get_lid_pn_entry(&phone)
+                    .await
+                    .map_err(|_| "could not verify a status recipient's identity")?
+                    .map(|entry| Jid::lid(entry.lid.as_ref()))
+                    .ok_or_else(|| "could not verify a status recipient's linked identity".into())
+            }).await?;
             (audience, StatusPrivacySetting::DenyList)
         }
         Some(0) => (listed()?, StatusPrivacySetting::AllowList),
@@ -239,6 +244,9 @@ async fn status_audience(
             );
         }
     };
+    if setting != client.status().audience() {
+        return Err("status privacy changed while preparing the audience; try again".into());
+    }
     if audience.is_empty() {
         return Err(
             "there is nobody to share this status with: your status privacy setting selects no contacts"
@@ -610,8 +618,6 @@ impl WhatsAppClient {
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let (recipients, privacy) =
-                status_audience(&live.client, &live.chat_store, explicit).await?;
             let data = match crate::exec::unblock(take).await {
                 Ok(Some(data)) if !data.is_empty() => data,
                 Ok(_) => return Err("nothing staged for that status; stage it first".to_string()),
@@ -636,6 +642,8 @@ impl WhatsAppClient {
                 Ok(response) => super::outgoing::Uploaded::from(response),
                 Err(e) => return Err(e.to_string()),
             };
+            let (recipients, privacy) =
+                status_audience(&live.client, &live.chat_store, explicit).await?;
             let message = super::outgoing::message(&file, shape, uploaded, None);
             let result = live
                 .client
@@ -1488,5 +1496,42 @@ fn channel_view_of(meta: whatsapp_rust::features::NewsletterMetadata) -> Channel
         description: meta.description,
         subscriber_count: meta.subscriber_count,
         picture_url: meta.picture_url,
+    }
+}
+
+#[cfg(test)]
+mod status_exclusion_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn excludes_by_lid_without_resolving_lid_addresses() {
+        let excluded = Jid::lid("10000000001");
+        let allowed = Jid::lid("10000000002");
+        let book = vec![Jid::lid_device("10000000001", 1), allowed.clone()];
+        let audience = status_exclusion_audience(book, vec![excluded], |_| async {
+            panic!("a LID audience does not require a lookup")
+        })
+        .await
+        .unwrap();
+        assert_eq!(audience, vec![allowed]);
+    }
+
+    #[tokio::test]
+    async fn passes_the_checked_lids_to_delivery() {
+        let blocked_phone = Jid::pn("15550000001");
+        let allowed_phone = Jid::pn("15550000002");
+        let blocked = Jid::lid("10000000001");
+        let allowed = Jid::lid("10000000002");
+        let book = vec![blocked_phone.clone(), allowed_phone];
+        let audience = status_exclusion_audience(book, vec![blocked.clone()], |phone| {
+            std::future::ready(Ok(if phone == blocked_phone {
+                blocked.clone()
+            } else {
+                allowed.clone()
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(audience, vec![allowed]);
     }
 }
