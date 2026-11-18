@@ -120,21 +120,16 @@ pub mod slot {
     pub const NONE: u8 = 0;
     /// Beside the conversation's name. The action carries the open chat.
     pub const CHAT_HEADER: u8 = 1;
+    /// A panel next to the composer. The action carries the open chat.
+    pub const COMPOSER: u8 = 2;
     /// A section of the Settings screen, which is where a plugin's own
     /// configuration belongs.
     pub const SETTINGS: u8 = 3;
 
-    // 2 is reserved for the composer, which is not drawn yet. It is *not*
-    // defined here for that reason: a slot the front end silently ignores is
-    // a button whose author never finds out why it did not appear, which is
-    // the same failure `ParseError::Misplaced` exists to refuse. A slot
-    // arrives when something draws it, and arriving is a new constant — an
-    // addition, not a change.
-
     /// Whether a byte names a slot this format defines.
     #[must_use]
     pub const fn is_known(slot: u8) -> bool {
-        matches!(slot, CHAT_HEADER | SETTINGS)
+        matches!(slot, CHAT_HEADER | COMPOSER | SETTINGS)
     }
 }
 
@@ -943,8 +938,7 @@ mod tests {
     fn a_slot_this_build_does_not_draw_is_refused() {
         let mut bytes = vec![FORMAT];
         bytes.extend_from_slice(&1u32.to_le_bytes());
-        // 2 is reserved for the composer, which nothing renders yet.
-        bytes.extend_from_slice(&[kind::BUTTON, 2, flags::ENABLED, 0]);
+        bytes.extend_from_slice(&[kind::BUTTON, 4, flags::ENABLED, 0]);
         bytes.extend_from_slice(&0u16.to_le_bytes());
         for text in ["b", "B", ""] {
             bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
@@ -954,7 +948,7 @@ mod tests {
             parse(&bytes),
             Err(ParseError::Unknown {
                 kind: kind::BUTTON,
-                slot: 2
+                slot: 4
             })
         );
     }

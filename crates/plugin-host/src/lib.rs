@@ -954,7 +954,7 @@ impl Live {
         // produce, so both are somebody else's client rather than a person
         // pressing something.
         let chat = match (action.slot, action.chat_jid.as_deref()) {
-            (PluginSlot::ChatHeader, Some(jid)) if !jid.is_empty() => jid,
+            (PluginSlot::ChatHeader | PluginSlot::Composer, Some(jid)) if !jid.is_empty() => jid,
             (PluginSlot::Settings, None) => "",
             (slot, _) => {
                 log::debug!(

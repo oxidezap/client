@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 pub enum PluginSlot {
     /// Beside the conversation's name.
     ChatHeader,
+    /// Tools shown beside the conversation composer.
+    Composer,
     /// A section of the Settings screen.
     Settings,
 }

@@ -83,7 +83,7 @@ const MAX_FIELD_BYTES: usize = 64 * 1024;
 /// gone for a context it never had.
 fn key(plugin: &str, slot: PluginSlot, chat: Option<&str>, id: &str) -> FieldKey {
     let chat = match slot {
-        PluginSlot::ChatHeader => chat,
+        PluginSlot::ChatHeader | PluginSlot::Composer => chat,
         PluginSlot::Settings => None,
     };
     FieldKey {
@@ -378,7 +378,9 @@ impl WhatsAppApp {
                     // what it was. Clicking elsewhere, tabbing away and
                     // closing the screen all blur the box, and all of them
                     // now commit what is in it.
-                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    InputEvent::PressEnter { .. } | InputEvent::Blur
+                        if commit_slot != PluginSlot::Composer =>
+                    {
                         this.commit_plugin_field(&commit_plugin, commit_slot, &commit_id, cx);
                     }
                     _ => {}
@@ -704,6 +706,30 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    fn composer_form(&self, plugin: &str, cx: &App) -> Option<String> {
+        let surface = self
+            .plugins(cx)
+            .iter()
+            .find(|surface| surface.id == plugin)?;
+        let mut fields = Vec::new();
+        for node in surface.roots_in(PluginSlot::Composer) {
+            collect_fields(plugin, PluginSlot::Composer, node, &mut fields);
+        }
+        let mut values = std::collections::BTreeMap::new();
+        let mut remaining = MAX_FIELD_BYTES;
+        for field in fields {
+            let value = self
+                .plugin_field(plugin, PluginSlot::Composer, &field.id, cx)?
+                .read(cx)
+                .value();
+            remaining = remaining.checked_sub(field.id.len() + value.len())?;
+            values.insert(field.id, value.to_string());
+        }
+        serde_json::to_string(&values)
+            .ok()
+            .filter(|value| value.len() <= MAX_FIELD_BYTES)
+    }
+
     /// Tell a plugin one of its widgets was used.
     ///
     /// The open conversation goes along only for a slot that has one. A
@@ -721,8 +747,21 @@ impl WhatsAppApp {
         cx: &mut Context<Self>,
     ) {
         let chat = match slot {
-            PluginSlot::ChatHeader => self.selected_chat_jid(),
+            PluginSlot::ChatHeader | PluginSlot::Composer => self.selected_chat_jid(),
             PluginSlot::Settings => None,
+        };
+        let value = if slot == PluginSlot::Composer && widget == PluginWidget::Button {
+            let Some(form) = self.composer_form(plugin, cx) else {
+                self.notify_user(
+                    crate::tr!(ComposerPluginFormUnavailable),
+                    super::notices::Tone::Problem,
+                    cx,
+                );
+                return;
+            };
+            Some(form)
+        } else {
+            value
         };
         if let Some(client) = self.client.as_ref() {
             client.plugin_action(plugin, action, value, chat, slot, widget);
@@ -819,10 +858,10 @@ mod tests {
     }
 
     /// A Settings field is one field whatever is selected, because the action
-    /// it commits carries no conversation. A header field is one per chat,
-    /// because the action it commits carries the open one.
+    /// it commits carries no conversation. Chat tools keep separate fields
+    /// for each conversation.
     #[test]
-    fn only_a_header_field_belongs_to_a_conversation() {
+    fn chat_tools_fields_belong_to_a_conversation() {
         let settings = |chat| key("autoreply", PluginSlot::Settings, chat, "keyword");
         assert_eq!(settings(Some("a@s.whatsapp.net")), settings(None));
         assert_eq!(
@@ -830,16 +869,17 @@ mod tests {
             settings(Some("b@s.whatsapp.net"))
         );
 
-        let header = |chat| key("autoreply", PluginSlot::ChatHeader, chat, "keyword");
-        assert_ne!(
-            header(Some("a@s.whatsapp.net")),
-            header(Some("b@s.whatsapp.net"))
-        );
-        assert_ne!(
-            header(Some("a@s.whatsapp.net")),
-            settings(Some("a@s.whatsapp.net")),
-            "and the same id in two slots is still two fields"
-        );
+        for slot in [PluginSlot::ChatHeader, PluginSlot::Composer] {
+            let chat_field = |chat| key("autoreply", slot, chat, "keyword");
+            assert_ne!(
+                chat_field(Some("a@s.whatsapp.net")),
+                chat_field(Some("b@s.whatsapp.net"))
+            );
+            assert_ne!(
+                chat_field(Some("a@s.whatsapp.net")),
+                settings(Some("a@s.whatsapp.net"))
+            );
+        }
     }
 
     /// The key used to be a formatted string with `/` between its parts. A

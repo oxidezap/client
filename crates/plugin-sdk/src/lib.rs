@@ -824,7 +824,7 @@ impl Action<'_> {
     }
 
     /// What it now holds — a toggle's new state as `1` or `0`, a field's
-    /// contents, and nothing at all for a button.
+    /// contents, or a JSON object of field values for a composer button.
     #[must_use]
     pub fn value(self) -> Text<256> {
         self.0.text(fields::ACTION_VALUE)

@@ -12,7 +12,8 @@
 //! with a clickable rectangle.
 
 use gpui::{
-    App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder as _,
+    App, Entity, InteractiveElement as _, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, rems,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -52,6 +53,51 @@ pub fn slot(
         .flat_map(|surface| surface.roots_in(slot).map(move |node| (surface, node)))
         .map(|(surface, node)| widget(surface, slot, node, app, ctx, cx).into_any_element())
         .collect()
+}
+
+pub fn composer(app: &WhatsAppApp, ctx: &PluginContext, cx: &App) -> Option<gpui::AnyElement> {
+    let chat = app.selected_chat_jid()?;
+    if !app
+        .plugins(cx)
+        .iter()
+        .any(|surface| surface.roots_in(PluginSlot::Composer).next().is_some())
+    {
+        return None;
+    }
+    let ctx = ctx.clone();
+    let metrics = ctx.metrics;
+    Some(
+        div()
+            .px(metrics.space_md())
+            .child(
+                gpui_component::popover::Popover::new(SharedString::from(format!(
+                    "composer-plugins/{chat}"
+                )))
+                .anchor(gpui::Anchor::BottomLeft)
+                .trigger(
+                    Button::new("composer-plugin-tools")
+                        .label(crate::tr!(ComposerPlugins))
+                        .ghost()
+                        .small(),
+                )
+                .content(move |_, window, cx| {
+                    let app = ctx.entity.read(cx);
+                    div()
+                        .id("composer-plugin-panel")
+                        .flex()
+                        .flex_col()
+                        .gap(metrics.space_md())
+                        .w(rems(20.))
+                        .max_w(
+                            (window.viewport_size().width - metrics.space_xl()).max(gpui::px(0.)),
+                        )
+                        .max_h(rems(24.))
+                        .overflow_y_scroll()
+                        .children(slot(app.plugins(cx), PluginSlot::Composer, app, &ctx, cx))
+                }),
+            )
+            .into_any_element(),
+    )
 }
 
 /// One widget and, below it, whatever it holds.
@@ -154,7 +200,9 @@ fn widget(
             // keyword into, reads back, and leaves — and the plugin goes on
             // answering the old one. Not drawn over a dead control: a
             // plugin that stopped cannot be given anything.
-            let unsaved = live && app.plugin_field_unsaved(&surface.id, slot, &node.id, cx);
+            let unsaved = live
+                && slot != PluginSlot::Composer
+                && app.plugin_field_unsaved(&surface.id, slot, &node.id, cx);
             div()
                 .flex()
                 .flex_col()

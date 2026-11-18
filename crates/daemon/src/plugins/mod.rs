@@ -329,11 +329,15 @@ fn publishing_to(hub: &Arc<StateHub>) -> Sink {
 /// the rest of the split. Everything a plugin can actually ask for is here,
 /// written once on top of it.
 struct Bridge {
+    hub: Arc<StateHub>,
     commands: SessionCommands,
 }
 
 impl Commands for Bridge {
     fn send_text(&self, jid: &str, text: &str, quoted: Option<&str>) -> Outcome {
+        if !self.hub.connection().is_connected() {
+            return Outcome::NoSession;
+        }
         self.ask(Action::SendText(oxidezap_ipc::SendText {
             jid: jid.to_owned(),
             text: text.to_owned(),

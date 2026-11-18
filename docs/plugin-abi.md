@@ -253,10 +253,9 @@ node:
 Kinds: `1` button, `2` toggle, `3` label, `4` text field, `5` row, `6` column,
 `7` section. Only rows, columns and sections are drawn with children.
 
-Slots: `1` chat header, `3` settings. `2` is **reserved and undefined** — the
-composer's number, unassigned on purpose, because a slot the front end
-silently ignores is a button whose author never finds out why it did not
-appear.
+Slots: `1` chat header, `2` composer tools popover, `3` settings. Actions
+in the header and composer slots carry the open chat. Use the composer slot
+for forms and tools that act on that conversation.
 
 Flags: `1` enabled, `2` checked.
 
@@ -299,11 +298,16 @@ so they are decoded strictly — a broken byte in an id is an error, where a
 broken byte in a label is replaced and drawn.
 
 When somebody uses a widget, `UI_ACTION` arrives carrying `ACTION_ID`,
-`ACTION_VALUE` (a toggle's *new* state as `1`/`0`, a field's contents, empty
-for a button) and `CHAT_JID` for a slot that has a chat behind it. The daemon
+`ACTION_VALUE` (a toggle's *new* state as `1`/`0`, a field's contents, or
+a composer button's form values) and `CHAT_JID` for a slot that has a chat
+behind it. The daemon
 checks the action against the tree it currently publishes — kind and slot
 included — so a press from a window whose frame is older than the daemon's
 does not land as a real one.
+
+Composer text fields are local until a composer button is pressed. That button
+receives a JSON object mapping the plugin's composer field IDs to the values
+currently visible in the same chat. Other buttons have an empty value.
 
 ## What the host holds a plugin to
 

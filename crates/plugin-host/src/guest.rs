@@ -1134,6 +1134,7 @@ fn link_free(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
 fn root(node: &abi::ui::Node) -> Option<PluginRoot> {
     let slot = match node.slot {
         abi::ui::slot::CHAT_HEADER => PluginSlot::ChatHeader,
+        abi::ui::slot::COMPOSER => PluginSlot::Composer,
         abi::ui::slot::SETTINGS => PluginSlot::Settings,
         _ => return None,
     };

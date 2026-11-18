@@ -276,6 +276,8 @@ catalog! {
     Gentle => ("Gentle", "Suave");
     TestRingtone => ("Test ringtone", "Testar toque");
     Camera => ("CAMERA", "CÂMERA");
+    ComposerPluginFormUnavailable => ("This plugin form is unavailable or too large", "Este formulário do plugin está indisponível ou é grande demais");
+    ComposerPlugins => ("Chat tools", "Ferramentas da conversa");
     CameraModesUnavailable => ("No modes reported for this camera", "Nenhum modo informado para esta câmera");
     ResolutionAndFrameRate => ("RESOLUTION AND FRAME RATE", "RESOLUÇÃO E TAXA DE QUADROS");
     StopCameraPreview => ("Stop camera preview", "Parar prévia da câmera");
