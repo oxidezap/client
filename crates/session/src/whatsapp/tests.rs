@@ -1319,7 +1319,13 @@ fn a_batch_spanning_chats_reaches_every_lane_it_is_about() {
     use whatsapp_rust::wacore::types::events::{BatchOrigin, Event, InboundMessage, MessageBatch};
     use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
 
-    let chats = ["1@s.whatsapp.net", "2@s.whatsapp.net", "3@s.whatsapp.net"];
+    let chats = [
+        "2@s.whatsapp.net",
+        "1@s.whatsapp.net",
+        "2@s.whatsapp.net",
+        "3@s.whatsapp.net",
+        "1@s.whatsapp.net",
+    ];
     let messages: Arc<[InboundMessage]> = chats
         .iter()
         .enumerate()
@@ -1345,30 +1351,79 @@ fn a_batch_spanning_chats_reaches_every_lane_it_is_about() {
         MessageBatch::builder()
             .messages(messages)
             .origin(BatchOrigin::OfflineDrain)
+            .hook_committed(true)
             .build(),
     ));
 
     let parts = super::lanes::split_by_subject(&batch);
     assert_eq!(parts.len(), 3, "one per chat it is about");
-    let mut subjects: Vec<String> = parts
+    let subjects: Vec<String> = parts
         .iter()
         .filter_map(|part| super::lanes::event_subject(part).map(|s| s.as_written()))
         .collect();
-    subjects.sort();
-    assert_eq!(subjects, chats);
+    assert_eq!(
+        subjects,
+        ["2@s.whatsapp.net", "1@s.whatsapp.net", "3@s.whatsapp.net"]
+    );
     // How the batch was delivered is as true of one chat's share of it as
     // of the whole, and it is what decides whether media is fetched.
-    for part in &parts {
+    for (part, indices) in parts.iter().zip([&[0, 2][..], &[1, 4], &[3]]) {
         let Event::Messages(batch) = &**part else {
             panic!("a batch splits into batches");
         };
         assert!(matches!(batch.origin, BatchOrigin::OfflineDrain));
-        assert_eq!(batch.iter().count(), 1);
+        assert!(batch.hook_committed);
+        assert_eq!(batch.len(), indices.len());
+        for (message, index) in batch.iter().zip(indices) {
+            assert_eq!(message.info.id.as_str(), format!("MSG-BATCH-{index}"));
+        }
     }
+}
 
-    // And a batch about one chat is not rebuilt at all.
-    let single = incoming(wa::Message::text("oi"), "MSG-ONE", 1_700_000_000);
-    assert_eq!(super::lanes::split_by_subject(&Arc::new(single)).len(), 1);
+#[test]
+fn two_messages_for_one_rendered_chat_reuse_the_original_batch() {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
+    use whatsapp_rust::wacore_binary::Server;
+
+    let normal = Jid::new("15550000000", Server::Pn);
+    let bot_with_literal_dot = Jid::new("123.1", Server::Bot).with_device(2);
+    let mut bot_with_agent = Jid::new("123", Server::Bot).with_device(2);
+    bot_with_agent.agent = 1;
+    assert_eq!(bot_with_literal_dot.to_string(), bot_with_agent.to_string());
+    assert!(!bot_with_literal_dot.display_eq_jid(&bot_with_agent));
+
+    for [first, second] in [
+        [normal.clone(), normal],
+        [bot_with_literal_dot, bot_with_agent],
+    ] {
+        let messages: Arc<[InboundMessage]> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(index, chat)| {
+                let mut info = live_info(
+                    TEST_PEER,
+                    TEST_PEER,
+                    None,
+                    &format!("MSG-{index}"),
+                    1_700_000_000,
+                );
+                info.source.chat = chat;
+                InboundMessage::builder()
+                    .message(Arc::new(wa::Message::text("oi")))
+                    .info(Arc::new(info))
+                    .build()
+            })
+            .collect();
+        let batch = Arc::new(Event::Messages(
+            MessageBatch::builder()
+                .messages(messages)
+                .origin(BatchOrigin::OfflineDrain)
+                .build(),
+        ));
+        let parts = super::lanes::split_by_subject(&batch);
+        assert_eq!(parts.len(), 1);
+        assert!(Arc::ptr_eq(&parts[0], &batch));
+    }
 }
 
 /// Two chats are not each other's business, so they do not queue behind
