@@ -32,7 +32,7 @@ mod frame_rate;
 
 #[cfg(all(windows, not(feature = "docs-only")))]
 pub mod wmf {
-    use super::frame_rate::nominal_fps;
+    use super::frame_rate::{matching_rates, nominal_fps};
     use nokhwa_core::error::NokhwaError;
     use nokhwa_core::types::{
         ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueDescription,
@@ -1031,17 +1031,14 @@ pub mod wmf {
                     continue;
                 }
 
-                let matching_rates = [
+                let advertised_rates = [
                     MF_MT_FRAME_RATE,
                     MF_MT_FRAME_RATE_RANGE_MAX,
                     MF_MT_FRAME_RATE_RANGE_MIN,
                 ]
-                .into_iter()
-                .filter_map(|attribute| unsafe { media_type.GetUINT64(&attribute) }.ok())
-                .filter(|ratio| nominal_fps(*ratio) == Some(format.frame_rate()))
-                .collect::<Vec<_>>();
+                .map(|attribute| unsafe { media_type.GetUINT64(&attribute) }.ok());
 
-                for ratio in matching_rates {
+                for ratio in matching_rates(advertised_rates, format.frame_rate()) {
                     let result = unsafe {
                         media_type
                             .SetUINT64(&MF_MT_FRAME_RATE, ratio)
