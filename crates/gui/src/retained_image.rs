@@ -89,81 +89,88 @@ impl RetainedImage {
     pub(crate) fn source(&self, sticker: bool) -> ImageSource {
         let owner = self.clone();
         ImageSource::from(move |window: &mut gpui::Window, cx: &mut App| {
-            let asset = owner
-                .0
-                .assets
-                .borrow_mut()
-                .entry(sticker)
-                .or_insert_with(|| {
-                    let key = (owner.id, sticker);
-                    if let Some(asset) = cx
-                        .default_global::<Assets>()
-                        .0
-                        .get(&key)
-                        .and_then(WeakEntity::upgrade)
-                    {
-                        return asset;
-                    }
-                    let asset = cx.new(|cx| {
-                        cx.on_release(|asset: &mut Decoded, cx| {
-                            let source = asset.source.clone();
-                            let output = asset.output.clone();
-                            cx.defer(move |cx| {
-                                let key = (source.image.id, source.sticker);
-                                let assets = cx.default_global::<Assets>();
-                                // A new owner may acquire this content between
-                                // release and this deferred retirement.
-                                if assets.0.get(&key).and_then(WeakEntity::upgrade).is_some() {
-                                    return;
-                                }
-                                assets.0.remove(&key);
-                                cx.remove_asset::<Decoder>(&source);
-                                if let Some(output) = output {
-                                    cx.drop_image(output, None);
-                                }
-                            });
-                        })
-                        .detach();
-                        Decoded {
-                            source: Source {
-                                image: owner.0.image.clone(),
-                                sticker,
-                            },
-                            output: None,
-                        }
-                    });
-                    cx.default_global::<Assets>()
-                        .0
-                        .insert(key, asset.downgrade());
-                    asset
-                })
-                .clone();
+            owner.use_data(sticker, window, cx)
+        })
+    }
 
-            // A cached paint can retain atlas coordinates without retaining its
-            // ImageSource. Keep the asset with that element state as well.
-            window.with_global_id(
-                ElementId::NamedInteger(
-                    if sticker {
-                        "sticker-asset"
-                    } else {
-                        "image-asset"
-                    }
-                    .into(),
-                    owner.id,
-                ),
-                |id, window| {
-                    window.with_element_state(id, |_: Option<Entity<Decoded>>, _| {
-                        ((), asset.clone())
-                    });
-                },
-            );
-            asset.update(cx, |asset, cx| {
-                let output = window.use_asset::<Decoder>(&asset.source, cx);
-                if let Some(Ok(image)) = &output {
-                    asset.output = Some(image.clone());
+    pub(crate) fn use_data(
+        &self,
+        sticker: bool,
+        window: &mut gpui::Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        let asset = self
+            .0
+            .assets
+            .borrow_mut()
+            .entry(sticker)
+            .or_insert_with(|| {
+                let key = (self.id, sticker);
+                if let Some(asset) = cx
+                    .default_global::<Assets>()
+                    .0
+                    .get(&key)
+                    .and_then(WeakEntity::upgrade)
+                {
+                    return asset;
                 }
-                output
+                let asset = cx.new(|cx| {
+                    cx.on_release(|asset: &mut Decoded, cx| {
+                        let source = asset.source.clone();
+                        let output = asset.output.clone();
+                        cx.defer(move |cx| {
+                            let key = (source.image.id, source.sticker);
+                            let assets = cx.default_global::<Assets>();
+                            // A new owner may acquire this content between
+                            // release and this deferred retirement.
+                            if assets.0.get(&key).and_then(WeakEntity::upgrade).is_some() {
+                                return;
+                            }
+                            assets.0.remove(&key);
+                            cx.remove_asset::<Decoder>(&source);
+                            if let Some(output) = output {
+                                cx.drop_image(output, None);
+                            }
+                        });
+                    })
+                    .detach();
+                    Decoded {
+                        source: Source {
+                            image: self.0.image.clone(),
+                            sticker,
+                        },
+                        output: None,
+                    }
+                });
+                cx.default_global::<Assets>()
+                    .0
+                    .insert(key, asset.downgrade());
+                asset
             })
+            .clone();
+
+        // A cached paint can retain atlas coordinates without retaining its
+        // ImageSource. Keep the asset with that element state as well.
+        window.with_global_id(
+            ElementId::NamedInteger(
+                if sticker {
+                    "sticker-asset"
+                } else {
+                    "image-asset"
+                }
+                .into(),
+                self.id,
+            ),
+            |id, window| {
+                window.with_element_state(id, |_: Option<Entity<Decoded>>, _| ((), asset.clone()));
+            },
+        );
+        asset.update(cx, |asset, cx| {
+            let output = window.use_asset::<Decoder>(&asset.source, cx);
+            if let Some(Ok(image)) = &output {
+                asset.output = Some(image.clone());
+            }
+            output
         })
     }
 }

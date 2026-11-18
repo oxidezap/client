@@ -6,9 +6,8 @@ use std::sync::Arc;
 
 use gpui::StyledImage as _;
 use gpui::{
-    App, Entity, Image, ImageSource, InteractiveElement, IntoElement, ObjectFit, ParentElement,
-    RenderImage, SharedString, StatefulInteractiveElement, Styled, div, img,
-    prelude::FluentBuilder as _, px,
+    App, Entity, Image, InteractiveElement, IntoElement, ObjectFit, ParentElement, RenderImage,
+    SharedString, StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -209,15 +208,17 @@ pub(super) fn render_media_content(
                 match (sticker_render_kind(&media_content), decoded_image) {
                     (Some(_kind), Some(cached_image)) => {
                         let sticker_id: SharedString = format!("sticker-{}", message_id).into();
-                        let image = img(sticker_image_source(cached_image))
-                            .id(sticker_id)
+                        let image = div()
                             .w(px(display_w))
                             .h(px(display_h))
                             .aspect_square()
                             .when(cfg!(test), |image| {
                                 image.debug_selector(|| "sticker-image".into())
                             })
-                            .object_fit(gpui::ObjectFit::Contain);
+                            .child(crate::components::sticker::sticker(
+                                sticker_id,
+                                cached_image,
+                            ));
                         el.child(image)
                     }
                     (_, cached_image) => {
@@ -464,10 +465,6 @@ fn still_image_format(media: &oxidezap_core::MediaContent) -> Option<gpui::Image
 // GPUI's Arc<Image> decoder treats WebP as a still image. Keep the existing
 // encoded-image cache, but load sticker frames through a dedicated asset so
 // repeated renders reuse the decoded frames on desktop and web alike.
-fn sticker_image_source(image: RetainedImage) -> ImageSource {
-    image.source(true)
-}
-
 pub(crate) fn decode_sticker(bytes: &[u8]) -> image::ImageResult<Arc<RenderImage>> {
     let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))?;
     let frames: smallvec::SmallVec<[_; 1]> = if decoder.has_animation() {
@@ -1009,7 +1006,6 @@ mod tests {
     use crate::retained_image::RetainedImage;
     use std::sync::Arc;
 
-    use gpui::{InteractiveElement as _, Styled as _};
     use oxidezap_core::MediaContent;
 
     use super::{StickerRenderKind, extension_of, format_bytes, sticker_render_kind};
@@ -1242,7 +1238,6 @@ mod tests {
     }
 
     struct StickerTestView {
-        source: gpui::ImageSource,
         image: RetainedImage,
     }
 
@@ -1252,10 +1247,7 @@ mod tests {
             _: &mut gpui::Window,
             _: &mut gpui::Context<Self>,
         ) -> impl gpui::IntoElement {
-            // GPUI 0.3.10 associates assets with the view currently drawing.
-            gpui::img(self.source.clone())
-                .id("sticker-test")
-                .size_full()
+            crate::components::sticker::sticker("sticker-test".into(), self.image.clone())
         }
     }
 
@@ -1263,9 +1255,7 @@ mod tests {
     #[gpui::test]
     fn sticker_frames_loop_and_stay_cached_across_renders(cx: &mut gpui::TestAppContext) {
         let mut media = animated_webp_sticker();
-        // GPUI reads wall-clock Instant for playback, not the test executor's
-        // clock. Shorten only this fixture's frame delays to keep the real
-        // playback regression fast without mocking GPUI's implementation.
+        // The playback clock is independent of the GPUI test executor.
         let bytes = Arc::make_mut(&mut media.data);
         let mut at = 12;
         while at + 8 <= bytes.len() {
@@ -1279,13 +1269,12 @@ mod tests {
             gpui::ImageFormat::Webp,
             media.data.to_vec(),
         ));
-        let source = super::sticker_image_source(image.clone());
         let handle = cx.open_window(gpui::size(gpui::px(10.), gpui::px(10.)), |_, _| {
             StickerTestView {
-                source,
                 image: image.clone(),
             }
         });
+        let executor = cx.executor();
         let mut window = gpui::VisualTestContext::from_window(handle.into(), cx);
         window.run_until_parked();
         window.update(|window, _| window.activate_window());
@@ -1298,6 +1287,14 @@ mod tests {
         });
         let first = window.read(|cx| handle.read(cx).unwrap().image.decoded(true, cx).unwrap());
         assert_eq!(first.frame_count(), 2);
+        let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = window.update(|window, cx| {
+            let entity = window.root::<StickerTestView>().unwrap().unwrap();
+            let count = notifications.clone();
+            cx.observe(&entity, move |_, _| count.set(count.get() + 1))
+        });
+        window.run_until_parked();
+        let initial_notifications = notifications.get();
         // Probe frame zero under the decoded image's texture id. Removing
         // textures before every draw prevents stale uploads hiding a restart.
         let mut probe = gpui::RenderImage::new(smallvec::smallvec![image::Frame::new(
@@ -1307,8 +1304,11 @@ mod tests {
         for frame in 1..=6 {
             window.update(|window, _| window.drop_image(first.clone()).unwrap());
             std::thread::sleep(std::time::Duration::from_millis(3));
+            executor.advance_clock(std::time::Duration::from_millis(3));
+            window.run_until_parked();
+            assert_eq!(notifications.get(), initial_notifications + frame);
             window.update(|window, cx| {
-                window.simulate_next_frame(cx);
+                assert_eq!(window.simulate_next_frame(cx), 0);
                 window.refresh();
                 window.draw(cx).clear(cx);
             });
@@ -1318,6 +1318,7 @@ mod tests {
             );
             let next = window.read(|cx| handle.read(cx).unwrap().image.decoded(true, cx).unwrap());
             assert!(Arc::ptr_eq(&first, &next));
+            window.run_until_parked();
         }
     }
 

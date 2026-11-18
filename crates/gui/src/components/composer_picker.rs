@@ -295,19 +295,27 @@ impl InputAreaView {
                                         let id: SharedString =
                                             format!("picker-{}", request.message_id).into();
                                         Button::new(id.clone())
-                                            .debug_selector(move || id.to_string())
+                                            .debug_selector({
+                                                let id = id.clone();
+                                                move || id.to_string()
+                                            })
                                             .ghost()
                                             .w(edge)
                                             .h(edge)
                                             .tooltip(format!("{item_label} · {}", item.description))
                                             .child(match &item.preview {
-                                                Some(preview) => {
-                                                    img(preview.source(item.decode_as_sticker))
-                                                        .w_full()
-                                                        .h_full()
-                                                        .object_fit(gpui::ObjectFit::Contain)
-                                                        .into_any_element()
+                                                Some(preview) if item.decode_as_sticker => {
+                                                    crate::components::sticker::sticker(
+                                                        id,
+                                                        preview.clone(),
+                                                    )
+                                                    .into_any_element()
                                                 }
+                                                Some(preview) => img(preview.source(false))
+                                                    .w_full()
+                                                    .h_full()
+                                                    .object_fit(gpui::ObjectFit::Contain)
+                                                    .into_any_element(),
                                                 None => div().child(item_label).into_any_element(),
                                             })
                                             .on_click(move |_, window, cx| {
