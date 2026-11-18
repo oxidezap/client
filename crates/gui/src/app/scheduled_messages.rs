@@ -86,17 +86,21 @@ impl WhatsAppApp {
                                 .and_then(|result| result.map_err(|error| error.to_string()));
                             let _ = app.update(cx, |app, cx| match result {
                                 Ok(()) => {
-                                    if app.selected_chat.as_deref() == Some(jid.as_str())
-                                        && app
-                                            .client
-                                            .as_ref()
-                                            .is_some_and(|session| session.account() == account)
+                                    if app
+                                        .client
+                                        .as_ref()
+                                        .is_some_and(|session| session.account() == account)
                                     {
-                                        let _ = window.update(cx, |_, window, cx| {
-                                            let _ = composer.update(cx, |view, cx| {
-                                                view.clear_scheduled_draft(&draft, window, cx);
+                                        if app.drafts.get(&jid) == Some(&draft) {
+                                            app.drafts.remove(&jid);
+                                        }
+                                        if app.selected_chat.as_deref() == Some(jid.as_str()) {
+                                            let _ = window.update(cx, |_, window, cx| {
+                                                let _ = composer.update(cx, |view, cx| {
+                                                    view.clear_scheduled_draft(&draft, window, cx);
+                                                });
                                             });
-                                        });
+                                        }
                                     }
                                     app.notify_user(crate::tr!(ScheduledMessage), Tone::Info, cx);
                                 }
