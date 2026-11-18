@@ -252,3 +252,51 @@ jobs:
           name: oxidezap-${{ matrix.name }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
+
+  plugins:
+    name: Plugin bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.100.0"
+          targets: wasm32-unknown-unknown
+      - name: Build installable plugins
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            ""|*[!a-zA-Z0-9._-]*|-*|.*) exit 1 ;;
+          esac
+          modules=()
+          for manifest in examples/*/Cargo.toml; do
+            plugin="${manifest%/Cargo.toml}"
+            if [ "$plugin" = examples/template ]; then continue; fi
+            module="$(cargo xtask plugin build "$plugin")"
+            modules+=("$module")
+          done
+          test "${#modules[@]}" -gt 0
+          mkdir -p dist/release
+          python3 - "dist/release/oxidezap-$VERSION-plugins.zip" "${modules[@]}" <<'PYTHON'
+          import sys
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          modules = [Path(path) for path in sys.argv[2:]]
+          names = [module.name for module in modules]
+          if len(set(names)) != len(names):
+              raise SystemExit("Duplicate plugin module names")
+          with ZipFile(sys.argv[1], "w", compression=ZIP_DEFLATED) as archive:
+              for module in modules:
+                  archive.write(module, module.name)
+          PYTHON
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oxidezap-plugins
+          path: dist/release/oxidezap-${{ inputs.version }}-plugins.zip
+          if-no-files-found: error

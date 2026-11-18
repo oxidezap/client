@@ -42,5 +42,21 @@ jobs:
               test -s "artifacts/oxidezap-$VERSION-linux-$arch.$suffix"
             done
           done
-          test "$(find artifacts -type f | wc -l)" -eq 12
+          python3 - "artifacts/oxidezap-$VERSION-plugins.zip" <<'PYTHON'
+          import sys
+          from pathlib import PurePosixPath
+          from zipfile import ZipFile
+
+          with ZipFile(sys.argv[1]) as archive:
+              names = archive.namelist()
+              assert names and len(set(names)) == len(names), names
+              for name in names:
+                  path = PurePosixPath(name)
+                  assert name == path.name and path.suffix == ".wasm", name
+                  assert name != "template.wasm", name
+                  with archive.open(name) as module:
+                      assert module.read(8) == b"\0asm\x01\0\0\0", name
+              assert archive.testzip() is None
+          PYTHON
+          test "$(find artifacts -type f | wc -l)" -eq 13
           (cd artifacts && sha256sum oxidezap-* > checksums.sha256 && sha256sum -c checksums.sha256)

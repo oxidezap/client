@@ -67,6 +67,9 @@ jobs:
           that runs in place, adds its own menu entry and updates through
           its `.zsync`. `OxideZap.AppImage --cli ...` runs the CLI.
 
+          `oxidezap-nightly-plugins.zip` contains optional `.wasm` plugins.
+          Unpack it and install the modules you want under Settings → Plugins.
+
           The tarballs carry the execute bit. On macOS, clear the quarantine
           flag before the first run:
 
@@ -83,10 +86,12 @@ jobs:
           obtains the cross-origin isolation the window needs. `README.md`
           inside says the rest.
           NOTES
-          echo "" >> notes.md
-          echo "Built from [\`${GITHUB_SHA:0:7}\`](https://github.com/$GH_REPO/commit/$GITHUB_SHA) on $(date -u +"%Y-%m-%d %H:%M") UTC." >> notes.md
-          echo "" >> notes.md
-          echo "Verify download integrity with \`sha256sum -c --ignore-missing checksums.sha256\`." >> notes.md
+          {
+            echo ""
+            echo "Built from [\`${GITHUB_SHA:0:7}\`](https://github.com/$GH_REPO/commit/$GITHUB_SHA) on $(date -u +"%Y-%m-%d %H:%M") UTC."
+            echo ""
+            echo "Verify download integrity with \`sha256sum -c --ignore-missing checksums.sha256\`."
+          } >> notes.md
           # Recreate rather than edit: `gh release edit` cannot move a tag, and
           # a stale tag would leave the assets pointing at an older commit.
           gh release delete nightly --yes --cleanup-tag || true
