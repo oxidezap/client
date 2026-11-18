@@ -195,6 +195,9 @@ async fn status_audience(
         Some(1) => {
             let listed = listed()?;
             let book = book().await?;
+            let audience = if listed.is_empty() {
+                book
+            } else {
             // Compared as people, not as addresses: a contact saved under a
             // phone number and the same person excluded under a LID share no
             // digits, and comparing the raw users would send the status to
@@ -218,10 +221,11 @@ async fn status_audience(
                     .await?;
             let excluded: std::collections::HashSet<_> =
                 listed.iter().map(|jid| &keys[&jid.to_non_ad_string()]).collect();
-            let audience = book
+            book
                 .into_iter()
                 .filter(|jid| !excluded.contains(&keys[&jid.to_non_ad_string()]))
-                .collect();
+                .collect()
+            };
             (audience, StatusPrivacySetting::DenyList)
         }
         Some(0) => (listed()?, StatusPrivacySetting::AllowList),

@@ -174,18 +174,15 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   shutdown; a second one while it drains exits on 128-plus-signal-number
   rather than waiting it out, because the teardown has joins without a
   deadline and a repeated signal is somebody saying the wait is the problem.
-- **Closing the window stops the daemon unless the person said otherwise.**
-  The daemon outliving the window is a choice, not a law: Settings → Advanced
-  → Background keeps it in `background.json` beside `theme.json`, default off.
-  The window's quit hook (`main.rs`, `on_app_quit`) sends `Shutdown` on the
-  control connection when `platform::background::stops_daemon_on_exit()` says
-  so. The tray's Hide is exempt — `platform::leave` marks the departure first,
-  because Hide exists so the daemon stays. The daemon's own teardown has a
-  ten-second deadline (`TEARDOWN_DEADLINE`) so a disconnect that hangs cannot
-  leave a process only a second signal could end. On macOS the status item
-  exists only when that setting is on (`macos_main::keep_running_requested`),
-  since a Mac app that dies with its window has nothing for an icon to do, and
-  it opens its menu on a left click.
+- **Closing the last window stops the daemon with Background off.**
+  Settings → Advanced → Background is stored in `background.json` beside
+  `theme.json`. The closing window sends `ShutdownUnlessOtherWindows` on its
+  control connection. The daemon checks for other windows as it releases
+  that connection, independently of any work on the account connection.
+  The tray's Hide uses `platform::leave` to close without a stop request.
+  Teardown gives accounts ten seconds to disconnect, followed by a separate
+  three-second deadline for the runtime. On macOS the status item appears
+  when Background is enabled, and a left click opens its menu.
 - **A daemon the window starts must reset its own signals.** It inherits the
   window's signal state across the spawn, and the GUI's left SIGTERM and
   SIGINT without effect: the same binary stopped in a second from a shell and
