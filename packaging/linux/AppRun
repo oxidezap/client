@@ -22,15 +22,24 @@ set -u
 APPDIR="$(dirname "$(readlink -f "$0")")"
 DESK_ID=org.oxidezap.client.local
 
+launch() {
+  binary="$1"
+  shift
+  if [ -d "$APPDIR/usr/lib" ]; then
+    export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+  exec "$APPDIR/usr/bin/$binary" "$@"
+}
+
 # Select the bundled CLI before desktop integration: a scripted launch must leave
 # stdio untouched and must not install a GUI launcher.
 if [ "${1:-}" = --cli ]; then
   shift
-  exec "$APPDIR/usr/bin/oxidezap-cli" "$@"
+  launch oxidezap-cli "$@"
 fi
 # Type 2 runtimes preserve a symlink's original name in ARGV0.
 case "${ARGV0:-}" in
-  oxidezap-cli | */oxidezap-cli) exec "$APPDIR/usr/bin/oxidezap-cli" "$@" ;;
+  oxidezap-cli | */oxidezap-cli) launch oxidezap-cli "$@" ;;
 esac
 
 # A damaged snapshot is not evidence that an absent user key was newly added.
@@ -88,15 +97,18 @@ integrate() {
   desktop="$apps/$DESK_ID.desktop"
   baseline="$apps/.$DESK_ID.generated"
   external=0
+  set --
   for f in "$apps"/*.desktop; do
-    if [ ! -f "$f" ] || [ "$f" = "$apps/$DESK_ID.desktop" ]; then
-      continue
-    fi
-    if grep '^Exec=' "$f" 2>/dev/null | grep -Fq "$appimage"; then
-      external=1
-      break
+    if [ -f "$f" ] && [ "$f" != "$desktop" ]; then
+      set -- "$@" "$f"
     fi
   done
+  if [ "$#" -gt 0 ] && awk -v image="$appimage" '
+    /^Exec=/ && index($0, image) { found = 1; exit }
+    END { exit !found }
+  ' "$@" 2>/dev/null; then
+    external=1
+  fi
   # AM / AppMan install their own launcher, whose Exec runs a command on
   # PATH rather than this AppImage, so the check above misses it. AM's author
   # names the only two places it writes one: system-wide for AM, per user for
@@ -229,4 +241,4 @@ integrate() {
 }
 
 integrate
-exec "$APPDIR/usr/bin/oxidezap" "$@"
+launch oxidezap "$@"

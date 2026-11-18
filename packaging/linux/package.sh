@@ -135,6 +135,28 @@ fi
 if has appimage; then
   APPDIR="$WORK/OxideZap.AppDir"
   cp -R "$STAGE" "$APPDIR"
+  mkdir -p "$APPDIR/usr/lib"
+  # Wayland is loaded dynamically. GPU loaders and drivers come from the host.
+  {
+    for b in "${BINARIES[@]}"; do
+      ldd "$APPDIR/usr/bin/$b"
+    done
+    for lib in libwayland-client.so libwayland-egl.so; do
+      path="$(cc -print-file-name="$lib")"
+      [[ -f "$path" ]] || { echo "error: $lib not found" >&2; exit 1; }
+      soname="$(objdump -p "$path" | awk '$1 == "SONAME" { print $2 }')"
+      printf '%s => %s\n' "$soname" "$path"
+      ldd "$path"
+    done
+  } >"$WORK/appimage-dependencies"
+  while read -r soname arrow path _; do
+    [[ "$arrow" = '=>' ]] || continue
+    case "$soname" in
+      libc.so.* | libm.so.* | libdl.so.* | libpthread.so.* | librt.so.* | libresolv.so.* | ld-linux*) continue ;;
+    esac
+    [[ -f "$path" ]] || { echo "error: $soname not found" >&2; exit 1; }
+    install -m644 "$path" "$APPDIR/usr/lib/$soname"
+  done <"$WORK/appimage-dependencies"
   # AppRun is a script, not a symlink: it installs the .desktop entry and icons into
   # $XDG_DATA_HOME before launching, so Wayland compositors can resolve the window's
   # app_id to our icon instead of the generic Wayland logo (opt-out env in the script

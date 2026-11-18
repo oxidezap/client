@@ -54,6 +54,7 @@ export VERSION LABEL CHANNEL
 
 DIST="${DIST:-$ROOT/dist/release}"
 mkdir -p "$DIST"
+DIST="$(cd "$DIST" && pwd)"
 export DIST
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
