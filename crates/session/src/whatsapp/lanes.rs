@@ -192,6 +192,9 @@ pub(super) fn split_by_subject(event: &Arc<Event>) -> Vec<Arc<Event>> {
             });
         groups[*slot].push(inbound.clone());
     }
+    if groups.len() == 1 {
+        return vec![Arc::clone(event)];
+    }
     groups
         .into_iter()
         .map(|messages| {

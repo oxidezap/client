@@ -1378,13 +1378,52 @@ fn a_batch_spanning_chats_reaches_every_lane_it_is_about() {
             assert_eq!(message.info.id.as_str(), format!("MSG-BATCH-{index}"));
         }
     }
+}
 
-    // And a batch about one chat is not rebuilt at all.
-    let single = incoming(wa::Message::text("oi"), "MSG-ONE", 1_700_000_000);
-    let single = Arc::new(single);
-    let parts = super::lanes::split_by_subject(&single);
-    assert_eq!(parts.len(), 1);
-    assert!(Arc::ptr_eq(&parts[0], &single));
+#[test]
+fn two_messages_for_one_rendered_chat_reuse_the_original_batch() {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
+    use whatsapp_rust::wacore_binary::Server;
+
+    let normal = Jid::new("15550000000", Server::Pn);
+    let bot_with_literal_dot = Jid::new("123.1", Server::Bot).with_device(2);
+    let mut bot_with_agent = Jid::new("123", Server::Bot).with_device(2);
+    bot_with_agent.agent = 1;
+    assert_eq!(bot_with_literal_dot.to_string(), bot_with_agent.to_string());
+    assert!(!bot_with_literal_dot.display_eq_jid(&bot_with_agent));
+
+    for [first, second] in [
+        [normal.clone(), normal],
+        [bot_with_literal_dot, bot_with_agent],
+    ] {
+        let messages: Arc<[InboundMessage]> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(index, chat)| {
+                let mut info = live_info(
+                    TEST_PEER,
+                    TEST_PEER,
+                    None,
+                    &format!("MSG-{index}"),
+                    1_700_000_000,
+                );
+                info.source.chat = chat;
+                InboundMessage::builder()
+                    .message(Arc::new(wa::Message::text("oi")))
+                    .info(Arc::new(info))
+                    .build()
+            })
+            .collect();
+        let batch = Arc::new(Event::Messages(
+            MessageBatch::builder()
+                .messages(messages)
+                .origin(BatchOrigin::OfflineDrain)
+                .build(),
+        ));
+        let parts = super::lanes::split_by_subject(&batch);
+        assert_eq!(parts.len(), 1);
+        assert!(Arc::ptr_eq(&parts[0], &batch));
+    }
 }
 
 /// Two chats are not each other's business, so they do not queue behind
