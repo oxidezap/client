@@ -274,14 +274,14 @@ impl Fanout {
         ALL_WINDOWS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // A window opening is somebody still using the daemon: whatever an
         // earlier window asked on its way out no longer applies.
-        STOP_WHEN_NO_WINDOWS.store(false, std::sync::atomic::Ordering::SeqCst);
+        *STOP_REQUESTED_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub(super) fn detach_window(&self) {
         self.windows
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let was = ALL_WINDOWS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if was == 1 && STOP_WHEN_NO_WINDOWS.load(std::sync::atomic::Ordering::SeqCst) {
+        if was == 1 && stop_was_just_requested() {
             crate::shutdown::request("last window closed");
         }
     }
@@ -338,18 +338,35 @@ impl Claim<'_> {
 /// though ownership is counted per account.
 static ALL_WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// A closing window asked for the daemon to stop once no window is left.
-static STOP_WHEN_NO_WINDOWS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// When a closing window last asked for the daemon to stop once no window is
+/// left, in milliseconds, or zero.
+static STOP_REQUESTED_AT: std::sync::Mutex<Option<wacore::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// How long such a request stays good. The window asks as it closes, so the
+/// request and its own detach land within moments of each other; a request
+/// still unconsumed after this belonged to a window that was not the last, and
+/// must not stop the daemon when some later, unrelated window leaves.
+const STOP_REQUEST_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn stop_was_just_requested() -> bool {
+    STOP_REQUESTED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|at| at.elapsed() <= STOP_REQUEST_GRACE)
+}
 
 /// What a window going away asks: stop the daemon when no window remains.
 ///
 /// A request rather than a count taken now, because the window is closing as
 /// it asks and its own connection may already be gone: a count would see
 /// either one window too many or one too few. Recorded, then checked, and the
-/// detach checks it too, so whichever of the two happens last decides.
+/// detach checks it too, so whichever of the two happens last decides. The
+/// request lapses after a moment (see [`STOP_REQUEST_GRACE`]), so it cannot
+/// outlive the departure it was made for.
 pub(crate) fn stop_when_no_windows() {
-    STOP_WHEN_NO_WINDOWS.store(true, std::sync::atomic::Ordering::SeqCst);
+    *STOP_REQUESTED_AT.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(wacore::time::Instant::now());
     if ALL_WINDOWS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         crate::shutdown::request("last window closed");
     }
