@@ -151,8 +151,8 @@ if has appimage; then
   } >"$WORK/appimage-dependencies"
   while read -r soname arrow path _; do
     [[ "$arrow" = '=>' ]] || continue
-    case "$soname" in
-      libc.so.* | libm.so.* | libdl.so.* | libpthread.so.* | librt.so.* | libresolv.so.* | ld-linux*) continue ;;
+    case "${soname##*/}" in
+      libc.so.* | libm.so.* | libdl.so.* | libpthread.so.* | librt.so.* | libresolv.so.* | libgcc_s.so.* | libstdc++.so.* | ld-linux*) continue ;;
     esac
     [[ -f "$path" ]] || { echo "error: $soname not found" >&2; exit 1; }
     install -m644 "$path" "$APPDIR/usr/lib/$soname"
