@@ -1274,6 +1274,7 @@ mod tests {
                 image: image.clone(),
             }
         });
+        let executor = cx.executor();
         let mut window = gpui::VisualTestContext::from_window(handle.into(), cx);
         window.run_until_parked();
         window.update(|window, _| window.activate_window());
@@ -1286,6 +1287,14 @@ mod tests {
         });
         let first = window.read(|cx| handle.read(cx).unwrap().image.decoded(true, cx).unwrap());
         assert_eq!(first.frame_count(), 2);
+        let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = window.update(|window, cx| {
+            let entity = window.root::<StickerTestView>().unwrap().unwrap();
+            let count = notifications.clone();
+            cx.observe(&entity, move |_, _| count.set(count.get() + 1))
+        });
+        window.run_until_parked();
+        let initial_notifications = notifications.get();
         // Probe frame zero under the decoded image's texture id. Removing
         // textures before every draw prevents stale uploads hiding a restart.
         let mut probe = gpui::RenderImage::new(smallvec::smallvec![image::Frame::new(
@@ -1295,6 +1304,9 @@ mod tests {
         for frame in 1..=6 {
             window.update(|window, _| window.drop_image(first.clone()).unwrap());
             std::thread::sleep(std::time::Duration::from_millis(3));
+            executor.advance_clock(std::time::Duration::from_millis(3));
+            window.run_until_parked();
+            assert_eq!(notifications.get(), initial_notifications + frame);
             window.update(|window, cx| {
                 assert_eq!(window.simulate_next_frame(cx), 0);
                 window.refresh();
@@ -1306,6 +1318,7 @@ mod tests {
             );
             let next = window.read(|cx| handle.read(cx).unwrap().image.decoded(true, cx).unwrap());
             assert!(Arc::ptr_eq(&first, &next));
+            window.run_until_parked();
         }
     }
 
