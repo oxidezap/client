@@ -112,6 +112,14 @@ pub struct DownloadableMedia {
     pub download_type: DownloadMediaType,
 }
 
+/// Sticker in an account's picker, with its origin when reused from history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickerSticker {
+    pub id: String,
+    pub source: Option<String>,
+    pub media: DownloadableMedia,
+}
+
 /// Implement Downloadable trait for DownloadableMedia to enable downloading
 #[async_trait]
 impl Downloadable for DownloadableMedia {
@@ -225,7 +233,7 @@ pub struct MediaContent {
     /// Download info for fetching full media (videos, documents)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloadable: Option<DownloadableMedia>,
-    /// Whether this is an animated sticker (WebP animation)
+    /// Whether this is an animated sticker or a video marked for GIF playback.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_animated: bool,
     /// Duration in seconds (for audio/video)

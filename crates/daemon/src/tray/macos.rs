@@ -29,6 +29,8 @@ const QUIT_ID: &str = "oxidezap-quit";
 /// pinned there by its own types rather than by convention.
 pub struct MacTray {
     tray: TrayIcon,
+    /// The menu's first line, which says what the icon's colour means.
+    status: MenuItem,
     watch: watch::Receiver<TrayState>,
     click: crate::window::Toggle,
 }
@@ -42,9 +44,10 @@ impl MacTray {
         let mut watch = hub.watch_tray();
         let initial = watch.borrow_and_update().clone();
 
-        let tray = build(&initial)?;
+        let (tray, status) = build(&initial)?;
         Ok(Self {
             tray,
+            status,
             watch,
             click: crate::window::Toggle::default(),
         })
@@ -61,7 +64,7 @@ impl MacTray {
         // away, which the worker thread says louder than this ever could.
         if self.watch.has_changed().unwrap_or(false) {
             let state = self.watch.borrow_and_update().clone();
-            apply(&self.tray, &state);
+            apply(&self.tray, &self.status, &state);
         }
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
             // A left-click release, like the other trays' `activate`: put
@@ -96,30 +99,42 @@ impl MacTray {
 }
 
 /// The menu and the icon, on the thread that will own both.
-fn build(initial: &TrayState) -> Result<TrayIcon, String> {
+fn build(initial: &TrayState) -> Result<(TrayIcon, MenuItem), String> {
     let menu = Menu::new();
-    let open = MenuItem::with_id(OPEN_ID, "Open", true, None);
-    let hide = MenuItem::with_id(HIDE_ID, "Hide", true, None);
-    let quit = MenuItem::with_id(QUIT_ID, "Quit", true, None);
-    menu.append(&open)
+    // A line that is only read: what the connection is doing, in the words
+    // the tooltip uses, so the menu answers "is it working" before anything
+    // is clicked.
+    let status = MenuItem::new(initial.single_line(), false, None);
+    let open = MenuItem::with_id(OPEN_ID, "Open OxideZap", true, None);
+    let hide = MenuItem::with_id(HIDE_ID, "Hide Window", true, None);
+    let quit = MenuItem::with_id(QUIT_ID, "Quit OxideZap", true, None);
+    menu.append(&status)
+        .and_then(|_| menu.append(&PredefinedMenuItem::separator()))
+        .and_then(|_| menu.append(&open))
         .and_then(|_| menu.append(&hide))
         .and_then(|_| menu.append(&PredefinedMenuItem::separator()))
         .and_then(|_| menu.append(&quit))
         .map_err(|e| format!("building the tray menu: {e}"))?;
 
-    TrayIconBuilder::new()
+    // The menu opens on a left click, which is what a menu-bar item does on
+    // this platform: a click that toggled the window instead left Quit
+    // reachable only by a right click, which a trackpad user does not have to
+    // hand, and a click that did nothing visible read as a dead icon.
+    let tray = TrayIconBuilder::new()
         .with_id("oxidezap")
-        .with_menu_on_left_click(false)
+        .with_menu_on_left_click(true)
         .with_tooltip(initial.single_line())
         .with_menu(Box::new(menu))
         .with_icon(icon_for(initial))
         .build()
-        .map_err(|e| format!("adding the tray icon: {e}"))
+        .map_err(|e| format!("adding the tray icon: {e}"))?;
+    Ok((tray, status))
 }
 
 /// Redraw for a new state. Failures are lines in the log, not errors: the
 /// next pump retries, and losing one repaint is not worth losing the icon.
-fn apply(tray: &TrayIcon, state: &TrayState) {
+fn apply(tray: &TrayIcon, status: &MenuItem, state: &TrayState) {
+    status.set_text(state.single_line());
     if let Err(e) = tray.set_icon(Some(icon_for(state))) {
         log::warn!("the tray icon could not be redrawn: {e}");
     }

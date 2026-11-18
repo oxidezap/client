@@ -248,11 +248,13 @@ pub(super) fn quote_context(quoted: &oxidezap_core::QuotedMessage) -> wa::Contex
             constructed
         }
     };
-    whatsapp_rust::wacore::proto_helpers::build_quote_context(
+    let mut context = whatsapp_rust::wacore::proto_helpers::build_quote_context(
         quoted.message_id.clone(),
         quoted.sender.clone(),
         &original,
-    )
+    );
+    context.remote_jid.clone_from(&quoted.remote_jid);
+    context
 }
 
 /// Who this device is linked as, off the device store.

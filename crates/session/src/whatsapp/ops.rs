@@ -115,6 +115,147 @@ pub struct BackfillReport {
     pub files: Vec<BackfillFile>,
 }
 
+async fn status_exclusion_audience<Fut: std::future::Future<Output = Result<Jid, String>>>(
+    book: Vec<Jid>,
+    excluded: Vec<Jid>,
+    lookup_lid: impl Fn(Jid) -> Fut,
+) -> Result<Vec<Jid>, String> {
+    use futures_util::{StreamExt as _, TryStreamExt as _};
+    use std::collections::{HashMap, HashSet};
+
+    if excluded.is_empty() {
+        return Ok(book);
+    }
+
+    // The sender resolves PN addresses again. Use the same LID for checking
+    // exclusions and delivering, even if the mapping changes during upload.
+    let phones: HashSet<_> = book
+        .iter()
+        .chain(&excluded)
+        .filter(|jid| jid.is_pn())
+        .map(Jid::to_non_ad)
+        .collect();
+    let lids: HashMap<_, _> = futures_util::stream::iter(phones)
+        .map(|phone| {
+            let lookup = lookup_lid(phone.clone());
+            async move {
+                let lid = lookup.await?;
+                Ok::<_, String>((phone, lid))
+            }
+        })
+        .buffer_unordered(16)
+        .try_collect()
+        .await?;
+    let canonical = |jid: Jid| {
+        let jid = jid.to_non_ad();
+        lids.get(&jid).cloned().unwrap_or(jid)
+    };
+    let excluded: HashSet<_> = excluded.into_iter().map(canonical).collect();
+    Ok(book
+        .into_iter()
+        .map(canonical)
+        .filter(|jid| !excluded.contains(jid))
+        .collect())
+}
+
+/// Who a status goes to, and under which setting.
+///
+/// Anybody named explicitly is an allow list, which is what "share only with
+/// these" means. Nobody named is what WhatsApp does by default: the account's
+/// own status privacy setting, which a phone keeps in app state — *My
+/// contacts* unless somebody changed it, with or without exceptions, or a
+/// fixed list. A client that posted to nobody unless told otherwise was a
+/// different product from the one on the phone.
+async fn status_audience(
+    client: &std::sync::Arc<whatsapp_rust::Client>,
+    store: &oxidezap_chat_store::ChatStore,
+    explicit: Vec<Jid>,
+) -> Result<(Vec<Jid>, whatsapp_rust::features::StatusPrivacySetting), String> {
+    use whatsapp_rust::features::StatusPrivacySetting;
+
+    if !explicit.is_empty() {
+        return Ok((explicit, StatusPrivacySetting::AllowList));
+    }
+    let setting = client.status().audience();
+    // `mode` is the current one; `modes` is the newer repeated form a newer
+    // phone may have written instead.
+    let mode = setting
+        .as_ref()
+        .and_then(|action| action.mode.as_ref().or_else(|| action.modes.first()))
+        .map(|mode| mode.to_i32());
+    let listed = || {
+        setting
+            .iter()
+            .flat_map(|action| &action.user_jid)
+            .map(|address| {
+                address
+                    .parse::<Jid>()
+                    .ok()
+                    .filter(|jid| jid.is_pn() || jid.is_lid())
+                    .ok_or_else(|| "status privacy contains an unsupported recipient".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+
+    // The address book: people saved under a name, not everybody who ever
+    // messaged. Excludes the account itself.
+    let own = super::history::own_jids(client);
+    let book = || async {
+        store
+            .contacts(None, 100_000)
+            .await
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.full_name.is_some() || entry.first_name.is_some())
+                    .map(|entry| entry.jid)
+                    .filter(|jid| jid.is_pn() || jid.is_lid())
+                    .filter(|jid| !own.contains(&jid.to_non_ad_string()))
+                    .collect::<Vec<Jid>>()
+            })
+            .map_err(|e| format!("loading contacts failed: {e}"))
+    };
+
+    let (audience, privacy) = match mode {
+        // The phone's own default.
+        Some(2) => (book().await?, StatusPrivacySetting::Contacts),
+        None => return Err("status privacy is not known yet; choose recipients explicitly or try again after syncing".into()),
+        Some(1) => {
+            let listed = listed()?;
+            let book = book().await?;
+            let audience = status_exclusion_audience(book, listed, |phone| async move {
+                client
+                    .get_lid_pn_entry(&phone)
+                    .await
+                    .map_err(|_| "could not verify a status recipient's identity")?
+                    .map(|entry| Jid::lid(entry.lid.as_ref()))
+                    .ok_or_else(|| "could not verify a status recipient's linked identity".into())
+            }).await?;
+            (audience, StatusPrivacySetting::DenyList)
+        }
+        Some(0) => (listed()?, StatusPrivacySetting::AllowList),
+        // Close friends and custom lists are kept under names this client does
+        // not read. Refused rather than guessed at as an allow list, which
+        // would post to nobody or to the wrong people.
+        Some(_) => {
+            return Err(
+                "your status privacy uses a close-friends or custom list this app cannot read yet; choose people explicitly to share"
+                    .to_string(),
+            );
+        }
+    };
+    if setting != client.status().audience() {
+        return Err("status privacy changed while preparing the audience; try again".into());
+    }
+    if audience.is_empty() {
+        return Err(
+            "there is nobody to share this status with: your status privacy setting selects no contacts"
+                .to_string(),
+        );
+    }
+    Ok((audience, privacy))
+}
+
 impl WhatsAppClient {
     /// Interrupt the library's current reconnect wait. Pause/resume wakes the
     /// running supervisor; it does not construct another bot or open a store.
@@ -388,39 +529,148 @@ impl WhatsAppClient {
     }
 
     /// Publish a text status broadcast.
-    pub fn send_status(&self, text: String) -> Task<Result<(String, i64), String>> {
-        use whatsapp_rust::features::{StatusPrivacySetting, StatusSendOptions};
+    pub fn send_status(
+        &self,
+        text: String,
+        recipients: Vec<String>,
+    ) -> Task<Result<(String, i64), String>> {
+        use whatsapp_rust::features::StatusSendOptions;
 
         let session = self.session.clone();
         self.exec.spawn(async move {
+            let text = text.trim();
             if text.is_empty() {
                 return Err("status text must not be empty".to_string());
             }
+            let explicit = recipients
+                .iter()
+                .map(|jid| jid.parse::<Jid>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "invalid status recipient".to_string())?;
             let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
+            let (recipients, privacy) =
+                status_audience(&live.client, &live.chat_store, explicit).await?;
+            let jid = Jid::status_broadcast();
+            let mut message = wa::Message::default();
+            let mut body = wa::message::ExtendedTextMessage::default();
+            body.text = Some(text.to_owned());
+            body.background_argb = Some(0xFF1E_6E4F);
+            body.font = Some(wa::message::extended_text_message::FontType::System);
+            message.extended_text_message = whatsapp_rust::buffa::MessageField::some(body);
             let result = live
                 .client
                 .status()
-                .send_text(
-                    &text,
-                    0xFF1E_6E4F,
-                    wa::message::extended_text_message::FontType::System,
-                    &[],
-                    StatusSendOptions::default().with_privacy(StatusPrivacySetting::Contacts),
+                .send_raw(
+                    message.clone(),
+                    &recipients,
+                    StatusSendOptions::default().with_privacy(privacy),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Err(error) = live
-                .chat_store
-                .record_operation(&Jid::status_broadcast(), result.message_id.as_str())
+
+            // The post is already on WhatsApp. A local write failure must
+            // never prompt the user to send it a second time.
+            let now = whatsapp_rust::wacore::time::now_utc();
+            if let Err(error) =
+                live.chat_store
+                    .record_outgoing(&jid, result.message_id.as_str(), &message, now)
             {
-                log::warn!("status was sent but its acknowledgement could not be tracked: {error}");
+                log::warn!("published status could not be cached: {error}");
             }
-            Ok((
-                result.message_id.to_string(),
-                whatsapp_rust::wacore::time::now_millis(),
-            ))
+            Ok((result.message_id.to_string(), now.timestamp_millis()))
+        })
+    }
+
+    /// Publish a photo or video status broadcast.
+    ///
+    /// The same prepare, upload and message-building the chat sends use, so a
+    /// status carries the thumbnail and dimensions a chat message would; only
+    /// the destination differs. Documents, audio and stickers are not a status.
+    ///
+    /// `take` fetches the staged bytes; it runs off the caller's thread, so a
+    /// large video never blocks the loop that dispatched the post.
+    pub fn send_status_media(
+        &self,
+        take: impl FnOnce() -> Option<Vec<u8>> + Send + 'static,
+        kind: oxidezap_core::OutgoingMedia,
+        mime_type: String,
+        file_name: String,
+        caption: Option<String>,
+        recipients: Vec<String>,
+    ) -> Task<Result<(String, i64), String>> {
+        use whatsapp_rust::features::StatusSendOptions;
+
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            if !matches!(
+                kind,
+                oxidezap_core::OutgoingMedia::Image | oxidezap_core::OutgoingMedia::Video
+            ) {
+                return Err("a status can be text, a photo or a video".to_string());
+            }
+            let explicit = recipients
+                .iter()
+                .map(|jid| jid.parse::<Jid>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "invalid status recipient".to_string())?;
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            // Reject an unusable account audience before the upload. Resolve it
+            // again afterwards because privacy and LID mappings can change meanwhile.
+            if explicit.is_empty() {
+                status_audience(&live.client, &live.chat_store, Vec::new()).await?;
+            }
+            let data = match crate::exec::unblock(take).await {
+                Ok(Some(data)) if !data.is_empty() => data,
+                Ok(_) => return Err("nothing staged for that status; stage it first".to_string()),
+                Err(e) => return Err(format!("the staged file could not be read: {e}")),
+            };
+            let file = super::OutgoingFile {
+                data,
+                kind,
+                mime_type,
+                file_name,
+                caption,
+            };
+            let (shape, mut file) =
+                match crate::exec::unblock(move || super::outgoing::prepare_for_send(file)).await {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(reason)) => return Err(reason),
+                    Err(e) => return Err(format!("that file could not be prepared: {e}")),
+                };
+            let data = std::mem::take(&mut file.data);
+            let (media_type, options) = file.upload_options();
+            let uploaded = match live.client.upload(data, media_type, options).await {
+                Ok(response) => super::outgoing::Uploaded::from(response),
+                Err(e) => return Err(e.to_string()),
+            };
+            let (recipients, privacy) =
+                status_audience(&live.client, &live.chat_store, explicit).await?;
+            let message = super::outgoing::message(&file, shape, uploaded, None);
+            let result = live
+                .client
+                .status()
+                .send_raw(
+                    message.clone(),
+                    &recipients,
+                    StatusSendOptions::default().with_privacy(privacy),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            // Already on WhatsApp: a failed local write must not invite a
+            // second post.
+            let jid = Jid::status_broadcast();
+            let now = whatsapp_rust::wacore::time::now_utc();
+            if let Err(error) =
+                live.chat_store
+                    .record_outgoing(&jid, result.message_id.as_str(), &message, now)
+            {
+                log::warn!("published status could not be cached: {error}");
+            }
+            Ok((result.message_id.to_string(), now.timestamp_millis()))
         })
     }
 
@@ -1251,5 +1501,42 @@ fn channel_view_of(meta: whatsapp_rust::features::NewsletterMetadata) -> Channel
         description: meta.description,
         subscriber_count: meta.subscriber_count,
         picture_url: meta.picture_url,
+    }
+}
+
+#[cfg(test)]
+mod status_exclusion_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn excludes_by_lid_without_resolving_lid_addresses() {
+        let excluded = Jid::lid("10000000001");
+        let allowed = Jid::lid("10000000002");
+        let book = vec![Jid::lid_device("10000000001", 1), allowed.clone()];
+        let audience = status_exclusion_audience(book, vec![excluded], |_| async {
+            panic!("a LID audience does not require a lookup")
+        })
+        .await
+        .unwrap();
+        assert_eq!(audience, vec![allowed]);
+    }
+
+    #[tokio::test]
+    async fn passes_the_checked_lids_to_delivery() {
+        let blocked_phone = Jid::pn("15550000001");
+        let allowed_phone = Jid::pn("15550000002");
+        let blocked = Jid::lid("10000000001");
+        let allowed = Jid::lid("10000000002");
+        let book = vec![blocked_phone.clone(), allowed_phone];
+        let audience = status_exclusion_audience(book, vec![blocked.clone()], |phone| {
+            std::future::ready(Ok(if phone == blocked_phone {
+                blocked.clone()
+            } else {
+                allowed.clone()
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(audience, vec![allowed]);
     }
 }

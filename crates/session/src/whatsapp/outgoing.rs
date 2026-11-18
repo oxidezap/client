@@ -317,7 +317,7 @@ fn native_image_source_extension(data: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn image_has_animation(data: &[u8]) -> Result<bool, String> {
+pub(super) fn image_has_animation(data: &[u8]) -> Result<bool, String> {
     use image::ImageDecoder as _;
 
     const ERROR: &str = "Não foi possível verificar esta animação. Envie como Documento.";
@@ -1404,6 +1404,7 @@ mod tests {
     #[test]
     fn an_attachment_can_be_a_reply() {
         let quoted = QuotedMessage {
+            remote_jid: None,
             message_id: "3EB0A".to_string(),
             sender: "559900000001@s.whatsapp.net".to_string(),
             sender_name: "quem quer que seja".to_string(),

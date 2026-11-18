@@ -305,7 +305,7 @@ fn timeline_sync(
 pub use notices::what_went_wrong;
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
-pub use status::{Destination, StatusPane};
+pub use status::{Destination, StatusPane, StatusPost};
 pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
@@ -602,6 +602,7 @@ impl ActiveMedia {
 
 // Answering a call must not require a pointer.
 actions!(calls, [AcceptCall, DeclineCall]);
+actions!(app, [Quit]);
 
 /// Initialize chat list and call popup key bindings
 pub fn init_app_bindings(cx: &mut gpui::App) {
@@ -1062,6 +1063,8 @@ pub struct WhatsAppApp {
     destination_selections: HashMap<&'static str, Option<String>>,
     /// Whose status updates are open, and which one of them.
     status_pane: StatusPane,
+    status_reply: Option<status::StatusReply>,
+    status_post: Option<status::StatusPost>,
     /// The broadcast grouped by author, against the message count it was
     /// built from.
     status_feed_cache: RefCell<Option<(usize, oxidezap_core::StatusFeed)>>,
@@ -1542,6 +1545,8 @@ impl WhatsAppApp {
             destination: Destination::default(),
             destination_selections: HashMap::new(),
             status_pane: StatusPane::default(),
+            status_reply: None,
+            status_post: None,
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
             chat_filter: ChatFilter::default(),
@@ -1657,7 +1662,7 @@ impl WhatsAppApp {
             Destination::Chats | Destination::Channels | Destination::Communities => {
                 self.selected_destination_jid().is_some()
             }
-            Destination::Status => self.status_pane.is_open(),
+            Destination::Status => self.status_pane.is_open() || self.status_post.is_some(),
         }
     }
 
@@ -1674,6 +1679,7 @@ impl WhatsAppApp {
         // Stopped before it is closed, and in that order — afterwards there
         // is no way to ask which update was on screen, so a video went on
         // decoding and playing behind the chat list.
+        self.cancel_status_post(cx);
         self.leave_shown_status();
         self.status_pane.close();
         cx.notify();
@@ -2364,6 +2370,8 @@ impl WhatsAppApp {
         // account — and otherwise at an empty reader which, on a phone, is
         // the whole screen with no way back out of it.
         self.status_pane.close();
+        self.status_reply = None;
+        self.status_post = None;
         self.destination = Destination::default();
         self.destination_selections.clear();
         self.message_list_cache.borrow_mut().clear();
@@ -3255,7 +3263,7 @@ impl WhatsAppApp {
     /// Handle events from the isolated input area view
     fn handle_input_area_event(
         &mut self,
-        _input_area: &Entity<InputAreaView>,
+        input_area: &Entity<InputAreaView>,
         event: &InputAreaEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3268,6 +3276,8 @@ impl WhatsAppApp {
                     self.send_message(text, cx);
                 }
             }
+            InputAreaEvent::LoadPickerMedia(tab) => self.load_picker_media(*tab, input_area, cx),
+            InputAreaEvent::SendPickerMedia(request) => self.send_picker_media(request, cx),
             InputAreaEvent::AttachFiles(category) => {
                 self.attach_category(*category, cx);
             }
@@ -3348,38 +3358,47 @@ impl WhatsAppApp {
     /// failed message again, and the reply draft that produced it was
     /// consumed when it was first sent.
     fn send_quoted(&mut self, text: &str, quoted: Option<QuotedMessage>, cx: &mut Context<Self>) {
-        // Check if connected before attempting to send
-        if !self.is_connected() {
-            warn!("Cannot send message: not connected");
-            return;
-        }
-
         let Some(jid) = self.selected_chat.clone() else {
             return;
         };
-
-        let local_id = Self::next_local_id("local");
-        let Some(client) = &self.client else {
-            warn!("Cannot send message: client is unavailable");
+        if !self.send_text_to(&jid, text, quoted, cx) {
             return;
-        };
-        client.send_message(&jid, text, local_id.clone(), quoted.clone());
-
-        // Add to local chat immediately for responsiveness; the client renames
-        // it to the real id via MessageIdAssigned.
-        let mut msg = ChatMessage::new_outgoing(local_id, text.to_string());
-        // The bubble shows its own quote from the moment it is drawn, the way
-        // the reply will look once it comes back from the store.
-        msg.quoted = quoted;
-        if self.add_message_to_chat(&jid, msg, cx) {
-            self.scroll_to_last_message();
         }
+        self.scroll_to_last_message();
         // The reply bar goes with the reply it composed.
         if let Some(input) = &self.input_area {
             input.update(cx, |view, cx| view.set_reply(None, cx));
         }
 
         cx.notify();
+    }
+
+    fn send_text_to(
+        &mut self,
+        jid: &str,
+        text: &str,
+        quoted: Option<QuotedMessage>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_connected() {
+            warn!("Cannot send message: not connected");
+            return false;
+        }
+
+        let Some(client) = &self.client else {
+            warn!("Cannot send message: client is unavailable");
+            return false;
+        };
+        let local_id = Self::next_local_id("local");
+        client.send_message(jid, text, local_id.clone(), quoted.clone());
+
+        // MessageIdAssigned replaces the local id once the daemon accepts the send.
+        let mut message = ChatMessage::new_outgoing(local_id, text.to_string());
+        message.quoted = quoted;
+        self.ensure_chat(jid);
+        self.add_message_to_chat(jid, message, cx);
+        cx.notify();
+        true
     }
 
     // ========== PTT Recording ==========

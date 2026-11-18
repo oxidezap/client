@@ -29,6 +29,7 @@ use wacore::time::Instant;
 
 use crate::state::StateHub;
 
+pub(crate) use platform::keeps_daemon_running;
 pub use platform::show;
 
 /// Ask every account's front ends to raise a window, launching one if none of

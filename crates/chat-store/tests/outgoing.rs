@@ -887,3 +887,34 @@ async fn a_late_receipt_does_not_revive_a_failed_send() {
         );
     }
 }
+
+#[tokio::test]
+async fn recent_stickers_only_include_own_messages_across_chats() {
+    let (_store, chat_store) = test_store().await;
+    let mut sticker = wa::Message::default();
+    sticker.sticker_message = buffa::MessageField::some(Default::default());
+    chat_store
+        .record_outgoing(&jid(PEER), "OWN-OLDER", &sticker, ts(1_700_000_100))
+        .unwrap();
+    chat_store
+        .record_outgoing(&jid(GROUP), "OWN-NEWER", &sticker, ts(1_700_000_101))
+        .unwrap();
+    feed(
+        &chat_store,
+        [message_event(
+            sticker,
+            incoming_info(PEER, PEER, "INBOUND", 1_700_000_102),
+        )],
+    )
+    .await;
+    chat_store.flush().await.unwrap();
+
+    let stickers = chat_store.own_recent_stickers().await.unwrap();
+    assert_eq!(
+        stickers
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        ["OWN-NEWER", "OWN-OLDER"]
+    );
+}

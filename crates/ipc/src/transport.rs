@@ -288,7 +288,10 @@ use std::path::PathBuf;
 /// [`PairingCode`]: crate::PairingCode
 /// 41 adds addressed device settings, tests and camera previews with their own identity.
 /// 42 adds non-destructive, idempotent relinking of a logged-out account.
-pub const PROTOCOL_VERSION: u32 = 42;
+/// 43 adds the status, sticker-library and composer-media requests, among them
+/// `PublishStatusMedia`, which an older daemon would refuse as malformed after
+/// the file had been staged.
+pub const PROTOCOL_VERSION: u32 = 43;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

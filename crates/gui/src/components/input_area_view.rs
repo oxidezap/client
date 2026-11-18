@@ -13,7 +13,6 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     input::{Enter, InputEvent, Paste, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
-    popover::Popover,
 };
 
 use super::emoji_picker::{EmojiPicked, EmojiPicker};
@@ -21,11 +20,17 @@ use crate::components::{ProductIcon, parts};
 use crate::platform::picker::AttachmentCategory;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 
+#[path = "composer_picker.rs"]
+mod composer_picker;
+pub(crate) use composer_picker::{PickerItem, PickerRequest, PickerTab};
+
 /// Events emitted by the input area to communicate with the parent app.
 #[derive(Clone, Debug)]
 pub enum InputAreaEvent {
     /// User wants to send the current message
     SendMessage(String),
+    LoadPickerMedia(PickerTab),
+    SendPickerMedia(PickerRequest),
     /// User picked an attachment category from the composer menu.
     ///
     /// Which conversation is the app's to know, and the files are chosen
@@ -98,6 +103,7 @@ impl From<ReplyDraft> for oxidezap_core::QuotedMessage {
     /// with nothing to work from.
     fn from(draft: ReplyDraft) -> Self {
         Self {
+            remote_jid: None,
             message_id: draft.message_id,
             sender: draft.sender,
             sender_name: draft.sender_name,
@@ -128,6 +134,9 @@ pub struct InputAreaView {
     is_recording: bool,
     editing: bool,
     edit_pending: bool,
+    picker_tab: PickerTab,
+    picker_status: Option<String>,
+    picker_items: Vec<PickerItem>,
     /// When the current recording started, for the elapsed counter.
     recording_started_at: Option<Instant>,
     /// Most recent input level, 0..=1, for the live meter.
@@ -202,6 +211,9 @@ impl InputAreaView {
             is_recording: false,
             editing: false,
             edit_pending: false,
+            picker_tab: PickerTab::Emoji,
+            picker_status: None,
+            picker_items: Vec::new(),
             recording_started_at: None,
             level: 0.0,
             reply: None,
@@ -327,7 +339,7 @@ impl InputAreaView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> String {
-        self.emoji_open = false;
+        self.close_picker();
         let old = self.input.read(cx).text().to_string();
         self.input.update(cx, |state, cx| {
             state.set_value(crate::emoji::content(new_text), window, cx);
@@ -349,7 +361,7 @@ impl InputAreaView {
             state.set_value("", window, cx);
         });
         self.stop_typing_internal(cx);
-        self.emoji_open = false;
+        self.close_picker();
         cx.emit(InputAreaEvent::SendMessage(text));
     }
 
@@ -369,7 +381,7 @@ impl InputAreaView {
                 .expect("picker choices are valid single emoji tokens");
             state.focus(window, cx);
         });
-        self.emoji_open = false;
+        self.close_picker();
         self.on_keystroke(cx);
         cx.notify();
     }
@@ -409,7 +421,7 @@ impl InputAreaView {
             return;
         }
         self.is_recording = is_recording;
-        self.emoji_open = false;
+        self.close_picker();
         self.recording_started_at = is_recording.then(Instant::now);
         if !is_recording {
             self.level = 0.0;
@@ -427,7 +439,7 @@ impl InputAreaView {
         self.editing = editing;
         self.edit_pending = pending;
         if pending {
-            self.emoji_open = false;
+            self.close_picker();
         }
         cx.notify();
     }
@@ -532,8 +544,6 @@ impl InputAreaView {
         let entity = cx.entity().clone();
         let record_entity = entity.clone();
         let attach_entity = entity.clone();
-        let emoji_entity = entity.clone();
-        let picker = self.emoji_picker.clone();
         // Asked of the rope rather than of a copy of it. `text()` hands back
         // the document itself; `to_string` copied all of it, on every
         // keystroke, to answer whether the send button or the microphone
@@ -618,29 +628,7 @@ impl InputAreaView {
                             .w_full(),
                     ),
             )
-            .child(
-                Popover::new("emoji-popover")
-                    .anchor(gpui::Anchor::BottomRight)
-                    .open(self.emoji_open)
-                    .on_open_change(move |open, _, cx| {
-                        emoji_entity.update(cx, |view, cx| {
-                            view.emoji_open = *open && !view.edit_pending && !view.is_recording;
-                            cx.notify();
-                        });
-                    })
-                    .track_focus(&self.emoji_picker.read(cx).focus_handle(cx))
-                    .trigger(
-                        parts::icon_button(
-                            "emoji",
-                            Icon::new(ProductIcon::Smile),
-                            crate::tr!(ChooseEmoji),
-                            control,
-                        )
-                        .disabled(self.edit_pending)
-                        .debug_selector(|| "emoji-trigger".into()),
-                    )
-                    .content(move |_, _, _| picker.clone()),
-            )
+            .child(self.render_picker(control, cx))
             // Record or send, never both: which one is available follows
             // whether there is anything to send, the way every messaging
             // client behaves.

@@ -295,7 +295,7 @@ impl<'a> Frames<'a> {
                 // For most requests this only releases the entry. For the few
                 // whose whole answer is that they were done, it is the answer.
                 match take_pending(self.pending, id) {
-                    Some(Awaiting::Mutation(tx)) => {
+                    Some(Awaiting::Mutation(tx)) | Some(Awaiting::StagedMutation { tx, .. }) => {
                         let _ = tx.send(Ok(()));
                     }
                     Some(Awaiting::Acted(tx)) => {
@@ -381,6 +381,15 @@ impl<'a> Frames<'a> {
                     None => debug!("a plugin listing arrived for {id}, which nobody is waiting on"),
                 }
             }
+            DaemonMessage::SyncedStickers { id, items } => match take_pending(self.pending, id) {
+                Some(Awaiting::SyncedStickers(tx)) => {
+                    let _ = tx.send(Ok(items));
+                }
+                Some(waiting) => {
+                    self.fail(waiting, &Failure::permanent("unexpected sticker listing"))
+                }
+                None => debug!("a sticker listing arrived for a cancelled request"),
+            },
             DaemonMessage::Storage {
                 id,
                 database_bytes,

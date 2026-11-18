@@ -174,6 +174,23 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   shutdown; a second one while it drains exits on 128-plus-signal-number
   rather than waiting it out, because the teardown has joins without a
   deadline and a repeated signal is somebody saying the wait is the problem.
+- **Closing the last window stops the daemon with Background off.**
+  Settings → Advanced → Background is stored in `background.json` beside
+  `theme.json`. The closing window sends `ShutdownUnlessOtherWindows` on its
+  control connection. The daemon checks for other windows as it releases
+  that connection, independently of any work on the account connection.
+  Before that connection is set up, closing the window stops only a daemon
+  that the window started itself.
+  The tray's Hide uses `platform::leave` to close without a stop request.
+  Teardown gives accounts ten seconds to disconnect, followed by a separate
+  three-second deadline for the runtime. On macOS the status item appears
+  when Background is enabled, and a left click opens its menu.
+- **A daemon the window starts must reset its own signals.** It inherits the
+  window's signal state across the spawn, and the GUI's left SIGTERM and
+  SIGINT without effect: the same binary stopped in a second from a shell and
+  never from the window. `restore_default_signals` at the top of the daemon's
+  `main` clears the mask and the dispositions before any thread exists. Test
+  it by starting the front end, not the daemon, and signalling the child.
 - **The front end owns no session.** `oxidezap` starts `oxidezapd` when none is
   listening and speaks to it; the two ship together and the release packages
   them in one directory. A front end that cannot reach the daemon has no

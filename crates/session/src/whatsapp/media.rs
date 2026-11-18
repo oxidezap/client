@@ -347,12 +347,12 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
         // A video's `data` is never the video: these are the JPEG bytes of its
         // poster frame, which is why the constructor takes it under that name
         // and settles the mime type and the preview flag itself.
-        return Some(
-            MediaContent::video(Arc::new(thumbnail), video.seconds)
-                .with_size(video.width, video.height)
-                .with_caption(video.caption.clone())
-                .with_download(downloadable),
-        );
+        let mut media = MediaContent::video(Arc::new(thumbnail), video.seconds)
+            .with_size(video.width, video.height)
+            .with_caption(video.caption.clone())
+            .with_download(downloadable);
+        media.is_animated = video.gif_playback == Some(true);
+        return Some(media);
     }
 
     // Audio is lazy either way: the bytes are fetched when somebody presses

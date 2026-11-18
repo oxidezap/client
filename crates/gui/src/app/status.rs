@@ -9,10 +9,36 @@
 //! they change rather than mirrored into a second copy that could disagree
 //! with the first.
 
-use gpui::Context;
-use oxidezap_core::{MediaType, STATUS_BROADCAST_JID, StatusFeed};
+use gpui::{AppContext as _, Context, Entity, Window};
+use gpui_component::input::{InputEvent, InputState};
+use oxidezap_core::{
+    ChatMessage, MediaType, QuotedKind, QuotedMessage, STATUS_BROADCAST_JID, StatusFeed,
+};
 
 use super::WhatsAppApp;
+
+pub(super) struct StatusReply {
+    quote: QuotedMessage,
+    input: Entity<InputState>,
+}
+
+pub struct StatusPost {
+    /// The text of a text status, or the caption over a photo or video.
+    pub text: Entity<InputState>,
+    pub search: Entity<InputState>,
+    pub recipients: std::collections::BTreeSet<String>,
+    pub pending: bool,
+    /// A photo or video chosen to post instead of text.
+    pub media: Option<StatusMediaDraft>,
+}
+
+/// A photo or video waiting to be posted as a status.
+#[derive(Clone)]
+pub struct StatusMediaDraft {
+    pub file: crate::platform::picker::Picked,
+    /// A still to show for an image; a video has none until it is posted.
+    pub preview: Option<std::sync::Arc<gpui::Image>>,
+}
 
 /// Which of the sidebar's destinations is on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -92,6 +118,7 @@ pub struct StatusPane {
     /// different message — never marked watched, never fetched, with the
     /// previous update's video still playing over it.
     shown: Option<String>,
+    playback_revision: u64,
 }
 
 impl StatusPane {
@@ -124,7 +151,12 @@ impl StatusPane {
 
     /// Record what the current position resolved to.
     pub fn follow(&mut self, message_id: Option<String>) {
+        self.playback_revision = self.playback_revision.wrapping_add(1);
         self.shown = message_id;
+    }
+
+    pub fn playback_revision(&self) -> u64 {
+        self.playback_revision
     }
 
     /// Put the reader back on the update it was showing, which has moved to
@@ -201,6 +233,7 @@ impl WhatsAppApp {
         // was drawn and left a video decoding and talking underneath the
         // conversation that replaced it.
         if self.destination == Destination::Status {
+            self.cancel_status_post(cx);
             self.leave_shown_status();
         }
         if self.destination.has_conversations() {
@@ -349,11 +382,348 @@ impl WhatsAppApp {
         self.status_feed().unseen_authors()
     }
 
+    pub fn status_reply_input(
+        &mut self,
+        author: &str,
+        author_name: &str,
+        message: &ChatMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<InputState>> {
+        if author.is_empty() || message.is_from_me {
+            self.status_reply = None;
+            return None;
+        }
+        if let Some(reply) = &self.status_reply
+            && reply.quote.message_id == message.id
+            && reply.quote.sender == author
+        {
+            return Some(reply.input.clone());
+        }
+
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(crate::tr!(ReplyPrivately)));
+        cx.subscribe_in(
+            &input,
+            window,
+            |app, source, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    app.send_status_reply(source, window, cx);
+                }
+            },
+        )
+        .detach();
+
+        self.status_reply = Some(StatusReply {
+            quote: QuotedMessage {
+                remote_jid: Some(STATUS_BROADCAST_JID.to_string()),
+                message_id: message.id.clone(),
+                sender: author.to_string(),
+                sender_name: author_name.to_string(),
+                preview: message.content.clone(),
+                kind: message
+                    .media
+                    .as_ref()
+                    .and_then(|media| QuotedKind::of(&media.media_type)),
+            },
+            input: input.clone(),
+        });
+        Some(input)
+    }
+
+    pub fn send_status_reply(
+        &mut self,
+        input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(reply) = &self.status_reply else {
+            return;
+        };
+        if self.destination != Destination::Status
+            || &reply.input != input
+            || self.status_pane.author() != Some(reply.quote.sender.as_str())
+            || self.shown_status_message_id().as_deref() != Some(reply.quote.message_id.as_str())
+        {
+            return;
+        }
+        let value = input.read(cx).value();
+        let text = value.trim();
+        if text.is_empty() {
+            return;
+        }
+        let quote = reply.quote.clone();
+        let jid = quote.sender.clone();
+        if self.send_text_to(&jid, text, Some(quote), cx) {
+            self.status_reply = None;
+            self.select_chat(jid, super::ChatOpen::ToPreview, window, cx);
+            self.scroll_to_last_message();
+        }
+    }
+
+    pub fn status_post(&self) -> Option<&StatusPost> {
+        self.status_post.as_ref()
+    }
+
+    pub fn status_recipients(&self, query: &str) -> impl Iterator<Item = (&str, &str)> {
+        let query = query.trim().to_lowercase();
+        self.chats.iter().filter_map(move |chat| {
+            let (number, server) = chat.jid.split_once('@')?;
+            if !matches!(server, "s.whatsapp.net" | "lid")
+                || self.account_jid.as_deref() == Some(chat.jid.as_str())
+                || self.account_lid.as_deref() == Some(chat.jid.as_str())
+            {
+                return None;
+            }
+            (query.is_empty()
+                || chat.name.to_lowercase().contains(&query)
+                || number.contains(&query))
+            .then_some((chat.jid.as_str(), chat.name.as_str()))
+        })
+    }
+
+    pub fn begin_status_post(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_send() || self.status_post.is_some() {
+            return;
+        }
+        self.close_status(cx);
+        let text = cx.new(|cx| InputState::new(window, cx).placeholder(crate::tr!(WriteAStatus)));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(crate::tr!(SearchChats)));
+        for field in [&text, &search] {
+            cx.subscribe(field, |_, _, _: &InputEvent, cx| cx.notify())
+                .detach();
+        }
+        text.update(cx, |input, cx| input.focus(window, cx));
+        self.status_post = Some(StatusPost {
+            text,
+            search,
+            recipients: Default::default(),
+            pending: false,
+            media: None,
+        });
+        self.navigate_to_chat();
+        cx.notify();
+    }
+
+    /// Ask for a photo or video to post. Only images and videos qualify; a
+    /// document, a sticker or a voice note is not a status.
+    pub fn choose_status_media(&mut self, cx: &mut Context<Self>) {
+        if !self.can_send() || self.status_post.as_ref().is_none_or(|post| post.pending) {
+            return;
+        }
+        // Which draft asked: the chooser and the read take as long as they
+        // take, and a draft cancelled and replaced meanwhile must not be
+        // handed the old one's file.
+        let origin = self.status_post.as_ref().map(|post| post.text.downgrade());
+        let chosen = crate::platform::picker::choose_category(
+            cx,
+            crate::platform::picker::AttachmentCategory::PhotosVideos,
+        );
+        cx.spawn(async move |app, cx| {
+            let chosen = chosen.await;
+            let _ = app.update(cx, |app, cx| {
+                let Some(post) = &mut app.status_post else {
+                    return;
+                };
+                if post.pending
+                    || origin.as_ref().and_then(|origin| origin.upgrade()).as_ref()
+                        != Some(&post.text)
+                {
+                    return;
+                }
+                match chosen {
+                    Ok(chosen) => {
+                        for refusal in chosen.refused {
+                            app.notify_user(refusal, super::notices::Tone::Problem, cx);
+                        }
+                        let Some(post) = &mut app.status_post else {
+                            return;
+                        };
+                        if let Some(file) = chosen.files.into_iter().find(|file| {
+                            matches!(
+                                file.kind,
+                                oxidezap_core::OutgoingMedia::Image
+                                    | oxidezap_core::OutgoingMedia::Video
+                            )
+                        }) {
+                            // A still is a second copy of the picture, so only
+                            // a modest one is drawn; the file itself is sent
+                            // either way.
+                            const PREVIEW_LIMIT: usize = 16 * 1024 * 1024;
+                            let preview = (file.kind == oxidezap_core::OutgoingMedia::Image
+                                && file.bytes.len() <= PREVIEW_LIMIT)
+                                .then(|| crate::utils::mime_to_image_format(&file.mime_type))
+                                .flatten()
+                                .map(|format| {
+                                    std::sync::Arc::new(gpui::Image::from_bytes(
+                                        format,
+                                        file.bytes.clone(),
+                                    ))
+                                });
+                            post.media = Some(StatusMediaDraft { file, preview });
+                        }
+                    }
+                    Err(error) => {
+                        let _ = post;
+                        app.notify_user(error, super::notices::Tone::Problem, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn clear_status_media(&mut self, cx: &mut Context<Self>) {
+        if let Some(post) = &mut self.status_post
+            && !post.pending
+        {
+            post.media = None;
+            cx.notify();
+        }
+    }
+
+    pub fn cancel_status_post(&mut self, cx: &mut Context<Self>) {
+        if self.status_post.as_ref().is_some_and(|post| !post.pending) {
+            self.status_post = None;
+            if !self.status_pane.is_open() {
+                self.mobile_panel = crate::responsive::MobilePanel::ChatList;
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn set_status_recipient(&mut self, jid: &str, selected: bool, cx: &mut Context<Self>) {
+        let Some(post) = &mut self.status_post else {
+            return;
+        };
+        if post.pending {
+            return;
+        }
+        if selected {
+            post.recipients.insert(jid.to_owned());
+        } else {
+            post.recipients.remove(jid);
+        }
+        cx.notify();
+    }
+
+    pub fn publish_status(&mut self, cx: &mut Context<Self>) {
+        if !self.can_send() {
+            return;
+        }
+        let Some(client) = &self.client else {
+            return;
+        };
+        let Some(post) = &mut self.status_post else {
+            return;
+        };
+        let text = post.text.read(cx).value();
+        let text = text.trim();
+        if post.pending || (text.is_empty() && post.media.is_none()) {
+            return;
+        }
+        post.pending = true;
+        let draft = post.text.downgrade();
+        let recipients = post.recipients.iter().cloned().collect();
+        let result = match &post.media {
+            Some(media) => {
+                let crate::platform::picker::Picked {
+                    file_name,
+                    mime_type,
+                    kind,
+                    bytes,
+                } = media.file.clone();
+                client.publish_status_media(
+                    crate::session::Attachment {
+                        bytes,
+                        kind,
+                        mime_type,
+                        file_name,
+                        caption: (!text.is_empty()).then(|| text.to_owned()),
+                    },
+                    recipients,
+                )
+            }
+            None => client.publish_status(text.to_owned(), recipients),
+        };
+        cx.spawn(async move |app, cx| {
+            let result = result
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = app.update(cx, |app, cx| {
+                let Some(post) = &mut app.status_post else {
+                    return;
+                };
+                if draft.upgrade().as_ref() != Some(&post.text) {
+                    return;
+                }
+                post.pending = false;
+                match result {
+                    Ok(()) => {
+                        // Not `cancel_status_post`: it also puts a phone's
+                        // layout back on the chat list, which would take the
+                        // person out of whatever they opened while this was
+                        // posting.
+                        app.status_post = None;
+                        app.notify_user(
+                            crate::tr!(StatusPublished),
+                            super::notices::Tone::Info,
+                            cx,
+                        );
+                    }
+                    Err(error) => app.notify_user(error, super::notices::Tone::Problem, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn open_quoted_status(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let feed = self.status_feed();
+        let target = feed
+            .mine()
+            .into_iter()
+            .chain(feed.authors())
+            .find_map(|author| {
+                let index = feed
+                    .updates_of(author)
+                    .position(|message| message.id == id)?;
+                Some((author.jid.clone(), index))
+            });
+        let Some((author, index)) = target else {
+            self.notify_user(
+                crate::tr!(OriginalStatusUnavailable),
+                super::notices::Tone::Info,
+                cx,
+            );
+            return;
+        };
+        self.set_destination(Destination::Status, window, cx);
+        let leaving = self.shown_status_message_id();
+        self.status_pane.open(author);
+        self.status_pane.seek(index);
+        self.navigate_to_chat();
+        self.shown_status_changed(leaving, cx);
+        cx.notify();
+    }
+
     pub fn open_status(&mut self, author: String, cx: &mut Context<Self>) {
         // Read before the selection moves, because afterwards there is no way
         // to ask what was on screen. Opening an image or a text update does
         // not touch the player, so a video left this way went on playing.
+        // While a post is in flight its composer stays on screen, so a
+        // reader opened now would play behind it. Navigation resumes when the
+        // post settles.
+        if self.status_post.as_ref().is_some_and(|post| post.pending) {
+            return;
+        }
+        self.cancel_status_post(cx);
         let leaving = self.shown_status_message_id();
+        self.status_reply = None;
         self.status_pane.open(author);
         self.navigate_to_chat();
         self.shown_status_changed(leaving, cx);
@@ -395,6 +765,7 @@ impl WhatsAppApp {
     /// so an update that lapsed under the reader handed its place to the next
     /// one and left it unfetched and still ringed as new.
     fn shown_status_changed(&mut self, leaving: Option<String>, cx: &mut Context<Self>) {
+        self.status_reply = None;
         self.stop_status_media(leaving);
         self.mark_shown_status_seen();
         self.fetch_shown_status(cx);
@@ -468,6 +839,7 @@ impl WhatsAppApp {
     /// selection, so the frame task kept running and the audio kept going over
     /// whatever the window showed next.
     pub(super) fn leave_shown_status(&mut self) {
+        self.status_reply = None;
         let shown = self.shown_status_message_id();
         self.stop_status_media(shown);
     }

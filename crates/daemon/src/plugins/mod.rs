@@ -348,6 +348,7 @@ impl Commands for Bridge {
             // in means a lookup the daemon has no store to make; see the
             // note in docs/roadmap.md.
             quoted: quoted.map(|id| oxidezap_core::QuotedMessage {
+                remote_jid: None,
                 message_id: id.to_owned(),
                 sender: String::new(),
                 sender_name: String::new(),

@@ -126,6 +126,102 @@ impl Bridge {
                 });
                 None
             }
+            Action::SyncedStickers {
+                id,
+                favorites,
+                answer_to,
+            } => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let task = client.sticker_library(favorites);
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(items)) => Ok(DaemonMessage::SyncedStickers { id, items }),
+                        other => mutation_answer(id, other),
+                    };
+                    answer_now(&answer_to, answered(id, result));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
+            Action::ReuseComposerMedia {
+                id,
+                source,
+                message_id,
+                target,
+                answer_to,
+            } => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let task = client.reuse_composer_media(source, message_id, target);
+                oxidezap_session::spawn(async move {
+                    let result = mutation_answer(id, task.await);
+                    answer_now(&answer_to, answered(id, result));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
+            Action::PublishStatus {
+                id,
+                text,
+                recipients,
+                answer_to,
+            } => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let task = client.send_status(text, recipients);
+                oxidezap_session::spawn(async move {
+                    let result = mutation_answer(id, task.await);
+                    answer_now(&answer_to, answered(id, result));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
+            Action::PublishStatusMedia {
+                id,
+                request,
+                answer_to,
+            } => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let oxidezap_ipc::PublishStatusMedia {
+                    upload,
+                    kind,
+                    mime_type,
+                    file_name,
+                    caption,
+                    recipients,
+                } = request;
+                let account_media = crate::media::AccountMedia::new(self.hub.account_id());
+                // Taken, not read: nothing else will ever remove what the
+                // client staged. See `Action::SendMedia`.
+                let task = client.send_status_media(
+                    move || account_media.take_staged(&upload),
+                    kind,
+                    mime_type,
+                    file_name,
+                    caption,
+                    recipients,
+                );
+                oxidezap_session::spawn(async move {
+                    let result = mutation_answer(id, task.await);
+                    answer_now(&answer_to, answered(id, result));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
             Action::EditMessage {
                 id,
                 request,
@@ -996,7 +1092,7 @@ impl Bridge {
                 );
             }
             WireRequest::SendStatus { text } => {
-                let task = client.send_status(text);
+                let task = client.send_status(text, Vec::new());
                 run_wire(
                     answer_to.clone(),
                     id,
@@ -1471,7 +1567,13 @@ impl Bridge {
         }
 
         match action {
-            Action::Wire { .. } | Action::EditMessage { .. } | Action::RevokeMessage { .. } => {
+            Action::Wire { .. }
+            | Action::EditMessage { .. }
+            | Action::RevokeMessage { .. }
+            | Action::PublishStatus { .. }
+            | Action::PublishStatusMedia { .. }
+            | Action::SyncedStickers { .. }
+            | Action::ReuseComposerMedia { .. } => {
                 unreachable!("addressed actions are handled in begin_slow")
             }
             Action::SendText(oxidezap_ipc::SendText {

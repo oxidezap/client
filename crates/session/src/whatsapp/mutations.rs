@@ -36,6 +36,44 @@ pub(super) async fn delete_and_record<T, E: std::fmt::Display>(
     Ok(())
 }
 
+fn reusable_composer_media(original: &wa::Message) -> Option<wa::Message> {
+    use whatsapp_rust::wacore::proto_helpers::MessageExt as _;
+
+    if original.is_view_once() {
+        return None;
+    }
+    let base = original.get_base_message();
+    let mut message = wa::Message::default();
+    let lottie = base
+        .lottie_sticker_message
+        .as_option()
+        .and_then(|wrapper| wrapper.message.as_option())
+        .and_then(|inner| inner.sticker_message.as_option());
+    if let Some(sticker) = base.sticker_message.as_option().or(lottie) {
+        let mut sticker = sticker.clone();
+        sticker.context_info = Default::default();
+        if lottie.is_some() && !base.sticker_message.is_set() {
+            let mut inner = wa::Message::default();
+            inner.sticker_message = MessageField::some(sticker);
+            let mut wrapper = wa::message::FutureProofMessage::default();
+            wrapper.message = MessageField::some(inner);
+            message.lottie_sticker_message = MessageField::some(wrapper);
+        } else {
+            message.sticker_message = MessageField::some(sticker);
+        }
+    } else {
+        let video = base
+            .video_message
+            .as_option()
+            .filter(|video| video.gif_playback == Some(true))?;
+        let mut video = video.clone();
+        video.context_info = Default::default();
+        video.caption = None;
+        message.video_message = MessageField::some(video);
+    }
+    Some(message)
+}
+
 fn edit_text_content(original: Option<&wa::Message>, text: String) -> wa::Message {
     let context = original
         .map(oxidezap_chat_store::normalized_message)
@@ -366,6 +404,81 @@ impl WhatsAppClient {
         })
     }
 
+    /// Send a fresh sticker or GIF using media already in this account's history.
+    pub fn reuse_composer_media(
+        &self,
+        source_chat_jid: Option<String>,
+        message_id: String,
+        target_chat_jid: String,
+    ) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let target: Jid = target_chat_jid
+                .parse()
+                .map_err(|_| "not a chat address".to_string())?;
+            if !(target.is_pn() || target.is_lid() || target.is_group()) {
+                return Err(
+                    "stickers and GIFs can only be reused in direct and group chats".into(),
+                );
+            }
+            let Some(live) = session.lock().await.clone() else {
+                return Err("no session yet".into());
+            };
+            let mut message = if let Some(source) = source_chat_jid.as_deref() {
+                let source: Jid = source
+                    .parse()
+                    .map_err(|_| "not a chat address".to_string())?;
+                if !(source.is_pn() || source.is_lid() || source.is_group()) {
+                    return Err("that chat is unable to supply reusable media".into());
+                }
+                let stored = live
+                    .chat_store
+                    .message(&source, &message_id)
+                    .await
+                    .map_err(|error| format!("could not read that media: {error}"))?
+                    .filter(|message| !message.revoked)
+                    .and_then(|message| message.message)
+                    .ok_or_else(|| "that sticker or GIF is no longer available".to_string())?;
+                reusable_composer_media(&stored)
+            } else {
+                live.stickers.message(&message_id)
+            }
+            .ok_or_else(|| "that sticker or GIF is no longer available".to_string())?;
+            let client = &live.client;
+            if source_chat_jid.is_none()
+                && let Some(sticker) = message.sticker_message.as_option_mut()
+                && sticker.is_animated.is_none()
+                && let Ok(bytes) = client
+                    .download(sticker, whatsapp_rust::download::DownloadLimits::default())
+                    .await
+                && let Ok(animated) = super::outgoing::image_has_animation(&bytes)
+            {
+                if let Some(hash) = &sticker.file_enc_sha256 {
+                    live.stickers
+                        .remember_animation(&message_id, hash, animated);
+                }
+                sticker.is_animated = Some(animated);
+            }
+            let id = client.generate_message_id();
+            super::record_outgoing(
+                &live.chat_store,
+                &target,
+                id.as_str(),
+                &message,
+                &live.resolve_chat_names,
+            )?;
+            let options = whatsapp_rust::SendOptions::default().with_message_id(id.clone());
+            if let Err(error) = client
+                .send(whatsapp_rust::SendRequest::new(&target, message).with_options(options))
+                .await
+            {
+                super::mark_send_failed(&live.chat_store, &target, id.as_str());
+                return Err(error.to_string());
+            }
+            Ok(())
+        })
+    }
+
     /// Answer an interactive list message by selecting one of its rows.
     ///
     /// The row id is the caller's, taken from the list message the sender
@@ -595,6 +708,51 @@ impl WhatsAppClient {
                 log::warn!("Failed to send recording state: {}", e);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod composer_media_tests {
+    use super::*;
+
+    #[test]
+    fn reusing_a_gif_keeps_animation_and_drops_the_original_caption_and_quote() {
+        let mut video = wa::message::VideoMessage::default();
+        video.gif_playback = Some(true);
+        video.caption = Some("source chat caption".into());
+        video.direct_path = Some("/media/gif".into());
+        let mut context = wa::ContextInfo::default();
+        context.stanza_id = Some("source-reply".into());
+        video.context_info = MessageField::some(context);
+        let mut original = wa::Message::default();
+        original.video_message = MessageField::some(video.clone());
+
+        let outgoing = reusable_composer_media(&original).unwrap();
+        let reused = outgoing.video_message.as_option().unwrap();
+        assert_eq!(reused.gif_playback, Some(true));
+        assert_eq!(reused.direct_path, video.direct_path);
+        assert!(reused.caption.is_none());
+        assert!(!reused.context_info.is_set());
+
+        video.view_once = Some(true);
+        original.video_message = MessageField::some(video.clone());
+        assert!(reusable_composer_media(&original).is_none());
+        video.view_once = None;
+        video.gif_playback = None;
+        original.video_message = MessageField::some(video);
+        assert!(reusable_composer_media(&original).is_none());
+    }
+
+    #[test]
+    fn reusing_an_animated_sticker_keeps_its_media() {
+        let mut sticker = wa::message::StickerMessage::default();
+        sticker.is_animated = Some(true);
+        sticker.direct_path = Some("/media/sticker".into());
+        let mut original = wa::Message::default();
+        original.sticker_message = MessageField::some(sticker.clone());
+
+        let outgoing = reusable_composer_media(&original).unwrap();
+        assert_eq!(outgoing.sticker_message.as_option(), Some(&sticker));
     }
 }
 

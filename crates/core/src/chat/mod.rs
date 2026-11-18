@@ -14,7 +14,7 @@ mod reactions;
 mod retain;
 
 pub use group_hierarchy::{GroupHierarchy, SubgroupKind};
-pub use media::{DownloadableMedia, MediaContent, MediaType, OutgoingMedia};
+pub use media::{DownloadableMedia, MediaContent, MediaType, OutgoingMedia, PickerSticker};
 pub use message::{ChatMessage, PollContent, Resend};
 pub use retain::ReleasedMedia;
 
@@ -480,6 +480,7 @@ mod tests {
         original.sender_name = Some("Ana".into());
         let mut reply = ChatMessage::new_incoming("m2".into(), "b@lid".into(), "pong".into());
         reply.quoted = Some(crate::QuotedMessage {
+            remote_jid: None,
             message_id: "m1".into(),
             sender: "a@lid".into(),
             sender_name: String::new(),
@@ -506,6 +507,7 @@ mod tests {
         let original = ChatMessage::new_incoming("m1".into(), "a@lid".into(), "ping".into());
         let mut reply = ChatMessage::new_incoming("m2".into(), "b@lid".into(), "pong".into());
         reply.quoted = Some(crate::QuotedMessage {
+            remote_jid: None,
             message_id: "m1".into(),
             sender: "a@lid".into(),
             sender_name: String::new(),
@@ -531,6 +533,7 @@ mod tests {
                 let mut reply =
                     ChatMessage::new_incoming("m2".into(), "b@lid".into(), "pong".into());
                 reply.quoted = Some(crate::QuotedMessage {
+                    remote_jid: None,
                     message_id: "m1".into(),
                     sender: "a@lid".into(),
                     sender_name: String::new(),

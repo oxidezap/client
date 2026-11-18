@@ -69,6 +69,7 @@ fn open_the_window() {
         // reports what it could not honour in Settings.
         theme::init(cx);
         init_app_bindings(cx);
+        install_menus(cx);
 
         let bounds = Bounds::centered(None, opening_size(cx), cx);
 
@@ -83,6 +84,23 @@ fn open_the_window() {
         crate::platform::window_identity::apply(&mut options, cx);
         if let Err(error) = cx.open_window(options, |window, cx| {
             let view = cx.new(WhatsAppApp::new);
+            // However the app ends — close button, Cmd-Q, the menu — the
+            // daemon goes with it unless the person chose otherwise.
+            let closing_view = view.downgrade();
+            cx.on_app_quit(move |cx| {
+                let _ = closing_view.update(cx, |app, _| app.stop_daemon_with_window());
+                async {}
+            })
+            .detach();
+            // The red close button ends the window without passing through
+            // the app's quit, so the daemon has to be asked here too; asking
+            // twice is harmless. Before the window goes, while the app that
+            // holds the connection is still alive.
+            let closing_view = view.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                let _ = closing_view.update(cx, |app, _| app.stop_daemon_with_window());
+                true
+            });
             let notification_view = view.downgrade();
             let notification_window = window.window_handle();
             let app_notification_window = notification_window;
@@ -131,6 +149,11 @@ fn open_the_window() {
         }) {
             log::error!("Failed to open main window: {error}");
             cx.quit();
+        } else {
+            // Started from a terminal or a launcher an unbundled app is not
+            // made the active one, and the menu bar keeps showing whichever
+            // app was.
+            cx.activate(true);
         }
     };
 
@@ -140,6 +163,39 @@ fn open_the_window() {
     // beneath `platform/` like every other one: a desktop blocks here for the
     // life of the process and a page hands the loop back to the browser.
     crate::platform::run(application, launch);
+}
+
+/// The menu bar. Without one the system shows only the previous app's menus
+/// over this window, which reads as the app not being there at all.
+fn install_menus(cx: &mut App) {
+    use gpui::{Menu, MenuItem, OsAction};
+    use gpui_component::input::{Copy, Cut, Paste, SelectAll};
+
+    cx.on_action(|_: &crate::app::Quit, cx| cx.quit());
+    // `load`, not `new`: only it resolves the `secondary` alias to Command on
+    // macOS and Control elsewhere. See `init_app_bindings`.
+    cx.bind_keys([gpui::KeyBinding::load(
+        "secondary-q",
+        Box::new(crate::app::Quit),
+        None,
+        false,
+        None,
+        cx,
+    )
+    .expect("valid application shortcut")]);
+    cx.set_menus(vec![
+        Menu::new("OxideZap").items([
+            MenuItem::action("Settings…", crate::app::OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("Quit OxideZap", crate::app::Quit),
+        ]),
+        Menu::new("Edit").items([
+            MenuItem::os_action("Cut", Cut, OsAction::Cut),
+            MenuItem::os_action("Copy", Copy, OsAction::Copy),
+            MenuItem::os_action("Paste", Paste, OsAction::Paste),
+            MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+        ]),
+    ]);
 }
 
 /// How big the window opens.

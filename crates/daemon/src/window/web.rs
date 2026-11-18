@@ -4,6 +4,10 @@ use oxidezap_ipc::DaemonMessage;
 
 use crate::state::StateHub;
 
+pub(crate) fn keeps_daemon_running() -> bool {
+    true
+}
+
 /// Ask whoever is attached to raise their window.
 ///
 /// There is no second half here. Launching a front end is starting a process,

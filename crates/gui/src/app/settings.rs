@@ -507,6 +507,31 @@ impl WhatsAppApp {
     ///
     /// A store that will not take it is a notice rather than a refusal: the
     /// level *has* changed, and what failed is only the memory of it.
+    /// Called as the window closes: take the daemon along unless the person
+    /// asked for it to keep running, or the window is only leaving because
+    /// the tray said so. See `platform::background`.
+    pub fn stop_daemon_with_window(&self) {
+        if !crate::platform::background::stops_daemon_on_exit() {
+            return;
+        }
+        info!("the window is closing and the daemon is not meant to outlive it");
+        match self.control() {
+            Some(control) => control.shutdown_daemon(),
+            // Closed before it ever attached: there is no connection to ask
+            // through, but there is a process this window started.
+            None => crate::session::terminate_started_daemon(),
+        }
+    }
+
+    /// Choose whether closing the window leaves the daemon running.
+    pub fn set_keep_running(&mut self, keep: bool, cx: &mut Context<Self>) {
+        if let Err(error) = crate::platform::background::set_keep_running(keep) {
+            error!("could not remember the background choice: {error}");
+            self.notify_user(error, Tone::Problem, cx);
+        }
+        cx.notify();
+    }
+
     pub fn set_log_level(&mut self, level: LogLevel, cx: &mut Context<Self>) {
         // This process, first and synchronously: it is one atomic store and
         // the point of the control.

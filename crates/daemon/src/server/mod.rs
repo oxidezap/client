@@ -215,7 +215,7 @@ pub(crate) async fn serve_client_with_registry(
 
     let (hub, plugins, commands) = match attached.scope {
         oxidezap_ipc::ClientScope::Control => {
-            return serve_control_client(reader, writer, registry).await;
+            return serve_control_client(reader, writer, registry, attached.owns_window).await;
         }
         oxidezap_ipc::ClientScope::Account { account } => {
             if let Some(successor) = registry.retirement_target(account) {
@@ -548,13 +548,19 @@ pub(crate) async fn serve_client_with_registry(
                         }
 
                         let answer = handle_wire_request(env, &hub, &plugins, &commands, &outbox).await;
-                        if let Some(frame) = answer.frame {
-                            write_line(&mut writer, &frame).await?;
-                        }
+                        let written = match answer.frame {
+                            Some(frame) => write_line(&mut writer, &frame).await,
+                            None => Ok(()),
+                        };
+                        // Honoured even when the answer could not be written:
+                        // a client that asks and leaves, as a closing window
+                        // does, must not turn its own departure into a
+                        // refusal.
                         if answer.shutdown {
                             crate::shutdown::request("ipc client");
                             return Ok(());
                         }
+                        written?;
                         continue;
                     }
 
@@ -613,17 +619,22 @@ pub(crate) async fn serve_client_with_registry(
                         awaiting_resync = false;
                     }
                     let answer = handle_request(request, &hub, &plugins, &commands, &outbox).await;
-                    if let Some(frame) = answer.frame {
-                        write_line(&mut writer, &frame).await?;
-                    }
+                    let written = match answer.frame {
+                        Some(frame) => write_line(&mut writer, &frame).await,
+                        None => Ok(()),
+                    };
                     if answer.shutdown {
-                        // After the write, not before. Signalling first lets
+                        // After the write, not before: signalling first lets
                         // the daemon tear this task down mid-answer, and a
                         // client that asked politely to stop the daemon would
-                        // see EOF where the protocol promised it a reply.
+                        // see EOF where the protocol promised it a reply. But
+                        // not *because of* the write either: a window that
+                        // closes the moment it asks has no one to read the
+                        // answer, and a failed write must not cancel the stop.
                         crate::shutdown::request("ipc client");
                         return Ok(());
                     }
+                    written?;
                 }
                 Some(oxidezap_ipc::FrameRead::NotUtf8) => {
                     write_line(&mut writer, &not_utf8()?).await?;
@@ -645,6 +656,61 @@ pub(crate) async fn serve_client_with_registry(
     }
 }
 
+#[derive(Default)]
+struct ControlWindows {
+    attached: usize,
+    stopping: bool,
+}
+
+impl ControlWindows {
+    fn attach(&mut self) -> bool {
+        if self.stopping {
+            return false;
+        }
+        self.attached += 1;
+        true
+    }
+
+    fn detach(&mut self, stop_on_close: bool) -> bool {
+        self.attached -= 1;
+        self.stopping = self.attached == 0 && stop_on_close;
+        self.stopping
+    }
+}
+
+static CONTROL_WINDOWS: std::sync::Mutex<ControlWindows> = std::sync::Mutex::new(ControlWindows {
+    attached: 0,
+    stopping: false,
+});
+
+struct ControlWindow {
+    stop_on_close: bool,
+}
+
+impl ControlWindow {
+    fn attach() -> Option<Self> {
+        CONTROL_WINDOWS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach()
+            .then(|| Self {
+                stop_on_close: false,
+            })
+    }
+}
+
+impl Drop for ControlWindow {
+    fn drop(&mut self) {
+        if CONTROL_WINDOWS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .detach(self.stop_on_close && !crate::window::keeps_daemon_running())
+        {
+            crate::shutdown::request("last window closed");
+        }
+    }
+}
+
 /// Serve the control plane without subscribing to any account state.
 ///
 /// The control plane lists the registry and carries the account lifecycle:
@@ -658,10 +724,16 @@ async fn serve_control_client<S>(
     mut reader: BufReader<ReadHalf<S>>,
     mut writer: WriteHalf<S>,
     registry: Arc<AccountRegistry>,
+    owns_window: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut window = if owns_window {
+        Some(ControlWindow::attach().context("daemon is shutting down")?)
+    } else {
+        None
+    };
     let mut accounts = registry.subscribe();
     let mut retirements = registry.watch_retirements();
     let hello = serde_json::to_string(&DaemonMessage::ControlHello {
@@ -773,6 +845,16 @@ where
                             write_line(&mut writer, &frame).await?;
                             crate::shutdown::request("ipc client");
                             return Ok(());
+                        }
+                        ClientRequest::ShutdownUnlessOtherWindows => {
+                            if let Some(window) = window.as_mut() {
+                                window.stop_on_close = true;
+                                write_line(&mut writer, &answer_shutdown(id)?).await?;
+                                return Ok(());
+                            }
+                            Some(error_frame(id, ProtocolError::Refused {
+                                detail: "only a window can request shutdown on close".into(),
+                            })?)
                         }
                         // The log level is the process's, not an account's:
                         // one daemon logs once, so a control connection is

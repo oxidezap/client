@@ -240,6 +240,7 @@ mod tests {
     #[test]
     fn quote_authorship_is_localized_from_identity_not_a_saved_label() {
         let mut quote = QuotedMessage {
+            remote_jid: None,
             message_id: "synthetic".into(),
             sender: "1@s.whatsapp.net".into(),
             sender_name: "Account owner".into(),
@@ -355,6 +356,7 @@ mod tests {
     #[test]
     fn captions_and_contact_names_are_never_used_as_translation_keys() {
         let mut quote = QuotedMessage {
+            remote_jid: None,
             message_id: "synthetic".into(),
             sender: "peer@example.invalid".into(),
             sender_name: "You".into(),

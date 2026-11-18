@@ -33,6 +33,11 @@ pub use media::MediaCache;
 pub(crate) use media::{clear_image_sources, get_avatar_image};
 #[cfg(not(target_family = "wasm"))]
 mod native;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use native::terminate_started_daemon;
+/// A page owns no daemon process to stop.
+#[cfg(target_family = "wasm")]
+pub(crate) fn terminate_started_daemon() {}
 mod recovery;
 mod sink;
 #[cfg(target_family = "wasm")]
@@ -301,10 +306,20 @@ impl From<&oxidezap_ipc::ProtocolError> for Failure {
 /// the whole of the front end's bookkeeping: a download hands bytes to whoever
 /// is waiting, and a send that was refused becomes the failure the message it
 /// drew is already able to render.
+type SyncedStickers = Vec<oxidezap_core::PickerSticker>;
+
 enum Awaiting {
+    SyncedStickers(oneshot::Sender<Result<SyncedStickers, Failure>>),
     Account(oneshot::Sender<Result<oxidezap_core::AccountId, String>>),
     /// A message mutation whose result must reach the action that opened it.
     Mutation(oneshot::Sender<Result<(), Failure>>),
+    /// A mutation whose payload was staged through the media cache: a photo
+    /// or video status. Carries the key for the reason a send does, since a
+    /// request that never runs would otherwise leave the bytes behind.
+    StagedMutation {
+        tx: oneshot::Sender<Result<(), Failure>>,
+        staged: String,
+    },
     Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, Failure>>),
     /// What this account occupies on disk, for the Storage pane.
     Storage(oneshot::Sender<StorageUsage>),
@@ -379,6 +394,8 @@ impl Awaiting {
         match self {
             Self::Account(tx) => tx.is_closed(),
             Self::Mutation(tx) => tx.is_closed(),
+            Self::StagedMutation { tx, .. } => tx.is_closed(),
+            Self::SyncedStickers(tx) => tx.is_closed(),
             Self::Download(tx) => tx.is_closed(),
             Self::Storage(tx) => tx.is_closed(),
             Self::CallDevices(tx) => tx.is_closed(),
@@ -418,7 +435,13 @@ impl Awaiting {
             Self::CallDevices(tx) => {
                 let _ = tx.send(Err(detail.to_string()));
             }
+            Self::SyncedStickers(tx) => {
+                let _ = tx.send(Err(failure.clone()));
+            }
             Self::Mutation(tx) => {
+                let _ = tx.send(Err(failure.clone()));
+            }
+            Self::StagedMutation { tx, .. } => {
                 let _ = tx.send(Err(failure.clone()));
             }
             // The only caller that reads more than the sentence: whether
@@ -504,7 +527,7 @@ impl Awaiting {
     fn staged_key(&self) -> Option<&str> {
         match self {
             Self::Send { staged, .. } => staged.as_deref(),
-            Self::Installed { staged, .. } => Some(staged),
+            Self::Installed { staged, .. } | Self::StagedMutation { staged, .. } => Some(staged),
             _ => None,
         }
     }
@@ -1121,6 +1144,129 @@ impl SessionHandle {
         );
     }
 
+    pub fn sticker_library(
+        &self,
+        favorites: bool,
+    ) -> oneshot::Receiver<Result<SyncedStickers, Failure>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::SyncedStickers { favorites },
+            Awaiting::SyncedStickers(tx),
+        );
+        rx
+    }
+
+    pub fn reuse_composer_media(
+        &self,
+        source: Option<String>,
+        message_id: String,
+        target: String,
+    ) -> oneshot::Receiver<Result<(), Failure>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::ReuseComposerMedia {
+                source,
+                message_id,
+                target,
+            },
+            Awaiting::Mutation(tx),
+        );
+        rx
+    }
+
+    pub fn publish_status(
+        &self,
+        text: String,
+        recipients: Vec<String>,
+    ) -> oneshot::Receiver<Result<(), Failure>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::PublishStatus { text, recipients },
+            Awaiting::Mutation(tx),
+        );
+        rx
+    }
+
+    /// Publish a photo or video as a status.
+    ///
+    /// Staged like a file being sent: the bytes go through the media cache
+    /// and the frame naming them is written from the upload's completion.
+    /// Answered when the daemon has put the post on WhatsApp.
+    pub fn publish_status_media(
+        &self,
+        file: Attachment,
+        recipients: Vec<String>,
+    ) -> oneshot::Receiver<Result<(), Failure>> {
+        let (tx, rx) = oneshot::channel();
+        let Attachment {
+            bytes,
+            kind,
+            mime_type,
+            file_name,
+            caption,
+        } = file;
+        let size = bytes.len() as u64;
+        if size > oxidezap_ipc::MAX_STAGED_BYTES {
+            let _ = tx.send(Err(Failure::permanent(format!(
+                "that file is {} and the most that can be staged is {}.",
+                crate::utils::format_size(size),
+                crate::utils::format_size(oxidezap_ipc::MAX_STAGED_BYTES)
+            ))));
+            return rx;
+        }
+        let ticket = self
+            .conn
+            .outbox
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .claim();
+        // Per front end and per clock reading as well as per ticket: the
+        // cache is shared by every window talking to one daemon.
+        let upload = oxidezap_ipc::account_staged_key(
+            self.conn.account,
+            &sanitize(&format!(
+                "status_{}_{}_{ticket}",
+                crate::platform::front_end_id(),
+                wacore::time::now_millis()
+            )),
+        );
+        let request =
+            ClientRequest::PublishStatusMedia(Box::new(oxidezap_ipc::PublishStatusMedia {
+                upload: upload.clone(),
+                kind,
+                mime_type,
+                file_name,
+                caption,
+                recipients,
+            }));
+        let id = self.reserve(Awaiting::StagedMutation {
+            tx,
+            staged: upload.clone(),
+        });
+        let conn = self.conn.clone();
+        self.conn.media.stage_then(
+            &upload,
+            bytes,
+            Box::new(move |staged| match staged {
+                Ok(()) => deliver(&conn, id, request, Delivery::Staged(ticket)),
+                Err(e) => {
+                    if let Err(Unwritten { lost, reason }) = release(&conn, ticket, None) {
+                        error!("could not reach the daemon: {reason}");
+                        for lost in lost {
+                            fail_reserved(
+                                &conn,
+                                lost,
+                                format!("could not reach the daemon: {reason}"),
+                            );
+                        }
+                    }
+                    fail_reserved(&conn, id, format!("that status could not be staged: {e}"));
+                }
+            }),
+        );
+        rx
+    }
+
     pub fn revoke_message(
         &self,
         jid: String,
@@ -1607,6 +1753,20 @@ impl SessionHandle {
         rx
     }
 
+    /// Ask the daemon to stop: disconnect, close the store, exit.
+    ///
+    /// Written before it returns and not waited on, because the one caller is
+    /// a window that is closing and will not be there for the answer.
+    pub fn shutdown_daemon(&self) {
+        let request = Request::bare(ClientRequest::ShutdownUnlessOtherWindows);
+        let result = serde_json::to_vec(&request)
+            .map_err(std::io::Error::other)
+            .and_then(|frame| self.conn.wire.send_line(&frame));
+        if let Err(error) = result {
+            error!("could not send the window close request: {error}");
+        }
+    }
+
     /// Put a `.wasm` somebody chose into the daemon's plugin folder.
     ///
     /// Staged like a file being sent, and through the same machinery: the
@@ -1960,7 +2120,7 @@ fn deliver(conn: &Conn, id: RequestId, request: ClientRequest, how: Delivery) {
     {
         // Nothing to send, but the queue behind it is still waiting.
         if let Delivery::Staged(ticket) = how {
-            let _ = release(conn, ticket, None);
+            fail_unwritten(conn, release(conn, ticket, None));
         }
         return;
     }
@@ -1971,7 +2131,7 @@ fn deliver(conn: &Conn, id: RequestId, request: ClientRequest, how: Delivery) {
         Ok(frame) => frame,
         Err(e) => {
             if let Delivery::Staged(ticket) = how {
-                let _ = release(conn, ticket, None);
+                fail_unwritten(conn, release(conn, ticket, None));
             }
             fail_reserved(conn, id, format!("unserializable: {e}"));
             return;
@@ -1981,6 +2141,10 @@ fn deliver(conn: &Conn, id: RequestId, request: ClientRequest, how: Delivery) {
         Delivery::Staged(ticket) => release(conn, ticket, Some((id, frame))),
         Delivery::Ordinary => write_or_queue(conn, Some(id), frame),
     };
+    fail_unwritten(conn, written);
+}
+
+fn fail_unwritten(conn: &Conn, written: Result<(), Unwritten>) {
     if let Err(Unwritten { lost, reason }) = written {
         error!("could not reach the daemon: {reason}");
         for id in lost {

@@ -17,6 +17,37 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use crate::tray::TrayHub;
 use crate::tray::macos::MacTray;
 
+/// Make the tray match the setting: build it when the setting is on and there
+/// is none, drop it when the setting is off.
+///
+/// `gave_up` remembers a start that failed, so it is not retried (and logged)
+/// every second: the next attempt waits for the setting to turn off and on.
+fn settle_tray(tray: Option<MacTray>, hub: &Arc<TrayHub>, gave_up: &mut bool) -> Option<MacTray> {
+    let wanted = oxidezap_ipc::background::keep_running();
+    if !wanted {
+        *gave_up = false;
+    }
+    match (tray, wanted) {
+        (None, true) if *gave_up => None,
+        (None, true) => match MacTray::start(hub) {
+            Ok(tray) => {
+                log::info!("menu-bar icon on: the daemon is meant to outlive the window");
+                Some(tray)
+            }
+            Err(e) => {
+                log::warn!("no tray presence: {e}");
+                *gave_up = true;
+                None
+            }
+        },
+        (Some(_), false) => {
+            log::info!("menu-bar icon off: the daemon stops with the window");
+            None
+        }
+        (tray, _) => tray,
+    }
+}
+
 /// Run the daemon with the tray on this thread.
 ///
 /// Builds the icon first, since nothing else may: AppKit answers the main
@@ -35,22 +66,27 @@ pub fn run(runtime: tokio::runtime::Runtime, hub: Arc<TrayHub>) -> Result<()> {
         log::warn!("AppKit refused the accessory activation policy; a Dock icon may appear");
     }
 
-    let mut tray = match MacTray::start(&hub) {
-        Ok(tray) => Some(tray),
-        Err(e) => {
-            log::warn!("no tray presence: {e}");
-            None
-        }
-    };
+    // A menu-bar item is for a daemon that is meant to stay once the window
+    // is gone, and Mac apps do not otherwise have one. With the window closing
+    // the daemon too (the default), the icon would only ever be a second way
+    // to do what the window already does, so it is drawn only when the person
+    // asked for the background behaviour.
+    let mut tray_failed = false;
+    let mut tray = settle_tray(None, &hub, &mut tray_failed);
 
     let worker = std::thread::Builder::new()
         .name("oxidezap-main".to_string())
         .spawn({
             let hub = Arc::clone(&hub);
-            move || runtime.block_on(super::run(hub))
+            move || {
+                let outcome = runtime.block_on(super::run(hub));
+                runtime.shutdown_timeout(super::RUNTIME_SHUTDOWN_DEADLINE);
+                outcome
+            }
         })
         .context("starting the daemon worker")?;
 
+    let mut checks = 0u32;
     loop {
         // One runloop slice, on the thread AppKit dispatches to. Fifty
         // milliseconds is ages for a click and nothing for a thread that
@@ -62,6 +98,13 @@ pub fn run(runtime: tokio::runtime::Runtime, hub: Arc<TrayHub>) -> Result<()> {
         let _ = unsafe {
             CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, Duration::from_millis(50), false)
         };
+        // The setting is read again about once a second, so turning it on
+        // while the daemon runs brings the icon up, and turning it off takes
+        // it away: the icon exists exactly while the daemon is meant to stay.
+        checks += 1;
+        if checks.is_multiple_of(20) {
+            tray = settle_tray(tray, &hub, &mut tray_failed);
+        }
         if let Some(tray) = tray.as_mut() {
             tray.pump(&hub);
         }

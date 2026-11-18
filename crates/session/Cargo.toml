@@ -12,6 +12,9 @@ repository.workspace = true
 test-support = ["whatsapp-rust/test-support"]
 
 [dependencies]
+# `buffer_unordered`, for resolving a status audience a few lookups at a time.
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+base64 = "0.22.1"
 async-channel = "2.5.0"
 async-trait = { workspace = true }
 # What an outgoing picture says about itself: its dimensions, and the small

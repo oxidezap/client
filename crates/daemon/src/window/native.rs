@@ -26,6 +26,10 @@ use crate::state::StateHub;
 /// whether it is alive needs no clock and reaps it when it is not.
 static LAUNCHED: Mutex<Option<Child>> = Mutex::new(None);
 
+pub(crate) fn keeps_daemon_running() -> bool {
+    oxidezap_ipc::background::keep_running()
+}
+
 /// Raise the front end's window, starting a front end if none is attached.
 ///
 /// The request goes out first, always: a front end that owns a window raises

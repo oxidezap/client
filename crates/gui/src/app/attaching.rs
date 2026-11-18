@@ -12,11 +12,268 @@ use oxidezap_core::OutgoingMedia;
 
 use gpui_component::input::{InputEvent, InputState};
 
-use crate::components::PreviewFile;
+use crate::components::{PickerItem, PickerRequest, PickerTab, PreviewFile};
 
 use super::*;
 
+fn composer_media_chat(jid: &str) -> bool {
+    jid.rsplit_once('@')
+        .is_some_and(|(_, server)| matches!(server, "s.whatsapp.net" | "lid" | "g.us"))
+}
+
 impl WhatsAppApp {
+    pub(super) fn load_picker_media(
+        &self,
+        tab: PickerTab,
+        input: &Entity<InputAreaView>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self
+            .selected_chat
+            .as_deref()
+            .filter(|jid| composer_media_chat(jid))
+        else {
+            input.update(cx, |view, cx| view.set_picker_items(tab, Vec::new(), cx));
+            return;
+        };
+
+        if matches!(tab, PickerTab::Favorites | PickerTab::Stickers) {
+            self.load_sticker_library(tab, target.to_owned(), input, cx);
+            return;
+        }
+
+        let mut candidates = Vec::new();
+        for chat in &self.chats {
+            if !composer_media_chat(&chat.jid) {
+                continue;
+            }
+            for message in &chat.messages {
+                if !message.revoked
+                    && let Some(media) = &message.media
+                    && media.downloadable.is_some()
+                    && tab.matches(media)
+                {
+                    candidates.push((chat.as_ref(), message, media));
+                }
+            }
+        }
+        candidates.sort_unstable_by(|(_, left, _), (_, right, _)| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+
+        let mut seen = std::collections::HashSet::new();
+        let items = candidates
+            .into_iter()
+            .filter_map(|(source, message, media)| {
+                let hash = &media.downloadable.as_ref()?.file_sha256;
+                if !hash.is_empty() && !seen.insert(hash.as_slice()) {
+                    return None;
+                }
+                let request = PickerRequest {
+                    source: Some(source.jid.clone()),
+                    message_id: message.id.clone(),
+                    target: target.to_owned(),
+                    generation: self.document_state_generation,
+                };
+                Some(PickerItem {
+                    request,
+                    description: format!(
+                        "{} · {}",
+                        source.name,
+                        crate::utils::format_status_time(&message.timestamp)
+                    ),
+                    preview: (!media.data.is_empty())
+                        .then(|| self.get_decoded_image(&message.id, media, cx))
+                        .flatten(),
+                    decode_as_sticker: false,
+                })
+            })
+            .take(12)
+            .collect();
+        input.update(cx, |view, cx| view.set_picker_items(tab, items, cx));
+    }
+
+    fn load_sticker_library(
+        &self,
+        tab: PickerTab,
+        target: String,
+        input: &Entity<InputAreaView>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.as_ref().map(|session| session.handle()) else {
+            return;
+        };
+        input.update(cx, |view, cx| {
+            view.set_picker_status(
+                tab,
+                Some(
+                    if tab == PickerTab::Favorites {
+                        crate::tr!(SyncingStickerFavorites)
+                    } else {
+                        crate::tr!(LoadingRecentStickers)
+                    }
+                    .into(),
+                ),
+                cx,
+            );
+        });
+        let generation = self.document_state_generation;
+        let answer = client.sticker_library(tab == PickerTab::Favorites);
+        let input = input.downgrade();
+        cx.spawn(async move |app, cx| {
+            let response = answer
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let Some(input) = input.upgrade() else {
+                return;
+            };
+            let Ok(Some(items)) = app.update(cx, |app, cx| {
+                if app.document_state_generation != generation
+                    || app.selected_chat.as_deref() != Some(target.as_str())
+                {
+                    return None;
+                }
+                let media = match response {
+                    Ok(items) => items,
+                    Err(error) => {
+                        input.update(cx, |view, cx| view.set_picker_status(tab, Some(error), cx));
+                        return None;
+                    }
+                };
+                // The same sticker is sent many times and syncs once per
+                // use; one tile per distinct file is what a picker is for.
+                let mut seen = std::collections::HashSet::new();
+                let items: Vec<_> = media
+                    .into_iter()
+                    .filter(|item| {
+                        let hash = &item.media.file_sha256;
+                        hash.is_empty() || seen.insert(hash.clone())
+                    })
+                    .map(|item| {
+                        let request = PickerRequest {
+                            source: item.source,
+                            message_id: item.id,
+                            target: target.clone(),
+                            generation,
+                        };
+                        (request, item.media)
+                    })
+                    .collect();
+                input.update(cx, |view, cx| {
+                    view.set_picker_items(
+                        tab,
+                        items
+                            .iter()
+                            .map(|(request, _)| PickerItem {
+                                request: request.clone(),
+                                preview: None,
+                                decode_as_sticker: true,
+                                description: if tab == PickerTab::Favorites {
+                                    crate::tr!(StickerFavorites)
+                                } else {
+                                    crate::tr!(RecentStickers)
+                                }
+                                .into(),
+                            })
+                            .collect(),
+                        cx,
+                    )
+                });
+                Some(items)
+            }) else {
+                return;
+            };
+
+            // Fetch only while the picker still contains this account's items.
+            // Batches cap concurrent CDN reads at eight.
+            for batch in items.chunks(8) {
+                if !app
+                    .update(cx, |app, cx| {
+                        app.document_state_generation == generation
+                            && input.read(cx).has_picker_item(&batch[0].0)
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                let downloads: Vec<_> = batch
+                    .iter()
+                    .map(|(request, media)| {
+                        (
+                            request,
+                            client.download_downloadable_media(media.clone()),
+                            crate::utils::mime_to_image_format(&media.mime_type),
+                        )
+                    })
+                    .collect();
+                for (request, download, format) in downloads {
+                    let downloaded = download_with_timeout(download).await;
+                    let (bytes, format) = match (downloaded, format) {
+                        (Ok(bytes), Some(format)) => (bytes, format),
+                        // The network let go for a moment: the tile stays, as
+                        // a label, and the sticker is still there to be sent.
+                        (Err(failure), Some(_)) if failure.retryable => continue,
+                        // Expired or not an image: nothing will ever draw it.
+                        _ => {
+                            let _ = app.update(cx, |_, cx| {
+                                input.update(cx, |view, cx| view.drop_picker_item(request, cx));
+                            });
+                            continue;
+                        }
+                    };
+                    let _ = app.update(cx, |app, cx| {
+                        if app.document_state_generation != generation {
+                            return;
+                        }
+                        let image = crate::retained_image::RetainedImage::new(
+                            gpui::Image::from_bytes(format, bytes.to_vec()),
+                        );
+                        input.update(cx, |view, cx| view.set_picker_preview(request, image, cx));
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn send_picker_media(&mut self, request: &PickerRequest, cx: &mut Context<Self>) {
+        if !self.can_send()
+            || self.edit_draft.is_some()
+            || self.selected_chat.as_deref() != Some(request.target.as_str())
+            || self.document_state_generation != request.generation
+            || !composer_media_chat(&request.target)
+        {
+            return;
+        }
+        let Some(client) = &self.client else {
+            return;
+        };
+        let generation = request.generation;
+        let sent = client.reuse_composer_media(
+            request.source.clone(),
+            request.message_id.clone(),
+            request.target.clone(),
+        );
+        cx.spawn(async move |app, cx| {
+            let result = sent
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            if let Err(error) = result {
+                let _ = app.update(cx, |app, cx| {
+                    if app.document_state_generation == generation {
+                        app.notify_user(error, notices::Tone::Problem, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn ensure_file_drop(&mut self, cx: &mut Context<Self>) {
         if self.file_drop_listener.is_none() {
             match crate::platform::drop::install(cx.entity().downgrade(), cx.to_async()) {

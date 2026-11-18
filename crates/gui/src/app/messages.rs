@@ -630,6 +630,54 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn hover_react_and_reply_buttons_act_on_their_message(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let rows = vec![(
+            fixtures::PEER.to_string(),
+            false,
+            fixtures::message("PEER-1", fixtures::PEER, "hello"),
+        )];
+        let mut app_handle = None;
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(WhatsAppApp::new);
+            app_handle = Some(app.clone());
+            let fixture = cx.new(|_| EditedBubbleFixture { app, rows });
+            gpui_component::Root::new(fixture, window, cx)
+        });
+        let app = app_handle.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        {
+            let id = "PEER-1";
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let bubble = cx
+                .debug_bounds(Box::leak(format!("react-{id}").into_boxed_str()))
+                .unwrap_or_else(|| panic!("react-{id} is not laid out"));
+            // Reach it the way a pointer does: over the row first, then onto
+            // the revealed control.
+            cx.simulate_mouse_move(
+                bubble.center() - gpui::point(gpui::px(200.), gpui::px(0.)),
+                None,
+                gpui::Modifiers::default(),
+            );
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_mouse_move(bubble.center(), None, gpui::Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_click(bubble.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(
+                app.read_with(&cx, |app, _| app.reaction_picker_for().map(str::to_owned)),
+                Some(id.to_string()),
+                "react button on {id}"
+            );
+        }
+    }
+
     fn typing(names: &[&str]) -> TypingSummary {
         TypingSummary {
             typists: names

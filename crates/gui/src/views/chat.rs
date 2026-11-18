@@ -2,11 +2,12 @@
 
 use gpui::{
     AnyElement, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    Styled, Window, div, prelude::FluentBuilder as _,
+    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
 };
-use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{ActiveTheme as _, Disableable as _};
 use gpui_component::{Icon, IconName};
+use gpui_component::{checkbox::Checkbox, input::Input};
 
 use crate::app::{Destination, MessageListCache, OfflineRecovery, WhatsAppApp};
 use crate::components::{
@@ -196,6 +197,9 @@ pub fn render_connected_view(
     }
     let status_feed = (destination == Destination::Status).then(|| app.status_feed());
     let status_view = status_feed.as_ref().and_then(|feed| {
+        if app.status_post().is_some() {
+            return None;
+        }
         let selected = app.status_pane().author()?;
         let author = feed.author(selected)?;
         let at = app.status_pane().index_in(author.count());
@@ -219,7 +223,17 @@ pub fn render_connected_view(
                 || app
                     .video_player_state(&message.id)
                     .is_some_and(|state| state.is_loading()));
+        let reply_input = app.status_reply_input(&author.jid, &author.name, &message, window, cx);
+        let video_progress = message
+            .media
+            .as_ref()
+            .filter(|media| media.media_type == oxidezap_core::MediaType::Video)
+            .map(|_| app.video_progress(&message.id));
         Some(StatusViewProps {
+            playback_revision: app.status_pane().playback_revision(),
+            video_progress,
+            reply_input,
+            can_reply: app.can_send(),
             author_jid: author.jid.clone(),
             author_name: author.name.clone().into(),
             message,
@@ -310,7 +324,16 @@ pub fn render_connected_view(
         })
         .when(layout.show_chat_area(), |el| {
             if destination == Destination::Status {
-                el.child(render_status_view(status_view, entity.clone(), layout, cx))
+                if app.status_post().is_some() {
+                    el.child(render_status_post(
+                        app,
+                        entity.clone(),
+                        *layout.metrics(),
+                        cx,
+                    ))
+                } else {
+                    el.child(render_status_view(status_view, entity.clone(), layout, cx))
+                }
             } else {
                 el.child(render_chat_area(
                     ChatAreaProps {
@@ -360,6 +383,150 @@ pub fn render_connected_view(
 /// to ring at the far end with no card, no Accept and no Decline anywhere in
 /// the window. It floats and takes no input of its own, so the screen
 /// underneath stays usable for the whole call.
+fn render_status_post(
+    app: &WhatsAppApp,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let post = app.status_post().expect("status composer is open");
+    let editable = app.can_send() && !post.pending;
+    let search = post.search.read(cx).value();
+    let selected = app
+        .status_recipients("")
+        .filter(|(jid, _)| post.recipients.contains(*jid));
+    let matches = app
+        .status_recipients(&search)
+        .filter(|(jid, _)| !post.recipients.contains(*jid))
+        .take(50);
+    let recipients = selected
+        .chain(matches)
+        .map(|(jid, name)| {
+            let entity = entity.clone();
+            let jid = jid.to_owned();
+            Checkbox::new(SharedString::from(format!("status-recipient-{jid}")))
+                .label(name.to_owned())
+                .checked(post.recipients.contains(&jid))
+                .disabled(!editable)
+                .on_click(move |selected, _, cx| {
+                    entity.update(cx, |app, cx| app.set_status_recipient(&jid, *selected, cx));
+                })
+        })
+        .collect::<Vec<_>>();
+    let no_matches = recipients.is_empty();
+    let cancel = entity.clone();
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .bg(cx.theme().background)
+        .p(metrics.space_xl())
+        .gap(metrics.space_lg())
+        .child(
+            div()
+                .text_size(metrics.text_title())
+                .child(crate::tr!(AddStatus)),
+        )
+        .child(render_status_media(post, entity.clone(), editable, metrics))
+        .child(Input::new(&post.text).w_full().disabled(!editable))
+        .child(
+            div()
+                .text_color(cx.theme().muted_foreground)
+                .child(crate::tr!(ChooseStatusAudience)),
+        )
+        .child(Input::new(&post.search).w_full().disabled(!editable))
+        .child(
+            div()
+                .id("status-audience")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .gap(metrics.space_sm())
+                .overflow_y_scroll()
+                .when(no_matches, |el| {
+                    el.child(crate::tr!(NoStatusRecipientsFound))
+                })
+                .children(recipients),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(metrics.space_md())
+                .child(
+                    Button::new("status-post-cancel")
+                        .ghost()
+                        .label(crate::tr!(Cancel))
+                        .disabled(post.pending)
+                        .on_click(move |_, _, cx| {
+                            cancel.update(cx, |app, cx| app.cancel_status_post(cx));
+                        }),
+                )
+                .child(
+                    Button::new("status-post-confirm")
+                        .primary()
+                        .label(if post.pending {
+                            crate::tr!(StatusPosting)
+                        } else {
+                            crate::tr!(PostStatus)
+                        })
+                        .disabled(
+                            !editable
+                                || (post.media.is_none()
+                                    && post.text.read(cx).value().trim().is_empty()),
+                        )
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |app, cx| app.publish_status(cx));
+                        }),
+                ),
+        )
+}
+
+/// The photo or video chosen for a status, or the button that chooses one.
+fn render_status_media(
+    post: &crate::app::StatusPost,
+    entity: Entity<WhatsAppApp>,
+    editable: bool,
+    metrics: Metrics,
+) -> impl IntoElement + use<> {
+    let remove = entity.clone();
+    let Some(media) = &post.media else {
+        return Button::new("status-media-add")
+            .ghost()
+            .label(crate::tr!(AddPhotoOrVideo))
+            .disabled(!editable)
+            .on_click(move |_, _, cx| {
+                entity.update(cx, |app, cx| app.choose_status_media(cx));
+            })
+            .into_any_element();
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(metrics.space_md())
+        .children(media.preview.clone().map(|image| {
+            use gpui::StyledImage as _;
+            gpui::img(image)
+                .h(metrics.icon_button() * 3.0)
+                .object_fit(gpui::ObjectFit::Contain)
+        }))
+        .child(div().flex_1().min_w_0().child(media.file.file_name.clone()))
+        .child(
+            Button::new("status-media-remove")
+                .ghost()
+                .label(crate::tr!(RemoveStatusMedia))
+                .disabled(!editable)
+                .on_click(move |_, _, cx| {
+                    remove.update(cx, |app, cx| app.clear_status_media(cx));
+                }),
+        )
+        .into_any_element()
+}
+
 pub fn render_call_overlay(
     app: &mut WhatsAppApp,
     window: &mut Window,
