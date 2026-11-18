@@ -7,6 +7,14 @@ catalog! {
     More => ("More", "Mais");
     You => ("You", "Você");
     TypeAMessage => ("Type a message", "Digite uma mensagem");
+    ScheduledMessages => ("Scheduled messages", "Mensagens agendadas");
+    NoScheduledMessages => ("No scheduled messages in this chat.", "Nenhuma mensagem agendada nesta conversa.");
+    CancelScheduledMessage => ("Cancel send", "Cancelar envio");
+    ScheduleMessage => ("Schedule message", "Agendar mensagem");
+    ScheduledMessage => ("Message scheduled", "Mensagem agendada");
+    ScheduleMessageTime => ("Local time (YYYY-MM-DD HH:MM)", "Hora local (AAAA-MM-DD HH:MM)");
+    ScheduleMessageInvalidTime => ("Enter an unambiguous future local time.", "Digite uma hora local futura e sem ambiguidade.");
+    ScheduleMessageDelivery => ("The message sends when OxideZap is running and connected.", "A mensagem será enviada quando o OxideZap estiver em execução e conectado.");
     SavingEdit => ("Saving edit...", "Salvando edição...");
     EditingMessage => ("Editing message", "Editando mensagem");
     Cancel => ("Cancel", "Cancelar");

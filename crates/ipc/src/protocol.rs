@@ -420,6 +420,10 @@ pub enum DaemonMessage {
         protocol: u32,
         snapshot: Box<StateSnapshot>,
     },
+    ScheduledMessages {
+        id: RequestId,
+        items: Vec<oxidezap_core::ScheduledMessage>,
+    },
     /// The linked account’s favorite or recently sent stickers.
     SyncedStickers {
         id: RequestId,
@@ -1036,6 +1040,19 @@ pub enum ClientRequest {
     /// — and the serde working set — of every request. The wire is unchanged:
     /// `Box` is transparent to serde, and the round-trip test pins the bytes.
     SendText(Box<SendText>),
+    /// Save a text message for the account to send on or after a UTC deadline.
+    ScheduleMessage {
+        jid: String,
+        text: String,
+        send_at_ms: i64,
+    },
+    ListScheduledMessages {
+        jid: String,
+    },
+    CancelScheduledMessage {
+        jid: String,
+        scheduled_id: i64,
+    },
     SyncedStickers {
         favorites: bool,
     },

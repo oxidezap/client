@@ -28,6 +28,7 @@ mod receipt;
 mod recovery;
 pub(crate) mod retirement;
 mod revoke;
+mod scheduled_messages;
 pub(crate) mod shared_history;
 mod writer;
 

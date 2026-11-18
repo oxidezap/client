@@ -381,6 +381,18 @@ impl<'a> Frames<'a> {
                     None => debug!("a plugin listing arrived for {id}, which nobody is waiting on"),
                 }
             }
+            DaemonMessage::ScheduledMessages { id, items } => {
+                match take_pending(self.pending, id) {
+                    Some(Awaiting::ScheduledMessages(tx)) => {
+                        let _ = tx.send(Ok(items));
+                    }
+                    Some(waiting) => self.fail(
+                        waiting,
+                        &Failure::permanent("unexpected scheduled message listing"),
+                    ),
+                    None => debug!("a scheduled message listing arrived for a cancelled request"),
+                }
+            }
             DaemonMessage::SyncedStickers { id, items } => match take_pending(self.pending, id) {
                 Some(Awaiting::SyncedStickers(tx)) => {
                     let _ = tx.send(Ok(items));

@@ -27,6 +27,7 @@ mod mutations;
 /// Polls, profiles, contacts, channels, media fetch and history coverage.
 mod ops;
 mod profile;
+mod scheduled_messages;
 /// Sends a scriptable front end asks for, read from daemon-local paths.
 mod sends;
 mod sticker_sync;

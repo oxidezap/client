@@ -103,6 +103,47 @@ pub(super) async fn handle_request(
         ClientRequest::SendText(request) => {
             acted(dispatch(hub, commands, Action::SendText(*request)).await)
         }
+        ClientRequest::ScheduleMessage {
+            jid,
+            text,
+            send_at_ms,
+        } => acted(
+            dispatch(
+                hub,
+                commands,
+                Action::ScheduleMessage {
+                    jid,
+                    text,
+                    send_at_ms,
+                },
+            )
+            .await,
+        ),
+        ClientRequest::CancelScheduledMessage { jid, scheduled_id } => acted(
+            dispatch(
+                hub,
+                commands,
+                Action::CancelScheduledMessage { jid, scheduled_id },
+            )
+            .await,
+        ),
+        ClientRequest::ListScheduledMessages { jid } => {
+            let id = match addressed(id, "listing scheduled messages needs an id") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::ListScheduledMessages {
+                    id,
+                    jid,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
         ClientRequest::SyncedStickers { favorites } => {
             let id = match addressed(id, "sticker sync needs an id to answer under") {
                 Ok(id) => id,
