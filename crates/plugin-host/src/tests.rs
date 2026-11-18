@@ -1133,6 +1133,77 @@ fn shutting_down_joins_every_plugin() {
     plugins.shutdown();
 }
 
+#[test]
+#[ignore = "needs examples/schedule built for wasm32-unknown-unknown"]
+fn the_schedule_plugin_submits_chat_forms_and_cancels_pending_messages() {
+    let built = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/schedule/target/wasm32-unknown-unknown/release/schedule.wasm"
+    );
+    let dir = TempDir::new("schedule-example");
+    std::fs::copy(built, dir.0.join("schedule.wasm")).expect("build the schedule example first");
+    let state = TempDir::new("schedule-example-state");
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Arc::clone(&commands)),
+        published.sink(),
+    );
+    published.settles("the composer form", |surfaces| {
+        surfaces.first().is_some_and(|surface| {
+            surface.is_running() && surface.roots_in(PluginSlot::Composer).next().is_some()
+        })
+    });
+    let chat = "15550100000@s.whatsapp.net";
+    plugins.act(&PluginAction {
+        plugin: "schedule".into(),
+        action: "schedule".into(),
+        value: Some(r#"{"message":"see you later","when":"60"}"#.into()),
+        chat_jid: Some(chat.into()),
+        slot: PluginSlot::Composer,
+        widget: PluginWidget::Button,
+    });
+    published.settles("the scheduled job", |surfaces| {
+        surfaces[0]
+            .roots_in(PluginSlot::Settings)
+            .any(|root| root.children.iter().any(|child| child.id == "cancel-1"))
+    });
+    std::thread::sleep(Duration::from_millis(1100));
+    plugins.act(&PluginAction {
+        plugin: "schedule".into(),
+        action: "cancel-1".into(),
+        value: None,
+        chat_jid: None,
+        slot: PluginSlot::Settings,
+        widget: PluginWidget::Button,
+    });
+    published.settles("the cancelled job", |surfaces| {
+        surfaces[0]
+            .roots_in(PluginSlot::Settings)
+            .all(|root| root.children.iter().all(|child| child.id != "cancel-1"))
+    });
+    assert!(commands.sent().is_empty());
+
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(plugins.approve("schedule", true));
+    let due = wacore::time::now_utc() + Duration::from_secs(3);
+    plugins.act(&PluginAction {
+        plugin: "schedule".into(),
+        action: "schedule".into(),
+        value: Some(format!(
+            r#"{{"message":"due now","when":"{}"}}"#,
+            due.to_rfc3339()
+        )),
+        chat_jid: Some(chat.into()),
+        slot: PluginSlot::Composer,
+        widget: PluginWidget::Button,
+    });
+    published.settles("the timer sends the job", |_| !commands.sent().is_empty());
+    assert_eq!(commands.sent(), [(chat.into(), "due now".into(), None)]);
+}
+
 /// The real SDK, against the real host.
 ///
 /// Ignored by default because it needs the example built for wasm32, which

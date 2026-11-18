@@ -223,6 +223,9 @@ history, which is what the in-app "pair again" action does.
 
 ## Plugins
 
+Releases include an optional `oxidezap-<version>-plugins.zip`. Unpack it and
+install the `.wasm` modules you want under Settings → Plugins.
+
 A plugin is a `.wasm` file dropped in `~/.local/share/oxidezap/plugins` — or,
 in a page running its own session, added under Settings → Plugins, which keeps
 it in the browser's own storage. Either way it runs inside the daemon — which

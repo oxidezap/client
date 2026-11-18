@@ -141,6 +141,7 @@ pub mod imports {
     pub const KV_GET: &str = "oxi_kv_get";
     /// `fn(key, key_len, val, val_len) -> i32`. An empty value deletes.
     pub const KV_SET: &str = "oxi_kv_set";
+    pub const KV_SET_DURABLE: &str = "oxi_kv_set_durable";
     /// `fn(delay_ms: i64, token: i64) -> i32` — deliver
     /// [`super::kinds::TIMER`] carrying `token`, once, after `delay_ms`.
     /// The host holds a floor under the delay and a ceiling over it: a
@@ -492,6 +493,7 @@ pub mod outcome {
     /// Called at a moment this is not allowed — a declaration outside
     /// `oxi_init`.
     pub const STATE: i32 = -5;
+    pub const UNCONFIRMED: i32 = -6;
 }
 
 /// A string field that is not there at all, distinct from one that is present

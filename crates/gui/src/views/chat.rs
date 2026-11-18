@@ -51,6 +51,7 @@ pub fn render_connected_view(
         &plugin_ctx,
         cx,
     );
+    let plugin_composer = plugin_ui::composer(app, &plugin_ctx, cx);
     let selected_jid = app.selected_destination_jid();
     // Cloned rather than borrowed: building the timeline's rows below needs
     // the app mutably, and these are handles — a clone is a refcount.
@@ -349,6 +350,7 @@ pub fn render_connected_view(
                         offline_recovery,
                         is_own_number,
                         plugin_actions,
+                        plugin_composer,
                         media: media.clone(),
                     },
                     &message_list,
@@ -570,6 +572,7 @@ struct ChatAreaProps<'a> {
     /// `Context`. Empty when no plugin drew there, which is the ordinary
     /// case.
     plugin_actions: Vec<gpui::AnyElement>,
+    plugin_composer: Option<AnyElement>,
     media: Option<std::sync::Arc<dyn crate::session::MediaCache>>,
 }
 
@@ -593,6 +596,7 @@ fn render_chat_area(
         offline_recovery,
         is_own_number,
         plugin_actions,
+        plugin_composer,
         media,
     } = props;
     let metrics = *layout.metrics();
@@ -665,7 +669,7 @@ fn render_chat_area(
                     if let Some(recovery) = offline_recovery {
                         el.child(render_offline_strip(entity.clone(), recovery, metrics, cx))
                     } else {
-                        el.children(input_area)
+                        el.children(plugin_composer).children(input_area)
                     }
                 })
                 .on_drop({

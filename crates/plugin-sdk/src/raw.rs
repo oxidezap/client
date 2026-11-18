@@ -82,6 +82,8 @@ unsafe extern "C" {
     pub fn kv_get(key: Ptr, key_len: i32, ptr: Ptr, cap: i32) -> i32;
     #[link_name = "oxi_kv_set"]
     pub fn kv_set(key: Ptr, key_len: i32, val: Ptr, val_len: i32) -> i32;
+    #[link_name = "oxi_kv_set_durable"]
+    pub fn kv_set_durable(key: Ptr, key_len: i32, val: Ptr, val_len: i32) -> i32;
     #[link_name = "oxi_timer_set"]
     pub safe fn timer_set(delay_ms: i64, token: i64) -> i32;
 
@@ -199,6 +201,16 @@ mod off_target {
             borrow(val, val_len)
         })
     }
+    pub unsafe fn kv_set_durable(
+        key: super::Ptr,
+        key_len: i32,
+        val: super::Ptr,
+        val_len: i32,
+    ) -> i32 {
+        testing::kv_set_durable(unsafe { borrow(key, key_len) }, unsafe {
+            borrow(val, val_len)
+        })
+    }
     pub fn timer_set(delay_ms: i64, token: i64) -> i32 {
         testing::command(testing::Command::Timer { delay_ms, token })
     }
@@ -269,6 +281,14 @@ mod off_target {
         nowhere()
     }
     pub unsafe fn kv_set(_key: super::Ptr, _key_len: i32, _val: super::Ptr, _val_len: i32) -> i32 {
+        nowhere()
+    }
+    pub unsafe fn kv_set_durable(
+        _key: super::Ptr,
+        _key_len: i32,
+        _val: super::Ptr,
+        _val_len: i32,
+    ) -> i32 {
         nowhere()
     }
     pub fn timer_set(_delay_ms: i64, _token: i64) -> i32 {

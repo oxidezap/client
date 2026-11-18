@@ -31,8 +31,12 @@ use crate::state::StateHub;
 pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
     let sink = publishing_to(hub);
     let account_id = hub.account_id();
-    let fallback = (publishing_to(hub), commands.clone());
-    tokio::task::spawn_blocking(move || load(sink, commands, account_id))
+    let bridge = Arc::new(Bridge {
+        hub: hub.clone(),
+        commands,
+    });
+    let fallback = (publishing_to(hub), bridge.clone());
+    tokio::task::spawn_blocking(move || load(sink, bridge, account_id))
         .await
         .unwrap_or_else(|e| {
             // With the daemon's own sink and bridge, not a discarding pair.
@@ -43,28 +47,23 @@ pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc
             // and every command answering `NoSession` — while reporting the
             // reload as having worked.
             log::error!("the plugin loader did not finish: {e}");
-            let (sink, commands) = fallback;
-            Arc::new(Plugins::none(sink, Arc::new(Bridge { commands })))
+            let (sink, bridge) = fallback;
+            Arc::new(Plugins::none(sink, bridge))
         })
 }
 
 /// The scan itself, on the blocking thread [`start`] put it on.
-fn load(sink: Sink, commands: SessionCommands, account_id: AccountId) -> Arc<Plugins> {
+fn load(sink: Sink, bridge: Arc<Bridge>, account_id: AccountId) -> Arc<Plugins> {
     let Some(dir) = oxidezap_plugin_host::default_dir() else {
         log::debug!("no per-user data directory, so no plugins");
-        return Arc::new(Plugins::none(sink, Arc::new(Bridge { commands })));
+        return Arc::new(Plugins::none(sink, bridge));
     };
     // Not the daemon's `state_dir`: that one prefers XDG_RUNTIME_DIR, which
     // is cleared on logout, and a permission answer that does not survive a
     // logout is a prompt asked forever. Scoped to this account: see
     // `account_state_dir`.
     let state_dir = account_state_dir(account_id);
-    Arc::new(Plugins::load(
-        &dir,
-        state_dir.as_deref(),
-        Arc::new(Bridge { commands }),
-        sink,
-    ))
+    Arc::new(Plugins::load(&dir, state_dir.as_deref(), bridge, sink))
 }
 
 /// See [`super::reload`].

@@ -291,7 +291,9 @@ use std::path::PathBuf;
 /// 43 adds the status, sticker-library and composer-media requests, among them
 /// `PublishStatusMedia`, which an older daemon would refuse as malformed after
 /// the file had been staged.
-pub const PROTOCOL_VERSION: u32 = 43;
+///
+/// 44 adds the Composer plugin slot to published widget trees and actions.
+pub const PROTOCOL_VERSION: u32 = 44;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

@@ -59,7 +59,10 @@ pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc
         Plugins::start(
             modules,
             Arc::new(Origin::storage_for_account(hub.account_id())),
-            Arc::new(Bridge { commands }),
+            Arc::new(Bridge {
+                hub: hub.clone(),
+                commands,
+            }),
             sink,
         )
         .await,

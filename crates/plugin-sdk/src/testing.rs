@@ -138,6 +138,7 @@ struct State {
     subscription: i64,
     capabilities: i64,
     now_ms: i64,
+    unconfirmed_write: bool,
 }
 
 thread_local! {
@@ -253,6 +254,11 @@ impl Host {
     }
 
     /// What `oxi_now_ms` answers. Zero unless a test says otherwise, so a
+    /// Replace the value on the next durable write and report uncertainty.
+    pub fn unconfirm_next_durable_write(&mut self) {
+        HOST.with(|host| host.borrow_mut().unconfirmed_write = true);
+    }
+
     /// plugin that stamps something is testable at all.
     pub fn set_now_ms(&mut self, now: i64) {
         HOST.with(|h| h.borrow_mut().now_ms = now);
@@ -368,6 +374,15 @@ pub(crate) fn kv_set(key: &str, value: &str) -> i32 {
         }
     });
     abi::outcome::ACCEPTED
+}
+
+pub(crate) fn kv_set_durable(key: &str, value: &str) -> i32 {
+    let outcome = kv_set(key, value);
+    if HOST.with(|host| core::mem::take(&mut host.borrow_mut().unconfirmed_write)) {
+        abi::outcome::UNCONFIRMED
+    } else {
+        outcome
+    }
 }
 
 #[cfg(test)]

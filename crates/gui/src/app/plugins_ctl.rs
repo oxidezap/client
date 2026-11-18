@@ -6,7 +6,7 @@
 //! which needs somewhere to hold what is being typed before anybody commits
 //! it — and that is what this file is.
 
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gpui_component::input::{InputEvent, InputState};
@@ -58,6 +58,7 @@ impl PluginField {
 /// oversized setting would disconnect the window. A plugin setting is a
 /// keyword or a sentence; anything of this size is a mistake either way.
 const MAX_FIELD_BYTES: usize = 64 * 1024;
+const MAX_INACTIVE_COMPOSER_FIELDS: usize = 64;
 
 /// A field's address. Two plugins may both call a widget `keyword`, and one
 /// plugin may draw the same id in two slots.
@@ -72,8 +73,8 @@ const MAX_FIELD_BYTES: usize = 64 * 1024;
 /// selection when Enter is pressed, so a box shared across chats would take
 /// what somebody typed in one and commit it carrying the other's JID — a
 /// plugin storing or sending it for the wrong conversation. Switching chats
-/// therefore drops what was half-typed in the old one, which is the honest
-/// trade: the alternative is not a preserved draft, it is a misdirected one.
+/// drops legacy header fields. Composer drafts stay keyed to their own chat
+/// until the plugin removes the field, the account changes, or the cache fills.
 ///
 /// Which is why the *same* answer `send_plugin_action` gives is taken here
 /// rather than the selection itself: a Settings action carries no chat, so
@@ -83,7 +84,7 @@ const MAX_FIELD_BYTES: usize = 64 * 1024;
 /// gone for a context it never had.
 fn key(plugin: &str, slot: PluginSlot, chat: Option<&str>, id: &str) -> FieldKey {
     let chat = match slot {
-        PluginSlot::ChatHeader => chat,
+        PluginSlot::ChatHeader | PluginSlot::Composer => chat,
         PluginSlot::Settings => None,
     };
     FieldKey {
@@ -289,14 +290,39 @@ impl Plugins {
             }
         }
 
-        // Gone means gone: a plugin that stopped drawing a field has taken it
-        // back, and holding the entity would keep a subscription alive that
-        // fires into a widget nobody can see.
         let live: std::collections::HashSet<FieldKey> = wanted
             .iter()
             .map(|f| key(&f.plugin, f.slot, chat, &f.id))
             .collect();
-        self.fields.retain(|k, _| live.contains(k));
+        let composers: std::collections::HashSet<_> = wanted
+            .iter()
+            .filter(|f| f.slot == PluginSlot::Composer)
+            .map(|f| (f.plugin.as_str(), f.id.as_str()))
+            .collect();
+        let mut inactive = 0;
+        self.fields.retain(|key, field| {
+            if live.contains(key) {
+                return true;
+            }
+            if key.slot != PluginSlot::Composer
+                || !composers.contains(&(key.plugin.as_str(), key.id.as_str()))
+            {
+                return false;
+            }
+            let typed = field.state.read(cx).value();
+            let keep = typed.len() <= MAX_FIELD_BYTES && typed.as_ref() != field.published;
+            inactive += usize::from(keep);
+            keep
+        });
+        let mut excess = inactive.saturating_sub(MAX_INACTIVE_COMPOSER_FIELDS);
+        self.fields.retain(|key, _| {
+            if excess == 0 || live.contains(key) {
+                true
+            } else {
+                excess -= 1;
+                false
+            }
+        });
 
         // What is left is what has no box yet. The ones that do are brought
         // up to date here, and only when the *plugin* moved them: a tree
@@ -378,7 +404,9 @@ impl WhatsAppApp {
                     // what it was. Clicking elsewhere, tabbing away and
                     // closing the screen all blur the box, and all of them
                     // now commit what is in it.
-                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    InputEvent::PressEnter { .. } | InputEvent::Blur
+                        if commit_slot != PluginSlot::Composer =>
+                    {
                         this.commit_plugin_field(&commit_plugin, commit_slot, &commit_id, cx);
                     }
                     _ => {}
@@ -704,6 +732,31 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    fn composer_form(&self, plugin: &str, chat: &str, cx: &App) -> Option<String> {
+        let surface = self
+            .plugins(cx)
+            .iter()
+            .find(|surface| surface.id == plugin)?;
+        let mut fields = Vec::new();
+        for node in surface.roots_in(PluginSlot::Composer) {
+            collect_fields(plugin, PluginSlot::Composer, node, &mut fields);
+        }
+        let mut values = std::collections::BTreeMap::new();
+        let limit = MAX_FIELD_BYTES.checked_sub(chat.len())?;
+        let mut remaining = limit;
+        for field in fields {
+            let value = self
+                .plugin_field(plugin, PluginSlot::Composer, &field.id, cx)?
+                .read(cx)
+                .value();
+            remaining = remaining.checked_sub(field.id.len() + value.len())?;
+            values.insert(field.id, value.to_string());
+        }
+        serde_json::to_string(&values)
+            .ok()
+            .filter(|value| value.len() <= limit)
+    }
+
     /// Tell a plugin one of its widgets was used.
     ///
     /// The open conversation goes along only for a slot that has one. A
@@ -721,8 +774,24 @@ impl WhatsAppApp {
         cx: &mut Context<Self>,
     ) {
         let chat = match slot {
-            PluginSlot::ChatHeader => self.selected_chat_jid(),
+            PluginSlot::ChatHeader | PluginSlot::Composer => self.selected_chat_jid(),
             PluginSlot::Settings => None,
+        };
+        let value = if slot == PluginSlot::Composer && widget == PluginWidget::Button {
+            let Some(form) = chat
+                .as_deref()
+                .and_then(|chat| self.composer_form(plugin, chat, cx))
+            else {
+                self.notify_user(
+                    crate::tr!(ComposerPluginFormUnavailable),
+                    super::notices::Tone::Problem,
+                    cx,
+                );
+                return;
+            };
+            Some(form)
+        } else {
+            value
         };
         if let Some(client) = self.client.as_ref() {
             client.plugin_action(plugin, action, value, chat, slot, widget);
@@ -760,7 +829,7 @@ fn collect_fields(plugin: &str, slot: PluginSlot, node: &PluginNode, out: &mut V
 }
 
 /// The boxes, keyed by what names each one.
-type PluginFields = HashMap<FieldKey, PluginField>;
+type PluginFields = IndexMap<FieldKey, PluginField>;
 
 #[cfg(test)]
 mod tests {
@@ -819,10 +888,10 @@ mod tests {
     }
 
     /// A Settings field is one field whatever is selected, because the action
-    /// it commits carries no conversation. A header field is one per chat,
-    /// because the action it commits carries the open one.
+    /// it commits carries no conversation. Chat tools keep separate fields
+    /// for each conversation.
     #[test]
-    fn only_a_header_field_belongs_to_a_conversation() {
+    fn chat_tools_fields_belong_to_a_conversation() {
         let settings = |chat| key("autoreply", PluginSlot::Settings, chat, "keyword");
         assert_eq!(settings(Some("a@s.whatsapp.net")), settings(None));
         assert_eq!(
@@ -830,16 +899,17 @@ mod tests {
             settings(Some("b@s.whatsapp.net"))
         );
 
-        let header = |chat| key("autoreply", PluginSlot::ChatHeader, chat, "keyword");
-        assert_ne!(
-            header(Some("a@s.whatsapp.net")),
-            header(Some("b@s.whatsapp.net"))
-        );
-        assert_ne!(
-            header(Some("a@s.whatsapp.net")),
-            settings(Some("a@s.whatsapp.net")),
-            "and the same id in two slots is still two fields"
-        );
+        for slot in [PluginSlot::ChatHeader, PluginSlot::Composer] {
+            let chat_field = |chat| key("autoreply", slot, chat, "keyword");
+            assert_ne!(
+                chat_field(Some("a@s.whatsapp.net")),
+                chat_field(Some("b@s.whatsapp.net"))
+            );
+            assert_ne!(
+                chat_field(Some("a@s.whatsapp.net")),
+                settings(Some("a@s.whatsapp.net"))
+            );
+        }
     }
 
     /// The key used to be a formatted string with `/` between its parts. A

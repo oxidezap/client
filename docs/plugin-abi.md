@@ -91,6 +91,7 @@ returns an outcome (below).
 | `oxi_ui_set` | `(ptr, len) -> i32` | `UI` |
 | `oxi_kv_get` | `(key, key_len, ptr, cap) -> i32` | `STORAGE` |
 | `oxi_kv_set` | `(key, key_len, val, val_len) -> i32` | `STORAGE` |
+| `oxi_kv_set_durable` | `(key, key_len, val, val_len) -> i32` | `STORAGE` |
 | `oxi_timer_set` | `(delay_ms: i64, token: i64) -> i32` | `TIMERS` |
 | `oxi_log` | `(level: i32, ptr: i32, len: i32)` | none |
 | `oxi_now_ms` | `() -> i64` | none |
@@ -101,6 +102,15 @@ a value read as absent comes back as the plugin's default, which the next
 action then writes over the user's own. An empty value passed to `oxi_kv_set`
 deletes the key. `oxi_ui_set` replaces the
 plugin's whole published tree.
+
+`oxi_kv_set_durable` applies the same limits as `oxi_kv_set`. It returns
+`ACCEPTED` only after the backing store acknowledges the write. It refuses
+writes without persistent storage, during the normal one-second storage
+write interval, or when the backing write fails before replacing the entry.
+A refused change is not queued. If replacement succeeded but the backing
+store could not confirm persistence, it returns `UNCONFIRMED` and keeps
+the new value visible. Use it before an external action that must not be replayed on restart.
+Modules importing it need a host that provides this import.
 
 `oxi_now_ms` is the only clock: Unix milliseconds, which is the resolution a
 plugin needs to stamp a message or space its own timers. Read it as the
@@ -117,6 +127,7 @@ call's fuel, so nothing here is a promise about timing side channels.
 | `-2` | `REFUSED` | The daemon will not do this as asked. |
 | `-3` | `DENIED` | The plugin did not declare this capability, or the user has not agreed to it. |
 | `-4` | `INVALID` | A pointer outside memory, bytes that are not UTF-8, a length past what the host accepts. |
+| `-6` | `UNCONFIRMED` | The store replaced the value but could not confirm persistence. |
 | `-5` | `STATE` | Right call, wrong moment — declaring outside `oxi_init`, or acting inside it. |
 
 `-1` is also `ABSENT` for the field reads, where there is no outcome to
@@ -253,10 +264,9 @@ node:
 Kinds: `1` button, `2` toggle, `3` label, `4` text field, `5` row, `6` column,
 `7` section. Only rows, columns and sections are drawn with children.
 
-Slots: `1` chat header, `3` settings. `2` is **reserved and undefined** — the
-composer's number, unassigned on purpose, because a slot the front end
-silently ignores is a button whose author never finds out why it did not
-appear.
+Slots: `1` chat header, `2` composer tools popover, `3` settings. Actions
+in the header and composer slots carry the open chat. Use the composer slot
+for forms and tools that act on that conversation.
 
 Flags: `1` enabled, `2` checked.
 
@@ -299,11 +309,16 @@ so they are decoded strictly — a broken byte in an id is an error, where a
 broken byte in a label is replaced and drawn.
 
 When somebody uses a widget, `UI_ACTION` arrives carrying `ACTION_ID`,
-`ACTION_VALUE` (a toggle's *new* state as `1`/`0`, a field's contents, empty
-for a button) and `CHAT_JID` for a slot that has a chat behind it. The daemon
+`ACTION_VALUE` (a toggle's *new* state as `1`/`0`, a field's contents, or
+a composer button's form values) and `CHAT_JID` for a slot that has a chat
+behind it. The daemon
 checks the action against the tree it currently publishes — kind and slot
 included — so a press from a window whose frame is older than the daemon's
 does not land as a real one.
+
+Composer text fields are local until a composer button is pressed. That button
+receives a JSON object mapping the plugin's composer field IDs to the values
+currently visible in the same chat. Other buttons have an empty value.
 
 ## What the host holds a plugin to
 

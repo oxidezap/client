@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::Backing;
+use super::{Backing, ReplaceError};
 
 /// Files in one directory. Native only; a page has no directory to name.
 pub struct Files(PathBuf);
@@ -61,6 +61,10 @@ impl Backing for Files {
     }
 
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.replace(name, bytes).map_err(ReplaceError::reason)
+    }
+
+    fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), ReplaceError> {
         let path = self.path(name);
         // Unique per process and thread. A fixed name is one two daemons
         // sharing a state directory both write, so one can rename a file the
@@ -70,22 +74,16 @@ impl Backing for Files {
             std::process::id(),
             std::thread::current().id()
         ));
-        let landed = crate::write_private(&temp, bytes)
-            .and_then(|()| std::fs::rename(&temp, &path))
-            // The rename is metadata, and syncing the file did not persist
-            // it: an answer that reported success while the entry was still
-            // only in memory is a withdrawal the next start hands back.
-            .and_then(|()| match path.parent() {
-                Some(dir) => crate::sync_dir(dir),
-                None => Ok(()),
-            });
-        match landed {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp);
-                Err(e.to_string())
-            }
+        if let Err(error) =
+            crate::write_private(&temp, bytes).and_then(|()| std::fs::rename(&temp, &path))
+        {
+            let _ = std::fs::remove_file(&temp);
+            return Err(ReplaceError::Unchanged(error.to_string()));
         }
+        if let Some(dir) = path.parent() {
+            crate::sync_dir(dir).map_err(|error| ReplaceError::Unconfirmed(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn remove(&self, name: &str) -> Result<(), String> {

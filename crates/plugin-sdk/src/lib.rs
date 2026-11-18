@@ -275,6 +275,8 @@ pub enum Outcome {
     /// [`Invalid`]: Self::Invalid
     /// [`Denied`]: Self::Denied
     State,
+    /// The entry changed, but its persistence could not be confirmed.
+    Unconfirmed,
 }
 
 impl Outcome {
@@ -285,6 +287,7 @@ impl Outcome {
             abi::outcome::DENIED => Self::Denied,
             abi::outcome::REFUSED => Self::Refused,
             abi::outcome::STATE => Self::State,
+            abi::outcome::UNCONFIRMED => Self::Unconfirmed,
             _ => Self::Invalid,
         }
     }
@@ -824,7 +827,7 @@ impl Action<'_> {
     }
 
     /// What it now holds — a toggle's new state as `1` or `0`, a field's
-    /// contents, and nothing at all for a button.
+    /// contents, or a JSON object of field values for a composer button.
     #[must_use]
     pub fn value(self) -> Text<256> {
         self.0.text(fields::ACTION_VALUE)
@@ -1199,6 +1202,20 @@ pub fn get<const N: usize>(key: &str) -> Text<N> {
 pub fn set(key: &str, value: &str) -> Outcome {
     Outcome::of(unsafe {
         raw::kv_set(
+            raw::at(key.as_bytes()),
+            key.len() as i32,
+            raw::at(value.as_bytes()),
+            value.len() as i32,
+        )
+    })
+}
+
+/// Store a value and wait for the backing store to accept the write.
+///
+/// Shares the normal storage write limit. A refused change is not queued. An unconfirmed change is visible in memory.
+pub fn set_durable(key: &str, value: &str) -> Outcome {
+    Outcome::of(unsafe {
+        raw::kv_set_durable(
             raw::at(key.as_bytes()),
             key.len() as i32,
             raw::at(value.as_bytes()),

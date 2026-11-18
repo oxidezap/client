@@ -13,6 +13,20 @@
 //! What each implementation owes is narrower — hand back what was written, or
 //! nothing.
 
+#[derive(Debug)]
+pub enum ReplaceError {
+    Unchanged(String),
+    Unconfirmed(String),
+}
+
+impl ReplaceError {
+    pub fn reason(self) -> String {
+        match self {
+            Self::Unchanged(reason) | Self::Unconfirmed(reason) => reason,
+        }
+    }
+}
+
 /// A named document that outlives the process.
 ///
 /// `Send + Sync` because the approvals are read from every thread the daemon
@@ -38,6 +52,14 @@ pub trait Backing: Send + Sync + 'static {
     /// Whatever the platform said, in words, for the one log line each caller
     /// writes about it.
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String>;
+
+    /// Like `write`, preserving whether failure happened before replacement
+    /// or while confirming a replacement already visible to readers.
+    ///
+    /// Backends that can fail after replacement must override this method.
+    fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), ReplaceError> {
+        self.write(name, bytes).map_err(ReplaceError::Unchanged)
+    }
 
     /// Remove `name`, durably. Missing is success.
     ///
