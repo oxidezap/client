@@ -22,6 +22,7 @@ mod rich_text;
 pub(crate) mod rich_text_selection;
 mod status;
 mod status_ticks;
+mod sticker;
 
 pub use avatar::Avatar;
 pub use call_card::render_call_card;
