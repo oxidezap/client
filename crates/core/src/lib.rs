@@ -18,6 +18,7 @@ pub mod base64;
 /// asked for, so nothing an embedder links carries it.
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
+pub mod time;
 
 mod account;
 mod app_state;

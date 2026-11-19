@@ -1119,7 +1119,7 @@ async fn delete_for_me_normalizes_device_qualified_participants_without_hitting_
             .maybe_participant_jid(Some(jid(&device_sender)))
             .message_id(id.into())
             .from_me(false)
-            .timestamp(ts(1_700_000_020))
+            .timestamp(sdk_timestamp(ts(1_700_000_020)))
             .action(Box::new(
                 wa::sync_action_value::DeleteMessageForMeAction::default(),
             ))

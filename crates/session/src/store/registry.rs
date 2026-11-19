@@ -507,7 +507,7 @@ mod tests {
                 &peer,
                 "RETAINED",
                 &whatsapp_rust::waproto::whatsapp::Message::default(),
-                wacore::time::now_utc(),
+                oxidezap_core::time::now_utc(),
             )
             .unwrap();
         history.flush().await.unwrap();
@@ -536,7 +536,7 @@ mod tests {
                 &peer,
                 "NEW-ACCOUNT",
                 &whatsapp_rust::waproto::whatsapp::Message::default(),
-                wacore::time::now_utc(),
+                oxidezap_core::time::now_utc(),
             )
             .unwrap();
         new_history.flush().await.unwrap();
@@ -595,7 +595,7 @@ mod tests {
                 &peer,
                 "A-MSG",
                 &whatsapp_rust::waproto::whatsapp::Message::default(),
-                wacore::time::now_utc(),
+                oxidezap_core::time::now_utc(),
             )
             .expect("record A's message");
         chat_b
@@ -603,7 +603,7 @@ mod tests {
                 &peer,
                 "B-MSG",
                 &whatsapp_rust::waproto::whatsapp::Message::default(),
-                wacore::time::now_utc(),
+                oxidezap_core::time::now_utc(),
             )
             .expect("record B's message");
         chat_a.flush().await.expect("flush A");
@@ -663,7 +663,7 @@ mod tests {
                 &peer,
                 "B-KEEP",
                 &whatsapp_rust::waproto::whatsapp::Message::default(),
-                wacore::time::now_utc(),
+                oxidezap_core::time::now_utc(),
             )
             .expect("record B's message");
         chat_b.flush().await.expect("flush B");

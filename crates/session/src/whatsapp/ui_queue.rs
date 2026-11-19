@@ -869,7 +869,7 @@ mod tests {
             UiEvent::SystemNotice {
                 chat_jid: "test@g.us".into(),
                 notice_id: "id".into(),
-                at: wacore::time::from_secs(0).unwrap(),
+                at: oxidezap_core::time::from_sdk(wacore::Timestamp::UNIX_EPOCH),
                 notice: oxidezap_core::SystemNotice::GroupChanged("x".repeat(4096)),
             },
         ];

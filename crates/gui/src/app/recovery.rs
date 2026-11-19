@@ -51,7 +51,7 @@ impl Recovering {
     /// Seconds until the automatic retry, or `None` when none is scheduled.
     pub(super) fn countdown_secs(&self) -> Option<u64> {
         self.retry_at.map(|at| {
-            let now = wacore::time::now_utc();
+            let now = oxidezap_core::time::now_utc();
             (at - now).num_seconds().max(0) as u64
         })
     }
@@ -99,8 +99,9 @@ impl Recovering {
         if self.retry_at.is_some() {
             return;
         }
-        self.retry_at =
-            Some(wacore::time::now_utc() + chrono::Duration::seconds(RETRY_AFTER_SECS as i64));
+        self.retry_at = Some(
+            oxidezap_core::time::now_utc() + chrono::Duration::seconds(RETRY_AFTER_SECS as i64),
+        );
 
         self.countdown = Some(cx.spawn(async move |me: WeakEntity<Self>, cx| {
             loop {
@@ -450,7 +451,7 @@ mod tests {
                 caller_jid: "999000@s.whatsapp.net".into(),
                 is_video: false,
                 is_offline: false,
-                received_at: wacore::time::now_utc(),
+                received_at: oxidezap_core::time::now_utc(),
             });
             app.adopt_calls(ringing.clone(), cx);
             assert!(app.calls.read(cx).state().incoming().is_some());
@@ -483,7 +484,7 @@ mod tests {
             "nothing armed, nothing to count"
         );
 
-        recovering.retry_at = Some(wacore::time::now_utc() + chrono::Duration::seconds(9));
+        recovering.retry_at = Some(oxidezap_core::time::now_utc() + chrono::Duration::seconds(9));
         assert!(matches!(recovering.countdown_secs(), Some(8 | 9)));
     }
 
@@ -493,7 +494,7 @@ mod tests {
     #[test]
     fn a_deadline_already_past_reads_as_due() {
         let mut recovering = Recovering::new();
-        recovering.retry_at = Some(wacore::time::now_utc() - chrono::Duration::seconds(30));
+        recovering.retry_at = Some(oxidezap_core::time::now_utc() - chrono::Duration::seconds(30));
 
         assert_eq!(recovering.countdown_secs(), Some(0));
     }
@@ -504,7 +505,7 @@ mod tests {
     #[test]
     fn working_offline_stops_the_wait() {
         let mut recovering = Recovering::new();
-        recovering.retry_at = Some(wacore::time::now_utc() + chrono::Duration::seconds(15));
+        recovering.retry_at = Some(oxidezap_core::time::now_utc() + chrono::Duration::seconds(15));
 
         recovering.stop();
 

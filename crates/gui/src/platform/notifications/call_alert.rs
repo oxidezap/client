@@ -137,7 +137,9 @@ mod imp {
             let path = std::env::temp_dir().join(format!(
                 "oxidezap-call-alert-failure-{}-{}",
                 std::process::id(),
-                wacore::time::now_utc().timestamp_nanos_opt().unwrap()
+                oxidezap_core::time::now_utc()
+                    .timestamp_nanos_opt()
+                    .unwrap()
             ));
             let cancelled = Arc::new(AtomicBool::new(false));
             let ringtone_cancelled = Arc::new(AtomicBool::new(false));
@@ -171,7 +173,9 @@ mod imp {
             let path = std::env::temp_dir().join(format!(
                 "oxidezap-call-alert-test-{}-{}",
                 std::process::id(),
-                wacore::time::now_utc().timestamp_nanos_opt().unwrap()
+                oxidezap_core::time::now_utc()
+                    .timestamp_nanos_opt()
+                    .unwrap()
             ));
             let owner = claim_at(&path, "call-one".into()).unwrap().unwrap();
             assert!(claim_at(&path, "call-one".into()).unwrap().is_none());

@@ -403,7 +403,7 @@ mod tests {
                     &peer,
                     "RETAINED",
                     &Default::default(),
-                    wacore::time::now_utc(),
+                    oxidezap_core::time::now_utc(),
                 )
                 .unwrap();
             history.flush().await.unwrap();

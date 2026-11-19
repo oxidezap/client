@@ -783,7 +783,7 @@ impl Bridge {
 /// Refresh time-dependent attention and wait for its next possible change.
 /// Video frames do not reset this timer or scan the conversation list.
 async fn wait_for_mute_expiry(hub: Arc<StateHub>) {
-    let now_ms = wacore::time::now_utc().timestamp_millis();
+    let now_ms = wacore::time::now_millis();
     hub.refresh_tray();
     match hub.next_mute_expiry(now_ms) {
         Some(until) => {

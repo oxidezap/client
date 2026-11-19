@@ -253,7 +253,7 @@ pub(super) fn apply(
         if let Some(context) = base.context_info()
             && context.expiration.is_some_and(|duration| {
                 duration > 0
-                    && ts.saturating_add(i64::from(duration)) <= wacore::time::now_utc().timestamp()
+                    && ts.saturating_add(i64::from(duration)) <= wacore::time::now_utc().as_secs()
             })
         {
             continue;
@@ -339,7 +339,7 @@ pub(super) fn attempted(
     bundle: &PendingHistoryBundle,
 ) -> QueryResult<()> {
     diesel::sql_query("UPDATE shared_group_history SET attempted_ms = ? WHERE device_id = ? AND chat_jid = ? AND msg_id = ? AND sender_jid = ?")
-        .bind::<BigInt,_>(wacore::time::now_utc().timestamp_millis())
+        .bind::<BigInt,_>(wacore::time::now_millis())
         .bind::<Integer,_>(device).bind::<Text,_>(&bundle.chat_jid).bind::<Text,_>(&bundle.msg_id).bind::<Text,_>(&bundle.sender_jid).execute(conn)?;
     Ok(())
 }

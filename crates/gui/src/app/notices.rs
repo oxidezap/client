@@ -119,7 +119,7 @@ impl Notices {
         self.push(
             text.into(),
             tone,
-            wacore::time::now_utc()
+            oxidezap_core::time::now_utc()
                 + chrono::Duration::from_std(LIFETIME).unwrap_or(chrono::Duration::seconds(6)),
         );
         self.sweep(cx);
@@ -181,7 +181,7 @@ impl Notices {
             loop {
                 crate::platform::sleep(SWEEP).await;
                 let more = entity.update(cx, |notices, cx| {
-                    if notices.expire(wacore::time::now_utc()) {
+                    if notices.expire(oxidezap_core::time::now_utc()) {
                         cx.notify();
                     }
                     !notices.shown.is_empty()

@@ -106,7 +106,7 @@ pub(super) fn upsert(
 ) -> QueryResult<()> {
     use schema::avatar_descriptors::dsl;
     let jid = jid.to_string();
-    let now_ms = wacore::time::now_utc().timestamp_millis();
+    let now_ms = wacore::time::now_millis();
     let seq = i64::try_from(seq).unwrap_or(i64::MAX);
     if !picture_id.is_empty() && seq <= order_floor(conn, device_id)? {
         let present = dsl::avatar_descriptors

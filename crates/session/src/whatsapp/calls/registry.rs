@@ -42,7 +42,7 @@ const MAX_RINGABLE_OFFER_AGE_MS: i64 = 120_000;
 fn ringable_offer(offer: &WaIncomingCall, now_ms: i64) -> bool {
     !offer.offline
         && offer.timestamp.is_some_and(|timestamp| {
-            now_ms.saturating_sub(timestamp.timestamp_millis()) <= MAX_RINGABLE_OFFER_AGE_MS
+            now_ms.saturating_sub(timestamp.as_millis()) <= MAX_RINGABLE_OFFER_AGE_MS
         })
 }
 
@@ -3063,8 +3063,7 @@ mod tests {
             &ui,
         );
         let mut old = (*replay_offer("BACKLOG")).clone();
-        old.timestamp =
-            wacore::time::from_millis(old.timestamp.unwrap().timestamp_millis() - 300_000);
+        old.timestamp = wacore::time::from_millis(old.timestamp.unwrap().as_millis() - 300_000);
         assert!(
             !old.offline,
             "an offline flag is not required for freshness"
@@ -3097,8 +3096,7 @@ mod tests {
             Arc::new(ui_queue::HistoryBudget::new()),
         );
         let mut old = (*replay_offer("LOOKUP")).clone();
-        old.timestamp =
-            wacore::time::from_millis(old.timestamp.unwrap().timestamp_millis() - 300_000);
+        old.timestamp = wacore::time::from_millis(old.timestamp.unwrap().as_millis() - 300_000);
         let old = Arc::new(old);
         // The registered offer is the one held across the name lookup; age
         // can change without either its identity or its epoch changing.
