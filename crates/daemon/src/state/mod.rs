@@ -994,7 +994,7 @@ mod tests {
             summary.clone(),
         )));
         assert_eq!(tray.borrow_and_update().unread, 7);
-        let until = wacore::time::now_utc().timestamp_millis() + 30;
+        let until = wacore::time::now_millis() + 30;
         summary.muted_until_ms = Some(until);
         hub.apply(Change::from_store(DaemonEvent::ChatUpdated(
             summary.clone(),

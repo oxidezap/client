@@ -11,7 +11,7 @@ fn notice(id: &str, index: u32) -> Event {
             .notification_id(id.to_owned())
             .action_index(index)
             .participant(jid(PEER))
-            .timestamp(ts(1_700_000_000))
+            .timestamp(sdk_timestamp(ts(1_700_000_000)))
             .is_lid_addressing_mode(true)
             .action(Box::new(
                 GroupNotificationAction::add()

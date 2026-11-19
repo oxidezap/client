@@ -402,7 +402,7 @@ fn apply_writer_msg(
             device_id,
             &chat.to_string(),
             operation_id,
-            wacore::time::now_utc().timestamp_millis(),
+            wacore::time::now_millis(),
         ),
         WriterMsg::InboundDurability { event, .. } => {
             apply_event(conn, device_id, event, cs, deferred)
@@ -501,11 +501,9 @@ fn apply_writer_msg(
                 // The row this send's ack was waiting for now exists. Applying
                 // it here also corrects the optimistic timestamp we just wrote
                 // to the server's, before anything renders the row.
-                while let Some(ack) = deferred.take_matching(
-                    msg_id,
-                    &chat_str,
-                    wacore::time::now_utc().timestamp_millis(),
-                ) {
+                while let Some(ack) =
+                    deferred.take_matching(msg_id, &chat_str, wacore::time::now_millis())
+                {
                     if let AckApplied::Deferrable(_) =
                         apply_server_ack_with_operations(conn, device_id, &ack, cs, deferred)?
                     {

@@ -558,7 +558,7 @@ async fn review_245_deleted_pending_import(delete: bool) {
             wacore::types::events::DeleteChatUpdate::builder()
                 .jid(jid(GROUP))
                 .delete_media(false)
-                .timestamp(ts(AT + 1))
+                .timestamp(sdk_timestamp(ts(AT + 1)))
                 .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
                 .from_full_sync(false)
                 .build(),
@@ -569,7 +569,7 @@ async fn review_245_deleted_pending_import(delete: bool) {
                 .jid(jid(GROUP))
                 .delete_starred(false)
                 .delete_media(false)
-                .timestamp(ts(AT + 1))
+                .timestamp(sdk_timestamp(ts(AT + 1)))
                 .action(Box::new(wa::sync_action_value::ClearChatAction::default()))
                 .from_full_sync(false)
                 .build(),
@@ -766,7 +766,7 @@ async fn review_245_ranged_clear_retires_only_covered_attachment_keys() {
                 .jid(jid(GROUP))
                 .delete_starred(false)
                 .delete_media(false)
-                .timestamp(ts(AT + 2))
+                .timestamp(sdk_timestamp(ts(AT + 2)))
                 .action(Box::new(action))
                 .from_full_sync(false)
                 .build(),

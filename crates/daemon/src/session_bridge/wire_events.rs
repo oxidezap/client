@@ -75,7 +75,7 @@ pub(crate) fn connection_status_of(state: &ConnectionState, hub: &StateHub) -> C
 
 /// A chat summary as the protocol's chat. Archive state still requires a full chat.
 pub(crate) fn chat_summary_to_dto(summary: ChatSummary) -> ChatDto {
-    let is_muted = summary.is_muted(wacore::time::now_utc().timestamp_millis());
+    let is_muted = summary.is_muted(wacore::time::now_millis());
     let is_group = summary.jid.parse::<Jid>().is_ok_and(|jid| jid.is_group());
     ChatDto {
         jid: summary.jid,
@@ -101,7 +101,7 @@ pub(crate) fn chat_to_dto(chat: oxidezap_core::Chat) -> ChatDto {
         is_pinned: chat.pinned_at.is_some(),
         is_muted: chat
             .muted_until
-            .is_some_and(|until| until > wacore::time::now_utc()),
+            .is_some_and(|until| until > oxidezap_core::time::now_utc()),
         is_archived: chat.archived,
         last_message_ts: chat.last_message_time.map(|t| t.timestamp_millis()),
         last_message_preview: chat.last_message,

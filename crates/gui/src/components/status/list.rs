@@ -866,7 +866,7 @@ mod visible_cost {
             crate::theme::init(cx);
         });
         let mut chat = oxidezap_core::Chat::new("status@broadcast".into());
-        let now = wacore::time::now_utc();
+        let now = oxidezap_core::time::now_utc();
         for n in 0..50 {
             let mut message = oxidezap_core::ChatMessage::new_incoming(
                 format!("S-{n}"),

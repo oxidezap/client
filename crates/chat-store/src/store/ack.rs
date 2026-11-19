@@ -511,7 +511,7 @@ pub(super) fn apply_server_ack(
     let server_timestamp_ms = ack
         .timestamp
         .filter(|_| ack.error.is_none())
-        .map(|timestamp| timestamp.timestamp_millis());
+        .map(wacore::Timestamp::as_millis);
     let timestamp_updated = if let Some(timestamp_ms) = server_timestamp_ms {
         diesel::update(
             message_row(device_id, &chat, &ack.id)

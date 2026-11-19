@@ -400,7 +400,7 @@ pub(crate) fn reconcile_startup(
 /// the history-sync seed) makes that zero durable across later repairs.
 /// Runs exactly on the dirty startups that precede a full repair.
 fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> QueryResult<()> {
-    let now_ms = wacore::time::now_utc().timestamp_millis();
+    let now_ms = wacore::time::now_millis();
     // Chats the scalar sweep cannot fully cover: rows timestamped ahead of
     // the capped frontier need explicit ids or the repair below recounts
     // them. Selected up front, while the sweep predicate still identifies
@@ -809,7 +809,7 @@ fn refresh_chat_after_merge(
                 .select(diesel::dsl::max(schema::messages::timestamp_ms))
                 .first(conn)?;
             if let Some(max_ts) = max_ts.filter(|&ts| ts > 0) {
-                let baseline = max_ts.min(wacore::time::now_utc().timestamp_millis());
+                let baseline = max_ts.min(wacore::time::now_millis());
                 // Past more coverable ids than the retained list holds, a
                 // committed scalar without its ids would leave the next
                 // merge recounting the uncovered rows — so an overflowing

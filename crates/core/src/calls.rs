@@ -60,7 +60,7 @@ impl ActiveCall {
     /// but a clock that steps backwards would otherwise render a negative
     /// duration.
     pub fn elapsed(&self) -> chrono::Duration {
-        (wacore::time::now_utc() - self.started_at).max(chrono::Duration::zero())
+        (crate::time::now_utc() - self.started_at).max(chrono::Duration::zero())
     }
 
     /// `m:ss`, growing an hour field only once there is one.
@@ -553,7 +553,7 @@ impl CallState {
                 ..CallVideo::default()
             },
             is_outgoing: matches!(stage, Stage::Outgoing(_)),
-            started_at: wacore::time::now_utc(),
+            started_at: crate::time::now_utc(),
             muted: false,
         };
         self.stage = Some(Stage::Active(active));
@@ -601,7 +601,7 @@ impl CallState {
             },
             // Answering an offer: they called us.
             is_outgoing: false,
-            started_at: wacore::time::now_utc(),
+            started_at: crate::time::now_utc(),
             muted: false,
         }));
     }
@@ -1295,7 +1295,7 @@ mod tests {
     #[test]
     fn incoming_calls_keep_the_protocol_timestamp() {
         let mut wire = offer("OLD");
-        wire.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0);
+        wire.timestamp = wacore::Timestamp::from_secs(1_700_000_000);
         let call = IncomingCall::new(
             "OLD",
             "Example".into(),
@@ -1303,14 +1303,17 @@ mod tests {
             false,
             &wire,
         );
-        assert_eq!(Some(call.received_at), wire.timestamp);
+        assert_eq!(
+            Some(call.received_at),
+            wire.timestamp.map(crate::time::from_sdk)
+        );
     }
 
     #[test]
     fn incoming_call_without_server_time_uses_local_receipt_time() {
         let mut wire = offer("NO-TIME");
         wire.timestamp = None;
-        let before = wacore::time::now_utc();
+        let before = crate::time::now_utc();
         let call = IncomingCall::new(
             "NO-TIME",
             "Example".into(),
@@ -1318,7 +1321,7 @@ mod tests {
             false,
             &wire,
         );
-        let after = wacore::time::now_utc();
+        let after = crate::time::now_utc();
         assert!(call.received_at >= before && call.received_at <= after);
     }
 

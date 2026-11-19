@@ -572,7 +572,7 @@ impl WhatsAppClient {
 
             // The post is already on WhatsApp. A local write failure must
             // never prompt the user to send it a second time.
-            let now = whatsapp_rust::wacore::time::now_utc();
+            let now = oxidezap_core::time::now_utc();
             if let Err(error) =
                 live.chat_store
                     .record_outgoing(&jid, result.message_id.as_str(), &message, now)
@@ -663,7 +663,7 @@ impl WhatsAppClient {
             // Already on WhatsApp: a failed local write must not invite a
             // second post.
             let jid = Jid::status_broadcast();
-            let now = whatsapp_rust::wacore::time::now_utc();
+            let now = oxidezap_core::time::now_utc();
             if let Err(error) =
                 live.chat_store
                     .record_outgoing(&jid, result.message_id.as_str(), &message, now)

@@ -180,7 +180,7 @@ async fn a_sent_delete_succeeds_when_the_local_writer_has_stopped() {
 
     let result = super::mutations::delete_and_record(
         async { Ok::<_, String>(()) },
-        || chat_store.record_revoke(&chat, "SENT-DELETE", wacore::time::now_utc()),
+        || chat_store.record_revoke(&chat, "SENT-DELETE", oxidezap_core::time::now_utc()),
         async { panic!("an unqueued delete must not await a flush") },
     )
     .await;
@@ -2115,7 +2115,7 @@ fn alias_history_unread_deduplicates_only_matching_messages() {
         sender: "12025550143@s.whatsapp.net".to_string(),
         sender_name: None,
         content: id.to_string(),
-        timestamp: whatsapp_rust::wacore::time::now_utc(),
+        timestamp: oxidezap_core::time::now_utc(),
         is_from_me: false,
         is_read: false,
         media: None,
@@ -2160,7 +2160,7 @@ fn watched_updates_come_back_watched() {
         sender: "12025550143@s.whatsapp.net".to_string(),
         sender_name: None,
         content: id.to_string(),
-        timestamp: whatsapp_rust::wacore::time::now_utc(),
+        timestamp: oxidezap_core::time::now_utc(),
         is_from_me: from_me,
         is_read: false,
         media: None,
@@ -2724,7 +2724,9 @@ fn a_message_cursor_survives_the_round_trip() {
         id: "3EB0".to_string(),
         sender_jid: "5599000000001@s.whatsapp.net".parse().unwrap(),
         from_me: false,
-        timestamp: whatsapp_rust::wacore::time::from_millis(1_700_000_000_123).unwrap(),
+        timestamp: oxidezap_core::time::from_sdk(
+            wacore::Timestamp::from_millis(1_700_000_000_123).unwrap(),
+        ),
         kind: oxidezap_chat_store::MessageKind::Text,
         text: Some("olá".to_string()),
         message: None,
@@ -2761,7 +2763,8 @@ fn stored_edit_state_reaches_own_and_peer_bubbles_in_direct_and_group_chats() {
 
     const PEER: &str = "559900000001@s.whatsapp.net";
     const GROUP: &str = "120363000000000001@g.us";
-    let timestamp = whatsapp_rust::wacore::time::from_millis(1_700_000_000_000).unwrap();
+    let timestamp =
+        oxidezap_core::time::from_sdk(wacore::Timestamp::from_millis(1_700_000_000_000).unwrap());
     for chat_jid in [PEER, GROUP] {
         for from_me in [false, true] {
             let stored = oxidezap_chat_store::StoredMessage {
@@ -2852,11 +2855,15 @@ fn a_chat_cursor_keeps_an_address_with_a_colon_in_it() {
     let entry = ChatEntry {
         jid: "5599000000001:57@s.whatsapp.net".parse().unwrap(),
         name: None,
-        last_message_at: Some(whatsapp_rust::wacore::time::from_millis(1_700_000_000_123).unwrap()),
+        last_message_at: Some(oxidezap_core::time::from_sdk(
+            wacore::Timestamp::from_millis(1_700_000_000_123).unwrap(),
+        )),
         last_message_preview: None,
         last_message_kind: None,
         unread_count: 0,
-        pinned_at: Some(whatsapp_rust::wacore::time::from_millis(1_699_999_999_000).unwrap()),
+        pinned_at: Some(oxidezap_core::time::from_sdk(
+            wacore::Timestamp::from_millis(1_699_999_999_000).unwrap(),
+        )),
         muted_until: None,
         archived: false,
         ephemeral_expiration: None,

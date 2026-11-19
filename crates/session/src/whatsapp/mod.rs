@@ -1996,9 +1996,12 @@ impl WhatsAppClient {
                     let cached_read = offline_reads
                         .get(&inbound.info.source.chat.to_non_ad_string())
                         .map(|state| {
-                            state
-                                .as_ref()
-                                .map(|state| state.covers(&inbound.info.id, inbound.info.timestamp))
+                            state.as_ref().map(|state| {
+                                state.covers(
+                                    &inbound.info.id,
+                                    oxidezap_core::time::from_sdk(inbound.info.timestamp),
+                                )
+                            })
                         });
                     Self::handle_inbound_message_with_read(
                         &inbound.message,
@@ -2133,9 +2136,11 @@ impl WhatsAppClient {
             Event::Presence(update) => {
                 let availability = match update.status {
                     PresenceStatus::Available => Availability::Online,
-                    PresenceStatus::Unavailable => update
-                        .last_seen
-                        .map_or(Availability::Unknown, Availability::LastSeen),
+                    PresenceStatus::Unavailable => {
+                        update.last_seen.map_or(Availability::Unknown, |ts| {
+                            Availability::LastSeen(oxidezap_core::time::from_sdk(ts))
+                        })
+                    }
                     _ => Availability::Unknown,
                 };
                 // Keyed like the receipt and chat-presence branches beside
@@ -2168,10 +2173,10 @@ impl WhatsAppClient {
                             chat_jid: update.group_jid.to_string(),
                             notice_id: format!(
                                 "group-anonymous-{}-{}",
-                                update.timestamp.timestamp_millis(),
+                                update.timestamp.as_millis(),
                                 update.action_index
                             ),
-                            at: update.timestamp,
+                            at: oxidezap_core::time::from_sdk(update.timestamp),
                             notice: SystemNotice::GroupMembership(Box::new(event)),
                         });
                     }
@@ -2243,10 +2248,10 @@ impl WhatsAppClient {
                             update
                                 .notification_id
                                 .clone()
-                                .unwrap_or_else(|| update.timestamp.timestamp_millis().to_string()),
+                                .unwrap_or_else(|| update.timestamp.as_millis().to_string()),
                             update.action_index
                         ),
-                        at: update.timestamp,
+                        at: oxidezap_core::time::from_sdk(update.timestamp),
                         notice: SystemNotice::GroupChanged(text),
                     });
                 }
@@ -2403,7 +2408,7 @@ impl WhatsAppClient {
             sender_name: None, // Will be set in handle_message_received for groups
             content,
             is_text: oxidezap_chat_store::message_kind(base_msg) == "text",
-            timestamp: info.timestamp,
+            timestamp: oxidezap_core::time::from_sdk(info.timestamp),
             is_from_me: info.source.is_from_me,
             is_read: false,
             media: None,
@@ -2578,7 +2583,11 @@ impl WhatsAppClient {
         } else {
             if let Some(store) = names.chat_store() {
                 match store
-                    .message_is_read(&info.source.chat, &info.id, info.timestamp)
+                    .message_is_read(
+                        &info.source.chat,
+                        &info.id,
+                        oxidezap_core::time::from_sdk(info.timestamp),
+                    )
                     .await
                 {
                     Ok(read) => Some(read),
@@ -3380,12 +3389,7 @@ fn record_outgoing(
     resolve_chat_names: &chat_names::ChatNameResolveSignal,
 ) -> Result<(), String> {
     store
-        .record_outgoing(
-            jid,
-            message_id,
-            message,
-            whatsapp_rust::wacore::time::now_utc(),
-        )
+        .record_outgoing(jid, message_id, message, oxidezap_core::time::now_utc())
         .map_err(|error| {
             // ChatStoreError's outer Display only says "storage error". Preserve
             // the admission reason so the caller can distinguish a full queue

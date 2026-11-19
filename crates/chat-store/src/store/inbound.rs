@@ -25,7 +25,7 @@ pub(super) fn apply_inbound(
     let info = &inbound.info;
     let chat = route_chat(conn, device_id, info.source.chat.to_string(), cs)?;
     let sender = info.source.sender.to_string();
-    let ts_ms = info.timestamp.timestamp_millis();
+    let ts_ms = info.timestamp.as_millis();
 
     // Live push names ride on every message; keep contacts warm from them.
     if !info.push_name.is_empty() && !info.source.is_from_me {

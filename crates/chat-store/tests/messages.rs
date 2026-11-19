@@ -115,7 +115,7 @@ async fn delete_for_me_targets_only_the_named_group_sender() {
                     .maybe_participant_jid(Some(jid(PEER)))
                     .message_id("DELETE-REUSED".into())
                     .from_me(false)
-                    .timestamp(ts(1_700_000_002))
+                    .timestamp(sdk_timestamp(ts(1_700_000_002)))
                     .action(Box::new(
                         wa::sync_action_value::DeleteMessageForMeAction::default(),
                     ))

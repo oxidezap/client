@@ -32,7 +32,7 @@ async fn send_ack_timestamp_and_delivery_only_invalidate_the_affected_chat() {
     let Event::ServerAck(mut sent) = ack("SCOPED-SEND", jid(PEER)) else {
         unreachable!()
     };
-    sent.timestamp = Some(ts(101));
+    sent.timestamp = Some(sdk_timestamp(ts(101)));
     feed(&store, [Event::ServerAck(sent)]).await;
     drain_scoped(&mut changes);
     assert_eq!(

@@ -39,7 +39,7 @@ impl OutgoingCall {
             recipient_jid,
             is_video,
             state: OutgoingCallState::Initiating,
-            initiated_at: wacore::time::now_utc(),
+            initiated_at: crate::time::now_utc(),
         }
     }
 
@@ -99,7 +99,9 @@ impl IncomingCall {
             caller_jid,
             is_video,
             is_offline: offer.offline,
-            received_at: offer.timestamp.unwrap_or_else(wacore::time::now_utc),
+            received_at: crate::time::from_sdk(
+                offer.timestamp.unwrap_or_else(wacore::time::now_utc),
+            ),
         }
     }
 
