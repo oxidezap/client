@@ -229,7 +229,7 @@ fn render_expiry(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let (left, remaining) = life
-        .map(|life| life.left_at(wacore::time::now_utc()))
+        .map(|life| life.left_at(oxidezap_core::time::now_utc()))
         .unwrap_or((0, 0.0));
     let subtle = parts::subtle(cx);
     // Running out is worth noticing before it happens.

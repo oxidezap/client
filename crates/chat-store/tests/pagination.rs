@@ -563,7 +563,7 @@ async fn chat_list_pages_across_the_pinned_boundary() {
         events.push(Event::PinUpdate(
             wacore::types::events::PinUpdate::builder()
                 .jid(jid(peer))
-                .timestamp(ts(1_700_000_500 + i as i64))
+                .timestamp(sdk_timestamp(ts(1_700_000_500 + i as i64)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::PinAction = Default::default();
                     constructed.pinned = Some(true);

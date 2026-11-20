@@ -503,7 +503,7 @@ mod announcement_tests {
                             &chat,
                             format!("FILL-{index}"),
                             &message,
-                            whatsapp_rust::wacore::time::now_utc(),
+                            oxidezap_core::time::now_utc(),
                         )
                         .unwrap();
                 }

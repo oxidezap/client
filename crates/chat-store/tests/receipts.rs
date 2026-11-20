@@ -607,7 +607,7 @@ async fn a_receipt_arriving_after_a_delete_does_not_resurrect_it() {
                 .jid(peer.clone())
                 .delete_starred(true)
                 .delete_media(false)
-                .timestamp(ts(1_700_000_300))
+                .timestamp(sdk_timestamp(ts(1_700_000_300)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::ClearChatAction =
                         Default::default();
@@ -753,7 +753,7 @@ async fn companion_sender_push_name_lands_on_the_bare_contact() {
             ..Default::default()
         },
         id: "IN-AD-2".into(),
-        timestamp: ts(1_700_000_000),
+        timestamp: sdk_timestamp(ts(1_700_000_000)),
         ..Default::default()
     };
     info.push_name = "Alice Example".into();

@@ -170,7 +170,7 @@ async fn clearing_a_chat_discards_unmatched_offline_evidence() {
                 .jid(jid(PEER))
                 .delete_starred(true)
                 .delete_media(false)
-                .timestamp(ts(103))
+                .timestamp(sdk_timestamp(ts(103)))
                 .action(Box::new(wa::sync_action_value::ClearChatAction::default()))
                 .from_full_sync(false)
                 .build(),
@@ -263,7 +263,7 @@ async fn offline_receipts_are_bounded_per_account() {
             )
             .bind::<Text, _>(PEER)
             .bind::<Text, _>(PEER)
-            .bind::<BigInt, _>(wacore::time::now_utc().timestamp_millis() - 1000)
+            .bind::<BigInt, _>(wacore::time::now_millis() - 1000)
             .execute(conn)
             .map_err(db_err)
         })
@@ -363,7 +363,7 @@ fn clear(
             .jid(jid(PEER))
             .delete_starred(delete_starred)
             .delete_media(false)
-            .timestamp(ts(103))
+            .timestamp(sdk_timestamp(ts(103)))
             .action(Box::new(action))
             .from_full_sync(false)
             .build(),
@@ -378,7 +378,7 @@ async fn ranged_clear_and_delete_preserve_receipts_for_surviving_messages_in_the
         wacore::types::events::DeleteChatUpdate::builder()
             .jid(jid(PEER))
             .delete_media(false)
-            .timestamp(ts(103))
+            .timestamp(sdk_timestamp(ts(103)))
             .action(Box::new(delete))
             .from_full_sync(false)
             .build(),
@@ -420,7 +420,7 @@ async fn clear_preserving_starred_messages_keeps_their_pending_receipts() {
             .chat_jid(jid(PEER))
             .message_id("STARRED-SURVIVOR".into())
             .from_me(true)
-            .timestamp(ts(101))
+            .timestamp(sdk_timestamp(ts(101)))
             .action(Box::new(action))
             .from_full_sync(false)
             .build(),

@@ -223,7 +223,12 @@ impl WhatsAppClient {
             let timestamp = wacore::time::from_millis(timestamp_ms)
                 .ok_or_else(|| "edit was sent with an invalid timestamp".to_string())?;
             live.chat_store
-                .record_edit(&chat, &message_id, sent_content, timestamp)
+                .record_edit(
+                    &chat,
+                    &message_id,
+                    sent_content,
+                    oxidezap_core::time::from_sdk(timestamp),
+                )
                 .map_err(|e| format!("edit was sent but could not be saved locally: {e}"))?;
             live.chat_store
                 .flush()
@@ -309,7 +314,7 @@ impl WhatsAppClient {
                     },
                     || {
                         live.chat_store
-                            .record_revoke(&chat, &message_id, wacore::time::now_utc())
+                            .record_revoke(&chat, &message_id, oxidezap_core::time::now_utc())
                     },
                     live.chat_store.flush(),
                 )
@@ -346,7 +351,7 @@ impl WhatsAppClient {
                             from_me,
                             participant.clone(),
                             timestamp,
-                            wacore::time::now_utc(),
+                            oxidezap_core::time::now_utc(),
                         )
                     },
                     live.chat_store.flush(),

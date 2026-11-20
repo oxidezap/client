@@ -79,6 +79,10 @@ pub fn jid(s: &str) -> Jid {
 /// The tests date everything from 1_700_000_000 and step by seconds, so this
 /// is the one spelling of `Utc.timestamp_opt(secs, 0).unwrap()` — which was
 /// written out at every one of a hundred and thirty-seven sites.
+pub fn sdk_timestamp(time: DateTime<Utc>) -> wacore::Timestamp {
+    wacore::Timestamp::from_millis(time.timestamp_millis()).unwrap()
+}
+
 pub fn ts(secs: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, 0).expect("a representable test instant")
 }
@@ -93,7 +97,7 @@ pub fn incoming_info(chat: &str, sender: &str, id: &str, ts_secs: i64) -> Messag
             ..Default::default()
         },
         id: id.to_string().into(),
-        timestamp: ts(ts_secs),
+        timestamp: sdk_timestamp(ts(ts_secs)),
         ..Default::default()
     }
 }
@@ -180,7 +184,7 @@ fn built_receipt(
                 ..Default::default()
             })
             .message_ids(ids.iter().map(|id| (*id).into()).collect())
-            .timestamp(at)
+            .timestamp(sdk_timestamp(at))
             .r#type(ty)
             .offline(offline)
             .build(),
@@ -236,7 +240,7 @@ fn built_ack(id: &str, chat: Option<Jid>, at: Option<DateTime<Utc>>, code: Optio
             .id(id.to_string())
             .class("message".to_string())
             .maybe_from(chat)
-            .maybe_timestamp(at)
+            .maybe_timestamp(at.map(sdk_timestamp))
             .maybe_error(code.map(str::to_string))
             .build(),
     )
@@ -276,7 +280,7 @@ pub fn delete_for_me(chat: Jid, id: &str, from_me: bool, at: DateTime<Utc>) -> E
             .chat_jid(chat)
             .message_id(id.to_string())
             .from_me(from_me)
-            .timestamp(at)
+            .timestamp(sdk_timestamp(at))
             .action(Box::new(
                 wa::sync_action_value::DeleteMessageForMeAction::default(),
             ))
@@ -300,7 +304,7 @@ pub fn mark_read_event(chat: &str, read: bool, ts_secs: i64) -> Event {
     Event::MarkChatAsReadUpdate(
         wacore::types::events::MarkChatAsReadUpdate::builder()
             .jid(jid(chat))
-            .timestamp(ts(ts_secs))
+            .timestamp(sdk_timestamp(ts(ts_secs)))
             .action(Box::new({
                 let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                     Default::default();

@@ -26,7 +26,7 @@ async fn alias_reconcile_keeps_explicit_unmute_and_unarchive_over_history() {
             Event::MuteUpdate(
                 wacore::types::events::MuteUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_001))
+                    .timestamp(sdk_timestamp(ts(1_700_000_001)))
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                         constructed.muted = Some(false);
@@ -38,7 +38,7 @@ async fn alias_reconcile_keeps_explicit_unmute_and_unarchive_over_history() {
             Event::ArchiveUpdate(
                 wacore::types::events::ArchiveUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_001))
+                    .timestamp(sdk_timestamp(ts(1_700_000_001)))
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::ArchiveChatAction =
                             Default::default();
@@ -332,7 +332,7 @@ async fn reconcile_merges_split_pair() {
             Event::PinUpdate(
                 wacore::types::events::PinUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_050))
+                    .timestamp(sdk_timestamp(ts(1_700_000_050)))
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::PinAction = Default::default();
                         constructed.pinned = Some(true);

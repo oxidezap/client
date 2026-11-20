@@ -364,7 +364,7 @@ impl StateStore {
         if only_for.is_some_and(|asked| asked != inner.account_generation) {
             return None;
         }
-        inner.advance_attention(wacore::time::now_utc().timestamp_millis());
+        inner.advance_attention(wacore::time::now_millis());
         inner.version = inner.version.next();
 
         match &event {
@@ -578,7 +578,7 @@ impl Inner {
     }
 
     fn tray_state(&mut self) -> TrayState {
-        self.advance_attention(wacore::time::now_utc().timestamp_millis());
+        self.advance_attention(wacore::time::now_millis());
         TrayState {
             connected: self.connection.is_connected(),
             unread: self.attention.total.min(u128::from(u32::MAX)) as u32,
@@ -601,7 +601,7 @@ mod tests {
             .unwrap_or_else(|_| "0".into())
             .parse()
             .unwrap();
-        let until = wacore::time::now_utc().timestamp_millis() + 3_600_000;
+        let until = wacore::time::now_millis() + 3_600_000;
         let make_chat = |i: usize, unread| {
             let mut change = chat(&format!("synthetic-{i}@s.whatsapp.net"), unread);
             if mute_every > 0
@@ -624,7 +624,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(published.tray.unread, expected);
                 store.refresh_tray(|tray| assert_eq!(tray.unread, expected));
-                let deadline = store.next_mute_expiry(wacore::time::now_utc().timestamp_millis());
+                let deadline = store.next_mute_expiry(wacore::time::now_millis());
                 assert_eq!(deadline, (mute_every > 0).then_some(until));
                 let _ = std::hint::black_box(published);
             }
@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn incremental_attention_matches_scan_through_updates_expiry_and_clock_reversal() {
         let store = store();
-        let now = wacore::time::now_utc().timestamp_millis();
+        let now = wacore::time::now_millis();
         let forever = chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis();
         let mut seed = 17u64;
         for step in 0..2000 {
@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn attention_recovers_after_saturation_and_removes_shared_deadlines() {
         let store = store();
-        let until = wacore::time::now_utc().timestamp_millis() + 60_000;
+        let until = wacore::time::now_millis() + 60_000;
         for jid in ["a", "b", "c"] {
             let mut change = chat(jid, u32::MAX);
             if let DaemonEvent::ChatUpdated(summary) = &mut change.event {

@@ -1188,7 +1188,7 @@ fn the_schedule_plugin_submits_chat_forms_and_cancels_pending_messages() {
 
     std::thread::sleep(Duration::from_millis(1100));
     assert!(plugins.approve("schedule", true));
-    let due = wacore::time::now_utc() + Duration::from_secs(3);
+    let due = oxidezap_core::time::now_utc() + Duration::from_secs(3);
     plugins.act(&PluginAction {
         plugin: "schedule".into(),
         action: "schedule".into(),

@@ -74,7 +74,7 @@ async fn history_prefills_live_row_without_overwriting_appstate() {
             Event::MuteUpdate(
                 wacore::types::events::MuteUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_100))
+                    .timestamp(sdk_timestamp(ts(1_700_000_100)))
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                         constructed.muted = Some(false);
@@ -86,7 +86,7 @@ async fn history_prefills_live_row_without_overwriting_appstate() {
             Event::ArchiveUpdate(
                 wacore::types::events::ArchiveUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_100))
+                    .timestamp(sdk_timestamp(ts(1_700_000_100)))
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::ArchiveChatAction =
                             Default::default();
@@ -137,7 +137,7 @@ async fn missing_preference_options_do_not_unmute_or_unarchive() {
             Event::MuteUpdate(
                 wacore::types::events::MuteUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_100))
+                    .timestamp(sdk_timestamp(ts(1_700_000_100)))
                     .action(Box::new(wa::sync_action_value::MuteAction::default()))
                     .from_full_sync(false)
                     .build(),
@@ -145,7 +145,7 @@ async fn missing_preference_options_do_not_unmute_or_unarchive() {
             Event::ArchiveUpdate(
                 wacore::types::events::ArchiveUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_100))
+                    .timestamp(sdk_timestamp(ts(1_700_000_100)))
                     .action(Box::new(wa::sync_action_value::ArchiveChatAction::default()))
                     .from_full_sync(false)
                     .build(),

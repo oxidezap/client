@@ -40,7 +40,7 @@ async fn mark_chat_as_read_resets_unread_count() {
         [Event::MarkChatAsReadUpdate(
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_100))
+                .timestamp(sdk_timestamp(ts(1_700_000_100)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                         Default::default();
@@ -119,7 +119,7 @@ async fn delete_for_me_cleans_satellites_and_recomputes_preview() {
                     ..Default::default()
                 })
                 .message_ids(vec!["MSG-D".into()])
-                .timestamp(ts(1_700_000_110))
+                .timestamp(sdk_timestamp(ts(1_700_000_110)))
                 .r#type(ReceiptType::Read)
                 .offline(false)
                 .build(),
@@ -166,7 +166,7 @@ async fn forever_mute_is_not_reported_as_unmuted() {
             Event::MuteUpdate(
                 wacore::types::events::MuteUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_100))
+                    .timestamp(sdk_timestamp(ts(1_700_000_100)))
                     // muted with no end timestamp = muted forever
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::MuteAction = Default::default();
@@ -183,7 +183,7 @@ async fn forever_mute_is_not_reported_as_unmuted() {
 
     let chats = chat_store.chats(false, 10).await.unwrap();
     let muted_until = chats[0].muted_until.expect("forever mute must be Some");
-    assert!(muted_until > wacore::time::now_utc());
+    assert!(muted_until > oxidezap_core::time::now_utc());
     assert_eq!(muted_until, chrono::DateTime::<Utc>::MAX_UTC);
 }
 
@@ -208,7 +208,7 @@ async fn clear_chat_reflects_surviving_starred_messages() {
                     .chat_jid(chat.clone())
                     .message_id("MSG-S1".to_string())
                     .from_me(false)
-                    .timestamp(ts(1_700_000_200))
+                    .timestamp(sdk_timestamp(ts(1_700_000_200)))
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::StarAction = Default::default();
                         constructed.starred = Some(true);
@@ -222,7 +222,7 @@ async fn clear_chat_reflects_surviving_starred_messages() {
                     .jid(chat.clone())
                     .delete_starred(false)
                     .delete_media(false)
-                    .timestamp(ts(1_700_000_300))
+                    .timestamp(sdk_timestamp(ts(1_700_000_300)))
                     .action(Box::new(wa::sync_action_value::ClearChatAction::default()))
                     .from_full_sync(false)
                     .build(),
@@ -271,7 +271,7 @@ async fn mark_read_range_preserves_newer_unread() {
         [Event::MarkChatAsReadUpdate(
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_050))
+                .timestamp(sdk_timestamp(ts(1_700_000_050)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                         Default::default();
@@ -310,7 +310,7 @@ async fn the_unread_tail_does_not_repeat_on_an_older_page() {
         [Event::MarkChatAsReadUpdate(
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_050))
+                .timestamp(sdk_timestamp(ts(1_700_000_050)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                         Default::default();
@@ -367,7 +367,7 @@ async fn ranged_clear_and_delete_keep_newer_messages() {
                 .jid(chat.clone())
                 .delete_starred(true)
                 .delete_media(false)
-                .timestamp(ts(1_700_000_050))
+                .timestamp(sdk_timestamp(ts(1_700_000_050)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::ClearChatAction =
                         Default::default();
@@ -394,7 +394,7 @@ async fn ranged_clear_and_delete_keep_newer_messages() {
             wacore::types::events::DeleteChatUpdate::builder()
                 .jid(chat.clone())
                 .delete_media(false)
-                .timestamp(ts(1_700_000_060))
+                .timestamp(sdk_timestamp(ts(1_700_000_060)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::DeleteChatAction =
                         Default::default();
@@ -416,7 +416,7 @@ async fn ranged_clear_and_delete_keep_newer_messages() {
             wacore::types::events::DeleteChatUpdate::builder()
                 .jid(chat.clone())
                 .delete_media(false)
-                .timestamp(ts(1_700_000_070))
+                .timestamp(sdk_timestamp(ts(1_700_000_070)))
                 .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
                 .from_full_sync(false)
                 .build(),
@@ -433,7 +433,7 @@ async fn range_boundary_covers_the_whole_wire_second() {
     // 500 ms into the boundary second: the wire range (whole seconds) covers
     // it, so a mark-read up to that second must clear it.
     let mut info = incoming_info(PEER, PEER, "MSG-SUB", 1_700_000_000);
-    info.timestamp = Utc.timestamp_opt(1_700_000_000, 500_000_000).unwrap();
+    info.timestamp = wacore::Timestamp::from_millis(1_700_000_000_500).unwrap();
     feed(
         &chat_store,
         [message_event(wa::Message::text("sub-second"), info)],
@@ -446,7 +446,7 @@ async fn range_boundary_covers_the_whole_wire_second() {
         [Event::MarkChatAsReadUpdate(
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_001))
+                .timestamp(sdk_timestamp(ts(1_700_000_001)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                         Default::default();
@@ -503,7 +503,7 @@ async fn keyed_range_spares_unlisted_same_second_siblings() {
                 .jid(chat.clone())
                 .delete_starred(true)
                 .delete_media(false)
-                .timestamp(ts(1_700_000_001))
+                .timestamp(sdk_timestamp(ts(1_700_000_001)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::ClearChatAction =
                         Default::default();
@@ -561,7 +561,7 @@ async fn ranged_clear_keeps_unread_survivors_counted() {
                 .jid(chat.clone())
                 .delete_starred(true)
                 .delete_media(false)
-                .timestamp(ts(1_700_000_050))
+                .timestamp(sdk_timestamp(ts(1_700_000_050)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::ClearChatAction =
                         Default::default();
@@ -731,7 +731,7 @@ async fn stale_ranged_mark_read_respects_the_read_cursor() {
         [Event::MarkChatAsReadUpdate(
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_050))
+                .timestamp(sdk_timestamp(ts(1_700_000_050)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                         Default::default();
@@ -788,7 +788,7 @@ async fn keyed_mark_read_spares_unlisted_same_second_sibling() {
         [Event::MarkChatAsReadUpdate(
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_001))
+                .timestamp(sdk_timestamp(ts(1_700_000_001)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                         Default::default();
@@ -815,7 +815,7 @@ async fn late_materialized_old_message_does_not_badge_after_read() {
         [Event::MarkChatAsReadUpdate(
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_100))
+                .timestamp(sdk_timestamp(ts(1_700_000_100)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                         Default::default();
@@ -951,7 +951,7 @@ async fn keyed_read_covers_a_message_that_materializes_later() {
         [Event::MarkChatAsReadUpdate(
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_001))
+                .timestamp(sdk_timestamp(ts(1_700_000_001)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                         Default::default();
@@ -1002,7 +1002,7 @@ async fn wire_indefinite_mute_value_reads_as_forever() {
             Event::MuteUpdate(
                 wacore::types::events::MuteUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_100))
+                    .timestamp(sdk_timestamp(ts(1_700_000_100)))
                     // The wire's indefinite-mute sentinel (what the library's
                     // own mute_chat() sends).
                     .action(Box::new({
@@ -1060,7 +1060,7 @@ async fn notification_policy_is_fail_closed_and_follows_mute_and_archive() {
         [Event::MuteUpdate(
             wacore::types::events::MuteUpdate::builder()
                 .jid(jid(GROUP))
-                .timestamp(ts(1_700_000_100))
+                .timestamp(sdk_timestamp(ts(1_700_000_100)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                     constructed.muted = Some(true);
@@ -1086,7 +1086,7 @@ async fn notification_policy_is_fail_closed_and_follows_mute_and_archive() {
         [Event::MuteUpdate(
             wacore::types::events::MuteUpdate::builder()
                 .jid(jid(GROUP))
-                .timestamp(ts(1_700_000_200))
+                .timestamp(sdk_timestamp(ts(1_700_000_200)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                     constructed.muted = Some(false);
@@ -1112,7 +1112,7 @@ async fn notification_policy_is_fail_closed_and_follows_mute_and_archive() {
         [Event::MuteUpdate(
             wacore::types::events::MuteUpdate::builder()
                 .jid(jid(GROUP))
-                .timestamp(ts(1_700_000_250))
+                .timestamp(sdk_timestamp(ts(1_700_000_250)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                     constructed.muted = Some(true);
@@ -1137,7 +1137,7 @@ async fn notification_policy_is_fail_closed_and_follows_mute_and_archive() {
         [Event::ArchiveUpdate(
             wacore::types::events::ArchiveUpdate::builder()
                 .jid(jid(GROUP))
-                .timestamp(ts(1_700_000_300))
+                .timestamp(sdk_timestamp(ts(1_700_000_300)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::ArchiveChatAction =
                         Default::default();
@@ -1172,7 +1172,7 @@ async fn notification_policy_checks_both_unmerged_peer_aliases() {
             Event::MuteUpdate(
                 wacore::types::events::MuteUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_050))
+                    .timestamp(sdk_timestamp(ts(1_700_000_050)))
                     .action(Box::new({
                         let mut constructed: wa::sync_action_value::MuteAction = Default::default();
                         constructed.muted = Some(true);
@@ -1289,7 +1289,7 @@ async fn notification_read_query_respects_aliases_and_keyed_boundary_seconds() {
         [Event::MarkChatAsReadUpdate(
             wacore::types::events::MarkChatAsReadUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_100))
+                .timestamp(sdk_timestamp(ts(1_700_000_100)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::MarkChatAsReadAction =
                         Default::default();

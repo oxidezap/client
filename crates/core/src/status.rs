@@ -68,7 +68,7 @@ impl StatusFeed {
     /// rebuild: one pass, one small vector per author, and no message is
     /// copied.
     pub fn from_chat(chat: &Chat) -> Self {
-        Self::from_chat_at(chat, wacore::time::now_utc())
+        Self::from_chat_at(chat, crate::time::now_utc())
     }
 
     /// The feed as it stood at `now`.

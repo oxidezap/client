@@ -228,7 +228,7 @@ fn apply_history_conversation(
         // cover is durable for every row, so an oversized snapshot seeds
         // nothing at all and leaves the stored count (and later merges,
         // which keep a stored zero over an unset marker) alone.
-        let now_ms = wacore::time::now_utc().timestamp_millis();
+        let now_ms = wacore::time::now_millis();
         let frontier_ms = last_ts_ms.max(synced_max_ms).min(now_ms);
         // Appending past the retained-id cap would evict older explicitly
         // covered ids — possibly for rows not yet materialized — so only

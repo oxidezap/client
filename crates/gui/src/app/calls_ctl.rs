@@ -1676,7 +1676,7 @@ mod call_alert_review_regressions {
                 caller_jid: "999000@s.whatsapp.net".into(),
                 is_video: false,
                 is_offline: false,
-                received_at: wacore::time::now_utc(),
+                received_at: oxidezap_core::time::now_utc(),
             };
             assert!(calls.post_alert_notification(&key, &offer, cx));
             calls.stop_alert(false, cx);
@@ -1699,7 +1699,7 @@ mod call_alert_review_regressions {
                 caller_jid: "999000@s.whatsapp.net".into(),
                 is_video: false,
                 is_offline: false,
-                received_at: wacore::time::now_utc(),
+                received_at: oxidezap_core::time::now_utc(),
             });
             assert!(calls.alerts.follow(Some(account), &calls.state));
             calls.silence_alerts(cx);
@@ -1854,7 +1854,7 @@ mod call_control_tests {
                 caller_jid: "999001@s.whatsapp.net".into(),
                 is_video: true,
                 is_offline: false,
-                received_at: wacore::time::now_utc(),
+                received_at: oxidezap_core::time::now_utc(),
             });
             let image = Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(
                 image::Frame::new(image::RgbaImage::new(1, 1)),
@@ -1895,7 +1895,7 @@ mod call_control_tests {
                     caller_jid: "999000@s.whatsapp.net".into(),
                     is_video: false,
                     is_offline: false,
-                    received_at: wacore::time::now_utc(),
+                    received_at: oxidezap_core::time::now_utc(),
                 });
             });
             app.hang_up(cx);

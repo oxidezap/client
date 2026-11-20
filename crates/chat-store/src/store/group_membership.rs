@@ -36,7 +36,7 @@ pub(super) fn apply(
             msg_id: &id,
             sender_jid: &chat,
             from_me: false,
-            timestamp_ms: update.timestamp.timestamp_millis(),
+            timestamp_ms: update.timestamp.as_millis(),
             kind: "group_membership",
             text: None,
             proto: None,
@@ -68,7 +68,7 @@ pub(super) fn apply(
             &chat,
             ChatBump {
                 msg_id: &id,
-                ts_ms: update.timestamp.timestamp_millis(),
+                ts_ms: update.timestamp.as_millis(),
                 preview: Some(&preview),
                 kind: Some("group_membership"),
                 unread_delta: 0,

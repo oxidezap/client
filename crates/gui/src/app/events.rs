@@ -207,7 +207,7 @@ impl WhatsAppApp {
                         data: code,
                         png_bytes: Arc::new(png_bytes),
                     })
-                    .map(|qr| Issued::new(qr, timeout_secs, wacore::time::now_utc()))
+                    .map(|qr| Issued::new(qr, timeout_secs, oxidezap_core::time::now_utc()))
                     .or(previous);
                 self.app_state = AppState::WaitingForPairing {
                     qr_code: cached_qr,
@@ -225,7 +225,11 @@ impl WhatsAppApp {
                 };
                 self.app_state = AppState::WaitingForPairing {
                     qr_code,
-                    pair_code: Some(Issued::new(code, timeout_secs, wacore::time::now_utc())),
+                    pair_code: Some(Issued::new(
+                        code,
+                        timeout_secs,
+                        oxidezap_core::time::now_utc(),
+                    )),
                 };
                 self.ensure_heartbeat(cx);
                 cx.notify();

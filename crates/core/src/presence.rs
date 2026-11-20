@@ -237,7 +237,7 @@ impl PresenceRegistry {
         self.typing
             .entry(chat)
             .or_default()
-            .set(sender, name, kind, wacore::time::now_utc());
+            .set(sender, name, kind, crate::time::now_utc());
     }
 
     /// Record that `sender` stopped.
@@ -268,7 +268,7 @@ impl PresenceRegistry {
     pub fn typing(&self, chat: &str) -> Option<TypingSummary> {
         self.typing
             .get(chat)
-            .and_then(|entry| entry.summary(wacore::time::now_utc()))
+            .and_then(|entry| entry.summary(crate::time::now_utc()))
     }
 
     /// Whether anyone at all is typing, so a render pass can skip the work.
@@ -277,7 +277,7 @@ impl PresenceRegistry {
     /// throwing them away: this exists to *avoid* work, and `summary` allocates
     /// a vector and clones a JID and a name for every chat it is asked about.
     pub fn has_typing(&self) -> bool {
-        let now = wacore::time::now_utc();
+        let now = crate::time::now_utc();
         self.typing.values().any(|entry| entry.has_live(now))
     }
 
@@ -287,7 +287,7 @@ impl PresenceRegistry {
     /// it keeps the map from growing with people who typed once and left.
     /// Returns whether anything was removed, so the caller can skip a redraw.
     pub fn prune(&mut self) -> bool {
-        let now = wacore::time::now_utc();
+        let now = crate::time::now_utc();
         // Typists, not chats. Counting chats missed the case that matters in
         // a group: one of two typists stops, the chat is still typing, and the
         // caller skipped the redraw that would have dropped their name.

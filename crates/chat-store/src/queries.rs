@@ -820,7 +820,7 @@ impl ChatStore {
         let device_id = self.device_id();
         let is_group = jid.is_group();
         let jid = jid.to_string();
-        let now_ms = wacore::time::now_utc().timestamp_millis();
+        let now_ms = wacore::time::now_millis();
         let rows: Vec<(Option<i64>, bool, Option<String>)> = self
             .db()
             .read(move |conn| {
@@ -2366,7 +2366,7 @@ impl ChatStore {
     ) -> Result<()> {
         use schema::media_refs::dsl;
         let device_id = self.device_id();
-        let now_ms = wacore::time::now_utc().timestamp_millis();
+        let now_ms = wacore::time::now_millis();
         self.db()
             .run(move |conn| {
                 diesel::insert_into(dsl::media_refs)

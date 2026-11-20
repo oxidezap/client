@@ -85,7 +85,7 @@ async fn a_pin_names_its_chat_instead_of_the_whole_list() {
         [Event::PinUpdate(
             wacore::types::events::PinUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(1_700_000_050))
+                .timestamp(sdk_timestamp(ts(1_700_000_050)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::PinAction = Default::default();
                     constructed.pinned = Some(true);
@@ -902,7 +902,7 @@ async fn a_metadata_answer_for_a_deleted_chat_writes_nothing() {
             DeleteChatUpdate::builder()
                 .jid(group.clone())
                 .delete_media(false)
-                .timestamp(ts(1_700_000_100))
+                .timestamp(sdk_timestamp(ts(1_700_000_100)))
                 .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
                 .from_full_sync(false)
                 .build(),
