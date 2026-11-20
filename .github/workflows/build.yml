@@ -129,6 +129,9 @@ jobs:
           # than compiled ones. A profile cannot make a `.crate` file stale.
           key: ${{ matrix.target }}
           cache-targets: "false"
+          # Pull requests and tags can restore main's cache without creating
+          # duplicate registry and git caches in their own ref scopes.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Three binaries, because they are one product now: the front end owns
       # no WhatsApp session and starts `oxidezapd` beside itself when none is
