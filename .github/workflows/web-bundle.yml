@@ -66,19 +66,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
-          # Its own, and not shareable with the Pages build however alike the
-          # two are: `key` is *added to* rust-cache's automatic job-based key
-          # rather than replacing it, so a cache written by one job is never
-          # read by another. Only `shared-key` does that, and taking it would
-          # mean both jobs writing one entry — a release build and a preview
-          # build racing to save the same key, for a compilation neither of
-          # them shortens for the other.
-          # The root manifest's hash, for the reason spelled out over the
-          # `Check` job: the profiles live there, a profile decides every
-          # dependency's fingerprint, and rust-cache's automatic key does not
-          # hash that file.
-          key: web-bundle-${{ hashFiles('Cargo.toml') }}
-          cache-on-failure: "true"
+          # Pages on main is the only writer. Releases restore its dependency
+          # cache without competing for space or racing to save the same key.
+          shared-key: web-wasm-${{ hashFiles('Cargo.toml') }}
+          save-if: "false"
 
       # `./`, which is the whole point of this archive. Trunk rewrites
       # `index.html` to name the hashed files under the public URL, and a
