@@ -73,7 +73,7 @@ impl StatusFeed {
     /// The clock is a parameter so expiry is something a test can state rather
     /// than something it has to wait for.
     pub fn from_chat_at(chat: &Chat, now: DateTime<Utc>) -> Self {
-        Self::from_messages(&chat.messages, chat, now)
+        Self::from_chat_with_names(chat, now, |_| None)
     }
 
     /// When the next update on screen lapses, so a caller can arrange to
@@ -90,7 +90,13 @@ impl StatusFeed {
             .min()
     }
 
-    fn from_messages(messages: &[ChatMessage], chat: &Chat, now: DateTime<Utc>) -> Self {
+    /// Resolve an origin's label from the caller's chat list when available.
+    pub fn from_chat_with_names(
+        chat: &Chat,
+        now: DateTime<Utc>,
+        origin_name: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        let messages = &chat.messages;
         let mut mine: Option<StatusAuthor> = None;
         // A handful of contacts post on a given day, so a linear scan over the
         // authors found so far beats a map: no hashing, no allocation per
@@ -128,8 +134,11 @@ impl StatusFeed {
                 })
             } else {
                 let key = crate::StatusPostKey::from_feed_id(&message.id);
+                // Hydration resolves a contact's PN/LID aliases. A group
+                // remains its own source even when the same contact posted.
                 let jid = key
                     .as_ref()
+                    .filter(|key| key.origin != key.sender)
                     .map_or(message.sender.as_str(), |key| key.origin.as_str());
                 match authors.iter().position(|author| author.jid == jid) {
                     Some(at) => &mut authors[at],
@@ -139,7 +148,7 @@ impl StatusFeed {
                             name: if jid == message.sender {
                                 author_name(message, chat)
                             } else {
-                                crate::chat::fallback_sender_name(jid).into_owned()
+                                origin_name(jid).unwrap_or_else(|| jid.to_owned())
                             },
                             updates: Vec::new(),
                             latest: message.timestamp,

@@ -382,3 +382,57 @@ async fn tagged_statuses_keep_their_origin_and_watched_row() {
         2
     );
 }
+
+#[tokio::test]
+async fn status_post_does_not_become_a_group_message() {
+    let (_db, store) = test_store().await;
+    let mut info = incoming_info(GROUP, PEER, "same-id", 1_700_000_000);
+    info.is_status_stanza = true;
+    feed(
+        &store,
+        [message_event(wa::Message::text("group post"), info)],
+    )
+    .await;
+    assert!(
+        store
+            .messages(&jid(GROUP), None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn group_participants_sharing_a_status_id_have_independent_watched_marks() {
+    const OTHER: &str = "10000000002@s.whatsapp.net";
+    let (_db, store) = test_store().await;
+    for (author, own) in [(PEER, false), (OTHER, false), (PEER, true)] {
+        let mut info = incoming_info(GROUP, author, "same", 1_700_000_000);
+        info.source.is_from_me = own;
+        info.is_status_stanza = true;
+        feed(&store, [message_event(wa::Message::text("post"), info)]).await;
+    }
+    let broadcast = jid(STATUS_BROADCAST);
+    let mut before = None;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(row) = store.messages(&broadcast, before, 1).await.unwrap().pop() {
+        before = Some((&row).into());
+        let key = oxidezap_core::StatusPostKey::from_feed_id(&row.id).unwrap();
+        assert!(seen.insert((key.sender.clone(), key.from_me)));
+        if key.sender == PEER {
+            store.mark_status_watched(&broadcast, vec![row.id]).unwrap();
+        }
+    }
+    assert_eq!(seen.len(), 3);
+    store.flush().await.unwrap();
+    let rows = store.messages(&broadcast, None, 10).await.unwrap();
+    for row in rows {
+        let key = oxidezap_core::StatusPostKey::from_feed_id(&row.id).unwrap();
+        assert_eq!(
+            row.status == MessageStatus::Read,
+            key.sender == PEER && !key.from_me
+        );
+    }
+    assert_eq!(store.unread_total().await.unwrap(), 0);
+    assert!(store.chat(&jid(GROUP)).await.unwrap().is_none());
+}

@@ -293,7 +293,11 @@ impl WhatsAppApp {
         }
 
         let feed = chat
-            .map(|chat| StatusFeed::from_chat_at(chat, now))
+            .map(|chat| {
+                StatusFeed::from_chat_with_names(chat, now, |jid| {
+                    self.chat_named(jid).map(|chat| chat.name.clone())
+                })
+            })
             .unwrap_or_default();
         *cache = Some((count, feed.clone()));
         feed
@@ -416,23 +420,14 @@ impl WhatsAppApp {
         )
         .detach();
 
-        let key = oxidezap_core::StatusPostKey::from_feed_id(&message.id);
+        let key = oxidezap_core::StatusPostKey::wire_key(&message.id, author, message.is_from_me);
         self.status_reply = Some(StatusReply {
             feed_id: message.id.clone(),
             feed_author: author.to_owned(),
             quote: QuotedMessage {
-                remote_jid: Some(
-                    key.as_ref()
-                        .map_or(STATUS_BROADCAST_JID, |k| &k.origin)
-                        .to_owned(),
-                ),
-                message_id: key.as_ref().map_or_else(
-                    || oxidezap_core::StatusPostKey::broadcast_wire_id(&message.id).to_owned(),
-                    |k| k.id.clone(),
-                ),
-                sender: key
-                    .as_ref()
-                    .map_or_else(|| author.to_owned(), |k| k.sender.clone()),
+                remote_jid: Some(key.origin),
+                message_id: key.id,
+                sender: key.sender,
                 sender_name: message.sender_name.clone().unwrap_or_else(|| {
                     if message.sender == author {
                         author_name.to_owned()

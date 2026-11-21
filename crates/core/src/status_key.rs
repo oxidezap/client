@@ -27,6 +27,16 @@ impl StatusPostKey {
         serde_json::from_str(id.strip_prefix(ENVELOPE)?).ok()
     }
 
+    /// Recover the original address before quoting a status or requesting its media.
+    pub fn wire_key(feed_id: &str, sender: &str, from_me: bool) -> Self {
+        Self::from_feed_id(feed_id).unwrap_or_else(|| Self {
+            origin: crate::STATUS_BROADCAST_JID.to_owned(),
+            sender: sender.to_owned(),
+            from_me,
+            id: Self::broadcast_wire_id(feed_id).to_owned(),
+        })
+    }
+
     /// Existing broadcast IDs keep their spelling unless it is reserved for
     /// a feed key. Even an ID containing a complete valid key stays distinct.
     pub fn broadcast_feed_id(id: String) -> String {
@@ -39,5 +49,30 @@ impl StatusPostKey {
 
     pub fn broadcast_wire_id(id: &str) -> &str {
         id.strip_prefix(BROADCAST).unwrap_or(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_keys_round_trip_for_group_and_broadcast_even_if_ids_collide() {
+        let key = StatusPostKey {
+            origin: "120363000000000001@g.us".into(),
+            sender: "10000000001@s.whatsapp.net".into(),
+            from_me: false,
+            id: "opaque/quoted-\"id\"".into(),
+        };
+        let feed_id = key.feed_id();
+        assert_eq!(StatusPostKey::wire_key(&feed_id, "", false), key);
+        let broadcast = StatusPostKey::wire_key(
+            &StatusPostKey::broadcast_feed_id(feed_id.clone()),
+            &key.sender,
+            false,
+        );
+        assert_eq!(broadcast.id, feed_id);
+        assert_eq!(broadcast.origin, crate::STATUS_BROADCAST_JID);
+        assert_eq!(broadcast.sender, key.sender);
     }
 }

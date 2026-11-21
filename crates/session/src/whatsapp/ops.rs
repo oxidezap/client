@@ -1141,6 +1141,21 @@ impl WhatsAppClient {
                 .media
                 .and_then(|media| media.downloadable)
                 .ok_or_else(|| "that message carries no downloadable media".to_string())?;
+            let (chat, message_id) = if chat.is_status_broadcast() {
+                let key = oxidezap_core::StatusPostKey::wire_key(
+                    &message_id,
+                    &sender.to_string(),
+                    from_me,
+                );
+                (
+                    key.origin
+                        .parse()
+                        .map_err(|_| "invalid status origin".to_owned())?,
+                    key.id,
+                )
+            } else {
+                (chat, message_id)
+            };
             let participant = (!from_me && super::participant_keyed_chat(&chat)).then_some(sender);
             let request = whatsapp_rust::features::MediaReuploadRequest {
                 target: whatsapp_rust::MessageRef::new(
