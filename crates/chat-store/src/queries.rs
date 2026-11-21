@@ -2721,6 +2721,8 @@ impl ChatStore {
 mod tests {
     use super::{ArrivalCursor, arrival_page_query};
     use diesel::prelude::*;
+    use diesel::query_builder::{AstPass, Query, QueryFragment, QueryId};
+    use diesel::sqlite::Sqlite;
     use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
     const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
@@ -2917,10 +2919,24 @@ mod tests {
         println!("sqlite_version={}", version.version);
     }
 
-    /// `EXPLAIN QUERY PLAN` for the query as diesel actually renders it. Binds
-    /// stay unbound: the planner does not need their values, and asking it
-    /// about hand-written SQL would pin a string this crate never runs.
-    fn plan(sql: &str) -> String {
+    #[derive(QueryId)]
+    struct Explain<Q>(Q);
+
+    impl<Q> Query for Explain<Q> {
+        type SqlType = diesel::sql_types::Untyped;
+    }
+
+    impl<Q: QueryFragment<Sqlite>> QueryFragment<Sqlite> for Explain<Q> {
+        fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+            out.push_sql("EXPLAIN QUERY PLAN ");
+            self.0.walk_ast(out)
+        }
+    }
+
+    impl<Q> RunQueryDsl<SqliteConnection> for Explain<Q> {}
+
+    /// Explain the Diesel query with the same SQL and bindings it uses at runtime.
+    fn plan(query: impl QueryFragment<Sqlite> + QueryId) -> String {
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
         // Production opens this parent through whatsapp-rust before the chat
         // store runs. This planner test uses Diesel directly, so provide the
@@ -2933,56 +2949,13 @@ mod tests {
             .execute(&mut conn)
             .expect("mapping parent for the repair-generation triggers");
         conn.run_pending_migrations(MIGRATIONS).expect("migrate");
-        let rows: Vec<PlanRow> = diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
-            .load(&mut conn)
-            .expect("explain");
+        let rows: Vec<PlanRow> = Explain(query).load(&mut conn).expect("explain");
         rows.into_iter()
             .map(|row| row.detail)
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    /// [`plan`] with the binds the writer actually sends. Explaining bare
-    /// `?` placeholders plans `idx_messages_chat_time` for everything — with
-    /// nothing bound the planner has no values to weigh — which is not the
-    /// runtime plan: bound, it enters the partial index (verified against
-    /// `sqlite3` with and without `ANALYZE`, empty and seeded).
-    fn plan_bound(sql: &str) -> String {
-        use diesel::sql_types::{BigInt, Bool, Integer, Text};
-        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
-        // See `plan`'s comment: the cascade migration's FK needs this parent
-        // to exist before it runs. The repair triggers also need its mapping
-        // table.
-        diesel::sql_query("CREATE TABLE device (id INTEGER PRIMARY KEY)")
-            .execute(&mut conn)
-            .expect("device parent");
-        diesel::sql_query("CREATE TABLE lid_pn_mapping (device_id INTEGER NOT NULL)")
-            .execute(&mut conn)
-            .expect("mapping parent for the repair-generation triggers");
-        conn.run_pending_migrations(MIGRATIONS).expect("migrate");
-        // Placeholder order is the filter order diesel renders:
-        // `device_id = ? AND msg_id = ? AND from_me = ? ... LIMIT ?`.
-        let rows: Vec<PlanRow> = diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
-            .bind::<Integer, _>(1)
-            .bind::<Text, _>("m")
-            .bind::<Bool, _>(true)
-            .bind::<BigInt, _>(2)
-            .load(&mut conn)
-            .expect("explain");
-        rows.into_iter()
-            .map(|row| row.detail)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn rendered_sql(after: Option<ArrivalCursor>, since_ms: Option<i64>) -> String {
-        let query = arrival_page_query(1, after, since_ms, None, 50);
-        rendered(&query)
-    }
-
-    /// The SQL diesel actually renders for `query`. Binds stay unbound: the
-    /// planner does not need their values, and asking it about hand-written
-    /// SQL would pin a string this crate never runs.
     fn rendered(
         query: &impl diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite>,
     ) -> String {
@@ -3002,20 +2975,18 @@ mod tests {
             seq: 17,
         };
         let keys = vec!["synthetic".to_string()];
-        let queries = [
-            rendered(
-                &super::page_query(1, &keys, Some(&cursor))
+        for details in [
+            plan(
+                super::page_query(1, &keys, Some(&cursor))
                     .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
                     .limit(50),
             ),
-            rendered(
-                &super::page_query_after(1, &keys, &cursor)
+            plan(
+                super::page_query_after(1, &keys, &cursor)
                     .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
                     .limit(50),
             ),
-        ];
-        for sql in queries {
-            let details = plan(&sql);
+        ] {
             assert!(details.contains("idx_messages_chat_time"), "{details}");
             assert!(
                 details.contains("timestamp_ms"),
@@ -3146,9 +3117,7 @@ mod tests {
             )
             .select((dsl::chat_jid, dsl::timestamp_ms))
             .limit(2);
-        // Bound: explaining bare `?` plans `idx_messages_chat_time`, which
-        // is not the runtime plan.
-        let plan = plan_bound(&rendered(&query));
+        let plan = plan(query);
         assert!(
             plan.contains("USING INDEX idx_messages_by_id")
                 || plan.contains("USING COVERING INDEX idx_messages_by_id"),
@@ -3174,15 +3143,12 @@ mod tests {
     /// a `from_me` predicate — but the autoindex is, so the guard stays.)
     #[test]
     fn arrival_page_reads_the_table_in_arrival_order_without_sorting() {
-        for (label, sql) in [
-            ("first page", rendered_sql(None, None)),
-            (
-                "resumed page",
-                rendered_sql(Some(ArrivalCursor { seq: 4_096 }), None),
-            ),
-            ("windowed page", rendered_sql(None, Some(1_700_000_000_000))),
+        for (label, cursor, since_ms) in [
+            ("first page", None, None),
+            ("resumed page", Some(ArrivalCursor { seq: 4_096 }), None),
+            ("windowed page", None, Some(1_700_000_000_000)),
         ] {
-            let plan = plan(&sql);
+            let plan = plan(arrival_page_query(1, cursor, since_ms, None, 50));
             assert!(
                 // Any `INDEX`, not just `USING INDEX`: SQLite also spells the
                 // regressed plans `USING COVERING INDEX` and `USING AUTOMATIC
