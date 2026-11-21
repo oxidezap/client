@@ -132,12 +132,12 @@ pub(crate) fn unavailable_kind(unavailable_type: UnavailableType) -> Option<&'st
 /// Repeating the pass handles valid nested combinations (for example a group
 /// mention around an associated child around a future-proof poll).
 pub fn normalized_message(message: &wa::Message) -> &wa::Message {
-    let mut base = message;
-    // A finite budget also handles malformed, deeply nested carriers without
-    // unbounded projection work. Each pass borrows the next message.
-    for _ in 0..32 {
-        let inner = base
-            .device_sent_message
+    message_layers(message).last().unwrap_or(message)
+}
+
+fn message_layers(msg: &wa::Message) -> impl Iterator<Item = &wa::Message> {
+    std::iter::successors(Some(msg), |&base| {
+        base.device_sent_message
             .as_option()
             .and_then(|w| w.message.as_option())
             .or_else(|| {
@@ -154,13 +154,35 @@ pub fn normalized_message(message: &wa::Message) -> &wa::Message {
                 ]
                 .into_iter()
                 .find_map(|w| w.as_option().and_then(|w| w.message.as_option()))
-            });
-        match inner {
-            Some(inner) => base = inner,
-            None => return base,
-        }
-    }
-    base
+            })
+    })
+    .take(33)
+}
+
+/// Parent key carried by a dual-upload image or video. The engine can deliver
+/// the media unwrapped with its context, or retain context on a carrier.
+pub fn rendition_parent_key(msg: &wa::Message) -> Option<&wa::MessageKey> {
+    use wa::message_association::AssociationType as Type;
+    let association = message_layers(msg)
+        .filter_map(|layer| {
+            layer
+                .message_context_info
+                .as_option()?
+                .message_association
+                .as_option()
+        })
+        .last()?;
+    let base = normalized_message(msg);
+    let media_matches = match association.association_type? {
+        Type::HD_IMAGE_DUAL_UPLOAD => base.image_message.is_set(),
+        Type::HD_VIDEO_DUAL_UPLOAD
+        | Type::HEVC_VIDEO_DUAL_UPLOAD
+        | Type::AV1_VIDEO_DUAL_UPLOAD
+        | Type::STREAMED_HD_VIDEO_DUAL_UPLOAD => base.video_message.is_set(),
+        _ => false,
+    };
+    let key = association.parent_message_key.as_option()?;
+    (media_matches && key.id.as_deref().is_some_and(|id| !id.is_empty())).then_some(key)
 }
 
 /// Shared poll-creation detector for classification and storage compaction.
@@ -331,19 +353,15 @@ fn has_any_content(base: &wa::Message) -> bool {
     waproto::codec::message_encoded_len(&probe) > 0
 }
 
-/// Whether a message is bookkeeping rather than something to draw.
-///
-/// The classifier's question, asked from outside the store. A live handler
-/// that skips only reactions and protocol stubs publishes a poll update, an
-/// encrypted reaction, a pin or a keep-in-chat as a `[Media]` bubble with an
-/// unread badge on it -- one that disappears on the next hydration, because
-/// the store never wrote a row for it. Peels first, for the reason `classify`
-/// does: a carrier inside a wrapper `get_base_message` does not open is still
-/// a carrier.
+/// Whether the live session should suppress a standalone bubble. Control
+/// messages amend other rows. Media renditions keep a retrievable payload
+/// but belong to the timeline entry identified by their parent key.
 #[must_use]
 pub fn is_control_only(msg: &wa::Message) -> bool {
     let base = normalized_message(msg);
-    is_control_carrier(base) || base.message_history_bundle.is_set()
+    is_control_carrier(base)
+        || base.message_history_bundle.is_set()
+        || rendition_parent_key(msg).is_some()
 }
 
 #[cfg(test)]

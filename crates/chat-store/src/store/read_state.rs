@@ -69,6 +69,7 @@ pub(super) fn coverable_future_ids(
                 .eq(device_id)
                 .and(msgs::chat_jid.eq(chat))
                 .and(msgs::from_me.eq(false))
+                .and(msgs::rendition_parent_id.is_null())
                 .and(msgs::local_revoke_placeholder.eq(false))
                 .and(msgs::timestamp_ms.gt(frontier_ms)),
         )
@@ -174,6 +175,7 @@ pub(super) fn advance_read_state(
                     .and(dsl::chat_jid.eq(chat))
                     .and(dsl::msg_id.eq_any(&state.extra_ids))
                     .and(dsl::from_me.eq(false))
+                    .and(dsl::rendition_parent_id.is_null())
                     .and(dsl::timestamp_ms.le(state.watermark_ms)),
             )
             .select(dsl::msg_id)
@@ -191,6 +193,7 @@ pub(super) fn advance_read_state(
                         .and(dsl::from_me.eq(false))
                         .and(dsl::local_revoke_placeholder.eq(false))
                         .and(dsl::received_as_shared_history.eq(false))
+                        .and(dsl::rendition_parent_id.is_null())
                         .and(dsl::kind.ne("history_notice"))
                         .and(dsl::kind.ne("group_membership"))
                         .and(dsl::timestamp_ms.gt(state.watermark_ms)),
@@ -268,6 +271,7 @@ pub(super) fn count_unread(
                 .and(dsl::from_me.eq(false))
                 .and(dsl::local_revoke_placeholder.eq(false))
                 .and(dsl::received_as_shared_history.eq(false))
+                .and(dsl::rendition_parent_id.is_null())
                 .and(dsl::kind.ne("history_notice"))
                 .and(dsl::kind.ne("group_membership"))
                 .and(dsl::timestamp_ms.gt(state.watermark_ms)),
@@ -300,6 +304,7 @@ pub(super) fn count_uncovered_incoming(
                 .and(dsl::from_me.eq(false))
                 .and(dsl::local_revoke_placeholder.eq(false))
                 .and(dsl::received_as_shared_history.eq(false))
+                .and(dsl::rendition_parent_id.is_null())
                 .and(dsl::kind.ne("history_notice"))
                 .and(dsl::kind.ne("group_membership"))
                 .and(dsl::timestamp_ms.gt(state.watermark_ms)),

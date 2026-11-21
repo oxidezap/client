@@ -597,12 +597,16 @@ pub(crate) fn compact_encoded_proto(
     device_id: i32,
     chat: &str,
     bytes: &[u8],
-) -> QueryResult<(Vec<u8>, i32)> {
+) -> QueryResult<(Vec<u8>, i32, Option<String>)> {
     let Ok(msg) = waproto::codec::message_decode(bytes) else {
-        return Ok((bytes.to_vec(), CODEC_RAW));
+        return Ok((bytes.to_vec(), CODEC_RAW, None));
     };
     let stored = storage_bytes_for(conn, device_id, chat, &msg)?;
-    Ok((stored.bytes, stored.codec))
+    Ok((
+        stored.bytes,
+        stored.codec,
+        crate::rendition_parent_key(&msg).and_then(|key| key.id.clone()),
+    ))
 }
 
 /// Encode for storage, compressing selectively.
