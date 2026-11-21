@@ -2472,11 +2472,24 @@ impl ChatStore {
         Ok(self
             .db()
             .read(move |conn| {
-                let keys = crate::lid::chat_key_candidates(conn, device, &chat).map_err(db_err)?;
+                let (partition, parents) = if chat != STATUS_BROADCAST_JID {
+                    (chat.as_str(), vec![id])
+                } else if let Some(key) = StatusPostKey::from_feed_id(&id) {
+                    let ids = crate::store::status_posts::candidate_ids(conn, device, key)
+                        .map_err(db_err)?;
+                    (POSTS, ids)
+                } else {
+                    (
+                        chat.as_str(),
+                        vec![StatusPostKey::broadcast_wire_id(&id).to_owned()],
+                    )
+                };
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device, partition).map_err(db_err)?;
                 let rows = dsl::messages
                     .filter(dsl::device_id.eq(device))
                     .filter(dsl::chat_jid.eq_any(keys))
-                    .filter(dsl::rendition_parent_id.eq(id))
+                    .filter(dsl::rendition_parent_id.eq_any(parents))
                     .filter(dsl::from_me.eq(from_me))
                     .filter(dsl::revoked.eq(false))
                     .order(dsl::id)
@@ -2691,6 +2704,7 @@ impl ChatStore {
                 if let Some(chat) = &chat {
                     let keys =
                         crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
+                    let keys = crate::store::status_posts::page_keys(&keys).unwrap_or(keys);
                     query = query.filter(dsl::chat_jid.eq_any(keys));
                 }
                 let rows: Vec<MessageRow> = query

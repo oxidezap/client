@@ -24,24 +24,15 @@ pub(crate) fn storage_key<'a>(
 pub(super) fn resolve_id(
     conn: &mut diesel::SqliteConnection,
     device_id: i32,
-    mut key: StatusPostKey,
+    key: StatusPostKey,
 ) -> diesel::QueryResult<String> {
     use crate::schema::messages::dsl;
     use diesel::prelude::*;
 
     let original = key.feed_id();
-    let origins = crate::lid::chat_key_candidates(conn, device_id, &key.origin)?;
-    let authors = crate::lid::chat_key_candidates(conn, device_id, &key.sender)?;
-    if origins.len() == 1 && authors.len() == 1 {
+    let spellings = candidate_ids(conn, device_id, key)?;
+    if spellings.len() == 1 {
         return Ok(original);
-    }
-    let mut spellings = Vec::new();
-    for origin in origins {
-        key.origin = origin;
-        for author in &authors {
-            key.sender.clone_from(author);
-            spellings.push(key.feed_id());
-        }
     }
     let mut first = None;
     for chunk in spellings.chunks(crate::queries::BIND_CHUNK) {
@@ -56,6 +47,28 @@ pub(super) fn resolve_id(
         first = [first, found].into_iter().flatten().min_by_key(|row| row.0);
     }
     Ok(first.map_or(original, |row| row.1))
+}
+
+/// Equivalent local keys, including both wire spellings of a known PN/LID.
+pub(crate) fn candidate_ids(
+    conn: &mut diesel::SqliteConnection,
+    device_id: i32,
+    mut key: StatusPostKey,
+) -> diesel::QueryResult<Vec<String>> {
+    let origins = crate::lid::chat_key_candidates(conn, device_id, &key.origin)?;
+    let authors = crate::lid::chat_key_candidates(conn, device_id, &key.sender)?;
+    if origins.len() == 1 && authors.len() == 1 {
+        return Ok(vec![key.feed_id()]);
+    }
+    let mut spellings = Vec::new();
+    for origin in origins {
+        key.origin = origin;
+        for author in &authors {
+            key.sender.clone_from(author);
+            spellings.push(key.feed_id());
+        }
+    }
+    Ok(spellings)
 }
 
 pub(super) fn touch_feed(

@@ -92,11 +92,19 @@ pub(super) fn apply_inbound(
                 .transpose()?;
             let rendition_parent_id =
                 crate::rendition_parent_key(&inbound.message).and_then(|key| key.id.as_deref());
+            // A wire parent ID can be reused by another origin in the combined feed.
+            let status_parent = if status_post {
+                rendition_parent_id
+                    .map(|id| scoped_id(conn, id, &sender, info.source.is_from_me))
+                    .transpose()?
+            } else {
+                None
+            };
             let inserted = insert_message(
                 conn,
                 device_id,
                 NewMessage {
-                    rendition_parent_id,
+                    rendition_parent_id: status_parent.as_deref().or(rendition_parent_id),
                     chat_jid: &chat,
                     msg_id: feed_id.as_deref().unwrap_or(&info.id),
                     sender_jid: &sender,
@@ -118,7 +126,7 @@ pub(super) fn apply_inbound(
                 cs,
             )?;
             if status_post {
-                if inserted != StoredRow::Skipped {
+                if inserted != StoredRow::Skipped && rendition_parent_id.is_none() {
                     super::status_posts::touch_feed(conn, device_id, ts_ms, cs)?;
                 }
                 return Ok(());
