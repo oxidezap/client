@@ -32,6 +32,7 @@ pub(super) fn apply(
         conn,
         device,
         NewMessage {
+            rendition_parent_id: None,
             chat_jid: &chat,
             msg_id: &id,
             sender_jid: &chat,

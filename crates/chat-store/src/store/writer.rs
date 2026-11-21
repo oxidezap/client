@@ -458,12 +458,13 @@ fn apply_writer_msg(
             let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
             // Same compaction as inbound (a reply sent from here embeds the
             // parent the same way); undecodable input is kept as-is.
-            let (proto_bytes, proto_codec) =
+            let (proto_bytes, proto_codec, rendition_parent_id) =
                 crate::storage_proto::compact_encoded_proto(conn, device_id, &chat_str, proto)?;
             let stored = insert_message(
                 conn,
                 device_id,
                 NewMessage {
+                    rendition_parent_id: rendition_parent_id.as_deref(),
                     chat_jid: &chat_str,
                     msg_id,
                     sender_jid: "",
@@ -481,18 +482,20 @@ fn apply_writer_msg(
                 cs,
             )?;
             if stored != StoredRow::Skipped {
-                bump_chat(
-                    conn,
-                    device_id,
-                    &chat_str,
-                    ChatBump {
-                        msg_id,
-                        ts_ms: *timestamp_ms,
-                        preview: text.as_deref(),
-                        kind: Some(kind),
-                        unread_delta: 0,
-                    },
-                )?;
+                if rendition_parent_id.is_none() {
+                    bump_chat(
+                        conn,
+                        device_id,
+                        &chat_str,
+                        ChatBump {
+                            msg_id,
+                            ts_ms: *timestamp_ms,
+                            preview: text.as_deref(),
+                            kind: Some(kind),
+                            unread_delta: 0,
+                        },
+                    )?;
+                }
                 // The affected chat is published below, including new chats.
                 // A send does not require rehydrating the entire list.
                 // The row this send's ack was waiting for now exists. Applying

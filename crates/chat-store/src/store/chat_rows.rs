@@ -67,6 +67,7 @@ fn refresh_preview(
     use schema::messages::dsl;
     let keys = crate::lid::chat_key_candidates(conn, device_id, chat)?;
     let newest: Option<(i64, String)> = dsl::messages
+        .filter(dsl::rendition_parent_id.is_null())
         .filter(
             dsl::device_id
                 .eq(device_id)
@@ -109,6 +110,7 @@ fn newest_chat_head(
     let keys = crate::lid::chat_key_candidates(conn, device_id, chat)?;
     type HeadRow = (i64, Option<String>, String, bool, Option<String>);
     let newest: Option<HeadRow> = dsl::messages
+        .filter(dsl::rendition_parent_id.is_null())
         .filter(
             dsl::device_id
                 .eq(device_id)

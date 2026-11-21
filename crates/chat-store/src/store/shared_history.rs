@@ -325,7 +325,7 @@ pub(super) fn apply(
             unread_delta: 0,
         },
     )?;
-    diesel::sql_query("UPDATE chats SET last_message_ts = MAX(last_message_ts, COALESCE((SELECT MAX(timestamp_ms) FROM messages WHERE device_id = ? AND chat_jid = ?), 0)) WHERE device_id = ? AND jid = ?")
+    diesel::sql_query("UPDATE chats SET last_message_ts = MAX(last_message_ts, COALESCE((SELECT MAX(timestamp_ms) FROM messages WHERE rendition_parent_id IS NULL AND device_id = ? AND chat_jid = ?), 0)) WHERE device_id = ? AND jid = ?")
         .bind::<Integer,_>(device).bind::<Text,_>(&bundle.chat_jid).bind::<Integer,_>(device).bind::<Text,_>(&bundle.chat_jid).execute(conn)?;
     super::chat_rows::recompute_chat_preview(conn, device, &bundle.chat_jid)?;
     cs.chats = true;
@@ -460,6 +460,7 @@ pub(super) fn repair_legacy(
     let head: Option<i64> = dsl::messages
         .filter(dsl::device_id.eq(device))
         .filter(dsl::chat_jid.eq(chat))
+        .filter(dsl::rendition_parent_id.is_null())
         .select(diesel::dsl::max(dsl::timestamp_ms))
         .first(conn)?;
     diesel::sql_query("UPDATE chats SET last_message_ts = ? WHERE device_id = ? AND jid = ? AND last_message_ts = ?")

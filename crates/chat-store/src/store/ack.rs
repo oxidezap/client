@@ -21,6 +21,7 @@ enum AckTarget {
     Resolved {
         chat: String,
         timestamp_ms: i64,
+        visible: bool,
     },
     /// No outgoing row with this id yet. Carries the storage key the ack named,
     /// when it named one, so a deferral can be held against that chat instead
@@ -41,13 +42,17 @@ fn resolve_server_ack_message(
     if let Some(from) = &ack.from {
         let wire = from.to_string();
         let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
-        let timestamp_ms: Option<i64> = message_row(device_id, &chat, &ack.id)
+        let row: Option<(i64, bool)> = message_row(device_id, &chat, &ack.id)
             .filter(dsl::from_me.eq(true))
-            .select(dsl::timestamp_ms)
+            .select((dsl::timestamp_ms, dsl::rendition_parent_id.is_null()))
             .first(conn)
             .optional()?;
-        if let Some(timestamp_ms) = timestamp_ms {
-            return Ok(AckTarget::Resolved { chat, timestamp_ms });
+        if let Some((timestamp_ms, visible)) = row {
+            return Ok(AckTarget::Resolved {
+                chat,
+                timestamp_ms,
+                visible,
+            });
         }
         // The row may sit under the peer's other identity, so retry across the
         // PN/LID pair — but ONLY that pair. Message ids are sender-chosen and
@@ -55,7 +60,7 @@ fn resolve_server_ack_message(
         // would let a named ack land on an unrelated thread that happens to
         // reuse the id.
         let keys = crate::lid::chat_key_candidates(conn, device_id, &wire)?;
-        let aliased: Option<(String, i64)> = dsl::messages
+        let aliased: Option<(String, i64, bool)> = dsl::messages
             .filter(
                 dsl::device_id
                     .eq(device_id)
@@ -63,29 +68,45 @@ fn resolve_server_ack_message(
                     .and(dsl::msg_id.eq(&ack.id))
                     .and(dsl::from_me.eq(true)),
             )
-            .select((dsl::chat_jid, dsl::timestamp_ms))
+            .select((
+                dsl::chat_jid,
+                dsl::timestamp_ms,
+                dsl::rendition_parent_id.is_null(),
+            ))
             .first(conn)
             .optional()?;
         return Ok(match aliased {
-            Some((chat, timestamp_ms)) => AckTarget::Resolved { chat, timestamp_ms },
+            Some((chat, timestamp_ms, visible)) => AckTarget::Resolved {
+                chat,
+                timestamp_ms,
+                visible,
+            },
             None => AckTarget::NotYet { chat: Some(chat) },
         });
     }
 
     // Only a chatless ack falls back to the whole device, and then the id is
     // safe only when it names exactly one outgoing row.
-    let matches: Vec<(String, i64)> = dsl::messages
+    let matches: Vec<(String, i64, bool)> = dsl::messages
         .filter(
             dsl::device_id
                 .eq(device_id)
                 .and(dsl::msg_id.eq(&ack.id))
                 .and(dsl::from_me.eq(true)),
         )
-        .select((dsl::chat_jid, dsl::timestamp_ms))
+        .select((
+            dsl::chat_jid,
+            dsl::timestamp_ms,
+            dsl::rendition_parent_id.is_null(),
+        ))
         .limit(2)
         .load(conn)?;
-    match <[(String, i64); 1]>::try_from(matches) {
-        Ok([(chat, timestamp_ms)]) => Ok(AckTarget::Resolved { chat, timestamp_ms }),
+    match <[(String, i64, bool); 1]>::try_from(matches) {
+        Ok([(chat, timestamp_ms, visible)]) => Ok(AckTarget::Resolved {
+            chat,
+            timestamp_ms,
+            visible,
+        }),
         Err(matches) if matches.is_empty() => Ok(AckTarget::NotYet { chat: None }),
         Err(_) => {
             warn!(
@@ -445,15 +466,20 @@ pub(super) fn apply_server_ack(
         return Ok(AckApplied::Settled);
     }
     use schema::messages::dsl;
-    let (chat, old_timestamp_ms) = match resolve_server_ack_message(conn, device_id, ack, cs)? {
-        AckTarget::Resolved { chat, timestamp_ms } => (chat, timestamp_ms),
-        // Answerable by waiting: the send may just not be recorded yet.
-        AckTarget::NotYet { chat } => return Ok(AckApplied::Deferrable(chat)),
-        // Not answerable by waiting, and dangerous to hold — report it settled
-        // so the caller drops it instead of arming it for the next row that
-        // reuses the id.
-        AckTarget::Ambiguous => return Ok(AckApplied::Settled),
-    };
+    let (chat, old_timestamp_ms, visible) =
+        match resolve_server_ack_message(conn, device_id, ack, cs)? {
+            AckTarget::Resolved {
+                chat,
+                timestamp_ms,
+                visible,
+            } => (chat, timestamp_ms, visible),
+            // Answerable by waiting: the send may just not be recorded yet.
+            AckTarget::NotYet { chat } => return Ok(AckApplied::Deferrable(chat)),
+            // Not answerable by waiting, and dangerous to hold — report it settled
+            // so the caller drops it instead of arming it for the next row that
+            // reuses the id.
+            AckTarget::Ambiguous => return Ok(AckApplied::Settled),
+        };
     let target = message_row(device_id, &chat, &ack.id).filter(dsl::from_me.eq(true));
     let status_updated = if ack.error.is_some() {
         // Nack: the server rejected the send. Only a still-pending row fails —
@@ -498,7 +524,10 @@ pub(super) fn apply_server_ack(
     } else {
         false
     };
-    if timestamp_updated && let Some(timestamp_ms) = server_timestamp_ms {
+    if visible
+        && timestamp_updated
+        && let Some(timestamp_ms) = server_timestamp_ms
+    {
         reconcile_chat_head_after_timestamp_change(
             conn,
             device_id,

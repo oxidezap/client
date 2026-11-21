@@ -355,7 +355,7 @@ fn fts_hit_sql(scoped: bool, ranked: bool, has_media: bool) -> String {
     format!(
         "SELECT f.rowid AS id, f.rank AS rank
          FROM messages_fts f CROSS JOIN messages m ON m.id = f.rowid
-         WHERE messages_fts MATCH ? AND m.device_id = ?{scope}{media_filter}
+         WHERE messages_fts MATCH ? AND m.rendition_parent_id IS NULL AND m.device_id = ?{scope}{media_filter}
          ORDER BY {order} LIMIT ?"
     )
 }

@@ -62,10 +62,13 @@ pub(super) fn apply_inbound(
                 crate::storage_proto::storage_bytes_for(conn, device_id, &chat, &inbound.message)?;
             let proto_bytes = stored.bytes;
             let proto_codec = stored.codec;
+            let rendition_parent_id =
+                crate::rendition_parent_key(&inbound.message).and_then(|key| key.id.as_deref());
             let inserted = insert_message(
                 conn,
                 device_id,
                 NewMessage {
+                    rendition_parent_id,
                     chat_jid: &chat,
                     msg_id: &info.id,
                     sender_jid: &sender,
@@ -95,7 +98,7 @@ pub(super) fn apply_inbound(
                     && !info.source.is_from_me
                     && kind != "history_notice",
             );
-            if inserted != StoredRow::Skipped {
+            if inserted != StoredRow::Skipped && rendition_parent_id.is_none() {
                 bump_chat(
                     conn,
                     device_id,

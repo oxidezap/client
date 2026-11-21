@@ -19,6 +19,7 @@ pub(super) struct NewMessage<'a> {
     pub(super) proto: Option<&'a [u8]>,
     /// [`crate::storage_proto`] representation of `proto` (raw vs zlib).
     pub(super) proto_codec: i32,
+    pub(super) rendition_parent_id: Option<&'a str>,
     pub(super) status: i32,
     /// Explicit WebMessageInfo status, never a placeholder insertion default.
     pub(super) history_status: Option<i32>,
@@ -89,10 +90,25 @@ pub(super) fn insert_message(
         }
         // A revoke that arrived first had no original position. Recover only
         // its kind/time, never the content, after sender-scoped resolution.
-        let old_ts: i64 = dsl::messages
+        let (old_ts, old_parent, old_kind, shared, local_tombstone): (
+            i64,
+            Option<String>,
+            String,
+            bool,
+            bool,
+        ) = dsl::messages
             .filter(dsl::id.eq(existing.id))
-            .select(dsl::timestamp_ms)
+            .select((
+                dsl::timestamp_ms,
+                dsl::rendition_parent_id,
+                dsl::kind,
+                dsl::received_as_shared_history,
+                dsl::local_revoke_placeholder,
+            ))
             .first(conn)?;
+        if old_parent.is_some() && old_parent.as_deref() != new.rendition_parent_id {
+            return Ok(StoredRow::Skipped);
+        }
         let repaired = diesel::update(
             dsl::messages
                 .filter(dsl::id.eq(existing.id))
@@ -103,22 +119,41 @@ pub(super) fn insert_message(
         .set((
             dsl::timestamp_ms.eq(new.timestamp_ms),
             dsl::kind.eq(new.kind),
+            dsl::rendition_parent_id.eq(new.rendition_parent_id),
         ))
         .execute(conn)?;
         if repaired > 0 {
             // Re-derive the activity head too when this placeholder was newest.
-            super::chat_rows::reconcile_chat_head_after_timestamp_change(
-                conn,
-                device_id,
-                new.chat_jid,
-                old_ts,
-                new.timestamp_ms,
-            )?;
+            if new.rendition_parent_id.is_some() {
+                let counted = !new.from_me
+                    && !shared
+                    && !local_tombstone
+                    && !super::read_state::read_state(conn, device_id, new.chat_jid)?
+                        .covers(old_ts, new.msg_id);
+                super::renditions::repair_chat(
+                    conn,
+                    device_id,
+                    new.chat_jid,
+                    old_ts,
+                    i32::from(counted),
+                )?;
+            } else {
+                super::chat_rows::reconcile_chat_head_after_timestamp_change(
+                    conn,
+                    device_id,
+                    new.chat_jid,
+                    old_ts,
+                    new.timestamp_ms,
+                )?;
+            }
             changes.chats = true;
             changes.message_chats.insert(new.chat_jid.to_owned());
             return Ok(StoredRow::Skipped);
         }
-        if !new.overwrite {
+        if !new.overwrite
+            && !(old_kind == crate::materialize::KIND_UNDECRYPTABLE
+                && new.rendition_parent_id.is_some())
+        {
             // History is a stale copy: live rows and placeholders win.
             return Ok(StoredRow::Skipped);
         }
@@ -155,8 +190,23 @@ pub(super) fn insert_message(
             dsl::text_content.eq(new.text),
             dsl::proto.eq(new.proto),
             dsl::proto_codec.eq(new.proto_codec),
+            dsl::rendition_parent_id.eq(new.rendition_parent_id),
         ))
         .execute(conn)?;
+        if refreshed > 0 && old_parent.is_none() && new.rendition_parent_id.is_some() {
+            let counted = !new.from_me
+                && !shared
+                && !super::read_state::read_state(conn, device_id, new.chat_jid)?
+                    .covers(old_ts, new.msg_id);
+            super::renditions::repair_chat(
+                conn,
+                device_id,
+                new.chat_jid,
+                old_ts,
+                i32::from(counted),
+            )?;
+            changes.chats = true;
+        }
         return Ok(if refreshed > 0 {
             StoredRow::Refreshed
         } else {
@@ -176,6 +226,7 @@ pub(super) fn insert_message(
             dsl::text_content.eq(new.text),
             dsl::proto.eq(new.proto),
             dsl::proto_codec.eq(new.proto_codec),
+            dsl::rendition_parent_id.eq(new.rendition_parent_id),
             dsl::status.eq(new.status),
             dsl::starred.eq(new.starred),
         ))

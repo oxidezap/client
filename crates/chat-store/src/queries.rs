@@ -284,6 +284,7 @@ pub(crate) struct MessageRow {
     local_revoke_placeholder: bool,
     received_as_shared_history: bool,
     group_membership: Option<String>,
+    _rendition_parent_id: Option<String>,
 }
 
 /// Fold an author-equivalent legacy copy for a read without hiding a
@@ -391,6 +392,7 @@ fn page_rows_with_copies(
         for id_page in msg_ids.chunks(id_chunk_size) {
             candidates.extend(
                 dsl::messages
+                    .filter(dsl::rendition_parent_id.is_null())
                     .filter(
                         dsl::device_id
                             .eq(device_id)
@@ -441,6 +443,7 @@ fn rows_at_timestamp(
 ) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
     dsl::messages
+        .filter(dsl::rendition_parent_id.is_null())
         .filter(
             dsl::device_id
                 .eq(device_id)
@@ -570,6 +573,7 @@ fn arrival_page_query(
     // table backwards and stops at LIMIT, which is the plan this feed is
     // designed around.
     let mut query = dsl::messages
+        .filter(dsl::rendition_parent_id.is_null())
         .filter(diesel::dsl::sql::<Bool>("+device_id = ").bind::<Integer, _>(device_id))
         .into_boxed();
     if let Some(cursor) = after {
@@ -1000,6 +1004,7 @@ impl ChatStore {
                     return Ok((messages, unread));
                 };
                 let ahead: i64 = dsl::messages
+                    .filter(dsl::rendition_parent_id.is_null())
                     .filter(
                         dsl::device_id
                             .eq(device_id)
@@ -1284,6 +1289,7 @@ fn page_query<'a>(
 ) -> schema::messages::BoxedQuery<'a, diesel::sqlite::Sqlite> {
     use schema::messages::dsl;
     let mut query = dsl::messages
+        .filter(dsl::rendition_parent_id.is_null())
         .filter(
             dsl::device_id
                 .eq(device_id)
@@ -1316,6 +1322,7 @@ fn page_query_after<'a>(
 ) -> schema::messages::BoxedQuery<'a, diesel::sqlite::Sqlite> {
     use schema::messages::dsl;
     dsl::messages
+        .filter(dsl::rendition_parent_id.is_null())
         .filter(
             dsl::device_id
                 .eq(device_id)
@@ -1743,6 +1750,7 @@ impl ChatStore {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 let rows: Vec<MessageRow> = dsl::messages
+                    .filter(dsl::rendition_parent_id.is_null())
                     .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
                     .filter(dsl::kind.ne("group_membership"))
                     .order((dsl::timestamp_ms.asc(), dsl::id.asc()))
@@ -2426,6 +2434,61 @@ impl ChatStore {
         ))
     }
 
+    /// The media copies of one message, scoped to its chat, direction and
+    /// author. The parent need not be stored yet. Orphans also remain
+    /// discoverable through `pending_media_messages` and by their own id.
+    pub async fn media_renditions(
+        &self,
+        chat: &Jid,
+        parent_id: &str,
+        sender: &Jid,
+        from_me: bool,
+    ) -> Result<Vec<StoredMessage>> {
+        use schema::messages::dsl;
+        let device = self.device_id();
+        let (chat, id, sender) = (chat.to_string(), parent_id.to_owned(), sender.to_string());
+        Ok(self
+            .db()
+            .read(move |conn| {
+                let keys = crate::lid::chat_key_candidates(conn, device, &chat).map_err(db_err)?;
+                let rows = dsl::messages
+                    .filter(dsl::device_id.eq(device))
+                    .filter(dsl::chat_jid.eq_any(keys))
+                    .filter(dsl::rendition_parent_id.eq(id))
+                    .filter(dsl::from_me.eq(from_me))
+                    .filter(dsl::revoked.eq(false))
+                    .order(dsl::id)
+                    .load::<MessageRow>(conn)
+                    .map_err(db_err)?;
+                let mut unique = Vec::new();
+                let mut edit_sources = HashMap::new();
+                for row in rows {
+                    if crate::store::message_identity::authors_match(
+                        conn,
+                        device,
+                        from_me,
+                        &sender,
+                        row.from_me,
+                        &row.sender_jid,
+                    )
+                    .map_err(db_err)?
+                    {
+                        let edit_source = row.edited_at_ms.map(|_| row.id);
+                        push_unique_message(
+                            conn,
+                            device,
+                            &mut unique,
+                            &mut edit_sources,
+                            row,
+                            edit_source,
+                        )?;
+                    }
+                }
+                finalize_messages(conn, device, unique)
+            })
+            .await?)
+    }
+
     /// Starred messages across every chat, newest first.
     pub async fn starred_messages(&self, limit: i64) -> Result<Vec<StoredMessage>> {
         use schema::messages::dsl;
@@ -2434,6 +2497,7 @@ impl ChatStore {
             .db()
             .read(move |conn| {
                 let rows: Vec<MessageRow> = dsl::messages
+                    .filter(dsl::rendition_parent_id.is_null())
                     .filter(dsl::device_id.eq(device_id).and(dsl::starred.eq(true)))
                     .order((dsl::timestamp_ms.desc(), dsl::id.desc()))
                     .limit(limit.max(0))
@@ -2513,6 +2577,7 @@ impl ChatStore {
             .db()
             .read(move |conn| {
                 let mut query = dsl::messages
+                    .filter(dsl::rendition_parent_id.is_null())
                     .filter(dsl::device_id.eq(device_id))
                     .into_boxed();
                 if let Some(chat) = &chat {
@@ -2667,9 +2732,9 @@ mod tests {
         let mut conn = SqliteConnection::establish(":memory:").unwrap();
         conn.batch_execute(
             "CREATE TABLE messages(id INTEGER PRIMARY KEY, device_id INTEGER NOT NULL, \
-             chat_jid TEXT NOT NULL, timestamp_ms BIGINT NOT NULL); \
+             chat_jid TEXT NOT NULL, timestamp_ms BIGINT NOT NULL, rendition_parent_id TEXT); \
              CREATE INDEX idx_messages_chat_time ON messages(device_id,chat_jid,timestamp_ms); \
-             INSERT INTO messages VALUES \
+             INSERT INTO messages(id,device_id,chat_jid,timestamp_ms) VALUES \
              (-9223372036854775808,1,'primary',-9223372036854775808), \
              (1,1,'primary',10),(2,1,'alias',10),(3,2,'primary',10), \
              (9223372036854775807,1,'primary',9223372036854775807)",
@@ -2968,7 +3033,7 @@ mod tests {
         use crate::schema::messages::dsl;
         use diesel::sql_types::{BigInt, Integer, Text};
         let mut conn = SqliteConnection::establish(":memory:").unwrap();
-        diesel::sql_query("CREATE TABLE messages(id INTEGER PRIMARY KEY, device_id INTEGER NOT NULL, chat_jid TEXT NOT NULL, timestamp_ms BIGINT NOT NULL)")
+        diesel::sql_query("CREATE TABLE messages(id INTEGER PRIMARY KEY, device_id INTEGER NOT NULL, chat_jid TEXT NOT NULL, timestamp_ms BIGINT NOT NULL, rendition_parent_id TEXT)")
             .execute(&mut conn).unwrap();
         let mut rows = Vec::new();
         for (i, id) in [
@@ -2995,13 +3060,15 @@ mod tests {
             let timestamp = [i64::MIN, -1, 0, 1, i64::MAX][i % 5];
             let device = if i % 4 == 0 { 2 } else { 1 };
             let chat = if i % 3 == 0 { "alias" } else { "primary" };
-            diesel::sql_query("INSERT INTO messages VALUES (?, ?, ?, ?)")
-                .bind::<BigInt, _>(id)
-                .bind::<Integer, _>(device)
-                .bind::<Text, _>(chat)
-                .bind::<BigInt, _>(timestamp)
-                .execute(&mut conn)
-                .unwrap();
+            diesel::sql_query(
+                "INSERT INTO messages(id,device_id,chat_jid,timestamp_ms) VALUES (?, ?, ?, ?)",
+            )
+            .bind::<BigInt, _>(id)
+            .bind::<Integer, _>(device)
+            .bind::<Text, _>(chat)
+            .bind::<BigInt, _>(timestamp)
+            .execute(&mut conn)
+            .unwrap();
             rows.push((timestamp, id, device, chat));
         }
         for keys in [

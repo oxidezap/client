@@ -136,6 +136,8 @@ struct StoredMessage {
     local_revoke_placeholder: bool,
     #[diesel(sql_type = Bool)]
     received_as_shared_history: bool,
+    #[diesel(sql_type = Nullable<Text>)]
+    rendition_parent_id: Option<String>,
 }
 
 /// Fold rows already proven to be one author/message. Keep the oldest stable
@@ -172,6 +174,7 @@ pub(crate) fn merge_rows(
             dsl::revoked,
             dsl::local_revoke_placeholder,
             dsl::received_as_shared_history,
+            dsl::rendition_parent_id,
         ))
         .load(conn)?;
     rows.sort_by_key(|row| row.id);
@@ -242,6 +245,7 @@ pub(crate) fn merge_rows(
             dsl::chat_jid.eq(destination_chat),
             dsl::sender_jid.eq(&sender_jid),
             dsl::timestamp_ms.eq(timestamp_ms),
+            dsl::rendition_parent_id.eq(rows.iter().find_map(|r| r.rendition_parent_id.as_deref())),
             dsl::kind.eq(content.map_or(survivor.kind.as_str(), |row| row.kind.as_str())),
             dsl::text_content.eq(if tombstone {
                 None
@@ -415,7 +419,7 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
            AND c.read_boundary_ms = 0
            AND c.read_boundary_ids IS NULL
            AND m.from_me = FALSE
-           AND m.local_revoke_placeholder = FALSE AND m.received_as_shared_history = FALSE AND m.kind != 'history_notice' AND m.kind != 'group_membership'
+           AND m.local_revoke_placeholder = FALSE AND m.received_as_shared_history = FALSE AND m.rendition_parent_id IS NULL AND m.kind != 'history_notice' AND m.kind != 'group_membership'
            AND m.timestamp_ms > ?",
     )
     .bind::<Integer, _>(device_id)
@@ -436,7 +440,7 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice' AND messages.kind != 'group_membership'
+               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.rendition_parent_id IS NULL AND messages.kind != 'history_notice' AND messages.kind != 'group_membership'
          )
          WHERE chats.device_id = ?
            AND chats.unread_count = 0
@@ -447,14 +451,14 @@ fn backfill_legacy_read_state(conn: &mut SqliteConnection, device_id: i32) -> Qu
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice' AND messages.kind != 'group_membership'
+               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.rendition_parent_id IS NULL AND messages.kind != 'history_notice' AND messages.kind != 'group_membership'
            )
            AND (
              SELECT COUNT(DISTINCT msg_id) FROM messages
              WHERE messages.device_id = chats.device_id
                AND messages.chat_jid = chats.jid
                AND messages.from_me = FALSE
-               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.kind != 'history_notice' AND messages.kind != 'group_membership'
+               AND messages.local_revoke_placeholder = FALSE AND messages.received_as_shared_history = FALSE AND messages.rendition_parent_id IS NULL AND messages.kind != 'history_notice' AND messages.kind != 'group_membership'
                AND messages.timestamp_ms > ?
            ) <= ?",
     )
@@ -799,6 +803,7 @@ fn refresh_chat_after_merge(
                         .eq(device_id)
                         .and(schema::messages::chat_jid.eq(chat))
                         .and(schema::messages::from_me.eq(false))
+                        .and(schema::messages::rendition_parent_id.is_null())
                         .and(schema::messages::local_revoke_placeholder.eq(false)),
                 )
                 .select(diesel::dsl::max(schema::messages::timestamp_ms))
