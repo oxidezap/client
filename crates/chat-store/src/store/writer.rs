@@ -702,9 +702,10 @@ fn apply_writer_msg(
             // Ours carry the peer's read tick in this column, so a local view
             // must not set it; and `< READ` is what keeps a second viewing —
             // or a played voice status — from moving anything backwards.
-            let mut partitions = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+            let mut partitions = std::collections::BTreeMap::<&str, Vec<_>>::new();
             for id in msg_ids {
-                let (partition, id) = super::status_posts::storage_key(&chat_str, id);
+                let (partition, id) =
+                    super::status_posts::storage_key(conn, device_id, &chat_str, id)?;
                 partitions.entry(partition).or_default().push(id);
             }
             let mut updated = 0;

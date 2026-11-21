@@ -436,3 +436,106 @@ async fn group_participants_sharing_a_status_id_have_independent_watched_marks()
     assert_eq!(store.unread_total().await.unwrap(), 0);
     assert!(store.chat(&jid(GROUP)).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn status_revoke_uses_the_original_feed_key_across_proven_aliases() {
+    let (db, store) = test_store().await;
+    let status = jid(STATUS_BROADCAST);
+    let tagged = |origin: &str, sender: &str, id: &str, message: wa::Message| {
+        let mut info = incoming_info(origin, sender, id, 1_700_000_000);
+        info.is_status_stanza = true;
+        message_event(message, info)
+    };
+    feed(
+        &store,
+        [
+            message_event(
+                wa::Message::text("chat"),
+                incoming_info(GROUP, PEER, "same", 1_700_000_000),
+            ),
+            tagged(GROUP, PEER, "same", wa::Message::text("group post")),
+            tagged(PEER, PEER, "same", wa::Message::text("contact post")),
+        ],
+    )
+    .await;
+    let first = store.messages(&status, None, 10).await.unwrap();
+    assert_eq!(first.len(), 2);
+    store
+        .mark_status_watched(&status, first.iter().map(|row| row.id.clone()).collect())
+        .unwrap();
+    store.flush().await.unwrap();
+    add_lid_mapping(&db).await;
+    let alias_id = oxidezap_core::StatusPostKey {
+        origin: GROUP.into(),
+        sender: PEER_LID.into(),
+        id: "same".into(),
+        from_me: false,
+    }
+    .feed_id();
+    let found = store.message(&status, &alias_id).await.unwrap().unwrap();
+    assert_eq!(found.status, MessageStatus::Read);
+    assert_eq!(found.sender_jid, jid(PEER));
+    feed(
+        &store,
+        [
+            tagged(GROUP, PEER_LID, "same", wa::Message::text("group post")),
+            tagged(
+                PEER_LID,
+                PEER_LID,
+                "same",
+                wa::Message::text("contact post"),
+            ),
+        ],
+    )
+    .await;
+    let rows = store.messages(&status, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status == MessageStatus::Read));
+    assert_eq!(
+        rows.iter().map(|row| &row.id).collect::<Vec<_>>(),
+        first.iter().map(|row| &row.id).collect::<Vec<_>>()
+    );
+
+    let mut edit_key = wa::MessageKey::default();
+    edit_key.id = Some("same".into());
+    let mut change = wa::message::ProtocolMessage::default();
+    change.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+    change.key = MessageField::some(edit_key);
+    change.edited_message = MessageField::from_box(Box::new(wa::Message::text("edited post")));
+    let mut edit = wa::Message::default();
+    edit.protocol_message = MessageField::some(change);
+    feed(&store, [tagged(GROUP, PEER_LID, "edit", edit)]).await;
+    let edited = store.message(&status, &alias_id).await.unwrap().unwrap();
+    assert_eq!(edited.text.as_deref(), Some("edited post"));
+    assert_eq!(edited.status, MessageStatus::Read);
+
+    feed(
+        &store,
+        [
+            tagged(GROUP, PEER_LID, "revoke", revoke("same")),
+            tagged(GROUP, PEER, "same", wa::Message::text("stale")),
+            tagged(GROUP, PEER_LID, "early-revoke", revoke("later")),
+            tagged(
+                GROUP,
+                PEER,
+                "later",
+                wa::Message::text("arrived after revocation"),
+            ),
+        ],
+    )
+    .await;
+    let rows = store.messages(&status, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let key = oxidezap_core::StatusPostKey::from_feed_id(&row.id).unwrap();
+        assert_eq!(row.revoked, key.origin == GROUP);
+        if row.revoked {
+            assert!(row.message.is_none());
+            assert!(row.text.is_none());
+        }
+    }
+    let ordinary = store.message(&jid(GROUP), "same").await.unwrap().unwrap();
+    assert!(!ordinary.revoked);
+    assert_eq!(ordinary.text.as_deref(), Some("chat"));
+    assert_eq!(store.unread_total().await.unwrap(), 1);
+}

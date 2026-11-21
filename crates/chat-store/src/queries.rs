@@ -1837,13 +1837,14 @@ impl ChatStore {
         use schema::messages::dsl;
         let device_id = self.device_id();
         let chat = chat.to_string();
-        let (chat, msg_id) = storage_key(&chat, msg_id);
-        let (chat, msg_id) = (chat.to_owned(), msg_id.to_owned());
+        let msg_id = msg_id.to_owned();
         let messages: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
+                let (partition, msg_id) =
+                    storage_key(conn, device_id, &chat, &msg_id).map_err(db_err)?;
                 let keys =
-                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                    crate::lid::chat_key_candidates(conn, device_id, partition).map_err(db_err)?;
                 let query = dsl::messages
                     .filter(
                         dsl::device_id

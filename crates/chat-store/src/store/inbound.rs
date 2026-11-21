@@ -27,23 +27,27 @@ pub(super) fn apply_inbound(
     let sender = info.source.sender.to_string();
     let op = classify(&inbound.message);
     let status_post = info.is_status_stanza && !info.source.chat.is_status_broadcast();
-    let (chat, feed_id) = if status_post {
-        // Control messages have no feed item of their own. In particular they
-        // must never amend a same-ID row in the source conversation.
-        if !matches!(op, MessageOp::Store { .. }) {
+    let chat = if status_post {
+        if !matches!(
+            op,
+            MessageOp::Store { .. } | MessageOp::Edit { .. } | MessageOp::Revoke { .. }
+        ) {
             return Ok(());
         }
-        let key = oxidezap_core::StatusPostKey {
-            origin: info.source.chat.to_non_ad_string(),
-            sender: info.source.sender.to_non_ad_string(),
-            from_me: info.source.is_from_me,
-            id: info.id.to_string(),
-        };
-        (super::status_posts::POSTS.to_owned(), Some(key.feed_id()))
+        super::status_posts::POSTS.to_owned()
     } else {
-        (
-            route_chat(conn, device_id, info.source.chat.to_string(), cs)?,
-            None,
+        route_chat(conn, device_id, info.source.chat.to_string(), cs)?
+    };
+    let scoped_id = |conn: &mut SqliteConnection, id: &str, author: &str, from_me: bool| {
+        super::status_posts::resolve_id(
+            conn,
+            device_id,
+            oxidezap_core::StatusPostKey {
+                origin: info.source.chat.to_non_ad_string(),
+                sender: stored_sender(author, false),
+                from_me,
+                id: id.to_owned(),
+            },
         )
     };
     let ts_ms = info.timestamp.as_millis();
@@ -83,6 +87,9 @@ pub(super) fn apply_inbound(
                 crate::storage_proto::storage_bytes_for(conn, device_id, &chat, &inbound.message)?;
             let proto_bytes = stored.bytes;
             let proto_codec = stored.codec;
+            let feed_id = status_post
+                .then(|| scoped_id(conn, &info.id, &sender, info.source.is_from_me))
+                .transpose()?;
             let inserted = insert_message(
                 conn,
                 device_id,
@@ -152,6 +159,11 @@ pub(super) fn apply_inbound(
             new_proto,
             sender_timestamp_ms,
         } => {
+            let target_id = if status_post {
+                scoped_id(conn, &target_id, &sender, info.source.is_from_me)?
+            } else {
+                target_id
+            };
             if apply_edit(
                 conn,
                 device_id,
@@ -168,7 +180,11 @@ pub(super) fn apply_inbound(
             )? {
                 cs.chats = true;
             }
-            cs.message_chats.insert(chat);
+            if status_post {
+                super::status_posts::touch_feed(conn, device_id, ts_ms, cs)?;
+            } else {
+                cs.message_chats.insert(chat);
+            }
         }
         MessageOp::Revoke {
             target_id,
@@ -180,13 +196,14 @@ pub(super) fn apply_inbound(
             // Only a peer's false bit needs checking against our own PN/LID;
             // linked-device keys already use our account's perspective. A
             // peer's false key without a participant names us in a direct chat.
+            let wire_chat = status_post.then(|| info.source.chat.to_non_ad_string());
             let (target_sender, target_from_me) = if target_from_me {
                 (sender.as_str(), info.source.is_from_me)
             } else {
                 let fallback_author = if info.source.is_from_me
                     && (info.source.chat.is_pn() || info.source.chat.is_lid())
                 {
-                    chat.as_str()
+                    wire_chat.as_deref().unwrap_or(&chat)
                 } else {
                     sender.as_str()
                 };
@@ -196,6 +213,11 @@ pub(super) fn apply_inbound(
                         || own_participant_jids(conn, device_id)?
                             .contains(&stored_sender(author, false)));
                 (author, is_own)
+            };
+            let target_id = if status_post {
+                scoped_id(conn, &target_id, target_sender, target_from_me)?
+            } else {
+                target_id
             };
             if apply_revoke(
                 conn,
@@ -211,7 +233,11 @@ pub(super) fn apply_inbound(
             )? {
                 cs.chats = true;
             }
-            cs.message_chats.insert(chat);
+            cs.message_chats.insert(if status_post {
+                oxidezap_core::STATUS_BROADCAST_JID.to_owned()
+            } else {
+                chat
+            });
         }
         MessageOp::HistoryBundle => {
             super::shared_history::persist(
