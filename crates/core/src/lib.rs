@@ -40,6 +40,8 @@ mod presence;
 mod quoted;
 mod rich_text;
 mod status;
+mod status_key;
+pub use status_key::StatusPostKey;
 mod system_notice;
 pub use group_membership::{
     GroupMembership, MembershipAction, NoticeParticipant, format_phone_jid,

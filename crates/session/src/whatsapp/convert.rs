@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use oxidezap_core::{ChatMessage, MessageStatus, PollContent, UiEvent};
 use whatsapp_rust::client::Client;
+use whatsapp_rust::wacore_binary::jid::JidExt;
 use whatsapp_rust::waproto::whatsapp as wa;
 
 use super::media;
@@ -28,7 +29,8 @@ pub(super) fn stored_with_unread_tail(
         .into_iter()
         .rev()
         .map(|row| {
-            let eligible = !row.from_me
+            let eligible = !row.chat_jid.is_status_broadcast()
+                && !row.from_me
                 && !row.local_revoke_placeholder
                 && !row.received_as_shared_history
                 && row.kind != oxidezap_chat_store::MessageKind::HistoryNotice
@@ -79,7 +81,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
     // Outgoing ticks come from the stored delivery status; incoming default
     // to read and load_history un-reads the chat's unread tail (per-incoming
     // read state lives on the chat cursor, not the row).
-    let is_read = if stored.from_me {
+    let is_read = if stored.from_me || stored.chat_jid.is_status_broadcast() {
         matches!(
             stored.status,
             oxidezap_chat_store::MessageStatus::Read | oxidezap_chat_store::MessageStatus::Played

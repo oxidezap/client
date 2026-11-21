@@ -18,6 +18,8 @@ use oxidezap_core::{
 use super::WhatsAppApp;
 
 pub(super) struct StatusReply {
+    feed_id: String,
+    feed_author: String,
     quote: QuotedMessage,
     input: Entity<InputState>,
 }
@@ -395,8 +397,8 @@ impl WhatsAppApp {
             return None;
         }
         if let Some(reply) = &self.status_reply
-            && reply.quote.message_id == message.id
-            && reply.quote.sender == author
+            && reply.feed_id == message.id
+            && reply.feed_author == author
         {
             return Some(reply.input.clone());
         }
@@ -414,12 +416,30 @@ impl WhatsAppApp {
         )
         .detach();
 
+        let key = oxidezap_core::StatusPostKey::from_feed_id(&message.id);
         self.status_reply = Some(StatusReply {
+            feed_id: message.id.clone(),
+            feed_author: author.to_owned(),
             quote: QuotedMessage {
-                remote_jid: Some(STATUS_BROADCAST_JID.to_string()),
-                message_id: message.id.clone(),
-                sender: author.to_string(),
-                sender_name: author_name.to_string(),
+                remote_jid: Some(
+                    key.as_ref()
+                        .map_or(STATUS_BROADCAST_JID, |k| &k.origin)
+                        .to_owned(),
+                ),
+                message_id: key.as_ref().map_or_else(
+                    || oxidezap_core::StatusPostKey::broadcast_wire_id(&message.id).to_owned(),
+                    |k| k.id.clone(),
+                ),
+                sender: key
+                    .as_ref()
+                    .map_or_else(|| author.to_owned(), |k| k.sender.clone()),
+                sender_name: message.sender_name.clone().unwrap_or_else(|| {
+                    if message.sender == author {
+                        author_name.to_owned()
+                    } else {
+                        oxidezap_core::fallback_sender_name(&message.sender).into_owned()
+                    }
+                }),
                 preview: message.content.clone(),
                 kind: message
                     .media
@@ -442,8 +462,8 @@ impl WhatsAppApp {
         };
         if self.destination != Destination::Status
             || &reply.input != input
-            || self.status_pane.author() != Some(reply.quote.sender.as_str())
-            || self.shown_status_message_id().as_deref() != Some(reply.quote.message_id.as_str())
+            || self.status_pane.author() != Some(reply.feed_author.as_str())
+            || self.shown_status_message_id().as_deref() != Some(reply.feed_id.as_str())
         {
             return;
         }

@@ -29,6 +29,7 @@ mod recovery;
 pub(crate) mod retirement;
 mod revoke;
 pub(crate) mod shared_history;
+pub(crate) mod status_posts;
 mod writer;
 
 use std::sync::{Arc, Mutex};

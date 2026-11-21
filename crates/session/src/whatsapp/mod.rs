@@ -1959,8 +1959,9 @@ impl WhatsAppClient {
                         .iter()
                         .filter_map(|inbound| {
                             let chat = &inbound.info.source.chat;
-                            (chat.is_group() || chat.is_newsletter())
-                                .then(|| chat.to_non_ad_string())
+                            (!inbound.info.is_status_stanza
+                                && (chat.is_group() || chat.is_newsletter()))
+                            .then(|| chat.to_non_ad_string())
                         })
                         .collect::<Vec<_>>()
                 });
@@ -1969,10 +1970,9 @@ impl WhatsAppClient {
                 // offline batches cannot trigger alerts.
                 let mut offline_reads = HashMap::new();
                 if !eager {
-                    for inbound in batch
-                        .iter()
-                        .filter(|inbound| !inbound.info.source.is_from_me)
-                    {
+                    for inbound in batch.iter().filter(|inbound| {
+                        !inbound.info.source.is_from_me && !inbound.info.is_status_stanza
+                    }) {
                         let key = inbound.info.source.chat.to_non_ad_string();
                         if let std::collections::hash_map::Entry::Vacant(entry) =
                             offline_reads.entry(key)
@@ -2282,6 +2282,11 @@ impl WhatsAppClient {
         eager: bool,
         cached_read: Option<Option<bool>>,
     ) {
+        // The committed status row invalidates the feed. Hydration supplies
+        // its watched mark, including on redelivery after a restart.
+        if info.is_status_stanza && !info.source.chat.is_status_broadcast() {
+            return;
+        }
         // Use the shared store normalization for both ordinary envelopes and
         // the nested wrappers it peels, so live and hydrated paths agree.
         let base_msg = oxidezap_chat_store::normalized_message(msg);
@@ -2403,7 +2408,11 @@ impl WhatsAppClient {
         });
 
         let mut chat_message = ChatMessage {
-            id: info.id.to_string(),
+            id: if info.source.chat.is_status_broadcast() {
+                oxidezap_core::StatusPostKey::broadcast_feed_id(info.id.to_string())
+            } else {
+                info.id.to_string()
+            },
             sender: info.source.sender.to_string(),
             sender_name: None, // Will be set in handle_message_received for groups
             content,

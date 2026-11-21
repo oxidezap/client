@@ -26,6 +26,7 @@ chrono = { workspace = true, features = ["std", "clock", "serde"] }
 # front end in another process receives `UiEvent` itself rather than a
 # parallel set of protocol structs that would have to be kept in step.
 serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
 phonenumber = "0.3.10"
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
@@ -38,10 +39,6 @@ getrandom_02 = { workspace = true }
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-# The call snapshot crosses the daemon socket; the round trip is a test.
-serde_json = { workspace = true, features = ["std"] }
 
 # Exercise the actual build-time visitor against all runtime regex categories.
 # The backend already uses this dependency; this edge is test-only.

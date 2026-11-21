@@ -4,6 +4,7 @@
 
 use diesel::prelude::*;
 use wacore::types::events::InboundMessage;
+use wacore_binary::JidExt;
 use waproto::whatsapp as wa;
 
 use crate::materialize::{MessageOp, classify};
@@ -23,8 +24,28 @@ pub(super) fn apply_inbound(
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
     let info = &inbound.info;
-    let chat = route_chat(conn, device_id, info.source.chat.to_string(), cs)?;
     let sender = info.source.sender.to_string();
+    let op = classify(&inbound.message);
+    let status_post = info.is_status_stanza && !info.source.chat.is_status_broadcast();
+    let (chat, feed_id) = if status_post {
+        // Control messages have no feed item of their own. In particular they
+        // must never amend a same-ID row in the source conversation.
+        if !matches!(op, MessageOp::Store { .. }) {
+            return Ok(());
+        }
+        let key = oxidezap_core::StatusPostKey {
+            origin: info.source.chat.to_non_ad_string(),
+            sender: info.source.sender.to_non_ad_string(),
+            from_me: info.source.is_from_me,
+            id: info.id.to_string(),
+        };
+        (super::status_posts::POSTS.to_owned(), Some(key.feed_id()))
+    } else {
+        (
+            route_chat(conn, device_id, info.source.chat.to_string(), cs)?,
+            None,
+        )
+    };
     let ts_ms = info.timestamp.as_millis();
 
     // Live push names ride on every message; keep contacts warm from them.
@@ -43,7 +64,7 @@ pub(super) fn apply_inbound(
         cs.contacts |= upsert_contact_business_name(conn, device_id, &sender, name)?;
     }
 
-    match classify(&inbound.message) {
+    match op {
         MessageOp::Store { kind, text } => {
             if kind == "history_notice"
                 && !super::shared_history::notice_visible(
@@ -67,7 +88,7 @@ pub(super) fn apply_inbound(
                 device_id,
                 NewMessage {
                     chat_jid: &chat,
-                    msg_id: &info.id,
+                    msg_id: feed_id.as_deref().unwrap_or(&info.id),
                     sender_jid: &sender,
                     from_me: info.source.is_from_me,
                     timestamp_ms: ts_ms,
@@ -86,6 +107,12 @@ pub(super) fn apply_inbound(
                 },
                 cs,
             )?;
+            if status_post {
+                if inserted != StoredRow::Skipped {
+                    super::status_posts::touch_feed(conn, device_id, ts_ms, cs)?;
+                }
+                return Ok(());
+            }
             // A refreshed row (redelivery, PDO recovery of a placeholder that
             // already counted) must not inflate the unread badge again — and a
             // skipped one (revoked tombstone) must not surface its content in
