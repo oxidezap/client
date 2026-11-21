@@ -68,7 +68,7 @@ pub(super) fn apply_inbound(
                 conn,
                 device_id,
                 NewMessage {
-                    rendition_parent_id: rendition_parent_id,
+                    rendition_parent_id,
                     chat_jid: &chat,
                     msg_id: &info.id,
                     sender_jid: &sender,

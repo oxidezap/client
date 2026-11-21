@@ -2732,9 +2732,9 @@ mod tests {
         let mut conn = SqliteConnection::establish(":memory:").unwrap();
         conn.batch_execute(
             "CREATE TABLE messages(id INTEGER PRIMARY KEY, device_id INTEGER NOT NULL, \
-             chat_jid TEXT NOT NULL, timestamp_ms BIGINT NOT NULL); \
+             chat_jid TEXT NOT NULL, timestamp_ms BIGINT NOT NULL, rendition_parent_id TEXT); \
              CREATE INDEX idx_messages_chat_time ON messages(device_id,chat_jid,timestamp_ms); \
-             INSERT INTO messages VALUES \
+             INSERT INTO messages(id,device_id,chat_jid,timestamp_ms) VALUES \
              (-9223372036854775808,1,'primary',-9223372036854775808), \
              (1,1,'primary',10),(2,1,'alias',10),(3,2,'primary',10), \
              (9223372036854775807,1,'primary',9223372036854775807)",
@@ -3033,7 +3033,7 @@ mod tests {
         use crate::schema::messages::dsl;
         use diesel::sql_types::{BigInt, Integer, Text};
         let mut conn = SqliteConnection::establish(":memory:").unwrap();
-        diesel::sql_query("CREATE TABLE messages(id INTEGER PRIMARY KEY, device_id INTEGER NOT NULL, chat_jid TEXT NOT NULL, timestamp_ms BIGINT NOT NULL)")
+        diesel::sql_query("CREATE TABLE messages(id INTEGER PRIMARY KEY, device_id INTEGER NOT NULL, chat_jid TEXT NOT NULL, timestamp_ms BIGINT NOT NULL, rendition_parent_id TEXT)")
             .execute(&mut conn).unwrap();
         let mut rows = Vec::new();
         for (i, id) in [
@@ -3060,13 +3060,15 @@ mod tests {
             let timestamp = [i64::MIN, -1, 0, 1, i64::MAX][i % 5];
             let device = if i % 4 == 0 { 2 } else { 1 };
             let chat = if i % 3 == 0 { "alias" } else { "primary" };
-            diesel::sql_query("INSERT INTO messages VALUES (?, ?, ?, ?)")
-                .bind::<BigInt, _>(id)
-                .bind::<Integer, _>(device)
-                .bind::<Text, _>(chat)
-                .bind::<BigInt, _>(timestamp)
-                .execute(&mut conn)
-                .unwrap();
+            diesel::sql_query(
+                "INSERT INTO messages(id,device_id,chat_jid,timestamp_ms) VALUES (?, ?, ?, ?)",
+            )
+            .bind::<BigInt, _>(id)
+            .bind::<Integer, _>(device)
+            .bind::<Text, _>(chat)
+            .bind::<BigInt, _>(timestamp)
+            .execute(&mut conn)
+            .unwrap();
             rows.push((timestamp, id, device, chat));
         }
         for keys in [

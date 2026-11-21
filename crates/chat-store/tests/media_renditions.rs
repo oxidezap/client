@@ -153,7 +153,9 @@ fn dual_upload_types_require_the_matching_media_and_a_parent_key() {
 #[tokio::test]
 async fn startup_reclassifies_old_rows_once_and_preserves_the_media() {
     let (db, store) = test_store().await;
-    let hd = child(Type::HD_IMAGE_DUAL_UPLOAD, "parent", image("legacy"));
+    let mut media = image("legacy");
+    media.image_message.as_option_mut().unwrap().jpeg_thumbnail = Some(vec![42; 16 * 1024]);
+    let hd = child(Type::HD_IMAGE_DUAL_UPLOAD, "parent", media);
     feed(
         &store,
         [
@@ -166,7 +168,9 @@ async fn startup_reclassifies_old_rows_once_and_preserves_the_media() {
         .run(|conn| {
             use diesel::connection::SimpleConnection;
             conn.batch_execute(
-                "UPDATE messages SET rendition_parent_id=NULL;
+                "DROP INDEX idx_messages_rendition_parent;
+             ALTER TABLE messages DROP COLUMN rendition_parent_id;
+             DELETE FROM __diesel_schema_migrations WHERE version='20261121100330';
              UPDATE chats SET unread_count=2,last_message_ts=200000,last_message_preview='legacy';
              DELETE FROM chat_store_meta WHERE key='media_renditions'",
             )
@@ -191,4 +195,117 @@ async fn startup_reclassifies_old_rows_once_and_preserves_the_media() {
                 .is_empty()
         );
     }
+}
+
+#[tokio::test]
+async fn recovering_then_deleting_a_child_preserves_its_parents_badge() {
+    let (_db, store) = test_store().await;
+    let peer = jid(PEER);
+    let placeholder = wacore::types::events::UndecryptableMessage::builder()
+        .info(Arc::new(incoming_info(PEER, PEER, "hd", 200)))
+        .is_unavailable(false)
+        .unavailable_type(wacore::types::events::UnavailableType::Unknown)
+        .decrypt_fail_mode(wacore::types::events::DecryptFailMode::Show)
+        .build();
+    feed(
+        &store,
+        [
+            incoming("parent", 100, image("standard")),
+            Event::UndecryptableMessage(placeholder),
+        ],
+    )
+    .await;
+    assert_eq!(store.chat(&peer).await.unwrap().unwrap().unread_count, 2);
+    feed(
+        &store,
+        [incoming(
+            "hd",
+            200,
+            child(Type::HD_IMAGE_DUAL_UPLOAD, "parent", image("HD")),
+        )],
+    )
+    .await;
+    assert_eq!(store.chat(&peer).await.unwrap().unwrap().unread_count, 1);
+    feed(
+        &store,
+        [
+            incoming("hd", 200, image("stale copy")),
+            delete_for_me(peer.clone(), "hd", false, ts(201)),
+        ],
+    )
+    .await;
+    let chat = store.chat(&peer).await.unwrap().unwrap();
+    assert_eq!(chat.unread_count, 1);
+    assert_eq!(chat.last_message_at, Some(ts(100)));
+    assert!(
+        store
+            .media_renditions(&peer, "parent", &peer, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn deleting_the_parent_keeps_the_only_remaining_media_discoverable() {
+    let (_db, store) = test_store().await;
+    let peer = jid(PEER);
+    let hd = child(Type::HD_IMAGE_DUAL_UPLOAD, "parent", image("only copy"));
+    feed(
+        &store,
+        [
+            incoming("parent", 100, image("standard")),
+            incoming("hd", 200, hd.clone()),
+            delete_for_me(peer.clone(), "parent", false, ts(201)),
+        ],
+    )
+    .await;
+    assert!(store.messages(&peer, None, 3).await.unwrap().is_empty());
+    let copies = store
+        .media_renditions(&peer, "parent", &peer, false)
+        .await
+        .unwrap();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(copies[0].message.as_deref(), Some(&hd));
+    assert_eq!(
+        store.pending_media_messages(Some(&peer), 3).await.unwrap()[0].id,
+        "hd"
+    );
+}
+
+#[tokio::test]
+async fn a_renditions_ack_keeps_the_chats_existing_activity_timestamp() {
+    let (_db, store) = test_store().await;
+    let peer = jid(PEER);
+    store
+        .record_outgoing(&peer, "parent", &image("standard"), ts(100))
+        .unwrap();
+    feed(
+        &store,
+        [
+            incoming("latest", 150, image("later")),
+            delete_for_me(peer.clone(), "latest", false, ts(151)),
+        ],
+    )
+    .await;
+    let before = store.chat(&peer).await.unwrap().unwrap();
+    assert_eq!(before.last_message_at, Some(ts(150)));
+    store
+        .record_outgoing(
+            &peer,
+            "hd",
+            &child(Type::HD_IMAGE_DUAL_UPLOAD, "parent", image("HD")),
+            ts(200),
+        )
+        .unwrap();
+    feed(&store, [ack_at("hd", peer.clone(), ts(250))]).await;
+    let copies = store
+        .media_renditions(&peer, "parent", &peer, true)
+        .await
+        .unwrap();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(copies[0].timestamp, ts(250));
+    let after = store.chat(&peer).await.unwrap().unwrap();
+    assert_eq!(after.last_message_at, before.last_message_at);
+    assert_eq!(after.last_message_preview, before.last_message_preview);
 }
