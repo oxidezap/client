@@ -66,6 +66,7 @@ pub(super) fn apply_event(
                 conn,
                 device_id,
                 NewMessage {
+                    rendition_parent_id: None,
                     chat_jid: &chat,
                     msg_id: &undec.info.id,
                     sender_jid: &sender,
@@ -291,6 +292,7 @@ pub(super) fn apply_event(
                         use schema::messages::dsl;
                         let newest: Option<Option<i64>> = dsl::messages
                             .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(&chat)))
+                            .filter(dsl::rendition_parent_id.is_null())
                             .select(diesel::dsl::max(dsl::timestamp_ms))
                             .first(conn)
                             .optional()?;
@@ -423,12 +425,14 @@ pub(super) fn apply_event(
                 #[diesel(sql_type = diesel::sql_types::Bool)]
                 from_me: bool,
                 #[diesel(sql_type = diesel::sql_types::Bool)]
+                rendition: bool,
+                #[diesel(sql_type = diesel::sql_types::Bool)]
                 local_revoke_placeholder: bool,
                 #[diesel(sql_type = diesel::sql_types::BigInt)]
                 timestamp_ms: i64,
             }
             let victim: Victim = diesel::sql_query(
-                "SELECT from_me, local_revoke_placeholder, timestamp_ms FROM messages WHERE device_id = ? AND id = ? LIMIT 1",
+                "SELECT from_me, rendition_parent_id IS NOT NULL AS rendition, local_revoke_placeholder, timestamp_ms FROM messages WHERE device_id = ? AND id = ? LIMIT 1",
             )
             .bind::<diesel::sql_types::Integer, _>(device_id)
             .bind::<diesel::sql_types::BigInt, _>(target.id)
@@ -447,6 +451,7 @@ pub(super) fn apply_event(
                 .bind::<diesel::sql_types::BigInt, _>(target.id)
                 .execute(conn)?;
             if !victim.from_me
+                && !victim.rendition
                 && !victim.local_revoke_placeholder
                 && !read_state(conn, device_id, &chat)?
                     .covers(victim.timestamp_ms, &update.message_id)

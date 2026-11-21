@@ -26,6 +26,7 @@ mod reaction;
 pub(crate) mod read_state;
 mod receipt;
 mod recovery;
+mod renditions;
 pub(crate) mod retirement;
 mod revoke;
 pub(crate) mod shared_history;
@@ -564,6 +565,7 @@ impl ChatStore {
                 .map(|_| ())
                 .map_err(StoreError::Migration)?;
             repair_unknown_message_kinds(conn).map_err(crate::error::db_err)?;
+            renditions::backfill(conn).map_err(crate::error::db_err)?;
             #[cfg(feature = "search")]
             crate::fts::ensure_fts(conn).map_err(db_err)?;
             Ok(())

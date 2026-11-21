@@ -254,6 +254,7 @@ fn apply_history_conversation(
                         .and(msgs::chat_jid.eq(chat.as_str()))
                         .and(msgs::msg_id.eq_any(&before.extra_ids))
                         .and(msgs::from_me.eq(false))
+                        .and(msgs::rendition_parent_id.is_null())
                         .and(msgs::timestamp_ms.le(frontier_ms)),
                 )
                 .select(msgs::msg_id)
@@ -273,6 +274,7 @@ fn apply_history_conversation(
                         .and(msgs::chat_jid.eq(chat.as_str()))
                         .and(msgs::msg_id.eq_any(&before.extra_ids))
                         .and(msgs::from_me.eq(false))
+                        .and(msgs::rendition_parent_id.is_null())
                         .and(msgs::local_revoke_placeholder.eq(false))
                         .and(msgs::timestamp_ms.gt(frontier_ms)),
                 )
@@ -379,6 +381,8 @@ pub(super) fn apply_history_message(
                     conn,
                     device_id,
                     NewMessage {
+                        rendition_parent_id: crate::rendition_parent_key(message)
+                            .and_then(|key| key.id.as_deref()),
                         chat_jid: chat,
                         msg_id,
                         sender_jid: sender,

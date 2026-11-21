@@ -105,13 +105,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
-          # A separate cache from CI's: a different target, a different
-          # toolchain and a rebuilt std share nothing worth restoring.
-          # The root manifest's hash, for the reason spelled out over the
-          # `Check` job: the profiles live there, a profile decides every
-          # dependency's fingerprint, and rust-cache's automatic key does not
-          # hash that file.
-          key: pages-wasm-${{ hashFiles('Cargo.toml') }}
+          # The release bundle uses the same compiler and build command.
+          # Include the root manifest because it defines dependency profiles.
+          shared-key: web-wasm-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
