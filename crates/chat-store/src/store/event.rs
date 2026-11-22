@@ -5,6 +5,7 @@
 use diesel::prelude::*;
 use wacore::stanza::groups::GroupNotificationAction;
 use wacore::types::events::Event;
+use wacore_binary::JidExt;
 use waproto::whatsapp as wa;
 
 use crate::materialize::{KIND_UNDECRYPTABLE, unavailable_kind};
@@ -53,6 +54,11 @@ pub(super) fn apply_event(
             Ok(())
         }
         Event::UndecryptableMessage(undec) => {
+            // A failed status decryption has no content to display. Recovery
+            // will file the decrypted update in the feed.
+            if undec.info.is_status_stanza && !undec.info.source.chat.is_status_broadcast() {
+                return Ok(());
+            }
             let kind = unavailable_kind(undec.unavailable_type).unwrap_or(KIND_UNDECRYPTABLE);
             let chat = route_chat(conn, device_id, undec.info.source.chat.to_string(), cs)?;
             let sender = undec.info.source.sender.to_string();

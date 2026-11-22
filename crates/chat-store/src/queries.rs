@@ -15,11 +15,13 @@ use wacore_binary::jid::{Jid, JidExt};
 use crate::error::{ChatStoreError, Result, db_err};
 use crate::schema;
 use crate::store::ChatStore;
+use crate::store::status_posts::{POSTS, storage_key};
 use crate::types::{
     ArrivalCursor, AvatarDescriptor, ChatArchiveFilter, ChatCursor, ChatEntry,
     ChatNotificationMetadata, ContactEntry, MediaRef, MessageCoverage, MessageCursor, MessageKind,
     MessageStatus, ReactionEntry, ReceiptEntry, StoredMessage,
 };
+use oxidezap_core::{STATUS_BROADCAST_JID, StatusPostKey};
 
 /// A conversation's durable read verdicts at one point in time.
 /// Reuse within an offline batch; live arrivals should request fresh state.
@@ -287,6 +289,12 @@ pub(crate) struct MessageRow {
     _rendition_parent_id: Option<String>,
 }
 
+impl MessageRow {
+    fn same_stanza_id(&self, other: &Self) -> bool {
+        self.msg_id == other.msg_id && (self.chat_jid == POSTS) == (other.chat_jid == POSTS)
+    }
+}
+
 /// Fold an author-equivalent legacy copy for a read without hiding a
 /// tombstone or treating a sender collision as the same message.
 fn fold_read_duplicate(
@@ -410,7 +418,7 @@ fn page_rows_with_copies(
         let mut copies = Vec::new();
         for candidate in candidates
             .iter()
-            .filter(|candidate| candidate.msg_id == row.msg_id && candidate.from_me == row.from_me)
+            .filter(|candidate| candidate.same_stanza_id(row) && candidate.from_me == row.from_me)
         {
             if crate::store::message_identity::authors_match(
                 conn,
@@ -475,7 +483,7 @@ fn push_unique_message(
     incoming_edit_source_id: Option<i64>,
 ) -> std::result::Result<(), wacore::store::error::StoreError> {
     for prior in kept.iter_mut() {
-        if prior.msg_id == row.msg_id
+        if prior.same_stanza_id(&row)
             && crate::store::message_identity::authors_match(
                 conn,
                 device_id,
@@ -529,8 +537,16 @@ impl From<MessageRow> for StoredMessage {
                 .group_membership
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
-            chat_jid: parse_jid(&row.chat_jid),
-            id: row.msg_id,
+            chat_jid: if row.chat_jid == POSTS {
+                Jid::status_broadcast()
+            } else {
+                parse_jid(&row.chat_jid)
+            },
+            id: if row.chat_jid == STATUS_BROADCAST_JID {
+                StatusPostKey::broadcast_feed_id(row.msg_id)
+            } else {
+                row.msg_id
+            },
             sender_jid: parse_jid(&row.sender_jid),
             from_me: row.from_me,
             timestamp: ms_to_utc(row.timestamp_ms).unwrap_or_default(),
@@ -1133,6 +1149,8 @@ fn fill_unique(
     limit: i64,
 ) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
+    let feed_keys = super::store::status_posts::page_keys(keys);
+    let keys = feed_keys.as_deref().unwrap_or(keys);
     let mut kept: Vec<MessageRow> = Vec::new();
     let mut edit_source_ids = std::collections::HashMap::new();
     let mut saw_alias_copies = false;
@@ -1211,6 +1229,8 @@ fn fill_unique_after(
     limit: i64,
 ) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
     use schema::messages::dsl;
+    let feed_keys = super::store::status_posts::page_keys(keys);
+    let keys = feed_keys.as_deref().unwrap_or(keys);
     let mut kept: Vec<MessageRow> = Vec::new();
     let mut edit_source_ids = std::collections::HashMap::new();
     let mut saw_alias_copies = false;
@@ -1829,8 +1849,10 @@ impl ChatStore {
         let messages: Vec<StoredMessage> = self
             .db()
             .read(move |conn| {
+                let (partition, msg_id) =
+                    storage_key(conn, device_id, &chat, &msg_id).map_err(db_err)?;
                 let keys =
-                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                    crate::lid::chat_key_candidates(conn, device_id, partition).map_err(db_err)?;
                 let query = dsl::messages
                     .filter(
                         dsl::device_id
@@ -2450,11 +2472,24 @@ impl ChatStore {
         Ok(self
             .db()
             .read(move |conn| {
-                let keys = crate::lid::chat_key_candidates(conn, device, &chat).map_err(db_err)?;
+                let (partition, parents) = if chat != STATUS_BROADCAST_JID {
+                    (chat.as_str(), vec![id])
+                } else if let Some(key) = StatusPostKey::from_feed_id(&id) {
+                    let ids = crate::store::status_posts::candidate_ids(conn, device, key)
+                        .map_err(db_err)?;
+                    (POSTS, ids)
+                } else {
+                    (
+                        chat.as_str(),
+                        vec![StatusPostKey::broadcast_wire_id(&id).to_owned()],
+                    )
+                };
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device, partition).map_err(db_err)?;
                 let rows = dsl::messages
                     .filter(dsl::device_id.eq(device))
                     .filter(dsl::chat_jid.eq_any(keys))
-                    .filter(dsl::rendition_parent_id.eq(id))
+                    .filter(dsl::rendition_parent_id.eq_any(parents))
                     .filter(dsl::from_me.eq(from_me))
                     .filter(dsl::revoked.eq(false))
                     .order(dsl::id)
@@ -2669,6 +2704,7 @@ impl ChatStore {
                 if let Some(chat) = &chat {
                     let keys =
                         crate::lid::chat_key_candidates(conn, device_id, chat).map_err(db_err)?;
+                    let keys = crate::store::status_posts::page_keys(&keys).unwrap_or(keys);
                     query = query.filter(dsl::chat_jid.eq_any(keys));
                 }
                 let rows: Vec<MessageRow> = query
@@ -2700,9 +2736,11 @@ impl ChatStore {
                             .eq(device_id)
                             .and(diesel::dsl::not(diesel::dsl::exists(
                                 messages::messages.filter(
-                                    messages::device_id
-                                        .eq(device_id)
-                                        .and(messages::chat_jid.eq(chats::jid)),
+                                    messages::device_id.eq(device_id).and(
+                                        messages::chat_jid.eq(chats::jid).or(chats::jid
+                                            .eq(STATUS_BROADCAST_JID)
+                                            .and(messages::chat_jid.eq(POSTS))),
+                                    ),
                                 ),
                             ))),
                     ),

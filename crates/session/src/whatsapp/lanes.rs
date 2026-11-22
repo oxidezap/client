@@ -115,7 +115,8 @@ impl EventLanes {
                     if let Event::Messages(batch) = &*event {
                         for inbound in batch.iter() {
                             let chat = &inbound.info.source.chat;
-                            if (chat.is_group() || chat.is_newsletter())
+                            if !inbound.info.is_status_stanza
+                                && (chat.is_group() || chat.is_newsletter())
                                 && !outcome
                                     .special_chat_jids
                                     .iter()

@@ -705,20 +705,28 @@ fn apply_writer_msg(
             // Ours carry the peer's read tick in this column, so a local view
             // must not set it; and `< READ` is what keeps a second viewing —
             // or a played voice status — from moving anything backwards.
-            let updated = diesel::update(
-                schema::messages::table.filter(
-                    schema::messages::device_id
-                        .eq(device_id)
-                        .and(schema::messages::chat_jid.eq(&chat_str))
-                        .and(schema::messages::msg_id.eq_any(msg_ids.as_slice()))
-                        .and(schema::messages::from_me.eq(false))
-                        .and(
-                            schema::messages::status.lt(wa::web_message_info::Status::READ as i32),
-                        ),
-                ),
-            )
-            .set(schema::messages::status.eq(wa::web_message_info::Status::READ as i32))
-            .execute(conn)?;
+            let mut partitions = std::collections::BTreeMap::<&str, Vec<_>>::new();
+            for id in msg_ids {
+                let (partition, id) =
+                    super::status_posts::storage_key(conn, device_id, &chat_str, id)?;
+                partitions.entry(partition).or_default().push(id);
+            }
+            let mut updated = 0;
+            for (partition, ids) in partitions {
+                for chunk in ids.chunks(crate::queries::BIND_CHUNK) {
+                    use schema::messages::dsl;
+                    updated += diesel::update(
+                        dsl::messages
+                            .filter(dsl::device_id.eq(device_id))
+                            .filter(dsl::chat_jid.eq(partition))
+                            .filter(dsl::msg_id.eq_any(chunk))
+                            .filter(dsl::from_me.eq(false))
+                            .filter(dsl::status.lt(wa::web_message_info::Status::READ as i32)),
+                    )
+                    .set(dsl::status.eq(wa::web_message_info::Status::READ as i32))
+                    .execute(conn)?;
+                }
+            }
             // Same rule as every other write here: an invalidation is a claim
             // that something changed, and re-watching an update changes
             // nothing.

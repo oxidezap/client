@@ -1,11 +1,8 @@
 //! Status updates, grouped by who posted them.
 //!
-//! Every status update on the account arrives in one conversation —
-//! `status@broadcast` — addressed to nobody in particular. Read as a chat that
-//! is nonsense: it has no other party, its "messages" are not to you, and a
-//! reply would not go where the bubble suggests. Read as a feed grouped by
-//! author it is what it actually is, which is why this type exists and why the
-//! broadcast is kept out of the conversation list.
+//! The feed combines broadcast updates with posts delivered in a group's or
+//! contact's status envelope. The latter retain both the origin and the
+//! participant who posted. The broadcast is kept out of the conversation list.
 //!
 //! The grouping holds indices into the message slice rather than copies of it:
 //! a feed is rebuilt whenever the conversation grows, and one rebuild should
@@ -76,7 +73,7 @@ impl StatusFeed {
     /// The clock is a parameter so expiry is something a test can state rather
     /// than something it has to wait for.
     pub fn from_chat_at(chat: &Chat, now: DateTime<Utc>) -> Self {
-        Self::from_messages(&chat.messages, chat, now)
+        Self::from_chat_with_names(chat, now, |_| None)
     }
 
     /// When the next update on screen lapses, so a caller can arrange to
@@ -93,7 +90,13 @@ impl StatusFeed {
             .min()
     }
 
-    fn from_messages(messages: &[ChatMessage], chat: &Chat, now: DateTime<Utc>) -> Self {
+    /// Resolve an origin's label from the caller's chat list when available.
+    pub fn from_chat_with_names(
+        chat: &Chat,
+        now: DateTime<Utc>,
+        origin_name: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        let messages = &chat.messages;
         let mut mine: Option<StatusAuthor> = None;
         // A handful of contacts post on a given day, so a linear scan over the
         // authors found so far beats a map: no hashing, no allocation per
@@ -130,13 +133,23 @@ impl StatusFeed {
                     unseen: 0,
                 })
             } else {
-                let jid = message.sender.as_str();
+                let key = crate::StatusPostKey::from_feed_id(&message.id);
+                // Hydration resolves a contact's PN/LID aliases. A group
+                // remains its own source even when the same contact posted.
+                let jid = key
+                    .as_ref()
+                    .filter(|key| key.origin != key.sender)
+                    .map_or(message.sender.as_str(), |key| key.origin.as_str());
                 match authors.iter().position(|author| author.jid == jid) {
                     Some(at) => &mut authors[at],
                     None => {
                         authors.push(StatusAuthor {
                             jid: jid.to_string(),
-                            name: author_name(message, chat),
+                            name: if jid == message.sender {
+                                author_name(message, chat)
+                            } else {
+                                origin_name(jid).unwrap_or_else(|| jid.to_owned())
+                            },
                             updates: Vec::new(),
                             latest: message.timestamp,
                             unseen: 0,
@@ -271,6 +284,37 @@ mod tests {
     /// real one these tests would start failing a day after they were written.
     fn feed_of(messages: Vec<ChatMessage>) -> StatusFeed {
         StatusFeed::from_chat_at(&broadcast(messages), at(59))
+    }
+
+    #[test]
+    fn a_group_and_its_author_have_separate_status_runs() {
+        let sender = "10000000001@s.whatsapp.net";
+        let group = "120363000000000001@g.us";
+        let post = |origin: &str| {
+            let id = crate::StatusPostKey {
+                origin: origin.into(),
+                sender: sender.into(),
+                id: "same".into(),
+                from_me: false,
+            }
+            .feed_id();
+            update(&id, sender, Some("Contact"), 10, false)
+        };
+        let feed = feed_of(vec![
+            post(group),
+            post(sender),
+            update("same", sender, None, 12, true),
+        ]);
+        assert_eq!(feed.author(group).unwrap().count(), 1);
+        assert_eq!(feed.author(sender).unwrap().count(), 2);
+        assert_eq!(feed.unseen_authors(), 2);
+        assert_eq!(
+            feed.updates_of(feed.author(group).unwrap())
+                .next()
+                .unwrap()
+                .sender,
+            sender
+        );
     }
 
     /// A contact deleting a status they posted an hour ago leaves a row —

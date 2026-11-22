@@ -92,7 +92,7 @@ pub(super) fn apply_edit(
         .on_conflict_do_nothing()
         .execute(conn)?
         > 0;
-    if !inserted {
+    if !inserted || chat == super::status_posts::POSTS {
         return Ok(false);
     }
     // The message DID happen — the chat must exist, order by it and badge it

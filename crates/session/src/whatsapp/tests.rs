@@ -990,6 +990,42 @@ async fn a_live_self_mention_uses_the_sender_push_name() {
 /// The live wire event carries the durable alert decision, not the GUI's
 /// possibly-unhydrated chat row. The first committed message is eligible.
 #[tokio::test]
+async fn status_envelopes_never_emit_live_conversation_bubbles() {
+    let (store, client) = test_session("status-envelope-live").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    for source in [TEST_GROUP, TEST_PEER] {
+        let mut info = live_info(source, TEST_PEER, None, "same-id", 1_700_000_100);
+        info.is_status_stanza = true;
+        WhatsAppClient::handle_inbound_message(
+            &wa::Message::text("status"),
+            &info,
+            &client,
+            &ui_tx,
+            &book_with(&store),
+            true,
+        )
+        .await;
+        assert!(ui_rx.try_recv().is_err());
+        info.is_status_stanza = false;
+        WhatsAppClient::handle_inbound_message(
+            &wa::Message::text("chat"),
+            &info,
+            &client,
+            &ui_tx,
+            &book_with(&store),
+            true,
+        )
+        .await;
+        assert!(
+            matches!(ui_rx.try_recv(), Ok(oxidezap_core::UiEvent::MessageReceived { chat_jid, .. }) if chat_jid == source)
+        );
+    }
+}
+
+#[tokio::test]
 async fn live_message_carries_store_notification_decision() {
     let (chat_store, client) = test_session("notification-policy").await;
     let info = live_info(

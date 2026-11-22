@@ -88,7 +88,7 @@ pub(super) fn apply_revoke(
     // The tombstone may be the chat's first/newest row: the chat must exist
     // and order by it (the deleted message DID happen), and an unseen deletion
     // still counts as unread. A deletion sent here adds no attention.
-    if !inserted {
+    if !inserted || chat == super::status_posts::POSTS {
         return Ok(false);
     }
     let row_id: i64 = dsl::messages

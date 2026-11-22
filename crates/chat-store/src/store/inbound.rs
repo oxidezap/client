@@ -4,6 +4,7 @@
 
 use diesel::prelude::*;
 use wacore::types::events::InboundMessage;
+use wacore_binary::JidExt;
 use waproto::whatsapp as wa;
 
 use crate::materialize::{MessageOp, classify};
@@ -23,8 +24,32 @@ pub(super) fn apply_inbound(
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
     let info = &inbound.info;
-    let chat = route_chat(conn, device_id, info.source.chat.to_string(), cs)?;
     let sender = info.source.sender.to_string();
+    let op = classify(&inbound.message);
+    let status_post = info.is_status_stanza && !info.source.chat.is_status_broadcast();
+    let chat = if status_post {
+        if !matches!(
+            op,
+            MessageOp::Store { .. } | MessageOp::Edit { .. } | MessageOp::Revoke { .. }
+        ) {
+            return Ok(());
+        }
+        super::status_posts::POSTS.to_owned()
+    } else {
+        route_chat(conn, device_id, info.source.chat.to_string(), cs)?
+    };
+    let scoped_id = |conn: &mut SqliteConnection, id: &str, author: &str, from_me: bool| {
+        super::status_posts::resolve_id(
+            conn,
+            device_id,
+            oxidezap_core::StatusPostKey {
+                origin: info.source.chat.to_non_ad_string(),
+                sender: stored_sender(author, false),
+                from_me,
+                id: id.to_owned(),
+            },
+        )
+    };
     let ts_ms = info.timestamp.as_millis();
 
     // Live push names ride on every message; keep contacts warm from them.
@@ -43,7 +68,7 @@ pub(super) fn apply_inbound(
         cs.contacts |= upsert_contact_business_name(conn, device_id, &sender, name)?;
     }
 
-    match classify(&inbound.message) {
+    match op {
         MessageOp::Store { kind, text } => {
             if kind == "history_notice"
                 && !super::shared_history::notice_visible(
@@ -62,15 +87,26 @@ pub(super) fn apply_inbound(
                 crate::storage_proto::storage_bytes_for(conn, device_id, &chat, &inbound.message)?;
             let proto_bytes = stored.bytes;
             let proto_codec = stored.codec;
+            let feed_id = status_post
+                .then(|| scoped_id(conn, &info.id, &sender, info.source.is_from_me))
+                .transpose()?;
             let rendition_parent_id =
                 crate::rendition_parent_key(&inbound.message).and_then(|key| key.id.as_deref());
+            // A wire parent ID can be reused by another origin in the combined feed.
+            let status_parent = if status_post {
+                rendition_parent_id
+                    .map(|id| scoped_id(conn, id, &sender, info.source.is_from_me))
+                    .transpose()?
+            } else {
+                None
+            };
             let inserted = insert_message(
                 conn,
                 device_id,
                 NewMessage {
-                    rendition_parent_id,
+                    rendition_parent_id: status_parent.as_deref().or(rendition_parent_id),
                     chat_jid: &chat,
-                    msg_id: &info.id,
+                    msg_id: feed_id.as_deref().unwrap_or(&info.id),
                     sender_jid: &sender,
                     from_me: info.source.is_from_me,
                     timestamp_ms: ts_ms,
@@ -89,6 +125,12 @@ pub(super) fn apply_inbound(
                 },
                 cs,
             )?;
+            if status_post {
+                if inserted != StoredRow::Skipped && rendition_parent_id.is_none() {
+                    super::status_posts::touch_feed(conn, device_id, ts_ms, cs)?;
+                }
+                return Ok(());
+            }
             // A refreshed row (redelivery, PDO recovery of a placeholder that
             // already counted) must not inflate the unread badge again — and a
             // skipped one (revoked tombstone) must not surface its content in
@@ -128,6 +170,11 @@ pub(super) fn apply_inbound(
             new_proto,
             sender_timestamp_ms,
         } => {
+            let target_id = if status_post {
+                scoped_id(conn, &target_id, &sender, info.source.is_from_me)?
+            } else {
+                target_id
+            };
             if apply_edit(
                 conn,
                 device_id,
@@ -144,7 +191,11 @@ pub(super) fn apply_inbound(
             )? {
                 cs.chats = true;
             }
-            cs.message_chats.insert(chat);
+            if status_post {
+                super::status_posts::touch_feed(conn, device_id, ts_ms, cs)?;
+            } else {
+                cs.message_chats.insert(chat);
+            }
         }
         MessageOp::Revoke {
             target_id,
@@ -156,13 +207,14 @@ pub(super) fn apply_inbound(
             // Only a peer's false bit needs checking against our own PN/LID;
             // linked-device keys already use our account's perspective. A
             // peer's false key without a participant names us in a direct chat.
+            let wire_chat = status_post.then(|| info.source.chat.to_non_ad_string());
             let (target_sender, target_from_me) = if target_from_me {
                 (sender.as_str(), info.source.is_from_me)
             } else {
                 let fallback_author = if info.source.is_from_me
                     && (info.source.chat.is_pn() || info.source.chat.is_lid())
                 {
-                    chat.as_str()
+                    wire_chat.as_deref().unwrap_or(&chat)
                 } else {
                     sender.as_str()
                 };
@@ -172,6 +224,11 @@ pub(super) fn apply_inbound(
                         || own_participant_jids(conn, device_id)?
                             .contains(&stored_sender(author, false)));
                 (author, is_own)
+            };
+            let target_id = if status_post {
+                scoped_id(conn, &target_id, target_sender, target_from_me)?
+            } else {
+                target_id
             };
             if apply_revoke(
                 conn,
@@ -187,7 +244,11 @@ pub(super) fn apply_inbound(
             )? {
                 cs.chats = true;
             }
-            cs.message_chats.insert(chat);
+            cs.message_chats.insert(if status_post {
+                oxidezap_core::STATUS_BROADCAST_JID.to_owned()
+            } else {
+                chat
+            });
         }
         MessageOp::HistoryBundle => {
             super::shared_history::persist(

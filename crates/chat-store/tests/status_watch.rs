@@ -278,3 +278,264 @@ async fn watching_nothing_is_a_no_op() {
         .unwrap();
     chat_store.flush().await.unwrap();
 }
+
+/// Same author and stanza ID can appear in a group, a DM and the broadcast.
+#[tokio::test]
+async fn tagged_statuses_keep_their_origin_and_watched_row() {
+    use oxidezap_core::StatusPostKey;
+    use wacore_binary::builder::NodeBuilder;
+
+    const WIRE_ID: &str = "same/id";
+    const OTHER_GROUP: &str = "120363000000000002@g.us";
+    let (db, store) = test_store().await;
+    let post = |origin: &str| {
+        let node = NodeBuilder::new("status")
+            .attr("from", origin)
+            .attr("participant", PEER)
+            .attr("id", WIRE_ID)
+            .attr("type", "text")
+            .attr("t", "1700000001")
+            .build();
+        let info = wacore::messages::parse_message_info(
+            &node.as_node_ref(),
+            &jid("10000000001@s.whatsapp.net"),
+            None,
+        )
+        .unwrap();
+        assert!(info.is_status_stanza);
+        message_event(wa::Message::text("status"), info)
+    };
+    for origin in [GROUP, PEER, OTHER_GROUP] {
+        feed(
+            &store,
+            [
+                message_event(
+                    wa::Message::text("chat"),
+                    incoming_info(origin, PEER, WIRE_ID, 1_700_000_000),
+                ),
+                post(origin),
+            ],
+        )
+        .await;
+        let chat = store.chat(&jid(origin)).await.unwrap().unwrap();
+        assert_eq!(chat.unread_count, 1);
+        assert_eq!(chat.last_message_preview.as_deref(), Some("chat"));
+        assert_eq!(
+            store.messages(&jid(origin), None, 10).await.unwrap().len(),
+            1
+        );
+    }
+    let broadcast = jid(STATUS_BROADCAST);
+    let rows = store.messages(&broadcast, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(store.unread_total().await.unwrap(), 3);
+    let mut keys = std::collections::HashMap::new();
+    for row in rows {
+        let key = StatusPostKey::from_feed_id(&row.id).unwrap();
+        assert_eq!(row.chat_jid, broadcast);
+        assert_eq!(row.sender_jid, jid(PEER));
+        assert_eq!(key.sender, PEER);
+        assert_eq!(key.id, WIRE_ID);
+        keys.insert(key.origin, row.id);
+    }
+    let group_id = keys[GROUP].clone();
+    // A broadcast sender may even choose the complete local ID of a group post.
+    for id in [WIRE_ID, group_id.as_str()] {
+        feed(
+            &store,
+            [message_event(
+                wa::Message::text("broadcast"),
+                incoming_info(STATUS_BROADCAST, PEER, id, 1_700_000_001),
+            )],
+        )
+        .await;
+    }
+    store
+        .mark_status_watched(&broadcast, vec![group_id.clone()])
+        .unwrap();
+    feed(&store, [post(GROUP)]).await;
+    let reopened = ChatStore::new(&db).await.unwrap();
+    let rows = reopened.pages(vec![(broadcast.clone(), 10)]).await.unwrap();
+    let rows = &rows[STATUS_BROADCAST];
+    assert_eq!(rows.len(), 5);
+    for row in rows {
+        let expected = if row.id == group_id {
+            MessageStatus::Read
+        } else {
+            MessageStatus::Delivered
+        };
+        assert_eq!(row.status, expected, "{}", row.id);
+        assert_eq!(
+            reopened
+                .message(&broadcast, &row.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .seq,
+            row.seq
+        );
+    }
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.text.as_deref() == Some("broadcast"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn status_post_does_not_become_a_group_message() {
+    let (_db, store) = test_store().await;
+    let mut info = incoming_info(GROUP, PEER, "same-id", 1_700_000_000);
+    info.is_status_stanza = true;
+    feed(
+        &store,
+        [message_event(wa::Message::text("group post"), info)],
+    )
+    .await;
+    assert!(
+        store
+            .messages(&jid(GROUP), None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn group_participants_sharing_a_status_id_have_independent_watched_marks() {
+    const OTHER: &str = "10000000002@s.whatsapp.net";
+    let (_db, store) = test_store().await;
+    for (author, own) in [(PEER, false), (OTHER, false), (PEER, true)] {
+        let mut info = incoming_info(GROUP, author, "same", 1_700_000_000);
+        info.source.is_from_me = own;
+        info.is_status_stanza = true;
+        feed(&store, [message_event(wa::Message::text("post"), info)]).await;
+    }
+    let broadcast = jid(STATUS_BROADCAST);
+    let mut before = None;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(row) = store.messages(&broadcast, before, 1).await.unwrap().pop() {
+        before = Some((&row).into());
+        let key = oxidezap_core::StatusPostKey::from_feed_id(&row.id).unwrap();
+        assert!(seen.insert((key.sender.clone(), key.from_me)));
+        if key.sender == PEER {
+            store.mark_status_watched(&broadcast, vec![row.id]).unwrap();
+        }
+    }
+    assert_eq!(seen.len(), 3);
+    store.flush().await.unwrap();
+    let rows = store.messages(&broadcast, None, 10).await.unwrap();
+    for row in rows {
+        let key = oxidezap_core::StatusPostKey::from_feed_id(&row.id).unwrap();
+        assert_eq!(
+            row.status == MessageStatus::Read,
+            key.sender == PEER && !key.from_me
+        );
+    }
+    assert_eq!(store.unread_total().await.unwrap(), 0);
+    assert!(store.chat(&jid(GROUP)).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn status_revoke_uses_the_original_feed_key_across_proven_aliases() {
+    let (db, store) = test_store().await;
+    let status = jid(STATUS_BROADCAST);
+    let tagged = |origin: &str, sender: &str, id: &str, message: wa::Message| {
+        let mut info = incoming_info(origin, sender, id, 1_700_000_000);
+        info.is_status_stanza = true;
+        message_event(message, info)
+    };
+    feed(
+        &store,
+        [
+            message_event(
+                wa::Message::text("chat"),
+                incoming_info(GROUP, PEER, "same", 1_700_000_000),
+            ),
+            tagged(GROUP, PEER, "same", wa::Message::text("group post")),
+            tagged(PEER, PEER, "same", wa::Message::text("contact post")),
+        ],
+    )
+    .await;
+    let first = store.messages(&status, None, 10).await.unwrap();
+    assert_eq!(first.len(), 2);
+    store
+        .mark_status_watched(&status, first.iter().map(|row| row.id.clone()).collect())
+        .unwrap();
+    store.flush().await.unwrap();
+    add_lid_mapping(&db).await;
+    let alias_id = oxidezap_core::StatusPostKey {
+        origin: GROUP.into(),
+        sender: PEER_LID.into(),
+        id: "same".into(),
+        from_me: false,
+    }
+    .feed_id();
+    let found = store.message(&status, &alias_id).await.unwrap().unwrap();
+    assert_eq!(found.status, MessageStatus::Read);
+    assert_eq!(found.sender_jid, jid(PEER));
+    feed(
+        &store,
+        [
+            tagged(GROUP, PEER_LID, "same", wa::Message::text("group post")),
+            tagged(
+                PEER_LID,
+                PEER_LID,
+                "same",
+                wa::Message::text("contact post"),
+            ),
+        ],
+    )
+    .await;
+    let rows = store.messages(&status, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status == MessageStatus::Read));
+    assert_eq!(
+        rows.iter().map(|row| &row.id).collect::<Vec<_>>(),
+        first.iter().map(|row| &row.id).collect::<Vec<_>>()
+    );
+
+    let mut edit_key = wa::MessageKey::default();
+    edit_key.id = Some("same".into());
+    let mut change = wa::message::ProtocolMessage::default();
+    change.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+    change.key = MessageField::some(edit_key);
+    change.edited_message = MessageField::from_box(Box::new(wa::Message::text("edited post")));
+    let mut edit = wa::Message::default();
+    edit.protocol_message = MessageField::some(change);
+    feed(&store, [tagged(GROUP, PEER_LID, "edit", edit)]).await;
+    let edited = store.message(&status, &alias_id).await.unwrap().unwrap();
+    assert_eq!(edited.text.as_deref(), Some("edited post"));
+    assert_eq!(edited.status, MessageStatus::Read);
+
+    feed(
+        &store,
+        [
+            tagged(GROUP, PEER_LID, "revoke", revoke("same")),
+            tagged(GROUP, PEER, "same", wa::Message::text("stale")),
+            tagged(GROUP, PEER_LID, "early-revoke", revoke("later")),
+            tagged(
+                GROUP,
+                PEER,
+                "later",
+                wa::Message::text("arrived after revocation"),
+            ),
+        ],
+    )
+    .await;
+    let rows = store.messages(&status, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let key = oxidezap_core::StatusPostKey::from_feed_id(&row.id).unwrap();
+        assert_eq!(row.revoked, key.origin == GROUP);
+        if row.revoked {
+            assert!(row.message.is_none());
+            assert!(row.text.is_none());
+        }
+    }
+    let ordinary = store.message(&jid(GROUP), "same").await.unwrap().unwrap();
+    assert!(!ordinary.revoked);
+    assert_eq!(ordinary.text.as_deref(), Some("chat"));
+    assert_eq!(store.unread_total().await.unwrap(), 1);
+}

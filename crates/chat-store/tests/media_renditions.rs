@@ -309,3 +309,63 @@ async fn a_renditions_ack_keeps_the_chats_existing_activity_timestamp() {
     assert_eq!(after.last_message_at, before.last_message_at);
     assert_eq!(after.last_message_preview, before.last_message_preview);
 }
+
+#[tokio::test]
+async fn tagged_hd_status_copies_stay_with_their_origin_and_out_of_the_feed() {
+    use oxidezap_core::StatusPostKey;
+
+    let (_, store) = test_store().await;
+    let statuses = jid(oxidezap_core::STATUS_BROADCAST_JID);
+    for origin in [GROUP, PEER] {
+        for (id, at, msg) in [
+            (
+                "hd",
+                200,
+                child(Type::HD_IMAGE_DUAL_UPLOAD, "parent", image(origin)),
+            ),
+            ("parent", 100, image("standard")),
+        ] {
+            let mut info = incoming_info(origin, PEER, id, at);
+            info.is_status_stanza = true;
+            feed(&store, [message_event(msg, info)]).await;
+        }
+        assert!(
+            store
+                .messages(&jid(origin), None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let page = store.messages(&statuses, None, 10).await.unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(
+        store
+            .chat(&statuses)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_message_at,
+        Some(ts(100))
+    );
+    for parent in page {
+        let key = StatusPostKey::from_feed_id(&parent.id).unwrap();
+        assert_eq!(key.id, "parent");
+        let children = store
+            .media_renditions(&statuses, &parent.id, &jid(PEER), false)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        let hd = &children[0];
+        assert_eq!(hd.text.as_deref(), Some(key.origin.as_str()));
+        assert_eq!(StatusPostKey::from_feed_id(&hd.id).unwrap().id, "hd");
+    }
+    assert_eq!(
+        store
+            .pending_media_messages(Some(&statuses), 10)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+}
