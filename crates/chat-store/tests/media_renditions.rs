@@ -122,7 +122,7 @@ async fn orphan_keeps_its_parent_and_media_across_reload_and_history() {
 
 #[test]
 fn dual_upload_types_require_the_matching_media_and_a_parent_key() {
-    use oxidezap_chat_store::{is_control_only, rendition_parent_key};
+    use oxidezap_chat_store::{is_control_only, message_association, rendition_parent_key};
     let mut video = wa::Message::default();
     video.video_message = MessageField::some(Default::default());
     // The live session consults this predicate before building a bubble.
@@ -141,7 +141,18 @@ fn dual_upload_types_require_the_matching_media_and_a_parent_key() {
         assert!(!is_control_only(&child(kind, "image", image("regular"))));
     }
     for kind in [Type::MEDIA_ALBUM, Type::MOTION_PHOTO] {
-        assert!(!is_control_only(&child(kind, "parent", image("distinct"))));
+        let msg = child(kind, "parent", image("distinct"));
+        assert!(!is_control_only(&msg));
+        let assoc = message_association(&msg).expect("association should be exposed");
+        assert_eq!(assoc.association_type, Some(kind));
+        assert_eq!(
+            assoc
+                .parent_message_key
+                .as_option()
+                .and_then(|k| k.id.as_deref()),
+            Some("parent")
+        );
+        assert_eq!(rendition_parent_key(&msg), None);
     }
     assert!(!is_control_only(&child(
         Type::HD_IMAGE_DUAL_UPLOAD,

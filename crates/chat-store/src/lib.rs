@@ -49,8 +49,8 @@ pub mod types;
 pub use contacts_text::shared_contacts_text;
 pub use error::{ChatStoreError, Result, db_err};
 pub use materialize::{
-    is_control_only, message_kind, normalized_message, poll_creation_message, rendition_parent_key,
-    supported_poll_creation_message,
+    is_control_only, message_association, message_kind, normalized_message, poll_creation_message,
+    rendition_parent_key, supported_poll_creation_message,
 };
 pub use queries::MessageReadState;
 pub use store::ChatStore;

@@ -159,11 +159,10 @@ fn message_layers(msg: &wa::Message) -> impl Iterator<Item = &wa::Message> {
     .take(33)
 }
 
-/// Parent key carried by a dual-upload image or video. The engine can deliver
-/// the media unwrapped with its context, or retain context on a carrier.
-pub fn rendition_parent_key(msg: &wa::Message) -> Option<&wa::MessageKey> {
-    use wa::message_association::AssociationType as Type;
-    let association = message_layers(msg)
+/// Association carried on any message layer, such as media albums, motion
+/// photos, or dual-upload renditions.
+pub fn message_association(msg: &wa::Message) -> Option<&wa::MessageAssociation> {
+    message_layers(msg)
         .filter_map(|layer| {
             layer
                 .message_context_info
@@ -171,7 +170,14 @@ pub fn rendition_parent_key(msg: &wa::Message) -> Option<&wa::MessageKey> {
                 .message_association
                 .as_option()
         })
-        .last()?;
+        .last()
+}
+
+/// Parent key carried by a dual-upload image or video. The engine can deliver
+/// the media unwrapped with its context, or retain context on a carrier.
+pub fn rendition_parent_key(msg: &wa::Message) -> Option<&wa::MessageKey> {
+    use wa::message_association::AssociationType as Type;
+    let association = message_association(msg)?;
     let base = normalized_message(msg);
     let media_matches = match association.association_type? {
         Type::HD_IMAGE_DUAL_UPLOAD => base.image_message.is_set(),
