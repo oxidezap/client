@@ -72,7 +72,7 @@ async fn a_view_moves_only_incoming_rows_in_the_chat_it_names() {
             ..Default::default()
         },
         id: "MINE".into(),
-        timestamp: ts(1_700_000_000),
+        timestamp: sdk_timestamp(ts(1_700_000_000)),
         ..Default::default()
     };
     feed(
@@ -202,7 +202,7 @@ async fn a_redelivered_pin_buys_no_reload() {
         Event::PinUpdate(
             wacore::types::events::PinUpdate::builder()
                 .jid(jid(PEER))
-                .timestamp(ts(ts_secs))
+                .timestamp(sdk_timestamp(ts(ts_secs)))
                 .action(Box::new({
                     let mut constructed: wa::sync_action_value::PinAction = Default::default();
                     constructed.pinned = Some(true);

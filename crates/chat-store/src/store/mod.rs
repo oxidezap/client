@@ -983,7 +983,11 @@ impl ChatStore {
             .maybe_participant_jid(participant)
             .message_id(target_id.to_owned())
             .from_me(from_me)
-            .timestamp(timestamp)
+            .timestamp(
+                wacore::Timestamp::from_millis(timestamp.timestamp_millis()).ok_or_else(|| {
+                    StoreError::Validation("delete timestamp is outside the SDK range".into())
+                })?,
+            )
             .action(Box::new({
                 let mut constructed: wa::sync_action_value::DeleteMessageForMeAction =
                     Default::default();

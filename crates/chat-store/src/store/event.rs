@@ -48,7 +48,7 @@ pub(super) fn apply_event(
             if let AckApplied::Deferrable(chat) =
                 apply_server_ack_with_operations(conn, device_id, ack, cs, deferred)?
             {
-                deferred.defer(ack, chat, wacore::time::now_utc().timestamp_millis());
+                deferred.defer(ack, chat, wacore::time::now_millis());
             }
             Ok(())
         }
@@ -65,7 +65,7 @@ pub(super) fn apply_event(
                     msg_id: &undec.info.id,
                     sender_jid: &sender,
                     from_me: undec.info.source.is_from_me,
-                    timestamp_ms: undec.info.timestamp.timestamp_millis(),
+                    timestamp_ms: undec.info.timestamp.as_millis(),
                     kind,
                     text: None,
                     proto: None,
@@ -87,7 +87,7 @@ pub(super) fn apply_event(
                     &chat,
                     ChatBump {
                         msg_id: &undec.info.id,
-                        ts_ms: undec.info.timestamp.timestamp_millis(),
+                        ts_ms: undec.info.timestamp.as_millis(),
                         preview: None,
                         kind: Some(kind),
                         unread_delta: i32::from(!undec.info.source.is_from_me),
@@ -173,7 +173,7 @@ pub(super) fn apply_event(
                 .action
                 .pinned
                 .unwrap_or(false)
-                .then(|| update.timestamp.timestamp_millis());
+                .then(|| update.timestamp.as_millis());
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             crate::store::chat_rows::ensure_preference_chat(conn, device_id, &chat)?;
             // Only when it is news, the same rule the subject change already
@@ -295,7 +295,7 @@ pub(super) fn apply_event(
                         // stale replay resurrects a badge this read cleared.
                         let watermark = newest
                             .flatten()
-                            .unwrap_or_else(|| update.timestamp.timestamp_millis());
+                            .unwrap_or_else(|| update.timestamp.as_millis());
                         advance_read_state(conn, device_id, &chat, watermark, &[])?
                     }
                 };

@@ -93,7 +93,7 @@ async fn zero_unmutes_and_malformed_mute_does_not_replace_durable_state() {
             [Event::MuteUpdate(
                 wacore::types::events::MuteUpdate::builder()
                     .jid(jid(PEER))
-                    .timestamp(ts(1_700_000_000))
+                    .timestamp(sdk_timestamp(ts(1_700_000_000)))
                     .action(Box::new({
                         let mut action = wa::sync_action_value::MuteAction::default();
                         action.muted = Some(true);
@@ -233,7 +233,7 @@ async fn late_channel_metadata_rejects_aba_and_same_value_decisions() {
                     [Event::MuteUpdate(
                         wacore::types::events::MuteUpdate::builder()
                             .jid(jid(CHANNEL))
-                            .timestamp(ts(1_700_000_000))
+                            .timestamp(sdk_timestamp(ts(1_700_000_000)))
                             .action(Box::new({
                                 let mut action = wa::sync_action_value::MuteAction::default();
                                 action.muted = Some(muted);
@@ -358,7 +358,7 @@ async fn preference_only_rows_accept_initial_history_unread_and_manual_markers()
                     [Event::MuteUpdate(
                         wacore::types::events::MuteUpdate::builder()
                             .jid(jid(chat))
-                            .timestamp(ts(1_700_000_000))
+                            .timestamp(sdk_timestamp(ts(1_700_000_000)))
                             .action(Box::new({
                                 let mut action = wa::sync_action_value::MuteAction::default();
                                 action.muted = Some(true);
@@ -468,7 +468,7 @@ async fn self_receipts_establish_unread_ownership_before_initial_history() {
                 [Event::MuteUpdate(
                     wacore::types::events::MuteUpdate::builder()
                         .jid(jid(PEER))
-                        .timestamp(ts(1_700_000_000))
+                        .timestamp(sdk_timestamp(ts(1_700_000_000)))
                         .action(Box::new({
                             let mut action = wa::sync_action_value::MuteAction::default();
                             action.muted = Some(true);
@@ -544,7 +544,7 @@ async fn late_metadata_does_not_resurrect_a_deleted_revision_zero_channel() {
             wacore::types::events::DeleteChatUpdate::builder()
                 .jid(jid(CHANNEL))
                 .delete_media(false)
-                .timestamp(ts(1_700_000_100))
+                .timestamp(sdk_timestamp(ts(1_700_000_100)))
                 .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
                 .from_full_sync(false)
                 .build(),

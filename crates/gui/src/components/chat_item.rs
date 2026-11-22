@@ -176,7 +176,7 @@ fn render_name_row(
         )
         .children(
             row.muted_until
-                .filter(|until| *until > wacore::time::now_utc())
+                .filter(|until| *until > oxidezap_core::time::now_utc())
                 .map(|_| {
                     div()
                         .flex_shrink_0()

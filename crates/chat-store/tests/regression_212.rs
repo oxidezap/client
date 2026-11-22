@@ -466,7 +466,7 @@ async fn marked_unread_history_keeps_marker_through_seed() {
 #[tokio::test]
 async fn future_dated_history_row_does_not_reopen_phone_read_chat() {
     let (store, chat_store) = test_store().await;
-    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let future_secs = (wacore::time::now_millis() / 1000) as u64 + 3_600;
     feed(
         &chat_store,
         [history_sync_event({
@@ -623,7 +623,7 @@ async fn upgrade_repair_merging_incoming_duplicates_without_marker_keeps_zero() 
 #[tokio::test]
 async fn oversized_future_snapshot_keeps_phone_read_zero() {
     let (store, chat_store) = test_store().await;
-    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let future_secs = (wacore::time::now_millis() / 1000) as u64 + 3_600;
     let messages: Vec<wa::HistorySyncMsg> = (0..300)
         .map(|n| {
             let mut constructed: wa::HistorySyncMsg = Default::default();
@@ -691,7 +691,7 @@ async fn seed_does_not_evict_existing_keyed_coverage() {
         .unwrap();
     // Another phone-read snapshot with one future row: no room beside the
     // kept ids, so the seed refuses rather than evicting them.
-    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let future_secs = (wacore::time::now_millis() / 1000) as u64 + 3_600;
     feed(
         &chat_store,
         [history_sync_event({
@@ -732,7 +732,7 @@ async fn seed_does_not_evict_existing_keyed_coverage() {
 #[tokio::test]
 async fn sweep_covers_future_rows_for_later_merges() {
     let (store, chat_store) = test_store().await;
-    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let future_secs = (wacore::time::now_millis() / 1000) as u64 + 3_600;
     feed(
         &chat_store,
         [history_sync_event({
@@ -786,7 +786,7 @@ async fn sweep_covers_future_rows_for_later_merges() {
     let watermark = read_boundary_ms(&store, PEER).await;
     assert!(watermark > 0, "the sweep backfills a baseline");
     assert!(
-        watermark <= wacore::time::now_utc().timestamp_millis(),
+        watermark <= wacore::time::now_millis(),
         "the baseline never outruns the local clock"
     );
     assert!(
@@ -829,7 +829,7 @@ async fn sweep_covers_future_rows_for_later_merges() {
 #[tokio::test]
 async fn oversized_legacy_snapshot_seeds_nothing_at_all() {
     let (store, chat_store) = test_store().await;
-    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let future_secs = (wacore::time::now_millis() / 1000) as u64 + 3_600;
     let messages: Vec<wa::HistorySyncMsg> = (0..300)
         .map(|n| {
             let mut constructed: wa::HistorySyncMsg = Default::default();
@@ -934,7 +934,7 @@ async fn seed_counts_capacity_after_pruning_implied_ids() {
         .unwrap();
     // One more future row: every kept id falls below the new frontier, so
     // the advance prunes them and room remains for the new coverage.
-    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let future_secs = (wacore::time::now_millis() / 1000) as u64 + 3_600;
     feed(
         &chat_store,
         [history_sync_event({
@@ -975,7 +975,7 @@ async fn seed_counts_capacity_after_pruning_implied_ids() {
 #[tokio::test]
 async fn seed_frees_only_ids_without_a_newer_row() {
     let (store, chat_store) = test_store().await;
-    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let future_secs = (wacore::time::now_millis() / 1000) as u64 + 3_600;
     // One id in two rows straddling any frontier: an old copy and a future
     // one, side by side before any mapping proves them one message.
     feed(
@@ -1086,7 +1086,7 @@ async fn seed_frees_only_ids_without_a_newer_row() {
 #[tokio::test]
 async fn outgoing_twins_do_not_occupy_read_coverage_room() {
     let (store, chat_store) = test_store().await;
-    let future_secs = (wacore::time::now_utc().timestamp_millis() / 1000) as u64 + 3_600;
+    let future_secs = (wacore::time::now_millis() / 1000) as u64 + 3_600;
     // One id in two directions: an incoming copy below any frontier and an
     // own copy above it. Coverage only ever badges incoming traffic, so the
     // outgoing twin must not keep the id occupying room.
@@ -1291,7 +1291,7 @@ async fn deleted_lid_full_repair_merges_duplicate_without_losing_phone_read_coun
 #[tokio::test]
 async fn local_revoke_placeholders_do_not_exhaust_history_read_coverage() {
     let (store, chat_store) = test_store().await;
-    let future = wacore::time::now_utc() + chrono::Duration::hours(1);
+    let future = oxidezap_core::time::now_utc() + chrono::Duration::hours(1);
     for n in 0..257 {
         chat_store
             .record_revoke_target(

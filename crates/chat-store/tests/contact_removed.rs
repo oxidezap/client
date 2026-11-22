@@ -8,7 +8,7 @@ fn contact_update(jid: &str, full_name: &str, first_name: &str) -> Event {
     Event::ContactUpdate(
         ContactUpdate::builder()
             .jid(jid.parse().expect("test JID"))
-            .timestamp(ts(1_700_000_100))
+            .timestamp(sdk_timestamp(ts(1_700_000_100)))
             .action(Box::new({
                 let mut constructed: wa::sync_action_value::ContactAction = Default::default();
                 constructed.full_name = Some(full_name.to_owned());
@@ -24,7 +24,7 @@ fn contact_removed(jid: &str) -> Event {
     Event::ContactRemoved(
         ContactRemoved::builder()
             .jid(jid.parse().expect("test JID"))
-            .timestamp(ts(1_700_000_200))
+            .timestamp(sdk_timestamp(ts(1_700_000_200)))
             .from_full_sync(false)
             .build(),
     )

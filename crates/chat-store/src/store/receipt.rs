@@ -24,7 +24,7 @@ pub(super) fn apply_receipt(
     // pipeline and the receipt echo need the full JID, so a companion device
     // acking a DM arrives as `user:48@lid`. Rows are keyed bare.
     let chat = receipt.source.chat.to_non_ad_string();
-    let ts_ms = receipt.timestamp.timestamp_millis();
+    let ts_ms = receipt.timestamp.as_millis();
     let message_ids: Vec<String> = receipt
         .message_ids
         .iter()

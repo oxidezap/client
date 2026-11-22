@@ -66,7 +66,7 @@ async fn rejected_inbound_preserves_preceding_local_writes_and_causal_order() {
     handler.handle_event(Arc::new(Event::PinUpdate(
         PinUpdate::builder()
             .jid(chat.clone())
-            .timestamp(ts(1_700_000_040))
+            .timestamp(sdk_timestamp(ts(1_700_000_040)))
             .action(Box::new({
                 let mut constructed: wa::sync_action_value::PinAction = Default::default();
                 constructed.pinned = Some(true);
@@ -78,7 +78,7 @@ async fn rejected_inbound_preserves_preceding_local_writes_and_causal_order() {
     handler.handle_event(Arc::new(Event::ContactUpdate(
         ContactUpdate::builder()
             .jid(chat.clone())
-            .timestamp(ts(1_700_000_050))
+            .timestamp(sdk_timestamp(ts(1_700_000_050)))
             .action(Box::new({
                 let mut constructed: wa::sync_action_value::ContactAction = Default::default();
                 constructed.full_name = Some("Synthetic Contact".into());
@@ -446,7 +446,7 @@ async fn ordinary_event_rollback_retains_mixed_writes_and_blocks_later_batches()
     handler.handle_event(Arc::new(Event::PinUpdate(
         PinUpdate::builder()
             .jid(chat.clone())
-            .timestamp(ts(1_700_000_040))
+            .timestamp(sdk_timestamp(ts(1_700_000_040)))
             .action(Box::new({
                 let mut constructed: wa::sync_action_value::PinAction = Default::default();
                 constructed.pinned = Some(true);
@@ -458,7 +458,7 @@ async fn ordinary_event_rollback_retains_mixed_writes_and_blocks_later_batches()
     handler.handle_event(Arc::new(Event::ContactUpdate(
         ContactUpdate::builder()
             .jid(chat.clone())
-            .timestamp(ts(1_700_000_050))
+            .timestamp(sdk_timestamp(ts(1_700_000_050)))
             .action(Box::new({
                 let mut constructed: wa::sync_action_value::ContactAction = Default::default();
                 constructed.full_name = Some("Synthetic Retained Contact".into());

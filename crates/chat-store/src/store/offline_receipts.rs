@@ -29,7 +29,7 @@ pub(super) fn retain(
     timestamp: i64,
 ) -> QueryResult<()> {
     use diesel::query_dsl::methods::FilterDsl;
-    let now = wacore::time::now_utc().timestamp_millis();
+    let now = wacore::time::now_millis();
     diesel::insert_into(pending::table)
         .values((
             pending::device_id.eq(device),
@@ -56,7 +56,7 @@ pub(super) fn retain(
 
 /// Enforce retention once per batch, after matching available outgoing rows.
 pub(super) fn prune(conn: &mut SqliteConnection, device: i32) -> QueryResult<()> {
-    let now = wacore::time::now_utc().timestamp_millis();
+    let now = wacore::time::now_millis();
     diesel::sql_query(
         "DELETE FROM offline_receipts WHERE device_id = ? AND \
         (received_at_ms < ? OR rowid IN (SELECT rowid FROM offline_receipts \
@@ -91,7 +91,7 @@ pub(super) fn apply(
             pending::received_at_ms,
         ))
         .load::<(String, String, String, i32, i64, i64)>(conn)?;
-    let cutoff = wacore::time::now_utc().timestamp_millis() - RETENTION_MS;
+    let cutoff = wacore::time::now_millis() - RETENTION_MS;
     for (wire_chat, id, user, status, timestamp, received) in rows {
         let owner = messages::table
             .filter(messages::device_id.eq(device))

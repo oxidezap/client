@@ -364,7 +364,7 @@ async fn server_nack_does_not_reconcile_timestamp() {
                 .id("OUT-NACK-CLOCK".to_string())
                 .class("message".to_string())
                 .from(chat.clone())
-                .timestamp(ts(1_700_000_500))
+                .timestamp(sdk_timestamp(ts(1_700_000_500)))
                 .error("479".to_string())
                 .build(),
         )],
@@ -411,7 +411,7 @@ async fn server_ack_disambiguates_reused_message_id_by_chat() {
             ServerAck::builder()
                 .id(shared_id.to_string())
                 .class("message".to_string())
-                .timestamp(server_timestamp)
+                .timestamp(sdk_timestamp(server_timestamp))
                 .build(),
         )],
     )

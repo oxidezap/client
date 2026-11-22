@@ -264,7 +264,7 @@ async fn chatless_ack_collision_between_a_row_and_another_chats_operation_is_ref
             .id("CHATLESS-COLLISION".to_string())
             .class("message".to_string())
             .maybe_error(rejected.then(|| "403".to_string()))
-            .timestamp(ts(1_700_000_042))
+            .timestamp(sdk_timestamp(ts(1_700_000_042)))
             .build();
         feed(&chat_store, [Event::ServerAck(answer)]).await;
         let row = chat_store
@@ -292,7 +292,7 @@ async fn distinct_early_ack_answers_keep_arrival_order_and_timestamp_corrections
                         .class("message".to_string())
                         .from(chat.clone())
                         .maybe_error(error.map(str::to_owned))
-                        .timestamp(ts(1_700_000_010 + i as i64))
+                        .timestamp(sdk_timestamp(ts(1_700_000_010 + i as i64)))
                         .build(),
                 )
             })

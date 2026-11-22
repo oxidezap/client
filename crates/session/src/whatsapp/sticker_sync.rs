@@ -42,7 +42,7 @@ impl EventHandler for StickerSync {
         let Event::FavoriteStickerUpdate(update) = &*event else {
             return;
         };
-        let timestamp = update.timestamp.timestamp_millis();
+        let timestamp = update.timestamp.as_millis();
         let mut entries = self
             .entries
             .lock()
