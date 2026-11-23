@@ -126,6 +126,23 @@ impl Bridge {
                 });
                 None
             }
+            Action::StatusMutes { id, answer_to } => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let task = client.status_mutes();
+                oxidezap_session::spawn(async move {
+                    let result = match task.await {
+                        Ok(Ok(jids)) => Ok(DaemonMessage::StatusMutes { id, jids }),
+                        other => mutation_answer(id, other),
+                    };
+                    answer_now(&answer_to, answered(id, result));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
             Action::SyncedStickers {
                 id,
                 favorites,
@@ -1572,6 +1589,7 @@ impl Bridge {
             | Action::RevokeMessage { .. }
             | Action::PublishStatus { .. }
             | Action::PublishStatusMedia { .. }
+            | Action::StatusMutes { .. }
             | Action::SyncedStickers { .. }
             | Action::ReuseComposerMedia { .. } => {
                 unreachable!("addressed actions are handled in begin_slow")

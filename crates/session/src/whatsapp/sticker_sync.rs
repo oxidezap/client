@@ -294,3 +294,77 @@ mod tests {
         assert!(sync.message(&hash).is_none());
     }
 }
+
+/// Whose status updates this account has muted, as the phone said so.
+///
+/// Learned from the `userStatusMute` app-state action, which arrives with a
+/// snapshot of the collection that carries it. Kept here rather than in the
+/// store: it is a short list, and the next snapshot replays it.
+#[derive(Default)]
+pub(super) struct StatusMuteSync {
+    muted: Mutex<BTreeMap<String, bool>>,
+    loaded: tokio::sync::Mutex<bool>,
+}
+
+impl EventHandler for StatusMuteSync {
+    fn interest(&self) -> EventInterest {
+        EventInterest::of(&[EventKind::UserStatusMuteUpdate])
+    }
+
+    fn handle_event(&self, event: Arc<Event>) {
+        let Event::UserStatusMuteUpdate(update) = &*event else {
+            return;
+        };
+        self.muted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(update.jid.to_non_ad_string(), update.muted);
+    }
+}
+
+impl WhatsAppClient {
+    /// The addresses whose status updates are muted, in both of their
+    /// identities where the mapping is known: a status arrives from a LID and
+    /// a mute may have been made on a phone number.
+    pub fn status_mutes(&self) -> Task<Result<Vec<String>, String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            let live = session.lock().await.clone().ok_or("no session yet")?;
+            let sync = &live.status_mutes;
+            {
+                let mut loaded = sync.loaded.lock().await;
+                if !*loaded {
+                    let report = live
+                        .client
+                        .resync_app_state([WAPatchName::RegularHigh], AppStateResyncMode::Snapshot)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if !report.synced.contains(&WAPatchName::RegularHigh) {
+                        return Err("WhatsApp did not provide the status mutes".into());
+                    }
+                    *loaded = true;
+                }
+            }
+            let muted: Vec<String> = sync
+                .muted
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .filter(|(_, muted)| **muted)
+                .map(|(jid, _)| jid.clone())
+                .collect();
+            let mut all = std::collections::BTreeSet::new();
+            for jid in muted {
+                if let Ok(parsed) = jid.parse::<whatsapp_rust::wacore_binary::jid::Jid>()
+                    && let Ok(Some(entry)) = live.client.get_lid_pn_entry(&parsed).await
+                {
+                    all.insert(format!("{}@lid", entry.lid));
+                    all.insert(format!("{}@s.whatsapp.net", entry.phone_number));
+                }
+                all.insert(jid);
+            }
+            log::info!("{} addresses have their status updates muted", all.len());
+            Ok(all.into_iter().collect())
+        })
+    }
+}

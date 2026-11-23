@@ -76,6 +76,11 @@ impl StatusFeed {
         Self::from_chat_with_names(chat, now, |_| None)
     }
 
+    /// Drop the authors `keep` says no to. Our own updates are never dropped.
+    pub fn retain_authors(&mut self, keep: impl Fn(&StatusAuthor) -> bool) {
+        self.authors.retain(keep);
+    }
+
     /// When the next update on screen lapses, so a caller can arrange to
     /// redraw then rather than leaving a ring standing over nothing.
     ///
@@ -347,6 +352,19 @@ mod tests {
 
         assert!(feed.author("a@s.whatsapp.net").is_none());
         assert_eq!(feed.unseen_authors(), 0, "no ring for a deleted update");
+    }
+
+    #[test]
+    fn dropping_an_author_leaves_the_others_and_their_unseen_count() {
+        let mut feed = feed_of(vec![
+            update("a", "a@s.whatsapp.net", Some("Ana"), 10, false),
+            update("b", "b@s.whatsapp.net", Some("Bo"), 11, false),
+        ]);
+        feed.retain_authors(|author| author.jid != "a@s.whatsapp.net");
+
+        assert!(feed.author("a@s.whatsapp.net").is_none());
+        assert!(feed.author("b@s.whatsapp.net").is_some());
+        assert_eq!(feed.unseen_authors(), 1, "no ring for who was dropped");
     }
 
     #[test]

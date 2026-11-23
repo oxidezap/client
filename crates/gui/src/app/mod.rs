@@ -1065,6 +1065,8 @@ pub struct WhatsAppApp {
     status_pane: StatusPane,
     status_reply: Option<status::StatusReply>,
     status_post: Option<status::StatusPost>,
+    /// Addresses whose status updates the account has muted.
+    status_muted: std::collections::HashSet<String>,
     /// The broadcast grouped by author, against the message count it was
     /// built from.
     status_feed_cache: RefCell<Option<(usize, oxidezap_core::StatusFeed)>>,
@@ -1547,6 +1549,7 @@ impl WhatsAppApp {
             status_pane: StatusPane::default(),
             status_reply: None,
             status_post: None,
+            status_muted: Default::default(),
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
             chat_filter: ChatFilter::default(),

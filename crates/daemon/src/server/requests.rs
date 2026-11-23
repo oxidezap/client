@@ -103,6 +103,22 @@ pub(super) async fn handle_request(
         ClientRequest::SendText(request) => {
             acted(dispatch(hub, commands, Action::SendText(*request)).await)
         }
+        ClientRequest::StatusMutes => {
+            let id = match addressed(id, "status mutes need an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::StatusMutes {
+                    id,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
         ClientRequest::SyncedStickers { favorites } => {
             let id = match addressed(id, "sticker sync needs an id to answer under") {
                 Ok(id) => id,

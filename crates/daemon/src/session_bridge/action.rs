@@ -24,6 +24,10 @@ use oxidezap_ipc::{CallAction, RequestId};
 #[derive(Debug)]
 pub enum Action {
     SendText(oxidezap_ipc::SendText),
+    StatusMutes {
+        id: RequestId,
+        answer_to: Outbox,
+    },
     SyncedStickers {
         id: RequestId,
         favorites: bool,

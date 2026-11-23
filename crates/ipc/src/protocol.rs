@@ -425,6 +425,8 @@ pub enum DaemonMessage {
         id: RequestId,
         items: Vec<oxidezap_core::PickerSticker>,
     },
+    /// The addresses whose status updates the account has muted.
+    StatusMutes { id: RequestId, jids: Vec<String> },
     /// Device work answered only to the front end that requested it.
     CallDevices {
         id: RequestId,
@@ -1039,6 +1041,9 @@ pub enum ClientRequest {
     SyncedStickers {
         favorites: bool,
     },
+    /// Whose status updates the account has muted. Answered by
+    /// [`DaemonMessage::StatusMutes`].
+    StatusMutes,
     ReuseComposerMedia {
         source: Option<String>,
         message_id: String,
@@ -2113,6 +2118,10 @@ mod tests {
                     quoted: None,
                 })),
                 r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-2","kind":"document","mime_type":"application/pdf","file_name":"nota.pdf","local_id":null}"#.to_string(),
+            ),
+            (
+                ClientRequest::StatusMutes,
+                r#"{"request":"status_mutes"}"#.to_string(),
             ),
             (
                 ClientRequest::ShutdownUnlessOtherWindows,

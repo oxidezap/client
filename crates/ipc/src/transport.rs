@@ -293,7 +293,9 @@ use std::path::PathBuf;
 /// the file had been staged.
 ///
 /// 44 adds the Composer plugin slot to published widget trees and actions.
-pub const PROTOCOL_VERSION: u32 = 44;
+///
+/// 45 adds `StatusMutes`, which an older daemon would refuse as malformed.
+pub const PROTOCOL_VERSION: u32 = 45;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///
