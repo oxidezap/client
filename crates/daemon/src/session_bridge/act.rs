@@ -132,13 +132,17 @@ impl Bridge {
                     return None;
                 };
                 let task = client.status_mutes();
+                // Accepted now, answered later: the first answer waits on a
+                // snapshot from the server, and the connection that asked is
+                // held in `handle_request` until this reply, so waiting for
+                // the snapshot stopped its events and later requests.
+                let _ = reply.send(CommandOutcome::Accepted);
                 oxidezap_session::spawn(async move {
                     let result = match task.await {
                         Ok(Ok(jids)) => Ok(DaemonMessage::StatusMutes { id, jids }),
                         other => mutation_answer(id, other),
                     };
                     answer_now(&answer_to, answered(id, result));
-                    let _ = reply.send(CommandOutcome::Accepted);
                     drop(permit);
                 });
                 None

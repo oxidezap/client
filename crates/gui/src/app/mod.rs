@@ -2330,6 +2330,9 @@ impl WhatsAppApp {
         // epoch nothing had bumped, and send the old account's note from the
         // newly paired one.
         self.leave_connected_view(Some(window), cx);
+        // Mutes belong to the account; keep them across a reconnect of the same
+        // one, but never show one account's to the next.
+        self.status_muted.clear();
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.incoming_file_reading = false;
         self.paste_preview = None;
@@ -3194,6 +3197,11 @@ impl WhatsAppApp {
                         app.avatar_manager.flush_demands(&client);
                         app.client = Some(client);
                         app.resume_visible_read(cx);
+                        // A daemon that attaches while Status is already open
+                        // has not been asked yet.
+                        if app.destination == Destination::Status {
+                            app.refresh_status_mutes(cx);
+                        }
                         if let Ok((control, control_rx)) = control {
                             // Its frames answer through the control session's
                             // own request table; the reader just has to keep
