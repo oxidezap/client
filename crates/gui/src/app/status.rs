@@ -238,6 +238,9 @@ impl WhatsAppApp {
             self.cancel_status_post(cx);
             self.leave_shown_status();
         }
+        if destination == Destination::Status {
+            self.refresh_status_mutes(cx);
+        }
         if self.destination.has_conversations() {
             self.destination_selections
                 .insert(self.destination.id(), self.selected_destination_jid());
@@ -277,7 +280,40 @@ impl WhatsAppApp {
     /// Cached against the message count and dropped by the same invalidation
     /// that drops the chat list's: one pass over the updates per change, not
     /// one per frame.
+    /// The feed without anyone whose status updates the account has muted.
+    /// Applied after the cache, because a mute changes without a message
+    /// arriving.
     pub fn status_feed(&self) -> StatusFeed {
+        let mut feed = self.unfiltered_status_feed();
+        feed.retain_authors(|author| !self.status_muted.contains(&author.jid));
+        feed
+    }
+
+    /// Ask the daemon whose status updates are muted. Asked each time Status is
+    /// opened, and only then: the first answer is a snapshot of the collection
+    /// the phone keeps chat mutes and pins in, which is not worth fetching for
+    /// a window that never looks at Status. Free once the daemon has it.
+    pub fn refresh_status_mutes(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        let answer = client.status_mutes();
+        cx.spawn(async move |app, cx| {
+            match answer.await {
+                Ok(Ok(jids)) => {
+                    let _ = app.update(cx, |app, cx| {
+                        app.status_muted = jids.into_iter().collect();
+                        cx.notify();
+                    });
+                }
+                Ok(Err(failure)) => log::debug!("status mutes unavailable: {failure}"),
+                Err(_) => {}
+            };
+        })
+        .detach();
+    }
+
+    fn unfiltered_status_feed(&self) -> StatusFeed {
         let chat = self.chats.iter().find(|chat| chat.is_status);
         let count = chat.map_or(0, |chat| chat.messages.len());
 

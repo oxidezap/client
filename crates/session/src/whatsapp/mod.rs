@@ -339,6 +339,7 @@ pub(crate) struct Session {
     /// sightings, so a locally created special-chat row is not left nameless.
     resolve_chat_names: chat_names::ChatNameResolveSignal,
     stickers: Arc<sticker_sync::StickerSync>,
+    status_mutes: Arc<sticker_sync::StatusMuteSync>,
 }
 
 /// Where the one session lives: `None` until it is open, and `None` again the
@@ -1223,8 +1224,13 @@ impl WhatsAppClient {
         // book, a send that had the client but nothing recording it.
         let stickers = Arc::new(sticker_sync::StickerSync::default());
         bot.client().subscribe_handler(stickers.clone()).detach();
+        let status_mutes = Arc::new(sticker_sync::StatusMuteSync::default());
+        bot.client()
+            .subscribe_handler(status_mutes.clone())
+            .detach();
         let live = Arc::new(Session {
             stickers,
+            status_mutes,
             client: bot.client(),
             chat_store: chat_store.clone(),
             names: Arc::new(NameBook::new(Some(chat_store))),

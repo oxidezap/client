@@ -381,6 +381,13 @@ impl<'a> Frames<'a> {
                     None => debug!("a plugin listing arrived for {id}, which nobody is waiting on"),
                 }
             }
+            DaemonMessage::StatusMutes { id, jids } => match take_pending(self.pending, id) {
+                Some(Awaiting::StatusMutes(tx)) => {
+                    let _ = tx.send(Ok(jids));
+                }
+                Some(waiting) => self.fail(waiting, &Failure::permanent("unexpected status mutes")),
+                None => debug!("status mutes arrived for a cancelled request"),
+            },
             DaemonMessage::SyncedStickers { id, items } => match take_pending(self.pending, id) {
                 Some(Awaiting::SyncedStickers(tx)) => {
                     let _ = tx.send(Ok(items));

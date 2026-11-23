@@ -310,6 +310,7 @@ type SyncedStickers = Vec<oxidezap_core::PickerSticker>;
 
 enum Awaiting {
     SyncedStickers(oneshot::Sender<Result<SyncedStickers, Failure>>),
+    StatusMutes(oneshot::Sender<Result<Vec<String>, Failure>>),
     Account(oneshot::Sender<Result<oxidezap_core::AccountId, String>>),
     /// A message mutation whose result must reach the action that opened it.
     Mutation(oneshot::Sender<Result<(), Failure>>),
@@ -396,6 +397,7 @@ impl Awaiting {
             Self::Mutation(tx) => tx.is_closed(),
             Self::StagedMutation { tx, .. } => tx.is_closed(),
             Self::SyncedStickers(tx) => tx.is_closed(),
+            Self::StatusMutes(tx) => tx.is_closed(),
             Self::Download(tx) => tx.is_closed(),
             Self::Storage(tx) => tx.is_closed(),
             Self::CallDevices(tx) => tx.is_closed(),
@@ -436,6 +438,9 @@ impl Awaiting {
                 let _ = tx.send(Err(detail.to_string()));
             }
             Self::SyncedStickers(tx) => {
+                let _ = tx.send(Err(failure.clone()));
+            }
+            Self::StatusMutes(tx) => {
                 let _ = tx.send(Err(failure.clone()));
             }
             Self::Mutation(tx) => {
@@ -1153,6 +1158,13 @@ impl SessionHandle {
             ClientRequest::SyncedStickers { favorites },
             Awaiting::SyncedStickers(tx),
         );
+        rx
+    }
+
+    /// Whose status updates this account has muted.
+    pub fn status_mutes(&self) -> oneshot::Receiver<Result<Vec<String>, Failure>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(ClientRequest::StatusMutes, Awaiting::StatusMutes(tx));
         rx
     }
 
