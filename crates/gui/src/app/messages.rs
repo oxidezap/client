@@ -118,6 +118,7 @@ pub struct BubbleIds {
     pub react: SharedString,
     pub reply: SharedString,
     pub copy: SharedString,
+    pub forward: SharedString,
     /// The optional edited indicator beside the time.
     pub edited: SharedString,
     /// The button a failed send grows.
@@ -135,6 +136,7 @@ impl BubbleIds {
             react: format!("react-{id}").into(),
             reply: format!("reply-{id}").into(),
             copy: format!("copy-{id}").into(),
+            forward: format!("forward-{id}").into(),
             edited: format!("edited-{id}").into(),
             retry: format!("retry-{id}").into(),
         }
@@ -321,6 +323,7 @@ mod tests {
                         is_preparing: false,
                         saved_document_path: None,
                         reaction_picker_open: false,
+                        selecting: None,
                     };
                     render_message_bubble(props, self.app.clone(), layout, cx)
                 }))

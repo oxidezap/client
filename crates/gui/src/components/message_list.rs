@@ -322,6 +322,9 @@ fn render_row(
                     || app.is_document_downloading(message_id),
                 saved_document_path: app.saved_document_path(message_id),
                 reaction_picker_open: app.reaction_picker_for() == Some(message_id.as_str()),
+                selecting: app
+                    .selection()
+                    .map(|selected| selected.contains(message_id)),
                 is_preparing: app.is_audio_preparing(message_id),
             };
 

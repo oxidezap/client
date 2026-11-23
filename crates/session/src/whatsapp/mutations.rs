@@ -374,38 +374,34 @@ impl WhatsAppClient {
     ) -> Task<Result<SendId, String>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
-            let source: Jid = source_chat_jid
-                .parse()
-                .map_err(|_| "not a chat address".to_string())?;
-            let target: Jid = target_chat_jid
-                .parse()
-                .map_err(|_| "not a chat address".to_string())?;
-            let Some(live) = session.lock().await.clone() else {
-                return Err("no session yet".to_string());
-            };
-            let stored = live
-                .chat_store
-                .message(&source, &message_id)
-                .await
-                .map_err(|e| format!("database query failed: {e}"))?
-                .ok_or_else(|| "message not found".to_string())?;
-            let Some(proto) = stored.message.map(|boxed| *boxed) else {
-                return Err("that message has no forwardable content".to_string());
-            };
-            let result = live
-                .client
-                .forward_message(target.clone(), &proto)
-                .await
-                .map_err(|e| e.to_string())?;
-            if let Err(error) = live
-                .chat_store
-                .record_operation(&target, result.message_id.as_str())
-            {
-                log::warn!(
-                    "message was forwarded but its acknowledgement could not be tracked: {error}"
-                );
+            forward_one(&session, &source_chat_jid, &message_id, &target_chat_jid).await
+        })
+    }
+
+    /// Forward several stored messages, in the order given, to one chat.
+    ///
+    /// Stops at the first one that fails and says how many had gone, so a
+    /// half-forwarded selection is reported as exactly that.
+    pub fn forward_messages(
+        &self,
+        source_chat_jid: String,
+        message_ids: Vec<String>,
+        target_chat_jid: String,
+    ) -> Task<Result<(), String>> {
+        let session = self.session.clone();
+        self.exec.spawn(async move {
+            for (sent, id) in message_ids.iter().enumerate() {
+                forward_one(&session, &source_chat_jid, id, &target_chat_jid)
+                    .await
+                    .map_err(|error| {
+                        if sent == 0 {
+                            error
+                        } else {
+                            format!("forwarded {sent} of {}, then: {error}", message_ids.len())
+                        }
+                    })?;
             }
-            Ok(result.message_id.into_string())
+            Ok(())
         })
     }
 
@@ -821,4 +817,42 @@ mod mute_deadline_tests {
         assert_eq!(super::mute_deadline_ms(1000, u64::MAX), None);
         assert_eq!(super::mute_deadline_ms(i64::MAX, 1), None);
     }
+}
+
+async fn forward_one(
+    session: &super::SessionSlot,
+    source_chat_jid: &str,
+    message_id: &str,
+    target_chat_jid: &str,
+) -> Result<SendId, String> {
+    let source: Jid = source_chat_jid
+        .parse()
+        .map_err(|_| "not a chat address".to_string())?;
+    let target: Jid = target_chat_jid
+        .parse()
+        .map_err(|_| "not a chat address".to_string())?;
+    let Some(live) = session.lock().await.clone() else {
+        return Err("no session yet".to_string());
+    };
+    let stored = live
+        .chat_store
+        .message(&source, message_id)
+        .await
+        .map_err(|e| format!("database query failed: {e}"))?
+        .ok_or_else(|| "message not found".to_string())?;
+    let Some(proto) = stored.message.map(|boxed| *boxed) else {
+        return Err("that message has no forwardable content".to_string());
+    };
+    let result = live
+        .client
+        .forward_message(target.clone(), &proto)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = live
+        .chat_store
+        .record_operation(&target, result.message_id.as_str())
+    {
+        log::warn!("message was forwarded but its acknowledgement could not be tracked: {error}");
+    }
+    Ok(result.message_id.into_string())
 }

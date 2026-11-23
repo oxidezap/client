@@ -951,6 +951,51 @@ async fn status_media_post_names_its_staged_file_and_audience_and_needs_an_id() 
 }
 
 #[tokio::test]
+async fn a_forward_is_dispatched_in_order_and_refused_when_empty_or_too_long() {
+    let hub = connected_hub();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let forward = |ids: Vec<String>| Request {
+        id: Some(9),
+        request: ClientRequest::ForwardMessages {
+            source: "15550001111@s.whatsapp.net".into(),
+            message_ids: ids,
+            target: "15550002222@s.whatsapp.net".into(),
+        },
+    };
+
+    for ids in [
+        Vec::new(),
+        (0..=oxidezap_ipc::MAX_FORWARD_MESSAGES)
+            .map(|n| n.to_string())
+            .collect(),
+    ] {
+        let refused = handle_request(forward(ids), &hub, &no_plugins(), &commands, &outbox()).await;
+        assert!(
+            refused.frame.is_some(),
+            "an empty or oversized forward is refused"
+        );
+    }
+
+    let answer = handle_request(
+        forward(vec!["B".into(), "A".into()]),
+        &hub,
+        &no_plugins(),
+        &commands,
+        &outbox(),
+    )
+    .await;
+    assert!(answer.frame.is_none(), "the forward has not completed yet");
+    let Action::ForwardMessages {
+        id, message_ids, ..
+    } = taken.await.unwrap().unwrap()
+    else {
+        panic!("expected a forward");
+    };
+    assert_eq!(id, 9);
+    assert_eq!(message_ids, ["B", "A"], "the order given is the order sent");
+}
+
+#[tokio::test]
 async fn gui_message_mutations_require_an_answer_id() {
     let hub = connected_hub();
     let (commands, _taken) = bridge(CommandOutcome::Accepted);

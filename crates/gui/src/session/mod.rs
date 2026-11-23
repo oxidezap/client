@@ -1186,6 +1186,25 @@ impl SessionHandle {
         rx
     }
 
+    /// Forward messages from `source` to `target`, in the order given.
+    pub fn forward_messages(
+        &self,
+        source: String,
+        message_ids: Vec<String>,
+        target: String,
+    ) -> oneshot::Receiver<Result<(), Failure>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::ForwardMessages {
+                source,
+                message_ids,
+                target,
+            },
+            Awaiting::Mutation(tx),
+        );
+        rx
+    }
+
     pub fn publish_status(
         &self,
         text: String,

@@ -159,6 +159,38 @@ pub(super) async fn handle_request(
             )
             .await
         }
+        ClientRequest::ForwardMessages {
+            source,
+            message_ids,
+            target,
+        } => {
+            let id = match addressed(id, "a forward needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            // Trust boundary: a client does not get to queue an unbounded send.
+            if message_ids.is_empty() || message_ids.len() > oxidezap_ipc::MAX_FORWARD_MESSAGES {
+                return acted(Err(ProtocolError::Malformed {
+                    detail: format!(
+                        "a forward carries 1 to {} messages",
+                        oxidezap_ipc::MAX_FORWARD_MESSAGES
+                    ),
+                }));
+            }
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::ForwardMessages {
+                    id,
+                    source,
+                    message_ids,
+                    target,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
         ClientRequest::PublishStatus { text, recipients } => {
             let id = match addressed(id, "a status post needs an id to answer under") {
                 Ok(id) => id,

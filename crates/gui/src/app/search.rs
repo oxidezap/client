@@ -169,6 +169,10 @@ impl Search {
             });
             let _ = app.update(cx, |app, cx| {
                 app.invalidate_chat_cache();
+                // A search only sees the chats this window holds, and the list
+                // is loaded a page at a time as it is scrolled. Typing in it
+                // is a request to look through all of them.
+                app.want_every_chat_for_search(cx);
                 cx.notify();
             });
         }));

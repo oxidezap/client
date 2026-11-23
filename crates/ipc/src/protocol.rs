@@ -855,6 +855,9 @@ pub struct PublishStatusMedia {
     pub recipients: Vec<String>,
 }
 
+/// The most messages one forward request may carry.
+pub const MAX_FORWARD_MESSAGES: usize = 100;
+
 /// Put a `.wasm` in the daemon's plugin folder. See
 /// [`ClientRequest::InstallPlugin`].
 ///
@@ -1047,6 +1050,13 @@ pub enum ClientRequest {
     ReuseComposerMedia {
         source: Option<String>,
         message_id: String,
+        target: String,
+    },
+    /// Forward messages from one chat to another, in the order given. At most
+    /// [`MAX_FORWARD_MESSAGES`] at a time.
+    ForwardMessages {
+        source: String,
+        message_ids: Vec<String>,
         target: String,
     },
     PublishStatus {
@@ -2122,6 +2132,14 @@ mod tests {
             (
                 ClientRequest::StatusMutes,
                 r#"{"request":"status_mutes"}"#.to_string(),
+            ),
+            (
+                ClientRequest::ForwardMessages {
+                    source: "559900000001@s.whatsapp.net".into(),
+                    message_ids: vec!["A1".into(), "A2".into()],
+                    target: "120363000000000000@g.us".into(),
+                },
+                r#"{"request":"forward_messages","source":"559900000001@s.whatsapp.net","message_ids":["A1","A2"],"target":"120363000000000000@g.us"}"#.to_string(),
             ),
             (
                 ClientRequest::ShutdownUnlessOtherWindows,

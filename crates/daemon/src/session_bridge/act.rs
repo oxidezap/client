@@ -188,6 +188,26 @@ impl Bridge {
                 });
                 None
             }
+            Action::ForwardMessages {
+                id,
+                source,
+                message_ids,
+                target,
+                answer_to,
+            } => {
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let task = client.forward_messages(source, message_ids, target);
+                oxidezap_session::spawn(async move {
+                    let result = mutation_answer(id, task.await);
+                    answer_now(&answer_to, answered(id, result));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
             Action::PublishStatus {
                 id,
                 text,
@@ -1591,6 +1611,7 @@ impl Bridge {
             Action::Wire { .. }
             | Action::EditMessage { .. }
             | Action::RevokeMessage { .. }
+            | Action::ForwardMessages { .. }
             | Action::PublishStatus { .. }
             | Action::PublishStatusMedia { .. }
             | Action::StatusMutes { .. }

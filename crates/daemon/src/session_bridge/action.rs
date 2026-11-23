@@ -40,6 +40,13 @@ pub enum Action {
         target: String,
         answer_to: Outbox,
     },
+    ForwardMessages {
+        id: RequestId,
+        source: String,
+        message_ids: Vec<String>,
+        target: String,
+        answer_to: Outbox,
+    },
     PublishStatus {
         id: RequestId,
         text: String,
