@@ -425,7 +425,7 @@ fn draw_scheduled_list(
 fn draw(queue: &Result<Queue, &'static str>, notice: &str) {
     let editing = read_edit_draft();
     let repeat_daily = read_repeat_daily();
-    ui::publish::<16384>(|ui| {
+    ui::publish::<32768>(|ui| {
         ui.section(ui::slot::COMPOSER, "Schedule a message", |section| {
             section.datetime("when", "Send time", "", true);
             section.toggle("repeat_daily", "Repeat daily", repeat_daily, true);
