@@ -45,12 +45,17 @@ fn rfc3339_or_str_equal(a: Option<&str>, b: &str) -> bool {
 fn acknowledge_datetime_publication(committed: &mut VecDeque<String>, value: &str) -> bool {
     let Some(pos) = committed
         .iter()
-        .rposition(|commit| rfc3339_or_str_equal(Some(commit), value))
+        .position(|commit| rfc3339_or_str_equal(Some(commit), value))
     else {
         return false;
     };
     committed.drain(..=pos);
     true
+}
+
+fn datetime_commit_is_redundant(last_sent: Option<&str>, published: &str, sent: &str) -> bool {
+    rfc3339_or_str_equal(Some(published), sent)
+        && last_sent.is_none_or(|last| rfc3339_or_str_equal(Some(last), sent))
 }
 
 /// One text field a plugin published, and what is currently typed in it.
@@ -652,7 +657,7 @@ impl WhatsAppApp {
             }
             let sent = entry.state.to_rfc3339().unwrap_or_default();
             let last_sent = entry.committed.back().map(String::as_str);
-            let redundant = rfc3339_or_str_equal(last_sent.or(Some(&entry.published)), &sent);
+            let redundant = datetime_commit_is_redundant(last_sent, &entry.published, &sent);
             let out = if can_dispatch && !redundant {
                 entry.committed.push_back(sent.clone());
                 Some(sent)
@@ -1031,7 +1036,10 @@ type PluginFields = IndexMap<FieldKey, PluginField>;
 mod tests {
     use std::collections::VecDeque;
 
-    use super::{PluginSlot, PluginSurface, Plugins, acknowledge_datetime_publication, key};
+    use super::{
+        PluginSlot, PluginSurface, Plugins, acknowledge_datetime_publication,
+        datetime_commit_is_redundant, key,
+    };
 
     fn surface(id: &str) -> PluginSurface {
         PluginSurface {
@@ -1126,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_acknowledges_the_latest_matching_datetime_commit() {
+    fn publication_acknowledges_the_oldest_matching_datetime_commit() {
         let mut committed = VecDeque::from([
             "2026-11-26T10:00:00Z".to_string(),
             "2026-11-26T11:00:00Z".to_string(),
@@ -1137,6 +1145,26 @@ mod tests {
             &mut committed,
             "2026-11-26T10:00:00Z"
         ));
-        assert!(committed.is_empty());
+        assert_eq!(
+            committed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["2026-11-26T11:00:00Z", "2026-11-26T10:00:00+00:00"]
+        );
+        assert!(acknowledge_datetime_publication(
+            &mut committed,
+            "2026-11-26T11:00:00Z"
+        ));
+        assert_eq!(
+            committed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["2026-11-26T10:00:00+00:00"]
+        );
+    }
+
+    #[test]
+    fn a_stale_pending_value_does_not_suppress_a_correction() {
+        assert!(!datetime_commit_is_redundant(
+            Some("2026-11-26T10:00:00Z"),
+            "2026-11-26T11:00:00Z",
+            "2026-11-26T10:00:00+00:00"
+        ));
     }
 }
