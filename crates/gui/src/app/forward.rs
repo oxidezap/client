@@ -290,11 +290,16 @@ fn remove_sent_prefix(ids: &mut Vec<String>, selection: &mut BTreeSet<String>, s
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use gpui::AppContext as _;
+    use oxidezap_core::fixtures;
     use std::collections::BTreeSet;
 
     use oxidezap_ipc::ProtocolError;
 
     use super::remove_sent_prefix;
+    use crate::app::{AppState, Chat, WhatsAppApp};
 
     #[test]
     fn partial_forward_progress_survives_protocol_error_conversion() {
@@ -329,5 +334,59 @@ mod tests {
             .filter(|id| selection.contains(id))
             .collect::<Vec<_>>();
         assert_eq!(reopened_ids, ids);
+    }
+
+    #[gpui::test]
+    fn cancel_and_reopen_after_partial_forward_uses_only_unsent_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_app_identity("org.oxidezap.test", "OxideZap Test");
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            super::super::init_app_bindings(cx);
+        });
+        let jid = "15550001111@s.whatsapp.net".to_string();
+        let ids = ["forward-first", "forward-second", "forward-third"];
+        let _window = cx.open_window(gpui::size(gpui::px(800.), gpui::px(600.)), |window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.app_state = AppState::Connected;
+                let mut chat = Chat::new(jid.clone());
+                chat.messages = ids
+                    .iter()
+                    .map(|id| fixtures::message(id, fixtures::PEER, id))
+                    .collect();
+                app.chats.push(Arc::new(chat));
+                app.selected_chat = Some(jid.clone());
+                app.forward_selection = Some(ids.iter().map(|id| (*id).to_string()).collect());
+                app.forward_selection_source = Some(jid.clone());
+                app
+            });
+
+            let selected = ids.iter().map(|id| (*id).to_string()).collect();
+            app.update(cx, |app, cx| app.begin_forward(selected, window, cx));
+            app.update(cx, |app, cx| {
+                {
+                    let pick = app.forward_pick.as_mut().expect("picker opened");
+                    assert_eq!(pick.ids, ids);
+                    remove_sent_prefix(
+                        &mut pick.ids,
+                        app.forward_selection.as_mut().expect("selection held"),
+                        1,
+                    );
+                }
+                app.cancel_forward(cx);
+                assert!(app.forward_pick.is_none());
+
+                let remaining = app.forward_selection.clone().expect("selection kept");
+                app.begin_forward(remaining, window, cx);
+                assert_eq!(
+                    app.forward_pick.as_ref().expect("picker reopened").ids,
+                    ["forward-second", "forward-third"]
+                );
+            });
+            gpui_component::Root::new(app, window, cx)
+        });
     }
 }
