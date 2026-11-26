@@ -42,6 +42,17 @@ fn rfc3339_or_str_equal(a: Option<&str>, b: &str) -> bool {
     }
 }
 
+fn acknowledge_datetime_publication(committed: &mut VecDeque<String>, value: &str) -> bool {
+    let Some(pos) = committed
+        .iter()
+        .rposition(|commit| rfc3339_or_str_equal(Some(commit), value))
+    else {
+        return false;
+    };
+    committed.drain(..=pos);
+    true
+}
+
 /// One text field a plugin published, and what is currently typed in it.
 pub struct PluginField {
     pub state: Entity<InputState>,
@@ -357,13 +368,7 @@ impl Plugins {
             match self.datetimes.get_mut(&k) {
                 Some(held) if held.published != dt.value => {
                     held.published.clone_from(&dt.value);
-                    if let Some(pos) = held
-                        .committed
-                        .iter()
-                        .position(|c| rfc3339_or_str_equal(Some(c.as_str()), &dt.value))
-                    {
-                        held.committed.drain(..=pos);
-                    } else {
+                    if !acknowledge_datetime_publication(&mut held.committed, &dt.value) {
                         // A publication that matches none of our in-flight commits
                         // is an authoritative plugin value (e.g. a corrected time).
                         held.committed.clear();
@@ -1024,7 +1029,9 @@ type PluginFields = IndexMap<FieldKey, PluginField>;
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginSlot, PluginSurface, Plugins, key};
+    use std::collections::VecDeque;
+
+    use super::{PluginSlot, PluginSurface, Plugins, acknowledge_datetime_publication, key};
 
     fn surface(id: &str) -> PluginSurface {
         PluginSurface {
@@ -1116,5 +1123,20 @@ mod tests {
             header("a@s.whatsapp.net", "b@s.whatsapp.net/note"),
             header("a@s.whatsapp.net/b@s.whatsapp.net", "note"),
         );
+    }
+
+    #[test]
+    fn publication_acknowledges_the_latest_matching_datetime_commit() {
+        let mut committed = VecDeque::from([
+            "2026-11-26T10:00:00Z".to_string(),
+            "2026-11-26T11:00:00Z".to_string(),
+            "2026-11-26T10:00:00+00:00".to_string(),
+        ]);
+
+        assert!(acknowledge_datetime_publication(
+            &mut committed,
+            "2026-11-26T10:00:00Z"
+        ));
+        assert!(committed.is_empty());
     }
 }
