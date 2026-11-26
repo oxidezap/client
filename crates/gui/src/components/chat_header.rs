@@ -26,6 +26,18 @@ fn is_callable_user(jid: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract the display phone number from a PN JID (e.g. `5511999999999@s.whatsapp.net` -> `+5511999999999`).
+///
+/// Returns `None` for non-PN JIDs (groups, LIDs, newsletters, status, etc.).
+fn phone_number_from_jid(jid: &str) -> Option<String> {
+    let parsed = jid.parse::<wacore_binary::jid::Jid>().ok()?;
+    if parsed.is_pn() && !parsed.user.is_empty() {
+        Some(format!("+{}", parsed.user))
+    } else {
+        None
+    }
+}
+
 /// How many names a group's line carries before it starts counting instead.
 ///
 /// A line that named everybody would be a paragraph in a bar one line tall,
@@ -405,13 +417,24 @@ fn render_overflow_menu(
         let video_jid = jid.clone();
         let jid = jid.clone();
 
-        let menu = menu.item(
+        let mut menu = menu.item(
             PopupMenuItem::new(crate::tr!(SearchInConversation))
                 .icon(IconName::Search)
                 .on_click(move |_, window, cx| {
                     search_entity.update(cx, |app, cx| app.toggle_conversation_search(window, cx));
                 }),
         );
+
+        if let Some(phone) = phone_number_from_jid(&jid) {
+            let copy_phone = phone.clone();
+            menu = menu.item(
+                PopupMenuItem::new(phone)
+                    .icon(Icon::from(ProductIcon::Phone))
+                    .on_click(move |_, _window, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_phone.clone()));
+                    }),
+            );
+        }
 
         if !callable {
             return menu;
@@ -468,6 +491,18 @@ mod tests {
             jid: "group@g.us".to_string(),
             members,
         }
+    }
+
+    #[test]
+    fn phone_number_from_jid_extracts_pn_only() {
+        assert_eq!(
+            phone_number_from_jid("5511999999999@s.whatsapp.net"),
+            Some("+5511999999999".to_string())
+        );
+        assert_eq!(phone_number_from_jid("12345678901234@lid"), None);
+        assert_eq!(phone_number_from_jid("1234567890-123456@g.us"), None);
+        assert_eq!(phone_number_from_jid("status@broadcast"), None);
+        assert_eq!(phone_number_from_jid("not-a-jid"), None);
     }
 
     fn group_with(members: usize) -> Chat {
