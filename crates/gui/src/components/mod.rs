@@ -6,6 +6,7 @@ mod chat_header;
 mod chat_item;
 mod chat_list;
 mod conversation_search;
+pub mod datetime_picker;
 mod emoji_picker;
 mod empty_state;
 mod icons;

@@ -3,8 +3,18 @@ use oxidezap_plugin::{
     Action, Caps, Declared, Event, Kinds, Outcome, Setup, Which, now_ms, plugin, ui,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 
 plugin!(init = setup, event = handle, panic = own);
+
+#[derive(Clone)]
+struct EditDraft {
+    id: u64,
+    text: String,
+    when: String,
+}
+
+static EDIT_DRAFT: Mutex<Option<EditDraft>> = Mutex::new(None);
 
 const STORE: &str = "messages";
 const TICK: i64 = 1;
@@ -106,8 +116,83 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         .and_then(|id| id.parse::<u64>().ok())
     {
         queue.jobs.retain(|job| job.id != id);
+        let mut draft = EDIT_DRAFT.lock().unwrap_or_else(|e| e.into_inner());
+        if draft.as_ref().is_some_and(|d| d.id == id) {
+            *draft = None;
+        }
+        drop(draft);
         save(queue, true)?;
         return Ok("Removed from the schedule.");
+    }
+    if let Some(id) = id
+        .as_str()
+        .strip_prefix("edit-")
+        .and_then(|id| id.parse::<u64>().ok())
+    {
+        let Some(job) = queue.jobs.iter().find(|j| j.id == id && !j.attempting) else {
+            return Err("Scheduled message is no longer editable.");
+        };
+        let when = DateTime::<Utc>::from_timestamp_millis(job.at)
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_default();
+        let mut draft = EDIT_DRAFT.lock().unwrap_or_else(|e| e.into_inner());
+        *draft = Some(EditDraft {
+            id,
+            text: job.text.clone(),
+            when,
+        });
+        return Ok("");
+    }
+    match id.as_str() {
+        "edit-message" => {
+            let value = action.value_into::<4096>();
+            if let Some(text) = value.whole() {
+                let mut draft = EDIT_DRAFT.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(d) = draft.as_mut() {
+                    d.text = text.to_owned();
+                }
+            }
+            return Ok("");
+        }
+        "edit-when" => {
+            let value = action.value_into::<256>();
+            if let Some(when) = value.whole() {
+                let mut draft = EDIT_DRAFT.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(d) = draft.as_mut() {
+                    d.when = when.to_owned();
+                }
+            }
+            return Ok("");
+        }
+        "discard-edit" => {
+            *EDIT_DRAFT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return Ok("");
+        }
+        "save-edit" => {
+            let draft_val = EDIT_DRAFT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .ok_or("No scheduled message is being edited.")?;
+            if draft_val.text.trim().is_empty() || draft_val.text.len() > MAX_MESSAGE {
+                return Err("Enter a message of up to 512 bytes.");
+            }
+            let at = deadline(&draft_val.when, now_ms())
+                .ok_or("Enter a future time within one year.")?;
+            let Some(job) = queue
+                .jobs
+                .iter_mut()
+                .find(|j| j.id == draft_val.id && !j.attempting)
+            else {
+                return Err("Scheduled message is no longer editable.");
+            };
+            job.text = draft_val.text;
+            job.at = at;
+            save(queue, true)?;
+            *EDIT_DRAFT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return Ok("Scheduled message updated.");
+        }
+        _ => {}
     }
     if !chat_supported(jid) {
         return Err("Open a direct conversation or group to schedule a message.");
@@ -210,16 +295,12 @@ fn handle(event: &Event) {
 }
 
 fn draw(queue: &Result<Queue, &'static str>, notice: &str) {
+    let editing = EDIT_DRAFT.lock().unwrap_or_else(|e| e.into_inner()).clone();
     ui::publish::<16384>(|ui| {
         ui.section(ui::slot::COMPOSER, "Schedule a message", |section| {
             section.field("message", "Message (up to 512 bytes)", "", true);
-            section.field(
-                "when",
-                "Minutes from now or RFC 3339 date with offset",
-                "",
-                true,
-            );
-            section.button("schedule", "Schedule");
+            section.datetime("when", "Send time", "", true);
+            section.button("schedule", "Schedule Send");
             if !notice.is_empty() {
                 section.label(notice);
             }
@@ -244,6 +325,18 @@ fn draw(queue: &Result<Queue, &'static str>, notice: &str) {
                     .unwrap_or_default();
                 section.label(&format!("{} · {}", job.jid, when));
                 section.label(&job.text);
+                if !job.attempting {
+                    if let Some(draft) = editing.as_ref().filter(|d| d.id == job.id) {
+                        section.field("edit-message", "Message", &draft.text, true);
+                        section.datetime("edit-when", "Send time", &draft.when, true);
+                        section.row(|row| {
+                            row.button("save-edit", "Save");
+                            row.button("discard-edit", "Discard");
+                        });
+                    } else {
+                        section.button(&format!("edit-{}", job.id), "Edit scheduled message");
+                    }
+                }
                 let label = if job.attempting {
                     "Dismiss unconfirmed send"
                 } else {
@@ -377,5 +470,32 @@ mod tests {
         assert_eq!(deadline("1970-01-01T01:01:00+01:00", 0), Some(60_000));
         assert_eq!(deadline("1970-01-01T00:01:00", 0), None);
         assert_eq!(deadline("-1", 0), None);
+    }
+
+    #[test]
+    fn composer_uses_datetime_picker_and_jobs_can_be_edited() {
+        *EDIT_DRAFT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let mut host = Host::new();
+        host.init(setup);
+        let tree = host.ui().unwrap().unwrap();
+        let composer = tree
+            .iter()
+            .find(|node| node.slot == ui::slot::COMPOSER)
+            .expect("composer root");
+        assert!(composer.children.iter().any(|node| node.kind
+            == oxidezap_plugin::abi::ui::kind::DATE_TIME
+            && node.id == "when"));
+
+        host.set_now_ms(1_000);
+        schedule(&mut host, CHAT, "10");
+        host.deliver(In::action("edit-1", ""), handle);
+        host.deliver(In::action("edit-message", "updated hello"), handle);
+        host.deliver(In::action("edit-when", "1970-01-01T00:05:00Z"), handle);
+        host.deliver(In::action("save-edit", ""), handle);
+
+        let saved: Queue = serde_json::from_str(&host.stored(STORE).unwrap()).unwrap();
+        assert_eq!(saved.jobs.len(), 1);
+        assert_eq!(saved.jobs[0].text, "updated hello");
+        assert_eq!(saved.jobs[0].at, 300_000);
     }
 }

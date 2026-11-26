@@ -44,13 +44,17 @@ pub enum PluginWidget {
     Row,
     Column,
     Section,
+    DateTime,
 }
 
 impl PluginWidget {
     /// Whether using this produces an action the plugin hears about.
     #[must_use]
     pub fn is_interactive(self) -> bool {
-        matches!(self, Self::Button | Self::Toggle | Self::TextField)
+        matches!(
+            self,
+            Self::Button | Self::Toggle | Self::TextField | Self::DateTime
+        )
     }
 }
 

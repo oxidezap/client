@@ -1366,6 +1366,47 @@ pub mod ui {
             );
         }
 
+        /// A date and time picker. Its value is an RFC 3339 timestamp with offset.
+        pub fn datetime(&mut self, id: &str, label: &str, value: &str, live: bool) {
+            let flags = if live { abi::ui::flags::ENABLED } else { 0 };
+            self.canvas.writer.leaf(
+                abi::ui::kind::DATE_TIME,
+                abi::ui::slot::NONE,
+                flags,
+                id,
+                label,
+                value,
+            );
+        }
+
+        /// A horizontal row of widgets.
+        pub fn row(&mut self, build: impl FnOnce(&mut Group)) {
+            self.canvas.writer.begin(
+                abi::ui::kind::ROW,
+                abi::ui::slot::NONE,
+                abi::ui::flags::ENABLED,
+                "",
+                "",
+                "",
+            );
+            build(self);
+            self.canvas.writer.end();
+        }
+
+        /// A vertical column of widgets.
+        pub fn column(&mut self, build: impl FnOnce(&mut Group)) {
+            self.canvas.writer.begin(
+                abi::ui::kind::COLUMN,
+                abi::ui::slot::NONE,
+                abi::ui::flags::ENABLED,
+                "",
+                "",
+                "",
+            );
+            build(self);
+            self.canvas.writer.end();
+        }
+
         /// A line of text. Carries no id, because nothing can be done to it.
         pub fn label(&mut self, text: &str) {
             self.canvas

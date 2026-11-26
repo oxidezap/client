@@ -262,7 +262,7 @@ node:
 ```
 
 Kinds: `1` button, `2` toggle, `3` label, `4` text field, `5` row, `6` column,
-`7` section. Only rows, columns and sections are drawn with children.
+`7` section, `8` date-time picker. Only rows, columns and sections are drawn with children.
 
 Slots: `1` chat header, `2` composer tools popover, `3` settings. Actions
 in the header and composer slots carry the open chat. Use the composer slot
