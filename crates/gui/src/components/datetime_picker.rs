@@ -3,7 +3,9 @@
 //! Draws a localized month grid, hour/minute steppers, and quick presets using
 //! theme tokens and rem-based sizing.
 
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike};
+use chrono::{
+    Datelike, Duration, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike,
+};
 use gpui::{
     App, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder as _, rems,
 };
@@ -28,6 +30,9 @@ pub struct DateTimeState {
     pub view_month: u32,
     pub hour: u32,
     pub minute: u32,
+    /// Fixed UTC offset preserved from an RFC 3339 input or relative preset so
+    /// ambiguous local times (e.g. during a DST fall-back) keep their exact instant.
+    pub offset: Option<FixedOffset>,
 }
 
 impl DateTimeState {
@@ -49,23 +54,32 @@ impl DateTimeState {
             view_month: selected_date.month(),
             hour: dt.hour(),
             minute: dt.minute(),
+            offset: Some(*dt.offset()),
+        }
+    }
+
+    fn local_datetime(&self) -> Option<chrono::DateTime<FixedOffset>> {
+        let time = NaiveTime::from_hms_opt(self.hour, self.minute, 0)?;
+        let naive = NaiveDateTime::new(self.selected_date, time);
+        if let Some(offset) = self.offset {
+            offset.from_local_datetime(&naive).single()
+        } else {
+            Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .map(|dt| dt.fixed_offset())
         }
     }
 
     /// Format the currently selected date and time as RFC 3339 with local offset.
     pub fn to_rfc3339(&self) -> Option<String> {
-        let time = NaiveTime::from_hms_opt(self.hour, self.minute, 0)?;
-        let naive = NaiveDateTime::new(self.selected_date, time);
-        let dt = Local.from_local_datetime(&naive).earliest()?;
-        Some(dt.to_rfc3339())
+        self.local_datetime().map(|dt| dt.to_rfc3339())
     }
 
     /// Format the selection only if it lies strictly in the future.
     pub fn future_rfc3339(&self) -> Option<String> {
-        let time = NaiveTime::from_hms_opt(self.hour, self.minute, 0)?;
-        let naive = NaiveDateTime::new(self.selected_date, time);
-        let dt = Local.from_local_datetime(&naive).earliest()?;
-        (dt > now_local()).then(|| dt.to_rfc3339())
+        let dt = self.local_datetime()?;
+        (dt > now_local().fixed_offset()).then(|| dt.to_rfc3339())
     }
 
     /// Human-readable summary of the selected date and time.
@@ -100,15 +114,18 @@ impl DateTimeState {
                 self.selected_date = date;
                 self.view_year = date.year();
                 self.view_month = date.month();
+                self.offset = None;
             }
             DateTimeUpdate::AdjustHour(delta) => {
                 self.hour = (self.hour as i32 + delta).rem_euclid(24) as u32;
+                self.offset = None;
             }
             DateTimeUpdate::AdjustMinute(delta) => {
                 let total = self.hour as i32 * 60 + self.minute as i32 + delta;
                 let wrapped = total.rem_euclid(24 * 60);
                 self.hour = (wrapped / 60) as u32;
                 self.minute = (wrapped % 60) as u32;
+                self.offset = None;
             }
             DateTimeUpdate::PresetMinutes(minutes) => {
                 let target = now_local() + Duration::minutes(minutes);
@@ -117,6 +134,7 @@ impl DateTimeState {
                 self.view_month = self.selected_date.month();
                 self.hour = target.hour();
                 self.minute = target.minute();
+                self.offset = Some(*target.offset());
             }
             DateTimeUpdate::PresetTomorrowMorning => {
                 let tomorrow = now_local().date_naive() + Duration::days(1);
@@ -125,6 +143,7 @@ impl DateTimeState {
                 self.view_month = tomorrow.month();
                 self.hour = 9;
                 self.minute = 0;
+                self.offset = None;
             }
         }
     }
@@ -367,7 +386,7 @@ where
                                 .disabled(!live)
                                 .when(live, |b| {
                                     b.cursor_pointer().on_click(move |_, window, cx| {
-                                        m_minus_cb(DateTimeUpdate::AdjustMinute(-5), window, cx);
+                                        m_minus_cb(DateTimeUpdate::AdjustMinute(-1), window, cx);
                                     })
                                 }),
                         )
@@ -388,7 +407,7 @@ where
                                 .disabled(!live)
                                 .when(live, |b| {
                                     b.cursor_pointer().on_click(move |_, window, cx| {
-                                        m_plus_cb(DateTimeUpdate::AdjustMinute(5), window, cx);
+                                        m_plus_cb(DateTimeUpdate::AdjustMinute(1), window, cx);
                                     })
                                 }),
                         ),
