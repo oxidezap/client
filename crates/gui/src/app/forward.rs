@@ -33,6 +33,14 @@ impl WhatsAppApp {
             .flatten()
     }
 
+    pub fn sync_selection_chat(&mut self, chat: Option<&str>, cx: &mut Context<Self>) {
+        if self.forward_selection.is_some() && self.forward_selection_source.as_deref() != chat {
+            self.forward_selection = Some(BTreeSet::new());
+            self.forward_selection_source = chat.map(str::to_owned);
+            self.invalidate_selected_chat(cx);
+        }
+    }
+
     pub fn forward_pick(&self) -> Option<&ForwardPick> {
         self.forward_pick.as_ref()
     }
@@ -191,6 +199,9 @@ impl WhatsAppApp {
 
     /// Send the picked messages to `target`.
     pub fn forward_to(&mut self, target: &str, cx: &mut Context<Self>) {
+        if !self.can_send() {
+            return;
+        }
         let Some(client) = &self.client else {
             return;
         };
@@ -228,6 +239,12 @@ impl WhatsAppApp {
                         }
                     }
                     Err(error) => {
+                        if let Some(sent) = forwarded_prefix(&error)
+                            && sent > 0
+                            && sent <= pick.ids.len()
+                        {
+                            pick.ids.drain(..sent);
+                        }
                         pick.pending = false;
                         app.notify_user(error, Tone::Problem, cx);
                     }
@@ -237,5 +254,29 @@ impl WhatsAppApp {
         })
         .detach();
         cx.notify();
+    }
+}
+
+fn forwarded_prefix(detail: &str) -> Option<usize> {
+    detail
+        .strip_prefix("forwarded ")?
+        .split_once(" of ")?
+        .0
+        .parse()
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forwarded_prefix;
+
+    #[test]
+    fn partial_forward_errors_report_the_already_sent_prefix() {
+        assert_eq!(
+            forwarded_prefix("forwarded 3 of 8, then: network error"),
+            Some(3)
+        );
+        assert_eq!(forwarded_prefix("network error"), None);
+        assert_eq!(forwarded_prefix("forwarded nope of 8, then: error"), None);
     }
 }

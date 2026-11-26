@@ -53,6 +53,7 @@ pub fn render_connected_view(
     );
     let plugin_composer = plugin_ui::composer(app, &plugin_ctx, cx);
     let selected_jid = app.selected_destination_jid();
+    app.sync_selection_chat(selected_jid.as_deref(), cx);
     // Cloned rather than borrowed: building the timeline's rows below needs
     // the app mutably, and these are handles — a clone is a refcount.
     let chat_list_scroll = app.chat_list_scroll().clone();
