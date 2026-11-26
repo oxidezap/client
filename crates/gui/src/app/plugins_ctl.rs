@@ -6,8 +6,6 @@
 //! which needs somewhere to hold what is being typed before anybody commits
 //! it — and that is what this file is.
 
-use std::collections::VecDeque;
-
 use indexmap::IndexMap;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};
@@ -22,8 +20,25 @@ use super::WhatsAppApp;
 pub struct PluginDateTime {
     pub state: DateTimeState,
     published: String,
-    committed: VecDeque<String>,
+    last_committed: Option<String>,
+    in_flight: usize,
     modified: bool,
+}
+
+fn rfc3339_or_str_equal(a: Option<&str>, b: &str) -> bool {
+    let Some(a) = a else {
+        return false;
+    };
+    if a == b {
+        return true;
+    }
+    match (
+        chrono::DateTime::parse_from_rfc3339(a),
+        chrono::DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(da), Ok(db)) => da == db,
+        _ => false,
+    }
 }
 
 /// One text field a plugin published, and what is currently typed in it.
@@ -341,11 +356,15 @@ impl Plugins {
             match self.datetimes.get_mut(&k) {
                 Some(held) if held.published != dt.value => {
                     held.published.clone_from(&dt.value);
-                    if let Some(pos) = held.committed.iter().position(|c| c == &dt.value) {
-                        held.committed.drain(..=pos);
-                    } else if held.committed.is_empty() {
-                        held.state = DateTimeState::from_rfc3339_or_default(&dt.value);
-                        held.modified = false;
+                    held.in_flight = held.in_flight.saturating_sub(1);
+                    if held.in_flight == 0 {
+                        let echoed =
+                            rfc3339_or_str_equal(held.last_committed.as_deref(), &dt.value);
+                        held.last_committed = None;
+                        if !echoed {
+                            held.state = DateTimeState::from_rfc3339_or_default(&dt.value);
+                            held.modified = false;
+                        }
                     }
                 }
                 Some(_) => {}
@@ -355,7 +374,8 @@ impl Plugins {
                         PluginDateTime {
                             state: DateTimeState::from_rfc3339_or_default(&dt.value),
                             published: dt.value,
-                            committed: VecDeque::new(),
+                            last_committed: None,
+                            in_flight: 0,
                             modified: false,
                         },
                     );
@@ -615,7 +635,8 @@ impl WhatsAppApp {
                 .or_insert_with(|| PluginDateTime {
                     state: DateTimeState::from_rfc3339_or_default(""),
                     published: String::new(),
-                    committed: VecDeque::new(),
+                    last_committed: None,
+                    in_flight: 0,
                     modified: false,
                 });
             entry.state.apply(update);
@@ -624,10 +645,8 @@ impl WhatsAppApp {
             }
             let sent = entry.state.to_rfc3339().unwrap_or_default();
             if can_dispatch {
-                if entry.committed.len() >= 16 {
-                    entry.committed.pop_front();
-                }
-                entry.committed.push_back(sent.clone());
+                entry.last_committed = Some(sent.clone());
+                entry.in_flight += 1;
             }
             cx.notify();
             sent
