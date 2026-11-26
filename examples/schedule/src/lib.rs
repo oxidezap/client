@@ -206,9 +206,25 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         .strip_prefix("save-edit-")
         .and_then(|s| s.parse::<u64>().ok())
     {
-        let draft_val = read_edit_draft()
+        let mut draft_val = read_edit_draft()
             .filter(|d| d.id == target_id)
             .ok_or("This edit session is no longer active.")?;
+        // In PluginSlot::Composer, button presses carry the current form values
+        // as a JSON object keyed by widget id; in Settings, fields commit as
+        // individual actions into `EDIT_DRAFT`.
+        let value = action.value_into::<4096>();
+        if let Some(raw) = value.whole().filter(|s| !s.trim().is_empty())
+            && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw)
+        {
+            let msg_key = format!("edit-message-{target_id}");
+            let when_key = format!("edit-when-{target_id}");
+            if let Some(text) = map.get(&msg_key).and_then(|v| v.as_str()) {
+                draft_val.text = text.to_owned();
+            }
+            if let Some(when) = map.get(&when_key).and_then(|v| v.as_str()) {
+                draft_val.when = when.to_owned();
+            }
+        }
         if draft_val.text.trim().is_empty() || draft_val.text.len() > MAX_MESSAGE {
             return Err("Enter a message of up to 512 bytes.");
         }
@@ -299,8 +315,18 @@ fn tick(queue: &mut Queue) -> Result<bool, &'static str> {
     let job = &queue.jobs[index];
     match oxidezap_plugin::send_text(&job.jid, &job.text) {
         Outcome::Accepted => {
+            const DAY_MS: i64 = 86_400_000;
             if queue.jobs[index].repeat_daily {
-                queue.jobs[index].at = queue.jobs[index].at.saturating_add(86_400_000);
+                let mut next = queue.jobs[index].at;
+                while next <= now {
+                    let Some(advanced) = next.checked_add(DAY_MS) else {
+                        queue.jobs.remove(index);
+                        save(queue, false)?;
+                        return Ok(true);
+                    };
+                    next = advanced;
+                }
+                queue.jobs[index].at = next;
                 queue.jobs[index].attempting = false;
             } else {
                 queue.jobs.remove(index);
@@ -589,5 +615,36 @@ mod tests {
         assert!(saved.jobs[0].repeat_daily);
         assert!(!saved.jobs[0].attempting);
         assert_eq!(saved.jobs[0].at, 61_000 + 86_400_000);
+
+        // Simulating multiple offline days: only one send fires and the next
+        // deadline skips strictly past `now`.
+        let four_days_later = 61_000 + 4 * 86_400_000 + 5_000;
+        host.set_now_ms(four_days_later);
+        host.deliver(In::timer(TICK), handle);
+        host.deliver(In::timer(TICK), handle);
+        assert_eq!(host.sent().len(), 2);
+        let saved: Queue = serde_json::from_str(&host.stored(STORE).unwrap()).unwrap();
+        assert!(saved.jobs[0].at > four_days_later);
+    }
+
+    #[test]
+    fn composer_form_edit_updates_job() {
+        let mut host = Host::new();
+        host.init(setup);
+        host.set_now_ms(1_000);
+        schedule(&mut host, CHAT, "10");
+        host.deliver(In::action("edit-1", ""), handle);
+        let form = serde_json::json!({
+            "edit-message-1": "composer updated",
+            "edit-when-1": "1970-01-01T00:06:00Z",
+        })
+        .to_string();
+        host.deliver(
+            In::action("save-edit-1", &form).str(abi::fields::CHAT_JID, CHAT),
+            handle,
+        );
+        let saved: Queue = serde_json::from_str(&host.stored(STORE).unwrap()).unwrap();
+        assert_eq!(saved.jobs[0].text, "composer updated");
+        assert_eq!(saved.jobs[0].at, 360_000);
     }
 }
