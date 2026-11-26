@@ -616,6 +616,7 @@ fn render_forward_pick(
     let search = pick.search.clone();
     let scroll = pick.scroll.clone();
     let pending = pick.pending;
+    let retry_target = pick.retry_target.clone();
     let cancel = entity.clone();
     let row_height = metrics.touch_target();
     let targets_list = uniform_list(
@@ -630,7 +631,12 @@ fn render_forward_pick(
                     Button::new(SharedString::from(format!("forward-to-{jid}")))
                         .ghost()
                         .label(name)
-                        .disabled(pending)
+                        .disabled(
+                            pending
+                                || retry_target
+                                    .as_deref()
+                                    .is_some_and(|retry_target| retry_target != jid),
+                        )
                         .h(row_height)
                         .on_click(move |_, _, cx| {
                             entity.update(cx, |app, cx| app.forward_to(&target, cx));

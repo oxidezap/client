@@ -20,6 +20,7 @@ pub struct ForwardPick {
     pub ids: Vec<String>,
     pub search: Entity<InputState>,
     pub scroll: UniformListScrollHandle,
+    pub retry_target: Option<String>,
     pub pending: bool,
 }
 
@@ -149,6 +150,7 @@ impl WhatsAppApp {
             ids,
             search,
             scroll: UniformListScrollHandle::new(),
+            retry_target: None,
             pending: false,
         });
         self.navigate_to_chat();
@@ -213,9 +215,16 @@ impl WhatsAppApp {
         if pick.pending {
             return;
         }
+        if pick
+            .retry_target
+            .as_deref()
+            .is_some_and(|retry_target| retry_target != target)
+        {
+            return;
+        }
         pick.pending = true;
-        let result =
-            client.forward_messages(pick.source.clone(), pick.ids.clone(), target.to_owned());
+        let target = target.to_owned();
+        let result = client.forward_messages(pick.source.clone(), pick.ids.clone(), target.clone());
         let marker = pick.search.downgrade();
         cx.spawn(async move |app, cx| {
             let result = result
@@ -246,6 +255,7 @@ impl WhatsAppApp {
                             && sent <= pick.ids.len()
                         {
                             pick.ids.drain(..sent);
+                            pick.retry_target = Some(target);
                         }
                         pick.pending = false;
                         app.notify_user(error, Tone::Problem, cx);
