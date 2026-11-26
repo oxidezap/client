@@ -3,6 +3,7 @@
 use gpui::{
     AnyElement, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
+    uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme as _, Disableable as _};
@@ -53,6 +54,7 @@ pub fn render_connected_view(
     );
     let plugin_composer = plugin_ui::composer(app, &plugin_ctx, cx);
     let selected_jid = app.selected_destination_jid();
+    app.sync_selection_chat(selected_jid.as_deref(), cx);
     // Cloned rather than borrowed: building the timeline's rows below needs
     // the app mutably, and these are handles — a clone is a refcount.
     let chat_list_scroll = app.chat_list_scroll().clone();
@@ -78,6 +80,7 @@ pub fn render_connected_view(
     let visible = (app.destination().has_conversations()
         && layout.show_chat_area()
         && !app.paste_preview_showing()
+        && app.forward_pick().is_none()
         && app.media_viewer(cx).is_none())
     .then(|| selected_jid.clone())
     .flatten();
@@ -274,9 +277,19 @@ pub fn render_connected_view(
         composer: destination.has_conversations()
             && layout.show_chat_area()
             && open_chat.is_some()
-            && !is_offline,
+            && !is_offline
+            && selected_jid
+                .as_deref()
+                .and_then(|jid| app.selection_in(jid))
+                .is_none(),
         viewer: viewer.is_some(),
         paste_preview: false,
+        forward_picker: app.forward_pick().is_some(),
+        forward_selection: layout.show_chat_area()
+            && selected_jid
+                .as_deref()
+                .and_then(|jid| app.selection_in(jid))
+                .is_some(),
         message_edit: false,
         message_delete: false,
         // The card floats above this view rather than inside it, so the root
@@ -297,6 +310,10 @@ pub fn render_connected_view(
         cx,
     );
 
+    let forward_pick = app
+        .forward_pick()
+        .is_some()
+        .then(|| render_forward_pick(app, entity.clone(), *layout.metrics(), cx));
     // Borrowed last, once nothing else needs `app` mutably: the header and
     // the empty state are the only readers of the chat itself, and everything
     // the timeline draws has already been gathered.
@@ -324,7 +341,9 @@ pub fn render_connected_view(
             )),
         })
         .when(layout.show_chat_area(), |el| {
-            if destination == Destination::Status {
+            if let Some(forward_pick) = forward_pick {
+                el.child(forward_pick)
+            } else if destination == Destination::Status {
                 if app.status_post().is_some() {
                     el.child(render_status_post(
                         app,
@@ -351,6 +370,18 @@ pub fn render_connected_view(
                         is_own_number,
                         plugin_actions,
                         plugin_composer,
+                        selection_bar: selected_jid
+                            .as_deref()
+                            .and_then(|jid| app.selection_in(jid))
+                            .map(|selected| {
+                                render_selection_bar(
+                                    selected.len(),
+                                    entity.clone(),
+                                    app.forward_selection_focus(),
+                                    *layout.metrics(),
+                                    cx,
+                                )
+                            }),
                         media: media.clone(),
                     },
                     &message_list,
@@ -529,6 +560,121 @@ fn render_status_media(
         .into_any_element()
 }
 
+/// Replaces the composer while messages are ticked: how many, Forward, Cancel.
+fn render_selection_bar(
+    count: usize,
+    entity: Entity<WhatsAppApp>,
+    focus: &gpui::FocusHandle,
+    metrics: Metrics,
+    cx: &App,
+) -> AnyElement {
+    let cancel = entity.clone();
+    div()
+        .track_focus(focus)
+        .flex()
+        .items_center()
+        .gap(metrics.space_md())
+        .px(metrics.space_xl())
+        .py(metrics.space_md())
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .child(
+            Button::new("selection-cancel")
+                .ghost()
+                .label(crate::tr!(Cancel))
+                .on_click(move |_, _, cx| {
+                    cancel.update(cx, |app, cx| app.cancel_selection(cx));
+                }),
+        )
+        .child(div().flex_1().child(crate::tr!(
+            selected_count,
+            count,
+            oxidezap_ipc::MAX_FORWARD_MESSAGES
+        )))
+        .child(
+            Button::new("selection-forward")
+                .primary()
+                .label(crate::tr!(Forward))
+                .disabled(count == 0)
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |app, cx| app.forward_selected(window, cx));
+                }),
+        )
+        .into_any_element()
+}
+
+/// Where a forward goes: a search box and the chats that match.
+fn render_forward_pick(
+    app: &mut WhatsAppApp,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &mut Context<WhatsAppApp>,
+) -> impl IntoElement + use<> {
+    let pick = app.forward_pick().expect("the forward picker is open");
+    let query = pick.search.read(cx).value();
+    let targets = app.forward_targets(&query);
+    let search = pick.search.clone();
+    let scroll = pick.scroll.clone();
+    let pending = pick.pending;
+    let retry_target = pick.retry_target.clone();
+    let cancel = entity.clone();
+    let row_height = metrics.touch_target();
+    let targets_list = uniform_list(
+        "forward-targets",
+        targets.len(),
+        cx.processor(move |_, range: std::ops::Range<usize>, _, _| {
+            range
+                .map(|ix| {
+                    let (jid, name) = targets[ix].clone();
+                    let entity = entity.clone();
+                    let target = jid.clone();
+                    Button::new(SharedString::from(format!("forward-to-{jid}")))
+                        .ghost()
+                        .label(name)
+                        .disabled(
+                            pending
+                                || retry_target
+                                    .as_deref()
+                                    .is_some_and(|retry_target| retry_target != jid),
+                        )
+                        .h(row_height)
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |app, cx| app.forward_to(&target, cx));
+                        })
+                })
+                .collect::<Vec<_>>()
+        }),
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .bg(cx.theme().background)
+        .p(metrics.space_xl())
+        .gap(metrics.space_lg())
+        .child(
+            div()
+                .text_size(metrics.text_title())
+                .child(crate::tr!(ForwardTo)),
+        )
+        .child(Input::new(&search).w_full().disabled(pending))
+        .child(targets_list.flex_1().min_h_0().track_scroll(&scroll))
+        .child(
+            div().flex().justify_end().child(
+                Button::new("forward-cancel")
+                    .ghost()
+                    .label(crate::tr!(Cancel))
+                    .disabled(pending)
+                    .on_click(move |_, _, cx| {
+                        cancel.update(cx, |app, cx| app.cancel_forward(cx));
+                    }),
+            ),
+        )
+}
+
 pub fn render_call_overlay(
     app: &mut WhatsAppApp,
     window: &mut Window,
@@ -573,6 +719,8 @@ struct ChatAreaProps<'a> {
     /// case.
     plugin_actions: Vec<gpui::AnyElement>,
     plugin_composer: Option<AnyElement>,
+    /// The bar that replaces the composer while messages are being selected.
+    selection_bar: Option<AnyElement>,
     media: Option<std::sync::Arc<dyn crate::session::MediaCache>>,
 }
 
@@ -597,6 +745,7 @@ fn render_chat_area(
         is_own_number,
         plugin_actions,
         plugin_composer,
+        selection_bar,
         media,
     } = props;
     let metrics = *layout.metrics();
@@ -666,7 +815,9 @@ fn render_chat_area(
                     )
                 }))
                 .map(|el| {
-                    if let Some(recovery) = offline_recovery {
+                    if let Some(bar) = selection_bar {
+                        el.child(bar)
+                    } else if let Some(recovery) = offline_recovery {
                         el.child(render_offline_strip(entity.clone(), recovery, metrics, cx))
                     } else {
                         el.children(plugin_composer).children(input_area)

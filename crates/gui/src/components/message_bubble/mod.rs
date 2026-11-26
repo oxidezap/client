@@ -18,8 +18,8 @@ use crate::retained_image::RetainedImage;
 use std::sync::Arc;
 
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString, Styled,
-    div, prelude::FluentBuilder as _,
+    App, Entity, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -36,8 +36,8 @@ use quote::render_quote;
 use reactions::{render_hover_actions, render_reaction_picker, render_reactions};
 
 use crate::app::{
-    BubbleIds, CopyMessage, DeleteSentMessage, EditMessage, OpenMessageLink, ReactToMessage,
-    ReplyToMessage, RetryMessage, WhatsAppApp, can_delete_sent,
+    BubbleIds, CopyMessage, DeleteSentMessage, EditMessage, ForwardMessage, OpenMessageLink,
+    ReactToMessage, ReplyToMessage, RetryMessage, SelectMessage, WhatsAppApp, can_delete_sent,
 };
 use crate::components::parts;
 use crate::components::{BubbleText, bubble_status_ticks, render_rich_text};
@@ -97,6 +97,8 @@ pub struct BubbleProps {
     pub reaction_picker_open: bool,
     /// Whether its downloaded audio is being decoded or retimed for playback.
     pub is_preparing: bool,
+    /// `None` outside selection; while selecting, whether this one is ticked.
+    pub selecting: Option<bool>,
 }
 
 /// How far into the voice note the player is.
@@ -213,6 +215,30 @@ pub fn render_message_bubble(
         })
         .items_end()
         .gap(metrics.space_md())
+        // While selecting, every row carries a tick box at the left edge and a
+        // click anywhere on the row toggles it. `mr_auto` keeps the box left
+        // of a right-aligned bubble.
+        .when_some(props.selecting, |el, ticked| {
+            let toggle = entity.clone();
+            let toggle_id = message_id.clone();
+            let toggle_box = toggle.clone();
+            let toggle_box_id = toggle_id.clone();
+            use gpui_component::switch::Switch;
+            el.cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    toggle.update(cx, |app, cx| app.toggle_selected(&toggle_id, cx));
+                })
+                .child(
+                    Switch::new(ids.select.clone())
+                        .accessibility_label(crate::tr!(SelectMessages))
+                        .checked(ticked)
+                        .on_click(move |_: &bool, _, cx| {
+                            cx.stop_propagation();
+                            toggle_box
+                                .update(cx, |app, cx| app.toggle_selected(&toggle_box_id, cx));
+                        }),
+                )
+        })
         // The action bar sits outside the bubble on the side the reader's eye
         // is not already on, so it never covers the message it acts upon.
         .when(is_from_me, |el| {
@@ -225,6 +251,7 @@ pub fn render_message_bubble(
                         &ids,
                         message_id.clone(),
                         message.content.clone(),
+                        WhatsAppApp::can_forward(&message),
                         entity.clone(),
                         metrics,
                         cx,
@@ -462,6 +489,7 @@ pub fn render_message_bubble(
                         &ids,
                         message_id.clone(),
                         message.content.clone(),
+                        WhatsAppApp::can_forward(&message),
                         entity,
                         metrics,
                         cx,
@@ -501,6 +529,24 @@ pub fn render_message_bubble(
                     id: menu_id.clone().into(),
                 }),
             );
+            // Forward is the one message; Select ticks every message so several
+            // can go at once.
+            let menu = if WhatsAppApp::can_forward(&menu_message) {
+                menu.menu(
+                    crate::tr!(Forward),
+                    Box::new(ForwardMessage {
+                        id: menu_id.clone().into(),
+                    }),
+                )
+                .menu(
+                    crate::tr!(SelectMessages),
+                    Box::new(SelectMessage {
+                        id: menu_id.clone().into(),
+                    }),
+                )
+            } else {
+                menu
+            };
             let menu = if menu_text.is_empty() {
                 menu
             } else {

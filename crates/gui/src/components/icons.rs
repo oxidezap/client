@@ -30,6 +30,7 @@ pub enum ProductIcon {
     Users,
     UserPlus,
     Reply,
+    Forward,
     Image,
     Film,
     FileText,
@@ -50,7 +51,7 @@ pub enum ProductIcon {
 
 impl ProductIcon {
     /// Every icon, so a test can prove each one actually loads.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::Phone,
         Self::PhoneOff,
         Self::Video,
@@ -67,6 +68,7 @@ impl ProductIcon {
         Self::Users,
         Self::UserPlus,
         Self::Reply,
+        Self::Forward,
         Self::Image,
         Self::Film,
         Self::FileText,
@@ -103,6 +105,7 @@ impl ProductIcon {
             Self::Users => "icons/users.svg",
             Self::UserPlus => "icons/user-plus.svg",
             Self::Reply => "icons/reply.svg",
+            Self::Forward => "icons/forward.svg",
             Self::Image => "icons/image.svg",
             Self::Film => "icons/film.svg",
             Self::FileText => "icons/file-text.svg",

@@ -24,6 +24,7 @@ mod groups;
 mod membership;
 /// Mutations a front end asks the account to perform.
 mod mutations;
+pub use mutations::ForwardFailure;
 /// Polls, profiles, contacts, channels, media fetch and history coverage.
 mod ops;
 mod profile;

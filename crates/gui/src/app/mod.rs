@@ -17,6 +17,7 @@ mod commands;
 pub(crate) mod editing;
 mod events;
 pub use editing::EditMessage;
+mod forward;
 #[cfg(test)]
 mod frame_cost;
 mod media;
@@ -138,6 +139,10 @@ enum KeyboardOwner {
     /// Files pasted or dropped into the composer, waiting for explicit
     /// confirmation before anything is uploaded.
     PastePreview,
+    /// The destination search for forwarding messages.
+    ForwardPicker,
+    /// The visible bar for selecting messages to forward.
+    ForwardSelection,
     /// The fullscreen viewer, which owns the arrow keys while it is up.
     Viewer,
     /// A screen with its own controls — Settings. It is handed the window's
@@ -169,6 +174,10 @@ pub struct KeyboardSurfaces {
     pub viewer: bool,
     /// The modal preview for files waiting to be sent.
     pub paste_preview: bool,
+    /// The destination picker drawn over the conversation.
+    pub forward_picker: bool,
+    /// The message selection bar.
+    pub forward_selection: bool,
     pub message_edit: bool,
     pub message_delete: bool,
     /// The call card, which only the connected screens float.
@@ -358,6 +367,20 @@ actions!(
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = message, no_json)]
 pub struct ReplyToMessage {
+    pub id: gpui::SharedString,
+}
+
+/// Forward one message. Carries its subject like [`ReplyToMessage`].
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct ForwardMessage {
+    pub id: gpui::SharedString,
+}
+
+/// Start selecting messages, this one first.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct SelectMessage {
     pub id: gpui::SharedString,
 }
 
@@ -1067,6 +1090,12 @@ pub struct WhatsAppApp {
     status_post: Option<status::StatusPost>,
     /// Addresses whose status updates the account has muted.
     status_muted: std::collections::HashSet<String>,
+    /// Messages ticked for forwarding, while selecting.
+    forward_selection: Option<std::collections::BTreeSet<String>>,
+    forward_selection_source: Option<String>,
+    forward_selection_focus: FocusHandle,
+    /// Where a forward goes, while picking.
+    forward_pick: Option<forward::ForwardPick>,
     /// The broadcast grouped by author, against the message count it was
     /// built from.
     status_feed_cache: RefCell<Option<(usize, oxidezap_core::StatusFeed)>>,
@@ -1550,6 +1579,10 @@ impl WhatsAppApp {
             status_reply: None,
             status_post: None,
             status_muted: Default::default(),
+            forward_selection: None,
+            forward_selection_source: None,
+            forward_selection_focus: cx.focus_handle(),
+            forward_pick: None,
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
             chat_filter: ChatFilter::default(),
@@ -1753,9 +1786,19 @@ impl WhatsAppApp {
         let mut rows = if self.destination == Destination::Communities {
             chats::hierarchical_group_rows(&rows, query, &self.collapsed_communities)
         } else {
+            // "me", "you" and "myself" are how people look for the chat with
+            // themselves, whatever it is called (WhatsApp suggests all
+            // three), and it should be the first result rather than one of
+            // every name with those letters in it.
+            let own_alias = Self::is_own_alias(query);
             rows.retain(|row| {
-                contains_ignore_case(&row.name, query) || contains_ignore_case(&row.jid, query)
+                contains_ignore_case(&row.name, query)
+                    || contains_ignore_case(&row.jid, query)
+                    || (own_alias && self.is_own_number(&row.jid))
             });
+            if own_alias {
+                rows.sort_by_key(|row| !self.is_own_number(&row.jid));
+            }
             rows
         };
         chat_row::disambiguate_names(&mut rows);
@@ -1770,6 +1813,11 @@ impl WhatsAppApp {
 
         *cache = Some(new_cache.clone());
         new_cache
+    }
+
+    /// Whether a search query is asking for the chat with yourself.
+    pub(crate) fn is_own_alias(query: &str) -> bool {
+        matches!(query.trim(), "me" | "you" | "myself")
     }
 
     /// How many conversations carry unread state, for the filter chip.
@@ -2336,6 +2384,9 @@ impl WhatsAppApp {
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.incoming_file_reading = false;
         self.paste_preview = None;
+        self.forward_pick = None;
+        self.forward_selection = None;
+        self.forward_selection_source = None;
         self.delete_confirmation = None;
         self.pending_attachment_previews.clear();
         self.notified_messages.clear();
@@ -4498,6 +4549,16 @@ impl Render for WhatsAppApp {
             }))
             .on_action(cx.listener(|app, reply: &ReplyToMessage, window, cx| {
                 app.begin_reply(&reply.id, window, cx);
+            }))
+            .on_action(cx.listener(|app, forward: &ForwardMessage, window, cx| {
+                app.begin_forward(
+                    std::collections::BTreeSet::from([forward.id.to_string()]),
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|app, select: &SelectMessage, _window, cx| {
+                app.select_message(&select.id, cx);
             }))
             .on_action(cx.listener(|app, retry: &RetryMessage, window, cx| {
                 app.retry_send(&retry.id, window, cx);

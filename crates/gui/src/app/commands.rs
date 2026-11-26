@@ -357,6 +357,14 @@ impl WhatsAppApp {
             self.close_settings(cx);
             return;
         }
+        if self.forward_pick.is_some() {
+            self.cancel_forward(cx);
+            return;
+        }
+        if self.forward_selection.is_some() {
+            self.cancel_selection(cx);
+            return;
+        }
         if self.close_conversation_search(cx) {
             return;
         }

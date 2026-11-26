@@ -855,6 +855,9 @@ pub struct PublishStatusMedia {
     pub recipients: Vec<String>,
 }
 
+/// The most messages one forward request may carry.
+pub const MAX_FORWARD_MESSAGES: usize = 100;
+
 /// Put a `.wasm` in the daemon's plugin folder. See
 /// [`ClientRequest::InstallPlugin`].
 ///
@@ -1047,6 +1050,13 @@ pub enum ClientRequest {
     ReuseComposerMedia {
         source: Option<String>,
         message_id: String,
+        target: String,
+    },
+    /// Forward messages from one chat to another, in the order given. At most
+    /// [`MAX_FORWARD_MESSAGES`] at a time.
+    ForwardMessages {
+        source: String,
+        message_ids: Vec<String>,
         target: String,
     },
     PublishStatus {
@@ -1445,6 +1455,10 @@ pub enum ProtocolError {
     /// what the client would have to change.
     #[error("refused: {detail}")]
     Refused { detail: String },
+    /// A batch forward failed after a prefix was delivered. The count is data
+    /// so a client can resume without repeating messages already sent.
+    #[error("forward stopped after {sent} messages: {detail}")]
+    PartialForward { sent: usize, detail: String },
     /// The daemon agreed to the request and the attempt failed anyway.
     ///
     /// Distinct from every error above it, because those are all about the
@@ -1476,6 +1490,20 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_forward_error_round_trips_its_sent_prefix() {
+        let error = ProtocolError::PartialForward {
+            sent: 3,
+            detail: "network error".into(),
+        };
+        let encoded = serde_json::to_string(&error).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<ProtocolError>(&encoded).unwrap(),
+            error
+        );
+    }
 
     /// The large frames stay heap-backed: every frame deserializes through
     /// serde's buffered `Content`, so the largest variant sets the working
@@ -2122,6 +2150,14 @@ mod tests {
             (
                 ClientRequest::StatusMutes,
                 r#"{"request":"status_mutes"}"#.to_string(),
+            ),
+            (
+                ClientRequest::ForwardMessages {
+                    source: "559900000001@s.whatsapp.net".into(),
+                    message_ids: vec!["A1".into(), "A2".into()],
+                    target: "120363000000000000@g.us".into(),
+                },
+                r#"{"request":"forward_messages","source":"559900000001@s.whatsapp.net","message_ids":["A1","A2"],"target":"120363000000000000@g.us"}"#.to_string(),
             ),
             (
                 ClientRequest::ShutdownUnlessOtherWindows,

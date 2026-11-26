@@ -129,10 +129,13 @@ pub fn render_hover_actions(
     ids: &BubbleIds,
     message_id: String,
     content: String,
+    forwardable: bool,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     _cx: &App,
 ) -> impl IntoElement + use<> {
+    let forward_id = message_id.clone();
+    let forward_entity = entity.clone();
     let reply_id = message_id.clone();
     let reply_entity = entity.clone();
     let picker_id = message_id;
@@ -180,6 +183,25 @@ pub fn render_hover_actions(
                 reply_entity.update(cx, |app, cx| app.begin_reply(&reply_id, window, cx));
             }),
         )
+        .when(forwardable, |el| {
+            el.child(
+                action(
+                    ids.forward.clone(),
+                    ProductIcon::Forward.into(),
+                    crate::tr!(Forward),
+                )
+                .cursor_pointer()
+                .on_click(move |_, window, cx| {
+                    forward_entity.update(cx, |app, cx| {
+                        app.begin_forward(
+                            std::collections::BTreeSet::from([forward_id.to_string()]),
+                            window,
+                            cx,
+                        )
+                    });
+                }),
+            )
+        })
         .when(has_text, |el| {
             el.child(gpui_component::clipboard::Clipboard::new(ids.copy.clone()).value(content))
         })

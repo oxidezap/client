@@ -38,4 +38,8 @@ formatted_catalog! {
     file_empty(file_name) => ("{file_name} is empty.", "{file_name} está vazio.");
     file_too_big(file_name, size, maximum) => ("{file_name} is {size} and the most that can be sent is {maximum}.", "{file_name} tem {size}, mas o limite de envio é {maximum}.");
     selection_full(file_name, maximum) => ("{file_name} did not fit: one trip to the file chooser can carry {maximum} in total. Send it on its own.", "{file_name} excede o limite total de {maximum} por seleção. Envie o arquivo separadamente.");
+    selected_count(count, maximum) => ("{count} of {maximum} selected", "{count} de {maximum} selecionadas");
+    forward_limit_reached(maximum) => ("You can forward up to {maximum} messages at once.", "Você pode encaminhar até {maximum} mensagens por vez.");
+    forward_partial_single(error) => ("The message was forwarded, but the rest failed: {error}", "A mensagem foi encaminhada, mas o restante falhou: {error}");
+    forward_partial_multiple(count, error) => ("{count} messages were forwarded before the failure: {error}", "{count} mensagens foram encaminhadas antes da falha: {error}");
 }

@@ -206,6 +206,11 @@ catalog! {
     LoadMoreUpdates => ("Load more updates", "Carregar mais atualizações");
     Recent => ("Recent", "Recentes");
     PostStatus => ("Post status", "Publicar status");
+    Forward => ("Forward", "Encaminhar");
+    ForwardTo => ("Forward to…", "Encaminhar para…");
+    SelectMessages => ("Select", "Selecionar");
+    SelectedCount => ("selected", "selecionadas");
+    Forwarded => ("Forwarded", "Encaminhada");
     AddPhotoOrVideo => ("Add a photo or video", "Adicionar foto ou vídeo");
     RemoveStatusMedia => ("Remove", "Remover");
     StatusCaption => ("Add a caption", "Adicione uma legenda");

@@ -665,7 +665,34 @@ impl WhatsAppApp {
         if archived_scan_finished {
             self.finish_archived_scan(cx);
         }
+        // Each page that arrives while somebody is searching asks for the
+        // next, until there is none.
+        self.want_every_chat_for_search(cx);
         cx.notify();
+    }
+
+    /// While a chat search is typed, or the forward picker is open, keep
+    /// asking for pages: both look only at what is loaded, and the chat a
+    /// person is after is as likely to be the hundredth as the first.
+    pub(super) fn want_every_chat_for_search(&mut self, cx: &mut Context<Self>) {
+        let searching =
+            !self.search.read(cx).list_query().is_empty() || self.forward_pick.is_some();
+        if searching {
+            self.want_more_chats(cx);
+            self.want_more_archived_chats(cx);
+        }
+    }
+
+    fn want_more_archived_chats(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        if let Some(ask) = self.pages.update(cx, |pages, _| pages.more_chats(true)) {
+            if ask.is_none() {
+                self.archived_scan.clear();
+            }
+            client.load_chats(ask, true);
+        }
     }
 
     /// Prune archived rows only after their include-archived scan reached its
