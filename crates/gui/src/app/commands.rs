@@ -353,6 +353,14 @@ impl WhatsAppApp {
         if self.close_media_viewer(cx) {
             return;
         }
+        if self.forward_pick.is_some() {
+            self.cancel_forward(cx);
+            return;
+        }
+        if self.forward_selection.is_some() {
+            self.cancel_selection(cx);
+            return;
+        }
         if self.showing_settings(cx) {
             self.close_settings(cx);
             return;

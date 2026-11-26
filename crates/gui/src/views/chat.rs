@@ -275,10 +275,18 @@ pub fn render_connected_view(
         composer: destination.has_conversations()
             && layout.show_chat_area()
             && open_chat.is_some()
-            && !is_offline,
+            && !is_offline
+            && selected_jid
+                .as_deref()
+                .and_then(|jid| app.selection_in(jid))
+                .is_none(),
         viewer: viewer.is_some(),
         paste_preview: false,
         forward_picker: app.forward_pick().is_some(),
+        forward_selection: selected_jid
+            .as_deref()
+            .and_then(|jid| app.selection_in(jid))
+            .is_some(),
         message_edit: false,
         message_delete: false,
         // The card floats above this view rather than inside it, so the root
@@ -367,6 +375,7 @@ pub fn render_connected_view(
                                 render_selection_bar(
                                     selected.len(),
                                     entity.clone(),
+                                    app.forward_selection_focus(),
                                     *layout.metrics(),
                                     cx,
                                 )
@@ -553,11 +562,13 @@ fn render_status_media(
 fn render_selection_bar(
     count: usize,
     entity: Entity<WhatsAppApp>,
+    focus: &gpui::FocusHandle,
     metrics: Metrics,
     cx: &App,
 ) -> AnyElement {
     let cancel = entity.clone();
     div()
+        .track_focus(focus)
         .flex()
         .items_center()
         .gap(metrics.space_md())
@@ -603,7 +614,6 @@ fn render_forward_pick(
     let cancel = entity.clone();
     let rows = targets
         .into_iter()
-        .take(100)
         .map(|(jid, name)| {
             let entity = entity.clone();
             let target = jid.clone();

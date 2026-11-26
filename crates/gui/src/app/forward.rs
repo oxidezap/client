@@ -23,6 +23,10 @@ pub struct ForwardPick {
 }
 
 impl WhatsAppApp {
+    pub fn forward_selection_focus(&self) -> &gpui::FocusHandle {
+        &self.forward_selection_focus
+    }
+
     pub fn selection_in(&self, chat: &str) -> Option<&BTreeSet<String>> {
         (self.forward_selection_source.as_deref() == Some(chat))
             .then_some(self.forward_selection.as_ref())

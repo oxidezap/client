@@ -141,6 +141,8 @@ enum KeyboardOwner {
     PastePreview,
     /// The destination search for forwarding messages.
     ForwardPicker,
+    /// The visible bar for selecting messages to forward.
+    ForwardSelection,
     /// The fullscreen viewer, which owns the arrow keys while it is up.
     Viewer,
     /// A screen with its own controls — Settings. It is handed the window's
@@ -174,6 +176,8 @@ pub struct KeyboardSurfaces {
     pub paste_preview: bool,
     /// The destination picker drawn over the conversation.
     pub forward_picker: bool,
+    /// The message selection bar.
+    pub forward_selection: bool,
     pub message_edit: bool,
     pub message_delete: bool,
     /// The call card, which only the connected screens float.
@@ -1089,6 +1093,7 @@ pub struct WhatsAppApp {
     /// Messages ticked for forwarding, while selecting.
     forward_selection: Option<std::collections::BTreeSet<String>>,
     forward_selection_source: Option<String>,
+    forward_selection_focus: FocusHandle,
     /// Where a forward goes, while picking.
     forward_pick: Option<forward::ForwardPick>,
     /// The broadcast grouped by author, against the message count it was
@@ -1576,6 +1581,7 @@ impl WhatsAppApp {
             status_muted: Default::default(),
             forward_selection: None,
             forward_selection_source: None,
+            forward_selection_focus: cx.focus_handle(),
             forward_pick: None,
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),

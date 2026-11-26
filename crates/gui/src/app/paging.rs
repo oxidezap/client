@@ -679,6 +679,19 @@ impl WhatsAppApp {
             !self.search.read(cx).list_query().is_empty() || self.forward_pick.is_some();
         if searching {
             self.want_more_chats(cx);
+            self.want_more_archived_chats(cx);
+        }
+    }
+
+    fn want_more_archived_chats(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        if let Some(ask) = self.pages.update(cx, |pages, _| pages.more_chats(true)) {
+            if ask.is_none() {
+                self.archived_scan.clear();
+            }
+            client.load_chats(ask, true);
         }
     }
 
