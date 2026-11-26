@@ -323,7 +323,8 @@ fn render_row(
                 saved_document_path: app.saved_document_path(message_id),
                 reaction_picker_open: app.reaction_picker_for() == Some(message_id.as_str()),
                 selecting: app
-                    .selection()
+                    .selection_in(chat_jid)
+                    .filter(|_| WhatsAppApp::can_forward(msg))
                     .map(|selected| selected.contains(message_id)),
                 is_preparing: app.is_audio_preparing(message_id),
             };

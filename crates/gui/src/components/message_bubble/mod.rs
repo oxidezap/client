@@ -18,8 +18,8 @@ use crate::retained_image::RetainedImage;
 use std::sync::Arc;
 
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString, Styled,
-    div, prelude::FluentBuilder as _,
+    App, Entity, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -221,30 +221,21 @@ pub fn render_message_bubble(
         .when_some(props.selecting, |el, ticked| {
             let toggle = entity.clone();
             let toggle_id = message_id.clone();
-            use gpui::StatefulInteractiveElement as _;
-            use gpui_component::{Icon, IconName};
+            let toggle_box = toggle.clone();
+            let toggle_box_id = toggle_id.clone();
+            use gpui_component::switch::Switch;
             el.cursor_pointer()
                 .on_click(move |_, _, cx| {
                     toggle.update(cx, |app, cx| app.toggle_selected(&toggle_id, cx));
                 })
                 .child(
-                    div()
-                        .flex_shrink_0()
-                        // Only a right-aligned row needs the box held to the
-                        // left; on a left-aligned one the same margin shoved
-                        // the bubble across to the right edge.
-                        .when(is_from_me, |tick| tick.mr_auto())
-                        .size(metrics.icon_button() * 0.6)
-                        .rounded(metrics.radius_sm())
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(ticked, |tick| {
-                            tick.bg(cx.theme().primary)
-                                .text_color(cx.theme().primary_foreground)
-                                .child(Icon::new(IconName::Check).size_3())
+                    Switch::new(ids.select.clone())
+                        .accessibility_label(crate::tr!(SelectMessages))
+                        .checked(ticked)
+                        .on_click(move |_: &bool, _, cx| {
+                            cx.stop_propagation();
+                            toggle_box
+                                .update(cx, |app, cx| app.toggle_selected(&toggle_box_id, cx));
                         }),
                 )
         })

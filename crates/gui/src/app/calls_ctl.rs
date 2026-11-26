@@ -1321,6 +1321,11 @@ impl WhatsAppApp {
                     window.focus(&self.paste_preview_focus, cx);
                 }
             }
+            KeyboardOwner::ForwardPicker => {
+                if let Some(search) = self.forward_pick.as_ref().map(|pick| pick.search.clone()) {
+                    window.focus(&search.read(cx).focus_handle(cx), cx);
+                }
+            }
             KeyboardOwner::Viewer => {
                 let handle = self.viewer.read(cx).focus().clone();
                 window.focus(&handle, cx)
@@ -1439,6 +1444,7 @@ fn keyboard_owner_for(
         None if surfaces.message_delete => KeyboardOwner::MessageDelete,
         None if surfaces.message_edit => KeyboardOwner::MessageEdit,
         None if surfaces.paste_preview => KeyboardOwner::PastePreview,
+        None if surfaces.forward_picker => KeyboardOwner::ForwardPicker,
         None if surfaces.viewer => KeyboardOwner::Viewer,
         None if showing_settings => KeyboardOwner::Screen,
         // Where both are drawn, the gesture decides. A chat opened to be
@@ -1513,6 +1519,7 @@ mod keyboard_owner_tests {
         composer: false,
         viewer: false,
         paste_preview: false,
+        forward_picker: false,
         message_edit: false,
         message_delete: false,
         call_card: false,
@@ -1537,6 +1544,7 @@ mod keyboard_owner_tests {
             composer: true,
             viewer: true,
             paste_preview: true,
+            forward_picker: false,
             message_edit: false,
             message_delete: false,
             call_card: true,

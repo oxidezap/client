@@ -78,6 +78,7 @@ pub fn render_connected_view(
     let visible = (app.destination().has_conversations()
         && layout.show_chat_area()
         && !app.paste_preview_showing()
+        && app.forward_pick().is_none()
         && app.media_viewer(cx).is_none())
     .then(|| selected_jid.clone())
     .flatten();
@@ -277,6 +278,7 @@ pub fn render_connected_view(
             && !is_offline,
         viewer: viewer.is_some(),
         paste_preview: false,
+        forward_picker: app.forward_pick().is_some(),
         message_edit: false,
         message_delete: false,
         // The card floats above this view rather than inside it, so the root
@@ -358,14 +360,17 @@ pub fn render_connected_view(
                         is_own_number,
                         plugin_actions,
                         plugin_composer,
-                        selection_bar: app.selection().map(|selected| {
-                            render_selection_bar(
-                                selected.len(),
-                                entity.clone(),
-                                *layout.metrics(),
-                                cx,
-                            )
-                        }),
+                        selection_bar: selected_jid
+                            .as_deref()
+                            .and_then(|jid| app.selection_in(jid))
+                            .map(|selected| {
+                                render_selection_bar(
+                                    selected.len(),
+                                    entity.clone(),
+                                    *layout.metrics(),
+                                    cx,
+                                )
+                            }),
                         media: media.clone(),
                     },
                     &message_list,
@@ -568,11 +573,11 @@ fn render_selection_bar(
                     cancel.update(cx, |app, cx| app.cancel_selection(cx));
                 }),
         )
-        .child(
-            div()
-                .flex_1()
-                .child(format!("{count} {}", crate::tr!(SelectedCount))),
-        )
+        .child(div().flex_1().child(crate::tr!(
+            selected_count,
+            count,
+            oxidezap_ipc::MAX_FORWARD_MESSAGES
+        )))
         .child(
             Button::new("selection-forward")
                 .primary()

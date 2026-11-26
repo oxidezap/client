@@ -139,6 +139,8 @@ enum KeyboardOwner {
     /// Files pasted or dropped into the composer, waiting for explicit
     /// confirmation before anything is uploaded.
     PastePreview,
+    /// The destination search for forwarding messages.
+    ForwardPicker,
     /// The fullscreen viewer, which owns the arrow keys while it is up.
     Viewer,
     /// A screen with its own controls — Settings. It is handed the window's
@@ -170,6 +172,8 @@ pub struct KeyboardSurfaces {
     pub viewer: bool,
     /// The modal preview for files waiting to be sent.
     pub paste_preview: bool,
+    /// The destination picker drawn over the conversation.
+    pub forward_picker: bool,
     pub message_edit: bool,
     pub message_delete: bool,
     /// The call card, which only the connected screens float.
@@ -1084,6 +1088,7 @@ pub struct WhatsAppApp {
     status_muted: std::collections::HashSet<String>,
     /// Messages ticked for forwarding, while selecting.
     forward_selection: Option<std::collections::BTreeSet<String>>,
+    forward_selection_source: Option<String>,
     /// Where a forward goes, while picking.
     forward_pick: Option<forward::ForwardPick>,
     /// The broadcast grouped by author, against the message count it was
@@ -1570,6 +1575,7 @@ impl WhatsAppApp {
             status_post: None,
             status_muted: Default::default(),
             forward_selection: None,
+            forward_selection_source: None,
             forward_pick: None,
             status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
@@ -2372,6 +2378,9 @@ impl WhatsAppApp {
         self.incoming_file_epoch = self.incoming_file_epoch.wrapping_add(1);
         self.incoming_file_reading = false;
         self.paste_preview = None;
+        self.forward_pick = None;
+        self.forward_selection = None;
+        self.forward_selection_source = None;
         self.delete_confirmation = None;
         self.pending_attachment_previews.clear();
         self.notified_messages.clear();

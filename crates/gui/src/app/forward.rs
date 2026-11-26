@@ -23,9 +23,10 @@ pub struct ForwardPick {
 }
 
 impl WhatsAppApp {
-    /// The messages ticked so far, while selecting.
-    pub fn selection(&self) -> Option<&BTreeSet<String>> {
-        self.forward_selection.as_ref()
+    pub fn selection_in(&self, chat: &str) -> Option<&BTreeSet<String>> {
+        (self.forward_selection_source.as_deref() == Some(chat))
+            .then_some(self.forward_selection.as_ref())
+            .flatten()
     }
 
     pub fn forward_pick(&self) -> Option<&ForwardPick> {
@@ -42,15 +43,32 @@ impl WhatsAppApp {
 
     /// Start selecting, with `id` already ticked.
     pub fn select_message(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.forward_selection_source = self.selected_chat_jid();
         self.forward_selection = Some(BTreeSet::from([id.to_owned()]));
         self.invalidate_selected_chat(cx);
     }
 
     pub fn toggle_selected(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(selection) = &mut self.forward_selection else {
+        if self.forward_selection_source != self.selected_chat_jid() {
+            self.forward_selection = None;
+            self.forward_selection_source = None;
+            self.invalidate_selected_chat(cx);
+            return;
+        }
+        let Some(current) = self.forward_selection.as_ref() else {
             return;
         };
-        if !selection.remove(id) {
+        if !current.contains(id) && current.len() >= oxidezap_ipc::MAX_FORWARD_MESSAGES {
+            self.notify_user(
+                crate::tr!(forward_limit_reached, oxidezap_ipc::MAX_FORWARD_MESSAGES),
+                Tone::Problem,
+                cx,
+            );
+            return;
+        }
+        if let Some(selection) = &mut self.forward_selection
+            && !selection.remove(id)
+        {
             selection.insert(id.to_owned());
         }
         self.invalidate_selected_chat(cx);
@@ -58,6 +76,7 @@ impl WhatsAppApp {
 
     pub fn cancel_selection(&mut self, cx: &mut Context<Self>) {
         if self.forward_selection.take().is_some() {
+            self.forward_selection_source = None;
             self.invalidate_selected_chat(cx);
         }
     }
@@ -72,7 +91,13 @@ impl WhatsAppApp {
 
     /// Forward what is ticked, once at least one is.
     pub fn forward_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(selection) = self.forward_selection.clone().filter(|s| !s.is_empty()) else {
+        let Some(selection) = self
+            .selected_chat_jid()
+            .as_deref()
+            .and_then(|jid| self.selection_in(jid))
+            .cloned()
+            .filter(|s| !s.is_empty())
+        else {
             return;
         };
         self.begin_forward(selection, window, cx);
@@ -192,6 +217,7 @@ impl WhatsAppApp {
                     Ok(()) => {
                         app.forward_pick = None;
                         app.forward_selection = None;
+                        app.forward_selection_source = None;
                         app.notify_user(crate::tr!(Forwarded), Tone::Info, cx);
                         if let Some(jid) = app.selected_chat_jid() {
                             app.invalidate_message_cache(&jid, cx);

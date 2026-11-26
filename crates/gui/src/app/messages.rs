@@ -119,6 +119,8 @@ pub struct BubbleIds {
     pub reply: SharedString,
     pub copy: SharedString,
     pub forward: SharedString,
+    /// The selection checkbox shown while picking multiple messages to forward.
+    pub select: SharedString,
     /// The optional edited indicator beside the time.
     pub edited: SharedString,
     /// The button a failed send grows.
@@ -137,6 +139,7 @@ impl BubbleIds {
             reply: format!("reply-{id}").into(),
             copy: format!("copy-{id}").into(),
             forward: format!("forward-{id}").into(),
+            select: format!("select-{id}").into(),
             edited: format!("edited-{id}").into(),
             retry: format!("retry-{id}").into(),
         }
