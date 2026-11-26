@@ -6,6 +6,8 @@
 //! which needs somewhere to hold what is being typed before anybody commits
 //! it — and that is what this file is.
 
+use std::collections::VecDeque;
+
 use indexmap::IndexMap;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};
@@ -20,8 +22,7 @@ use super::WhatsAppApp;
 pub struct PluginDateTime {
     pub state: DateTimeState,
     published: String,
-    last_committed: Option<String>,
-    in_flight: usize,
+    committed: VecDeque<String>,
     modified: bool,
 }
 
@@ -356,15 +357,18 @@ impl Plugins {
             match self.datetimes.get_mut(&k) {
                 Some(held) if held.published != dt.value => {
                     held.published.clone_from(&dt.value);
-                    held.in_flight = held.in_flight.saturating_sub(1);
-                    if held.in_flight == 0 {
-                        let echoed =
-                            rfc3339_or_str_equal(held.last_committed.as_deref(), &dt.value);
-                        held.last_committed = None;
-                        if !echoed {
-                            held.state = DateTimeState::from_rfc3339_or_default(&dt.value);
-                            held.modified = false;
-                        }
+                    if let Some(pos) = held
+                        .committed
+                        .iter()
+                        .position(|c| rfc3339_or_str_equal(Some(c.as_str()), &dt.value))
+                    {
+                        held.committed.drain(..=pos);
+                    } else {
+                        // A publication that matches none of our in-flight commits
+                        // is an authoritative plugin value (e.g. a corrected time).
+                        held.committed.clear();
+                        held.state = DateTimeState::from_rfc3339_or_default(&dt.value);
+                        held.modified = false;
                     }
                 }
                 Some(_) => {}
@@ -374,8 +378,7 @@ impl Plugins {
                         PluginDateTime {
                             state: DateTimeState::from_rfc3339_or_default(&dt.value),
                             published: dt.value,
-                            last_committed: None,
-                            in_flight: 0,
+                            committed: VecDeque::new(),
                             modified: false,
                         },
                     );
@@ -628,15 +631,14 @@ impl WhatsAppApp {
             DateTimeUpdate::PrevMonth | DateTimeUpdate::NextMonth
         );
         let can_dispatch = changes_value && slot != PluginSlot::Composer && self.client.is_some();
-        let value = self.plugins.update(cx, |plugins, cx| {
+        let dispatched = self.plugins.update(cx, |plugins, cx| {
             let entry = plugins
                 .datetimes
                 .entry(k)
                 .or_insert_with(|| PluginDateTime {
                     state: DateTimeState::from_rfc3339_or_default(""),
                     published: String::new(),
-                    last_committed: None,
-                    in_flight: 0,
+                    committed: VecDeque::new(),
                     modified: false,
                 });
             entry.state.apply(update);
@@ -644,14 +646,21 @@ impl WhatsAppApp {
                 entry.modified = true;
             }
             let sent = entry.state.to_rfc3339().unwrap_or_default();
-            if can_dispatch {
-                entry.last_committed = Some(sent.clone());
-                entry.in_flight += 1;
-            }
+            let last_sent = entry.committed.back().map(String::as_str);
+            let redundant = rfc3339_or_str_equal(last_sent.or(Some(&entry.published)), &sent);
+            let out = if can_dispatch && !redundant {
+                if entry.committed.len() >= 16 {
+                    entry.committed.pop_front();
+                }
+                entry.committed.push_back(sent.clone());
+                Some(sent)
+            } else {
+                None
+            };
             cx.notify();
-            sent
+            out
         });
-        if can_dispatch {
+        if let Some(value) = dispatched {
             self.send_plugin_action(plugin, id, Some(value), slot, PluginWidget::DateTime, cx);
         }
         cx.notify();
