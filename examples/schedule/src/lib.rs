@@ -12,6 +12,7 @@ struct EditDraft {
     id: u64,
     text: String,
     when: String,
+    text_invalid: bool,
 }
 
 thread_local! {
@@ -160,6 +161,7 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
             id,
             text: job.text.clone(),
             when,
+            text_invalid: false,
         }));
         return Ok("");
     }
@@ -168,13 +170,18 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         .strip_prefix("edit-message-")
         .and_then(|s| s.parse::<u64>().ok())
     {
-        let value = action.value_into::<4096>();
-        if let Some(text) = value.whole()
-            && let Some(mut d) = read_edit_draft().filter(|d| d.id == target_id)
-        {
-            d.text = text.to_owned();
+        let value = action.value_into::<MAX_MESSAGE>();
+        let Some(mut d) = read_edit_draft().filter(|d| d.id == target_id) else {
+            return Ok("");
+        };
+        let Some(text) = value.whole() else {
+            d.text_invalid = true;
             write_edit_draft(Some(d));
-        }
+            return Err("Enter a message of up to 512 bytes.");
+        };
+        d.text = text.to_owned();
+        d.text_invalid = false;
+        write_edit_draft(Some(d));
         return Ok("");
     }
     if let Some(target_id) = id
@@ -183,12 +190,16 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         .and_then(|s| s.parse::<u64>().ok())
     {
         let value = action.value_into::<256>();
-        if let Some(when) = value.whole()
-            && let Some(mut d) = read_edit_draft().filter(|d| d.id == target_id)
-        {
-            d.when = when.to_owned();
+        let Some(mut d) = read_edit_draft().filter(|d| d.id == target_id) else {
+            return Ok("");
+        };
+        let Some(when) = value.whole() else {
+            d.when.clear();
             write_edit_draft(Some(d));
-        }
+            return Err("Enter a future time within one year.");
+        };
+        d.when = when.to_owned();
+        write_edit_draft(Some(d));
         return Ok("");
     }
     if let Some(target_id) = id
@@ -222,13 +233,17 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
                 let when_key = format!("edit-when-{target_id}");
                 if let Some(text) = map.get(&msg_key).and_then(|v| v.as_str()) {
                     draft_val.text = text.to_owned();
+                    draft_val.text_invalid = false;
                 }
                 if let Some(when) = map.get(&when_key).and_then(|v| v.as_str()) {
                     draft_val.when = when.to_owned();
                 }
             }
         }
-        if draft_val.text.trim().is_empty() || draft_val.text.len() > MAX_MESSAGE {
+        if draft_val.text_invalid
+            || draft_val.text.trim().is_empty()
+            || draft_val.text.len() > MAX_MESSAGE
+        {
             return Err("Enter a message of up to 512 bytes.");
         }
         let at =
