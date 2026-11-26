@@ -20,6 +20,7 @@ use super::WhatsAppApp;
 pub struct PluginDateTime {
     pub state: DateTimeState,
     published: String,
+    committed: Option<String>,
     modified: bool,
 }
 
@@ -337,9 +338,13 @@ impl Plugins {
             let k = key(&dt.plugin, dt.slot, chat, &dt.id);
             match self.datetimes.get_mut(&k) {
                 Some(held) if held.published != dt.value => {
+                    let echoed_ours = held.committed.as_deref() == Some(dt.value.as_str());
                     held.published.clone_from(&dt.value);
-                    held.state = DateTimeState::from_rfc3339_or_default(&dt.value);
-                    held.modified = false;
+                    held.committed = None;
+                    if !echoed_ours {
+                        held.state = DateTimeState::from_rfc3339_or_default(&dt.value);
+                        held.modified = false;
+                    }
                 }
                 Some(_) => {}
                 None => {
@@ -348,6 +353,7 @@ impl Plugins {
                         PluginDateTime {
                             state: DateTimeState::from_rfc3339_or_default(&dt.value),
                             published: dt.value,
+                            committed: None,
                             modified: false,
                         },
                     );
@@ -606,24 +612,22 @@ impl WhatsAppApp {
                 .or_insert_with(|| PluginDateTime {
                     state: DateTimeState::from_rfc3339_or_default(""),
                     published: String::new(),
+                    committed: None,
                     modified: false,
                 });
             entry.state.apply(update);
             if changes_value {
                 entry.modified = true;
             }
+            let sent = entry.state.to_rfc3339().unwrap_or_default();
+            if changes_value && slot != PluginSlot::Composer {
+                entry.committed = Some(sent.clone());
+            }
             cx.notify();
-            entry.state.to_rfc3339()
+            sent
         });
         if changes_value && slot != PluginSlot::Composer {
-            self.send_plugin_action(
-                plugin,
-                id,
-                Some(value.unwrap_or_default()),
-                slot,
-                PluginWidget::DateTime,
-                cx,
-            );
+            self.send_plugin_action(plugin, id, Some(value), slot, PluginWidget::DateTime, cx);
         }
         cx.notify();
     }
