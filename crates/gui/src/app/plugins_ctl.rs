@@ -20,6 +20,7 @@ use super::WhatsAppApp;
 pub struct PluginDateTime {
     pub state: DateTimeState,
     published: String,
+    modified: bool,
 }
 
 /// One text field a plugin published, and what is currently typed in it.
@@ -307,14 +308,38 @@ impl Plugins {
             .iter()
             .map(|f| key(&f.plugin, f.slot, chat, &f.id))
             .collect();
-        self.datetimes
-            .retain(|k, _| live_dt.contains(k) || k.slot == PluginSlot::Composer);
+        let composers_dt: std::collections::HashSet<_> = wanted_dt
+            .iter()
+            .filter(|f| f.slot == PluginSlot::Composer)
+            .map(|f| (f.plugin.as_str(), f.id.as_str()))
+            .collect();
+        let mut inactive_dt = 0;
+        self.datetimes.retain(|k, dt| {
+            if live_dt.contains(k) {
+                return true;
+            }
+            let keep = k.slot == PluginSlot::Composer
+                && composers_dt.contains(&(k.plugin.as_str(), k.id.as_str()))
+                && dt.modified;
+            inactive_dt += usize::from(keep);
+            keep
+        });
+        let mut excess_dt = inactive_dt.saturating_sub(MAX_INACTIVE_COMPOSER_FIELDS);
+        self.datetimes.retain(|k, _| {
+            if excess_dt == 0 || live_dt.contains(k) {
+                true
+            } else {
+                excess_dt -= 1;
+                false
+            }
+        });
         for dt in wanted_dt {
             let k = key(&dt.plugin, dt.slot, chat, &dt.id);
             match self.datetimes.get_mut(&k) {
                 Some(held) if held.published != dt.value => {
                     held.published.clone_from(&dt.value);
                     held.state = DateTimeState::from_rfc3339_or_default(&dt.value);
+                    held.modified = false;
                 }
                 Some(_) => {}
                 None => {
@@ -323,6 +348,7 @@ impl Plugins {
                         PluginDateTime {
                             state: DateTimeState::from_rfc3339_or_default(&dt.value),
                             published: dt.value,
+                            modified: false,
                         },
                     );
                 }
@@ -569,6 +595,10 @@ impl WhatsAppApp {
     ) {
         let chat = self.selected_chat_jid();
         let k = key(plugin, slot, chat.as_deref(), id);
+        let changes_value = !matches!(
+            update,
+            DateTimeUpdate::PrevMonth | DateTimeUpdate::NextMonth
+        );
         let value = self.plugins.update(cx, |plugins, cx| {
             let entry = plugins
                 .datetimes
@@ -576,15 +606,24 @@ impl WhatsAppApp {
                 .or_insert_with(|| PluginDateTime {
                     state: DateTimeState::from_rfc3339_or_default(""),
                     published: String::new(),
+                    modified: false,
                 });
             entry.state.apply(update);
+            if changes_value {
+                entry.modified = true;
+            }
             cx.notify();
             entry.state.to_rfc3339()
         });
-        if slot != PluginSlot::Composer
-            && let Some(value) = value
-        {
-            self.send_plugin_action(plugin, id, Some(value), slot, PluginWidget::DateTime, cx);
+        if changes_value && slot != PluginSlot::Composer {
+            self.send_plugin_action(
+                plugin,
+                id,
+                Some(value.unwrap_or_default()),
+                slot,
+                PluginWidget::DateTime,
+                cx,
+            );
         }
         cx.notify();
     }
