@@ -3,37 +3,27 @@ use oxidezap_plugin::{
     Action, Caps, Declared, Event, Kinds, Outcome, Setup, Which, now_ms, plugin, ui,
 };
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 
 plugin!(init = setup, event = handle, panic = own);
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct EditDraft {
     id: u64,
     text: String,
     when: String,
 }
 
-const EDIT_KEY: &str = "edit_draft";
-
-fn read_edit_draft() -> Option<EditDraft> {
-    let stored = oxidezap_plugin::get::<MAX_QUEUE_BYTES>(EDIT_KEY);
-    let raw = stored
-        .whole()
-        .filter(|_| !stored.refused() && stored.present())?;
-    serde_json::from_str(raw).ok()
+thread_local! {
+    static EDIT_DRAFT: RefCell<Option<EditDraft>> = const { RefCell::new(None) };
 }
 
-fn write_edit_draft(draft: Option<&EditDraft>) {
-    match draft {
-        Some(draft) => {
-            if let Ok(raw) = serde_json::to_string(draft) {
-                let _ = oxidezap_plugin::set(EDIT_KEY, &raw);
-            }
-        }
-        None => {
-            let _ = oxidezap_plugin::set(EDIT_KEY, "");
-        }
-    }
+fn read_edit_draft() -> Option<EditDraft> {
+    EDIT_DRAFT.with(|cell| cell.borrow().clone())
+}
+
+fn write_edit_draft(draft: Option<EditDraft>) {
+    EDIT_DRAFT.with(|cell| *cell.borrow_mut() = draft);
 }
 
 const STORE: &str = "messages";
@@ -65,6 +55,7 @@ struct Form {
 }
 
 fn setup(p: Setup) -> impl Declared {
+    write_edit_draft(None);
     let declared = p
         .name("Scheduled messages")
         .subscribe(Kinds::NONE)
@@ -153,7 +144,7 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         let when = DateTime::<Utc>::from_timestamp_millis(job.at)
             .map(|time| time.to_rfc3339())
             .unwrap_or_default();
-        write_edit_draft(Some(&EditDraft {
+        write_edit_draft(Some(EditDraft {
             id,
             text: job.text.clone(),
             when,
@@ -170,7 +161,7 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
             && let Some(mut d) = read_edit_draft().filter(|d| d.id == target_id)
         {
             d.text = text.to_owned();
-            write_edit_draft(Some(&d));
+            write_edit_draft(Some(d));
         }
         return Ok("");
     }
@@ -184,7 +175,7 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
             && let Some(mut d) = read_edit_draft().filter(|d| d.id == target_id)
         {
             d.when = when.to_owned();
-            write_edit_draft(Some(&d));
+            write_edit_draft(Some(d));
         }
         return Ok("");
     }
