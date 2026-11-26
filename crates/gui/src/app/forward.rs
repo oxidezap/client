@@ -250,10 +250,10 @@ impl WhatsAppApp {
                         }
                     }
                     Err(error) => {
-                        if let Some(sent) = error.partial_forwarded
-                            && sent > 0
-                            && sent <= pick.ids.len()
-                        {
+                        let sent = error
+                            .partial_forwarded
+                            .filter(|sent| *sent > 0 && *sent <= pick.ids.len());
+                        if let Some(sent) = sent {
                             if app.forward_selection_source.as_deref() == Some(&pick.source)
                                 && let Some(selection) = &mut app.forward_selection
                             {
@@ -264,7 +264,14 @@ impl WhatsAppApp {
                             pick.retry_target = Some(target);
                         }
                         pick.pending = false;
-                        app.notify_user(error.to_string(), Tone::Problem, cx);
+                        let notice = match sent {
+                            Some(1) => crate::tr!(forward_partial_single, error.detail),
+                            Some(count) => {
+                                crate::tr!(forward_partial_multiple, count, error.detail)
+                            }
+                            None => error.to_string(),
+                        };
+                        app.notify_user(notice, Tone::Problem, cx);
                     }
                 }
                 cx.notify();
@@ -307,6 +314,7 @@ mod tests {
             "second".to_string(),
             "third".to_string(),
         ];
+        let timeline = ids.clone();
         let mut selection = ids.iter().cloned().collect::<BTreeSet<_>>();
 
         remove_sent_prefix(&mut ids, &mut selection, 1);
@@ -316,5 +324,10 @@ mod tests {
             selection,
             BTreeSet::from(["second".to_string(), "third".to_string()])
         );
+        let reopened_ids = timeline
+            .into_iter()
+            .filter(|id| selection.contains(id))
+            .collect::<Vec<_>>();
+        assert_eq!(reopened_ids, ids);
     }
 }
