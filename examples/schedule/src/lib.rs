@@ -275,7 +275,7 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
     if queue.jobs.len() >= MAX_JOBS {
         return Err("The schedule is full.");
     }
-    let value = action.value_into::<4096>();
+    let value = action.value_into::<8192>();
     let form: Form = value
         .whole()
         .and_then(|raw| serde_json::from_str(raw).ok())

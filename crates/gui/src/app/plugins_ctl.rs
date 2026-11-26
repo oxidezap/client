@@ -6,6 +6,8 @@
 //! which needs somewhere to hold what is being typed before anybody commits
 //! it — and that is what this file is.
 
+use std::collections::VecDeque;
+
 use indexmap::IndexMap;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};
@@ -20,7 +22,7 @@ use super::WhatsAppApp;
 pub struct PluginDateTime {
     pub state: DateTimeState,
     published: String,
-    committed: Option<String>,
+    committed: VecDeque<String>,
     modified: bool,
 }
 
@@ -338,10 +340,10 @@ impl Plugins {
             let k = key(&dt.plugin, dt.slot, chat, &dt.id);
             match self.datetimes.get_mut(&k) {
                 Some(held) if held.published != dt.value => {
-                    let echoed_ours = held.committed.as_deref() == Some(dt.value.as_str());
                     held.published.clone_from(&dt.value);
-                    held.committed = None;
-                    if !echoed_ours {
+                    if let Some(pos) = held.committed.iter().position(|c| c == &dt.value) {
+                        held.committed.drain(..=pos);
+                    } else if held.committed.is_empty() {
                         held.state = DateTimeState::from_rfc3339_or_default(&dt.value);
                         held.modified = false;
                     }
@@ -353,7 +355,7 @@ impl Plugins {
                         PluginDateTime {
                             state: DateTimeState::from_rfc3339_or_default(&dt.value),
                             published: dt.value,
-                            committed: None,
+                            committed: VecDeque::new(),
                             modified: false,
                         },
                     );
@@ -605,6 +607,7 @@ impl WhatsAppApp {
             update,
             DateTimeUpdate::PrevMonth | DateTimeUpdate::NextMonth
         );
+        let can_dispatch = changes_value && slot != PluginSlot::Composer && self.client.is_some();
         let value = self.plugins.update(cx, |plugins, cx| {
             let entry = plugins
                 .datetimes
@@ -612,7 +615,7 @@ impl WhatsAppApp {
                 .or_insert_with(|| PluginDateTime {
                     state: DateTimeState::from_rfc3339_or_default(""),
                     published: String::new(),
-                    committed: None,
+                    committed: VecDeque::new(),
                     modified: false,
                 });
             entry.state.apply(update);
@@ -620,13 +623,16 @@ impl WhatsAppApp {
                 entry.modified = true;
             }
             let sent = entry.state.to_rfc3339().unwrap_or_default();
-            if changes_value && slot != PluginSlot::Composer {
-                entry.committed = Some(sent.clone());
+            if can_dispatch {
+                if entry.committed.len() >= 16 {
+                    entry.committed.pop_front();
+                }
+                entry.committed.push_back(sent.clone());
             }
             cx.notify();
             sent
         });
-        if changes_value && slot != PluginSlot::Composer {
+        if can_dispatch {
             self.send_plugin_action(plugin, id, Some(value), slot, PluginWidget::DateTime, cx);
         }
         cx.notify();
