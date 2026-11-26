@@ -229,8 +229,8 @@ impl WhatsAppApp {
         cx.spawn(async move |app, cx| {
             let result = result
                 .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result.map_err(|error| error.to_string()));
+                .map_err(|error| crate::session::Failure::worth_retrying(error.to_string()))
+                .and_then(|result| result);
             let _ = app.update(cx, |app, cx| {
                 // The picker this answers is still the one on screen.
                 let Some(pick) = &mut app.forward_pick else {
@@ -250,15 +250,21 @@ impl WhatsAppApp {
                         }
                     }
                     Err(error) => {
-                        if let Some(sent) = forwarded_prefix(&error)
+                        if let Some(sent) = error.partial_forwarded
                             && sent > 0
                             && sent <= pick.ids.len()
                         {
-                            pick.ids.drain(..sent);
+                            if app.forward_selection_source.as_deref() == Some(&pick.source)
+                                && let Some(selection) = &mut app.forward_selection
+                            {
+                                remove_sent_prefix(&mut pick.ids, selection, sent);
+                            } else {
+                                pick.ids.drain(..sent);
+                            }
                             pick.retry_target = Some(target);
                         }
                         pick.pending = false;
-                        app.notify_user(error, Tone::Problem, cx);
+                        app.notify_user(error.to_string(), Tone::Problem, cx);
                     }
                 }
                 cx.notify();
@@ -269,26 +275,46 @@ impl WhatsAppApp {
     }
 }
 
-fn forwarded_prefix(detail: &str) -> Option<usize> {
-    detail
-        .strip_prefix("forwarded ")?
-        .split_once(" of ")?
-        .0
-        .parse()
-        .ok()
+fn remove_sent_prefix(ids: &mut Vec<String>, selection: &mut BTreeSet<String>, sent: usize) {
+    for id in ids.drain(..sent) {
+        selection.remove(&id);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::forwarded_prefix;
+    use std::collections::BTreeSet;
+
+    use oxidezap_ipc::ProtocolError;
+
+    use super::remove_sent_prefix;
 
     #[test]
-    fn partial_forward_errors_report_the_already_sent_prefix() {
+    fn partial_forward_progress_survives_protocol_error_conversion() {
+        let failure = crate::session::Failure::from(&ProtocolError::PartialForward {
+            sent: 3,
+            detail: "network error".into(),
+        });
+
+        assert_eq!(failure.partial_forwarded, Some(3));
+        assert!(failure.retryable);
+    }
+
+    #[test]
+    fn sent_prefix_is_removed_from_the_selection_before_reopening() {
+        let mut ids = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
+        let mut selection = ids.iter().cloned().collect::<BTreeSet<_>>();
+
+        remove_sent_prefix(&mut ids, &mut selection, 1);
+
+        assert_eq!(ids, ["second", "third"]);
         assert_eq!(
-            forwarded_prefix("forwarded 3 of 8, then: network error"),
-            Some(3)
+            selection,
+            BTreeSet::from(["second".to_string(), "third".to_string()])
         );
-        assert_eq!(forwarded_prefix("network error"), None);
-        assert_eq!(forwarded_prefix("forwarded nope of 8, then: error"), None);
     }
 }

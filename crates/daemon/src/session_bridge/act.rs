@@ -201,7 +201,7 @@ impl Bridge {
                 };
                 let task = client.forward_messages(source, message_ids, target);
                 oxidezap_session::spawn(async move {
-                    let result = mutation_answer(id, task.await);
+                    let result = forward_answer(id, task.await);
                     answer_now(&answer_to, answered(id, result));
                     let _ = reply.send(CommandOutcome::Accepted);
                     drop(permit);
@@ -2566,6 +2566,25 @@ fn mutation_answer<T, E: std::fmt::Display>(
     }
 }
 
+fn forward_answer<E: std::fmt::Display>(
+    id: RequestId,
+    result: Result<Result<(), oxidezap_session::ForwardFailure>, E>,
+) -> Result<DaemonMessage, ProtocolError> {
+    match result {
+        Ok(Ok(())) => Ok(DaemonMessage::Accepted { id: Some(id) }),
+        Ok(Err(error)) if error.sent > 0 => Err(ProtocolError::PartialForward {
+            sent: error.sent,
+            detail: error.detail,
+        }),
+        Ok(Err(error)) => Err(ProtocolError::Refused {
+            detail: error.detail,
+        }),
+        Err(error) => Err(ProtocolError::NoSession {
+            detail: format!("session stopped before the forward finished: {error}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -2576,6 +2595,23 @@ mod tests {
 
     use super::super::tests::{bridge, loaded, message, received, saturate, stored_chat};
     use super::*;
+
+    #[test]
+    fn partial_forward_answer_keeps_the_delivered_prefix_as_data() {
+        assert_eq!(
+            forward_answer(
+                41,
+                Ok::<_, std::convert::Infallible>(Err(oxidezap_session::ForwardFailure {
+                    sent: 3,
+                    detail: "network error".into(),
+                })),
+            ),
+            Err(ProtocolError::PartialForward {
+                sent: 3,
+                detail: "network error".into(),
+            })
+        );
+    }
 
     #[test]
     fn profile_mapping_preserves_identity_provenance_and_picture_outcome() {

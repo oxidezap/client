@@ -387,19 +387,15 @@ impl WhatsAppClient {
         source_chat_jid: String,
         message_ids: Vec<String>,
         target_chat_jid: String,
-    ) -> Task<Result<(), String>> {
+    ) -> Task<Result<(), ForwardFailure>> {
         let session = self.session.clone();
         self.exec.spawn(async move {
             for (sent, id) in message_ids.iter().enumerate() {
-                forward_one(&session, &source_chat_jid, id, &target_chat_jid)
-                    .await
-                    .map_err(|error| {
-                        if sent == 0 {
-                            error
-                        } else {
-                            format!("forwarded {sent} of {}, then: {error}", message_ids.len())
-                        }
-                    })?;
+                if let Err(detail) =
+                    forward_one(&session, &source_chat_jid, id, &target_chat_jid).await
+                {
+                    return Err(ForwardFailure { sent, detail });
+                }
             }
             Ok(())
         })
@@ -710,6 +706,12 @@ impl WhatsAppClient {
             }
         });
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardFailure {
+    pub sent: usize,
+    pub detail: String,
 }
 
 #[cfg(test)]

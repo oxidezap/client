@@ -1455,6 +1455,10 @@ pub enum ProtocolError {
     /// what the client would have to change.
     #[error("refused: {detail}")]
     Refused { detail: String },
+    /// A batch forward failed after a prefix was delivered. The count is data
+    /// so a client can resume without repeating messages already sent.
+    #[error("forward stopped after {sent} messages: {detail}")]
+    PartialForward { sent: usize, detail: String },
     /// The daemon agreed to the request and the attempt failed anyway.
     ///
     /// Distinct from every error above it, because those are all about the
@@ -1486,6 +1490,20 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_forward_error_round_trips_its_sent_prefix() {
+        let error = ProtocolError::PartialForward {
+            sent: 3,
+            detail: "network error".into(),
+        };
+        let encoded = serde_json::to_string(&error).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<ProtocolError>(&encoded).unwrap(),
+            error
+        );
+    }
 
     /// The large frames stay heap-backed: every frame deserializes through
     /// serde's buffered `Content`, so the largest variant sets the working

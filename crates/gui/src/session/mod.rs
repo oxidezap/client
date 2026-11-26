@@ -242,6 +242,7 @@ pub struct Failure {
     pub detail: String,
     /// Whether the same request, sent again, could succeed.
     pub retryable: bool,
+    pub partial_forwarded: Option<usize>,
 }
 
 impl Failure {
@@ -251,6 +252,7 @@ impl Failure {
         Self {
             detail: detail.into(),
             retryable: true,
+            partial_forwarded: None,
         }
     }
 
@@ -259,6 +261,7 @@ impl Failure {
         Self {
             detail: detail.into(),
             retryable: false,
+            partial_forwarded: None,
         }
     }
 }
@@ -293,10 +296,21 @@ impl From<&oxidezap_ipc::ProtocolError> for Failure {
             E::Failed { detail, retryable } => (detail.clone(), *retryable),
             E::NoSession { detail } => (detail.clone(), true),
             E::Refused { detail } | E::Malformed { detail } => (detail.clone(), false),
+            E::PartialForward { sent, detail } => {
+                return Self {
+                    detail: detail.clone(),
+                    retryable: true,
+                    partial_forwarded: Some(*sent),
+                };
+            }
             E::TooManyClients { .. } => (error.to_string(), true),
             E::VersionMismatch { .. } => (error.to_string(), false),
         };
-        Self { detail, retryable }
+        Self {
+            detail,
+            retryable,
+            partial_forwarded: None,
+        }
     }
 }
 

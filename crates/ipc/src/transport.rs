@@ -296,7 +296,8 @@ use std::path::PathBuf;
 ///
 /// 45 adds `StatusMutes`, which an older daemon would refuse as malformed.
 /// 46 adds `ForwardMessages`, which an older daemon would refuse as malformed.
-pub const PROTOCOL_VERSION: u32 = 46;
+/// 47 returns delivered-prefix progress after a partial `ForwardMessages`.
+pub const PROTOCOL_VERSION: u32 = 47;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///
