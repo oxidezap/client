@@ -76,6 +76,7 @@ pub fn composer(app: &WhatsAppApp, ctx: &PluginContext, cx: &App) -> Option<gpui
                 .anchor(gpui::Anchor::BottomLeft)
                 .trigger(
                     Button::new("composer-plugin-tools")
+                        .icon(crate::components::ProductIcon::Grid)
                         .label(crate::tr!(ComposerPlugins))
                         .ghost()
                         .small(),
@@ -87,11 +88,13 @@ pub fn composer(app: &WhatsAppApp, ctx: &PluginContext, cx: &App) -> Option<gpui
                         .flex()
                         .flex_col()
                         .gap(metrics.space_md())
-                        .w(rems(20.))
+                        .w(rems(31.))
                         .max_w(
                             (window.viewport_size().width - metrics.space_xl()).max(gpui::px(0.)),
                         )
-                        .max_h(rems(24.))
+                        .max_h(
+                            (window.viewport_size().height - metrics.space_xl()).max(gpui::px(0.)),
+                        )
                         .overflow_y_scroll()
                         .children(slot(app.plugins(cx), PluginSlot::Composer, app, &ctx, cx))
                 }),
@@ -131,22 +134,34 @@ fn widget(
             // plugin's roots. The same separator `key` uses, for the same
             // reason and with the same guarantee: no plugin id may contain
             // it.
-            Button::new(SharedString::from(format!(
+            let button = Button::new(SharedString::from(format!(
                 "plugin/{}/{}",
                 surface.id, node.id
             )))
-            .label(node.label.clone())
-            .ghost()
-            .small()
-            .disabled(!live)
-            .when(live, |button| button.cursor_pointer())
-            .on_click(move |_, _window, cx| {
-                let (plugin, action) = (plugin.clone(), action.clone());
-                entity.update(cx, |app, cx| {
-                    app.send_plugin_action(&plugin, &action, None, slot, PluginWidget::Button, cx);
-                });
-            })
-            .into_any_element()
+            .label(node.label.clone());
+            let button = if slot == PluginSlot::Composer {
+                button.outline()
+            } else {
+                button.ghost()
+            };
+            button
+                .small()
+                .disabled(!live)
+                .when(live, |button| button.cursor_pointer())
+                .on_click(move |_, _window, cx| {
+                    let (plugin, action) = (plugin.clone(), action.clone());
+                    entity.update(cx, |app, cx| {
+                        app.send_plugin_action(
+                            &plugin,
+                            &action,
+                            None,
+                            slot,
+                            PluginWidget::Button,
+                            cx,
+                        );
+                    });
+                })
+                .into_any_element()
         }
 
         PluginWidget::Toggle => {
@@ -226,6 +241,34 @@ fn widget(
                     ))
                 })
                 .into_any_element()
+        }
+
+        PluginWidget::DateTime => {
+            let state = app
+                .plugin_datetime(&surface.id, slot, &node.id, cx)
+                .unwrap_or_else(|| {
+                    crate::components::datetime_picker::DateTimeState::from_rfc3339_or_default(
+                        &node.value,
+                    )
+                });
+            let (plugin, id) = (surface.id.clone(), node.id.clone());
+            let entity = ctx.entity.clone();
+            let prefix = format!("plugin/{}/{:?}/{}", surface.id, slot, node.id);
+            crate::components::datetime_picker::render_datetime_picker(
+                &prefix,
+                &node.label,
+                &state,
+                live,
+                move |update, _window, cx| {
+                    let (plugin, id) = (plugin.clone(), id.clone());
+                    entity.update(cx, |app, cx| {
+                        app.update_plugin_datetime(&plugin, slot, &id, update, cx);
+                    });
+                },
+                metrics,
+                cx,
+            )
+            .into_any_element()
         }
 
         PluginWidget::Label => div()

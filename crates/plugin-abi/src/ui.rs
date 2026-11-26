@@ -80,6 +80,8 @@ pub mod kind {
     pub const COLUMN: u8 = 6;
     /// A titled group. Its label is the title.
     pub const SECTION: u8 = 7;
+    /// A date and time picker. Its value is an RFC 3339 timestamp with offset.
+    pub const DATE_TIME: u8 = 8;
 
     /// Whether this kind is drawn with whatever it holds inside it.
     ///
@@ -95,7 +97,7 @@ pub mod kind {
     pub const fn is_known(kind: u8) -> bool {
         matches!(
             kind,
-            BUTTON | TOGGLE | LABEL | TEXT_FIELD | ROW | COLUMN | SECTION
+            BUTTON | TOGGLE | LABEL | TEXT_FIELD | ROW | COLUMN | SECTION | DATE_TIME
         )
     }
 
@@ -105,7 +107,7 @@ pub mod kind {
     /// name is one the plugin could never tell apart from another.
     #[must_use]
     pub const fn is_interactive(kind: u8) -> bool {
-        matches!(kind, BUTTON | TOGGLE | TEXT_FIELD)
+        matches!(kind, BUTTON | TOGGLE | TEXT_FIELD | DATE_TIME)
     }
 }
 
@@ -707,6 +709,36 @@ mod tests {
         assert_eq!(tree[1].children.len(), 2);
         assert_eq!(tree[1].children[0].value, "1");
         assert_eq!(tree[1].children[1].kind, kind::LABEL);
+    }
+
+    #[test]
+    fn datetime_widget_survives_a_round_trip() {
+        let bytes = write(|w| {
+            w.begin(
+                kind::SECTION,
+                slot::COMPOSER,
+                flags::ENABLED,
+                "",
+                "Schedule",
+                "",
+            );
+            w.leaf(
+                kind::DATE_TIME,
+                slot::NONE,
+                flags::ENABLED,
+                "when",
+                "Send time",
+                "2030-01-01T09:00:00Z",
+            );
+            w.end();
+        })
+        .expect("fits");
+
+        let tree = parse(&bytes).expect("parses");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].children[0].kind, kind::DATE_TIME);
+        assert_eq!(tree[0].children[0].id, "when");
+        assert_eq!(tree[0].children[0].value, "2030-01-01T09:00:00Z");
     }
 
     /// The writer's whole error story: nothing is reported until `finish`, so

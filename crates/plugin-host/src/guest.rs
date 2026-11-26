@@ -1166,6 +1166,7 @@ fn widget(node: &abi::ui::Node) -> PluginNode {
             abi::ui::kind::ROW => PluginWidget::Row,
             abi::ui::kind::COLUMN => PluginWidget::Column,
             abi::ui::kind::SECTION => PluginWidget::Section,
+            abi::ui::kind::DATE_TIME => PluginWidget::DateTime,
             // Including `LABEL`, and anything the parser starts admitting
             // that this does not name yet: text nobody can press is the one
             // fallback that cannot do something the author did not ask for.

@@ -6,13 +6,57 @@
 //! which needs somewhere to hold what is being typed before anybody commits
 //! it — and that is what this file is.
 
+use std::collections::VecDeque;
+
 use indexmap::IndexMap;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gpui_component::input::{InputEvent, InputState};
 use oxidezap_core::{PluginNode, PluginSlot, PluginSurface, PluginWidget};
 
+use crate::components::datetime_picker::{DateTimeState, DateTimeUpdate};
+
 use super::WhatsAppApp;
+
+/// One date-time picker a plugin published, and its current local selection.
+pub struct PluginDateTime {
+    pub state: DateTimeState,
+    published: String,
+    committed: VecDeque<String>,
+    modified: bool,
+}
+
+fn rfc3339_or_str_equal(a: Option<&str>, b: &str) -> bool {
+    let Some(a) = a else {
+        return false;
+    };
+    if a == b {
+        return true;
+    }
+    match (
+        chrono::DateTime::parse_from_rfc3339(a),
+        chrono::DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(da), Ok(db)) => da == db,
+        _ => false,
+    }
+}
+
+fn acknowledge_datetime_publication(committed: &mut VecDeque<String>, value: &str) -> bool {
+    let Some(pos) = committed
+        .iter()
+        .position(|commit| rfc3339_or_str_equal(Some(commit), value))
+    else {
+        return false;
+    };
+    committed.drain(..=pos);
+    true
+}
+
+fn datetime_commit_is_redundant(last_sent: Option<&str>, published: &str, sent: &str) -> bool {
+    rfc3339_or_str_equal(Some(published), sent)
+        && last_sent.is_none_or(|last| rfc3339_or_str_equal(Some(last), sent))
+}
 
 /// One text field a plugin published, and what is currently typed in it.
 pub struct PluginField {
@@ -130,6 +174,8 @@ pub(super) struct Plugins {
     /// before anybody commits it. Keyed by plugin, slot, conversation and
     /// widget id; see [`key`].
     fields: PluginFields,
+    /// Somewhere to hold what is selected in a plugin's date-time picker.
+    datetimes: IndexMap<FieldKey, PluginDateTime>,
     /// Every plugin id in this front end's own folder, whether or not it
     /// loaded.
     ///
@@ -147,6 +193,7 @@ impl Plugins {
         Self {
             surfaces: Vec::new(),
             fields: PluginFields::new(),
+            datetimes: IndexMap::new(),
             installed: None,
         }
     }
@@ -257,6 +304,7 @@ impl Plugins {
     pub(super) fn forget(&mut self, cx: &mut Context<Self>) {
         self.surfaces.clear();
         self.fields.clear();
+        self.datetimes.clear();
         cx.notify();
     }
 
@@ -284,9 +332,67 @@ impl Plugins {
         cx: &mut Context<Self>,
     ) -> Vec<Field> {
         let mut wanted: Vec<Field> = Vec::new();
+        let mut wanted_dt: Vec<Field> = Vec::new();
         for surface in &self.surfaces {
             for root in &surface.roots {
                 collect_fields(&surface.id, root.slot, &root.node, &mut wanted);
+                collect_datetimes(&surface.id, root.slot, &root.node, &mut wanted_dt);
+            }
+        }
+        let live_dt: std::collections::HashSet<FieldKey> = wanted_dt
+            .iter()
+            .map(|f| key(&f.plugin, f.slot, chat, &f.id))
+            .collect();
+        let composers_dt: std::collections::HashSet<_> = wanted_dt
+            .iter()
+            .filter(|f| f.slot == PluginSlot::Composer)
+            .map(|f| (f.plugin.as_str(), f.id.as_str()))
+            .collect();
+        let mut inactive_dt = 0;
+        self.datetimes.retain(|k, dt| {
+            if live_dt.contains(k) {
+                return true;
+            }
+            let keep = k.slot == PluginSlot::Composer
+                && composers_dt.contains(&(k.plugin.as_str(), k.id.as_str()))
+                && dt.modified;
+            inactive_dt += usize::from(keep);
+            keep
+        });
+        let mut excess_dt = inactive_dt.saturating_sub(MAX_INACTIVE_COMPOSER_FIELDS);
+        self.datetimes.retain(|k, _| {
+            if excess_dt == 0 || live_dt.contains(k) {
+                true
+            } else {
+                excess_dt -= 1;
+                false
+            }
+        });
+        for dt in wanted_dt {
+            let k = key(&dt.plugin, dt.slot, chat, &dt.id);
+            match self.datetimes.get_mut(&k) {
+                Some(held) if held.published != dt.value => {
+                    held.published.clone_from(&dt.value);
+                    if !acknowledge_datetime_publication(&mut held.committed, &dt.value) {
+                        // A publication that matches none of our in-flight commits
+                        // is an authoritative plugin value (e.g. a corrected time).
+                        held.committed.clear();
+                        held.state = DateTimeState::from_rfc3339_or_default(&dt.value);
+                        held.modified = false;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.datetimes.insert(
+                        k,
+                        PluginDateTime {
+                            state: DateTimeState::from_rfc3339_or_default(&dt.value),
+                            published: dt.value,
+                            committed: VecDeque::new(),
+                            modified: false,
+                        },
+                    );
+                }
             }
         }
 
@@ -495,6 +601,76 @@ impl WhatsAppApp {
         self.plugins
             .read(cx)
             .field(plugin, slot, chat.as_deref(), id)
+    }
+
+    /// The current date/time selection for one plugin's `DateTime` widget.
+    #[must_use]
+    pub fn plugin_datetime(
+        &self,
+        plugin: &str,
+        slot: PluginSlot,
+        id: &str,
+        cx: &App,
+    ) -> Option<DateTimeState> {
+        let chat = self.selected_chat_jid();
+        let k = key(plugin, slot, chat.as_deref(), id);
+        self.plugins
+            .read(cx)
+            .datetimes
+            .get(&k)
+            .map(|dt| dt.state.clone())
+    }
+
+    /// Apply a user interaction to a plugin's `DateTime` picker.
+    ///
+    /// In [`PluginSlot::Composer`] the value stays local until a composer
+    /// button is pressed (matching [`PluginWidget::TextField`]); in other slots
+    /// it is dispatched immediately as a [`PluginWidget::DateTime`] action.
+    pub fn update_plugin_datetime(
+        &mut self,
+        plugin: &str,
+        slot: PluginSlot,
+        id: &str,
+        update: DateTimeUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let chat = self.selected_chat_jid();
+        let k = key(plugin, slot, chat.as_deref(), id);
+        let changes_value = !matches!(
+            update,
+            DateTimeUpdate::PrevMonth | DateTimeUpdate::NextMonth
+        );
+        let can_dispatch = changes_value && slot != PluginSlot::Composer && self.client.is_some();
+        let dispatched = self.plugins.update(cx, |plugins, cx| {
+            let entry = plugins
+                .datetimes
+                .entry(k)
+                .or_insert_with(|| PluginDateTime {
+                    state: DateTimeState::from_rfc3339_or_default(""),
+                    published: String::new(),
+                    committed: VecDeque::new(),
+                    modified: false,
+                });
+            entry.state.apply(update);
+            if changes_value {
+                entry.modified = true;
+            }
+            let sent = entry.state.to_rfc3339().unwrap_or_default();
+            let last_sent = entry.committed.back().map(String::as_str);
+            let redundant = datetime_commit_is_redundant(last_sent, &entry.published, &sent);
+            let out = if can_dispatch && !redundant {
+                entry.committed.push_back(sent.clone());
+                Some(sent)
+            } else {
+                None
+            };
+            cx.notify();
+            out
+        });
+        if let Some(value) = dispatched {
+            self.send_plugin_action(plugin, id, Some(value), slot, PluginWidget::DateTime, cx);
+        }
+        cx.notify();
     }
 
     /// Every plugin the daemon has loaded.
@@ -738,8 +914,10 @@ impl WhatsAppApp {
             .iter()
             .find(|surface| surface.id == plugin)?;
         let mut fields = Vec::new();
+        let mut datetimes = Vec::new();
         for node in surface.roots_in(PluginSlot::Composer) {
             collect_fields(plugin, PluginSlot::Composer, node, &mut fields);
+            collect_datetimes(plugin, PluginSlot::Composer, node, &mut datetimes);
         }
         let mut values = std::collections::BTreeMap::new();
         let limit = MAX_FIELD_BYTES.checked_sub(chat.len())?;
@@ -751,6 +929,14 @@ impl WhatsAppApp {
                 .value();
             remaining = remaining.checked_sub(field.id.len() + value.len())?;
             values.insert(field.id, value.to_string());
+        }
+        for dt in datetimes {
+            let value = self
+                .plugin_datetime(plugin, PluginSlot::Composer, &dt.id, cx)
+                .and_then(|state| state.to_rfc3339())
+                .unwrap_or_default();
+            remaining = remaining.checked_sub(dt.id.len() + value.len())?;
+            values.insert(dt.id, value);
         }
         serde_json::to_string(&values)
             .ok()
@@ -828,12 +1014,32 @@ fn collect_fields(plugin: &str, slot: PluginSlot, node: &PluginNode, out: &mut V
     }
 }
 
+/// Every date-time picker in a tree, with the value the plugin gave it.
+fn collect_datetimes(plugin: &str, slot: PluginSlot, node: &PluginNode, out: &mut Vec<Field>) {
+    if node.widget == PluginWidget::DateTime && !node.id.is_empty() {
+        out.push(Field {
+            plugin: plugin.to_owned(),
+            slot,
+            id: node.id.clone(),
+            value: node.value.clone(),
+        });
+    }
+    for child in &node.children {
+        collect_datetimes(plugin, slot, child, out);
+    }
+}
+
 /// The boxes, keyed by what names each one.
 type PluginFields = IndexMap<FieldKey, PluginField>;
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginSlot, PluginSurface, Plugins, key};
+    use std::collections::VecDeque;
+
+    use super::{
+        PluginSlot, PluginSurface, Plugins, acknowledge_datetime_publication,
+        datetime_commit_is_redundant, key,
+    };
 
     fn surface(id: &str) -> PluginSurface {
         PluginSurface {
@@ -925,5 +1131,40 @@ mod tests {
             header("a@s.whatsapp.net", "b@s.whatsapp.net/note"),
             header("a@s.whatsapp.net/b@s.whatsapp.net", "note"),
         );
+    }
+
+    #[test]
+    fn publication_acknowledges_the_oldest_matching_datetime_commit() {
+        let mut committed = VecDeque::from([
+            "2026-11-26T10:00:00Z".to_string(),
+            "2026-11-26T11:00:00Z".to_string(),
+            "2026-11-26T10:00:00+00:00".to_string(),
+        ]);
+
+        assert!(acknowledge_datetime_publication(
+            &mut committed,
+            "2026-11-26T10:00:00Z"
+        ));
+        assert_eq!(
+            committed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["2026-11-26T11:00:00Z", "2026-11-26T10:00:00+00:00"]
+        );
+        assert!(acknowledge_datetime_publication(
+            &mut committed,
+            "2026-11-26T11:00:00Z"
+        ));
+        assert_eq!(
+            committed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["2026-11-26T10:00:00+00:00"]
+        );
+    }
+
+    #[test]
+    fn a_stale_pending_value_does_not_suppress_a_correction() {
+        assert!(!datetime_commit_is_redundant(
+            Some("2026-11-26T10:00:00Z"),
+            "2026-11-26T11:00:00Z",
+            "2026-11-26T10:00:00+00:00"
+        ));
     }
 }

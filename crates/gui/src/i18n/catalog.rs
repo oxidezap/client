@@ -420,4 +420,21 @@ catalog! {
     OutgoingCalling => ("calling", "chamando");
     OutgoingRinging => ("ringing", "tocando");
     OutgoingConnected => ("connected", "conectada");
+    January => ("January", "janeiro");
+    February => ("February", "fevereiro");
+    March => ("March", "março");
+    April => ("April", "abril");
+    May => ("May", "maio");
+    June => ("June", "junho");
+    July => ("July", "julho");
+    August => ("August", "agosto");
+    September => ("September", "setembro");
+    October => ("October", "outubro");
+    November => ("November", "novembro");
+    December => ("December", "dezembro");
+    Preset15m => ("+15m", "+15 min");
+    Preset1h => ("+1h", "+1 h");
+    Tomorrow0900 => ("Tomorrow 09:00", "Amanhã 09:00");
+    SendTime => ("Time", "Horário");
+    SelectFutureDateTime => ("Select a future date and time.", "Selecione uma data e horário futuros.");
 }

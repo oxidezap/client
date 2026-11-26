@@ -262,7 +262,7 @@ node:
 ```
 
 Kinds: `1` button, `2` toggle, `3` label, `4` text field, `5` row, `6` column,
-`7` section. Only rows, columns and sections are drawn with children.
+`7` section, `8` date-time picker. Only rows, columns and sections are drawn with children.
 
 Slots: `1` chat header, `2` composer tools popover, `3` settings. Actions
 in the header and composer slots carry the open chat. Use the composer slot
@@ -316,9 +316,14 @@ checks the action against the tree it currently publishes — kind and slot
 included — so a press from a window whose frame is older than the daemon's
 does not land as a real one.
 
-Composer text fields are local until a composer button is pressed. That button
-receives a JSON object mapping the plugin's composer field IDs to the values
-currently visible in the same chat. Other buttons have an empty value.
+Composer text fields and date-time pickers are local until a composer button
+is pressed. That button receives a JSON object mapping the plugin's composer
+field and date-time IDs to the values currently visible in the same chat
+(date-time values are RFC 3339 timestamps with offset, or an empty string when
+unresolved). Other buttons have an empty value. Outside the composer slot,
+changing a date-time picker's date or time dispatches a `UI_ACTION` immediately
+carrying the RFC 3339 timestamp with offset (or empty string if unresolvable),
+while month navigation stays local.
 
 ## What the host holds a plugin to
 
