@@ -649,9 +649,6 @@ impl WhatsAppApp {
             let last_sent = entry.committed.back().map(String::as_str);
             let redundant = rfc3339_or_str_equal(last_sent.or(Some(&entry.published)), &sent);
             let out = if can_dispatch && !redundant {
-                if entry.committed.len() >= 16 {
-                    entry.committed.pop_front();
-                }
                 entry.committed.push_back(sent.clone());
                 Some(sent)
             } else {
