@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use gpui::{AppContext as _, Context, Entity, Window};
+use gpui::{AppContext as _, Context, Entity, UniformListScrollHandle, Window};
 use gpui_component::input::{InputEvent, InputState};
 
 use super::WhatsAppApp;
@@ -19,6 +19,7 @@ pub struct ForwardPick {
     /// What is being forwarded, in the order it was written.
     pub ids: Vec<String>,
     pub search: Entity<InputState>,
+    pub scroll: UniformListScrollHandle,
     pub pending: bool,
 }
 
@@ -147,6 +148,7 @@ impl WhatsAppApp {
             source,
             ids,
             search,
+            scroll: UniformListScrollHandle::new(),
             pending: false,
         });
         self.navigate_to_chat();

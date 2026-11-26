@@ -3,6 +3,7 @@
 use gpui::{
     AnyElement, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
+    uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme as _, Disableable as _};
@@ -284,10 +285,11 @@ pub fn render_connected_view(
         viewer: viewer.is_some(),
         paste_preview: false,
         forward_picker: app.forward_pick().is_some(),
-        forward_selection: selected_jid
-            .as_deref()
-            .and_then(|jid| app.selection_in(jid))
-            .is_some(),
+        forward_selection: layout.show_chat_area()
+            && selected_jid
+                .as_deref()
+                .and_then(|jid| app.selection_in(jid))
+                .is_some(),
         message_edit: false,
         message_delete: false,
         // The card floats above this view rather than inside it, so the root
@@ -308,6 +310,10 @@ pub fn render_connected_view(
         cx,
     );
 
+    let forward_pick = app
+        .forward_pick()
+        .is_some()
+        .then(|| render_forward_pick(app, entity.clone(), *layout.metrics(), cx));
     // Borrowed last, once nothing else needs `app` mutably: the header and
     // the empty state are the only readers of the chat itself, and everything
     // the timeline draws has already been gathered.
@@ -335,13 +341,8 @@ pub fn render_connected_view(
             )),
         })
         .when(layout.show_chat_area(), |el| {
-            if app.forward_pick().is_some() {
-                el.child(render_forward_pick(
-                    app,
-                    entity.clone(),
-                    *layout.metrics(),
-                    cx,
-                ))
+            if let Some(forward_pick) = forward_pick {
+                el.child(forward_pick)
             } else if destination == Destination::Status {
                 if app.status_post().is_some() {
                     el.child(render_status_post(
@@ -604,29 +605,40 @@ fn render_selection_bar(
 
 /// Where a forward goes: a search box and the chats that match.
 fn render_forward_pick(
-    app: &WhatsAppApp,
+    app: &mut WhatsAppApp,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
-    cx: &App,
+    cx: &mut Context<WhatsAppApp>,
 ) -> impl IntoElement + use<> {
     let pick = app.forward_pick().expect("the forward picker is open");
     let query = pick.search.read(cx).value();
     let targets = app.forward_targets(&query);
+    let search = pick.search.clone();
+    let scroll = pick.scroll.clone();
+    let pending = pick.pending;
     let cancel = entity.clone();
-    let rows = targets
-        .into_iter()
-        .map(|(jid, name)| {
-            let entity = entity.clone();
-            let target = jid.clone();
-            Button::new(SharedString::from(format!("forward-to-{jid}")))
-                .ghost()
-                .label(name)
-                .disabled(pick.pending)
-                .on_click(move |_, _, cx| {
-                    entity.update(cx, |app, cx| app.forward_to(&target, cx));
+    let row_height = metrics.touch_target();
+    let targets_list = uniform_list(
+        "forward-targets",
+        targets.len(),
+        cx.processor(move |_, range: std::ops::Range<usize>, _, _| {
+            range
+                .map(|ix| {
+                    let (jid, name) = targets[ix].clone();
+                    let entity = entity.clone();
+                    let target = jid.clone();
+                    Button::new(SharedString::from(format!("forward-to-{jid}")))
+                        .ghost()
+                        .label(name)
+                        .disabled(pending)
+                        .h(row_height)
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |app, cx| app.forward_to(&target, cx));
+                        })
                 })
-        })
-        .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        }),
+    );
 
     div()
         .flex()
@@ -642,24 +654,14 @@ fn render_forward_pick(
                 .text_size(metrics.text_title())
                 .child(crate::tr!(ForwardTo)),
         )
-        .child(Input::new(&pick.search).w_full().disabled(pick.pending))
-        .child(
-            div()
-                .id("forward-targets")
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .gap(metrics.space_xs())
-                .overflow_y_scroll()
-                .children(rows),
-        )
+        .child(Input::new(&search).w_full().disabled(pending))
+        .child(targets_list.flex_1().min_h_0().track_scroll(&scroll))
         .child(
             div().flex().justify_end().child(
                 Button::new("forward-cancel")
                     .ghost()
                     .label(crate::tr!(Cancel))
-                    .disabled(pick.pending)
+                    .disabled(pending)
                     .on_click(move |_, _, cx| {
                         cancel.update(cx, |app, cx| app.cancel_forward(cx));
                     }),
