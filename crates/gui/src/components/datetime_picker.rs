@@ -33,19 +33,21 @@ pub struct DateTimeState {
     /// Fixed UTC offset preserved from an RFC 3339 input or relative preset so
     /// ambiguous local times (e.g. during a DST fall-back) keep their exact instant.
     pub offset: Option<FixedOffset>,
+    /// Original RFC 3339 timestamp preserved until the user changes date or time,
+    /// keeping sub-minute precision intact when editing other fields.
+    pub preserved: Option<String>,
 }
 
 impl DateTimeState {
     /// Parse an RFC 3339 timestamp into local calendar state, or default to
     /// 15 minutes from now when `value` is empty or unparseable.
     pub fn from_rfc3339_or_default(value: &str) -> Self {
-        let dt = (!value.trim().is_empty())
-            .then(|| {
-                chrono::DateTime::parse_from_rfc3339(value.trim())
-                    .ok()
-                    .map(|parsed| parsed.with_timezone(&Local))
-            })
-            .flatten()
+        let parsed = (!value.trim().is_empty())
+            .then(|| chrono::DateTime::parse_from_rfc3339(value.trim()).ok())
+            .flatten();
+        let preserved = parsed.as_ref().map(|dt| dt.to_rfc3339());
+        let dt = parsed
+            .map(|p| p.with_timezone(&Local))
             .unwrap_or_else(|| now_local() + Duration::minutes(15));
         let selected_date = dt.date_naive();
         Self {
@@ -55,10 +57,16 @@ impl DateTimeState {
             hour: dt.hour(),
             minute: dt.minute(),
             offset: Some(*dt.offset()),
+            preserved,
         }
     }
 
     fn local_datetime(&self) -> Option<chrono::DateTime<FixedOffset>> {
+        if let Some(raw) = &self.preserved
+            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw)
+        {
+            return Some(dt);
+        }
         let time = NaiveTime::from_hms_opt(self.hour, self.minute, 0)?;
         let naive = NaiveDateTime::new(self.selected_date, time);
         if let Some(offset) = self.offset {
@@ -93,6 +101,12 @@ impl DateTimeState {
 
     /// Apply a user action to this state.
     pub fn apply(&mut self, update: DateTimeUpdate) {
+        if !matches!(
+            update,
+            DateTimeUpdate::PrevMonth | DateTimeUpdate::NextMonth
+        ) {
+            self.preserved = None;
+        }
         match update {
             DateTimeUpdate::PrevMonth => {
                 if self.view_month == 1 {
@@ -520,8 +534,21 @@ mod tests {
 
     #[test]
     fn datetime_state_parses_and_roundtrips_rfc3339() {
-        let state = DateTimeState::from_rfc3339_or_default("2030-05-15T14:30:00+00:00");
-        assert!(state.to_rfc3339().is_some());
+        let mut state = DateTimeState::from_rfc3339_or_default("2030-05-15T14:30:55+00:00");
+        assert_eq!(
+            state.to_rfc3339().as_deref(),
+            Some("2030-05-15T14:30:55+00:00")
+        );
         assert!(state.future_rfc3339().is_some());
+        state.apply(DateTimeUpdate::NextMonth);
+        assert_eq!(
+            state.to_rfc3339().as_deref(),
+            Some("2030-05-15T14:30:55+00:00")
+        );
+        state.apply(DateTimeUpdate::AdjustMinute(1));
+        assert_ne!(
+            state.to_rfc3339().as_deref(),
+            Some("2030-05-15T14:30:55+00:00")
+        );
     }
 }
