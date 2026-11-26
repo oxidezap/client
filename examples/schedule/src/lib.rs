@@ -16,6 +16,7 @@ struct EditDraft {
 
 thread_local! {
     static EDIT_DRAFT: RefCell<Option<EditDraft>> = const { RefCell::new(None) };
+    static REPEAT_DAILY: RefCell<bool> = const { RefCell::new(false) };
 }
 
 fn read_edit_draft() -> Option<EditDraft> {
@@ -24,6 +25,14 @@ fn read_edit_draft() -> Option<EditDraft> {
 
 fn write_edit_draft(draft: Option<EditDraft>) {
     EDIT_DRAFT.with(|cell| *cell.borrow_mut() = draft);
+}
+
+fn read_repeat_daily() -> bool {
+    REPEAT_DAILY.with(|cell| *cell.borrow())
+}
+
+fn write_repeat_daily(repeat: bool) {
+    REPEAT_DAILY.with(|cell| *cell.borrow_mut() = repeat);
 }
 
 const STORE: &str = "messages";
@@ -40,6 +49,8 @@ struct Job {
     text: String,
     at: i64,
     attempting: bool,
+    #[serde(default)]
+    repeat_daily: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -56,6 +67,7 @@ struct Form {
 
 fn setup(p: Setup) -> impl Declared {
     write_edit_draft(None);
+    write_repeat_daily(false);
     let declared = p
         .name("Scheduled messages")
         .subscribe(Kinds::NONE)
@@ -215,6 +227,11 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         write_edit_draft(None);
         return Ok("Scheduled message updated.");
     }
+    if id.as_str() == "repeat_daily" {
+        let on = action.value_into::<8>().as_str() == "1";
+        write_repeat_daily(on);
+        return Ok("");
+    }
     if !chat_supported(jid) {
         return Err("Open a direct conversation or group to schedule a message.");
     }
@@ -251,9 +268,11 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         text: form.message,
         at,
         attempting: false,
+        repeat_daily: read_repeat_daily(),
     });
     save(queue, true)?;
-    Ok("Message scheduled. Manage it in the plugin settings.")
+    write_repeat_daily(false);
+    Ok("Message scheduled.")
 }
 
 fn tick(queue: &mut Queue) -> Result<bool, &'static str> {
@@ -280,7 +299,12 @@ fn tick(queue: &mut Queue) -> Result<bool, &'static str> {
     let job = &queue.jobs[index];
     match oxidezap_plugin::send_text(&job.jid, &job.text) {
         Outcome::Accepted => {
-            queue.jobs.remove(index);
+            if queue.jobs[index].repeat_daily {
+                queue.jobs[index].at = queue.jobs[index].at.saturating_add(86_400_000);
+                queue.jobs[index].attempting = false;
+            } else {
+                queue.jobs.remove(index);
+            }
         }
         Outcome::NoSession | Outcome::Denied | Outcome::Refused => {
             queue.jobs[index].attempting = false;
@@ -315,66 +339,81 @@ fn handle(event: &Event) {
     }
 }
 
+fn draw_scheduled_list(
+    section: &mut ui::Group<'_, '_>,
+    queue: &Result<Queue, &'static str>,
+    editing: Option<&EditDraft>,
+    notice: &str,
+) {
+    if !notice.is_empty() {
+        section.label(notice);
+    }
+    let queue = match queue {
+        Ok(queue) => queue,
+        Err(error) => {
+            section.label(error);
+            return;
+        }
+    };
+    if queue.jobs.is_empty() {
+        section.label("No scheduled messages.");
+    }
+    for job in &queue.jobs {
+        let when = DateTime::<Utc>::from_timestamp_millis(job.at)
+            .map(|time| time.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_default();
+        let recurrence = if job.repeat_daily { " · daily" } else { "" };
+        section.label(&format!("{} · {}{}", job.jid, when, recurrence));
+        section.label(&job.text);
+        if !job.attempting {
+            if let Some(draft) = editing.as_ref().filter(|d| d.id == job.id) {
+                section.field(
+                    &format!("edit-message-{}", job.id),
+                    "Message",
+                    &draft.text,
+                    true,
+                );
+                section.datetime(
+                    &format!("edit-when-{}", job.id),
+                    "Send time",
+                    &draft.when,
+                    true,
+                );
+                section.row(|row| {
+                    row.button(&format!("save-edit-{}", job.id), "Save");
+                    row.button(&format!("discard-edit-{}", job.id), "Discard");
+                });
+            } else {
+                section.button(&format!("edit-{}", job.id), "Edit scheduled message");
+            }
+        }
+        let label = if job.attempting {
+            "Dismiss unconfirmed send"
+        } else {
+            "Cancel scheduled message"
+        };
+        section.button(&format!("cancel-{}", job.id), label);
+    }
+}
+
 fn draw(queue: &Result<Queue, &'static str>, notice: &str) {
     let editing = read_edit_draft();
+    let repeat_daily = read_repeat_daily();
     ui::publish::<16384>(|ui| {
         ui.section(ui::slot::COMPOSER, "Schedule a message", |section| {
-            section.field("message", "Message (up to 512 bytes)", "", true);
             section.datetime("when", "Send time", "", true);
+            section.toggle("repeat_daily", "Repeat daily", repeat_daily, true);
+            section.field("message", "Type a message (up to 512 bytes)", "", true);
             section.button("schedule", "Schedule Send");
             if !notice.is_empty() {
                 section.label(notice);
             }
         });
+        ui.section(ui::slot::COMPOSER, "Scheduled messages", |section| {
+            draw_scheduled_list(section, queue, editing.as_ref(), "");
+        });
         ui.section(ui::slot::SETTINGS, "Scheduled messages", |section| {
-            if !notice.is_empty() {
-                section.label(notice);
-            }
-            let queue = match queue {
-                Ok(queue) => queue,
-                Err(error) => {
-                    section.label(error);
-                    return;
-                }
-            };
-            if queue.jobs.is_empty() {
-                section.label("No scheduled messages.");
-            }
-            for job in &queue.jobs {
-                let when = DateTime::<Utc>::from_timestamp_millis(job.at)
-                    .map(|time| time.to_rfc3339())
-                    .unwrap_or_default();
-                section.label(&format!("{} · {}", job.jid, when));
-                section.label(&job.text);
-                if !job.attempting {
-                    if let Some(draft) = editing.as_ref().filter(|d| d.id == job.id) {
-                        section.field(
-                            &format!("edit-message-{}", job.id),
-                            "Message",
-                            &draft.text,
-                            true,
-                        );
-                        section.datetime(
-                            &format!("edit-when-{}", job.id),
-                            "Send time",
-                            &draft.when,
-                            true,
-                        );
-                        section.row(|row| {
-                            row.button(&format!("save-edit-{}", job.id), "Save");
-                            row.button(&format!("discard-edit-{}", job.id), "Discard");
-                        });
-                    } else {
-                        section.button(&format!("edit-{}", job.id), "Edit scheduled message");
-                    }
-                }
-                let label = if job.attempting {
-                    "Dismiss unconfirmed send"
-                } else {
-                    "Cancel scheduled message"
-                };
-                section.button(&format!("cancel-{}", job.id), label);
-            }
+            draw_scheduled_list(section, queue, editing.as_ref(), notice);
         });
     });
 }
@@ -462,6 +501,7 @@ mod tests {
                 text: "hello".into(),
                 at: 100,
                 attempting: true,
+                repeat_daily: false,
             }],
         };
         host.store(STORE, &serde_json::to_string(&queue).unwrap());
@@ -488,6 +528,7 @@ mod tests {
         let tree = host.ui().unwrap().unwrap();
         assert_eq!(
             tree.iter()
+                .filter(|node| node.slot == ui::slot::SETTINGS)
                 .flat_map(|node| &node.children)
                 .filter(|node| node.id.starts_with("cancel-"))
                 .count(),
@@ -527,5 +568,26 @@ mod tests {
         assert_eq!(saved.jobs.len(), 1);
         assert_eq!(saved.jobs[0].text, "updated hello");
         assert_eq!(saved.jobs[0].at, 300_000);
+    }
+
+    #[test]
+    fn repeat_daily_reschedules_job_for_next_day() {
+        let mut host = Host::new();
+        host.init(setup);
+        host.set_now_ms(1_000);
+        host.deliver(
+            In::action("repeat_daily", "1").str(abi::fields::CHAT_JID, CHAT),
+            handle,
+        );
+        schedule(&mut host, CHAT, "1");
+        host.set_now_ms(61_000);
+        host.deliver(In::timer(TICK), handle);
+        assert_eq!(host.sent(), [(CHAT.to_owned(), "hello".to_owned())]);
+
+        let saved: Queue = serde_json::from_str(&host.stored(STORE).unwrap()).unwrap();
+        assert_eq!(saved.jobs.len(), 1);
+        assert!(saved.jobs[0].repeat_daily);
+        assert!(!saved.jobs[0].attempting);
+        assert_eq!(saved.jobs[0].at, 61_000 + 86_400_000);
     }
 }

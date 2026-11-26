@@ -233,244 +233,277 @@ where
 
     div()
         .flex()
-        .flex_col()
-        .gap(metrics.space_sm())
-        // Calendar month header
+        .flex_wrap()
+        .items_start()
+        .gap(metrics.space_md())
+        // Left: Calendar month + weekday headers + 6x7 day grid
         .child(
             div()
+                .w(rems(16.5))
                 .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    Button::new(SharedString::from(format!("{id_prefix}/cal-prev")))
-                        .icon(IconName::ChevronLeft)
-                        .ghost()
-                        .small()
-                        .disabled(!live)
-                        .when(live, |b| {
-                            b.cursor_pointer().on_click(move |_, window, cx| {
-                                prev_cb(DateTimeUpdate::PrevMonth, window, cx);
-                            })
-                        }),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.text_small())
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(month_title),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("{id_prefix}/cal-next")))
-                        .icon(IconName::ChevronRight)
-                        .ghost()
-                        .small()
-                        .disabled(!live)
-                        .when(live, |b| {
-                            b.cursor_pointer().on_click(move |_, window, cx| {
-                                next_cb(DateTimeUpdate::NextMonth, window, cx);
-                            })
-                        }),
-                ),
-        )
-        // Weekday header row
-        .child(
-            div()
-                .grid()
-                .grid_cols(7)
-                .gap(rems(0.1))
-                .children(weekdays.into_iter().map(|day_name| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(rems(1.3))
-                        .text_size(metrics.text_micro())
-                        .text_color(theme.muted_foreground)
-                        .child(day_name)
-                })),
-        )
-        // 6x7 day grid
-        .child(
-            div()
-                .grid()
-                .grid_cols(7)
-                .gap(rems(0.1))
-                .children(days.into_iter().map(|day| {
-                    let in_month = day.month() == state.view_month && day.year() == state.view_year;
-                    let is_selected = day == state.selected_date;
-                    let is_past = day < today;
-                    let disabled = !live || is_past;
-                    let day_cb = on_update.clone();
-                    Button::new(SharedString::from(format!("{id_prefix}/day-{day}")))
-                        .label(day.day().to_string())
-                        .small()
-                        .disabled(disabled)
-                        .when(is_selected, |b| b.primary())
-                        .when(!is_selected, |b| b.ghost())
-                        .when(!in_month && !is_selected, |b| {
-                            b.text_color(theme.muted_foreground)
-                        })
-                        .when(!disabled, |b| {
-                            b.cursor_pointer().on_click(move |_, window, cx| {
-                                day_cb(DateTimeUpdate::SelectDate(day), window, cx);
-                            })
-                        })
-                })),
-        )
-        // Time steppers row
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .p(metrics.space_sm())
-                .rounded(rems(0.4))
-                .bg(theme.secondary)
-                .child(
-                    div()
-                        .text_size(metrics.text_small())
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child(time_label),
-                )
+                .flex_col()
+                .gap(metrics.space_xs())
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(metrics.space_xxs())
+                        .justify_between()
                         .child(
-                            Button::new(SharedString::from(format!("{id_prefix}/h-minus")))
-                                .label("-")
+                            Button::new(SharedString::from(format!("{id_prefix}/cal-prev")))
+                                .icon(IconName::ChevronLeft)
                                 .ghost()
                                 .small()
                                 .disabled(!live)
                                 .when(live, |b| {
                                     b.cursor_pointer().on_click(move |_, window, cx| {
-                                        h_minus_cb(DateTimeUpdate::AdjustHour(-1), window, cx);
+                                        prev_cb(DateTimeUpdate::PrevMonth, window, cx);
                                     })
                                 }),
                         )
                         .child(
                             div()
-                                .w(rems(1.8))
-                                .text_center()
                                 .text_size(metrics.text_small())
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme.foreground)
-                                .child(format!("{:02}", state.hour)),
+                                .child(month_title),
                         )
                         .child(
-                            Button::new(SharedString::from(format!("{id_prefix}/h-plus")))
-                                .label("+")
+                            Button::new(SharedString::from(format!("{id_prefix}/cal-next")))
+                                .icon(IconName::ChevronRight)
                                 .ghost()
                                 .small()
                                 .disabled(!live)
                                 .when(live, |b| {
                                     b.cursor_pointer().on_click(move |_, window, cx| {
-                                        h_plus_cb(DateTimeUpdate::AdjustHour(1), window, cx);
-                                    })
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_size(metrics.text_small())
-                                .text_color(theme.muted_foreground)
-                                .child(":"),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("{id_prefix}/m-minus")))
-                                .label("-")
-                                .ghost()
-                                .small()
-                                .disabled(!live)
-                                .when(live, |b| {
-                                    b.cursor_pointer().on_click(move |_, window, cx| {
-                                        m_minus_cb(DateTimeUpdate::AdjustMinute(-1), window, cx);
-                                    })
-                                }),
-                        )
-                        .child(
-                            div()
-                                .w(rems(1.8))
-                                .text_center()
-                                .text_size(metrics.text_small())
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme.foreground)
-                                .child(format!("{:02}", state.minute)),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("{id_prefix}/m-plus")))
-                                .label("+")
-                                .ghost()
-                                .small()
-                                .disabled(!live)
-                                .when(live, |b| {
-                                    b.cursor_pointer().on_click(move |_, window, cx| {
-                                        m_plus_cb(DateTimeUpdate::AdjustMinute(1), window, cx);
+                                        next_cb(DateTimeUpdate::NextMonth, window, cx);
                                     })
                                 }),
                         ),
+                )
+                .child(
+                    div()
+                        .grid()
+                        .grid_cols(7)
+                        .gap(rems(0.1))
+                        .children(weekdays.into_iter().map(|day_name| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(rems(1.3))
+                                .text_size(metrics.text_micro())
+                                .text_color(theme.muted_foreground)
+                                .child(day_name)
+                        })),
+                )
+                .child(
+                    div()
+                        .grid()
+                        .grid_cols(7)
+                        .gap(rems(0.1))
+                        .children(days.into_iter().map(|day| {
+                            let in_month =
+                                day.month() == state.view_month && day.year() == state.view_year;
+                            let is_selected = day == state.selected_date;
+                            let is_past = day < today;
+                            let disabled = !live || is_past;
+                            let day_cb = on_update.clone();
+                            Button::new(SharedString::from(format!("{id_prefix}/day-{day}")))
+                                .label(day.day().to_string())
+                                .small()
+                                .disabled(disabled)
+                                .when(is_selected, |b| b.primary())
+                                .when(!is_selected, |b| b.ghost())
+                                .when(!in_month && !is_selected, |b| {
+                                    b.text_color(theme.muted_foreground)
+                                })
+                                .when(!disabled, |b| {
+                                    b.cursor_pointer().on_click(move |_, window, cx| {
+                                        day_cb(DateTimeUpdate::SelectDate(day), window, cx);
+                                    })
+                                })
+                        })),
                 ),
         )
-        // Quick presets row
+        // Right: Send Time steppers, quick presets, and selected preview
         .child(
             div()
+                .flex_1()
+                .min_w(rems(11.))
                 .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(metrics.space_xs())
+                .flex_col()
+                .gap(metrics.space_sm())
                 .child(
-                    Button::new(SharedString::from(format!("{id_prefix}/preset-15m")))
-                        .label(crate::tr!(Preset15m))
-                        .ghost()
-                        .small()
-                        .disabled(!live)
-                        .when(live, |b| {
-                            b.cursor_pointer().on_click(move |_, window, cx| {
-                                p15_cb(DateTimeUpdate::PresetMinutes(15), window, cx);
-                            })
-                        }),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(metrics.space_xs())
+                        .p(metrics.space_sm())
+                        .rounded(rems(0.4))
+                        .bg(theme.secondary)
+                        .child(
+                            div()
+                                .text_size(metrics.text_micro())
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.muted_foreground)
+                                .child(time_label),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(metrics.space_xxs())
+                                .child(
+                                    Button::new(SharedString::from(format!("{id_prefix}/h-minus")))
+                                        .label("-")
+                                        .ghost()
+                                        .small()
+                                        .disabled(!live)
+                                        .when(live, |b| {
+                                            b.cursor_pointer().on_click(move |_, window, cx| {
+                                                h_minus_cb(
+                                                    DateTimeUpdate::AdjustHour(-1),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .w(rems(1.8))
+                                        .text_center()
+                                        .text_size(metrics.text_small())
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.foreground)
+                                        .child(format!("{:02}", state.hour)),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("{id_prefix}/h-plus")))
+                                        .label("+")
+                                        .ghost()
+                                        .small()
+                                        .disabled(!live)
+                                        .when(live, |b| {
+                                            b.cursor_pointer().on_click(move |_, window, cx| {
+                                                h_plus_cb(
+                                                    DateTimeUpdate::AdjustHour(1),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(metrics.text_small())
+                                        .text_color(theme.muted_foreground)
+                                        .child(":"),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("{id_prefix}/m-minus")))
+                                        .label("-")
+                                        .ghost()
+                                        .small()
+                                        .disabled(!live)
+                                        .when(live, |b| {
+                                            b.cursor_pointer().on_click(move |_, window, cx| {
+                                                m_minus_cb(
+                                                    DateTimeUpdate::AdjustMinute(-1),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .w(rems(1.8))
+                                        .text_center()
+                                        .text_size(metrics.text_small())
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.foreground)
+                                        .child(format!("{:02}", state.minute)),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("{id_prefix}/m-plus")))
+                                        .label("+")
+                                        .ghost()
+                                        .small()
+                                        .disabled(!live)
+                                        .when(live, |b| {
+                                            b.cursor_pointer().on_click(move |_, window, cx| {
+                                                m_plus_cb(
+                                                    DateTimeUpdate::AdjustMinute(1),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                ),
+                        ),
                 )
                 .child(
-                    Button::new(SharedString::from(format!("{id_prefix}/preset-1h")))
-                        .label(crate::tr!(Preset1h))
-                        .ghost()
-                        .small()
-                        .disabled(!live)
-                        .when(live, |b| {
-                            b.cursor_pointer().on_click(move |_, window, cx| {
-                                p60_cb(DateTimeUpdate::PresetMinutes(60), window, cx);
-                            })
-                        }),
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(metrics.space_xs())
+                        .child(
+                            Button::new(SharedString::from(format!("{id_prefix}/preset-15m")))
+                                .label(crate::tr!(Preset15m))
+                                .ghost()
+                                .small()
+                                .disabled(!live)
+                                .when(live, |b| {
+                                    b.cursor_pointer().on_click(move |_, window, cx| {
+                                        p15_cb(DateTimeUpdate::PresetMinutes(15), window, cx);
+                                    })
+                                }),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("{id_prefix}/preset-1h")))
+                                .label(crate::tr!(Preset1h))
+                                .ghost()
+                                .small()
+                                .disabled(!live)
+                                .when(live, |b| {
+                                    b.cursor_pointer().on_click(move |_, window, cx| {
+                                        p60_cb(DateTimeUpdate::PresetMinutes(60), window, cx);
+                                    })
+                                }),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("{id_prefix}/preset-tomorrow")))
+                                .label(crate::tr!(Tomorrow0900))
+                                .ghost()
+                                .small()
+                                .disabled(!live)
+                                .when(live, |b| {
+                                    b.cursor_pointer().on_click(move |_, window, cx| {
+                                        tomorrow_cb(
+                                            DateTimeUpdate::PresetTomorrowMorning,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                }),
+                        ),
                 )
                 .child(
-                    Button::new(SharedString::from(format!("{id_prefix}/preset-tomorrow")))
-                        .label(crate::tr!(Tomorrow0900))
-                        .ghost()
-                        .small()
-                        .disabled(!live)
-                        .when(live, |b| {
-                            b.cursor_pointer().on_click(move |_, window, cx| {
-                                tomorrow_cb(DateTimeUpdate::PresetTomorrowMorning, window, cx);
-                            })
+                    div()
+                        .text_size(metrics.text_micro())
+                        .text_color(if is_future {
+                            theme.muted_foreground
+                        } else {
+                            theme.danger
+                        })
+                        .child(if is_future {
+                            state.formatted_selection()
+                        } else {
+                            crate::tr!(SelectFutureDateTime).to_string()
                         }),
                 ),
-        )
-        // Selected summary / validation hint
-        .child(
-            div()
-                .text_size(metrics.text_micro())
-                .text_color(if is_future {
-                    theme.muted_foreground
-                } else {
-                    theme.danger
-                })
-                .child(if is_future {
-                    state.formatted_selection()
-                } else {
-                    crate::tr!(SelectFutureDateTime).to_string()
-                }),
         )
 }
 

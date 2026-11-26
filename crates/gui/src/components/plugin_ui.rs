@@ -76,6 +76,7 @@ pub fn composer(app: &WhatsAppApp, ctx: &PluginContext, cx: &App) -> Option<gpui
                 .anchor(gpui::Anchor::BottomLeft)
                 .trigger(
                     Button::new("composer-plugin-tools")
+                        .icon(crate::components::ProductIcon::Grid)
                         .label(crate::tr!(ComposerPlugins))
                         .ghost()
                         .small(),
@@ -87,7 +88,7 @@ pub fn composer(app: &WhatsAppApp, ctx: &PluginContext, cx: &App) -> Option<gpui
                         .flex()
                         .flex_col()
                         .gap(metrics.space_md())
-                        .w(rems(24.))
+                        .w(rems(31.))
                         .max_w(
                             (window.viewport_size().width - metrics.space_xl()).max(gpui::px(0.)),
                         )
