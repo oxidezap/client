@@ -212,17 +212,20 @@ fn edit_queue(action: Action<'_>, queue: &mut Queue) -> Result<&'static str, &'s
         // In PluginSlot::Composer, button presses carry the current form values
         // as a JSON object keyed by widget id; in Settings, fields commit as
         // individual actions into `EDIT_DRAFT`.
-        let value = action.value_into::<4096>();
-        if let Some(raw) = value.whole().filter(|s| !s.trim().is_empty())
-            && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw)
-        {
-            let msg_key = format!("edit-message-{target_id}");
-            let when_key = format!("edit-when-{target_id}");
-            if let Some(text) = map.get(&msg_key).and_then(|v| v.as_str()) {
-                draft_val.text = text.to_owned();
-            }
-            if let Some(when) = map.get(&when_key).and_then(|v| v.as_str()) {
-                draft_val.when = when.to_owned();
+        let value = action.value_into::<8192>();
+        if value.present() {
+            let raw = value.whole().ok_or("The edit form could not be read.")?;
+            if !raw.trim().is_empty() {
+                let map: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(raw).map_err(|_| "The edit form could not be read.")?;
+                let msg_key = format!("edit-message-{target_id}");
+                let when_key = format!("edit-when-{target_id}");
+                if let Some(text) = map.get(&msg_key).and_then(|v| v.as_str()) {
+                    draft_val.text = text.to_owned();
+                }
+                if let Some(when) = map.get(&when_key).and_then(|v| v.as_str()) {
+                    draft_val.when = when.to_owned();
+                }
             }
         }
         if draft_val.text.trim().is_empty() || draft_val.text.len() > MAX_MESSAGE {
